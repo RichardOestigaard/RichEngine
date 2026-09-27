@@ -379,10 +379,11 @@ constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 constexpr uint32_t kAssumedGpuCores = 32;
 
 // Apple10 wide plain projections reduce input re-reads with paired N256
-// tiles at one resident wave, measured on 16/20-core GPUs. Split-K remains
+// tiles at one resident wave. The crossover was measured at three tiles per
+// core on the 20-core M5 Pro (tune-kernels, 2026-09-23). Split-K remains
 // an offline candidate: its reassociation reduced speculative acceptance
 // on some measured prompts. Apple9's simdgroup policy is independent.
-constexpr uint32_t kPaired256TilesPerCore = 8;
+constexpr uint32_t kPaired256TilesPerCore = 3;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
 std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
@@ -461,6 +462,11 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
           std::max(1L, std::lround(kApple9GateUpGroupsPerCore * gpuCores_)));
       return {LinearTile::N256, std::min(tiles256, resident)};
     }
+    // One- and two-lane gate/up keeps the whole N256 grid resident while it
+    // fits four tiles per core; the balanced wave measured slower on the
+    // 20-core M5 Pro.
+    if (lanes <= 2 && tiles256 <= 4 * gpuCores_)
+      return {LinearTile::N256, tiles256};
     return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
   }
   // Pipelined N128 hides the latency of a single lane's weight stream.
