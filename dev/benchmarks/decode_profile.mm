@@ -152,6 +152,7 @@ void prefill(model::Runtime &executor, Lane &lane,
 struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  uint64_t tokens = 0;
   uint64_t commands = 0;
 };
 
@@ -171,15 +172,18 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
+  uint64_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
+    tokens += results[index].outputTokens.size() -
+              results[index].outputTokensWithoutKv;
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
   }
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
-          std::chrono::duration<double>(finished - started).count(),
+          std::chrono::duration<double>(finished - started).count(), tokens,
           backend.submissionCount() - submissionsBefore};
 }
 
@@ -287,10 +291,18 @@ int main(int argc, char **argv) {
                     return left.gpuSeconds < right.gpuSeconds;
                   });
         const CycleTiming median = fused[fused.size() / 2];
+        uint64_t tokens = 0;
+        double gpuTotal = 0.0, wallTotal = 0.0;
+        for (const CycleTiming &cycle : fused) {
+          tokens += cycle.tokens;
+          gpuTotal += cycle.gpuSeconds;
+          wallTotal += cycle.wallSeconds;
+        }
         std::printf("\n%s: median fused gpu %.2f ms, wall %.2f ms, %llu "
-                    "command(s) per cycle\n",
+                    "command(s) per cycle, %.1f tokens/gpu s, %.1f tokens/wall s\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
-                    static_cast<unsigned long long>(median.commands));
+                    static_cast<unsigned long long>(median.commands),
+                    tokens / gpuTotal, tokens / wallTotal);
         backend.setDispatchProfiling(true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
