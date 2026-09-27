@@ -14,12 +14,16 @@ projections up to four tiles per core.
 
 decode-profile, 6 cycles per width, median fused GPU ms/cycle:
 
-| Batch | Before (stash notes) | Full pass (stash notes) | Now |
-|---|---|---|---|
-| B1 | 83.36 | 74.92 | 73.89 |
-| B2 | 101.6 | 87.87 | 86.92 |
-| B3 | 136.4 | 129.32 | 127.96 |
-| B4 | 147.4 | 138.54 | 139.54 |
+| Batch | Before (ms) | After (ms) | Tok/s before | Tok/s after | Gain |
+|---|---|---|---|---|---|
+| B1 | 83.36 | 75.24 | 85.7 | 96.4 | +12.5% |
+| B2 | 101.6 | 88.43 | 151.7 | 169.9 | +12.0% |
+| B3 | 136.4 | 128.31 | 172.2 | 174.0 | +1.0% |
+| B4 | 147.4 | 139.37 | 211.4 | 214.1 | +1.3% |
+
+Tok/s after measured by `backend-benchmark --scenario decode`
+(wall-clock, draft acceptance 0.873 unchanged); ms/cycle from
+`decode-profile`, 6 cycles per width.
 
 The two applied changes alone match or beat the previously recorded
 full-pass numbers at B1–B3. B4 remains ~1 ms short; the lane-4 N128
@@ -70,7 +74,7 @@ Draft acceptance unchanged at ~0.87 across all batch widths.
 
 | Check | Result |
 |---|---|
-| `decode-profile` B1–B4, 512 prompt, 6 cycles | B1 73.89, B2 86.92, B3 127.96, B4 139.54 ms — no regressions vs recorded baselines |
+| `decode-profile` B1–B4, 512 prompt, 6 cycles | B1 75.24, B2 88.43, B3 128.31, B4 139.37 ms — no regressions vs recorded baselines |
 
 Note: `decode-profile` caps each lane at 256 new tokens, so runs above
 ~6 cycles per width abort early ("completed request was decoded").
