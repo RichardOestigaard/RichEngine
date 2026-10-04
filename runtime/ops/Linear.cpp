@@ -342,6 +342,9 @@ struct DecodeGroupPolicy final {
 constexpr DecodeGroupPolicy kN128Groups{4, 4, 12}, kN128M16Groups{5, 4, 12},
     kN256Groups{3, 3, 8}, kGateUpGroups{3, 3, 8},
     kFourSimdgroupGroups{8, 8, 24};
+// Apple9 retains its measured gate/up clamp. The round-robin policy above was
+// measured on Apple10; applying it to Apple9 requires separate calibration.
+constexpr double kApple9GateUpGroupsPerCore = 2.25;
 
 // Tiles on the most loaded core when `groups` threadgroups are placed
 // round-robin on `cores` and group g streams tiles g, g + groups, ...
@@ -502,6 +505,7 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     if (lanes <= 2 && tiles256 <= 4 * gpuCores_)
       return {LinearTile::N256, tiles256};
     return {LinearTile::N256, groups(tiles256, kGateUpGroups)};
+  }
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
   // Every M24 projection that gets here runs four SIMD groups.
