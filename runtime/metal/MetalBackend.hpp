@@ -214,8 +214,8 @@ private:
 // How long a command may run before the backend gives up on it, and how long
 // every buffer stays wired after the last command (see allocateBuffer), as the
 // engine keeps a model's weights after the last request
-// (NativeRuntime::releaseIdleWeights). Tests substitute shorter ones through
-// TestConfig.
+// (NativeRuntime::releaseIdleWeights), both in time the Mac is awake
+// (AwakeClock). Tests substitute shorter ones through TestConfig.
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);

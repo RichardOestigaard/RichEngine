@@ -36,6 +36,9 @@ the last failure. An engine whose loop leaves a status request unanswered for
 30 seconds, while requests are pending or during a background status refresh,
 is failed and restarted by the same rules.
 
+Timeouts and keep-alives count only time the Mac is awake: a request in flight
+when the Mac sleeps continues when it wakes.
+
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
 installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
@@ -778,7 +781,8 @@ queue's bound, the latency window, the prefill checkpoint interval and the
 resource wait) and its clocks and live host-memory estimate through
 `runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
 production parameter; `make architecture-check` keeps production from writing
-that configuration.
+that configuration, and from measuring time on a clock that counts sleep: the
+runtime measures it on `AwakeClock` (`runtime/AwakeClock.hpp`).
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The

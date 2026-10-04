@@ -5,6 +5,7 @@
 // RuntimeEncode.mm, RuntimeAne.mm and RuntimeNgram.mm.
 
 #include "model/Runtime.hpp"
+#include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
 #include "model/QwenState.hpp"
@@ -1719,7 +1720,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         const CommandTiming forward = command_.wait();
         addTiming(forward);
         targetForwardGpuSeconds_ += forward.gpuSeconds;
-        maskWaitStarted_ = std::chrono::steady_clock::now();
+        maskWaitStarted_ = AwakeClock::now();
         stage_ = Stage::WaitingMask;
       }
 
@@ -1731,7 +1732,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         }
         if (masksReady) {
           maskWaitSeconds_ +=
-              std::chrono::duration<double>(std::chrono::steady_clock::now() -
+              std::chrono::duration<double>(AwakeClock::now() -
                                             *maskWaitStarted_)
                   .count();
           maskWaitStarted_.reset();
@@ -1836,7 +1837,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::array<bool, kLaneCount> abandoned_{};
     double targetForwardGpuSeconds_ = 0.0;
     double maskWaitSeconds_ = 0.0;
-    std::optional<std::chrono::steady_clock::time_point> maskWaitStarted_;
+    std::optional<AwakeClock::time_point> maskWaitStarted_;
     std::function<void()> wake_;
   };
 };

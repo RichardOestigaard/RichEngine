@@ -210,6 +210,42 @@ class ArchitectureTests(unittest.TestCase):
                         )
                         source.unlink()
 
+    def test_production_measures_time_the_mac_is_awake(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clock = root / "runtime/AwakeClock.hpp"
+            clock.parent.mkdir(parents=True)
+            clock.write_text("clock_gettime_nsec_np(CLOCK_UPTIME_RAW);\n")
+            with mock.patch.object(check_architecture, "ROOT", root):
+                self.assertEqual(check_architecture.check(), [])
+                for relative, text in (
+                    (
+                        "runtime/metal/MetalBackend.mm",
+                        "std::chrono::steady_clock::now();\n",
+                    ),
+                    (
+                        "runtime/engine/Engine.cpp",
+                        "using Clock = std::chrono::steady_clock;\n",
+                    ),
+                    ("runtime/main.mm", "std::chrono::high_resolution_clock::now();\n"),
+                    # A wait for a duration measures it on the steady clock.
+                    (
+                        "runtime/engine/RuntimeResources.mm",
+                        "wake.wait_for(lock, kProbation, stopped);\n",
+                    ),
+                    ("runtime/engine/Cache.cpp", "mutex.try_lock_for(kWait);\n"),
+                    ("runtime/engine/KvPool.cpp", "slots.try_acquire_for(kWait);\n"),
+                ):
+                    with self.subTest(source=relative):
+                        source = root / relative
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        source.write_text(text)
+                        self.assertEqual(
+                            check_architecture.check(),
+                            [f"{relative}: measures time on a clock that counts sleep"],
+                        )
+                        source.unlink()
+
     def test_only_engine_assembly_depends_on_concrete_models(self):
         headers = (
             "model/DFlashDraft.hpp",

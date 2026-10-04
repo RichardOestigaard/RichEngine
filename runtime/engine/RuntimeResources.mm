@@ -1,4 +1,5 @@
 #include "engine/RuntimeResources.hpp"
+#include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
@@ -377,11 +378,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    const auto started = std::chrono::steady_clock::now();
+    const auto started = AwakeClock::now();
     package = model::loadModelPackage(*backend, config.modelRoot, config.model);
     requireLoadedModel(package);
-    const std::chrono::duration<double> loading =
-        std::chrono::steady_clock::now() - started;
+    const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logStartup("Weights loaded in ", std::fixed, std::setprecision(2),
                loading.count(), " s.");
   } catch (const metal::MetalAllocationError &error) {
@@ -586,7 +586,8 @@ void RuntimeResources::beginServing() {
     return;
   probation_ = std::thread([this, directory] {
     std::unique_lock lock(probationMutex_);
-    if (probationWake_.wait_for(lock, kProbation, [this] { return probationStopped_; }))
+    if (probationWake_.wait_until(lock, AwakeClock::now() + kProbation,
+                                  [this] { return probationStopped_; }))
       return;
     try {
       directory->endProbation();

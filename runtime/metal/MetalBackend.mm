@@ -1,4 +1,5 @@
 #import "MetalBackend.hpp"
+#include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Env.hpp"
 #include "Residency.hpp"
@@ -150,9 +151,8 @@ constexpr uint32_t kBufferArgumentEntries = 31;
 // How long a ticket waits for its command before it asks the watchdog.
 constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 
-double steadySeconds() noexcept {
-    return std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+double awakeSeconds() noexcept {
+    return std::chrono::duration<double>(AwakeClock::now().time_since_epoch()).count();
 }
 
 const char *commandStatusName(MTLCommandBufferStatus status) noexcept {
@@ -320,7 +320,7 @@ struct BackendAsyncState {
         std::lock_guard lock(gateMutex);
         activeCommand = command;
         activeCompletion = std::move(completion);
-        commandWatchdog.start(sequence, steadySeconds());
+        commandWatchdog.start(sequence, awakeSeconds());
         [command commit];
     }
 
@@ -357,7 +357,7 @@ struct BackendAsyncState {
         std::function<void(id<MTLCommandBuffer>)> complete;
         {
             std::lock_guard lock(gateMutex);
-            if (!commandWatchdog.expired(steadySeconds())) return false;
+            if (!commandWatchdog.expired(awakeSeconds())) return false;
             command = activeCommand;
             const auto status = command ? command.status
                                         : MTLCommandBufferStatusNotEnqueued;
@@ -418,13 +418,13 @@ struct CommandTicket::State {
     std::condition_variable condition;
     uint64_t sequence = 0;
     CommandTiming timing;
-    std::chrono::steady_clock::time_point wallStart;
+    AwakeClock::time_point wallStart;
     std::string error;
     bool completed = false;
     bool released = false;
 
     void finishCommand(id<MTLCommandBuffer> command) {
-        auto wallEnd = std::chrono::steady_clock::now();
+        auto wallEnd = AwakeClock::now();
         CommandTiming timing;
         timing.gpuSeconds =
             command.GPUEndTime - command.GPUStartTime;
@@ -527,8 +527,8 @@ struct CommandTicket::State {
     // this state.
     [[nodiscard]] bool awaitCompletion(bool honorShutdown) noexcept {
         std::unique_lock lock(mutex);
-        while (!condition.wait_for(lock, kTicketWaitSlice,
-                                   [this] { return completed; })) {
+        while (!condition.wait_until(lock, AwakeClock::now() + kTicketWaitSlice,
+                                     [this] { return completed; })) {
             lock.unlock();
             const bool abandoned = backend->commandAbandoned();
             const bool interrupted =
@@ -1411,7 +1411,7 @@ struct MetalBackend::Impl {
             throw MetalBackendError(std::move(message));
         };
 
-        auto wallStart = std::chrono::steady_clock::now();
+        auto wallStart = AwakeClock::now();
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
         // this submission (under the validation layer an autoreleased

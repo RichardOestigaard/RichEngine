@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "MetalBackend.hpp"
 
 #import <Metal/Metal.h>
@@ -101,7 +102,7 @@ public:
   void use() {
     {
       std::lock_guard lock(mutex_);
-      lastUse_ = std::chrono::steady_clock::now();
+      lastUse_ = AwakeClock::now();
       if (held_) return;
       held_ = true;
     }
@@ -119,7 +120,7 @@ private:
     bool lapsed;
     {
       std::lock_guard lock(mutex_);
-      lapsed = std::chrono::steady_clock::now() - lastUse_ >= keepAlive_;
+      lapsed = AwakeClock::now() - lastUse_ >= keepAlive_;
       held_ = !lapsed;
     }
     if (!lapsed) {
@@ -155,7 +156,7 @@ private:
   __strong dispatch_source_t heartbeat_ = nil;
   const std::chrono::duration<double> keepAlive_;
   std::mutex mutex_;
-  std::chrono::steady_clock::time_point lastUse_;
+  AwakeClock::time_point lastUse_;
   bool held_ = false;
 };
 

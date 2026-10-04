@@ -23,7 +23,7 @@ struct TestConfig final {
   std::optional<uint64_t> writeBehindHourlyBytes; // engine::WriteBehind::kHourlyBytes
   // RuntimeResources and its governor: the live vm_statistics64 estimate.
   std::function<std::optional<uint64_t>()> hostAvailableMemory;
-  // NativeRuntime: the system clock in microseconds and the steady clock in
+  // NativeRuntime: the system clock in microseconds and the awake clock in
   // milliseconds.
   std::function<uint64_t()> unixMicros;
   std::function<double()> monotonicMilliseconds;

@@ -1,4 +1,5 @@
 #include "engine/KvPool.hpp"
+#include "AwakeClock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,10 +12,8 @@
 namespace splash::engine {
 namespace {
 
-double millisecondsSince(std::chrono::steady_clock::time_point start) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now() - start)
-      .count();
+double millisecondsSince(AwakeClock::time_point start) {
+  return std::chrono::duration<double, std::milli>(AwakeClock::now() - start).count();
 }
 
 } // namespace
@@ -153,7 +152,7 @@ uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit) {
 }
 
 metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = AwakeClock::now();
   const metal::AllocationResult allocated = storage_.allocateExtent(extent);
   if (allocated) {
     ++extentAllocations_;
@@ -165,7 +164,7 @@ metal::AllocationResult KvPool::allocateExtent(uint32_t extent) {
 }
 
 void KvPool::releaseExtent(uint32_t extent) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = AwakeClock::now();
   storage_.releaseExtent(extent);
   ++extentReleases_;
   extentReleaseMaxMilliseconds_ =

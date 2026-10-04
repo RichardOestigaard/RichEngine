@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
 #include "model/QwenState.hpp"
@@ -691,7 +692,7 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
 }
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
-  using Clock = std::chrono::steady_clock;
+  using Clock = AwakeClock;
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
@@ -732,7 +733,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
-  using Clock = std::chrono::steady_clock;
+  using Clock = AwakeClock;
   if (!width || width > kLaneCount) {
     throw std::invalid_argument("invalid decode warmup width");
   }

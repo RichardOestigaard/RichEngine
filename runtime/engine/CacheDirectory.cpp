@@ -1,4 +1,5 @@
 #include "engine/CacheDirectory.hpp"
+#include "AwakeClock.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -131,9 +132,9 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
   static_cast<void>(openDirectory(root, "open cache root"));
   const std::filesystem::path path = root / cacheNamespace;
   // A restarting server's new engine can race the end of the old one.
-  const auto deadline = std::chrono::steady_clock::now() + lockWait;
+  const auto deadline = AwakeClock::now() + lockWait;
   const auto expired = [&] {
-    return std::chrono::steady_clock::now() >= deadline || (cancelled && cancelled());
+    return AwakeClock::now() >= deadline || (cancelled && cancelled());
   };
   std::unique_ptr<CacheDirectory> result;
   for (;;) {
@@ -150,8 +151,8 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
         fail("lock cache directory");
       if (expired())
         return nullptr;
-      std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
-          std::chrono::milliseconds(200), deadline - std::chrono::steady_clock::now()));
+      std::this_thread::sleep_for(std::min<AwakeClock::duration>(
+          std::chrono::milliseconds(200), deadline - AwakeClock::now()));
     }
     // Stale cleanup may have removed the lock while this process waited for
     // it; the namespace belongs to whoever holds the lock its path names now.

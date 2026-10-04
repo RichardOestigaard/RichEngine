@@ -142,7 +142,7 @@ private:
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;
 
-  // The system clock in microseconds and the steady clock in milliseconds,
+  // The system clock in microseconds and the awake clock in milliseconds,
   // or the test seam's (TestConfig).
   struct Clocks {
     std::function<uint64_t()> unixMicros;

@@ -1,3 +1,4 @@
+#include "AwakeClock.hpp"
 #include "StderrLine.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -369,7 +370,7 @@ int runNative(const NativeArguments &arguments) {
     } catch (const engine::RuntimeBootstrapError &error) {
       if (transport.shutdownRequested())
         return static_cast<int>(engine::NativeProcessExit::CleanEof);
-      const auto now = std::chrono::steady_clock::now();
+      const auto now = AwakeClock::now();
       const auto recoveryDeadline = recovery.retryUntil(error.report(), now);
       if (!recoveryDeadline)
         throw;
@@ -379,10 +380,8 @@ int runNative(const NativeArguments &arguments) {
             "the macOS reserve remains protected...");
         reportedRecoveryWait = true;
       }
-      const auto resumeAt = std::min(
-          now + std::chrono::steady_clock::duration(kStartupMemoryRecoveryPoll),
-          *recoveryDeadline);
-      while (std::chrono::steady_clock::now() < resumeAt &&
+      const auto resumeAt = std::min(now + kStartupMemoryRecoveryPoll, *recoveryDeadline);
+      while (AwakeClock::now() < resumeAt &&
              !transport.shutdownRequested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }

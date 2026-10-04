@@ -1,4 +1,5 @@
 #include "engine/NativeRuntime.hpp"
+#include "AwakeClock.hpp"
 #include "StderrLine.hpp"
 #include "TestConfig.hpp"
 #include "metal/MetalBackend.hpp"
@@ -494,7 +495,7 @@ NativeRuntime::Clocks NativeRuntime::clocks() {
   }
   if (!result.monotonicMilliseconds) {
     result.monotonicMilliseconds = [] {
-      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      auto now = AwakeClock::now().time_since_epoch();
       return std::chrono::duration<double, std::milli>(now).count();
     };
   }
