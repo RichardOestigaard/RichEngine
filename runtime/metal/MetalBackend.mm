@@ -1838,11 +1838,14 @@ CommandTiming CommandTicket::wait() {
     return timing;
 }
 
-MetalBackend::MetalBackend(std::string metallibPath)
+MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSeconds)
     : impl_(std::make_unique<Impl>()) {
     @autoreleasepool {
         if (metallibPath.empty()) {
             throw MetalBackendError("metallib path must not be empty");
+        }
+        if (!(residencyKeepAliveSeconds > 0.0)) {
+            throw MetalBackendError("residency keep-alive must be positive");
         }
         // Check the OS floor before loading Metal resources so an unsupported
         // system reports the version requirement first.
@@ -1891,9 +1894,7 @@ MetalBackend::MetalBackend(std::string metallibPath)
         // driver program is compiled when a keep-alive lapses.
         impl_->residency = std::make_shared<Residency>(
             impl_->device, impl_->queue,
-            impl_->newPipeline(Residency::kKickPipeline),
-            testConfig().residencyKeepAliveSeconds.value_or(
-                kResidencyKeepAliveSeconds));
+            impl_->newPipeline(Residency::kKickPipeline), residencyKeepAliveSeconds);
 
 #if SPLASH_MTL4_AVAILABLE
         // Opt-in Metal 4 submission: queue, reused allocator and argument

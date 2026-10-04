@@ -20,10 +20,13 @@ struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
   // The model's weights: released once the engine has held no request for
-  // the residency keep-alive (metal::kResidencyKeepAliveSeconds), and written
-  // back, an image per tick, before the engine runs the next request. Null
-  // where they stay, as in tests of other behavior.
+  // idleReleaseSeconds, and written back, an image per tick, before the
+  // engine runs the next request. Null where they stay, as in tests of other
+  // behavior.
   model::WeightMemory *weights = nullptr;
+  // Positive; infinite never releases them. Bootstrap binds it to
+  // RuntimeResourcesConfig::idleReleaseSeconds.
+  double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
@@ -60,8 +63,8 @@ public:
   // At a clean stop (Engine::flushRestorePoints). False until no restore
   // point is left, and once the engine has failed.
   bool flushRestorePoints();
-  // Releases the weights once the engine has held no request for the
-  // residency keep-alive. Runs between commands, in the control pass.
+  // Releases the weights once the engine has held no request for the idle
+  // release since it became ready. Runs between commands, in the control pass.
   void releaseIdleWeights();
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
@@ -90,6 +93,10 @@ public:
   [[nodiscard]] std::optional<double> millisecondsUntilNextWakeup() const;
   [[nodiscard]] engine::EngineSnapshot snapshot() const {
     return core_.snapshot();
+  }
+  [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
+    return {config_.idleReleaseSeconds, config_.weights && config_.weights->released(),
+            weightRestores_};
   }
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
@@ -168,13 +175,13 @@ private:
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
   uint64_t nextMaskRequestId_ = 1;
-  // metal::kResidencyKeepAliveSeconds, or the test seam's (TestConfig), and
-  // when the engine last held a request: when one ended, or when weights were
-  // restored for one.
-  double weightKeepAliveMilliseconds_;
-  double lastRequestMilliseconds_;
+  // When the engine's idle period began: at Ready, when a request ended, or
+  // when the weights were restored for one.
+  double idleSinceMilliseconds_;
   // When the weights began to be written back for a request, until they are.
   std::optional<double> restoreStarted_;
+  // The times the weights were written back, each for a request.
+  uint64_t weightRestores_ = 0;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

@@ -522,6 +522,7 @@ def main_args(**overrides):
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
+            "idle_release": None,
             "max_cache_disk": 0,
             "persistent_cache": False,
             "cache_dir": None,
@@ -3559,6 +3560,14 @@ class ServerTest(unittest.TestCase):
             api._native_command(disk_bf16_args)[-3:],
             [str(5 * 1024**3), "--kv-format", "bf16"],
         )
+        # The engine keeps its own default unless told one.
+        self.assertIsNone(args.idle_release)
+        self.assertNotIn("--idle-release", api._native_command(args))
+        for value, text in (("30m", "1800.0"), ("off", "off")):
+            release_args = api.parse_args([*required, "--idle-release", value])
+            self.assertEqual(
+                api._native_command(release_args)[-2:], ["--idle-release", text]
+            )
         self.assertIsNone(args.decode_share)
         self.assertNotIn("--decode-share", api._native_command(args))
         share_args = api.parse_args(

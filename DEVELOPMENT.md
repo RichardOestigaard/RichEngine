@@ -137,6 +137,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--host` | `127.0.0.1` | HTTP bind address. |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
 | `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
+| `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights: seconds, or with an `s`, `m` or `h` suffix, e.g. `30m`; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
@@ -515,11 +516,12 @@ the KV runway and any disk tier state staging, exceed the hard budget, so a
 model that can never fit is not loaded.
 Every buffer the backend allocates belongs to one residency set attached to its
 command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state cells
-and draft rings, and scratch alike stay wired between requests until 10 minutes
-pass without a command, and the next command wires them again. When 10 minutes
-pass without a request, the memory control between commands also releases the
-images' memory (`WeightImages::release`): their buffers are freed, the weights'
-views stay the same handles, and a command that binds released memory fails
+and draft rings, and scratch alike stay wired between requests until the idle
+release (`--idle-release`, 10 minutes by default) passes without a command, and
+the next command wires them again. When it passes without a request, the memory
+control between commands also releases the images' memory
+(`WeightImages::release`): their buffers are freed, the weights' views stay the
+same handles, and a command that binds released memory fails
 (`MetalBackend::releaseMemory`). The next request waits while the same writers
 write the images again (`WeightImages::restore`), an image per tick so that the
 loop keeps answering status and cancellations; this takes about as long as the
@@ -527,8 +529,11 @@ load at startup and logs `Weights restored in N s`. A restore is not admitted
 again: the memory plan counted the images at startup, and nothing else
 allocates while the engine holds no request. A restore that fails (an
 allocation the driver refuses, a read error, a source written in place) stops
-the engine, which the server starts again. Memory returns to macOS when the
-engine releases it, never because macOS compressed or dropped an idle buffer.
+the engine, which the server starts again. `--idle-release off` keeps both
+while the engine runs: every buffer stays wired and the images allocated, and
+KV extents return only through the reclaims below, memory pressure among them.
+Memory returns to macOS when the engine releases it, never because macOS
+compressed or dropped an idle buffer.
 macOS page cache, driver allocations and other applications still affect
 memory pressure and swap.
 
@@ -780,9 +785,9 @@ help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
 
 Tests substitute the values the native runtime holds constant (the Metal
-command timeout and residency keep-alive, the KV tier's transfers, the input
-queue's bound, the latency window, the prefill checkpoint interval and the
-resource wait) and its clocks and live host-memory estimate through
+command timeout, the KV tier's transfers, the input queue's bound, the latency
+window, the prefill checkpoint interval and the resource wait) and its clocks
+and live host-memory estimate through
 `runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
 production parameter; `make architecture-check` keeps production from writing
 that configuration, and from measuring durations on the standard library's
@@ -949,6 +954,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | --- | --- |
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
+| `weights.idle_release_seconds`, `released`, `restores` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, and the times it was restored for a request since engine start |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
 | `metrics.decode_cycle_ms` | Total engine time of the decode commands, each from the previous command's completion (or its plan after idleness) to its own: the GPU command plus the host work between commands |

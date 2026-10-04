@@ -234,17 +234,13 @@ struct PoolShape {
   uint32_t runwayPages = pages;
 };
 
-// How long the loop keeps weights without a request (NativeLoopConfig).
-constexpr double kWeightKeepAliveSeconds = 2.0;
-
 // A native loop over the fake model, collecting the bytes it writes. Its
 // clocks come from the test seam: the unix clock stands still and the awake
 // clock reads `monotonic`, advanced by `clockStep` on every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
                        protocol::ProtocolLimits limits = {})
-      : seam({.residencyKeepAliveSeconds = kWeightKeepAliveSeconds,
-              .unixMicros = [] { return uint64_t{1'000'000}; },
+      : seam({.unixMicros = [] { return uint64_t{1'000'000}; },
               .monotonicMilliseconds = [this] { return monotonic += clockStep; }}),
         storage(shape.pages, 4096, shape.extentPages),
         pool(storage, shape.runwayPages), cache(pool, nullptr, nullptr),
@@ -1420,17 +1416,19 @@ bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
 }
 
 // The control pass between commands releases the weights once the engine has
-// held no request for the keep-alive, counted from the end of the last one
-// however long it ran, never while one is there. A request waits while they
-// are written back, an image per tick, so the loop answers frames between
-// them, and the images all come back even when it is cancelled. A restore
-// that fails stops the engine.
+// held no request for the idle release, counted from Ready or from the end of
+// the last request however long it ran, never while one is there. A request
+// waits while they are written back, an image per tick, so the loop answers
+// frames between them, and the images all come back even when it is
+// cancelled. A restore that fails stops the engine.
 void testIdleWeightsAreReleasedAndRestored() {
-  constexpr double keepAlive = 1000.0 * kWeightKeepAliveSeconds;
+  constexpr double kIdleReleaseSeconds = 2.0;
+  constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
   Weights weights;
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &weights;
+  config.idleReleaseSeconds = kIdleReleaseSeconds;
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   fixture.executor.onBegin = [&] {
@@ -1446,9 +1444,14 @@ void testIdleWeightsAreReleasedAndRestored() {
     static_cast<void>(control.run(MemoryPressure::Normal));
     return weights.released();
   };
+  // Warmup before Ready is not idleness.
+  fixture.monotonic += 10 * idleRelease;
   loop.announceReady();
-  require(!idlePass(keepAlive - 1), "weights were released before the keep-alive passed");
-  require(idlePass(1), "idle weights were kept past the keep-alive");
+  require(!idlePass(idleRelease - 1), "weights were released before the idle release passed");
+  require(idlePass(1), "idle weights were kept past the idle release");
+  require(loop.weightsSnapshot().released && loop.weightsSnapshot().restores == 0 &&
+              loop.weightsSnapshot().idleReleaseSeconds == kIdleReleaseSeconds,
+          "the weights' snapshot did not report their release");
 
   require(loop.receive(protocol::peer::serialize(request(1))) && weights.restores == 0,
           "weights were written back before a tick");
@@ -1460,16 +1463,18 @@ void testIdleWeightsAreReleasedAndRestored() {
   while (weights.released())
     require(loop.tick(), "a tick did not write back an image");
   require(weights.restores == Weights::kImages, "an image was written back twice");
-  require(!idlePass(2 * keepAlive), "weights were released under a request");
+  require(!loop.weightsSnapshot().released && loop.weightsSnapshot().restores == 1,
+          "the weights' snapshot did not count one restore");
+  require(!idlePass(2 * idleRelease), "weights were released under a request");
   runUntilIdle(loop);
 
   require(loop.receive(protocol::peer::serialize(request(2))), "a second request failed");
-  // It runs past the keep-alive, without a control pass between commands.
-  fixture.clockStep = keepAlive;
+  // It runs past the idle release, without a control pass between commands.
+  fixture.clockStep = idleRelease;
   runUntilIdle(loop);
   fixture.clockStep = 0;
   require(!idlePass(0), "weights were released as soon as a long request ended");
-  require(idlePass(keepAlive), "weights were kept past the keep-alive after a request");
+  require(idlePass(idleRelease), "weights were kept past the idle release after a request");
 
   require(loop.receive(protocol::peer::serialize(request(3))) && loop.tick() &&
               loop.receive(protocol::peer::serialize(protocol::CancelFrame{3})),
@@ -1481,7 +1486,7 @@ void testIdleWeightsAreReleasedAndRestored() {
   // lets the cancelled request go.
   static_cast<void>(loop.tick());
 
-  require(idlePass(keepAlive), "weights were kept past the keep-alive after a cancel");
+  require(idlePass(idleRelease), "weights were kept past the idle release after a cancel");
   weights.failRestore = true;
   require(loop.receive(protocol::peer::serialize(request(4))) && !loop.tick(),
           "a failed restore kept the engine running");
@@ -1495,6 +1500,32 @@ void testIdleWeightsAreReleasedAndRestored() {
                       }) &&
               !loop.engineHealthy() && loop.connectionMustClose(),
           "a failed restore did not stop the engine");
+}
+
+// With --idle-release off the control pass never releases the weights,
+// however long the engine holds no request.
+void testIdleReleaseOffKeepsTheWeights() {
+  Weights weights;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &weights;
+  config.idleReleaseSeconds = std::numeric_limits<double>::infinity();
+  LoopFixture fixture(config);
+  fixture.loop.announceReady();
+  fixture.monotonic += 1e12;
+  fixture.loop.releaseIdleWeights();
+  require(!weights.released(), "weights were released with the idle release off");
+  // An idle release that is not positive is refused.
+  for (double seconds : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    config.idleReleaseSeconds = seconds;
+    bool refused = false;
+    try {
+      LoopFixture refusedFixture(config);
+    } catch (const std::invalid_argument &) {
+      refused = true;
+    }
+    require(refused, "an idle release that is not positive was accepted");
+  }
 }
 
 // The loop reports that it holds requests from the first it takes to the end
@@ -1589,6 +1620,7 @@ int main() {
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
     testIdleWeightsAreReleasedAndRestored();
+    testIdleReleaseOffKeepsTheWeights();
     testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native KV-first loop tests passed\n";

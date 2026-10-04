@@ -94,6 +94,12 @@ struct RuntimeResourcesConfig {
   // to it when the model loaded vision and none otherwise. The wire parser
   // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // How long the engine keeps its memory without work (--idle-release): every
+  // buffer stays wired that long after the last command (the backend's
+  // residency keep-alive), and the weights' memory is freed once that long
+  // passes without a request (NativeRuntime::releaseIdleWeights). Infinite
+  // keeps both while the engine runs.
+  double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.

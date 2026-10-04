@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import subprocess
 import sys
@@ -62,6 +63,11 @@ OPTIONS = {
             "1073741824": 1024**3,
         },
         ("0", "-1G", "bad", "G", str(2**64)),
+    ),
+    "--idle-release": values(
+        "--idle-release",
+        {"600": 600.0, "90s": 90.0, "30M": 1800.0, "1.5h": 5400.0, "off": math.inf},
+        ("0", "-1m", "inf", "nan", "10x", "m", "never"),
     ),
     "--max-cache-disk": values(
         "--max-cache-disk",

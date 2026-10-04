@@ -211,12 +211,12 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
-// How long a command may run before the backend gives up on it, and how long
-// every buffer stays wired after the last command (see allocateBuffer), as the
-// engine keeps a model's weights after the last request
-// (NativeRuntime::releaseIdleWeights), both in time the Mac is awake
-// (AwakeClock). Tests substitute shorter ones through TestConfig.
+// How long a command may run before the backend gives up on it, in time the
+// Mac is awake (AwakeClock). Tests substitute a shorter one through TestConfig.
 inline constexpr double kCommandTimeoutSeconds = 120.0;
+// How long every buffer stays wired after the last command by default (see
+// allocateBuffer), also the default of the engine's idle release
+// (RuntimeResourcesConfig::idleReleaseSeconds).
 inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 
@@ -226,7 +226,10 @@ static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
 // called from any thread.
 class MetalBackend final {
 public:
-  explicit MetalBackend(std::string metallibPath);
+  // Buffers stay wired for residencyKeepAliveSeconds after the last command;
+  // an infinite keep-alive holds them while the backend lives.
+  explicit MetalBackend(std::string metallibPath,
+                        double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);

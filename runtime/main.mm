@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <limits.h>
 #include <memory>
 #include <stdexcept>
@@ -61,6 +62,8 @@ struct NativeArguments final {
   kv::Format kvFormat = kv::Format::Int4;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // --idle-release SECONDS|off, infinite for off.
+  double idleReleaseSeconds = engine::RuntimeResourcesConfig{}.idleReleaseSeconds;
   // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
   // automatically while it holds a request.
   bool preventIdleSleep = true;
@@ -179,7 +182,7 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
-      " [--idle-sleep prevent|allow]");
+      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow]");
 }
 
 template <typename T>
@@ -220,12 +223,24 @@ uint32_t parseMaxImagePatches(std::string_view value) {
   return result;
 }
 
-double parseDecodeShare(std::string_view value) {
-  double result = 0.0;
+bool parseFinite(std::string_view value, double &result) {
   const char *end = value.data() + value.size();
   auto parsed = std::from_chars(value.data(), end, result);
-  if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result) ||
-      result < 0.0)
+  return parsed.ec == std::errc{} && parsed.ptr == end && std::isfinite(result);
+}
+
+double parseIdleRelease(std::string_view value) {
+  if (value == "off")
+    return std::numeric_limits<double>::infinity();
+  double result = 0.0;
+  if (!parseFinite(value, result) || result <= 0.0)
+    throw UsageError("--idle-release requires off or a positive number of seconds");
+  return result;
+}
+
+double parseDecodeShare(std::string_view value) {
+  double result = 0.0;
+  if (!parseFinite(value, result) || result < 0.0)
     throw UsageError("--decode-share requires a nonnegative number");
   return result;
 }
@@ -275,6 +290,8 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value.empty())
         throw UsageError("--cache-dir requires a directory");
       result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
+    } else if (option == "--idle-release") {
+      result.idleReleaseSeconds = parseIdleRelease(value);
     } else if (option == "--idle-sleep") {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
@@ -323,6 +340,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
+  config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

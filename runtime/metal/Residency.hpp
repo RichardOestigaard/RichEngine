@@ -16,13 +16,14 @@ namespace splash::metal {
 // Holds every buffer of a backend in one residency set, wired between the
 // commands of its command queue. Metal wires them while a command runs and
 // lets them go a few seconds later, and one request holds them only about two
-// seconds, so a heartbeat requests residency every 500 ms. After keepAlive without a command
-// it ends residency, which Metal applies at its next GPU operation on any
-// queue: one dispatch of the kick kernel, whose pipeline the backend builds
-// with its library, on a queue of its own, as the runtime keeps exactly one
-// command in flight on the command queue. Destruction ends residency without
-// GPU work: a backend being torn down must not start any. The set is used
-// only on the heartbeat's serial queue.
+// seconds, so a heartbeat requests residency every 500 ms. After keepAlive
+// without a command, never when it is infinite, it ends residency, which Metal
+// applies at its next GPU operation on any queue: one dispatch of the kick
+// kernel, whose pipeline the backend builds with its library, on a queue of
+// its own, as the runtime keeps exactly one command in flight on the command
+// queue. Destruction ends residency without GPU work: a backend being torn
+// down must not start any. The set is used only on the heartbeat's serial
+// queue.
 class Residency final {
 public:
   // A one-thread kernel that writes one word of its buffer 0

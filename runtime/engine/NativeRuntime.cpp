@@ -25,11 +25,8 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
       statusProvider_(std::move(statusProvider)), clocks_(clocks()),
       limits_(limits), parser_(limits_),
       core_(config_.engine, cache, model, *this),
-      weightKeepAliveMilliseconds_(
-          1000.0 * testConfig().residencyKeepAliveSeconds.value_or(
-                       metal::kResidencyKeepAliveSeconds)),
-      lastRequestMilliseconds_(clocks_.monotonicMilliseconds()) {
-  if (!output_ || !statusProvider_) {
+      idleSinceMilliseconds_(clocks_.monotonicMilliseconds()) {
+  if (!output_ || !statusProvider_ || !(config_.idleReleaseSeconds > 0.0)) {
     throw std::invalid_argument("invalid native engine loop config");
   }
   if (auto issue = protocol::validateLimits(limits_))
@@ -126,12 +123,12 @@ bool NativeRuntime::flushRestorePoints() {
 
 void NativeRuntime::releaseIdleWeights() {
   if (!config_.weights || config_.weights->released() || !core_.idle() ||
-      clocks_.monotonicMilliseconds() - lastRequestMilliseconds_ <
-          weightKeepAliveMilliseconds_)
+      clocks_.monotonicMilliseconds() - idleSinceMilliseconds_ <
+          1000.0 * config_.idleReleaseSeconds)
     return;
   config_.weights->release();
   std::ostringstream message;
-  message << "Weights released after " << weightKeepAliveMilliseconds_ / 1000.0
+  message << "Weights released after " << config_.idleReleaseSeconds
           << " s without a request; the next request restores them";
   writeStderrLine(message.str());
 }
@@ -139,10 +136,12 @@ void NativeRuntime::releaseIdleWeights() {
 void NativeRuntime::restoreWeights() {
   if (!config_.weights->restore())
     return;
-  lastRequestMilliseconds_ = clocks_.monotonicMilliseconds();
+  ++weightRestores_;
+  const double now = clocks_.monotonicMilliseconds();
+  idleSinceMilliseconds_ = now;
   std::ostringstream message;
   message << "Weights restored in " << std::fixed << std::setprecision(2)
-          << (lastRequestMilliseconds_ - *restoreStarted_) / 1000.0 << " s";
+          << (now - *restoreStarted_) / 1000.0 << " s";
   restoreStarted_.reset();
   writeStderrLine(message.str());
 }
@@ -173,6 +172,8 @@ void NativeRuntime::announceReady() {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;
+  // The idle release counts from here: warmup is not idleness.
+  idleSinceMilliseconds_ = clocks_.monotonicMilliseconds();
 }
 
 std::optional<double> NativeRuntime::millisecondsUntilNextWakeup() const {
@@ -485,7 +486,7 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
 void NativeRuntime::ended(uint64_t requestId, double now) {
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
-  lastRequestMilliseconds_ = now;
+  idleSinceMilliseconds_ = now;
   if (telemetry_.empty() && config_.holdingRequests)
     config_.holdingRequests(false);
 }
