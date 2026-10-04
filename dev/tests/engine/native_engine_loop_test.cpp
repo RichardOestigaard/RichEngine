@@ -1497,6 +1497,43 @@ void testIdleWeightsAreReleasedAndRestored() {
           "a failed restore did not stop the engine");
 }
 
+// The loop reports that it holds requests from the first it takes to the end
+// of its last, the span the process keeps the Mac from idle sleep for.
+void testHoldingRequestsSpansFirstToLastRequest() {
+  std::vector<bool> reported;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.holdingRequests = [&](bool held) { reported.push_back(held); };
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  require(reported.empty(), "a loop without requests reported holding one");
+  require(loop.receive(protocol::peer::serialize(request(1))) &&
+              loop.receive(protocol::peer::serialize(request(2))),
+          "two requests failed");
+  require(reported == std::vector<bool>{true}, "two requests did not share one span");
+  runUntilIdle(loop);
+  require(reported == std::vector<bool>{true, false},
+          "the span did not end with the last request");
+  // A cancelled request completes; a request whose deadline passes fails.
+  require(loop.receive(protocol::peer::serialize(request(3))) && loop.tick() &&
+              loop.receive(protocol::peer::serialize(protocol::CancelFrame{3})),
+          "a cancelled request failed");
+  runUntilIdle(loop);
+  require(reported == std::vector<bool>{true, false, true, false},
+          "a cancelled request did not end its span");
+  require(loop.receive(protocol::peer::serialize(request(4, 64))), "request 4 failed");
+  fixture.monotonic += 5000.0;
+  runUntilIdle(loop);
+  require(reported == std::vector<bool>{true, false, true, false, true, false},
+          "a request that failed did not end its span");
+  // One refused on arrival is never held.
+  protocol::RequestFrame expired = request(5);
+  expired.absoluteDeadlineUnixMicros = 1'000'000;
+  require(loop.receive(protocol::peer::serialize(expired)) && reported.size() == 6,
+          "a request refused on arrival was held");
+}
+
 // The reporter logs a change in what requests wait for, never a retry or the
 // depth of a queue.
 void testMemoryStatusReporterLogsTransitionsOnly() {
@@ -1552,6 +1589,7 @@ int main() {
     testConstrainedMaskExchange();
     testControlPassReclaimsUnderHostPressure();
     testIdleWeightsAreReleasedAndRestored();
+    testHoldingRequestsSpansFirstToLastRequest();
     testMemoryStatusReporterLogsTransitionsOnly();
     std::cout << "native KV-first loop tests passed\n";
     return EXIT_SUCCESS;

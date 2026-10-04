@@ -6,8 +6,10 @@
 #include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
 
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
+#include <mach/mach_error.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits.h>
 #include <memory>
@@ -58,6 +61,9 @@ struct NativeArguments final {
   kv::Format kvFormat = kv::Format::Int4;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
+  // automatically while it holds a request.
+  bool preventIdleSleep = true;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -124,13 +130,56 @@ private:
   dispatch_source_t timer_;
 };
 
+// Keeps the Mac from sleeping automatically while held, as `caffeinate -i`
+// does: the display may still sleep, and the lid, the Sleep command or a low
+// battery still sleep the Mac; requests continue when it wakes. Without the
+// assertion the engine serves on and says so once.
+class IdleSleepAssertion final {
+public:
+  IdleSleepAssertion() = default;
+  ~IdleSleepAssertion() { hold(false); }
+  IdleSleepAssertion(const IdleSleepAssertion &) = delete;
+  IdleSleepAssertion &operator=(const IdleSleepAssertion &) = delete;
+
+  void hold(bool held) noexcept {
+    if (held == (assertion_ != kIOPMNullAssertionID))
+      return;
+    if (!held) {
+      IOPMAssertionRelease(assertion_);
+      assertion_ = kIOPMNullAssertionID;
+      return;
+    }
+    const IOReturn result = IOPMAssertionCreateWithName(
+        kIOPMAssertPreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+        CFSTR("Splash is serving a request"), &assertion_);
+    if (result == kIOReturnSuccess)
+      return;
+    assertion_ = kIOPMNullAssertionID;
+    if (reported_)
+      return;
+    reported_ = true;
+    // Formatted without allocating: hold() must not throw.
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "Splash cannot keep the Mac awake while requests run (%s); "
+                  "it may sleep during one.",
+                  mach_error_string(result));
+    writeStderrLine(line);
+  }
+
+private:
+  IOPMAssertionID assertion_ = kIOPMNullAssertionID;
+  bool reported_ = false;
+};
+
 void printUsage(std::string_view executable) {
   writeStderrLine(
       "usage: " + std::string(executable) +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
-      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]");
+      " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
+      " [--idle-sleep prevent|allow]");
 }
 
 template <typename T>
@@ -226,6 +275,10 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value.empty())
         throw UsageError("--cache-dir requires a directory");
       result.persistentCacheRoot = std::filesystem::absolute(std::filesystem::path(value));
+    } else if (option == "--idle-sleep") {
+      if (value != "prevent" && value != "allow")
+        throw UsageError("--idle-sleep requires prevent or allow");
+      result.preventIdleSleep = value == "prevent";
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -346,6 +399,7 @@ int runNative(const NativeArguments &arguments) {
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
+  IdleSleepAssertion idleSleep;
   engine::RuntimeMetrics metrics;
   engine::RuntimeBootstrap *published = nullptr;
   auto statusProvider = [&] {
@@ -364,6 +418,8 @@ int runNative(const NativeArguments &arguments) {
     config.resources.memoryPressure = [&] { return pressureMonitor.pressure(); };
     config.resources.cancelled = [&] { return transport.shutdownRequested(); };
     config.nativeLoop.metrics = &metrics;
+    if (arguments.preventIdleSleep)
+      config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
     try {
       bootstrap = engine::RuntimeBootstrap::start(
           std::move(config), transport.outputSink(), statusProvider);

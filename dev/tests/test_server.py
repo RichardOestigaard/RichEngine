@@ -533,6 +533,7 @@ def main_args(**overrides):
             "allowed_host": [],
             "allowed_origin": [],
             "api_key": None,
+            "allow_idle_sleep": False,
             "no_webui": False,
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
@@ -3575,6 +3576,11 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(
                 api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
             )
+        self.assertNotIn("--idle-sleep", api._native_command(args))
+        sleep_args = api.parse_args([*required, "--allow-idle-sleep"])
+        self.assertEqual(
+            api._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
+        )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")

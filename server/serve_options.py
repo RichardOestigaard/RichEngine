@@ -381,6 +381,15 @@ SERVE_OPTIONS = (
         secret=True,
     ),
     ServeOption(
+        "--allow-idle-sleep",
+        dict(
+            action="store_true",
+            default=False,
+            help="let the Mac sleep automatically while requests run (default: it "
+            "stays awake until they finish; the display may still sleep)",
+        ),
+    ),
+    ServeOption(
         "--no-webui",
         dict(action="store_true", default=False, help="disable the chat page"),
     ),

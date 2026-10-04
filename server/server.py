@@ -1916,6 +1916,8 @@ def _native_command(args):
         command.extend(
             ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
         )
+    if args.allow_idle_sleep:
+        command.extend(("--idle-sleep", "allow"))
     return command
 
 

@@ -134,6 +134,7 @@ OPTIONS = {
         {"secret-key": "secret-key"},
         ("", "two words", "key\n", "非ASCII"),
     ),
+    "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
 }
 
