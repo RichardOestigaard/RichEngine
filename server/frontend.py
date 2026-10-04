@@ -957,12 +957,18 @@ class Frontend:
             raise APIError(
                 400, "stop cannot be combined with tools or structured output"
             )
-        # Tools and structured output generate under a grammar, which decides
-        # where the output ends.
-        constrained = bool(tools) or response_schema is not None
+        # Constrained tool calls and structured output generate under a
+        # grammar, which decides where the output ends; tools beside a
+        # response schema share one.
+        tool_constrained = tool_policy is not None and (
+            tool_policy.constrained or response_schema is not None
+        )
+        constrained = tool_constrained or response_schema is not None
         if options.ignore_eos and constrained:
             raise APIError(
-                400, "ignore_eos cannot be combined with tools or structured output"
+                400,
+                "ignore_eos cannot be combined with constrained tool calls, "
+                "tool_choice none or structured output",
             )
         rendered = self._render_prompt(prompt, deadline)
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
@@ -971,7 +977,7 @@ class Frontend:
         remaining_request_time(deadline)
         if constrained:
             with self.latencies.measure("grammar"):
-                if tools:
+                if tool_constrained:
                     constraint = self.constraint_factory.create(
                         tool_grammar(
                             tool_policy,
@@ -982,7 +988,7 @@ class Frontend:
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
-                elif response_schema is not None:
+                else:
                     constraint = self.constraint_factory.create(
                         json_grammar(
                             response_schema, thinking, think_end_id=self.think_end_id
@@ -1033,9 +1039,9 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each callable tool's call. Its parameter
-        names are all possible next, so a tool with more of them than the
-        parser admits fails there."""
+        """The tokens that begin each strict tool's call. Its parameter names
+        may come next, so a tool with more of them than the parser admits
+        fails there."""
         reasoning = [self.think_end_id] if thinking else []
         return [
             (
@@ -1046,6 +1052,7 @@ class Frontend:
                 f"tool {name} has too many parameters to constrain",
             )
             for name in policy.schemas
+            if name in policy.strict
         ]
 
     def _generation_options(self, body):

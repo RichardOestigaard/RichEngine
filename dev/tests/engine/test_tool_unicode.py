@@ -3,7 +3,6 @@ import unittest
 
 from dev.tests.tool_output import project, streamed_arguments
 from server import output, tool_schema
-from server.errors import APIError
 
 
 def policy(schema):
@@ -33,50 +32,42 @@ def tool_xml(value, name="value"):
 
 
 class ToolUnicodeTests(unittest.TestCase):
-    def test_all_surrogates_rejected_in_decoded_values_and_keys(self):
-        tool_policy = policy({})
-        for codepoint in range(0xD800, 0xE000):
-            char = chr(codepoint)
-            for value in (char, {"nested": [char]}, {char: "value"}):
-                with self.subTest(codepoint=codepoint, kind=type(value).__name__):
-                    text = tool_xml(json.dumps(value))
-                    with self.assertRaisesRegex(APIError, "invalid Unicode") as error:
-                        project(text, tool_policy)
-                    self.assertEqual(error.exception.status, 500)
-                    self.assertEqual(error.exception.code, "invalid_model_output")
-
-    def test_invalid_tools_fail_before_emitting_bad_arguments_at_every_split(self):
-        cases = (
-            ({}, r'"\ud800"'),
-            ({}, r'"\udfff"'),
-            ({}, r'"\udfff\ud800"'),
-            ({}, r'{"nested":[{"\ud800":"x"}]}'),
-            ({"type": "string"}, "valid prefix\ud800suffix"),
-        )
-        for schema, raw in cases:
-            tool_policy = policy(schema)
-            text = tool_xml(raw)
-            for split in range(len(text) + 1):
-                with self.subTest(schema=schema, raw=ascii(raw), split=split):
-                    projector = output.StreamingToolCallProjector(tool_policy, "test")
-                    events = []
-                    with self.assertRaisesRegex(APIError, "invalid Unicode") as error:
-                        events.extend(projector.put(text[:split]))
-                        events.extend(projector.put(text[split:]))
-                    self.assertEqual(error.exception.code, "invalid_model_output")
-                    emitted = "".join(
-                        value.get("function", {}).get("arguments", "")
-                        for kind, value in events
-                        if kind == "tool"
-                    )
-                    self.assertNotIn(r"\ud800", emitted)
-                    self.assertNotIn(r"\udfff", emitted)
-                    self.assertEqual(projector.closed_calls, [])
+    def test_json_that_decodes_to_lone_surrogates_keeps_its_text(self):
+        # Arguments are written back as JSON that the next turn reads; a value
+        # that would decode to a lone surrogate keeps its text instead, which
+        # writes back as valid JSON.
+        for schema in ({"type": "object"}, {"type": "array"}, {"type": "integer"}):
+            for raw in (
+                r'"\ud800"',
+                r'"\udfff\ud800"',
+                r'{"nested":[{"\ud800":"x"}]}',
+                r'["\udfff"]',
+            ):
+                text = tool_xml(raw)
+                for split in range(0, len(text) + 1, 7):
+                    with self.subTest(schema=schema, raw=raw, split=split):
+                        projector = output.StreamingToolCallProjector(
+                            policy(schema), "test"
+                        )
+                        events = projector.put(text[:split]) + projector.put(
+                            text[split:]
+                        )
+                        _, calls, owed = projector.finish(False)
+                        arguments = calls[0]["function"]["arguments"]
+                        self.assertEqual(json.loads(arguments), {"value": raw})
+                        self.assertEqual(streamed_arguments(events + owed), arguments)
 
     def test_valid_pairs_and_literal_escapes_preserve_streaming(self):
         cases = (
-            ({}, r'"\ud83c\udf0d"', "🌍"),
-            ({}, json.dumps({"🌍": ["中文", r"\ud800"]}), {"🌍": ["中文", r"\ud800"]}),
+            # Any type, a string among them, so a JSON string stays text.
+            ({}, r'"🌍"', r'"🌍"'),
+            # No string type, so the value is the JSON the text spells.
+            ({"type": "integer"}, r'"🌍"', "🌍"),
+            (
+                {"type": "object"},
+                json.dumps({"🌍": ["中文", r"\ud800"]}),
+                {"🌍": ["中文", r"\ud800"]},
+            ),
             ({"type": "string"}, r"\ud800", r"\ud800"),
             ({"type": "string"}, "中文🌍", "中文🌍"),
         )
@@ -90,15 +81,19 @@ class ToolUnicodeTests(unittest.TestCase):
                 with self.subTest(raw=raw, split=split):
                     projector = output.StreamingToolCallProjector(tool_policy, "test")
                     events = projector.put(text[:split]) + projector.put(text[split:])
-                    _, calls, _ = projector.finish(False)
+                    _, calls, owed = projector.finish(False)
                     self.assertEqual(calls[0]["function"]["arguments"], canonical)
-                    self.assertEqual(streamed_arguments(events), canonical)
+                    self.assertEqual(streamed_arguments(events + owed), canonical)
 
-    def test_invalid_parameter_names_and_final_validation(self):
-        tool_policy = policy({})
-        text = tool_xml('"ok"', "bad\ud800")
-        with self.assertRaisesRegex(APIError, "invalid Unicode"):
-            project(text, tool_policy)
-        calls = [{"function": {"name": "echo", "arguments": r'{"value":"\ud800"}'}}]
-        with self.assertRaisesRegex(APIError, "invalid Unicode"):
-            output.validate_tool_calls(calls, tool_policy)
+    def test_parameter_names_lose_surrounding_space(self):
+        # A name reads up to ">", without the space around it (#293).
+        for written, name in (("shift ", "shift"), (" a b\t", "a b"), ("名前", "名前")):
+            with self.subTest(name=written):
+                _, calls, _ = project(tool_xml("x", written), policy({}))
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]), {name: "x"}
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

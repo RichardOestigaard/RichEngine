@@ -3,8 +3,6 @@ import re
 import tracemalloc
 import unittest
 
-from jsonschema import Draft202012Validator
-
 from dev.tests.test_server import (
     FOREVER,
     FakeRuntime,
@@ -16,9 +14,11 @@ from dev.tests.test_server import (
 from dev.tests.tool_output import project, streamed_arguments, streamed_text
 from server import api_shapes
 from server import output as model_output
-from server import server as api
 from server.tool_schema import (
+    MAX_NAME_LENGTH,
     PARAMETER_CLOSE,
+    THINK_END,
+    TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     ToolPolicy,
     normalize_tools,
@@ -52,7 +52,11 @@ PARIS, ROME = weather_call("Paris"), weather_call("Rome")
 
 def weather_policy():
     return ToolPolicy(
-        {"weather": Draft202012Validator(SCHEMA)}, {"weather": SCHEMA}, False, True
+        schemas={"weather": SCHEMA},
+        required=False,
+        parallel=True,
+        strict=frozenset(),
+        constrained=False,
     )
 
 
@@ -208,13 +212,13 @@ def text_runs(projected):
 
 def visible_outside_calls(text):
     """The visible characters of `text` outside complete calls, without an
-    unfinished call or call marker at its end."""
+    unfinished call or a partial tag at its end."""
     parts = re.split(r"<tool_call>.*?</tool_call>", text, flags=re.S)
     unfinished = parts[-1].find(TOOL_CALL_OPEN)
     if unfinished >= 0:
         parts[-1] = parts[-1][:unfinished]
     else:
-        parts[-1] = model_output.hold_partial(parts[-1], TOOL_CALL_OPEN)[0]
+        parts[-1] = model_output.hold_partial(parts[-1], TOOL_CALL_OPEN, THINK_END)[0]
     return re.sub(r"\s", "", "".join(parts))
 
 
@@ -448,6 +452,28 @@ class PartialToolOutputTests(unittest.TestCase):
                     ["why\n", "Hi\n\nyou"],
                 )
 
+    def test_a_call_ends_the_reasoning_where_a_call_may_follow(self):
+        # A call's tag ends the reasoning too, and the call begins the
+        # answer. Where no call may follow, the tag is reasoning text.
+        text = "why<tool_call>\n<function=weather>\n</function>\n</tool_call>"
+        for tool_calls, expected in ((True, ["why", text[3:]]), (False, [text, ""])):
+            for size in range(1, len(text) + 1):
+                with self.subTest(tool_calls=tool_calls, size=size):
+                    splitter = model_output.ReasoningSplitter(True, tool_calls)
+                    parts = [
+                        part
+                        for offset in range(0, len(text), size)
+                        for part in splitter.put(text[offset : offset + size])
+                    ]
+                    parts += splitter.finish()
+                    self.assertEqual(
+                        [
+                            "".join(value for kind, value in parts if kind == field)
+                            for field in ("reasoning_content", "content")
+                        ],
+                        expected,
+                    )
+
     def test_projector_preserves_whitespace_without_a_tool(self):
         for text in (" \n\t", " \nhello \t\n"):
             for incomplete in (False, True):
@@ -614,9 +640,7 @@ class PartialToolOutputTests(unittest.TestCase):
     def test_complete_and_partial_calls_survive_arbitrary_chunk_boundaries(self):
         tokenizer = FakeTokenizer()
         text = tokenizer.fragments[5] + tokenizer.fragments[13]
-        policy = ToolPolicy(
-            {"weather": Draft202012Validator(SCHEMA)}, {"weather": SCHEMA}, False, True
-        )
+        policy = weather_policy()
         expected = None
         for size in (1, 3, 17, len(text)):
             result = project(text, policy, "owned", incomplete=True, size=size)[:2]
@@ -633,7 +657,11 @@ class PartialToolOutputTests(unittest.TestCase):
         # copied by every put, quadratic in its length.
         schema = {"type": "object", "properties": {"items": {"type": "array"}}}
         policy = ToolPolicy(
-            {"store": Draft202012Validator(schema)}, {"store": schema}, False, True
+            schemas={"store": schema},
+            required=False,
+            parallel=True,
+            strict=frozenset(),
+            constrained=False,
         )
         items = ["x" * 100] * 2048
         text = (
@@ -645,24 +673,78 @@ class PartialToolOutputTests(unittest.TestCase):
         projected = []
         for offset in range(0, len(text), 4):
             projected += projector.put(text[offset : offset + 4])
-            if projector.state == "parameter_value":
-                self.assertLess(len(projector.pending), len(PARAMETER_CLOSE))
+            if projector.state == "value":
+                # No longer than the longest end of a value.
+                self.assertLess(
+                    len(projector.pending), len(PARAMETER_CLOSE + TOOL_CALL_CLOSE)
+                )
         self.assertEqual(
             streamed_arguments(projected),
             json.dumps({"items": items}, separators=(",", ":")),
         )
 
-    def test_closed_calls_still_require_schema_validation_at_length(self):
+    def test_text_held_for_a_tag_stays_short(self):
+        # Text that may still complete a tag is held back and read again by
+        # every put. Space in a tag and names are bounded, so degenerate
+        # output holds little and is read in linear time.
+        close = "\n</parameter>\n</function>\n</tool_call>"
+        cases = (
+            # A "<" in a value and then space, which may still end the value.
+            (
+                "<tool_call>\n<function=weather>\n<parameter=city>\nx <",
+                " ",
+                [("weather", {"city": "x <" + " " * 16384})],
+            ),
+            # A parameter's name that does not close.
+            (
+                "<tool_call>\n<function=weather>\n<parameter=c",
+                "y",
+                [("weather", {})],
+            ),
+            # A function's name that does not close.
+            ("<tool_call>\n<function=w", "e", []),
+            # Between parameters, a "<" that no ">" follows.
+            ("<tool_call>\n<function=weather>\n<", "z", [("weather", {})]),
+        )
+        for head, filler, calls in cases:
+            with self.subTest(head=head):
+                projector = model_output.StreamingToolCallProjector(
+                    weather_policy(), "held"
+                )
+                projector.put(head)
+                for _ in range(4096):
+                    projector.put(filler * 4)
+                    self.assertLess(len(projector.pending), 2 * MAX_NAME_LENGTH)
+                projector.put(">\n" + close if filler != " " else close)
+                _, read, _ = projector.finish(False)
+                self.assertEqual(
+                    [
+                        (
+                            call["function"]["name"],
+                            json.loads(call["function"]["arguments"]),
+                        )
+                        for call in read
+                    ],
+                    calls,
+                )
+
+    def test_a_call_keeps_arguments_its_schema_does_not_allow(self):
+        # A call is not checked against its tool's schema.
         schema = {
             **SCHEMA,
             "properties": {"city": {"type": "string", "enum": ["Berlin"]}},
         }
         policy = ToolPolicy(
-            {"weather": Draft202012Validator(schema)}, {"weather": schema}, False, True
+            schemas={"weather": schema},
+            required=False,
+            parallel=True,
+            strict=frozenset(),
+            constrained=False,
         )
         projector = model_output.StreamingToolCallProjector(policy, "owned")
-        with self.assertRaises(api.APIError):
-            projector.put(FakeTokenizer().fragments[5])
+        projector.put(FakeTokenizer().fragments[5])
+        _, calls, _ = projector.finish(False)
+        self.assertEqual(calls[0]["function"]["arguments"], '{"city":"Paris"}')
 
 
 class TextAfterToolCallTests(unittest.TestCase):
@@ -756,12 +838,12 @@ class TextAfterToolCallTests(unittest.TestCase):
             [kind for kind, _ in first], ["content", "tool", "tool", "tool"]
         )
         self.assertEqual(second, [("content", "POST-CALL TEXT THAT SHOULD BE VISIBLE")])
-        content, calls, unsent = projector.finish(True)
+        content, calls, owed = projector.finish(True)
         self.assertEqual(
             content, "First message. POST-CALL TEXT THAT SHOULD BE VISIBLE"
         )
         self.assertEqual(len(calls), 1)
-        self.assertEqual(unsent, "")
+        self.assertEqual(owed, [])
 
     def test_a_cut_reports_the_text_it_streamed_without_markup(self):
         for text in self.OUTPUTS:
@@ -830,24 +912,14 @@ class TextAfterToolCallTests(unittest.TestCase):
                     outputs.append(joined(chat_output(payload, stream)[0]))
             with self.subTest(text=text):
                 self.assertEqual(outputs[0], outputs[1])
-        # The model writes a call without its required argument, then text
-        # after a pause. The projector checks the call as it is read, so the
-        # request fails and cancels the model while it is still writing.
-        parts = "<tool_call>\n<function=weather>\n</function>\n</tool_call>", "Done."
-        tokenizer, token_ids = character_tokenizer("".join(parts))
-        plan = Plan([[token_ids[char] for char in part] for part in parts], delay=1)
-        harness = Harness(FakeRuntime(plan), tokenizer=tokenizer, max_context=8192)
-        try:
-            status, _, payload = harness.request(
-                "POST",
-                "/v1/chat/completions",
-                weather_request("/v1/chat/completions", False, False),
-            )
-            self.assertTrue(plan.cancelled.is_set())
-        finally:
-            harness.close()
-        self.assertEqual(status, 500, payload)
-        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_model_output")
+        # A call without its required argument comes back as the model wrote
+        # it, and so does the text after it.
+        text = "<tool_call>\n<function=weather>\n</function>\n</tool_call>Done."
+        status, payload = respond("/v1/chat/completions", text, False, False)
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["content"], "Done.")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], "{}")
 
     def test_whitespace_around_parallel_calls_in_every_protocol(self):
         # After a preface and parallel calls, the newlines between and after

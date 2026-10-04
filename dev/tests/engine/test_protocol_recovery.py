@@ -412,8 +412,12 @@ class ProtocolRecoveryTests(unittest.TestCase):
             response["output"],
         )
 
-    def test_mixed_string_unions_keep_schema_and_value_types(self):
-        for union, valid, invalid in (
+    def test_mixed_string_unions_are_written_as_text_and_read_by_their_types(
+        self,
+    ):
+        # A value that may be a string is raw text in a strict tool's grammar,
+        # and converts to the first of its types the text reads as.
+        for union, written in (
             (
                 {
                     "anyOf": [
@@ -421,16 +425,14 @@ class ProtocolRecoveryTests(unittest.TestCase):
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                ["abc", ["abc"]],
-                3,
+                {"abc": "abc", '["abc"]': ["abc"], "12:00": "12:00"},
             ),
-            ({"type": ["string", "integer"]}, ["abc", 7], False),
+            ({"type": ["string", "number"]}, {"abc": "abc", "7": 7, "12:00": "12:00"}),
             (
                 {"anyOf": [{"type": "string"}, {"type": "integer"}], "minimum": 3},
-                ["abc", 7],
-                2,
+                {"abc": "abc", "7": 7, "7.5": "7.5"},
             ),
-            ({"enum": ["abc", 7]}, ["abc", 7], False),
+            ({"enum": ["abc", 7]}, {"abc": "abc", "7": 7}),
         ):
             schema = {
                 "type": "object",
@@ -438,9 +440,7 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 "required": ["value"],
             }
             grammar = argument_grammar(schema)
-            generated, _ = json.JSONDecoder().raw_decode(grammar.split("%json ", 1)[1])
-            generated.pop("x-guidance", None)
-            self.assertEqual(generated, union)
+            self.assertNotIn("%json", grammar)
             _, policy = tool_schema.normalize_tools(
                 [
                     {
@@ -451,24 +451,17 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 "auto",
                 True,
             )
-            for value in [*valid, invalid]:
-                text = (
-                    "<tool_call>\n<function=echo>\n<parameter=value>\n"
-                    + json.dumps(value)
-                    + "\n</parameter>\n</function>\n</tool_call>"
-                )
-                if value is invalid:
-                    # Typed as written, the value fails validation.
-                    with self.assertRaisesRegex(
-                        api.APIError,
-                        rf"^invalid arguments for echo at \$\.value: {value!r} ",
-                    ):
-                        project(text, policy)
-                    continue
-                _, calls, _ = project(text, policy)
-                self.assertEqual(
-                    json.loads(calls[0]["function"]["arguments"]), {"value": value}
-                )
+            for text, value in written.items():
+                with self.subTest(union=union, text=text):
+                    _, calls, _ = project(
+                        "<tool_call>\n<function=echo>\n<parameter=value>\n"
+                        + text
+                        + "\n</parameter>\n</function>\n</tool_call>",
+                        policy,
+                    )
+                    self.assertEqual(
+                        json.loads(calls[0]["function"]["arguments"]), {"value": value}
+                    )
 
     def test_anthropic_overflow_has_actual_counts_for_text_and_image_precheck(self):
         harness = self.harness(FakeRuntime(), max_context=2)

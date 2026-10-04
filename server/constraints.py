@@ -17,7 +17,7 @@ from llguidance.numpy import (
 
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
-from .tool_schema import THINK_END
+from .tool_schema import THINK_END, TOOL_CALL_OPEN
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,10 @@ class TokenizerContract:
     marker: str
     # The id the chat template's think-close text encodes to.
     think_end_id: int
+    # The id the chat template's tool-call-open text encodes to, or None for
+    # a tokenizer that spells tool calls differently (a model without one
+    # cannot emit a call the grammars write anyway).
+    tool_call_open_id: int | None = None
 
 
 class TokenConstraint:
@@ -178,8 +182,11 @@ def validate_tokenizer(tokenizer, config):
             "tokenizer assigns a native token id to several tokens"
         )
     think_end_id = vocabulary.get(THINK_END)
+    tool_call_open_id = vocabulary.get(TOOL_CALL_OPEN)
     expected = [(by_id.get(token_id), token_id) for token_id in eos_tokens]
     expected.append((THINK_END, think_end_id))
+    if tool_call_open_id is not None:
+        expected.append((TOOL_CALL_OPEN, tool_call_open_id))
     for token, token_id in expected:
         if token is None or token_id is None:
             raise engine_runtime.EngineUnhealthy(
@@ -198,7 +205,9 @@ def validate_tokenizer(tokenizer, config):
         raise engine_runtime.EngineUnhealthy(
             "tokenizer EOS token is not in its vocabulary"
         )
-    return TokenizerContract(vocabulary_size, eos_tokens, marker, think_end_id)
+    return TokenizerContract(
+        vocabulary_size, eos_tokens, marker, think_end_id, tool_call_open_id
+    )
 
 
 def _grammar_error(error):

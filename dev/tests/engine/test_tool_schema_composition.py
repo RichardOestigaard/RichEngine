@@ -8,89 +8,69 @@ from llguidance import LLMatcher
 from dev.tests.engine import test_structured_tools as structured
 from dev.tests.test_server import no_signed_thinking
 from dev.tests.tool_output import project, streamed_arguments
-from server import api_shapes, output, tool_schema
+from server import api_shapes, tool_schema
 from server.errors import APIError
 
 
+def strict_policy(*schemas):
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": f"t{index}", "parameters": schema, "strict": True},
+        }
+        for index, schema in enumerate(schemas)
+    ]
+    return tool_schema.normalize_tools(tools, "required", False)[1]
+
+
 class ToolSchemaCompositionTests(unittest.TestCase):
+    """A strict tool's arguments framed through schema composition, as its
+    grammar generates them and the projector reads them back."""
+
     @classmethod
     def setUpClass(cls):
         structured.StructuredToolGrammarTest.setUpClass()
         cls.tokenizer = structured.StructuredToolGrammarTest.tokenizer
         cls.guidance = structured.StructuredToolGrammarTest.guidance
 
-    def check_arguments(self, schema, arguments, invalid, *, order=None):
+    def accepts(self, policy, xml):
+        matcher = LLMatcher(self.guidance, tool_schema.tool_grammar(policy, False))
+        tokens = self.tokenizer.encode(xml).ids
+        return (
+            matcher.validate_tokens(tokens) == len(tokens)
+            and matcher.consume_tokens(tokens)
+            and matcher.is_accepting()
+        )
+
+    def check_arguments(self, schema, arguments, expected=None):
+        """Write `arguments` in the strict grammar's order, a string as its
+        text and any other value as JSON, check that the grammar takes them,
+        and read them back: `expected`, or the arguments themselves."""
         original = copy.deepcopy(schema)
-        tools = [
-            {"type": "function", "function": {"name": "test", "parameters": schema}}
-        ]
-        policy = tool_schema.normalize_tools(tools, "required", False)[1]
-        grammar = tool_schema.tool_grammar(policy, False)
-        self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
-        shape = policy.argument_schemas["test"]
+        policy = strict_policy(schema)
+        self.assertFalse(
+            LLMatcher.validate_grammar(
+                tool_schema.tool_grammar(policy, False), self.guidance
+            )
+        )
+        shape = policy.argument_schemas["t0"]
         names = [name for name in shape["properties"] if name in arguments]
         names += [name for name in arguments if name not in shape["properties"]]
-        if order is not None:
-            self.assertEqual(set(order), set(names))
-            names = order
-        xml = "<tool_call>\n<function=test>\n"
+        xml = "<tool_call>\n<function=t0>\n"
         for name in names:
             value = arguments[name]
-            value_schema = shape["properties"].get(name, shape["additionalProperties"])
-            raw = tool_schema.raw_string_schema(value_schema)
-            encoded = value if isinstance(value, str) and raw else json.dumps(value)
+            encoded = value if isinstance(value, str) else json.dumps(value)
             xml += f"<parameter={name}>\n{encoded}\n</parameter>\n"
         xml += "</function>\n</tool_call>"
-        matcher = LLMatcher(self.guidance, grammar)
-        tokens = self.tokenizer.encode(xml).ids
-        self.assertEqual(matcher.validate_tokens(tokens), len(tokens), xml)
-        self.assertTrue(matcher.consume_tokens(tokens))
-        self.assertTrue(matcher.is_accepting())
+        self.assertTrue(self.accepts(policy, xml), xml)
         _, calls, events = project(xml, policy, size=1)
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), arguments)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            arguments if expected is None else expected,
+        )
         self.assertEqual(streamed_arguments(events), calls[0]["function"]["arguments"])
-        output.validate_tool_calls(calls, policy)
         self.assertEqual(schema, original)
-        calls[0]["function"]["arguments"] = json.dumps(invalid)
-        with self.assertRaises(APIError):
-            output.validate_tool_calls(calls, policy)
         return policy, xml
-
-    def test_early_optional_fields_remain_available_after_required_fields(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string"},
-                "name": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "type": {"enum": ["txt", "group"]},
-            },
-            "required": ["name", "type"],
-            "additionalProperties": False,
-        }
-        arguments = {
-            "content": "正文\nSecond line",
-            "name": "Note",
-            "tags": [],
-            "type": "txt",
-        }
-        for order in (list(schema["properties"]), ["name", "type", "content", "tags"]):
-            with self.subTest(order=order):
-                policy, xml = self.check_arguments(
-                    schema, arguments, {"content": "missing name/type"}, order=order
-                )
-                grammar = tool_schema.tool_grammar(policy, False)
-                for bad in (
-                    xml.replace("<parameter=name>\nNote\n</parameter>\n", ""),
-                    xml.replace(
-                        "<parameter=name>\nNote\n</parameter>\n",
-                        "<parameter=name>\nNote\n</parameter>\n" * 2,
-                    ),
-                ):
-                    matcher = LLMatcher(self.guidance, grammar)
-                    tokens = self.tokenizer.encode(bad).ids
-                    self.assertLess(matcher.validate_tokens(tokens), len(tokens))
-        self.check_arguments(schema, {"name": "Folder", "type": "group"}, {})
 
     def test_note_content_survives_protocol_conversion_and_streaming(self):
         schema = {
@@ -124,49 +104,27 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 self.check_arguments(
                     converted,
                     {"name": "Release", "content": '第一行\n"quoted"\nliteral \\n'},
-                    {"content": "missing required name"},
                 )
                 # Optional means optional: folder/group creation must not be
                 # forced to invent a note body by the transport or grammar.
-                self.check_arguments(converted, {"name": "Folder"}, {})
+                self.check_arguments(converted, {"name": "Folder"})
 
-    def test_cyclic_alternatives_fail_without_recursing(self):
+    def test_cyclic_and_shared_alternatives_are_read_without_recursing(self):
         for keyword in ("anyOf", "oneOf"):
             with self.subTest(keyword=keyword):
-                schema = {
-                    "$defs": {
-                        "node": {
-                            keyword: [{"$ref": "#/$defs/node"}, {"type": "string"}]
-                        }
+                definitions = {
+                    "node": {keyword: [{"$ref": "#/$defs/node"}, {"type": "string"}]}
+                }
+                node = {"$defs": definitions, "$ref": "#/$defs/node"}
+                self.assertEqual(tool_schema.schema_types(node, node), {"string"})
+                self.check_arguments(
+                    {
+                        "$defs": definitions,
+                        "properties": {"value": {"$ref": "#/$defs/node"}},
                     },
-                    "$ref": "#/$defs/node",
-                }
-                with self.assertRaisesRegex(
-                    APIError, "cyclic tool parameter alternatives"
-                ) as error:
-                    tool_schema.raw_string_schema(schema)
-                self.assertEqual(error.exception.status, 400)
-                parameters = {
-                    "$defs": schema["$defs"],
-                    "properties": {"value": {"$ref": "#/$defs/node"}},
-                }
-                policy = tool_schema.normalize_tools(
-                    [
-                        {
-                            "type": "function",
-                            "function": {"name": "test", "parameters": parameters},
-                        }
-                    ],
-                    "required",
-                    False,
-                )[1]
-                with self.assertRaisesRegex(
-                    APIError, "cyclic tool parameter alternatives"
-                ):
-                    tool_schema.tool_grammar(policy, False)
-
-    def test_shared_string_alternatives_are_not_cycles(self):
-        schema = {
+                    {"value": "text"},
+                )
+        shared = {
             "$defs": {
                 "text": {"type": "string"},
                 "choice": {
@@ -175,7 +133,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
             },
             "$ref": "#/$defs/choice",
         }
-        self.assertEqual(tool_schema.raw_string_schema(schema), ("raw", None))
+        self.assertEqual(tool_schema.schema_types(shared, shared), {"string"})
 
     def test_shared_references_are_projected_once(self):
         # Two references per level to the next definition used to double the
@@ -194,16 +152,14 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         }
         field = {"$ref": "#/$defs/d0"}
         lookup = tool_schema._lookup_tool_reference
-        for schema, arguments, invalid in (
-            ({"$defs": definitions, **field}, {"x": "a"}, {"x": 1}),
+        for schema, arguments in (
+            ({"$defs": definitions, **field}, {"x": "a"}),
             (
                 {"$defs": definitions, "properties": {"value": field}},
                 {"value": {"x": "a"}},
-                {"value": {"x": 1}},
             ),
         ):
-            tool = {"type": "function", "function": {"name": "t", "parameters": schema}}
-            policy = tool_schema.normalize_tools([tool], "required", False)[1]
+            policy = strict_policy(schema)
             with (
                 self.subTest(schema=sorted(schema)),
                 mock.patch.object(
@@ -213,18 +169,28 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 tool_schema.tool_grammar(policy, False)
             # A few lookups per reference, rather than one per path.
             self.assertLess(counted.call_count, 4 * (depth + 1))
-            self.check_arguments(schema, arguments, invalid)
+            self.check_arguments(schema, arguments)
+
+    def test_shared_enumerations_are_read_once(self):
+        # Two references per level to an enumeration below: read along every
+        # path, deciding the values would take 2**40 steps.
+        depth = 40
+        definitions = {
+            f"d{i}": {
+                "anyOf": [{"$ref": f"#/$defs/d{i + 1}"}, {"$ref": f"#/$defs/d{i + 1}"}]
+            }
+            for i in range(depth)
+        }
+        definitions[f"d{depth}"] = {"enum": ["a", "b"]}
+        schema = {"$defs": definitions, "properties": {"value": {"$ref": "#/$defs/d0"}}}
+        grammar = tool_schema.tool_grammar(strict_policy(schema), False)
+        arguments = json.loads(grammar)["grammars"][1]["lark_grammar"]
+        self.assertIn('("a" | "b")', arguments)
+        self.check_arguments(schema, {"value": "b"})
 
     def test_framing_is_bounded_across_the_tools_of_a_request(self):
         # Composition and root copies can make the framed schemas quadratic or
         # exponential in the tool schemas; one budget covers all tools.
-        def policy(*schemas):
-            tools = [
-                {"type": "function", "function": {"name": f"t{i}", "parameters": s}}
-                for i, s in enumerate(schemas)
-            ]
-            return tool_schema.normalize_tools(tools, "auto", True)[1]
-
         wide = {
             "anyOf": [
                 {
@@ -246,7 +212,7 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         nested["$ref"] = "#/$defs/d0"
         half = {"properties": {"x": {"description": "d" * 12_000}}}
         with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
-            tool_schema.tool_grammar(policy(half), False)
+            tool_schema.tool_grammar(strict_policy(half), False)
             for name, schemas in (
                 ("wide union", [wide]),
                 ("root copies", [copies]),
@@ -257,30 +223,32 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                     self.subTest(name),
                     self.assertRaisesRegex(APIError, "too complex") as caught,
                 ):
-                    tool_schema.tool_grammar(policy(*schemas), False)
+                    tool_schema.tool_grammar(strict_policy(*schemas), False)
                 self.assertEqual(caught.exception.status, 400)
 
-    def test_recursive_objects_keep_json_framing_and_validation(self):
-        self.check_arguments(
-            {
-                "type": "object",
-                "$defs": {
-                    "node": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "object",
-                                "properties": {"child": {"$ref": "#/$defs/node"}},
-                                "additionalProperties": False,
-                            },
-                        ]
-                    }
-                },
-                "properties": {"value": {"$ref": "#/$defs/node"}},
-                "required": ["value"],
+    def test_recursive_objects_keep_json_framing(self):
+        schema = {
+            "type": "object",
+            "$defs": {
+                "node": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "properties": {"child": {"$ref": "#/$defs/node"}},
+                            "additionalProperties": False,
+                        },
+                    ]
+                }
             },
-            {"value": {"child": {"child": None}}},
-            {"value": {"child": "wrong"}},
+            "properties": {"value": {"$ref": "#/$defs/node"}},
+            "required": ["value"],
+        }
+        policy, xml = self.check_arguments(
+            schema, {"value": {"child": {"child": None}}}
+        )
+        self.assertFalse(
+            self.accepts(policy, xml.replace('{"child": null}', '"wrong"'))
         )
 
     def test_root_reference_and_chained_field_reference(self):
@@ -298,7 +266,6 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "$ref": "#/$defs/args",
             },
             {"value": "123"},
-            {"value": 123},
         )
 
     def test_root_reference_keeps_sibling_assertions_and_object_union(self):
@@ -313,14 +280,14 @@ class ToolSchemaCompositionTests(unittest.TestCase):
             },
             "$ref": "#/$defs/args",
         }
-        self.check_arguments(schema, {"name": "123", "extra": True}, {"name": "123"})
+        written = {"name": "123", "extra": True}
+        self.check_arguments(schema, written)
         self.check_arguments(
             {
                 "$defs": schema["$defs"],
                 "anyOf": [{"$ref": "#/$defs/args"}, {"type": "null"}],
             },
-            {"name": "123", "extra": True},
-            {"name": "123"},
+            written,
         )
 
     def test_intersection_union_and_conditional_fields(self):
@@ -339,7 +306,6 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 ]
             },
             {"path": "123", "count": 2},
-            {"path": "x", "count": 0},
         )
         for keyword in ("anyOf", "oneOf"):
             schema = {
@@ -358,9 +324,9 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                     },
                 ]
             }
-            for args in ({"text": "123"}, {"number": 3}):
-                with self.subTest(keyword=keyword, args=args):
-                    self.check_arguments(schema, args, {"text": "x", "number": 3})
+            for arguments in ({"text": "123"}, {"number": 3}):
+                with self.subTest(keyword=keyword, arguments=arguments):
+                    self.check_arguments(schema, arguments)
         self.check_arguments(
             {
                 "type": "object",
@@ -376,11 +342,12 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                     "required": ["text"],
                 },
             },
-            {"kind": "file", "path": "123"},
-            {"kind": "file"},
+            {"kind": "file", "path": "src/main.py"},
         )
 
-    def test_dynamic_names_and_cross_field_assertions_remain_validated(self):
+    def test_dynamic_names_and_cross_field_assertions_compile(self):
+        # Framing takes these schemas; the assertions across fields go
+        # unenforced.
         self.check_arguments(
             {
                 "type": "object",
@@ -390,32 +357,30 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "maxProperties": 2,
             },
             {"x_a": 3},
-            {"wrong": 3},
         )
-        self.check_arguments(
+        # Strict closing leaves no room for the property dependentRequired
+        # names.
+        policy, xml = self.check_arguments(
             {
                 "type": "object",
                 "properties": {"a": {"type": "string"}},
                 "dependentRequired": {"a": ["b"]},
                 "propertyNames": {"pattern": "^[ab]$"},
             },
-            {"a": "123", "b": 7},
             {"a": "123"},
         )
+        extra = "<parameter=b>\n7\n</parameter>\n</function>"
+        self.assertFalse(self.accepts(policy, xml.replace("</function>", extra)))
         self.check_arguments(
             {"type": "object", "not": {"required": ["forbidden"]}},
-            {"allowed": "123"},
-            {"forbidden": 1},
+            {"allowed": 123},
         )
-        self.check_arguments(
-            {"enum": [{"a": "123"}, {"b": 3}]}, {"a": "123"}, {"a": "other"}
-        )
+        self.check_arguments({"enum": [{"a": "123"}, {"b": 3}]}, {"a": "123"})
 
     def test_additional_typed_strings_and_local_anchors(self):
         self.check_arguments(
             {"type": "object", "additionalProperties": {"type": "string"}},
             {"extra": "123"},
-            {"extra": 123},
         )
         self.check_arguments(
             {
@@ -424,7 +389,6 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "required": ["value"],
             },
             {"value": "123"},
-            {"value": 123},
         )
         self.check_arguments(
             {
@@ -433,7 +397,6 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "required": ["value"],
             },
             {"value": "123"},
-            {"value": 123},
         )
 
     def test_forbidden_optional_fields_do_not_make_the_object_impossible(self):
@@ -444,7 +407,6 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             {},
-            {"disabled": 1},
         )
         self.check_arguments(
             {
@@ -460,21 +422,21 @@ class ToolSchemaCompositionTests(unittest.TestCase):
                 ]
             },
             {},
-            {"a": "x"},
         )
 
     def test_generic_name_rule_cannot_reencode_declared_strings(self):
         policy, _ = self.check_arguments(
-            {"properties": {"a": {"type": "string", "const": "hello"}}},
+            {
+                "properties": {"a": {"type": "string", "const": "hello"}},
+                "additionalProperties": True,
+            },
             {"a": "hello", "ab": 3},
-            {"a": 1},
         )
-        grammar = tool_schema.tool_grammar(policy, False)
-        bad = '<tool_call>\n<function=test>\n<parameter=a>\n"hello"\n</parameter>\n</function>\n</tool_call>'
-        tokens = self.tokenizer.encode(bad).ids
-        self.assertLess(
-            LLMatcher(self.guidance, grammar).validate_tokens(tokens), len(tokens)
+        bad = (
+            '<tool_call>\n<function=t0>\n<parameter=a>\n"hello"\n'
+            "</parameter>\n</function>\n</tool_call>"
         )
+        self.assertFalse(self.accepts(policy, bad))
 
     def test_extra_names_may_start_like_unused_declared_names(self):
         schema = {
@@ -483,25 +445,19 @@ class ToolSchemaCompositionTests(unittest.TestCase):
         }
         for extra in ("user-agent", "urls", "u", "a", "abc"):
             with self.subTest(extra=extra):
-                self.check_arguments(schema, {extra: 1}, {extra: "1"})
-
-        def rejected(policy, xml):
-            matcher = LLMatcher(self.guidance, tool_schema.tool_grammar(policy, False))
-            tokens = self.tokenizer.encode(xml).ids
-            return matcher.validate_tokens(tokens) < len(tokens)
-
+                self.check_arguments(schema, {extra: 1})
         # Declared names still appear once, and forbidden ones not at all.
         policy, xml = self.check_arguments(
-            schema, {"url": "x", "ab": 1, "user-agent": 2}, {"url": 1}
+            schema,
+            {"url": "x", "ab": 1, "user-agent": 2},
         )
         repeated = "<parameter=url>\nx\n</parameter>\n</function>"
-        self.assertTrue(rejected(policy, xml.replace("</function>", repeated)))
+        self.assertFalse(self.accepts(policy, xml.replace("</function>", repeated)))
         policy, xml = self.check_arguments(
             {"properties": {"secret": False}, "additionalProperties": {}},
             {"secrets": 1},
-            {"secret": 1},
         )
-        self.assertTrue(rejected(policy, xml.replace("secrets", "secret")))
+        self.assertFalse(self.accepts(policy, xml.replace("secrets", "secret")))
 
 
 if __name__ == "__main__":

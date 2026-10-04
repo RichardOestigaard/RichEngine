@@ -44,8 +44,9 @@ from server.api_shapes import _namespace_alias, normalize_responses_input
 from server.chat_templates import ChatTemplates
 from server.metrics import metrics_dict
 from server.origins import ANY_ORIGIN, parse_allowed_origin
+from server.output import MAX_JSON_NESTING
 from server.thinking import ThinkingCodec
-from server.tool_schema import MAX_JSON_NESTING, _grammar_compatible_schema
+from server.tool_schema import _grammar_compatible_schema
 
 # The deadline of a request prepared directly, which never expires.
 FOREVER = math.inf
@@ -128,6 +129,10 @@ class FakeTokenizer:
             25: "nk>",
             26: "</think>",
             27: "answer\n",
+            28: (
+                "<tool_call>\n<function=weather>\n<parameter=city>\n"
+                "3\n</parameter>\n</function>\n</tool_call>\n"
+            ),
         }
         self.backend_tokenizer = _byte_backend(self.fragments)
         self.templates = []
@@ -250,7 +255,7 @@ class PassthroughStreamer:
         pass
 
     @staticmethod
-    def count_reasoning_tokens(_enabled):
+    def count_reasoning_tokens(_enabled, _tool_calls=False):
         return 0
 
 
@@ -938,6 +943,37 @@ class ServerTest(unittest.TestCase):
             before_end = list(chunks)
             streamer.end()
             self.assertEqual(chunks, before_end)
+
+    def test_reasoning_tokens_end_where_the_splitter_ends_reasoning(self):
+        # A call-open token ends the reasoning where a call may follow and its
+        # text opens one; a </think> ends it always.
+        think_end = tool_schema.THINK_END_TOKEN_ID
+        call = tool_schema.TOOL_CALL_OPEN_TOKEN_ID
+        texts = {
+            1: "a",
+            2: " b",
+            3: "\n<function=",
+            call: "<tool_call>",
+            think_end: "</think>",
+        }
+        tokenizer = SimpleNamespace(
+            backend_tokenizer=None,
+            decode=lambda ids: "".join(texts[token] for token in ids),
+        )
+        for token_ids, tool_calls, expected in (
+            ([1, 2, think_end, 1], False, 2),
+            ([1, call, 3, think_end], False, 3),
+            ([1, call, 3, think_end], True, 1),
+            ([1, call, 2, think_end], True, 3),
+            ([1, 2], True, 2),
+        ):
+            with self.subTest(token_ids=token_ids, tool_calls=tool_calls):
+                streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
+                streamer.token_ids = token_ids
+                self.assertEqual(
+                    streamer.count_reasoning_tokens(True, tool_calls), expected
+                )
+                self.assertEqual(streamer.count_reasoning_tokens(False, True), 0)
 
     def test_callback_streamer_matches_one_shot_for_random_token_batches(self):
         family = "👨‍👩‍👧‍👦".encode()
@@ -3192,6 +3228,35 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(response.usage.prompt_tokens_details.cached_tokens, 1)
 
+    def test_usage_counts_reasoning_tokens_before_a_call_from_the_reasoning(self):
+        # Where a call may follow, its tag ends the reasoning, and a later
+        # </think> is dropped from the text.
+        harness = self.harness(FakeRuntime(Plan([[1], [5], [26], [27]])))
+        with (
+            # The fake vocabulary's </think> is token 26, and token 5 is a
+            # call, which begins with <tool_call>.
+            mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26),
+            mock.patch.object(backend_api, "TOOL_CALL_OPEN_TOKEN_ID", 5),
+            self.openai_client(harness) as client,
+        ):
+            response = client.chat.completions.create(
+                model="test-model",
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[{"type": "function", "function": {"name": "weather"}}],
+                temperature=0,
+            )
+        message = response.choices[0].message
+        self.assertEqual(message.reasoning_content, "because ")
+        self.assertEqual(
+            [
+                (call.function.name, call.function.arguments)
+                for call in message.tool_calls
+            ],
+            [("weather", '{"city":"Paris"}')],
+        )
+        self.assertEqual(message.content, "\nanswer\n")
+        self.assertEqual(response.usage.completion_tokens_details.reasoning_tokens, 1)
+
     def test_stream_options_null_uses_defaults(self):
         harness = self.harness(FakeRuntime(Plan([[3]])))
         status, content_type, payload = harness.request(
@@ -4376,6 +4441,7 @@ class ServerTest(unittest.TestCase):
             public_id="request",
             thinking=False,
             tool_policy=policy,
+            may_call_tools=True,
             response_validator=None,
             deadline=100,
             events=SimpleNamespace(get=next_event),
@@ -4780,7 +4846,9 @@ class ServerTest(unittest.TestCase):
         )
         self.assertNotIn("<tool_call>", payload.decode())
 
-    def test_streaming_malformed_tool_keeps_safe_prefix_without_xml(self):
+    def test_streaming_tool_tags_out_of_the_template_layout_stay_text(self):
+        # Calls read as the chat template lays them out; tags written without
+        # its newlines are text, which streams as written.
         harness = self.harness(FakeRuntime(Plan([[14], [8]])))
         status, _, payload = harness.request(
             "POST",
@@ -4801,15 +4869,15 @@ class ServerTest(unittest.TestCase):
             chunk["choices"][0]["delta"] for chunk in chunks if chunk.get("choices")
         ]
         self.assertEqual(
-            [delta["content"] for delta in deltas if delta.get("content")],
-            ["first "],
+            "".join(delta.get("content") or "" for delta in deltas),
+            "first " + FakeTokenizer().fragments[8],
         )
-        error = next(chunk["error"] for chunk in chunks if "error" in chunk)
-        self.assertEqual(error["code"], "invalid_model_output")
-        self.assertNotIn("<tool_call>", payload.decode())
+        self.assertFalse(any(delta.get("tool_calls") for delta in deltas))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
 
     def test_prose_beside_a_call_can_name_tool_tags(self):
-        # The grammar keeps only <tool_call> out of prose; other tags are text.
+        # Only <tool_call> opens a call, as in the grammars' text: other tags in
+        # prose, <function= among them, stay text.
         tokenizer = FakeTokenizer()
         tokenizer.fragments[40] = "Fix the </parameter> and <function= handling.\n"
         tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
@@ -5020,18 +5088,20 @@ class ServerTest(unittest.TestCase):
             },
         )
 
-    def test_json_value_has_an_explicit_nesting_limit(self):
+    def test_json_values_have_an_explicit_nesting_limit(self):
         allowed = "[" * MAX_JSON_NESTING + "0" + "]" * MAX_JSON_NESTING
         deep_array = "[" * (MAX_JSON_NESTING + 1) + "0" + "]" * (MAX_JSON_NESTING + 1)
         deep_object = (
             '{"value":' * (MAX_JSON_NESTING + 1) + "0" + "}" * (MAX_JSON_NESTING + 1)
         )
         escaped = r"brackets in a string: \"[{]}\"" * (MAX_JSON_NESTING + 1)
-
-        self.assertIsInstance(tool_schema.json_value(allowed), list)
-        self.assertEqual(tool_schema.json_value(deep_array), deep_array)
-        self.assertEqual(tool_schema.json_value(deep_object), deep_object)
-        self.assertEqual(tool_schema.json_value(json.dumps(escaped)), escaped)
+        convert = model_output.convert_value
+        self.assertIsInstance(convert(allowed, {"array"}), list)
+        # Too deep to write back, the value keeps its text.
+        self.assertEqual(convert(deep_array, {"array"}), deep_array)
+        self.assertEqual(convert(deep_object, {"object"}), deep_object)
+        # Text that reads as none of the types is the JSON value it spells.
+        self.assertEqual(convert(json.dumps(escaped), {"integer"}), escaped)
 
     def test_tool_parser_preserves_schema_typed_strings(self):
         schema = {
@@ -5054,87 +5124,37 @@ class ServerTest(unittest.TestCase):
             {"text": "123", "count": 3},
         )
 
-    def test_tool_parser_accepts_stock_client_string_constraints(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "minLength": 4,
-                    "maxLength": 16,
-                    "pattern": "^[A-Z]+$",
-                }
+    def test_strict_string_constraints_leave_the_value_raw(self):
+        # A strict tool writes a string as raw text, which its grammar does
+        # not pattern or bound; nothing checks the call after.
+        for value_schema in (
+            {"type": "string", "minLength": 4, "maxLength": 16, "pattern": "^[A-Z]+$"},
+            {
+                "type": "string",
+                "description": "Recipient",
+                "allOf": [
+                    {"pattern": r"^[^\n\r]*$"},
+                    {"pattern": r"^[\s\S]{0,300}$"},
+                ],
             },
-            "required": ["text"],
-        }
-        tools, policy = tool_schema.normalize_tools(
-            [
-                {
-                    "type": "function",
-                    "function": {"name": "echo", "parameters": schema},
+        ):
+            with self.subTest(schema=value_schema):
+                schema = {
+                    "type": "object",
+                    "properties": {"text": value_schema},
+                    "required": ["text"],
                 }
-            ],
-            "auto",
-            True,
-        )
-        self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", argument_grammar(schema))
-        valid = {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "echo", "arguments": '{"text":"VALID"}'},
-        }
-        model_output.validate_tool_calls([valid], policy)
-        invalid = json.loads(json.dumps(valid))
-        invalid["function"]["arguments"] = '{"text":"x"}'
-        with self.assertRaisesRegex(api.APIError, "invalid arguments for echo"):
-            model_output.validate_tool_calls([invalid], policy)
+                self.assertIn("/(?s:.*)/", argument_grammar(schema))
+                text = (
+                    "<tool_call>\n<function=echo>\n<parameter=text>\nx\ny\n"
+                    "</parameter>\n</function>\n</tool_call>"
+                )
+                _, calls, _ = project(text, tool_policy({"echo": schema}))
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]), {"text": "x\ny"}
+                )
 
-    def test_tool_parser_accepts_all_of_string_constraints(self):
-        value_schema = {
-            "type": "string",
-            "description": "Recipient",
-            "allOf": [
-                {"pattern": r"^[^\n\r]*$"},
-                {"pattern": r"^[\s\S]{0,300}$"},
-            ],
-        }
-        schema = {
-            "type": "object",
-            "properties": {"to": value_schema},
-            "required": ["to"],
-        }
-        tools, policy = tool_schema.normalize_tools(
-            [
-                {
-                    "type": "function",
-                    "function": {"name": "send_message", "parameters": schema},
-                }
-            ],
-            "auto",
-            True,
-        )
-        self.assertEqual(len(tools), 1)
-        self.assertIn("/(?s:.*)/", argument_grammar(schema))
-
-        valid = {
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "send_message",
-                "arguments": '{"to":"main [agent-1]"}',
-            },
-        }
-        model_output.validate_tool_calls([valid], policy)
-        for value in ("main\nagent", "x" * 301):
-            invalid = json.loads(json.dumps(valid))
-            invalid["function"]["arguments"] = json.dumps({"to": value})
-            with self.assertRaisesRegex(
-                api.APIError, "invalid arguments for send_message"
-            ):
-                model_output.validate_tool_calls([invalid], policy)
-
-    def test_tool_grammar_defers_property_name_assertions_to_validation(self):
+    def test_tool_grammar_leaves_out_property_name_assertions(self):
         schema = {
             "type": "object",
             "properties": {
@@ -5145,31 +5165,11 @@ class ServerTest(unittest.TestCase):
                 }
             },
         }
-        tools, policy = tool_schema.normalize_tools(
-            [
-                {
-                    "type": "function",
-                    "function": {"name": "ask", "parameters": schema},
-                }
-            ],
-            "auto",
-            True,
-        )
-        self.assertEqual(len(tools), 1)
         grammar = argument_grammar(schema)
         self.assertNotIn("propertyNames", grammar)
-        invalid = {
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "ask",
-                "arguments": '{"answers":{"NOT_LOWER":"value"}}',
-            },
-        }
-        with self.assertRaisesRegex(api.APIError, "invalid arguments for ask"):
-            model_output.validate_tool_calls([invalid], policy)
+        self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
 
-    def test_tool_grammar_defers_nested_lookaround_patterns_to_validation(self):
+    def test_tool_grammar_leaves_out_nested_lookaround_patterns(self):
         pattern = (
             r"^(?!\.\.?(?:/|$))[A-Za-z0-9_\-.~:@+]{1,200}"
             r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9_\-.~:@+]{1,200}){0,14}$"
@@ -5190,42 +5190,23 @@ class ServerTest(unittest.TestCase):
             "required": ["writes"],
         }
         original = json.dumps(schema)
-        _, policy = tool_schema.normalize_tools(
-            [{"type": "function", "function": {"name": "write", "parameters": schema}}],
-            "required",
-            False,
-        )
         grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
+        self.assertNotIn("?!", grammar)
         self.assertEqual(json.dumps(schema), original)
-        for path in ("website/index.html", "../secret", "website/../secret"):
+        policy = tool_policy({"write": schema})
+        for path in ("website/index.html", "../secret"):
             with self.subTest(path=path):
-                arguments = json.dumps({"writes": [{"path": path}]})
-                call = {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "write", "arguments": arguments},
-                }
-                xml = (
+                _, calls, _ = project(
                     "<tool_call>\n<function=write>\n<parameter=writes>\n"
                     + json.dumps([{"path": path}])
-                    + "\n</parameter>\n</function>\n</tool_call>"
+                    + "\n</parameter>\n</function>\n</tool_call>",
+                    policy,
                 )
-                projector = model_output.StreamingToolCallProjector(policy, "request_1")
-                if path == "website/index.html":
-                    model_output.validate_tool_calls([call], policy)
-                    projector.put(xml)
-                    self.assertEqual(len(projector.closed_calls), 1)
-                else:
-                    with self.assertRaisesRegex(
-                        api.APIError, "invalid arguments for write"
-                    ):
-                        model_output.validate_tool_calls([call], policy)
-                    with self.assertRaisesRegex(
-                        api.APIError, "invalid arguments for write"
-                    ):
-                        projector.put(xml)
-                    self.assertEqual(projector.closed_calls, [])
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"writes": [{"path": path}]},
+                )
 
     def test_tool_grammar_preserves_keyword_named_properties_and_literals(self):
         literal = {"pattern": "(?=literal)", "propertyNames": "literal"}
@@ -5251,34 +5232,16 @@ class ServerTest(unittest.TestCase):
             {"lenient": True, "whitespace_pattern": tool_schema.WHITESPACE},
         )
         self.assertEqual(projected, schema)
-        _, policy = tool_schema.normalize_tools(
-            [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
-            "required",
-            False,
-        )
         grammar = argument_grammar(schema)
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
-        for reference in references:
-            self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
+        # Literal values are written as their JSON text, annotations kept as
+        # data, and references rebased only where they are schemas.
+        for value in (literal, *references):
+            text = json.dumps(value, separators=(",", ":"))
+            self.assertIn(json.dumps(text), grammar)
+        self.assertIn('"default":{"$ref":"https://example.com/x.json"}', grammar)
         self.assertIn('"items":{"$ref":"#/$defs/__splash_root/$defs/x"}', grammar)
         self.assertNotIn("__splash_root/x", grammar)
-        arguments = {
-            "pattern": "literal",
-            "propertyNames": literal,
-            "nested": literal,
-            "constant": references[0],
-            "choice": references[1],
-        }
-        call = {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "echo", "arguments": json.dumps(arguments)},
-        }
-        model_output.validate_tool_calls([call], policy)
-        _, validator = tool_schema.normalize_response_format(
-            {"type": "json_schema", "json_schema": {"name": "echo", "schema": schema}}
-        )
-        validator.validate(arguments)
 
     def test_tool_parser_resolves_root_and_chained_string_refs(self):
         schema = {
@@ -5333,25 +5296,18 @@ class ServerTest(unittest.TestCase):
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
         }
-        policy = tool_schema.ToolPolicy({}, {"bash": schema}, False, False)
+        policy = tool_schema.ToolPolicy(
+            schemas={"bash": schema},
+            required=False,
+            parallel=False,
+            strict=frozenset(),
+            constrained=True,
+        )
         grammar = json.loads(tool_schema.tool_grammar(policy, True))
         main = grammar["grammars"][0]["lark_grammar"]
         self.assertIn(
             r"TEXT: /(?s:.*)/ & ~/(?s:.*)(<tool_call>|<\/think>)(?s:.*)/",
             main,
-        )
-
-    def test_tool_parser_keeps_nested_closing_tags_inside_raw_value(self):
-        text = (
-            "<tool_call>\n<function=echo>\n<parameter=x>\nhello"
-            "</function>\n</tool_call>world\n</parameter>\n"
-            "</function>\n</tool_call>"
-        )
-        content, calls, _ = project(text, tool_policy({"echo": {}}))
-        self.assertEqual(content, "")
-        self.assertEqual(
-            json.loads(calls[0]["function"]["arguments"]),
-            {"x": "hello</function>\n</tool_call>world"},
         )
 
     def test_tool_parser_handles_mixed_parameter_types(self):
@@ -5366,22 +5322,20 @@ class ServerTest(unittest.TestCase):
             "required": ["text", "count", "flags", "maybe"],
             "additionalProperties": False,
         }
-        tool = {
-            "type": "function",
-            "function": {"name": "echo", "parameters": schema},
-        }
-        _, policy = tool_schema.normalize_tools([tool], "required", True)
         raw = (
             "visible prefix "
             "<tool_call>\n<function=echo>\n"
-            "<parameter=text>\nsnow </function>\n</tool_call> tail\n</parameter>\n"
+            "<parameter=text>\n 3 \n</parameter>\n"
             "<parameter=count>\n3\n</parameter>\n"
             "<parameter=flags>\n[true,false]\n</parameter>\n"
             "<parameter=maybe>\nnull\n</parameter>\n"
             "</function>\n</tool_call> visible suffix"
         )
-        content, calls, _ = project(raw, policy, "fuzz")
-        model_output.validate_tool_calls(calls, policy)
+        content, calls, _ = project(raw, tool_policy({"echo": schema}), "fuzz")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"text": " 3 ", "count": 3, "flags": [True, False], "maybe": None},
+        )
         self.assertEqual(content, "visible prefix  visible suffix")
 
     def test_tool_parser_preserves_enum_edge_whitespace(self):
@@ -5398,18 +5352,37 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"text": " edge "}
         )
-        with self.assertRaisesRegex(api.APIError, "XML framing"):
-            argument_grammar(
-                {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "enum": ["bad\n</parameter>value"],
-                        }
-                    },
-                }
-            )
+        # An enumerated value may hold the tags, but not the close the grammar
+        # writes after a value.
+        for value, framing in (
+            ("a</parameter>b", False),
+            ("x<parameter=y", False),
+            ("f</function>g", False),
+            ("bad\n</parameter>\nvalue", True),
+        ):
+            schema = {
+                "type": "object",
+                "properties": {"text": {"type": "string", "enum": [value]}},
+            }
+            with self.subTest(value=value):
+                if not framing:
+                    self.assertIn(json.dumps(value), argument_grammar(schema))
+                    continue
+                with self.assertRaisesRegex(api.APIError, "XML framing"):
+                    argument_grammar(schema)
+
+    def test_tool_parser_keeps_nested_closing_tags_inside_raw_value(self):
+        text = (
+            "<tool_call>\n<function=echo>\n<parameter=x>\nhello"
+            "</function>\n</tool_call>world\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        content, calls, _ = project(text, tool_policy({"echo": {}}))
+        self.assertEqual(content, "")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"x": "hello</function>\n</tool_call>world"},
+        )
 
     def test_tool_choice_shapes_the_grammar_policy_not_the_prompt(self):
         tokenizer = FakeTokenizer()
@@ -5423,11 +5396,13 @@ class ServerTest(unittest.TestCase):
             {"type": "function", "function": {"name": "g"}},
         ]
         named = {"type": "function", "function": {"name": "g"}}
+        both = "(call_0 | call_1)"
         cases = (
-            ({"tool_choice": "none"}, False, True, "tail"),
-            ({"tool_choice": "required"}, True, True, "(tool_0 | tool_1)+ WS"),
-            ({"tool_choice": named}, True, False, "(tool_0) WS"),
-            ({"parallel_tool_calls": False}, False, False, "(tool_0 | tool_1)? tail"),
+            ({}, False, True, None),
+            ({"tool_choice": "none"}, False, True, "TEXT"),
+            ({"tool_choice": "required"}, True, True, f"WS {both} (TEXT {both})* TEXT"),
+            ({"tool_choice": named}, True, False, "WS (call_0) WS"),
+            ({"parallel_tool_calls": False}, False, False, f"TEXT ({both} WS)?"),
         )
         for extra, required, parallel, start in cases:
             with self.subTest(**extra):
@@ -5439,8 +5414,13 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(
                     (policy.required, policy.parallel), (required, parallel)
                 )
+                if start is None:
+                    # An auto choice of tools none of which is strict leaves
+                    # the output free.
+                    self.assertFalse(policy.constrained)
+                    continue
                 main = json.loads(tool_schema.tool_grammar(policy, True))["grammars"][0]
-                self.assertIn(f"start: think {start}", main["lark_grammar"])
+                self.assertIn(f"start: think {start}\n", main["lark_grammar"])
                 self.assertEqual(
                     [
                         name
@@ -5529,45 +5509,57 @@ class ServerTest(unittest.TestCase):
             },
         }
 
-    def test_pydantic_style_schema_and_invalid_output(self):
+    def test_pydantic_style_schema_reads_values_through_references(self):
+        # The parameter's types come through its local reference, and a value
+        # outside its enum still comes back.
         tool = self.rich_weather_tool()
-        harness = self.harness(FakeRuntime(Plan([[8]]), Plan([[5]])))
-        for expected in (500, 200):
+        harness = self.harness(FakeRuntime(Plan([[28]]), Plan([[5]])))
+        for city in ("3", "Paris"):
             status, _, payload = harness.request(
                 "POST",
                 "/v1/chat/completions",
                 self.body(tools=[tool], reasoning_effort="none"),
             )
-            self.assertEqual(status, expected)
-            if status == 500:
-                self.assertEqual(
-                    json.loads(payload)["error"]["code"], "invalid_model_output"
-                )
+            self.assertEqual(status, 200, payload)
+            call = json.loads(payload)["choices"][0]["message"]["tool_calls"][0]
+            self.assertEqual(json.loads(call["function"]["arguments"]), {"city": city})
 
     def test_required_named_and_parallel_tool_policies(self):
+        # Generation enforces the choice; what the model wrote is read back as
+        # it is.
         tools = [
             {"type": "function", "function": {"name": "weather"}},
             {"type": "function", "function": {"name": "time"}},
         ]
         named = {"type": "function", "function": {"name": "weather"}}
         cases = (
-            ([4], {"tool_choice": "required"}),
-            ([7], {"tool_choice": named}),
-            ([9], {"parallel_tool_calls": False}),
+            ([4], {"tool_choice": "required"}, []),
+            ([16], {"tool_choice": named}, ["time"]),
+            ([5, 16], {"parallel_tool_calls": False}, ["weather", "time"]),
         )
-        for batch, extra in cases:
-            harness = self.harness(FakeRuntime(Plan([batch])))
-            status, _, payload = harness.request(
-                "POST",
-                "/v1/chat/completions",
-                self.body(tools=tools, reasoning_effort="none", **extra),
-            )
-            self.assertEqual(status, 500)
-            self.assertEqual(
-                json.loads(payload)["error"]["code"], "invalid_model_output"
-            )
+        for batch, extra, names in cases:
+            with self.subTest(**extra):
+                factory = FakeConstraintFactory()
+                harness = self.harness(
+                    FakeRuntime(Plan([batch])), constraint_factory=factory
+                )
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    self.body(tools=tools, reasoning_effort="none", **extra),
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(len(factory.grammars), 1)
+                message = json.loads(payload)["choices"][0]["message"]
+                self.assertEqual(
+                    [
+                        call["function"]["name"]
+                        for call in message.get("tool_calls", [])
+                    ],
+                    names,
+                )
 
-    def test_cyclic_tool_alternatives_reject_before_inference_and_recover(self):
+    def test_cyclic_tool_alternatives_compile_without_recursing(self):
         runtime = FakeRuntime()
         factory = FakeConstraintFactory()
         harness = self.harness(runtime, constraint_factory=factory)
@@ -5578,25 +5570,21 @@ class ServerTest(unittest.TestCase):
                 },
                 "properties": {"value": {"$ref": "#/$defs/node"}},
             }
-            tools = [
-                {"type": "function", "function": {"name": "test", "parameters": schema}}
-            ]
+            function = {"name": "test", "parameters": schema, "strict": True}
             with self.subTest(keyword=keyword):
                 status, _, payload = harness.request(
                     "POST",
                     "/v1/chat/completions",
                     self.body(
-                        tools=tools, tool_choice="required", reasoning_effort="none"
+                        tools=[{"type": "function", "function": function}],
+                        tool_choice="required",
+                        reasoning_effort="none",
                     ),
                 )
-                self.assertEqual(status, 400)
-                self.assertIn(
-                    "cyclic tool parameter alternatives",
-                    json.loads(payload)["error"]["message"],
-                )
-        self.assertEqual(runtime.requests, [])
-        status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
-        self.assertEqual(status, 200)
+                self.assertEqual(status, 200, payload)
+                # A value that may be a string is raw text.
+                self.assertIn("/(?s:.*)/", factory.grammars[-1])
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_remote_tool_schema_ref_is_rejected_before_inference(self):
         runtime = FakeRuntime()
@@ -5626,98 +5614,9 @@ class ServerTest(unittest.TestCase):
                 )
         self.assertEqual(runtime.requests, [])
 
-    def test_streaming_invalid_tool_is_an_sse_error(self):
-        harness = self.harness(FakeRuntime(Plan([[8]])))
-        status, _, payload = harness.request(
-            "POST",
-            "/v1/chat/completions",
-            self.body(
-                stream=True,
-                tools=[self.rich_weather_tool()],
-                reasoning_effort="none",
-            ),
-        )
-        events = [
-            line[6:]
-            for line in payload.decode().splitlines()
-            if line.startswith("data: ")
-        ]
-        errors = [json.loads(event) for event in events if event.startswith('{"error"')]
-        self.assertEqual(status, 200)
-        self.assertEqual(errors[0]["error"]["code"], "invalid_model_output")
-        self.assertEqual(events[-1], "[DONE]")
-        chunks = [json.loads(event) for event in events[:-1]]
-        self.assertFalse(
-            any(
-                choice.get("delta", {}).get("tool_calls")
-                for chunk in chunks
-                for choice in chunk.get("choices", [])
-            )
-        )
-        self.assertNotIn("<tool_call>", payload.decode())
-
-    def test_streaming_tool_error_cancels_inflight_native_and_recovers(self):
-        function = self.rich_weather_tool()["function"]
-        cases = (
-            (
-                "/v1/chat/completions",
-                self.body(
-                    stream=True,
-                    tools=[{"type": "function", "function": function}],
-                    reasoning_effort="none",
-                ),
-            ),
-            (
-                "/v1/responses",
-                self.responses_body(
-                    stream=True,
-                    tools=[{"type": "function", **function}],
-                    reasoning={"effort": "none"},
-                ),
-            ),
-            (
-                "/v1/messages",
-                self.anthropic_body(
-                    stream=True,
-                    tools=[
-                        {
-                            "name": function["name"],
-                            "input_schema": function["parameters"],
-                        }
-                    ],
-                ),
-            ),
-        )
-        for path, body in cases:
-            with self.subTest(path=path):
-                # The invalid call is emitted while native still has work.
-                # A one-batch immediate completion cannot catch missing aborts.
-                plan = Plan([[8], [4]], delay=1)
-                runtime = FakeRuntime(plan)
-                harness = self.harness(runtime, queue_size=1)
-                status, _, payload = harness.request("POST", path, body)
-                self.assertEqual(status, 200, payload)
-                self.assertIn(
-                    b"api_error" if path == "/v1/messages" else b"invalid_model_output",
-                    payload,
-                )
-                self.assertEqual(runtime.cancel_count, 1)
-                runtime.threads[0].join(1)
-                self.assertEqual(runtime.pending_count, 0)
-                for _ in range(100):
-                    if not harness.backend.active:
-                        break
-                    time.sleep(0.01)
-                self.assertEqual(harness.backend.active, {})
-                self.assertEqual(harness.server.requests.stats()["active"], 0)
-                self.assertFalse(runtime.calls[0].cancel())
-                self.assertEqual(runtime.cancel_count, 1)
-                status, _, _ = harness.request(
-                    "POST", "/v1/chat/completions", self.body(reasoning_effort="none")
-                )
-                self.assertEqual(status, 200)
-
-    def test_parallel_tool_stream_fails_before_releasing_a_valid_first_call(self):
+    def test_parallel_calls_stream_as_the_model_writes_them(self):
+        # No call is checked against its tool's schema: a value its types
+        # cannot read keeps its text.
         tokenizer = FakeTokenizer()
         tokenizer.fragments[25] = (
             "<tool_call>\n<function=weather>\n"
@@ -5740,13 +5639,7 @@ class ServerTest(unittest.TestCase):
                 "required": ["count"],
             },
         }
-        chat_tools = [
-            {
-                "type": "function",
-                "function": {"name": name, "parameters": schema},
-            }
-            for name, schema in schemas.items()
-        ]
+        expected = [("weather", {"city": "Paris"}), ("echo", {"count": "invalid"})]
         harness = self.harness(
             FakeRuntime(Plan([[25]]), Plan([[25]])), tokenizer=tokenizer
         )
@@ -5755,53 +5648,53 @@ class ServerTest(unittest.TestCase):
             "/v1/chat/completions",
             self.body(
                 stream=True,
-                tools=chat_tools,
+                tools=[
+                    {"type": "function", "function": {"name": name, "parameters": s}}
+                    for name, s in schemas.items()
+                ],
                 reasoning_effort="none",
             ),
         )
+        self.assertEqual(status, 200, payload)
         chunks = [
             json.loads(line[6:])
             for line in payload.decode().splitlines()
             if line.startswith("data: {")
         ]
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(chunks[-1]["error"]["code"], "invalid_model_output")
-        self.assertFalse(
-            any(
-                choice.get("delta", {}).get("tool_calls")
-                for chunk in chunks
-                for choice in chunk.get("choices", [])
-            )
+        calls = {}
+        for chunk in chunks:
+            for choice in chunk.get("choices", []):
+                for call in choice["delta"].get("tool_calls", []):
+                    entry = calls.setdefault(call["index"], ["", ""])
+                    entry[0] += call["function"].get("name", "")
+                    entry[1] += call["function"].get("arguments", "")
+        self.assertEqual(
+            [(name, json.loads(arguments)) for name, arguments in calls.values()],
+            expected,
         )
         self.assertNotIn("<tool_call>", payload.decode())
-
-        responses_tools = [
-            {"type": "function", "name": name, "parameters": schema}
-            for name, schema in schemas.items()
-        ]
         status, _, payload = harness.request(
             "POST",
             "/v1/responses",
             self.responses_body(
                 stream=True,
-                tools=responses_tools,
+                tools=[
+                    {"type": "function", "name": name, "parameters": s}
+                    for name, s in schemas.items()
+                ],
                 reasoning={"effort": "none"},
             ),
         )
-        events = self.response_events(payload)
         self.assertEqual(status, 200, payload)
-        self.assertEqual(events[-1]["type"], "response.failed")
+        events = self.response_events(payload)
+        self.assertEqual(events[-1]["type"], "response.completed")
         self.assertEqual(
-            events[-1]["response"]["error"]["code"], "invalid_model_output"
+            [
+                (item["name"], json.loads(item["arguments"]))
+                for item in events[-1]["response"]["output"]
+            ],
+            expected,
         )
-        self.assertFalse(
-            any(
-                event["type"].startswith("response.function_call_arguments")
-                or event.get("item", {}).get("type") == "function_call"
-                for event in events
-            )
-        )
-        self.assertNotIn("<tool_call>", payload.decode())
 
     def test_qwen_reasoning_efforts(self):
         tokenizer = FakeTokenizer()
@@ -5899,7 +5792,7 @@ class ServerTest(unittest.TestCase):
             vision=True,
         )
         for tools, expected in (([], False), ([self.rich_weather_tool()], True)):
-            body = self.body(tools=tools)
+            body = self.body(tools=tools, tool_choice="required" if tools else "auto")
             body["messages"].insert(
                 0,
                 {
@@ -6171,16 +6064,25 @@ class ServerTest(unittest.TestCase):
                 self.assertIsNotNone(prompt.response_validator)
 
     def test_structured_output_keeps_required_tool_choice(self):
-        harness = self.harness(FakeRuntime(Plan([[10]]), Plan([[5]])))
+        # A forced call leaves the response format out of the grammar.
+        factory = FakeConstraintFactory()
+        harness = self.harness(FakeRuntime(Plan([[5]])), constraint_factory=factory)
         body = self.body(
             tools=[self.rich_weather_tool()],
             tool_choice="required",
             reasoning_effort="none",
             response_format={"type": "json_object"},
         )
-        for expected in (500, 200):
-            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
-            self.assertEqual(status, expected, payload)
+        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 200, payload)
+        main = json.loads(factory.grammars[-1])["grammars"][0]["lark_grammar"]
+        self.assertNotIn("answer", main)
+        self.assertEqual(
+            json.loads(payload)["choices"][0]["message"]["tool_calls"][0]["function"][
+                "name"
+            ],
+            "weather",
+        )
 
     def test_structured_stream_keeps_tool_markers_inside_json_strings(self):
         _, policy = tool_schema.normalize_tools(
@@ -6195,12 +6097,10 @@ class ServerTest(unittest.TestCase):
                 events = []
                 for start in range(0, len(payload), width):
                     events.extend(projector.put(payload[start : start + width]))
-                content, _, unsent = projector.finish(False)
+                content, _, owed = projector.finish(False)
                 self.assertEqual(content, payload)
-                self.assertTrue(all(kind == "content" for kind, _ in events))
-                self.assertEqual(
-                    "".join(value for _, value in events) + unsent, payload
-                )
+                self.assertTrue(all(kind == "content" for kind, _ in events + owed))
+                self.assertEqual("".join(value for _, value in events + owed), payload)
 
     def test_structured_tool_response_streams_and_recovers_from_length(self):
         harness = self.harness(FakeRuntime(Plan([[5]]), Plan([[13]], reason="length")))
@@ -6321,42 +6221,56 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("<tool_call>", payload.decode())
 
     def test_tool_constraint_requires_object_parameters(self):
+        # Where a strict tool's grammar frames its arguments; any tool's name
+        # must fit the template either way.
         factory = FakeConstraintFactory()
         harness = self.harness(FakeRuntime(), constraint_factory=factory)
         cases = (
+            ({"parameters": {"type": "string"}}, "top-level JSON object"),
             (
-                {"name": "bad", "parameters": {"type": "string"}},
-                "top-level JSON object",
-            ),
-            (
-                {
-                    "name": "bad",
-                    "parameters": {
-                        "type": "object",
-                        "$ref": "#/$defs/missing",
-                    },
-                },
+                {"parameters": {"type": "object", "$ref": "#/$defs/missing"}},
                 "unresolved tool parameter reference",
             ),
             (
                 {
-                    "name": "bad",
                     "parameters": {
                         "type": "object",
                         "properties": {" leading": {"type": "string"}},
-                    },
+                    }
                 },
                 "invalid tool parameter name",
             ),
-            ({"name": "bad>name", "parameters": {}}, "tool name must match"),
+            (
+                {
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"n" * 257: {"type": "string"}},
+                    }
+                },
+                "invalid tool parameter name",
+            ),
         )
         for function, message in cases:
-            tool = {"type": "function", "function": function}
-            status, _, payload = harness.request(
-                "POST", "/v1/chat/completions", self.body(tools=[tool])
-            )
-            self.assertEqual(status, 400)
-            self.assertIn(message, json.loads(payload)["error"]["message"])
+            for strict in (False, True):
+                tool = {
+                    "type": "function",
+                    "function": {"name": "bad", **function, "strict": strict},
+                }
+                with self.subTest(message=message, strict=strict):
+                    status, _, payload = harness.request(
+                        "POST", "/v1/chat/completions", self.body(tools=[tool])
+                    )
+                    if not strict:
+                        self.assertEqual(status, 200, payload)
+                        continue
+                    self.assertEqual(status, 400)
+                    self.assertIn(message, json.loads(payload)["error"]["message"])
+        tool = {"type": "function", "function": {"name": "bad>name", "parameters": {}}}
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(tools=[tool])
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("tool name must match", json.loads(payload)["error"]["message"])
         self.assertEqual(factory.grammars, [])
 
     def test_tool_constraint_accepts_nullable_non_strings(self):
@@ -6370,35 +6284,6 @@ class ServerTest(unittest.TestCase):
             grammar = argument_grammar(schema)
             self.assertIn("%json", grammar)
             self.assertNotIn("RAW_START", grammar)
-
-    def test_nullable_strings_use_json_and_preserve_string_null(self):
-        variants = (
-            {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            {"oneOf": [{"type": "string"}, {"type": "null"}]},
-            {"type": ["string", "null"]},
-            {"enum": ["null", None]},
-        )
-        for value_schema in variants:
-            with self.subTest(schema=value_schema):
-                schema = {
-                    "type": "object",
-                    "properties": {"value": value_schema},
-                    "required": ["value"],
-                }
-                grammar = argument_grammar(schema)
-                self.assertIn("%json", grammar)
-                policy = tool_policy({"echo": schema})
-                values = []
-                for wire in ("null", '"null"'):
-                    text = (
-                        "<tool_call>\n<function=echo>\n<parameter=value>\n"
-                        f"{wire}\n</parameter>\n</function>\n</tool_call>"
-                    )
-                    _, calls, _ = project(text, policy)
-                    values.append(
-                        json.loads(calls[0]["function"]["arguments"])["value"]
-                    )
-                self.assertEqual(values, [None, "null"])
 
     def test_validation(self):
         harness = self.harness(FakeRuntime())
@@ -6438,17 +6323,6 @@ class ServerTest(unittest.TestCase):
                 tools=[
                     {"type": "function", "function": {"name": "same"}},
                     {"type": "function", "function": {"name": "same"}},
-                ]
-            ),
-            self.body(
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "f",
-                            "parameters": {"type": "unknown"},
-                        },
-                    }
                 ]
             ),
             self.body(
@@ -8528,9 +8402,10 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(events[-1].response.status, "completed")
 
-        failed_harness = self.harness(FakeRuntime(Plan([[8]])))
-        with self.openai_client(failed_harness) as client:
-            failed = list(
+        # A value outside the tool's schema reads back as the model wrote it.
+        outside_harness = self.harness(FakeRuntime(Plan([[28]])))
+        with self.openai_client(outside_harness) as client:
+            outside = list(
                 client.responses.create(
                     model="test-model",
                     input="weather",
@@ -8541,9 +8416,8 @@ class ServerTest(unittest.TestCase):
                     tools=[tool],
                 )
             )[-1]
-        self.assertEqual(type(failed).__name__, "ResponseFailedEvent")
-        self.assertEqual(failed.response.status, "failed")
-        self.assertEqual(failed.response.error.code, "invalid_model_output")
+        self.assertEqual(type(outside).__name__, "ResponseCompletedEvent")
+        self.assertEqual(outside.response.output[0].arguments, '{"city":"3"}')
 
     def test_responses_tool_history_named_choice_and_output(self):
         runtime = FakeRuntime(Plan([[5]]))
@@ -8816,7 +8690,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(namespaces[aliases[0]], (namespace, first_name))
         self.assertEqual(_namespace_alias(namespace, first_name), aliases[0])
 
-    def test_responses_streaming_tool_call_and_failed_event(self):
+    def test_responses_streaming_tool_calls(self):
         tool = {
             "type": "function",
             "name": "weather",
@@ -8826,7 +8700,7 @@ class ServerTest(unittest.TestCase):
                 "required": ["city"],
             },
         }
-        harness = self.harness(FakeRuntime(Plan([[5]]), Plan([[8]])))
+        harness = self.harness(FakeRuntime(Plan([[5]]), Plan([[28]])))
         status, _, payload = harness.request(
             "POST",
             "/v1/responses",
@@ -8899,6 +8773,7 @@ class ServerTest(unittest.TestCase):
             [event["sequence_number"] for event in events], list(range(len(events)))
         )
 
+        # A value outside the tool's enum comes back as written.
         status, _, payload = harness.request(
             "POST",
             "/v1/responses",
@@ -8910,24 +8785,12 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         events = self.response_events(payload)
+        self.assertEqual(events[-1]["type"], "response.completed")
         self.assertEqual(
-            [event["type"] for event in events],
-            ["response.created", "response.in_progress", "response.failed"],
+            [item["arguments"] for item in events[-1]["response"]["output"]],
+            ['{"city":"3"}'],
         )
-        self.assertEqual(events[-1]["response"]["status"], "failed")
-        self.assertEqual(
-            events[-1]["response"]["error"]["code"], "invalid_model_output"
-        )
-        self.assertEqual([event["sequence_number"] for event in events], [0, 1, 2])
         self.assertNotIn("<tool_call>", payload.decode())
-        self.assertNotIn("response.completed", [event["type"] for event in events])
-        self.assertFalse(
-            any(
-                event["type"].startswith("response.function_call_arguments")
-                or event.get("item", {}).get("type") == "function_call"
-                for event in events
-            )
-        )
 
     def test_responses_output_items_carry_distinct_ids(self):
         tool = {

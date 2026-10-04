@@ -10,41 +10,33 @@ from server import server as api
 
 
 class OutputValidationTests(unittest.TestCase):
+    """A structured answer checked against its response format. Tool calls
+    go unchecked."""
+
     def test_evaluation_failures_are_distinct_from_invalid_output(self):
         schema = {"type": "string", "pattern": "^Paris$"}
         _, validator = tool_schema.normalize_response_format(
             {"type": "json_schema", "json_schema": {"schema": schema}}
         )
-        _, policy = tool_schema.normalize_tools(
-            [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
-            "auto",
-            True,
-        )
 
-        def validate_tool(value):
-            model_output.validate_tool_calls(
-                [{"function": {"name": "echo", "arguments": value}}], policy
-            )
+        def validate(value):
+            model_output.validate_response_content(value, validator)
 
-        for validate in (
-            lambda value: model_output.validate_response_content(value, validator),
-            validate_tool,
-        ):
-            for failure in (TimeoutError(), schema_validation.regex.error("test")):
-                with (
-                    self.subTest(failure=type(failure).__name__),
-                    mock.patch.object(
-                        schema_validation.regex, "search", side_effect=failure
-                    ),
-                ):
-                    with self.assertRaises(api.APIError) as caught:
-                        validate('"Paris"')
-                    self.assertEqual(caught.exception.status, 500)
-                    self.assertEqual(caught.exception.code, "output_validation_failed")
-            with self.assertRaises(api.APIError) as caught:
-                validate('"London"')
-            self.assertEqual(caught.exception.status, 500)
-            self.assertEqual(caught.exception.code, "invalid_model_output")
+        for failure in (TimeoutError(), schema_validation.regex.error("test")):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(
+                    schema_validation.regex, "search", side_effect=failure
+                ),
+            ):
+                with self.assertRaises(api.APIError) as caught:
+                    validate('"Paris"')
+                self.assertEqual(caught.exception.status, 500)
+                self.assertEqual(caught.exception.code, "output_validation_failed")
+        with self.assertRaises(api.APIError) as caught:
+            validate('"London"')
+        self.assertEqual(caught.exception.status, 500)
+        self.assertEqual(caught.exception.code, "invalid_model_output")
 
     def test_reference_lookup_crashes_are_evaluation_failures(self):
         # referencing's draft 3 crawls an extends object's keys as schemas once a
@@ -66,21 +58,10 @@ class OutputValidationTests(unittest.TestCase):
         _, validator = tool_schema.normalize_response_format(
             {"type": "json_schema", "json_schema": {"schema": schema}}
         )
-        _, policy = tool_schema.normalize_tools(
-            [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
-            "auto",
-            True,
-        )
-        for validate in (
-            lambda value: model_output.validate_response_content(value, validator),
-            lambda value: model_output.validate_tool_calls(
-                [{"function": {"name": "echo", "arguments": value}}], policy
-            ),
-        ):
-            with self.assertRaises(api.APIError) as caught:
-                validate('{"a": {"b": "y"}}')
-            self.assertEqual(caught.exception.status, 500)
-            self.assertEqual(caught.exception.code, "output_validation_failed")
+        with self.assertRaises(api.APIError) as caught:
+            model_output.validate_response_content('{"a": {"b": "y"}}', validator)
+        self.assertEqual(caught.exception.status, 500)
+        self.assertEqual(caught.exception.code, "output_validation_failed")
 
     def test_invalid_request_schemas_remain_client_errors(self):
         schema = {"type": 7}
@@ -106,22 +87,13 @@ class OutputValidationTests(unittest.TestCase):
 
     def test_protocols_report_evaluation_failure_and_accept_next_request(self):
         schema = {"type": "object", "patternProperties": {".*": {}}}
-        function = {
-            "name": "weather",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string", "pattern": "^Paris$"}},
-            },
-        }
-        for path, tools, stream in product(
+        for path, stream in product(
             ("/v1/chat/completions", "/v1/responses", "/v1/messages"),
             (False, True),
-            (False, True),
         ):
-            with self.subTest(path=path, tools=tools, stream=stream):
-                token = 5 if tools else 10
+            with self.subTest(path=path, stream=stream):
                 harness = Harness(
-                    FakeRuntime(Plan([[token]]), Plan([[token]])),
+                    FakeRuntime(Plan([[10]]), Plan([[10]])),
                     constraint_factory=FakeConstraintFactory(),
                 )
                 body = {"model": "test-model", "stream": stream}
@@ -130,43 +102,29 @@ class OutputValidationTests(unittest.TestCase):
                         input="hello",
                         max_output_tokens=16,
                         reasoning={"effort": "none"},
-                    )
-                    if tools:
-                        body["tools"] = [{"type": "function", **function}]
-                    else:
-                        body["text"] = {
+                        text={
                             "format": {
                                 "type": "json_schema",
                                 "name": "answer",
                                 "schema": schema,
                             }
-                        }
+                        },
+                    )
                 else:
                     body.update(
                         messages=[{"role": "user", "content": "hello"}], max_tokens=16
                     )
                     if path == "/v1/messages":
                         body["thinking"] = {"type": "disabled"}
-                        if tools:
-                            body["tools"] = [
-                                {
-                                    "name": "weather",
-                                    "input_schema": function["parameters"],
-                                }
-                            ]
-                        else:
-                            body["output_config"] = {
-                                "format": {"type": "json_schema", "schema": schema}
-                            }
+                        body["output_config"] = {
+                            "format": {"type": "json_schema", "schema": schema}
+                        }
                     else:
                         body["reasoning_effort"] = "none"
-                        if tools:
-                            body["tools"] = [{"type": "function", "function": function}]
-                        else:
-                            body["response_format"] = {
-                                "type": "json_schema",
-                                "json_schema": {"name": "answer", "schema": schema},
-                            }
+                        body["response_format"] = {
+                            "type": "json_schema",
+                            "json_schema": {"name": "answer", "schema": schema},
+                        }
                 try:
                     with mock.patch.object(
                         schema_validation.regex, "search", side_effect=TimeoutError

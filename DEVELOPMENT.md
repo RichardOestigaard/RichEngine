@@ -250,6 +250,31 @@ at the template's default effort where the effort is `none`. `enable_thinking`
 must be a boolean; null leaves it to the effort. They cannot set what Splash
 passes itself, such as `tools` or `add_generation_prompt`.
 
+## Tool calls
+
+With `tool_choice` `auto`, parallel calls allowed and no tool marked
+`"strict": true`, nothing constrains the output: the model writes its calls in
+the chat template's layout as it would without a grammar, and each call reads
+back as written. A grammar constrains the output under a `required` or named
+`tool_choice`, with `"parallel_tool_calls": false`, beside a strict tool or a
+response format, and under `tool_choice: "none"`, which keeps calls out. It
+holds each call to the template's layout and an offered tool's name, and a
+strict tool's arguments to its schema; other tools' arguments stay free. A
+strict tool's parameters come in schema order, as OpenAI's strict mode writes
+them, which requires every field; an optional field written after a later one
+cannot be placed. A Responses tool that omits `strict` is not strict.
+
+Each value converts by the JSON types its tool declares for it: to the JSON
+the text spells when that is of a declared type or when none of them is a
+string, and otherwise it stays the text. For `["string", "number"]`, `12:00`
+and `0800` stay strings and `12` becomes a number; a parameter of any type,
+one the tool does not declare included, is the JSON its text spells, a string
+kept as written. A boolean or null declared without a string may also be
+spelled `True`, `False` or `None`, as templates that write values through
+Jinja's `string` filter spell them. Calls are not validated against their
+schemas; a client reports what its tool rejects. A `stop` string cannot be
+combined with tools a call may name, since it could cut a call.
+
 ## Upstream model loading
 
 `install/upstream.py` installs a model from its upstream repository: it
@@ -786,20 +811,35 @@ resource wait) and its clocks and live host-memory estimate through
 production parameter; `make architecture-check` keeps production from writing
 that configuration.
 
-Tools can be combined with structured answers. Tool argument framing resolves
-local references and projects object fields through schema composition. The
-original schema validates complete arguments, including cross-field conditions,
-dependencies and property-count rules that framing alone cannot enforce; array
-item bounds and `multipleOf` above 64 are left to that validation as well, as
-are patterns the grammar cannot compile (look-around, word boundaries,
-backreferences). The framed schemas of one request are limited to 16 MiB. Extra
-properties use JSON-encoded values; statically typed strings retain raw text,
-so their patterns are checked on the complete call.
+`dev/tests/engine/test_tool_call_reading.py` holds model outputs with the calls
+and content they read as. The projector reads a call as the chat template lays
+it out: it opens at `<tool_call>` and the newline before `<function=`, and a
+value ends at `\n</parameter>\n` where the next parameter, `</function>` or
+`</tool_call>` follows, so a value may hold the tags in any other order, as a
+file an agent writes may. Tags written otherwise are text. Names lose the space
+around them; a call that names no function is dropped, and so is a `</think>`
+in text; a repeated parameter keeps its first value, which has streamed; text
+after a call stays content, with or without its `</tool_call>`; a call the
+token limit cuts keeps the arguments it streamed; and JSON that would decode to
+a lone surrogate or nest past 256 levels keeps its text, which writes back as
+valid JSON. A call's opening also ends the reasoning where a call may follow.
+Every tool's schema is checked as the request arrives, and its arguments are
+framed through schema composition and local references, which give each
+parameter its types. A strict tool's framed arguments are closed, so that an
+object or an array takes nothing it does not declare. Its values are written in
+Qwen XML: raw text where any string may be the value, whose pattern, format and
+length go unenforced; otherwise one of the values each member of the value's
+union lists, as its text, or JSON of a member that lists none, leaving out
+array item bounds and `multipleOf` above 64 and patterns the grammar cannot
+compile (look-around, word boundaries, backreferences). The framed schemas of
+one request are limited to 16 MiB, and a strict tool's parameter names cannot
+contain XML delimiters, start or end with whitespace, or run past 256
+characters. What a grammar writes reads back as written: raw text ends at its
+first `\n</parameter>\n`, and an enumerated value that holds one returns 400.
 `tool_choice: "none"` renders the tools like any other choice and only
-prevents calls. Remote schema references, parameter names containing XML
-delimiters and `unevaluatedProperties` combined with `patternProperties` are
-unsupported. Hosted search is unsupported; configure client-owned tools such as
-MCP. Omitted effort uses the model default.
+prevents calls. Remote schema references and `unevaluatedProperties` combined
+with `patternProperties` are unsupported. Hosted search is unsupported;
+configure client-owned tools such as MCP. Omitted effort uses the model default.
 `response_format` constrains generation and validates final output; it does not
 inject formatting instructions into the prompt. Clients should describe their
 output requirements in their own messages.
@@ -924,10 +964,11 @@ Chat and text completions accept `"ignore_eos":true` (default false), as vLLM
 and llama.cpp do: the model never selects its own stop tokens, and a draft
 proposal of one is rejected, so generation runs to its output budget and
 finishes with `length` unless a `stop` string ends it first. Benchmarks use it
-to generate a fixed number of tokens. Tools and structured output generate
-under a grammar, which decides where the output ends, so combining them with
-`ignore_eos` returns 400. The engine receives it as bit 0 of the request
-frame's flags word, which rejects undefined bits.
+to generate a fixed number of tokens. Constrained tool calls, output under
+`tool_choice: "none"` and structured output generate under a grammar, which
+decides where the output ends, so combining them with `ignore_eos` returns 400.
+The engine receives it as bit 0 of the request frame's flags word, which
+rejects undefined bits.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,

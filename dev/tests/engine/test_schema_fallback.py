@@ -18,7 +18,6 @@ from dev.tests.test_server import (
 from server import output as model_output
 from server import server as api
 from server import tool_schema
-from server.tool_schema import raw_string_schema
 
 
 class SchemaFallbackTests(unittest.TestCase):
@@ -29,17 +28,25 @@ class SchemaFallbackTests(unittest.TestCase):
         cls.tokenizer = helpers.StructuredToolGrammarTest.tokenizer
 
     def policy(self, schema):
+        """The policy of a required call of a strict tool, whose arguments
+        its grammar frames."""
+        function = {"name": "test", "parameters": schema, "strict": True}
         return tool_schema.normalize_tools(
-            [{"type": "function", "function": {"name": "test", "parameters": schema}}],
-            "required",
-            False,
+            [{"type": "function", "function": function}], "required", False
         )[1]
 
     @staticmethod
-    def framed_value(schema):
-        """The `value` parameter's schema as a request frames it."""
-        budget = [tool_schema.MAX_FRAMED_SCHEMA_BYTES]
-        return tool_schema.tool_argument_schema(schema, budget)["properties"]["value"]
+    def json_schemas(grammar):
+        """The schemas `grammar` compiles as JSON values."""
+        try:
+            sources = [part["lark_grammar"] for part in json.loads(grammar)["grammars"]]
+        except ValueError:
+            sources = [grammar]
+        decoder = json.JSONDecoder()
+        for source in sources:
+            for _, _, rest in (line.partition("%json ") for line in source.split("\n")):
+                if rest:
+                    yield decoder.raw_decode(rest)[0]
 
     @staticmethod
     def call(value):
@@ -80,24 +87,10 @@ class SchemaFallbackTests(unittest.TestCase):
         self.assertIs(type(json.loads(arguments)["value"]), type(expected))
         self.assertEqual(schema, original)
         self.assertEqual(policy.schemas["test"], original)
-        # Generation grammar is not the final authority: retain the exact
-        # original schema for checking completed calls.
-        with self.assertRaises(api.APIError):
-            model_output.validate_tool_calls(
-                [
-                    {
-                        "id": "bad",
-                        "type": "function",
-                        "function": {
-                            "name": "test",
-                            "arguments": json.dumps({"value": 7}),
-                        },
-                    }
-                ],
-                policy,
-            )
 
-    def test_string_union_with_outer_assertions_uses_json_encoding(self):
+    def test_enumerated_strings_are_written_as_their_text(self):
+        # An enumerated value is written in Qwen XML as its text, whatever
+        # other assertions stand beside it.
         for kind in ("anyOf", "oneOf"):
             schema = {
                 "type": "object",
@@ -111,8 +104,7 @@ class SchemaFallbackTests(unittest.TestCase):
                 "required": ["value"],
             }
             with self.subTest(kind=kind):
-                self.assertIsNone(raw_string_schema(self.framed_value(schema)))
-                self.verify(schema, '"red"', ['"blue"', "red", "7"], "red")
+                self.verify(schema, "red", ['"red"', "blue", "7"], "red")
 
     def test_local_reference_and_sibling_constraints_are_both_retained(self):
         schema = {
@@ -121,8 +113,7 @@ class SchemaFallbackTests(unittest.TestCase):
             "properties": {"value": {"$ref": "#/$defs/Choice", "const": "1"}},
             "required": ["value"],
         }
-        self.assertIsNone(raw_string_schema(self.framed_value(schema)))
-        self.verify(schema, '"1"', ['"2"', "1", "7"], "1")
+        self.verify(schema, "1", ['"1"', "2", "7"], "1")
         plain = {
             "type": "object",
             "properties": {"value": {"type": "string", "const": "1"}},
@@ -140,7 +131,7 @@ class SchemaFallbackTests(unittest.TestCase):
             {"id": "ORD-1234"},
         )
         # An unanchored pattern keeps its search semantics; look-around cannot
-        # compile and stays with validation of the complete output.
+        # compile and a response format checks it on the complete output.
         schema = {
             "type": "object",
             "properties": {
@@ -186,7 +177,10 @@ class SchemaFallbackTests(unittest.TestCase):
         }
         self.verify(schema, '["red"]', ['["red","blue"]', "[7]", '"red"'], ["red"])
 
-    def test_unsupported_generation_constraints_remain_enforced_on_output(self):
+    def test_unsupported_generation_constraints_remain_enforced_on_answers(self):
+        # A grammar leaves out what it cannot compile. A response format
+        # checks it on the complete answer; a strict tool's arguments go
+        # without it.
         schema = {
             "type": "object",
             "properties": {
@@ -226,18 +220,11 @@ class SchemaFallbackTests(unittest.TestCase):
             model_output.validate_response_content('{"value":["red","red"]}', validator)
         self.assertEqual(caught.exception.code, "invalid_model_output")
         projector = model_output.StreamingToolCallProjector(policy, "owned")
-        deltas = []
-        with self.assertRaises(api.APIError) as caught:
-            for character in self.call('["red","red"]'):
-                deltas.extend(projector.put(character))
-        self.assertEqual(caught.exception.code, "invalid_model_output")
-        arguments = "".join(
-            value.get("function", {}).get("arguments", "")
-            for kind, value in deltas
-            if kind == "tool"
-        )
-        with self.assertRaises(json.JSONDecodeError):
-            json.loads(arguments)
+        for character in self.call('["red","red"]'):
+            projector.put(character)
+        _, calls, _ = projector.finish(False)
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments, {"value": ["red", "red"]})
         self.assertEqual(schema, original)
         self.assertEqual(policy.schemas["test"], original)
 
@@ -268,15 +255,20 @@ class SchemaFallbackTests(unittest.TestCase):
                 tool_schema.tool_grammar(policy, False, schema),
             ):
                 with self.subTest(keyword=keyword, grammar=grammar[:60]):
-                    self.assertNotIn(str(huge), grammar)
+                    for compiled in self.json_schemas(grammar):
+                        self.assertNotIn(str(huge), json.dumps(compiled))
                     self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
 
-    def test_bounds_above_the_grammar_ceiling_are_validated_on_output(self):
+    def test_bounds_above_the_grammar_ceiling_are_left_out(self):
         limit = tool_schema.MAX_GRAMMAR_BOUND
         violations = (
-            ("maxItems", "array", lambda bound: [0] * (bound + 1)),
-            ("minItems", "array", lambda bound: [0]),
-            ("multipleOf", "integer", lambda bound: 1),
+            (
+                "maxItems",
+                {"type": "array", "items": {}},
+                lambda bound: [0] * (bound + 1),
+            ),
+            ("minItems", {"type": "array", "items": {}}, lambda bound: [0]),
+            ("multipleOf", {"type": "integer"}, lambda bound: 1),
         )
         for (keyword, kind, violation), bound in product(
             violations, (limit, limit + 1)
@@ -284,7 +276,7 @@ class SchemaFallbackTests(unittest.TestCase):
             value = violation(bound)
             schema = {
                 "type": "object",
-                "properties": {"value": {"type": kind, keyword: bound}},
+                "properties": {"value": {**kind, keyword: bound}},
                 "required": ["value"],
             }
             with self.subTest(keyword=keyword, bound=bound):
@@ -300,17 +292,10 @@ class SchemaFallbackTests(unittest.TestCase):
                     and matcher.is_accepting()
                 )
                 self.assertEqual(accepted, bound > limit)
-                call = {
-                    "function": {
-                        "name": "test",
-                        "arguments": json.dumps({"value": value}),
-                    }
-                }
-                with self.assertRaises(api.APIError) as caught:
-                    model_output.validate_tool_calls([call], policy)
-                self.assertEqual(caught.exception.code, "invalid_model_output")
 
-    def test_deferred_assertions_across_protocols_and_streaming(self):
+    def test_deferred_assertions_check_answers_but_not_calls(self):
+        # A response format checks what its grammar left out on the complete
+        # answer; a tool's arguments go unchecked.
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
@@ -392,6 +377,11 @@ class SchemaFallbackTests(unittest.TestCase):
                 )
                 try:
                     status, _, payload = harness.request("POST", path, body)
+                    if tool:
+                        self.assertEqual(status, 200, payload)
+                        self.assertNotIn(b"invalid", payload)
+                        self.assertIn(b"Paris", payload)
+                        continue
                     self.assertEqual(status, 200 if stream else 500, payload)
                     self.assertIn(b"invalid", payload)
                     self.assertNotIn(b'"type":"message_stop"', payload)
@@ -400,7 +390,7 @@ class SchemaFallbackTests(unittest.TestCase):
                 finally:
                     harness.close()
 
-    def test_top_level_tool_layout_constraints_compile_and_preserve_validation(self):
+    def test_top_level_tool_layout_constraints_compile(self):
         constraints = {
             "$ref": "#/$defs/Value",
             "$dynamicRef": "#/$defs/Value",
@@ -433,28 +423,6 @@ class SchemaFallbackTests(unittest.TestCase):
                 self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
                 self.assertEqual(schema, original)
                 self.assertEqual(policy.schemas["test"], original)
-                from jsonschema import Draft202012Validator
-
-                validator = Draft202012Validator(original)
-                for arguments in (
-                    {},
-                    {"value": "ok"},
-                    {"value": 7},
-                    {"value": "ok", "other": True},
-                ):
-                    calls = [
-                        {
-                            "function": {
-                                "name": "test",
-                                "arguments": json.dumps(arguments),
-                            }
-                        }
-                    ]
-                    if validator.is_valid(arguments):
-                        model_output.validate_tool_calls(calls, policy)
-                    else:
-                        with self.assertRaises(api.APIError):
-                            model_output.validate_tool_calls(calls, policy)
 
     def test_missing_and_remote_references_remain_explicit_errors(self):
         for reference in ("#/$defs/missing", "https://example.com/schema.json"):
@@ -552,13 +520,19 @@ class SchemaFallbackTests(unittest.TestCase):
 
     def test_unchecked_keywords_of_older_dialects_are_request_errors(self):
         # An older declared dialect leaves newer keywords unchecked, so they
-        # can hold any value. That is the client's schema error, not a crash.
+        # can hold any value. That is the client's schema error, not a crash;
+        # a value's keyword that names nothing leaves the value unconstrained.
+        schema = {
+            "$schema": "http://json-schema.org/draft-03/schema#",
+            "type": "object",
+            "properties": {"value": {"anyOf": 5}},
+        }
+        self.assertIn("/(?s:.*)/", tool_schema.tool_grammar(self.policy(schema), False))
         for draft, keywords in (
             ("draft-07", {"dependentSchemas": 5}),
             ("draft-03", {"allOf": 5}),
             ("draft-03", {"required": True}),
             ("draft-04", {"$ref": {"a": 1}}),
-            ("draft-03", {"properties": {"value": {"anyOf": 5}}}),
         ):
             schema = {
                 "$schema": f"http://json-schema.org/{draft}/schema#",
