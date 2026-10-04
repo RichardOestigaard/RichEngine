@@ -213,9 +213,16 @@ class ArchitectureTests(unittest.TestCase):
     def test_production_measures_time_the_mac_is_awake(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            clock = root / "runtime/AwakeClock.hpp"
-            clock.parent.mkdir(parents=True)
-            clock.write_text("clock_gettime_nsec_np(CLOCK_UPTIME_RAW);\n")
+            # What production measures time with: durations on the awake
+            # clock and its waits, wall-clock instants on the system clock.
+            allowed = root / "runtime/engine/Clocks.cpp"
+            allowed.parent.mkdir(parents=True)
+            allowed.write_text(
+                "AwakeClock::now();\n"
+                "wake.wait_until(lock, AwakeClock::now() + kSlice, ready);\n"
+                "std::this_thread::sleep_for(kPoll);\n"
+                "std::chrono::system_clock::now();\n"
+            )
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
                 for relative, text in (

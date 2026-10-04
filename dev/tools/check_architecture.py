@@ -29,8 +29,9 @@ OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
 OPERATOR_WORKSPACE_POLICY = re.compile(
     r"\b(?:" + "|".join(OPERATOR_WORKSPACE_POLICY_NAMES) + r")\b"
 )
-# The standard library's clocks that also count sleep, and the timed waits
-# that measure on them; production measures time on AwakeClock.
+# The standard library's steady clocks, which count sleep on macOS, and the
+# timed waits that measure on them; production measures durations on
+# AwakeClock and wall-clock instants on system_clock.
 SLEEP_COUNTING_CLOCK = re.compile(
     r"\b(?:steady_clock|high_resolution_clock|wait_for|try_lock_for"
     r"|try_acquire_for)\b"

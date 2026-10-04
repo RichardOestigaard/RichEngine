@@ -10,13 +10,6 @@
 #include <utility>
 
 namespace splash::engine {
-namespace {
-
-double millisecondsSince(AwakeClock::time_point start) {
-  return std::chrono::duration<double, std::milli>(AwakeClock::now() - start).count();
-}
-
-} // namespace
 
 KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
     : storage_(storage), extentPages_(storage.extentPages()),

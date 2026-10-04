@@ -785,8 +785,10 @@ queue's bound, the latency window, the prefill checkpoint interval and the
 resource wait) and its clocks and live host-memory estimate through
 `runtime/TestConfig.hpp` with `test::ScopedTestConfig`, never through a
 production parameter; `make architecture-check` keeps production from writing
-that configuration, and from measuring time on a clock that counts sleep: the
-runtime measures it on `AwakeClock` (`runtime/AwakeClock.hpp`).
+that configuration, and from measuring durations on the standard library's
+steady clock or its timed waits, which count sleep: the runtime measures them
+on `AwakeClock` (`runtime/AwakeClock.hpp`), and wall-clock instants on
+`system_clock`.
 
 Tools can be combined with structured answers. Tool argument framing resolves
 local references and projects object fields through schema composition. The

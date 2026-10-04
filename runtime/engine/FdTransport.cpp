@@ -334,8 +334,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     }
 
     const bool progressed = loop.tick();
-    const double tickMilliseconds = std::chrono::duration<double, std::milli>(
-        AwakeClock::now() - stepStarted).count();
+    const double tickMilliseconds = millisecondsSince(stepStarted);
     if (tickMilliseconds > maxTickMilliseconds_)
       maxTickMilliseconds_ = tickMilliseconds;
     if (progressed)

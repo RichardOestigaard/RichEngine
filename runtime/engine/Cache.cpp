@@ -725,9 +725,8 @@ bool Cache::compactExtent() {
     if (first < pages)
       pagesChanged(active, static_cast<uint32_t>(first));
   }
-  extentCompactMaxMilliseconds_ = std::max(
-      extentCompactMaxMilliseconds_,
-      std::chrono::duration<double, std::milli>(AwakeClock::now() - start).count());
+  extentCompactMaxMilliseconds_ =
+      std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
   return true;
 }
 
