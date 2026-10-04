@@ -390,8 +390,6 @@ class ChatTemplateProbeTests(unittest.TestCase):
         # effort, so there the patch would render that message twice.
         guard = "{%- if not loop.first %}"
         for effort in chat_templates.REASONING_EFFORTS:
-            if effort == "none":  # reaches the template as enable_thinking only
-                continue
             text = source("qwen36").replace(
                 guard, f"{{%- if not loop.first or reasoning_effort == '{effort}' %}}"
             )
@@ -728,12 +726,73 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     {**body, "chat_template_kwargs": kwargs}, deadline=fixtures.FOREVER
                 )
 
+    def test_both_template_switches_follow_the_thinking_mode(self):
+        """Thinking off reaches the template as enable_thinking false and as
+        reasoning_effort "none", by effort none or the request's own
+        enable_thinking: Nex-N2.5's template turns reasoning off by the
+        latter alone. A template that rejects "none" renders by
+        enable_thinking alone while thinking is off, and fails the request
+        when it is on: a "none" the request sets itself is never dropped
+        into thinking."""
+        # Nex-N2.5's generation prompt: thinking unless the effort is none.
+        by_effort = (
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n"
+            "{{ m.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n"
+            "{% if reasoning_effort == 'none' %}<think>\n\n</think>\n\n"
+            "{% else %}<think>{% endif %}{% endif %}"
+        )
+        # Checks the effort whether or not thinking is on.
+        rejects_none = (
+            "{% if reasoning_effort is defined and reasoning_effort != 'low' %}"
+            "{{ raise_exception('Unexpected reasoning effort') }}{% endif %}"
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n"
+            "{{ m.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n"
+            "{% if enable_thinking is false %}<think>\n\n</think>\n\n"
+            "{% else %}<think>\n{% endif %}{% endif %}"
+        )
+        off, on = {"enable_thinking": False}, {"enable_thinking": True}
+        effort_none = {"reasoning_effort": "none"}
+        cases = (
+            # Template, server default, request fields, thinking (None: 400).
+            (by_effort, None, {"reasoning_effort": "none"}, False),
+            (by_effort, None, {"reasoning_effort": "low"}, True),
+            (by_effort, "high", {"chat_template_kwargs": off}, False),
+            (by_effort, "none", {"chat_template_kwargs": on}, True),
+            (rejects_none, None, {"reasoning_effort": "none"}, False),
+            (rejects_none, None, {"reasoning_effort": "low"}, True),
+            # Qwen3.8's rejects "none" only while thinking.
+            (source("qwen38"), "none", {}, False),
+            (source("qwen38"), "none", {"chat_template_kwargs": on}, True),
+            (source("qwen38"), None, {"chat_template_kwargs": effort_none}, None),
+        )
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "Hi"}]}
+        for template, default, fields, thinking in cases:
+            app = fixtures.make_frontend(
+                chat_tokenizer(template, "<|im_start|>", "<|im_end|>"),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=False,
+                default_reasoning_effort=default,
+            )
+            with self.subTest(template=template[:40], default=default, fields=fields):
+                if thinking is None:
+                    with self.assertRaisesRegex(APIError, "could not be rendered"):
+                        app.prepare({**body, **fields}, deadline=fixtures.FOREVER)
+                    continue
+                job = app.prepare({**body, **fields}, deadline=fixtures.FOREVER)
+                self.assertEqual(job.thinking, thinking)
+
     class ScoringTokenizer(
         fixtures.TemplateTokenizer, fixtures.ServerTest.CharTokenizer
     ):
         """Renders the real template; one token per character for answer slots."""
 
-    def test_scoring_prompts_use_the_template_chosen_at_startup(self):
+    def test_scoring_prompts_render_without_thinking_in_the_startup_template(self):
         tokenizer = self.ScoringTokenizer(source("qwen36"))
         app = fixtures.make_frontend(
             tokenizer, None, "test-model", 8192, 10, 2, vision=True
@@ -747,8 +806,15 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             deadline=fixtures.FOREVER,
         )
         self.assertEqual(
-            [kwargs.get("chat_template") for _, kwargs in tokenizer.templates],
-            [app.chat_templates.select(None).source] * 2,
+            [
+                (
+                    kwargs.get("chat_template"),
+                    kwargs.get("enable_thinking"),
+                    kwargs.get("reasoning_effort"),
+                )
+                for _, kwargs in tokenizer.templates
+            ],
+            [(app.chat_templates.select(None).source, False, "none")] * 2,
         )
 
     def test_codex_shaped_responses_render_instructions_first_and_later_in_place(self):

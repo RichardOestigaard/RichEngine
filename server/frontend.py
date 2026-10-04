@@ -843,6 +843,7 @@ class Frontend:
                 preserve_thinking=prompt.preserve_thinking,
                 tools=prompt.tools,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=prompt.template_kwargs.get("enable_thinking"),
             ),
             **prompt.template_kwargs,
         }

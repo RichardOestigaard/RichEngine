@@ -39,6 +39,8 @@ import string
 import weakref
 from dataclasses import dataclass
 
+from .chat_templates import render_chat_template, template_options
+
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
     "Apply the supplied criterion to the supplied evidence. Choose exactly one "
@@ -187,7 +189,8 @@ def slot_labels(tokenizer):
 
 
 def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoint):
-    """Render messages with chat_template and verify single-token answer slots.
+    """Render messages with chat_template, without thinking as a request
+    with effort none renders, and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
@@ -199,12 +202,19 @@ def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoi
     `checkpoint` runs once per slot inside it; either may raise to abandon
     preparation.
     """
-    prompt = tokenizer.apply_chat_template(
+    prompt = render_chat_template(
+        tokenizer,
         messages,
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+        {
+            "chat_template": chat_template,
+            "tokenize": False,
+            **template_options(
+                reasoning_effort="none",
+                preserve_thinking=None,
+                tools=None,
+                add_generation_prompt=True,
+            ),
+        },
     )
     ids = list(tokenizer.encode(prompt, add_special_tokens=False))
     if not ids:

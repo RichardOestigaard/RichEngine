@@ -227,9 +227,12 @@ or empty, `.` or `..` path segments. This keeps model discovery URLs unambiguous
 fallback for Chat `reasoning_effort` and Responses `reasoning.effort` when absent
 or null. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 `max`. An explicit request value wins; the CLI flag takes precedence over the
-environment. Unset, the model's template default is unchanged. Effort names are
-passed to the template using the same mapping as per-request values, not token
-budgets.
+environment. Unset, the model's template default is unchanged. An effort, the
+default or a request's own, reaches the template as `enable_thinking`, false
+for `none`, and as `reasoning_effort`, not as a token budget, so a template that
+switches reasoning by either follows it. A template that rejects an effort
+renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
+rejects `none` renders by `enable_thinking` alone while thinking is off.
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
@@ -241,8 +244,9 @@ built-in chat page sends no effort unless the user picks one.
 
 A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
 passed to the template as variables and outrank the effort, so
-`{"enable_thinking": false}` turns reasoning off. They cannot set what Splash
-passes itself, such as `tools` or `add_generation_prompt`.
+`{"enable_thinking": false}` turns reasoning off and reaches the template as
+`reasoning_effort` `none` too, as effort `none` does. They cannot set what
+Splash passes itself, such as `tools` or `add_generation_prompt`.
 
 ## Upstream model loading
 

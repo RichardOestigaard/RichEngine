@@ -5818,7 +5818,7 @@ class ServerTest(unittest.TestCase):
         app.prepare(self.body(reasoning_effort="none"), deadline=FOREVER)
         template = tokenizer.templates[-1][1]
         self.assertFalse(template["enable_thinking"])
-        self.assertNotIn("reasoning_effort", template)
+        self.assertEqual(template["reasoning_effort"], "none")
 
     @staticmethod
     def reasoning_template(*, default=True, efforts=None):
