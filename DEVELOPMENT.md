@@ -245,8 +245,10 @@ built-in chat page sends no effort unless the user picks one.
 A Chat request's `chat_template_kwargs`, as vLLM and SGLang accept them, are
 passed to the template as variables and outrank the effort, so
 `{"enable_thinking": false}` turns reasoning off and reaches the template as
-`reasoning_effort` `none` too, as effort `none` does. They cannot set what
-Splash passes itself, such as `tools` or `add_generation_prompt`.
+`reasoning_effort` `none` too, as effort `none` does, and `true` turns it on,
+at the template's default effort where the effort is `none`. `enable_thinking`
+must be a boolean; null leaves it to the effort. They cannot set what Splash
+passes itself, such as `tools` or `add_generation_prompt`.
 
 ## Upstream model loading
 

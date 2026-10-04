@@ -211,7 +211,10 @@ class Prompt:
     response_schema: dict | bool | None = None
     response_validator: object = None
     preserve_thinking: bool | None = None
-    # Template variables from the request, which outrank Splash's own.
+    # The request's own chat_template_kwargs enable_thinking, which outranks
+    # its reasoning effort (template_options); None where it sets none.
+    enable_thinking: bool | None = None
+    # Its other template variables, which outrank Splash's own.
     template_kwargs: dict = field(default_factory=dict)
 
 
@@ -795,6 +798,12 @@ class Frontend:
             raise APIError(400, "chat_template_kwargs must be an object")
         elif reserved := sorted(RESERVED_TEMPLATE_KWARGS & template_kwargs.keys()):
             raise APIError(400, f"chat_template_kwargs cannot set {reserved[0]}")
+        template_kwargs = dict(template_kwargs)
+        enable_thinking = template_kwargs.pop("enable_thinking", None)
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise APIError(
+                400, "chat_template_kwargs enable_thinking must be a boolean"
+            )
         messages = template_messages(
             normalize_messages(
                 body.get("messages"), vision=self.vision, deadline=deadline
@@ -817,6 +826,7 @@ class Frontend:
             response_schema,
             response_validator,
             preserve_thinking,
+            enable_thinking,
             template_kwargs,
         )
 
@@ -843,7 +853,7 @@ class Frontend:
                 preserve_thinking=prompt.preserve_thinking,
                 tools=prompt.tools,
                 add_generation_prompt=add_generation_prompt,
-                enable_thinking=prompt.template_kwargs.get("enable_thinking"),
+                enable_thinking=prompt.enable_thinking,
             ),
             **prompt.template_kwargs,
         }

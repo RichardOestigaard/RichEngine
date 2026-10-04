@@ -87,7 +87,8 @@ class ChatTemplateError(ValueError):
     """The tokenizer has no chat template Splash can serve."""
 
 
-# What a template that rejects one of the REASONING_EFFORTS renders instead.
+# What a template that rejects one of the REASONING_EFFORTS renders instead;
+# one that rejects none renders by enable_thinking alone (render_chat_template).
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 
@@ -100,10 +101,11 @@ def template_options(
     enable_thinking=None,
 ):
     """Template variables exactly as request preparation passes them, before
-    the request's own chat_template_kwargs. Whether the model thinks follows
-    the request's own enable_thinking, else its effort, and both switches
-    templates read say so: enable_thinking, and reasoning_effort, which some
-    templates read alone, "none" without thinking and the effort with it."""
+    the request's other chat_template_kwargs. Whether the model thinks
+    follows the request's own enable_thinking, else its effort, and both
+    switches templates read say so: enable_thinking, and reasoning_effort,
+    which some templates read alone: "none" without thinking, the effort with
+    it, and absent for the template's default effort."""
     options = {"add_generation_prompt": add_generation_prompt}
     if enable_thinking is None and reasoning_effort is not None:
         enable_thinking = reasoning_effort != "none"
@@ -467,7 +469,12 @@ def _system_block(render, source):
     patched.
     """
     ask = [_ASK]
-    options = {"add_generation_prompt": False, "enable_thinking": False}
+    options = template_options(
+        reasoning_effort="none",
+        preserve_thinking=None,
+        tools=None,
+        add_generation_prompt=False,
+    )
     try:
         with_system = render(
             source, [{"role": "system", "content": _MARKER}, *ask], options
