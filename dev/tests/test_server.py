@@ -7900,9 +7900,11 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
+        # Where the server last had the error, and not its message.
         self.assertRegex(
             stderr.getvalue(),
-            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",
+            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
+            r"server/server\.py:\d+\n$",
         )
         self.assertNotIn("boom", stderr.getvalue())
 
@@ -7970,7 +7972,8 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(plan.cancelled.is_set())
         self.assertRegex(
             stderr.getvalue(),
-            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError\n$",
+            r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
+            r"server/server\.py:\d+\n$",
         )
 
     def test_streamer_end_error_does_not_kill_backend(self):
