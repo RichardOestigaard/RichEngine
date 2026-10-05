@@ -1398,7 +1398,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            build_validator(schema)
+            check_schema(schema)
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"

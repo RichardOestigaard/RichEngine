@@ -39,7 +39,7 @@ import string
 import weakref
 from dataclasses import dataclass
 
-from .chat_templates import render_chat_template
+from .chat_templates import render_chat_template, template_options
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -208,10 +208,16 @@ def encode_prompt(
     prompt = render_chat_template(
         tokenizer,
         messages,
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+        {
+            "chat_template": chat_template,
+            "tokenize": False,
+            **template_options(
+                reasoning_effort="none",
+                preserve_thinking=None,
+                tools=None,
+                add_generation_prompt=True,
+            ),
+        },
     )
     head, tail = prompt_tokenizer.split(prompt)
     tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
