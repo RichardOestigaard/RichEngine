@@ -16,7 +16,7 @@ from server.errors import APIError
 
 class DocumentWorkerTests(unittest.TestCase):
     def setUp(self):
-        with documents._pdf_lock:
+        with documents._cache_lock:
             documents._cache.clear()
             documents._cache_bytes = 0
 
@@ -38,7 +38,7 @@ class DocumentWorkerTests(unittest.TestCase):
         self.assertIsNotNone(children[0].poll())
         self.assertFalse(document_worker._workers)
         self.assertFalse(documents._cache)
-        self.assertFalse(documents._pdf_lock.locked())
+        self.assertFalse(documents._render_lock.locked())
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_deadline_stops_worker_and_next_document_succeeds(self):
