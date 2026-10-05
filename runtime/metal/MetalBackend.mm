@@ -329,7 +329,7 @@ struct BackendAsyncState {
     void commitSubmission4(uint64_t sequence) {
         std::lock_guard lock(gateMutex);
         activeMtl4 = true;
-        commandWatchdog.start(sequence, steadySeconds());
+        commandWatchdog.start(sequence, awakeSeconds());
     }
 
     void releaseSubmission(uint64_t sequence) noexcept {
@@ -451,7 +451,7 @@ struct CommandTicket::State {
     // The Metal 4 commit feedback carries the same terminal state the Metal 3
     // completed handler reads off its command buffer.
     void finishCommand4(id<MTL4CommitFeedback> feedback) {
-        auto wallEnd = std::chrono::steady_clock::now();
+        auto wallEnd = AwakeClock::now();
         CommandTiming timing;
         timing.gpuSeconds =
             feedback.GPUEndTime - feedback.GPUStartTime;
@@ -1556,7 +1556,7 @@ struct MetalBackend::Impl {
             throw MetalBackendError(std::move(message));
         };
 
-        auto wallStart = std::chrono::steady_clock::now();
+        auto wallStart = AwakeClock::now();
         // The allocator may be reused once the previous command buffer ended
         // (and, per the one-in-flight invariant, finished on the GPU), and
         // the serving loop's pool never drains, so temporary ownership ends
