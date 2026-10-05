@@ -87,8 +87,9 @@ struct ImageGrid final {
 
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings. Injection uses the encoded buffers independently,
-// so the arena can be released after encoding while later chunks inject rows.
+// bf16 language embeddings in the caller's buffer, so the arena can be
+// released after encoding while later chunks copy the image's rows into their
+// hidden rows (ops::RowCopy).
 class Vision final {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
@@ -114,14 +115,6 @@ public:
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
               const metal::MetalBuffer &embeddings) const;
-
-  // Overwrites rows of a packed bf16 hidden buffer with embedding rows of
-  // hiddenSize values each.
-  static void inject(metal::CommandGraph &graph,
-                     const metal::MetalBuffer &embeddings,
-                     const metal::MetalBuffer &packedHidden,
-                     uint32_t hiddenSize, uint32_t sourceRow,
-                     uint32_t destinationRow, uint32_t rows);
 
 private:
   enum class Scratch : uint32_t {

@@ -46,13 +46,3 @@ struct VisionAttentionParams {
 
 static_assert(sizeof(VisionAttentionParams) == 12,
               "Vision attention parameters are 12 bytes on both sides");
-
-struct VisionInjectParams {
-  uint32_t source_row;
-  uint32_t destination_row;
-  uint32_t rows;
-  uint32_t width;
-};
-
-static_assert(sizeof(VisionInjectParams) == 16,
-              "Vision injection parameters are 16 bytes on both sides");

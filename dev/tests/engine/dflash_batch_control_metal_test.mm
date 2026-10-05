@@ -130,12 +130,13 @@ void runWidth(MetalBackend &backend, uint32_t width,
   }
 }
 
-// The two row copies of a DFlash cycle, bitwise against a CPU copy: the
-// capture of 13 target hidden rows (width 2048) from source row 5 into the
-// third slot of four of the captured rows from row 2, and the gather of the
-// last 3 of 11 prefill rows into the head's input. Every value outside the
-// destination region keeps its poison, and regions past a row or a buffer
-// are refused.
+// The row copies of production, bitwise against a CPU copy: the capture of
+// 13 target hidden rows (width 2048) from source row 5 into the third slot of
+// four of the captured rows from row 2, the gather of the last 3 of 11
+// prefill rows into the head's input, and an image's embedding rows 1-2
+// (width 5120) over a chunk's placeholder rows from row 2. Every value
+// outside the destination region keeps its poison, and regions past a row or
+// a buffer are refused.
 void testRowCopy(MetalBackend &backend) {
   constexpr uint16_t kPoison = 0xA5A5;
   const auto check = [&](uint32_t sourceRows, RowRegion from,
@@ -163,6 +164,9 @@ void testRowCopy(MetalBackend &backend) {
         "captured rows differ from a CPU copy");
   check(11, {8, kWidth, 0}, kRows, {0, kWidth, 0}, 3, kWidth,
         "gathered rows differ from a CPU copy");
+  constexpr uint32_t kImageWidth = 5120;
+  check(4, {1, kImageWidth, 0}, 5, {2, kImageWidth, 0}, 2, kImageWidth,
+        "image rows differ from a CPU copy");
 
   MetalBuffer rows = shared(backend, uint64_t{4} * kWidth * 2, "row-copy-invalid");
   CommandGraph invalid;

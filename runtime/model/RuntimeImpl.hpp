@@ -739,12 +739,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         rows.encoding = true;
         ++counters.imageEncodes;
       }
-      ops::Vision::inject(
-          graph, rows.embeddings, prefillArena->get(PrefillTensor::Hidden0),
-          package.vision.tensors.layout.outputHiddenSize,
-          static_cast<uint32_t>(begin - image.span.offset),
-          rowBegin + static_cast<uint32_t>(begin - chunkBegin),
-          static_cast<uint32_t>(end - begin));
+      const uint32_t width = package.vision.tensors.layout.outputHiddenSize;
+      ops::RowCopy::add(
+          graph, rows.embeddings,
+          {static_cast<uint32_t>(begin - image.span.offset), width, 0},
+          prefillArena->get(PrefillTensor::Hidden0),
+          {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
+          static_cast<uint32_t>(end - begin), width);
     }
   }
   static float nextUniform(Request &entry) noexcept {

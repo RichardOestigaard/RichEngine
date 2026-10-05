@@ -220,17 +220,4 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
           kMergerRowTile, kMergerColumnTile);
 }
 
-void Vision::inject(CommandGraph &graph, const MetalBuffer &embeddings,
-                    const MetalBuffer &packedHidden, uint32_t hiddenSize,
-                    uint32_t sourceRow, uint32_t destinationRow,
-                    uint32_t rows) {
-  if (!rows || !hiddenSize)
-    throw std::invalid_argument("vision injection requires rows and a width");
-  const VisionInjectParams params{sourceRow, destinationRow, rows, hiddenSize};
-  graph.add("vision_inject_embeddings", {embeddings, packedHidden}, params,
-            {std::min<uint64_t>((uint64_t{rows} * hiddenSize + 255) / 256,
-                                1024),
-             1, 1});
-}
-
 } // namespace splash::ops

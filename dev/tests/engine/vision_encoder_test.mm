@@ -147,40 +147,6 @@ std::vector<uint8_t> syntheticPixels(ImageGrid grid) {
   return pixels;
 }
 
-bool verifyInjectionWidth(MetalBackend &backend, uint32_t hiddenSize) {
-  constexpr uint32_t sourceRows = 4;
-  constexpr uint32_t destinationRows = 5;
-  const uint64_t sourceElements = uint64_t{sourceRows} * hiddenSize;
-  const uint64_t destinationElements = uint64_t{destinationRows} * hiddenSize;
-  MetalBuffer source = backend.allocateBuffer(
-      sourceElements * sizeof(uint16_t), BufferStorage::Shared,
-      "injection source");
-  MetalBuffer destination = backend.allocateBuffer(
-      destinationElements * sizeof(uint16_t), BufferStorage::Shared,
-      "injection destination");
-  auto *sourceWords = static_cast<uint16_t *>(source.contents());
-  auto *destinationWords = static_cast<uint16_t *>(destination.contents());
-  for (uint64_t index = 0; index < sourceElements; ++index)
-    sourceWords[index] = static_cast<uint16_t>(index * 17 + 3);
-  std::fill_n(destinationWords, destinationElements, uint16_t{0x55aa});
-
-  CommandGraph graph;
-  Vision::inject(graph, source, destination, hiddenSize, 1, 2, 2);
-  const auto timing = backend.submitCommand(graph.dispatches());
-  (void)timing;
-  for (uint32_t row = 0; row < destinationRows; ++row) {
-    for (uint32_t column = 0; column < hiddenSize; ++column) {
-      const uint16_t expected = row >= 2 && row < 4
-                                    ? sourceWords[uint64_t{row - 1} * hiddenSize +
-                                                  column]
-                                    : uint16_t{0x55aa};
-      if (destinationWords[uint64_t{row} * hiddenSize + column] != expected)
-        return false;
-    }
-  }
-  return true;
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -243,13 +209,6 @@ int main(int argc, char **argv) {
       // at most 0.018 for the 27B, against 0.15; a corrupted row is off by
       // about its whole norm.
       bool pass = parity.relativeError < 0.03 && parity.worstRowError < 0.15;
-
-      for (uint32_t width : {2048U, 5120U}) {
-        if (!verifyInjectionWidth(backend, width)) {
-          std::printf("FAIL: vision injection width %u\n", width);
-          pass = false;
-        }
-      }
 
       const std::vector<float> second =
           encodeOnce(backend, encoder, grid, pixels,
