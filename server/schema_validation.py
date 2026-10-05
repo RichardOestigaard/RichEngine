@@ -178,6 +178,42 @@ _validator_cache = OrderedDict()
 _validator_cache_bytes = 0
 # Empty: callers refuse remote references, so a schema refers only to itself.
 _REGISTRY = Registry()
+# The sources of the schemas check_schema has passed, the least recently
+# checked first, apart from the validators response formats keep.
+_CHECKED_SCHEMAS_SIZE = 1024
+_CHECKED_SCHEMAS_SOURCE_BYTES = 8 * 1024 * 1024
+_checked_schemas_lock = threading.Lock()
+_checked_schemas = OrderedDict()
+_checked_schemas_bytes = 0
+
+
+def check_schema(schema):
+    """Raise SchemaError unless `schema` is valid in the dialect it declares.
+
+    A tool's schema needs no other check, as its calls are not validated, and
+    a client sends its tools on every turn, so those that pass are kept."""
+    global _checked_schemas_bytes
+    # json.dumps uses ASCII escapes, so character count equals source bytes.
+    key = json.dumps(schema, sort_keys=True)
+    with _checked_schemas_lock:
+        if key in _checked_schemas:
+            _checked_schemas.move_to_end(key)
+            return
+    validators.validator_for(schema).check_schema(schema)
+    if len(key) > _CHECKED_SCHEMAS_SOURCE_BYTES:
+        return
+    with _checked_schemas_lock:
+        # Another preparation thread may have checked the same schema.
+        if key in _checked_schemas:
+            return
+        _checked_schemas[key] = None
+        _checked_schemas_bytes += len(key)
+        while (
+            len(_checked_schemas) > _CHECKED_SCHEMAS_SIZE
+            or _checked_schemas_bytes > _CHECKED_SCHEMAS_SOURCE_BYTES
+        ):
+            evicted_key, _ = _checked_schemas.popitem(last=False)
+            _checked_schemas_bytes -= len(evicted_key)
 
 
 def build_validator(schema):

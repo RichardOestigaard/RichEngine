@@ -515,6 +515,8 @@ class SchemaFallbackTests(unittest.TestCase):
     def test_schemas_validation_cannot_evaluate_are_request_errors(self):
         # Draft 4 leaves $ref unchecked and draft 3 accepts any type name;
         # validating an output against either failed with an internal error.
+        # A tool's calls are not validated, so only a reference that cannot
+        # be read refuses its schema.
         for draft, value in (
             ("draft-04", {"$ref": None}),
             ("draft-04", {"$ref": 5}),
@@ -531,10 +533,16 @@ class SchemaFallbackTests(unittest.TestCase):
                 {"type": "function", "function": {"name": "t", "parameters": schema}}
             ]
             response_format = {"type": "json_schema", "json_schema": {"schema": schema}}
-            for normalize in (
-                lambda: tool_schema.normalize_tools(tools, None, None),
-                lambda: tool_schema.normalize_response_format(response_format),
-            ):
+            normalizers = [
+                lambda: tool_schema.normalize_response_format(response_format)
+            ]
+            if "$ref" in value:
+                normalizers.append(
+                    lambda: tool_schema.normalize_tools(tools, None, None)
+                )
+            else:
+                tool_schema.normalize_tools(tools, None, None)
+            for normalize in normalizers:
                 with (
                     self.subTest(value=value),
                     self.assertRaises(api.APIError) as caught,

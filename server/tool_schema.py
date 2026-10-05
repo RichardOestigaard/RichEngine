@@ -13,7 +13,12 @@ from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
 from .errors import APIError
-from .schema_validation import build_validator, json_objects, subschemas
+from .schema_validation import (
+    build_validator,
+    check_schema,
+    json_objects,
+    subschemas,
+)
 
 MAX_JSON_NESTING = 256
 
