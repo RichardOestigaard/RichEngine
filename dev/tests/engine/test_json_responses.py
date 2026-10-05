@@ -49,6 +49,39 @@ def tool_request(path, stream=False, schema=None):
     return body
 
 
+def call_arguments(path, payload, stream):
+    """The arguments of the response's first tool call."""
+    if not stream:
+        response = json.loads(payload)
+        if path == PATHS[0]:
+            call = response["choices"][0]["message"]["tool_calls"][0]
+            return json.loads(call["function"]["arguments"])
+        if path == PATHS[1]:
+            return json.loads(response["output"][0]["arguments"])
+        return response["content"][0]["input"]
+    rows = stream_events(payload)
+    if path == PATHS[0]:
+        fragments = (
+            call.get("function", {}).get("arguments", "")
+            for row in rows
+            for choice in row.get("choices", [])
+            for call in choice["delta"].get("tool_calls", [])
+        )
+    elif path == PATHS[1]:
+        fragments = (
+            row["delta"]
+            for row in rows
+            if row["type"] == "response.function_call_arguments.delta"
+        )
+    else:
+        fragments = (
+            row["delta"]["partial_json"]
+            for row in rows
+            if row.get("delta", {}).get("type") == "input_json_delta"
+        )
+    return json.loads("".join(fragments))
+
+
 def stream_events(payload):
     chunks = (payload[i : i + 1] for i in range(len(payload)))
     return [
@@ -348,10 +381,12 @@ class JsonResponseTests(unittest.TestCase):
         }
         cases = (
             ({"type": "string"}, TEXT, TEXT),
-            ({}, json.dumps(nested), nested),
-            ({}, '"\\ud83c\\udf0d"', "🌍"),
+            ({"type": "object"}, json.dumps(nested), nested),
+            ({"type": "object"}, json.dumps({"pair": "🌍"}), {"pair": "🌍"}),
             ({"type": "string"}, r"\ud800", r"\ud800"),
-            ({}, json.dumps(r"\ud800"), r"\ud800"),
+            ({"type": "object"}, json.dumps({"text": r"\ud800"}), {"text": r"\ud800"}),
+            # A value of any type is the JSON its text spells.
+            ({}, json.dumps(nested), nested),
             ({"type": "string"}, TEXT * 400, TEXT * 400),
         )
         for schema, raw, expected in cases:
@@ -507,10 +542,13 @@ class JsonResponseTests(unittest.TestCase):
                     harness.request("POST", path, request_body(path))[0], 200
                 )
 
-    def test_invalid_tool_unicode_is_request_scoped(self):
+    def test_unicode_that_cannot_be_written_back_keeps_its_text(self):
+        # JSON that decodes to a lone surrogate would not survive the next
+        # turn, so the value keeps the text the model wrote.
+        value = r'{"nested":[{"\ud800":"bad"}]}'
         fragments = [
             "<tool_call>\n<function=echo>\n<parameter=value>\n",
-            r'{"nested":[{"\ud800":"bad"}]}',
+            value,
             "\n</parameter>\n</function>\n</tool_call>\n",
         ]
         harness = self.harness(fragments)
@@ -520,8 +558,11 @@ class JsonResponseTests(unittest.TestCase):
                     plan = fixtures.Plan([[40], [41], [42]], delay=0.05)
                     harness.backend.runtime.plans.append(plan)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        failing = pool.submit(
-                            harness.request, "POST", path, tool_request(path, stream)
+                        calling = pool.submit(
+                            harness.request,
+                            "POST",
+                            path,
+                            tool_request(path, stream, {"type": "object"}),
                         )
                         self.assertTrue(plan.started.wait(1))
                         status, _, normal = harness.request(
@@ -531,16 +572,11 @@ class JsonResponseTests(unittest.TestCase):
                         self.assertEqual(
                             response_text(PATHS[0], normal, False), "plain answer\n"
                         )
-                        status, _, payload = failing.result(timeout=3)
-                    self.assertEqual(status, 200 if stream else 500, payload)
-                    self.assertIn(b"invalid Unicode in tool arguments", payload)
-                    if path != PATHS[2]:
-                        self.assertIn(b"invalid_model_output", payload)
-                    self.assertNotIn(b"ud800", payload)
-                    if stream:
-                        rows = stream_events(payload)
-                        self.assertNotIn("response.completed", str(rows))
-                        self.assertNotIn("message_stop", str(rows))
+                        status, _, payload = calling.result(timeout=3)
+                    self.assertEqual(status, 200, payload)
+                    self.assertEqual(
+                        call_arguments(path, payload, stream), {"value": value}
+                    )
                     self.assert_released(harness)
                     self.assertEqual(harness.request("GET", "/health")[0], 200)
                     self.assertEqual(

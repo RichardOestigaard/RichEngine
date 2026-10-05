@@ -29,10 +29,7 @@ class DefaultReasoningTests(unittest.TestCase):
             self.assertNotIn("reasoning_effort", template)
         else:
             self.assertEqual(template["enable_thinking"], expected != "none")
-            self.assertEqual(
-                template.get("reasoning_effort"),
-                None if expected == "none" else expected,
-            )
+            self.assertEqual(template["reasoning_effort"], expected)
 
     def test_default_and_every_explicit_effort_across_chat_and_responses(self):
         for default in (None, *EFFORTS):

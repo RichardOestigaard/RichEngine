@@ -8,6 +8,7 @@ import socket
 import struct
 import sys
 import unittest
+from functools import partial
 from unittest import mock
 
 from dev.tests.engine import native_peer
@@ -330,21 +331,30 @@ class RequestContractTests(unittest.TestCase):
 
     def test_nonstring_schema_is_a_request_error(self):
         for value in ([], {}, 1):
-            with self.subTest(value=value), self.assertRaises(api.APIError) as caught:
-                tool_schema.normalize_tools(
+            schema = {"type": "object", "$schema": value}
+            for normalize in (
+                partial(
+                    tool_schema.normalize_tools,
                     [
                         {
                             "type": "function",
-                            "function": {
-                                "name": "test",
-                                "parameters": {"type": "object", "$schema": value},
-                            },
+                            "function": {"name": "test", "parameters": schema},
                         }
                     ],
                     "auto",
                     True,
-                )
-            self.assertEqual(caught.exception.status, 400)
+                ),
+                partial(
+                    tool_schema.normalize_response_format,
+                    {"type": "json_schema", "json_schema": {"schema": schema}},
+                ),
+            ):
+                with (
+                    self.subTest(value=value),
+                    self.assertRaises(api.APIError) as caught,
+                ):
+                    normalize()
+                self.assertEqual(caught.exception.status, 400)
 
     def test_mask_byte_payload_round_trips(self):
         response = wire.MaskResponseFrame(

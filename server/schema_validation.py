@@ -182,9 +182,9 @@ _REGISTRY = Registry()
 
 def build_validator(schema):
     global _validator_cache_bytes
-    # check_schema walks the whole JSON Schema meta-schema; tool and
-    # response_format schemas are the same on every turn of a conversation,
-    # so cache the built validator instead of re-validating and rebuilding it.
+    # check_schema walks the whole JSON Schema meta-schema; a response_format
+    # schema is the same on every turn of a conversation, so cache the built
+    # validator instead of re-validating and rebuilding it.
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
     with _validator_cache_lock:

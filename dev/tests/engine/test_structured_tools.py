@@ -7,7 +7,7 @@ from llguidance import LLMatcher, LLTokenizer
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from dev.tests.test_server import _byte_alphabet
-from dev.tests.tool_output import argument_grammar, put, streamed_text
+from dev.tests.tool_output import argument_grammar, project, put, streamed_text
 from server import output as model_output
 from server import server as api
 from server import tool_schema
@@ -41,8 +41,15 @@ CALL = (
 OTHER_CALL = "<tool_call>\n<function=finish>\n</function>\n</tool_call>"
 
 
-def policy(choice="auto", parallel=True):
-    return tool_schema.normalize_tools(TOOLS, choice, parallel)[1]
+def policy(choice="auto", parallel=True, tools=TOOLS):
+    return tool_schema.normalize_tools(tools, choice, parallel)[1]
+
+
+def strict_tools(*tools):
+    return [
+        {"type": "function", "function": {**tool["function"], "strict": True}}
+        for tool in tools
+    ]
 
 
 class StructuredToolGrammarTest(unittest.TestCase):
@@ -66,33 +73,69 @@ class StructuredToolGrammarTest(unittest.TestCase):
             cls.tokenizer.to_str(), eos_token=cls.tokenizer.token_to_id("<eos>")
         )
 
-    def matcher(self, choice="auto", parallel=True, thinking=False, schema=SCHEMA):
+    def matcher(self, thinking=False, schema=SCHEMA, **settings):
         with mock.patch.object(
             tool_schema, "THINK_END_TOKEN_ID", self.tokenizer.token_to_id("</think>")
         ):
-            grammar = tool_schema.tool_grammar(
-                policy(choice, parallel), thinking, schema
-            )
+            grammar = tool_schema.tool_grammar(policy(**settings), thinking, schema)
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         return LLMatcher(self.guidance, grammar)
 
-    def assert_complete(self, text, *, byte_tokens=False, **settings):
+    def accepts(self, text, *, byte_tokens=False, **settings):
         matcher = self.matcher(**settings)
         tokens = list(text.encode()) if byte_tokens else self.tokenizer.encode(text).ids
-        self.assertEqual(matcher.validate_tokens(tokens), len(tokens), text)
-        self.assertTrue(matcher.consume_tokens(tokens), text)
-        self.assertTrue(matcher.is_accepting(), text)
+        return (
+            matcher.validate_tokens(tokens) == len(tokens)
+            and matcher.consume_tokens(tokens)
+            and matcher.is_accepting()
+        )
+
+    def assert_complete(self, text, **settings):
+        self.assertTrue(self.accepts(text, **settings), text)
 
     def assert_not_complete(self, text, **settings):
-        matcher = self.matcher(**settings)
-        tokens = self.tokenizer.encode(text).ids
-        accepted = matcher.validate_tokens(tokens)
-        if accepted == len(tokens):
-            self.assertTrue(matcher.consume_tokens(tokens))
-            self.assertFalse(matcher.is_accepting(), text)
+        self.assertFalse(self.accepts(text, **settings), text)
+
+    def test_a_grammar_applies_by_choice_and_strict_tools(self):
+        # An auto choice of parallel tools none of which is strict leaves the
+        # output free; a choice that requires a call, one that allows a single
+        # call, and a strict tool need the call envelope, and strict tools
+        # have their arguments pinned.
+        named = {"type": "function", "function": {"name": "finish"}}
+        cases = (
+            ({}, frozenset(), False),
+            ({"choice": "required"}, frozenset(), True),
+            ({"choice": named}, frozenset(), True),
+            ({"parallel": False}, frozenset(), True),
+            (
+                {"tools": [TOOLS[0], *strict_tools(TOOLS[1])]},
+                frozenset({"finish"}),
+                True,
+            ),
+        )
+        for settings, strict, constrained in cases:
+            with self.subTest(settings=settings):
+                chosen = policy(**settings)
+                self.assertEqual(
+                    (chosen.strict, chosen.constrained), (strict, constrained)
+                )
+        named = policy(choice=named)
+        self.assertEqual(
+            (list(named.schemas), named.required, named.parallel),
+            (["finish"], True, False),
+        )
 
     def test_auto_selects_one_json_answer_or_tool_calls(self):
-        for text in (ANSWER, " \n" + ANSWER + "\t", CALL, CALL + "\n" + OTHER_CALL):
+        # As under a required choice, beside the answer: a call first, then
+        # text and further calls.
+        for text in (
+            ANSWER,
+            " \n" + ANSWER + "\t",
+            CALL,
+            CALL + "\n" + OTHER_CALL,
+            CALL + "\nDone.",
+            CALL.replace("alpha", "beta"),
+        ):
             with self.subTest(text=text):
                 self.assert_complete(text)
         for text in (
@@ -101,7 +144,6 @@ class StructuredToolGrammarTest(unittest.TestCase):
             '{"answer":41}',
             '{"answer":42,"extra":1}',
             ANSWER + ANSWER,
-            CALL + ANSWER,
             ANSWER + CALL,
             "explanation" + CALL,
         ):
@@ -131,23 +173,21 @@ class StructuredToolGrammarTest(unittest.TestCase):
                         self.assert_complete(reasoning + text, **settings)
                     for text in ("", "plain answer", "Sure. " + CALL):
                         self.assert_not_complete(reasoning + text, **settings)
-        # A required choice may call several tools, a named one exactly once.
-        self.assert_complete(CALL + "\n" + OTHER_CALL, choice="required", schema=None)
+        # A required choice may call several tools, with text between and
+        # after them; a named one calls exactly once.
+        for text in (CALL + "\n" + OTHER_CALL, CALL + " Next. " + CALL + " Done."):
+            self.assert_complete(text, choice="required", schema=None)
         self.assert_not_complete(CALL + "\n" + CALL, choice=named, schema=None)
 
     def test_a_call_with_too_many_parameters_fails_where_it_begins(self):
         # The grammar compiles, but the parser cannot admit every parameter
-        # name at once: requests check each call's opening before prefill.
+        # name of a strict tool at once: requests check each strict call's
+        # opening before prefill.
         properties = {f"p{index}": {"type": "string"} for index in range(1100)}
-        tools = [
-            {
-                "type": "function",
-                "function": {"name": "wide", "parameters": {"properties": properties}},
-            }
-        ]
-        grammar = tool_schema.tool_grammar(
-            tool_schema.normalize_tools(tools, "auto", True)[1], False
+        tools = strict_tools(
+            {"function": {"name": "wide", "parameters": {"properties": properties}}}
         )
+        grammar = tool_schema.tool_grammar(policy(tools=tools), False)
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         opening = self.tokenizer.encode(
             tool_schema.TOOL_CALL_OPEN + tool_schema.function_opening("wide")
@@ -156,8 +196,8 @@ class StructuredToolGrammarTest(unittest.TestCase):
         self.assertFalse(matcher.consume_tokens(opening))
 
     def test_a_strict_tool_takes_only_the_arguments_it_declares(self):
-        # As vLLM and SGLang generate a strict tool's arguments; a tool that is
-        # not strict takes whatever its schema allows.
+        # A strict tool's arguments come in schema order; a tool that is not
+        # strict takes any arguments.
         parameters = {
             "type": "object",
             "properties": {
@@ -186,15 +226,13 @@ class StructuredToolGrammarTest(unittest.TestCase):
             call(("path", "src"), ("target", '"files"')),
             call(("path", "src"), ("options", '{"depth":2,"deep":true}')),
             call(("path", "src"), ("tags", '["a"]')),
+            call(("tags", "[]"), ("path", "src")),
+            call(("options", "deep")),
         )
         for strict in (False, True):
             tool = {"name": "search", "parameters": parameters, "strict": strict}
-            grammar = tool_schema.tool_grammar(
-                tool_schema.normalize_tools(
-                    [{"type": "function", "function": tool}], "auto", True
-                )[1],
-                False,
-            )
+            tools = [{"type": "function", "function": tool}]
+            grammar = tool_schema.tool_grammar(policy("required", tools=tools), False)
             for text in (declared, *undeclared):
                 with self.subTest(strict=strict, text=text):
                     matcher = LLMatcher(self.guidance, grammar)
@@ -206,6 +244,114 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     )
                     self.assertEqual(accepted, text == declared or not strict)
 
+    def test_parameters_of_a_strict_tool_come_in_schema_order(self):
+        # A parameter left out cannot come later.
+        tools = strict_tools(
+            {
+                "function": {
+                    "name": "roll_cut",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cut_at": {"type": "string"},
+                            "shift": {"type": "number"},
+                            "item": {"type": "string"},
+                        },
+                        "required": ["item"],
+                    },
+                }
+            }
+        )
+
+        def call(*arguments):
+            return (
+                "<tool_call>\n<function=roll_cut>\n"
+                + "".join(
+                    f"<parameter={name}>\n{value}\n</parameter>\n"
+                    for name, value in arguments
+                )
+                + "</function>\n</tool_call>"
+            )
+
+        settings = {"choice": "required", "tools": tools, "schema": None}
+        for text in (call(("shift", "-0.5"), ("item", "s1")), call(("item", "s1"))):
+            self.assert_complete(text, **settings)
+        for text in (
+            call(("item", "s1"), ("shift", "-0.5")),
+            call(("shift", "-0.5")),
+            call(("shift", "soon"), ("item", "s1")),
+        ):
+            self.assert_not_complete(text, **settings)
+
+    def test_strict_values_are_written_as_text_raw_or_json(self):
+        # Enumerated values as their text, a value that may be a string as
+        # raw text, any other as JSON.
+        schema = {
+            "type": "object",
+            "properties": {
+                "mode": {"enum": ["fast", 2, None]},
+                "time": {"type": ["string", "number"]},
+                "note": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "count": {"type": "integer"},
+            },
+            "required": ["mode", "time", "note", "count"],
+        }
+        grammar = argument_grammar(schema)
+        for mode in ("fast", "2", "null"):
+            self.assertIn(json.dumps(mode), grammar)
+        self.assertEqual(grammar.count("/(?s:.*)/"), 2)
+        self.assertIn('%json {"type":"integer"', grammar)
+
+    def test_strict_values_keep_their_constraints(self):
+        # A union whose string member lists its values takes those, the other
+        # members' JSON and nothing else; a refinement of a type keeps it.
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "$defs": {"color": {"enum": ["red", "green"]}},
+                    "properties": {
+                        "unit": {
+                            "anyOf": [
+                                {"type": "string", "enum": ["celsius", "kelvin"]},
+                                {"type": "null"},
+                            ]
+                        },
+                        "limit": {
+                            "anyOf": [
+                                {"enum": ["auto"]},
+                                {"type": "integer", "minimum": 1},
+                            ]
+                        },
+                        "count": {"allOf": [{"type": "integer"}, {"minimum": 0}]},
+                        "color": {"allOf": [{"$ref": "#/$defs/color"}]},
+                        "time": {"type": ["string", "number"]},
+                    },
+                },
+            },
+        }
+        settings = {"choice": "required", "schema": None, "tools": [tool]}
+        call = (
+            "<tool_call>\n<function=f>\n<parameter={}>\n{}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for name, taken, refused in (
+            ("unit", ("celsius", "null"), ("fahrenheit", '"celsius"')),
+            ("limit", ("auto", "5"), ("banana", "0")),
+            ("count", ("3",), ("abc", "-1")),
+            ("color", ("red",), ("blue",)),
+            ("time", ("12:00", "12"), ()),
+        ):
+            for value in taken:
+                with self.subTest(name=name, value=value):
+                    self.assert_complete(call.format(name, value), **settings)
+            for value in refused:
+                with self.subTest(name=name, value=value):
+                    self.assert_not_complete(call.format(name, value), **settings)
+
     def test_whitespace_between_tokens_is_bounded(self):
         # A model preferring whitespace to every token the grammar allows next
         # must write one of them within 64 characters; strings keep theirs.
@@ -213,15 +359,8 @@ class StructuredToolGrammarTest(unittest.TestCase):
         for spaces, complete in ((bound, True), (bound + 1, False)):
             with self.subTest(spaces=spaces):
                 pad = " " * spaces
-                for text in (
-                    "{" + pad + '"answer":42}',
-                    pad + ANSWER,
-                    CALL + "\n" * spaces + OTHER_CALL,
-                ):
-                    if complete:
-                        self.assert_complete(text)
-                    else:
-                        self.assert_not_complete(text)
+                for text in ("{" + pad + '"answer":42}', pad + ANSWER):
+                    self.assertEqual(self.accepts(text), complete, text)
                 grammar = tool_schema.json_grammar(SCHEMA, False)
                 matcher = LLMatcher(self.guidance, grammar)
                 tokens = self.tokenizer.encode("{" + pad + '"answer":42}').ids
@@ -232,21 +371,19 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     complete,
                 )
         self.assert_complete('{"answer":42,"marker":"' + " " * 200 + '"}')
-        # Any value, as an open parameter takes, is bounded alike.
-        tool = {"name": "note", "parameters": {"type": "object"}}
-        grammar = tool_schema.tool_grammar(
-            tool_schema.normalize_tools(
-                [{"type": "function", "function": tool}], "auto", True
-            )[1],
-            False,
+        # A strict tool's JSON value is bounded alike.
+        body = {"type": "object", "additionalProperties": True}
+        tools = strict_tools(
+            {"function": {"name": "note", "parameters": {"properties": {"body": body}}}}
         )
+        grammar = tool_schema.tool_grammar(policy(tools=tools), False)
         for spaces, complete in ((bound, True), (bound + 1, False)):
             text = (
                 "<tool_call>\n<function=note>\n<parameter=body>\n{"
                 + " " * spaces
                 + '"a":1}\n</parameter>\n</function>\n</tool_call>'
             )
-            with self.subTest(open_parameter=spaces):
+            with self.subTest(strict_parameter=spaces):
                 matcher = LLMatcher(self.guidance, grammar)
                 tokens = self.tokenizer.encode(text).ids
                 self.assertEqual(
@@ -303,40 +440,108 @@ class StructuredToolGrammarTest(unittest.TestCase):
     def test_none_keeps_the_tools_but_lets_no_call_start(self):
         # The prompt renders the tools as for any choice; only output changes.
         tools, none = tool_schema.normalize_tools(TOOLS, "none", True)
-        self.assertEqual((tools, none.schemas, none.required), (TOOLS, {}, False))
+        self.assertEqual(
+            (tools, none.schemas, none.required, none.strict, none.constrained),
+            (TOOLS, {}, False, frozenset(), True),
+        )
         self.assert_complete(ANSWER, choice="none")
         for text in (CALL, ANSWER + CALL, "plain answer"):
             with self.subTest(text=text):
                 self.assert_not_complete(text, choice="none")
-        grammar = tool_schema.tool_grammar(none, False)
         for text, complete in (("plain answer", True), ("see " + CALL, False)):
             with self.subTest(text=text):
-                matcher = LLMatcher(self.guidance, grammar)
-                tokens = self.tokenizer.encode(text).ids
-                accepted = (
-                    matcher.validate_tokens(tokens) == len(tokens)
-                    and matcher.consume_tokens(tokens)
-                    and matcher.is_accepting()
+                self.assertEqual(
+                    self.accepts(text, choice="none", schema=None), complete
                 )
-                self.assertEqual(accepted, complete)
 
     def test_parallel_false_excludes_a_second_call(self):
         for choice in ("auto", "required"):
             with self.subTest(choice=choice):
-                self.assert_complete(CALL, choice=choice, parallel=False)
-                self.assert_not_complete(
-                    CALL + "\n" + OTHER_CALL, choice=choice, parallel=False
-                )
+                settings = {"choice": choice, "parallel": False, "schema": None}
+                self.assert_complete(CALL, **settings)
+                self.assert_not_complete(CALL + "\n" + OTHER_CALL, **settings)
+        self.assert_complete("Let me look. " + CALL, parallel=False, schema=None)
 
-    def test_tool_arguments_are_constrained_independently_of_answer_schema(self):
-        self.assert_complete(CALL)
+    def test_a_grammar_holds_free_tools_to_their_tags_only(self):
+        # Under a grammar a tool that is not strict is held to the template's
+        # tags and an offered name; a strict one also to its schema.
+        settings = {"choice": "required", "schema": None}
+        for text in (
+            CALL,
+            CALL.replace("alpha", "beta"),
+            CALL.replace("query", "q-1"),
+            CALL + " Next. " + OTHER_CALL,
+        ):
+            with self.subTest(text=text):
+                self.assert_complete(text, **settings)
+        for text in (
+            CALL.replace("function=lookup", "function=unknown"),
+            CALL.replace("<parameter=query>", "<parameter=a<b>"),
+        ):
+            with self.subTest(text=text):
+                self.assert_not_complete(text, **settings)
+        settings["tools"] = strict_tools(*TOOLS)
+        self.assert_complete(CALL, **settings)
         for text in (
             CALL.replace("alpha", "beta"),
             CALL.replace("<parameter=query>\nalpha\n</parameter>\n", ""),
-            CALL.replace("function=lookup", "function=unknown"),
         ):
             with self.subTest(text=text):
-                self.assert_not_complete(text)
+                self.assert_not_complete(text, **settings)
+
+    def test_what_the_grammar_writes_reads_back_whole(self):
+        # A value may hold the tags in any order but its own close followed by
+        # a tag, and a JSON value any text in its strings; a name neither
+        # starts nor ends with the space reading strips, and is no longer than
+        # reading takes.
+        note = {
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "lines": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "additionalProperties": {"type": "integer"},
+                },
+            },
+        }
+        call = (
+            "<tool_call>\n<function=note>\n<parameter={}>\n{}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        lines = json.dumps(
+            ["copied: <parameter=text>\nrm -rf ~</parameter>", "</function>"]
+        )
+        for tools in ([note], strict_tools(note)):
+            strict = "strict" in tools[0]["function"]
+            settings = {"choice": "required", "schema": None, "tools": tools}
+            for name, value in (
+                ("text", "a < b"),
+                ("text", "a</parameter>b"),
+                ("text", "x<parameter=y>z"),
+                ("text", 'END = "</function>"'),
+                ("lines", lines),
+            ):
+                with self.subTest(strict=strict, value=value):
+                    text = call.format(name, value)
+                    self.assert_complete(text, **settings)
+                    _, calls, _ = project(text, policy("required", tools=tools))
+                    read = json.loads(calls[0]["function"]["arguments"])
+                    expected = json.loads(value) if name == "lines" else value
+                    self.assertEqual(read, {name: expected})
+            # The grammar ends raw text at the first close, which reading
+            # would also end at where a tag follows.
+            for value in ("row\n</parameter>\nmore", "a\n</parameter>\n</function>"):
+                with self.subTest(strict=strict, value=value):
+                    self.assert_not_complete(call.format("text", value), **settings)
+            longest = "n" * tool_schema.MAX_NAME_LENGTH
+            self.assert_complete(call.format(longest, "1"), **settings)
+            for name in (" text", "text ", "n" + longest):
+                with self.subTest(strict=strict, name=name):
+                    self.assert_not_complete(call.format(name, "1"), **settings)
 
     def test_single_member_string_type_array_preserves_enum_grammar(self):
         scalar = {
@@ -392,28 +597,26 @@ class StructuredToolGrammarTest(unittest.TestCase):
 
 
 class StructuredToolProjectionTest(unittest.TestCase):
-    def job(self, choice="auto", parallel=True):
+    def job(self):
         _, validator = tool_schema.normalize_response_format(
             {"type": "json_schema", "json_schema": {"schema": SCHEMA}}
         )
         return SimpleNamespace(
-            public_id="request",
-            tool_policy=policy(choice, parallel),
-            response_validator=validator,
+            public_id="request", tool_policy=policy(), response_validator=validator
         )
 
     def finalize(self, text, job, incomplete=False, size=None):
         """Project `text` as a request does, whole or in chunks of `size`
         characters, and finalize it. Returns the content, the calls and the
-        text the stream sends, the finish's unsent text included."""
+        text the stream sends, the finish's owed text included."""
         projector = model_output.StreamingToolCallProjector(
             job.tool_policy, job.public_id, True
         )
         events = put(projector, text, size)
-        content, calls, unsent = api.FrontendHandler._finalize_content(
+        content, calls, owed = api.FrontendHandler._finalize_content(
             None, "", job, incomplete, projector
         )
-        return content, calls, streamed_text(events) + unsent
+        return content, calls, streamed_text(events + owed)
 
     def test_json_tool_spellings_stream_as_text_at_every_split(self):
         text = json.dumps({"answer": 42, "marker": CALL})
@@ -425,10 +628,10 @@ class StructuredToolProjectionTest(unittest.TestCase):
                     job.tool_policy, job.public_id, True
                 )
                 events = projector.put(text[:split]) + projector.put(text[split:])
-                content, calls, unsent = projector.finish(False)
+                content, calls, owed = projector.finish(False)
                 self.assertEqual((content, calls), (text, []))
-                self.assertTrue(all(kind == "content" for kind, _ in events))
-                self.assertEqual(streamed_text(events) + unsent, text)
+                self.assertTrue(all(kind == "content" for kind, _ in events + owed))
+                self.assertEqual(streamed_text(events + owed), text)
 
     def test_partial_json_is_preserved_and_partial_tool_is_not_completed(self):
         job = self.job()
@@ -445,7 +648,6 @@ class StructuredToolProjectionTest(unittest.TestCase):
                     )
 
     def test_a_cut_after_a_call_reports_and_streams_no_text(self):
-        # Beside an output schema only whitespace surrounds calls.
         job = self.job()
         text = " \n" + CALL + "\n" + OTHER_CALL + "\n"
         for end in range(len(" \n" + CALL), len(text) + 1):
@@ -456,21 +658,19 @@ class StructuredToolProjectionTest(unittest.TestCase):
                     self.assertEqual((content, streamed), ("", ""))
                     self.assertEqual(calls[0]["function"]["name"], "lookup")
 
-    def test_finalization_enforces_required_parallel_and_output_schema(self):
-        for text, job in (
-            (ANSWER, self.job("required")),
-            (CALL + OTHER_CALL, self.job(parallel=False)),
-            (CALL + ANSWER, self.job()),
-            ('{"answer":41}', self.job()),
+    def test_finalization_validates_an_answer_without_calls(self):
+        # Generation enforces the tool choice; only the answer's schema is
+        # checked on the complete output.
+        with self.assertRaisesRegex(api.APIError, "invalid structured output"):
+            self.finalize('{"answer":41}', self.job())
+        for text, names in (
+            (CALL + "\n" + OTHER_CALL, ["lookup", "finish"]),
+            (CALL + ' {"answer":41}', ["lookup"]),
         ):
             with self.subTest(text=text):
-                with self.assertRaises(api.APIError):
-                    self.finalize(text, job)
-        content, calls, _ = self.finalize(CALL + "\n" + OTHER_CALL, self.job())
-        self.assertFalse(content.strip())
-        self.assertEqual(
-            [call["function"]["name"] for call in calls], ["lookup", "finish"]
-        )
+                _, calls, _ = self.finalize(text, self.job())
+                self.assertEqual([call["function"]["name"] for call in calls], names)
+        self.assertEqual(self.finalize(ANSWER, self.job())[:2], (ANSWER, []))
 
 
 if __name__ == "__main__":

@@ -184,7 +184,7 @@ class ServedModelNamesTests(unittest.TestCase):
                     self.assertEqual(status, 200, payload)
                     template = harness.tokenizer.templates[-1][1]
                     self.assertEqual(template["enable_thinking"], effort is not None)
-                    self.assertEqual(template.get("reasoning_effort"), effort)
+                    self.assertEqual(template["reasoning_effort"], effort or "none")
 
     def test_scoring_accepts_alias_and_reports_the_response_model(self):
         for announce in (False, True):

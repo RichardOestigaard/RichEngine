@@ -15,25 +15,39 @@ from llguidance import LLMatcher
 from .errors import APIError
 from .schema_validation import build_validator, json_objects, subschemas
 
-MAX_JSON_NESTING = 256
-
-# The chat template's tool-call framing. The projector that parses output and
-# the grammars must agree byte for byte, so every piece is spelled here once.
+# The chat template's tool-call tags, as it lays a call out: grammars write
+# calls that way, and the projector reads them that way (output.py). A call
+# opens at CALL_OPEN, and a value ends at PARAMETER_CLOSE where the next
+# parameter or the function's close follows, so a value may hold any of the
+# tags but that sequence.
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
-FUNCTION_OPEN = "\n<function="
-FUNCTION_CLOSE = "</function>\n</tool_call>"
+FUNCTION_START = "<function="
+FUNCTION_END = "</function>"
 PARAMETER_OPEN = "<parameter="
 PARAMETER_CLOSE = "\n</parameter>\n"
-# The chat template's think-close token id where no tokenizer contract
-# supplies one (tests); the server always passes its validated contract's.
-THINK_END_TOKEN_ID = 248069
+CALL_OPEN = f"{TOOL_CALL_OPEN}\n{FUNCTION_START}"
+THINK_END = "</think>"
+# The same framing in a ToolDialect's field terms: a call is call_open +
+# name_prefix + name + name_close, and ends with call_close.
+FUNCTION_OPEN = f"\n{FUNCTION_START}"
+FUNCTION_CLOSE = f"{FUNCTION_END}\n{TOOL_CALL_CLOSE}"
+# The chat template's token ids where no tokenizer contract supplies them
+# (tests); the server always passes its validated contract's.
+THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
+TOOL_CALL_OPEN_TOKEN_ID = 248058  # and its call-open token
+# A function's or parameter's name is at most this long, and reading strips
+# this space around it, so a name the grammars write neither starts nor ends
+# with it.
+MAX_NAME_LENGTH = 256
+NAME_SPACE = " \t\n\r"
+MAX_JSON_NESTING = 256
 
 
 def function_opening(name):
     """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
     arguments."""
-    return f"{FUNCTION_OPEN}{name}>\n"
+    return f"\n{FUNCTION_START}{name}>\n"
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,11 @@ class ToolDialect:
     param_close: str = PARAMETER_CLOSE
     # The text that ends one call.
     call_close: str = FUNCTION_CLOSE
+    # Where a call's parameters end (the function element's close), and the
+    # optional wrapper's close that may follow it after space; "" where the
+    # call is one element.
+    body_close: str = FUNCTION_END
+    block_close: str = TOOL_CALL_CLOSE
     # An optional separator a model may write between calls, consumed before
     # each call's marker ("" where calls run together).
     call_separator: str = ""
@@ -92,42 +111,49 @@ class ToolDialect:
             return _python_argument_grammar(schema)
         return _argument_grammar(schema, self)
 
-    def call_rules(self, names, separator, parallel):
-        """(rules, calls, maybe): the lark rules tool_0.. spelling one call
-        of each tool each, where the arguments of tool i come from the side
-        grammar ``arguments_i``; ``calls`` a run of one or more calls, and
-        ``maybe`` that run or nothing."""
+    def call_rule(self, index, name, arguments):
+        """The lark rule ``call_<index>`` spelling one call of tool `name`,
+        its arguments coming from the side grammar `arguments`."""
         if self.kind == "python":
-            rules = [
-                f'tool_{index}: {json.dumps(name + "(")} '
-                f"@arguments_{index} {json.dumps(')')}"
-                for index, name in enumerate(names)
-            ]
-            choice = "(" + " | ".join(
-                f"tool_{index}" for index in range(len(names))
-            ) + ")"
-            calls = (
-                f'{separator} {json.dumps(self.call_open)} {choice}'
-                + (f' ({json.dumps(", ")} {choice})*' if parallel else "")
-                + f' {json.dumps("]<|tool_call_end|>")}'
+            return (
+                f'call_{index}: {json.dumps(name + "(")} '
+                f"@{arguments} {json.dumps(')')}"
             )
-            return rules, calls, f"({calls})?"
-        optional_separator = (
+        separator = (
             f"{json.dumps(self.call_separator)}? " if self.call_separator else ""
         )
-        rules = [
-            f"tool_{index}: {separator} {optional_separator}"
-            f"{json.dumps(self.call_opening(name))} "
-            f"@arguments_{index} {json.dumps(self.call_close)}"
-            for index, name in enumerate(names)
-        ]
-        choice = "(" + " | ".join(
-            f"tool_{index}" for index in range(len(names))
-        ) + ")"
         return (
-            rules,
-            choice + ("+" if parallel else ""),
-            choice + ("*" if parallel else "?"),
+            f"call_{index}: {separator}{json.dumps(self.call_open)} "
+            f"{json.dumps(self.name_prefix + name + self.name_close)} "
+            f"@{arguments} {json.dumps(self.call_close)}"
+        )
+
+    def call_expression(self, count, parallel):
+        """The lark expression of one call unit: any offered tool's call for
+        an XML dialect, where parallel calls are separate units, or the
+        python dialect's bracketed call list, which holds them all."""
+        choice = "(" + " | ".join(f"call_{index}" for index in range(count)) + ")"
+        if self.kind != "python":
+            return choice
+        inner = choice + (f' ({json.dumps(", ")} {choice})*' if parallel else "")
+        return (
+            f"({json.dumps(self.call_open)} {inner} {json.dumps(self.call_close)})"
+        )
+
+    def free_arguments(self):
+        """The lark grammar of an unconstrained call's arguments: any
+        parameters in the dialect's framing, each with raw text."""
+        if self.kind == "python":
+            return _PYTHON_FREE_ARGUMENTS
+        name_open = json.dumps(self.param_open)
+        name_close = json.dumps(self.param_name_close)
+        closing = json.dumps(self.param_close)
+        return (
+            "%llguidance {}\n"
+            "start: parameter*\n"
+            f"parameter: {name_open} NAME {name_close} value\n"
+            f"value[suffix={closing}]: {_RAW_VALUE}\n"
+            f"NAME: {_name_regex(self)}\n"
         )
 
 
@@ -166,7 +192,7 @@ _PYTHON_NUMBER = r"/-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/"
 def _python_value_rules(rule, value_schema):
     """The lark rules naming `rule` the spelling of one argument value."""
     rules = []
-    string_schema = raw_string_schema(value_schema)
+    string_schema = raw_string_schema(value_schema, None)
     schema = _grammar_compatible_schema(value_schema)
     if string_schema is not None:
         if string_schema[0] == "raw":
@@ -200,10 +226,10 @@ def _python_value_rules(rule, value_schema):
             rules.append(f"{rule}: ({body})")
             return rules
     if kinds == ["boolean"]:
-        rules.append(f"{rule}: (True | False)")
+        rules.append(f'{rule}: ("True" | "False")')
         return rules
     if kinds == ["null"]:
-        rules.append(f"{rule}: None")
+        rules.append(f'{rule}: "None"')
         return rules
     if kinds and all(k in ("integer", "number") for k in kinds):
         rules.append(f"{rule}: {_PYTHON_NUMBER}")
@@ -273,6 +299,17 @@ def _python_argument_grammar(schema):
     return "%llguidance {}\nstart: chain_0\n" + "\n".join(rules) + "\n"
 
 
+# The arguments of an unconstrained python-dialect call: name=value pairs
+# joined by ", ", each value a quoted string, a scalar or JSON.
+_PYTHON_FREE_ARGUMENTS = (
+    "%llguidance {}\n"
+    'start: (NAME "=" value (", " NAME "=" value)*)?\n'
+    f"value: {_PYTHON_STRING} | {_PYTHON_NUMBER}"
+    ' | "True" | "False" | "None" | %json {"x-guidance":{"lenient":true}}\n'
+    "NAME: /[A-Za-z0-9_-]+/\n"
+)
+
+
 # The framing each supported chat template writes its calls in, detected at
 # startup from a rendered canary call.
 QWEN3_XML = ToolDialect(name="qwen3-xml")
@@ -286,6 +323,8 @@ MINICPM5_XML = ToolDialect(
     param_name_close='">',
     param_close="</param>",
     call_close="</function>",
+    body_close="</function>",
+    block_close="",
     call_separator="<tool_sep>",
     cdata=True,
     structural=("<function", "</function>", "<param", "</param>"),
@@ -299,6 +338,7 @@ LFM25_PYTHON = ToolDialect(
     name="lfm25-python",
     kind="python",
     call_open="<|tool_call_start|>[",
+    name_prefix="",
     call_close="]<|tool_call_end|>",
     structural=("<|tool_call_start|>", "<|tool_call_end|>"),
     param_name_forbidden="=(),'\"\\ \t\n\r",
@@ -332,26 +372,61 @@ def detect_tool_dialect(rendered):
 MAX_FRAMED_SCHEMA_BYTES = 16 * 1024 * 1024
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ToolPolicy:
-    validators: dict
+    """How a request's tool calls are generated and read."""
+
+    # The declared parameter schema of each tool a call may name.
     schemas: dict
     required: bool
     parallel: bool
+    # The strict tools, whose arguments are generated to their schemas.
+    strict: frozenset
+    # Whether a grammar constrains the output: under a required or named
+    # choice, with parallel_tool_calls false, beside a strict tool, and under
+    # tool_choice none, whose grammar lets no call start.
+    constrained: bool
     namespaces: dict = field(default_factory=dict)
     # The served model's tool-call framing; None means the default dialect.
     dialect: ToolDialect | None = None
 
     @cached_property
     def argument_schemas(self):
+        """The arguments of each tool, framed: a strict tool's as its grammar
+        generates them, any other's as declared. None for a tool whose
+        parameters cannot be framed, which only a strict tool refuses."""
         budget = [MAX_FRAMED_SCHEMA_BYTES]
-        return {
-            name: tool_argument_schema(schema, budget)
-            for name, schema in self.schemas.items()
-        }
+        framed = {}
+        for name, schema in self.schemas.items():
+            if name in self.strict:
+                framed[name] = tool_argument_schema(_strict_schema(schema), budget)
+                continue
+            try:
+                framed[name] = tool_argument_schema(schema, budget)
+            except APIError:
+                framed[name] = None
+        return framed
+
+    def parameter_types(self, name):
+        """The JSON types by which the values of tool `name` convert: those
+        of each parameter it declares, and those of any other; None stands
+        for any type, as for a tool that was not offered."""
+        schema = self.argument_schemas.get(name)
+        if schema is None:
+            return {}, None
+        other = schema["additionalProperties"]
+        return (
+            {
+                parameter: schema_types(value, value)
+                for parameter, value in schema["properties"].items()
+            },
+            frozenset() if other is False else schema_types(other, other),
+        )
 
 
 def json_value(value):
+    """The JSON value `value` spells, or `value` itself where it spells
+    none, nests deeper than MAX_JSON_NESTING or cannot be written back."""
     value = value.strip()
     try:
         parsed = json.loads(value, parse_constant=str)
@@ -405,9 +480,9 @@ SCHEMA_ANNOTATIONS = {
 }
 
 
-# Raw string parameters are framed by the tool-call grammar and validated
-# against their complete JSON Schema after parsing. Keeping these assertions
-# out of the grammar preserves multiline string payloads.
+# String assertions a raw-string parameter's text stays under: the grammar
+# writes the text as it is and the value converts by its declared types, so
+# these keywords neither frame nor convert it.
 STRING_SCHEMA_POST_VALIDATION_KEYWORDS = {
     "allOf",
     "minLength",
@@ -423,7 +498,8 @@ STRING_SCHEMA_POST_VALIDATION_KEYWORDS = {
 # The grammar compiler expands these keywords into work proportional to their
 # values: a rule per required or optional array item, a state per divisor
 # residue. A tiny schema with a huge bound would exhaust memory, so larger
-# bounds are left to validation of the complete output.
+# bounds are left out of the grammar; a response format checks them on the
+# complete output.
 GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
@@ -447,13 +523,14 @@ WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
 def _grammar_takes_pattern(pattern):
     """Whether the grammar compiler takes a JSON Schema ``pattern``. It keeps
     the pattern's search semantics but rejects look-around, word boundaries
-    and backreferences, which are left to validation of the complete output."""
+    and backreferences, which a response format checks on the complete
+    output."""
     string = json.dumps({"type": "string", "pattern": pattern})
     return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
 
 
 def _grammar_compatible_schema(schema):
-    """Guide generation with supported constraints; validate the original."""
+    """The constraints of `schema` the grammar compiler takes."""
     output = copy.deepcopy(schema)
     for node in subschemas(output):
         if isinstance(node, dict):
@@ -517,7 +594,7 @@ def _strict_schema(schema):
     SGLang generate them with XGrammar's strict mode: an object that does not
     say which properties it takes beyond those it declares takes none, and
     an array that does not say which items it takes beyond its leading ones
-    takes none. Validation keeps the declared schema.
+    takes none.
 
     A schema that other schemas of the same instance extend, as an allOf
     does, may declare only some of its properties, and closing it would
@@ -593,6 +670,148 @@ def _resolve_tool_schema(schema, root):
             return None
         schema = current
     return schema
+
+
+def _referenced(node, root):
+    """The schema a local reference of `node` names, or None."""
+    try:
+        return _lookup_tool_reference(node.get("$ref"), root)
+    except APIError:
+        return None
+
+
+def _enumeration(node):
+    """The values a schema node lists, as an enum or a const; None if it
+    lists none."""
+    return [node["const"]] if "const" in node else node.get("enum")
+
+
+# The JSON type of each kind of value json_codec reads.
+JSON_TYPES = {
+    type(None): "null",
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    str: "string",
+    list: "array",
+    dict: "object",
+}
+
+
+def _narrowed(types, other):
+    """The types of a value both `types` and `other` admit; None admits any."""
+    if types is None or other is None:
+        return other if types is None else types
+    both = types & other
+    if (
+        "number" in types
+        and "integer" in other
+        or "integer" in types
+        and "number" in other
+    ):
+        both |= {"integer"}
+    return frozenset(both)
+
+
+def schema_types(schema, root):
+    """The JSON types a value of `schema` may take, by which a parameter's
+    text converts; None for any. Those its type names, else those of its enum
+    or const values, else those its anyOf or oneOf members take together,
+    narrowed by its allOf members and the target of its local reference. A
+    member that constrains no type, such as one met again inside its own
+    reading, neither widens nor narrows the others'."""
+    types = {}
+
+    def read(node):
+        # Each node is read once.
+        if not isinstance(node, dict):
+            return frozenset() if node is False else None
+        if id(node) not in types:
+            types[id(node)] = None
+            types[id(node)] = own(node)
+        return types[id(node)]
+
+    def own(node):
+        kind = node.get("type")
+        values = _enumeration(node)
+        members = node.get("anyOf", node.get("oneOf"))
+        if isinstance(kind, (str, list)):
+            kinds = [kind] if isinstance(kind, str) else kind
+            result = frozenset(item for item in kinds if isinstance(item, str))
+        elif isinstance(values, list):
+            result = frozenset(
+                JSON_TYPES[type(value)] for value in values if type(value) in JSON_TYPES
+            )
+        elif isinstance(members, list) and members:
+            union = [types for member in members if (types := read(member)) is not None]
+            result = frozenset().union(*union) if union else None
+        else:
+            result = None
+        narrowing = node.get("allOf")
+        narrowing = list(narrowing) if isinstance(narrowing, list) else []
+        if "$ref" in node and (target := _referenced(node, root)) is not None:
+            narrowing.append(target)
+        for member in narrowing:
+            result = _narrowed(result, read(member))
+        return result
+
+    return read(schema)
+
+
+def _literal_texts(schema, root):
+    """The values a parameter of `schema` takes when the schema lists them
+    all, as the grammar writes each in Qwen XML: a string as its text, any
+    other value as JSON. An enum or const lists its values, a schema whose
+    only type is null or boolean lists that type's, a union lists its
+    members' and a local reference its target's, narrowed by allOf members
+    that list theirs. None when the schema does not list them."""
+    texts = {}
+
+    def read(node):
+        # Each node is read once, and a node met again inside its own reading
+        # lists nothing.
+        if id(node) in texts:
+            return texts[id(node)]
+        texts[id(node)] = None
+        if not isinstance(node, dict):
+            return None
+        values = _enumeration(node)
+        kind = node.get("type")
+        kind = kind[0] if isinstance(kind, list) and len(kind) == 1 else kind
+        members = node.get("anyOf", node.get("oneOf"))
+        if isinstance(values, list):
+            result = dict.fromkeys(
+                value
+                if isinstance(value, str)
+                else json.dumps(value, separators=(",", ":"))
+                for value in values
+            )
+        elif kind in ("null", "boolean"):
+            result = dict.fromkeys(["null"] if kind == "null" else ["true", "false"])
+        elif isinstance(members, list) and members:
+            result = {}
+            for member in members:
+                if (member_texts := read(member)) is None:
+                    result = None
+                    break
+                result.update(member_texts)
+        elif "$ref" in node and (target := _referenced(node, root)) is not None:
+            result = read(target)
+        else:
+            result = None
+        narrowing = node.get("allOf")
+        for member in narrowing if isinstance(narrowing, list) else ():
+            if (member_texts := read(member)) is not None:
+                result = (
+                    member_texts
+                    if result is None
+                    else {text: None for text in result if text in member_texts}
+                )
+        texts[id(node)] = result
+        return result
+
+    result = read(schema)
+    return None if result is None else list(result)
 
 
 def _schema_with_root(schema, root):
@@ -738,13 +957,7 @@ def _schema_combination(keyword, values):
         return not identity
     if len(values) == 1:
         return values[0]
-    combined = {keyword: values}
-    # Keep the raw-string transport when every union branch, or at least one
-    # intersection, requires a string. Other unions use JSON-encoded values.
-    strings = [value.get("type") == "string" for value in values]
-    if all(strings) if keyword == "anyOf" else any(strings):
-        combined["type"] = "string"
-    return combined
+    return {keyword: values}
 
 
 def _json_size(value, limit):
@@ -761,12 +974,22 @@ def _json_size(value, limit):
     return size
 
 
-def tool_argument_schema(root, budget):
-    """Project object fields for XML framing; validate the untouched schema.
+def _keyword(node, key, kind, default):
+    """The value of keyword `key` of `node`, which framing reads as a
+    `kind`. An older declared dialect leaves a newer keyword unchecked, so it
+    can hold anything; one of another kind is the client's schema error."""
+    value = node.get(key, default)
+    if not isinstance(value, kind):
+        raise APIError(400, f"unsupported tool parameter schema: {key}")
+    return value
 
-    Cross-field assertions remain on ToolPolicy.validators. This projection
-    preserves the set of possible field values rather than choosing a branch
-    before the model has supplied the discriminator or dependent properties.
+
+def tool_argument_schema(root, budget):
+    """Project a tool's object fields for XML framing.
+
+    The projection keeps every value a field may take rather than choosing a
+    branch before the model has written the discriminator or dependent
+    properties, so assertions across fields go unenforced.
     """
 
     def charge(size):
@@ -821,12 +1044,12 @@ def tool_argument_schema(root, budget):
         kind = node.get("type", "object")
         if kind != "object" and not (isinstance(kind, list) and "object" in kind):
             return None
-        properties = dict(node.get("properties", {}))
+        properties = dict(_keyword(node, "properties", dict, {}))
         additional = node.get("additionalProperties", True)
-        patterns = list(node.get("patternProperties", {}).values())
+        patterns = list(_keyword(node, "patternProperties", dict, {}).values())
         if patterns:
             additional = _schema_combination("anyOf", [additional, *patterns])
-        required = node.get("required", [])
+        required = _keyword(node, "required", list, [])
         for name in required:
             properties.setdefault(name, additional)
         shape = {
@@ -843,12 +1066,13 @@ def tool_argument_schema(root, budget):
                 resolved = _lookup_tool_reference(ref, root)
                 references[ref] = project(resolved, visiting | {ref})
             shapes.append(references[ref])
-        for child in node.get("allOf", []):
+        for child in _keyword(node, "allOf", list, []):
             shapes.append(project(child, visiting))
         for keyword in ("anyOf", "oneOf"):
             if keyword in node:
+                children = _keyword(node, keyword, list, [])
                 shapes.append(
-                    combine([project(child, visiting) for child in node[keyword]], True)
+                    combine([project(child, visiting) for child in children], True)
                 )
         if "if" in node:
             shapes.append(
@@ -860,11 +1084,11 @@ def tool_argument_schema(root, budget):
                     True,
                 )
             )
-        for child in node.get("dependentSchemas", {}).values():
+        for child in _keyword(node, "dependentSchemas", dict, {}).values():
             shapes.append(
                 combine([project(child, visiting), project({}, visiting)], True)
             )
-        choices = [node["const"]] if "const" in node else node.get("enum")
+        choices = _enumeration(node)
         if choices is not None:
             objects = [value for value in choices if isinstance(value, dict)]
             if not objects:
@@ -905,90 +1129,131 @@ def tool_argument_schema(root, budget):
     return shape
 
 
+def _lark_regex(pattern):
+    return "/" + pattern.replace("/", r"\/") + "/"
+
+
+_RAW_VALUE = "/(?s:.*)/"
+
+
+def _name_regex(dialect):
+    """The lexer pattern of a name the dialect's grammars write: one that
+    neither starts nor ends with the space reading strips, no longer than
+    reading takes, and free of the dialect's markup characters. A name is a
+    lexeme of its own: one spanning "<parameter=url>" would win over another
+    name that starts like it, and lexing cannot back off."""
+    forbidden = dialect.param_name_forbidden
+    edge = forbidden + " \t"
+    return _lark_regex(
+        rf"[^{edge}]([^{forbidden}]{{0,{MAX_NAME_LENGTH - 2}}}[^{edge}])?"
+    )
+
+
+def _union_members(schema):
+    """The members of a schema that is only a union of them; otherwise the
+    schema itself."""
+    if isinstance(schema, dict):
+        members = schema.get("anyOf", schema.get("oneOf"))
+        others = set(schema) - SCHEMA_ANNOTATIONS - SCHEMA_IDENTIFIERS
+        if isinstance(members, list) and members and others <= {"anyOf", "oneOf"}:
+            return members
+    return [schema]
+
+
 def _parameter_rules(rule, prefix, value_schema, dialect):
-    rules = []
+    """The rules of a parameter of a strict tool, its value written in the
+    dialect's framing as the template writes values, a string as its text
+    and any other value as JSON: raw text when it may be any string, else
+    one of the values each member of its union lists, or JSON of a member
+    that lists none. None when no value is possible. Framing makes each
+    parameter schema self-contained, so it is its own reference root."""
     closing = json.dumps(dialect.param_close)
-    string_schema = raw_string_schema(value_schema, dialect.value_barrier)
-    value_schema = _grammar_compatible_schema(value_schema)
-    if string_schema is None:
-        rules.append(
-            f"{rule}: {prefix} "
-            f"%json {json.dumps(value_schema, separators=(',', ':'))} "
-            f"{closing}"
-        )
-    elif string_schema[0] == "raw":
-        value_rule = f"{rule}_value"
-        rules.append(f"{rule}: {prefix} {value_rule}")
-        rules.append(f"{value_rule}[suffix={closing}]: /(?s:.*)/")
-    else:
-        choices = []
-        for choice_index, value in enumerate(string_schema[1]):
-            if value:
-                choices.append(json.dumps(value))
+    if value_schema is False:
+        return None
+    rules, choices = [], []
+    for member in _union_members(value_schema):
+        texts = _literal_texts(member, value_schema)
+        if texts is None:
+            types = schema_types(member, value_schema)
+            if types is None or "string" in types:
+                # Any text may be the value; the listed ones are among it.
+                return [
+                    f"{rule}: {prefix} {rule}_value",
+                    f"{rule}_value[suffix={closing}]: {_RAW_VALUE}",
+                ]
+            if member is not value_schema:
+                # A member refers to the parameter schema's definitions.
+                member = _schema_with_root(member, value_schema)
+            member = _grammar_compatible_schema(member)
+            choices.append(f"%json {json.dumps(member, separators=(',', ':'))}")
+            continue
+        for text in texts:
+            if dialect.value_barrier is not None and dialect.value_barrier in text:
+                raise APIError(400, "tool parameter enum contains XML framing")
+            if text:
+                choices.append(json.dumps(text))
             else:
-                empty_rule = f"{rule}_empty_{choice_index}"
-                rules.append(f"{empty_rule}:")
-                choices.append(empty_rule)
-        rules.append(f"{rule}: {prefix} ({' | '.join(choices)}) {closing}")
-    return rules
+                rules.append(f"{rule}_empty_{len(rules)}:")
+                choices.append(f"{rule}_empty_{len(rules) - 1}")
+    if not choices:
+        return None
+    return [
+        *rules,
+        f"{rule}: {prefix} ({' | '.join(dict.fromkeys(choices))}) {closing}",
+    ]
 
 
 def _argument_grammar(schema, dialect=None):
+    """The arguments of a strict tool: the declared parameters in schema
+    order, each required one present, then any others the schema allows."""
     if dialect is None:
         dialect = QWEN3_XML
     properties = schema["properties"]
     required = schema["required"]
     rules = []
     sequence = []
-    required_sequence = []
-    optional_sequence = []
     # A name is a lexeme of its own: one spanning "<parameter=url>" would win
     # over an extra name that starts like it, and lexing cannot back off.
     name_open = json.dumps(dialect.param_open)
     name_close = json.dumps(dialect.param_name_close)
     for index, (name, value_schema) in enumerate(properties.items()):
-        if value_schema is False:
+        rule = f"parameter_{index}"
+        prefix = f"{name_open} {json.dumps(name)} {name_close}"
+        if value_schema is not False and (
+            not isinstance(name, str)
+            or not name
+            or len(name) > MAX_NAME_LENGTH
+            or name != name.strip(NAME_SPACE)
+            or any(character in name for character in dialect.param_name_forbidden)
+        ):
+            raise APIError(400, "invalid tool parameter name")
+        parameter_rules = _parameter_rules(rule, prefix, value_schema, dialect)
+        if parameter_rules is None:
             if name in required:
                 raise APIError(
                     400, f"required tool parameter cannot have a value: {name}"
                 )
             continue
-        if (
-            not isinstance(name, str)
-            or not name
-            or name != name.strip()
-            or any(character in name for character in dialect.param_name_forbidden)
-        ):
-            raise APIError(400, "invalid tool parameter name")
-        rule = f"parameter_{index}"
-        item = rule + ("" if name in required else "?")
-        sequence.append(item)
-        (required_sequence if name in required else optional_sequence).append(item)
-        prefix = f"{name_open} {json.dumps(name)} {name_close}"
-        rules.extend(_parameter_rules(rule, prefix, value_schema, dialect))
-    additional = schema["additionalProperties"]
-    if additional is not False:
-        # Extra names are the complement of the declared names.
+        rules.extend(parameter_rules)
+        sequence.append(rule + ("" if name in required else "?"))
+    extra_rules = _parameter_rules(
+        "extra",
+        f"{name_open} EXTRA_NAME {name_close}",
+        schema["additionalProperties"],
+        dialect,
+    )
+    if extra_rules is not None:
+        # Other names are those the tool does not declare.
         declared = " | ".join(json.dumps(name) for name in properties)
         rules.append(
-            f"EXTRA_NAME: /{dialect.extra_name_pattern}/"
+            f"EXTRA_NAME: {_name_regex(dialect)}"
             + (f" & ~({declared})" if declared else "")
         )
-        prefix = f"{name_open} EXTRA_NAME {name_close}"
-        rules.extend(_parameter_rules("extra", prefix, additional, dialect))
-    # A skipped optional field cannot be revisited in an ordered grammar.
-    # Also accept required-first order so a model that starts with the required
-    # fields can still supply earlier optional fields. Two linear sequences
-    # retain required/unique fields without enumerating every permutation.
-    required_first = required_sequence + optional_sequence
-    start = " ".join(sequence)
-    if required_first != sequence:
-        start = f"({start}) | ({' '.join(required_first)})"
-    if additional is not False:
-        start = f"({start}) extra*" if start else "extra*"
+        rules.extend(extra_rules)
+        sequence.append("extra*")
     return (
         "%llguidance {}\nstart:"
-        + (" " + start if start else "")
+        + "".join(f" {item}" for item in sequence)
         + "\n"
         + "\n".join(rules)
         + "\n"
@@ -1036,6 +1301,8 @@ def normalize_response_format(value):
 
 
 def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None):
+    """The tools of a request and its ToolPolicy. `dialect` is the served
+    model's tool-call framing, None for the default."""
     if parallel is None:
         parallel = True
     if not isinstance(parallel, bool):
@@ -1046,8 +1313,8 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
         return None, None
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array")
-    validators = {}
     schemas = {}
+    marked = set()
     for tool in tools:
         if not isinstance(tool, dict) or tool.get("type") != "function":
             raise APIError(400, "only function tools are supported")
@@ -1058,7 +1325,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
             or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name) is None
         ):
             raise APIError(400, "tool name must match [A-Za-z0-9_-]{1,128}")
-        if name in validators:
+        if name in schemas:
             raise APIError(400, f"duplicate tool name: {name}")
         schema = function.get("parameters")
         if schema is None:
@@ -1071,88 +1338,113 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            validators[name] = build_validator(schema)
-            schemas[name] = _strict_schema(schema) if strict else schema
+            build_validator(schema)
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"
             ) from error
+        schemas[name] = schema
+        if strict:
+            marked.add(name)
     choice = "auto" if tool_choice is None else tool_choice
     if not tools:
         if choice not in ("auto", "none"):
             raise APIError(400, "tool_choice requires at least one tool")
         return None, None
     if choice == "none":
-        # The prompt keeps every tool; the grammar and validators allow no call.
-        validators, schemas = {}, {}
-    elif isinstance(choice, dict):
+        # The prompt keeps every tool; the grammar lets no call start.
+        return tools, ToolPolicy(
+            schemas={},
+            required=False,
+            parallel=parallel,
+            strict=frozenset(),
+            constrained=True,
+            namespaces=namespaces or {},
+            dialect=dialect,
+        )
+    if isinstance(choice, dict):
         function = choice.get("function", {})
         name = function.get("name") if isinstance(function, dict) else None
         if (
             choice.get("type") != "function"
             or not isinstance(name, str)
-            or name not in validators
+            or name not in schemas
         ):
             raise APIError(400, "invalid named tool_choice")
-        # The prompt keeps every tool; the grammar and validators force the
-        # call, exactly one, as a forced function is defined.
-        validators = {name: validators[name]}
+        # The prompt keeps every tool; the grammar forces the call, exactly
+        # one, as a forced function is defined.
         schemas = {name: schemas[name]}
         parallel = False
     elif choice not in ("auto", "required"):
         raise APIError(400, "invalid tool_choice")
+    strict = frozenset(marked & schemas.keys())
+    # A strict tool's schema compiles into its grammar, so its references
+    # must resolve.
+    for name in strict:
+        for node in subschemas(schemas[name]):
+            if isinstance(node, dict) and "$ref" in node:
+                _lookup_tool_reference(node["$ref"], schemas[name])
+    # A grammar holds the calls to the template's tags when the choice
+    # requires one, when it may make at most one, and beside a strict tool,
+    # whose arguments it generates; otherwise the model writes them freely.
     policy = ToolPolicy(
-        validators,
-        schemas,
-        choice == "required" or isinstance(choice, dict),
-        parallel,
-        namespaces or {},
-        dialect or QWEN3_XML,
+        schemas=schemas,
+        required=choice != "auto",
+        parallel=parallel,
+        strict=strict,
+        constrained=choice != "auto" or not parallel or bool(strict),
+        namespaces=namespaces or {},
+        dialect=dialect,
     )
     return tools, policy
 
 
-THINK_END = "</think>"
-
-
 def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
+    """The output grammar of a request whose tool calls are constrained, or
+    whose tools stand beside a response schema: each call names an offered
+    tool in the dialect's layout, with a strict tool's arguments generated
+    to its schema and any other's free. A required choice starts with a call
+    and a named one is that call; under an auto choice text may come first.
+    Parallel calls may be followed by text and further calls, and a single
+    call by whitespace only. Beside an auto choice, a response schema admits
+    its JSON answer instead of the calls."""
     dialect = policy.dialect or QWEN3_XML
     try:
-        arguments = [
-            dialect.argument_grammar(schema)
-            for schema in policy.argument_schemas.values()
-        ]
+        strict_arguments = {
+            name: dialect.argument_grammar(policy.argument_schemas[name])
+            for name in policy.strict
+        }
     except (AttributeError, TypeError) as error:
         # An older declared dialect leaves newer keywords unchecked, so framing
         # can meet any JSON value where it reads part of a schema.
         raise APIError(400, "unsupported tool parameter schema") from error
-    # Text of the model's own may come before a call only where the answer
-    # may be text. A required call, like a JSON answer, stands apart from the
-    # reasoning and from other calls by whitespace alone.
-    separator = "WS" if policy.required or response_schema is not None else "TEXT"
     side_grammars = []
-    for index, grammar in enumerate(arguments):
+    if len(strict_arguments) < len(policy.schemas):
         side_grammars.append(
-            {"name": f"arguments_{index}", "lark_grammar": grammar}
+            {"name": "free_arguments", "lark_grammar": dialect.free_arguments()}
         )
-    tag_rules, calls, maybe_calls = dialect.call_rules(
-        list(policy.argument_schemas), separator, policy.parallel
-    )
-    calls += " WS"
-    thinking_prefix = "think " if thinking else ""
-    if not tag_rules:
+    calls = []
+    for index, name in enumerate(policy.schemas):
+        arguments = "free_arguments"
+        if name in strict_arguments:
+            arguments = f"arguments_{index}"
+            side_grammars.append(
+                {"name": arguments, "lark_grammar": strict_arguments[name]}
+            )
+        calls.append(dialect.call_rule(index, name, arguments))
+    call = dialect.call_expression(len(calls), policy.parallel)
+    if not calls:
         # tool_choice "none": neither the text nor a JSON answer starts a call.
-        body = "tail" if response_schema is None else "answer"
-        start = f"start: {thinking_prefix}{body}"
-    elif response_schema is not None:
-        body = calls if policy.required else f"({calls} | answer)"
-        start = f"start: {thinking_prefix}{body}"
-    elif policy.required:
-        start = f"start: {thinking_prefix}{calls}"
+        body = "TEXT" if response_schema is None else "answer"
+    elif policy.required or response_schema is not None:
+        # A call comes first, set apart from the reasoning by whitespace.
+        body = f"WS {call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
+        if not policy.required:
+            body = f"(({body}) | answer)"
     else:
-        start = f"start: {thinking_prefix}{maybe_calls} tail"
-    main = ["%llguidance {}", start]
-    if response_schema is not None:
+        body = f"(TEXT {call})* TEXT" if policy.parallel else f"TEXT ({call} WS)?"
+    main = ["%llguidance {}", "start: " + ("think " if thinking else "") + body]
+    if response_schema is not None and not policy.required:
         main.append(
             "answer: WS %json "
             + json.dumps(
@@ -1160,9 +1452,6 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
             )
             + " WS"
         )
-    # The calls expression ends in WS in every branch, so the rule is bound
-    # even where the separator before a call is TEXT.
-    main.append(WHITESPACE_RULE)
     if thinking:
         think_end = (
             THINK_END_TOKEN_ID if think_end_id is None else think_end_id
@@ -1170,8 +1459,8 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
         main.append(f"think: TEXT <[{think_end}]>")
     main.extend(
         [
-            "tail: TEXT",
-            *tag_rules,
+            *calls,
+            WHITESPACE_RULE,
             rf"TEXT: /(?s:.*)/ & ~/(?s:.*)({dialect.barrier}|<\/think>)(?s:.*)/",
         ]
     )

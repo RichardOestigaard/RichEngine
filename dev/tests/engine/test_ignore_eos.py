@@ -50,15 +50,18 @@ class IgnoreEosTests(unittest.TestCase):
         self.assertEqual(runtime.requests, [])
 
     def test_grammar_constrained_generation_rejects_it(self):
-        # The grammar decides where tool calls and structured output end.
+        # The grammar decides where constrained tool calls, output under
+        # tool_choice none and structured output end.
         factory = FakeConstraintFactory()
-        harness, runtime = self.harness(Plan([[4]]), constraint_factory=factory)
+        harness, runtime = self.harness(
+            Plan([[4]]), Plan([[4]]), constraint_factory=factory
+        )
         tools = [{"type": "function", "function": {"name": "weather"}}]
         schema = {"type": "json_schema", "json_schema": {"schema": {}}}
         for fields in (
-            {"tools": tools},
             {"tools": tools, "tool_choice": "none"},
             {"tools": tools, "tool_choice": "required"},
+            {"tools": tools, "parallel_tool_calls": False},
             {"response_format": schema},
             {"response_format": {"type": "json_object"}},
         ):
@@ -69,18 +72,23 @@ class IgnoreEosTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(
                     json.loads(payload)["error"]["message"],
-                    "ignore_eos cannot be combined with tools or structured output",
+                    "ignore_eos cannot be combined with constrained tool calls, "
+                    "tool_choice none or structured output",
                 )
         self.assertEqual((runtime.requests, factory.grammars), ([], []))
-        # Unconstrained text ignores end-of-sequence as asked.
-        status, _, payload = harness.request(
-            "POST",
-            CHAT[0],
-            {**CHAT[1], "response_format": {"type": "text"}, "ignore_eos": True},
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(runtime.requests[0].frame.flags, IGNORE_EOS)
-        self.assertEqual(runtime.requests[0].frame.constraint, wire.ConstraintMode.NONE)
+        # Unconstrained text ignores end-of-sequence as asked, and so do tool
+        # calls that nothing constrains.
+        for fields in ({"response_format": {"type": "text"}}, {"tools": tools}):
+            with self.subTest(fields=fields):
+                status, _, payload = harness.request(
+                    "POST", CHAT[0], {**CHAT[1], **fields, "ignore_eos": True}
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(runtime.requests[-1].frame.flags, IGNORE_EOS)
+                self.assertEqual(
+                    runtime.requests[-1].frame.constraint, wire.ConstraintMode.NONE
+                )
+        self.assertEqual(factory.grammars, [])
 
 
 if __name__ == "__main__":

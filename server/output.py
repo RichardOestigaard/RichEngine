@@ -1,4 +1,4 @@
-"""Incremental model-output parsing, output blocks and final tool/answer
+"""Incremental model-output parsing, output blocks and final answer
 validation."""
 
 import re
@@ -11,68 +11,67 @@ from . import json_codec
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
+    CALL_OPEN,
+    JSON_TYPES,
+    MAX_NAME_LENGTH,
+    NAME_SPACE,
     QWEN3_XML,
     THINK_END,
     json_value,
-    raw_string_schema,
 )
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
+# A value read as JSON nests at most this deep, so that encoding it back never
+# exhausts the stack.
+MAX_JSON_NESTING = 256
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def _validate_tool_unicode(value):
-    # Validate decoded values, so literal backslash-u text remains unchanged.
-    if isinstance(value, str):
-        if _SURROGATE.search(value):
-            raise APIError(
-                500,
-                "model returned invalid Unicode in tool arguments",
-                "invalid_model_output",
-            )
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _validate_tool_unicode(key)
-            _validate_tool_unicode(item)
-    elif isinstance(value, list):
-        for item in value:
-            _validate_tool_unicode(item)
-
-
-def _tool_json(value):
-    _validate_tool_unicode(value)
-    return json_codec.dumps(value)
-
-
-def hold_partial(text, marker):
-    for length in range(min(len(text), len(marker) - 1), 0, -1):
-        if text.endswith(marker[:length]):
+def hold_partial(text, *markers):
+    """`text` split before its longest end that begins one of `markers`, which
+    more text may complete."""
+    longest = max(len(marker) for marker in markers)
+    for length in range(min(len(text), longest - 1), 0, -1):
+        if any(
+            length < len(marker) and text.endswith(marker[:length])
+            for marker in markers
+        ):
             return text[:-length], text[-length:]
     return text, ""
 
 
 class ReasoningSplitter:
-    def __init__(self, thinking):
+    def __init__(self, thinking, tool_calls=False):
         self.reasoning = thinking
         self.pending = ""
         # Whether the newlines after </think>, which set the answer apart in
         # the chat template's layout of a turn, are still to be dropped.
         self.separator = False
+        # Where a call may follow, a call's opening also ends the reasoning
+        # and begins the answer.
+        self.ends = (THINK_END, CALL_OPEN) if tool_calls else (THINK_END,)
 
     def put(self, text):
         if not self.reasoning:
             return self._content(text)
         self.pending += text
-        end = self.pending.find(THINK_END)
-        if end >= 0:
+        ends = [
+            (index, marker)
+            for marker in self.ends
+            if (index := self.pending.find(marker)) >= 0
+        ]
+        if ends:
+            end, marker = min(ends)
             reasoning = self.pending[:end]
-            content = self.pending[end + len(THINK_END) :]
+            content = self.pending[end:]
+            if marker == THINK_END:
+                content = content[len(THINK_END) :]
             self.pending = ""
             self.reasoning = False
-            self.separator = True
+            self.separator = marker == THINK_END
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
-        ready, self.pending = hold_partial(self.pending, THINK_END)
+        ready, self.pending = hold_partial(self.pending, *self.ends)
         return [("reasoning_content", ready)] if ready else []
 
     def _content(self, text):
@@ -91,6 +90,59 @@ class ReasoningSplitter:
         return [(kind, text)]
 
 
+_NOT_JSON = object()
+# A template that writes a value through Jinja's string filter, as Nex's and
+# some of Qwen's do, spells a boolean or null as Python does.
+_PYTHON_LITERALS = {"True": True, "False": False, "None": None}
+
+
+def _json_value(text):
+    """The JSON value `text` spells, if it can be written back as JSON: its
+    numbers finite, its strings Unicode and its containers nested at most
+    MAX_JSON_NESTING deep. Otherwise _NOT_JSON."""
+    try:
+        value = json_codec.loads(text)
+    except (ValueError, RecursionError):
+        return _NOT_JSON
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, str):
+            if _SURROGATE.search(item):
+                return _NOT_JSON
+        elif isinstance(item, (dict, list)):
+            if depth == MAX_JSON_NESTING:
+                return _NOT_JSON
+            children = [*item, *item.values()] if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+    return value
+
+
+def convert_value(text, types):
+    """A parameter's text as the JSON types its schema declares read it, any
+    type where `types` is None: a string as the text, and another value as
+    the JSON the text spells when that is of a declared type or when no
+    declared type is a string. A boolean or null declared without a string
+    may also be spelled as Python spells it. Otherwise the text."""
+    value = _json_value(text)
+    if value is _NOT_JSON:
+        value = _PYTHON_LITERALS.get(text.strip(), _NOT_JSON)
+        declared = (
+            value is not _NOT_JSON
+            and types is not None
+            and "string" not in types
+            and JSON_TYPES[type(value)] in types
+        )
+        return value if declared else text
+    if types is None or "string" in types:
+        kind = JSON_TYPES[type(value)]
+        declared = (
+            types is None or kind in types or (kind == "integer" and "number" in types)
+        )
+        return value if declared and kind != "string" else text
+    return value
+
+
 def StreamingToolCallProjector(policy, request_id, structured=False):
     """The output projector for the policy's tool-call dialect."""
     dialect = getattr(policy, "dialect", None) or QWEN3_XML
@@ -103,27 +155,49 @@ class _ProjectorBase:
     """Parse a model's tool-call framing as it arrives into OpenAI JSON
     argument deltas, for streamed and complete responses alike.
 
-    Emit function names before their arguments finish. Validate each closed
-    call before its closing JSON brace, then validate the complete response
-    at request completion. Text outside calls streams as it arrives, after a
-    call as before one.
+    Calls read as the chat template lays them out. Names lose the space
+    around them; a call that names no function is dropped, other text inside
+    a call is dropped, and a repeated parameter keeps its first value, which
+    may have streamed. A value converts by the types its tool declares for
+    it (convert_value), and one that may only be a string streams as it is
+    written. Text outside calls streams as it arrives, after a call as
+    before one, and a </think> there is dropped.
     """
+
+    # The state the text after a call's opening enters, and the state a
+    # finished call leaves for its close.
+    _after_open = "name"
+    _after_call = "closing"
 
     def __init__(self, policy, request_id, structured, dialect):
         self.policy = policy
         self.dialect = dialect
+        # The text that opens a call and begins its name: the call's open
+        # marker and the prefix its name follows.
+        self.call_marker = dialect.call_open + dialect.name_prefix
+        # Text outside calls: a call's opening opens one, and a </think>,
+        # which a model that called a tool from its reasoning may still
+        # write, is dropped.
+        self.text_tags = (self.call_marker, THINK_END)
         self.request_id = request_id
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
+        # The open call, None while the text names none or names no function.
         self.call_id = None
         self.function_name = None
-        self.parameter_name = None
-        self.string_schema = None
-        self.parameter_value_fragments = []
-        self.streaming_string = False
-        self.arguments = {}
+        # The types by which its declared parameters and any others convert.
+        self.parameter_types = {}
+        self.other_types = None
+        self.parameter_names = set()
         self.argument_fragments = []
+        self.parameter_count = 0
+        # The open parameter, None while its value is dropped.
+        self.parameter_name = None
+        self.value_types = None
+        self.value_streams = False
+        self.value_started = False
+        self.value_parts = []
         self.content_fragments = []
         # How many content fragments the stream has published (the rest are
         # whitespace it holds), and whether the text since the start of the
@@ -131,10 +205,14 @@ class _ProjectorBase:
         self.streamed_count = 0
         self.text_visible = False
         self.closed_calls = []
+        # Whether the open parameter's value arrived as a CDATA section.
+        self.cdata_open = None
 
     @staticmethod
     def _malformed():
-        raise APIError(500, "model returned malformed tool XML", "invalid_model_output")
+        raise APIError(
+            500, "model returned malformed tool output", "invalid_model_output"
+        )
 
     def _literal(self, value):
         if self.pending.startswith(value):
@@ -164,37 +242,9 @@ class _ProjectorBase:
     def _streamed_content(self):
         return "".join(self.content_fragments[: self.streamed_count])
 
-    def _open_call(self, name, events):
-        """The tool delta and state that begin a call of `name`."""
-        if not name or self.policy.validators.get(name) is None:
-            raise APIError(
-                500,
-                f"model called unknown tool {name}",
-                "invalid_model_output",
-            )
-        if not self.streamed_count:
-            # Whitespace before the first text only framed the calls.
-            self.content_fragments.clear()
-        self.function_name = name
-        self.call_id = f"call_{self.request_id}_{self.call_index}"
-        self.arguments = {}
-        self.argument_fragments = ["{"]
-        events.append(
-            (
-                "tool",
-                {
-                    "index": self.call_index,
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {"name": name},
-                },
-            )
-        )
-        events.append(
-            ("tool", {"index": self.call_index, "function": {"arguments": "{"}})
-        )
-
     def _emit_argument(self, fragment, events):
+        if self.call_id is None:
+            return
         self.argument_fragments.append(fragment)
         for chunk in argument_deltas(fragment):
             events.append(
@@ -207,115 +257,191 @@ class _ProjectorBase:
                 )
             )
 
-    def _emit_string_value(self, value, events):
-        if not value:
-            return
-        self.parameter_value_fragments.append(value)
-        self._emit_argument(_tool_json(value)[1:-1], events)
-
-    def _finish_call(self, events):
-        arguments = _tool_json(self.arguments)
-        call = {
-            "id": self.call_id,
-            "type": "function",
-            "function": {"name": self.function_name, "arguments": arguments},
-        }
-        validate_tool_calls([call], self.policy)
-        self.argument_fragments.append("}")
-        if "".join(self.argument_fragments) != arguments:
-            raise APIError(
-                500,
-                "streamed tool arguments do not match canonical arguments",
-                "internal_server_error",
-            )
-        events.append(
-            ("tool", {"index": self.call_index, "function": {"arguments": "}"}})
-        )
-        self.closed_calls.append(call)
-        self.call_index += 1
-        self.call_id = None
-        self.function_name = None
-        self.arguments = {}
+    def _begin_call(self, name, events):
         self.argument_fragments = []
-        self.text_visible = False
-        self.state = "content"
+        self.parameter_count = 0
+        self.parameter_names = set()
+        name = name.strip(NAME_SPACE)
+        if not name:
+            return
+        if not self.streamed_count:
+            # Whitespace before the first text only framed the calls.
+            self.content_fragments.clear()
+        self.function_name = name
+        self.call_id = f"call_{self.request_id}_{self.call_index}"
+        self.parameter_types, self.other_types = self.policy.parameter_types(name)
+        events.append(
+            (
+                "tool",
+                {
+                    "index": self.call_index,
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {"name": name},
+                },
+            )
+        )
+        self._emit_argument("{", events)
+
+    def _key(self, name):
+        separator = "," if self.parameter_count else ""
+        self.parameter_count += 1
+        return f"{separator}{json_codec.dumps(name)}:"
 
     def _begin_parameter(self, name, events):
-        if not name or name in self.arguments:
-            raise APIError(
-                500,
-                "model repeated a tool parameter",
-                "invalid_model_output",
-            )
-        self.parameter_name = name
-        self.string_schema = raw_string_schema(
-            _tool_property_schema(self.policy, self.function_name, name),
-            self.dialect.value_barrier,
-        )
-        self.streaming_string = (
-            self.string_schema is not None and self.string_schema[0] == "raw"
-        )
-        self.parameter_value_fragments = []
-        if self.streaming_string:
-            prefix = "" if len(self.arguments) == 0 else ","
-            self._emit_argument(
-                prefix + _tool_json(name) + ':"',
-                events,
-            )
+        name = name.strip(NAME_SPACE)
+        # A repeated parameter keeps its first value, which may have streamed;
+        # a parameter without a name, or of a call that names no function,
+        # keeps none.
+        kept = name and name not in self.parameter_names and self.call_id is not None
+        self.parameter_names.add(name)
+        self.parameter_name = name if kept else None
+        self.value_types = self.parameter_types.get(name, self.other_types)
+        # A value that may only be a string streams as it is written; any
+        # other waits for its end to convert.
+        self.value_streams = self.value_types == {"string"}
+        self.value_started = False
+        self.value_parts = []
+        if self.value_streams and self.parameter_name is not None:
+            self._emit_argument(self._key(name) + '"', events)
+        self.state = "value"
 
-    def _end_parameter(self, value, events):
-        """Publish a complete parameter value as an arguments fragment."""
-        self.arguments[self.parameter_name] = value
+    def _put_value(self, text, events):
+        if self.parameter_name is None:
+            return
+        if not self.value_started:
+            if not text:
+                return
+            self.value_started = True
+            text = text.removeprefix("\n")
+        if not text:
+            return
+        if self.value_streams:
+            self._emit_argument(json_codec.dumps(text)[1:-1], events)
+        else:
+            self.value_parts.append(text)
+
+    def _end_parameter(self, text, events):
+        if self.parameter_name is not None:
+            if not self.value_started:
+                self.value_started = True
+                text = text.removeprefix("\n")
+            self._put_value(text, events)
+            if self.value_streams:
+                self._emit_argument('"', events)
+            else:
+                value = convert_value("".join(self.value_parts), self.value_types)
+                self._emit_argument(
+                    self._key(self.parameter_name) + json_codec.dumps(value), events
+                )
         self.parameter_name = None
-        self.string_schema = None
-        self.parameter_value_fragments = []
-        self.streaming_string = False
+        self.value_parts = []
+        self.state = "arguments"
+
+    def _finish_call(self, events):
+        self._emit_argument("}", events)
+        if self.call_id is not None:
+            self.closed_calls.append(
+                {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": self.function_name,
+                        "arguments": "".join(self.argument_fragments),
+                    },
+                }
+            )
+            self.call_index += 1
+        self.call_id = None
+        self.function_name = None
+        self.argument_fragments = []
+        self.text_visible = False
+        self.state = self._after_call
+
+    def _next_tag(self, *tags):
+        """The tag of `tags` that the pending text spells first, and where."""
+        found = [(index, tag) for tag in tags if (index := self.pending.find(tag)) >= 0]
+        return min(found) if found else (-1, None)
+
+    def _name(self, delimiter):
+        """The name the pending text spells up to `delimiter`, taken off the
+        text; "" for a longer one, and None while it may yet end."""
+        end = self.pending.find(delimiter, 0, MAX_NAME_LENGTH + 1)
+        if end < 0:
+            return None if len(self.pending) <= MAX_NAME_LENGTH else ""
+        name, self.pending = self.pending[:end], self.pending[end + 1 :]
+        return name
+
+    def _output_state(self, events):
+        """The "output" and "json" states of a structured answer, which is
+        one JSON value or tool calls: once JSON starts, call spellings
+        inside its strings are just data. True to keep reading, False while
+        more text must arrive, None in any other state."""
+        if self.state == "output":
+            first = self.pending.lstrip()
+            if not first:
+                return False
+            self.state = "content" if first.startswith("<") else "json"
+        if self.state == "json":
+            self._emit_content(self.pending, events)
+            self.pending = ""
+            return False
+        return None
 
     def _content_state(self, events):
-        """The "content" state shared by every dialect: emit text up to the
-        next call's opening marker, and skip a separator between calls."""
+        """The "content" state every dialect shares: emit text up to the
+        next call's opening, skip a call separator, drop a </think>. False
+        while only a marker's partial prefix remains."""
         separator = self.dialect.call_separator
         if separator and self.pending.startswith(separator):
             self.pending = self.pending[len(separator) :]
             return True
-        start = self.pending.find(self.dialect.call_open)
-        if start >= 0:
-            self._emit_content(self.pending[:start], events)
-            self.pending = self.pending[start + len(self.dialect.call_open) :]
-            self.state = "call_started"
-            return True
-        # Hold the longest suffix that may begin a call marker or separator.
-        markers = (self.dialect.call_open,) + ((separator,) if separator else ())
-        held_len = max(
-            len(hold_partial(self.pending, marker)[1]) for marker in markers
-        )
-        ready = self.pending[:-held_len] if held_len else self.pending
-        self.pending = self.pending[len(ready) :]
-        self._emit_content(ready, events)
-        return False
+        start, tag = self._next_tag(*self.text_tags)
+        if tag is None:
+            markers = self.text_tags + ((separator,) if separator else ())
+            ready, self.pending = hold_partial(self.pending, *markers)
+            self._emit_content(ready, events)
+            return False
+        self._emit_content(self.pending[:start], events)
+        self.pending = self.pending[start + len(tag) :]
+        if tag == self.call_marker:
+            self.state = self._after_open
+        return True
+
+    def _drain(self, events):
+        """Close whatever complete output ended inside."""
 
     def finish(self, incomplete):
-        """The content and calls of the output, and the content the stream
-        still owes, which put() held back to see what followed.
+        """The content and calls of the output, and the events the stream
+        still owes for what put() held back.
 
-        Closed calls are complete, and output cut at the token limit keeps
-        an open call with the arguments it has. Cut output with a call has
-        the content the stream published, which leaves out whitespace that
-        no visible text has followed since the start or the last call.
-        Otherwise the content is the text outside calls without whitespace
-        that only frames them and, when cut, a trailing partial call marker
-        or unfinished call header."""
-        if self.state in ("content", "output", "json"):
-            if self.pending and not (
-                incomplete and self.dialect.call_open.startswith(self.pending)
-            ):
-                self.content_fragments.append(self.pending)
-            elif self.closed_calls:
-                # Whitespace held after the last text only framed the calls.
-                del self.content_fragments[self.streamed_count :]
+        Output cut at the token limit keeps an open call with the arguments
+        it has, and no call whose name it cut; other output that ends inside
+        a call closes the call, and what it held back after a value could
+        only begin the value's close. Cut output with a call has the content
+        the stream published, which leaves out whitespace that no visible
+        text has followed since the start or the last call. Otherwise the
+        content is the text outside calls without whitespace that only frames
+        them and, when cut, a trailing partial tag."""
+        events = []
+        if not incomplete:
+            self._drain(events)
+        if self.state in ("closing", "call_sep"):
             self.pending = ""
-        elif not incomplete:
-            self._malformed()
+            self.state = "content"
+        if (
+            self.state in ("content", "output", "json")
+            and self.pending
+            and not (
+                incomplete
+                and any(tag.startswith(self.pending) for tag in self.text_tags)
+            )
+        ):
+            self.content_fragments.append(self.pending)
+        elif self.closed_calls:
+            # Whitespace held after the last text only framed the calls.
+            del self.content_fragments[self.streamed_count :]
+        self.pending = ""
         calls = list(self.closed_calls)
         if self.call_id is not None:
             calls.append(
@@ -330,7 +456,9 @@ class _ProjectorBase:
             )
         streamed = self._streamed_content()
         content = streamed if calls and incomplete else "".join(self.content_fragments)
-        return content, calls, content[len(streamed) :]
+        if unsent := content[len(streamed) :]:
+            events.append(("content", unsent))
+        return content, calls, events
 
 
 _CDATA_OPEN = "<![CDATA["
@@ -338,143 +466,146 @@ _CDATA_OPEN = "<![CDATA["
 
 class _XmlToolCallProjector(_ProjectorBase):
     """The projector of an XML dialect: calls are elements whose parameters
-    are elements wrapping a raw or JSON-encoded value."""
+    are elements wrapping a value that ends at the parameter's close where
+    the next tag follows."""
 
-    def _begin_call(self, events):
-        name_end = self.pending.find(self.dialect.name_close)
-        if name_end < 0:
-            return False
-        name = self.pending[:name_end]
-        self.pending = self.pending[name_end + len(self.dialect.name_close) :]
-        self._open_call(name, events)
-        self.state = "body"
-        return True
+    def __init__(self, policy, request_id, structured, dialect):
+        super().__init__(policy, request_id, structured, dialect)
+        # Where a value ends: the close the template writes after it, then
+        # the next parameter, the function's close, or the call's close a
+        # model may write without the function's. A value may hold the tags
+        # in any other order.
+        follows = (dialect.param_open, dialect.body_close) + (
+            (dialect.block_close,) if dialect.block_close else ()
+        )
+        self.value_ends = tuple(dialect.param_close + tag for tag in follows)
+        self.argument_tags = follows
 
-    def _finish_parameter(self, events):
-        # Only text that may begin the closing marker stays pending, so each
-        # character of a value is scanned and copied a bounded number of times.
-        if self.dialect.cdata:
-            # A value may open as a CDATA section; wait until that much text
-            # has arrived or ruled it out before streaming the value.
-            if not self.parameter_value_fragments and not self.cdata_open:
-                if self.pending.startswith(_CDATA_OPEN):
-                    self.pending = self.pending[len(_CDATA_OPEN) :]
-                    self.cdata_open = True
-                elif _CDATA_OPEN.startswith(self.pending):
-                    return False
-            close = (
-                "]]>" + self.dialect.param_close
-                if self.cdata_open
-                else self.dialect.param_close
-            )
-        else:
-            close = self.dialect.param_close
-        value_end = self.pending.find(close)
-        if value_end < 0:
-            ready, self.pending = hold_partial(self.pending, close)
-            if self.streaming_string:
-                self._emit_string_value(ready, events)
-            elif ready:
-                self.parameter_value_fragments.append(ready)
-            return False
-        tail = self.pending[:value_end]
-        self.pending = self.pending[value_end + len(close) :]
-        self.cdata_open = False
-        if self.streaming_string:
-            self._emit_string_value(tail, events)
-            value = "".join(self.parameter_value_fragments)
-            self._emit_argument('"', events)
-        else:
-            self.parameter_value_fragments.append(tail)
-            value = _typed_tool_value(
-                "".join(self.parameter_value_fragments), self.string_schema
-            )
-            prefix = "" if len(self.arguments) == 0 else ","
-            fragment = (
-                prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
-            )
-            self._emit_argument(fragment, events)
-        self._end_parameter(value, events)
-        self.state = "body"
-        return True
+    def _drain(self, events):
+        if self.state == "name":
+            name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
+            self.pending = ""
+            self._begin_call(name, events)
+            self.state = "arguments"
+        if self.state == "value":
+            self.pending = ""
+            self._end_parameter("", events)
+        if self.state in ("arguments", "parameter"):
+            self.pending = ""
+            self._finish_call(events)
 
     def put(self, text):
         self.pending += text
         events = []
         while self.pending:
-            if self.state == "output":
-                first = self.pending.lstrip()
-                if not first:
+            handled = self._output_state(events)
+            if handled is not None:
+                if not handled:
                     break
-                # A structured answer is one JSON value or tool calls. Once
-                # JSON starts, call spellings inside its strings are just data.
-                self.state = "content" if first.startswith("<") else "json"
-            if self.state == "json":
-                self._emit_content(self.pending, events)
-                self.pending = ""
-                break
+                continue
             if self.state == "content":
                 if not self._content_state(events):
                     break
                 continue
-            if self.state == "call_started":
-                if not self._literal(self.dialect.name_prefix):
+            if self.state == "name":
+                if (name := self._name(self.dialect.name_close[0])) is None:
                     break
-                self.state = "function_name"
+                self._begin_call(name, events)
+                self.state = "arguments"
                 continue
-            if self.state == "function_name":
-                if not self._begin_call(events):
+            if self.state == "arguments":
+                # Text between parameters is dropped, but for a tag it may
+                # begin.
+                start, tag = self._next_tag(*self.argument_tags)
+                if tag is None:
+                    self.pending = hold_partial(self.pending, *self.argument_tags)[1]
                     break
-                continue
-            if self.state == "body":
-                if self.pending.startswith(self.dialect.param_open):
-                    self.pending = self.pending[len(self.dialect.param_open) :]
-                    self.state = "parameter_name"
-                    continue
-                if self.pending.startswith(self.dialect.call_close):
-                    self.pending = self.pending[len(self.dialect.call_close) :]
+                self.pending = self.pending[start + len(tag) :]
+                if tag == self.dialect.param_open:
+                    self.state = "parameter"
+                else:
                     self._finish_call(events)
-                    continue
-                if any(
-                    marker.startswith(self.pending)
-                    for marker in (self.dialect.param_open, self.dialect.call_close)
-                ):
+                    if (
+                        not self.dialect.block_close
+                        or tag == self.dialect.block_close
+                    ):
+                        self.state = "content"
+                continue
+            if self.state == "parameter":
+                if (name := self._name(self.dialect.param_name_close[0])) is None:
                     break
-                self._malformed()
-            if self.state == "parameter_name":
-                name_end = self.pending.find(self.dialect.param_name_close)
-                if name_end < 0:
-                    break
-                name = self.pending[:name_end]
-                self.pending = self.pending[
-                    name_end + len(self.dialect.param_name_close) :
-                ]
                 self._begin_parameter(name, events)
-                self.cdata_open = False
-                self.state = "parameter_value"
                 continue
-            if self.state == "parameter_value":
-                if not self._finish_parameter(events):
+            if self.state == "value":
+                ends = self.value_ends
+                skip = len(self.dialect.param_close)
+                if (
+                    self.dialect.cdata
+                    and not self.value_started
+                    and not self.value_parts
+                ):
+                    # A value may open as a CDATA section; wait until that
+                    # much text has arrived or ruled it out.
+                    if self.cdata_open is None:
+                        if self.pending.startswith(_CDATA_OPEN):
+                            self.pending = self.pending[len(_CDATA_OPEN) :]
+                            self.cdata_open = True
+                        elif _CDATA_OPEN.startswith(self.pending):
+                            break
+                        else:
+                            self.cdata_open = False
+                    if self.cdata_open:
+                        ends = tuple("]]>" + end for end in ends)
+                        skip += 3
+                start, tag = self._next_tag(*ends)
+                if tag is None:
+                    held = hold_partial(self.pending, *ends)[1]
+                    self._put_value(
+                        self.pending[: len(self.pending) - len(held)], events
+                    )
+                    self.pending = held
                     break
+                self._end_parameter(self.pending[:start], events)
+                # The tag after the close stays for the arguments to read.
+                self.pending = self.pending[start + skip :]
+                self.cdata_open = None
                 continue
+            if self.state == "closing":
+                # After the function's close, the template closes the call's
+                # block.
+                rest = self.pending.lstrip(NAME_SPACE)
+                if rest.startswith(self.dialect.block_close):
+                    self.pending = rest[len(self.dialect.block_close) :]
+                elif self.dialect.block_close.startswith(rest):
+                    break
+                self.state = "content"
         return events
 
 
 class _PythonCallProjector(_ProjectorBase):
     """The projector of a python-call dialect: ``[name(arg='v', ...)]``
     between the call-list tokens. Bare values read to the next ``, `` or
-    ``)`` at bracket depth zero; quoted strings stream their decoded
-    characters."""
+    ``)`` at bracket depth zero; a quoted string's escapes decode as it
+    reads."""
 
-    def _begin_call(self, events):
-        name_end = self.pending.find("(")
-        if name_end < 0:
-            return False
-        name = self.pending[:name_end]
-        self.pending = self.pending[name_end + 1 :]
-        self._open_call(name, events)
-        self.state = "argument_head"
-        return True
+    _after_open = "call_started"
+    _after_call = "call_sep"
+
+    def _begin_parameter(self, name, events):
+        name = name.strip(NAME_SPACE)
+        kept = name and name not in self.parameter_names and self.call_id is not None
+        self.parameter_names.add(name)
+        self.parameter_name = name if kept else None
+        self.value_started = True
+        self.value_parts = []
+
+    def _end_parameter_value(self, value, events):
+        if self.parameter_name is not None:
+            self._emit_argument(
+                self._key(self.parameter_name) + json_codec.dumps(value), events
+            )
+        self.parameter_name = None
+        self.value_parts = []
 
     def _begin_argument(self, events):
         # The name ends at "="; "(", ")" or "," first is malformed.
@@ -499,18 +630,15 @@ class _PythonCallProjector(_ProjectorBase):
     _ESCAPES = {"\\": "\\", "'": "'", "n": "\n", "r": "\r"}
 
     def _finish_string(self, events):
-        """Stream decoded characters of a quoted string to its close quote."""
-        decoded = []
+        """Read a quoted string's characters, decoding its escapes, to its
+        close quote."""
         index = 0
         while index < len(self.pending):
             character = self.pending[index]
             if character == "'":
+                value = "".join(self.value_parts)
                 self.pending = self.pending[index + 1 :]
-                if decoded:
-                    self._emit_string_value("".join(decoded), events)
-                value = "".join(self.parameter_value_fragments)
-                self._emit_argument('"', events)
-                self._end_parameter(value, events)
+                self._end_parameter_value(value, events)
                 self.state = "argument_sep"
                 return True
             if character == "\\":
@@ -519,14 +647,12 @@ class _PythonCallProjector(_ProjectorBase):
                 escaped = self._ESCAPES.get(self.pending[index + 1])
                 if escaped is None:
                     self._malformed()
-                decoded.append(escaped)
+                self.value_parts.append(escaped)
                 index += 2
                 continue
-            decoded.append(character)
+            self.value_parts.append(character)
             index += 1
         self.pending = self.pending[index:]
-        if decoded:
-            self._emit_string_value("".join(decoded), events)
         return False
 
     def _finish_value(self, events):
@@ -555,29 +681,33 @@ class _PythonCallProjector(_ProjectorBase):
             return False
         token = self.pending[:index]
         self.pending = self.pending[index:]
-        value = _python_call_value(token)
-        prefix = "" if len(self.arguments) == 0 else ","
-        self._emit_argument(
-            prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value),
-            events,
-        )
-        self._end_parameter(value, events)
+        self._end_parameter_value(_python_call_value(token), events)
         self.state = "argument_sep"
         return True
+
+    def _drain(self, events):
+        if self.state == "call_started" and "(" not in self.pending:
+            # The cut name never began a call's arguments.
+            self.pending = ""
+        if self.state == "argument_string":
+            # A quoted string that never closed keeps the text it decoded.
+            self._end_parameter_value("".join(self.value_parts), events)
+            self.pending = ""
+        elif self.state == "argument_value":
+            token, self.pending = self.pending, ""
+            self._end_parameter_value(_python_call_value(token), events)
+        if self.state in ("argument_head", "argument_sep") and self.call_id is not None:
+            self._finish_call(events)
 
     def put(self, text):
         self.pending += text
         events = []
         while self.pending:
-            if self.state == "output":
-                first = self.pending.lstrip()
-                if not first:
+            handled = self._output_state(events)
+            if handled is not None:
+                if not handled:
                     break
-                self.state = "content" if first.startswith("<") else "json"
-            if self.state == "json":
-                self._emit_content(self.pending, events)
-                self.pending = ""
-                break
+                continue
             if self.state == "content":
                 if not self._content_state(events):
                     break
@@ -588,8 +718,10 @@ class _PythonCallProjector(_ProjectorBase):
                 if stripped != self.pending:
                     self.pending = stripped
                     continue
-                if not self._begin_call(events):
+                if (name := self._name("(")) is None:
                     break
+                self._begin_call(name, events)
+                self.state = "argument_head"
                 continue
             if self.state == "argument_head":
                 stripped = self.pending.lstrip(" ")
@@ -599,14 +731,13 @@ class _PythonCallProjector(_ProjectorBase):
                 if self.pending.startswith(")"):
                     self.pending = self.pending[1:]
                     self._finish_call(events)
-                    self.state = "call_sep"
                     continue
                 if not self._begin_argument(events):
                     break
                 continue
             if self.state == "argument_value":
-                # A quote opens a streamed string; anything else is a bare
-                # literal or JSON container read to its delimiter.
+                # A quote opens a string; anything else is a bare literal or
+                # JSON container read to its delimiter.
                 if self.pending.startswith("'"):
                     self.pending = self.pending[1:]
                     self.state = "argument_string"
@@ -626,7 +757,6 @@ class _PythonCallProjector(_ProjectorBase):
                 if self.pending.startswith(")"):
                     self.pending = self.pending[1:]
                     self._finish_call(events)
-                    self.state = "call_sep"
                     continue
                 if ",)".find(self.pending[0]) < 0:
                     self._malformed()
@@ -658,27 +788,9 @@ def _python_call_value(token):
 
 def argument_deltas(arguments):
     # Keep individual SSE frames bounded even when a tool has a large string
-    # argument. Callers preserve fragment order and validate the canonical JSON.
+    # argument. Callers preserve fragment order.
     for offset in range(0, len(arguments), TOOL_ARGUMENT_DELTA_CHARS):
         yield arguments[offset : offset + TOOL_ARGUMENT_DELTA_CHARS]
-
-
-def _tool_property_schema(policy, tool_name, parameter_name):
-    if policy is None:
-        return None
-    root = policy.argument_schemas.get(tool_name)
-    if not isinstance(root, dict):
-        return None
-    return root.get("properties", {}).get(
-        parameter_name, root.get("additionalProperties", {})
-    )
-
-
-def _typed_tool_value(value, string_schema):
-    parsed = json_value(value)
-    if string_schema is None:
-        return parsed
-    return value if string_schema[0] == "raw" or value in string_schema[1] else parsed
 
 
 @dataclass(slots=True)
@@ -767,41 +879,6 @@ def _validate(validator, value):
         raise SchemaEvaluationError(
             "schema reference could not be evaluated"
         ) from error
-
-
-def validate_tool_calls(calls, policy):
-    if policy.required and not calls:
-        raise APIError(
-            500, "model did not call a required tool", "invalid_model_output"
-        )
-    if not policy.parallel and len(calls) > 1:
-        raise APIError(
-            500, "model returned parallel tool calls", "invalid_model_output"
-        )
-    for call in calls:
-        function = call["function"]
-        name = function["name"]
-        validator = policy.validators.get(name)
-        if validator is None:
-            raise APIError(
-                500, f"model called unknown tool {name}", "invalid_model_output"
-            )
-        try:
-            arguments = json_codec.loads(function["arguments"])
-            _validate_tool_unicode(arguments)
-            _validate(validator, arguments)
-        except SchemaEvaluationError as error:
-            raise APIError(500, str(error), "output_validation_failed") from error
-        except ValidationError as error:
-            raise APIError(
-                500,
-                f"invalid arguments for {name} at {error.json_path}: {error.message}",
-                "invalid_model_output",
-            ) from error
-        except (Unresolvable, RecursionError) as error:
-            raise APIError(
-                500, f"could not validate tool {name}", "invalid_model_output"
-            ) from error
 
 
 def validate_response_content(content, validator):

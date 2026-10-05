@@ -181,6 +181,7 @@ class PromptToolsTests(unittest.TestCase):
         body = {
             "messages": [{"role": "user", "content": "hello"}],
             "tools": [{"type": "function", "function": {"name": "note"}}],
+            "tool_choice": "required",
         }
         for _ in range(2):
             app.prepare(body, deadline=FOREVER)

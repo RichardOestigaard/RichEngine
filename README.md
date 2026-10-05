@@ -53,6 +53,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Reasoning follows the model default; `"reasoning_effort": "none"` turns it off.
 [Reasoning settings](DEVELOPMENT.md#default-reasoning-effort) ·
+[Tool calls](DEVELOPMENT.md#tool-calls) ·
 [API details](DEVELOPMENT.md#code-and-api-boundaries)
 
 ## Models

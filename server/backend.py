@@ -18,7 +18,12 @@ from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import hold_partial
-from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
+from .tool_schema import (
+    CALL_OPEN,
+    THINK_END_TOKEN_ID,
+    TOOL_CALL_OPEN_TOKEN_ID,
+    ToolPolicy,
+)
 
 # A failure counts toward a crash loop unless its engine served this long.
 CRASH_LOOP_WINDOW_SECONDS = 60.0
@@ -118,6 +123,12 @@ class Job:
     prompt_sha256: str | None = None
     latency: RequestLatency | None = None
 
+    @property
+    def may_call_tools(self):
+        """Whether the output may call a tool: tools are offered under a
+        choice other than none."""
+        return self.tool_policy is not None and bool(self.tool_policy.schemas)
+
 
 class CallbackStreamer:
     def __init__(
@@ -128,6 +139,7 @@ class CallbackStreamer:
         on_stop=None,
         think_end_id=None,
         visible_token_ids=(),
+        tool_call_open_id=None,
     ):
         self.tokenizer = tokenizer
         self.think_end_id = (
@@ -136,6 +148,9 @@ class CallbackStreamer:
         # Special tokens whose text the output parser needs, such as a tool
         # dialect's call markup, decoded despite skip_special_tokens.
         self.visible_token_ids = frozenset(visible_token_ids)
+        self.tool_call_open_id = (
+            TOOL_CALL_OPEN_TOKEN_ID if tool_call_open_id is None else tool_call_open_id
+        )
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
         self.on_stop = on_stop
@@ -248,13 +263,30 @@ class CallbackStreamer:
             self._send(self.pending_text)
             self.pending_text = ""
 
-    def count_reasoning_tokens(self, enabled):
+    def count_reasoning_tokens(self, enabled, tool_calls=False):
+        """The tokens before the reasoning's end, as ReasoningSplitter reads
+        the text: its close, or where a call may follow, a call's opening."""
         if not enabled:
             return 0
-        try:
-            return self.token_ids.index(self.think_end_id)
-        except ValueError:
-            return len(self.token_ids)
+        for index, token in enumerate(self.token_ids):
+            if token == self.think_end_id or (
+                tool_calls
+                and self.tool_call_open_id is not None
+                and token == self.tool_call_open_id
+                and self._opens_call(index)
+            ):
+                return index
+        return len(self.token_ids)
+
+    def _opens_call(self, index):
+        """Whether the text from the call-open token at `index` on begins
+        CALL_OPEN, decoded from as few tokens as decide it."""
+        text = ""
+        for end in range(index + 1, len(self.token_ids) + 1):
+            text = self.tokenizer.decode(self.token_ids[index:end])
+            if len(text) >= len(CALL_OPEN) or not CALL_OPEN.startswith(text):
+                break
+        return text.startswith(CALL_OPEN)
 
 
 @dataclass
@@ -288,12 +320,13 @@ class NativeBackend:
 
     def __init__(
         self, runtime, tokenizer, request_logger, think_end_id=None,
-        visible_token_ids=(),
+        visible_token_ids=(), tool_call_open_id=None,
     ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.think_end_id = think_end_id
         self.visible_token_ids = frozenset(visible_token_ids)
+        self.tool_call_open_id = tool_call_open_id
         self.request_logger = request_logger
         self.active = {}
         self.closing = False
@@ -651,6 +684,7 @@ class NativeBackend:
             stop_matched,
             think_end_id=self.think_end_id,
             visible_token_ids=self.visible_token_ids,
+            tool_call_open_id=self.tool_call_open_id,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)
@@ -795,7 +829,9 @@ class NativeBackend:
                 # still be computing.
                 job.constraint.finish()
             state.streamer.end()
-            job.reasoning_tokens = state.streamer.count_reasoning_tokens(job.thinking)
+            job.reasoning_tokens = state.streamer.count_reasoning_tokens(
+                job.thinking, job.may_call_tools
+            )
             stop_sequence = state.streamer.stop_sequence
             result = NativeResult(
                 reason=(

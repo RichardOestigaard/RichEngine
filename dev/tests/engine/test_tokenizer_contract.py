@@ -18,6 +18,7 @@ class TokenizerContractTests(unittest.TestCase):
             '<|endoftext|>': 248044,
             '<|im_end|>': 248046,
             "</think>": 248069,
+            "<tool_call>": 248058,
         }
         return mock.Mock(
             get_vocab=mock.Mock(return_value=vocabulary),
@@ -35,7 +36,7 @@ class TokenizerContractTests(unittest.TestCase):
         self.assertEqual(contract.think_end_id, 248069)
 
     def test_mismatched_stop_or_thinking_tokens_are_rejected(self):
-        for token in ('<|endoftext|>', '<|im_end|>', "</think>"):
+        for token in ("<|endoftext|>", "<|im_end|>", "</think>", "<tool_call>"):
             with self.subTest(token=token):
                 tokenizer = self.tokenizer()
                 tokenizer.get_vocab()[token] = 0
