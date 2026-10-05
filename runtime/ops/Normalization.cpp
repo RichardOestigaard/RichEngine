@@ -1,5 +1,6 @@
 #include "Normalization.hpp"
 
+#include "ops/BufferExtent.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <utility>
