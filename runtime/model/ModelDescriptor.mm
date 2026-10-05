@@ -22,15 +22,6 @@ struct GeometryField final {
   uint64_t value;
 };
 
-constexpr auto kExecutionGeometry = std::to_array<GeometryField>(
-    {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
-     {"draft_query_rows", ExecutionLimits::draftQueryRows},
-     {"draft_sliding_window", ExecutionLimits::draftContextTokens},
-     {"maximum_batch_width", ExecutionLimits::maximumBatchWidth},
-     {"prefill_token_budget", ExecutionLimits::prefillTokenBudget},
-     {"target_kv_block_tokens", kv::kPageTokens},
-     {"target_verify_rows", ExecutionLimits::targetVerifyRows}});
-
 // The JSON object of the file at path; with sha256, the SHA-256 of its bytes
 // too.
 NSDictionary *readObject(const std::filesystem::path &path,
@@ -137,12 +128,19 @@ void requireEqual(std::string_view actual, std::string_view expected,
   }
 }
 
+// A package records the execution geometry it was published with. Its draft
+// was trained for blocks of draft_query_rows rows, the anchor and
+// draft_proposal_tokens proposals, over draft_sliding_window context tokens,
+// which the draft kernels are built for. The batch width, prefill budget, KV
+// page and verify rows it records were that runtime's choices; this runtime
+// makes its own.
 void validateExecutionGeometry(NSDictionary *manifest) {
   NSDictionary *geometry = requireObject(
       manifest, @"execution_geometry", "model execution geometry");
-  // Packages may carry descriptive metadata, but every execution-semantic
-  // field understood by this runtime must be present and match exactly.
-  for (const GeometryField &field : kExecutionGeometry) {
+  for (const GeometryField &field : std::to_array<GeometryField>(
+           {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
+            {"draft_query_rows", ExecutionLimits::draftQueryRows},
+            {"draft_sliding_window", ExecutionLimits::draftContextTokens}})) {
     NSString *key = [NSString stringWithUTF8String:field.name];
     requireEqual(requireUnsigned(geometry, key, field.name), field.value,
                  field.name);

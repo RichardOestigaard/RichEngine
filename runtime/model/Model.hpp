@@ -371,9 +371,12 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
-// Compile-time ceiling of the one native DFlash execution contract. Concrete
-// target/draft manifests are validated against these limits at startup;
-// cache-page and attention-kernel geometry live with their operators.
+// Compile-time ceiling of the one native DFlash execution contract. A draft
+// must have been trained for blocks of draftQueryRows rows over
+// draftContextTokens context tokens, which inspectModelPackage checks a
+// package's manifest and a DFlash2 checkpoint's config for; the other limits
+// are the runtime's own. Cache-page and attention-kernel geometry live with
+// their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;

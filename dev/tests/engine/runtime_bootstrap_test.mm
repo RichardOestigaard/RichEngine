@@ -102,6 +102,21 @@ void testInstalledManifestBindsExecutionGeometry() {
   require(model::inspectModelPackage(root.path()).sourceIdentity != sourceIdentity,
           "another manifest named the same sources");
 
+  // The batch width, prefill budget, KV page and verify rows a package
+  // records are the runtime's choices, not its weights': other ones load.
+  std::string retuned = executionManifest();
+  for (const auto &[published, other] :
+       {std::pair<std::string, std::string>{"\"maximum_batch_width\":4", "\"maximum_batch_width\":8"},
+        {"\"prefill_token_budget\":2048", "\"prefill_token_budget\":4096"},
+        {"\"target_kv_block_tokens\":32", "\"target_kv_block_tokens\":16"},
+        {"\"target_verify_rows\":8", "\"target_verify_rows\":16"}}) {
+    const size_t at = retuned.find(published);
+    require(at != std::string::npos, "test manifest lost " + published);
+    retuned.replace(at, published.size(), other);
+  }
+  root.write(retuned);
+  static_cast<void>(model::inspectModelPackage(root.path()));
+
   // A whole number written as a float, as Python writes 1e7, is that
   // integer; a fraction is not one.
   std::string floatRows = executionManifest();
