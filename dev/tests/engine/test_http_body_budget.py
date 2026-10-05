@@ -18,6 +18,7 @@ from PIL import Image
 from dev.tests import test_server as fixtures
 from server import frontend, json_codec, serve_options
 from server import server as api
+from server.errors import RequestValidationError
 
 
 class HttpBodyBudgetTests(unittest.TestCase):
@@ -136,8 +137,13 @@ class HttpBodyBudgetTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValueError):
                     json_codec.loads(payload)
-                with self.assertRaises(ValueError):
+                # The body reader answers each with its own 400.
+                with self.assertRaises(RequestValidationError) as raised:
                     parse(payload)
+                self.assertEqual(
+                    (raised.exception.status, raised.exception.message),
+                    (400, "invalid JSON request body"),
+                )
 
     def test_shared_budget_rejects_before_reading_and_recovers_on_disconnect(self):
         with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 256):

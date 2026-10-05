@@ -1206,6 +1206,9 @@ def anthropic_usage(prompt_tokens, output_tokens, cache):
 
 
 def anthropic_response(model, job, blocks, result, tool_calls, thinking_signature):
+    """A complete Messages response. Its calls' arguments are complete JSON:
+    the projector writes each call it closes as such, and the caller leaves
+    out a call the token limit cut."""
     content = []
     for block in blocks:
         if block.kind == "reasoning":
@@ -1221,20 +1224,12 @@ def anthropic_response(model, job, blocks, result, tool_calls, thinking_signatur
         elif block.kind == "text":
             content.append({"type": "text", "text": block.text})
         else:
-            try:
-                arguments = json_codec.loads(block.text)
-            except ValueError:
-                # Only a call the token limit cut has unfinished arguments,
-                # and a complete message leaves it out.
-                if result.reason != "length":
-                    raise
-                continue
             content.append(
                 {
                     "type": "tool_use",
                     "id": block.call_id,
                     "name": block.name,
-                    "input": arguments,
+                    "input": json_codec.loads(block.text),
                 }
             )
     if all(item["type"] == "thinking" for item in content):

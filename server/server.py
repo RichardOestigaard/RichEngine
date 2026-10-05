@@ -140,6 +140,9 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
+    # The id of the call the token limit cut, whose arguments are
+    # unfinished; None when it cut none.
+    cut_call: str | None
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -404,9 +407,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-        payload.clear()
-        return json_codec.loads(text)
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except (ValueError, RecursionError):
+            # Text that is not JSON, or JSON nested deeper than the parser
+            # reads.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
+        return body
 
     def do_HEAD(self):
         self.do_GET()
@@ -709,18 +720,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
-        except (ValueError, RecursionError):
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone:
-                self._systemone_error(
-                    judgments.SystemOneError(
-                        [judgments.detail([], "invalid JSON request body")]
-                    )
-                )
-            else:
-                error = APIError(400, "invalid JSON request body")
-                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -920,7 +919,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if unsent and on_text is not None:
             on_text("content", unsent)
         return Collected(
-            "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+            "".join(reasoning),
+            content_text,
+            tool_calls,
+            result,
+            splitter.reasoning,
+            None if projector is None else projector.call_id,
         )
 
     def _complete(self, job):
@@ -959,6 +963,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         result = collected.result
         blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        if collected.cut_call is not None:
+            # A complete message leaves out the call the token limit cut.
+            blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
             if collected.reasoning and job.thinking_display == "omitted"

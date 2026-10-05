@@ -7887,6 +7887,43 @@ class ServerTest(unittest.TestCase):
         )
         self.assertNotIn("boom", stderr.getvalue())
 
+    def test_value_errors_past_the_body_are_internal_errors(self):
+        # Only a body the server cannot read is invalid JSON. A ValueError or
+        # RecursionError raised while a request is prepared or answered is
+        # the server's own: logged, answered with 500, and the job it
+        # submitted is cancelled.
+        systemone = {
+            "model": "test-model",
+            "state": "evidence",
+            "questions": {"supported": {"type": "noul"}},
+        }
+        for error in (ValueError("late"), RecursionError()):
+            for path, body, target, name in (
+                ("/v1/chat/completions", self.body(), "app", "prepare"),
+                ("/v1/systemone", systemone, "app", "prepare_systemone"),
+                ("/v1/chat/completions", self.body(), "handler", "_complete"),
+            ):
+                with self.subTest(error=type(error).__name__, path=path, name=name):
+                    harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
+                    owner = harness.app if target == "app" else api.FrontendHandler
+                    with (
+                        mock.patch.object(owner, name, side_effect=error),
+                        mock.patch.object(
+                            harness.backend, "cancel", wraps=harness.backend.cancel
+                        ) as cancel,
+                        mock.patch.object(api, "log_unexpected") as logged,
+                    ):
+                        status, _, payload = harness.request("POST", path, body)
+                    self.assertEqual(status, 500, payload)
+                    self.assertEqual(
+                        json.loads(payload)["error"]["code"], "internal_server_error"
+                    )
+                    logged.assert_called_once_with(error)
+                    if target == "handler":
+                        cancel.assert_called_once()
+                    else:
+                        cancel.assert_not_called()
+
     def test_unexpected_responses_stream_error_is_failed_and_cancels(self):
         # The first output item fails to render while the model still writes.
         plan = Plan([[14], [15]], delay=1)

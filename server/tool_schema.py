@@ -36,6 +36,11 @@ def function_opening(name):
     return f"{FUNCTION_OPEN}{name}>\n"
 
 
+# Schemas are read recursively, by jsonschema and by this module, several
+# stack frames a level, and arrays nested twice this deep would exhaust the
+# interpreter's stack: a schema nests objects and arrays at most this deep.
+MAX_SCHEMA_DEPTH = 64
+
 # Framing projects each tool's fields through schema composition and copies
 # the root schema into every field that refers to it. Pathological schemas
 # make that quadratic or exponential in their size, so framing all tools of
@@ -81,6 +86,21 @@ def json_value(value):
         return parsed
     except (ValueError, RecursionError):
         return value
+
+
+def _check_depth(schema, invalid):
+    """Refuse `schema`, as `invalid` names it, if it nests deeper than
+    MAX_SCHEMA_DEPTH. Read without recursion, before anything recurses."""
+    pending = [(schema, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, (dict, list)):
+            if depth > MAX_SCHEMA_DEPTH:
+                raise APIError(
+                    400, f"{invalid}: nested more than {MAX_SCHEMA_DEPTH} levels deep"
+                )
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((child, depth + 1) for child in children)
 
 
 def _remote_ref(schema):
@@ -730,6 +750,7 @@ def normalize_response_format(value):
             raise APIError(400, "response_format.json_schema.schema is required")
     else:
         raise APIError(400, "unsupported response_format")
+    _check_depth(schema, "invalid response schema")
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote schema reference is not allowed: {ref}")
     try:
@@ -772,6 +793,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         strict = function.get("strict")
         if strict is not None and not isinstance(strict, bool):
             raise APIError(400, f"strict must be a boolean for tool {name}")
+        _check_depth(schema, f"invalid tool schema for {name}")
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:

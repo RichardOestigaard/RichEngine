@@ -346,6 +346,69 @@ class RequestContractTests(unittest.TestCase):
                 )
             self.assertEqual(caught.exception.status, 400)
 
+    def test_schemas_nest_no_deeper_than_they_are_read(self):
+        def nested(depth):
+            schema = {"type": "string"}
+            for _ in range(depth - 1):
+                schema = {"type": "array", "items": schema}
+            return schema
+
+        for normalize, invalid in (
+            (
+                lambda schema: tool_schema.normalize_tools(
+                    [
+                        {
+                            "type": "function",
+                            "function": {"name": "test", "parameters": schema},
+                        }
+                    ],
+                    "auto",
+                    True,
+                ),
+                "invalid tool schema for test",
+            ),
+            (
+                lambda schema: tool_schema.normalize_response_format(
+                    {"type": "json_schema", "json_schema": {"schema": schema}}
+                ),
+                "invalid response schema",
+            ),
+        ):
+            with self.subTest(invalid=invalid):
+                normalize(nested(tool_schema.MAX_SCHEMA_DEPTH))
+                with self.assertRaises(api.APIError) as caught:
+                    normalize(nested(tool_schema.MAX_SCHEMA_DEPTH + 1))
+                self.assertEqual(
+                    (caught.exception.status, caught.exception.message),
+                    (
+                        400,
+                        f"{invalid}: nested more than "
+                        f"{tool_schema.MAX_SCHEMA_DEPTH} levels deep",
+                    ),
+                )
+        # A schema the parser reads but that would exhaust the stack where it
+        # is read recursively is refused as a schema, not as unreadable JSON.
+        harness = Harness(FakeRuntime())
+        self.addCleanup(harness.close)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": nested(600)},
+                },
+            },
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"],
+            "invalid response schema: nested more than 64 levels deep",
+        )
+        self.assertEqual(harness.backend.runtime.requests, [])
+
     def test_mask_byte_payload_round_trips(self):
         response = wire.MaskResponseFrame(
             1, 2, array.array("I", (0, 1, 0xFFFFFFFF, 42)).tobytes()
