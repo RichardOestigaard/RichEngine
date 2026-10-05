@@ -210,8 +210,7 @@ def serve(args):
             fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             raise LauncherError(
-                "Splash installation is busy; "
-                "stop the running server or wait for the upgrade to finish"
+                "Splash is being upgraded; wait for the upgrade to finish"
             ) from None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
