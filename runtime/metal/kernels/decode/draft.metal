@@ -266,9 +266,9 @@ inline void draft_attention_split_phase(
       uint row_start =
           query_position >= Window - 1 ? query_position - (Window - 1) : 0;
       uint hidden_prefix = row_start - common_start;
-      float local_scores[4];
+      float local_scores[N / 32];
       float tile_max = -INFINITY;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         uint column = lane + i * 32;
         uint key = slot + column;
         uint logical_key = key >= physical_start
@@ -286,7 +286,7 @@ inline void draft_attention_split_phase(
       bool empty = next_max == -INFINITY;
       float scale = empty ? 1.0f : fast::exp(row_max[matrix_row] - next_max);
       float tile_sum = 0.0f;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         local_scores[i] = empty ? 0.0f : fast::exp(local_scores[i] - next_max);
         tile_sum += local_scores[i];
       }
@@ -296,7 +296,7 @@ inline void draft_attention_split_phase(
         row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
         row_max[matrix_row] = next_max;
       }
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < N / 32; ++i) {
         uint column = lane + i * 32;
         score_storage[matrix_row * N + column] = local_scores[i];
       }

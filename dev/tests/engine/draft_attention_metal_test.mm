@@ -242,6 +242,132 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   }
 }
 
+// The same split/reduce check against a different head geometry: kvHeads,
+// query-heads-per-group and head dimension all come from the shape.
+void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
+                    DraftAttentionShape shape,
+                    const std::array<uint32_t, kLanes> &cacheLengths) {
+  const uint32_t kvHeads = shape.kvHeads;
+  const uint32_t headDim = shape.headDimension;
+  const uint32_t qPerKv = shape.queryHeads / kvHeads;
+  const uint32_t attention = shape.attentionSize;
+  const uint32_t groupRows = qPerKv * kRows;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(headDim));
+  Random random(0x5eed9000ULL + cacheLengths[0]);
+  const uint64_t ringElements = uint64_t{kvHeads} * kWindow * headDim;
+  MetalBuffer queries = randomBfloat(
+      backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
+      random, "draft queries");
+  std::vector<MetalBuffer> keys, values;
+  const uint64_t tailElements = uint64_t{128} * headDim;
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    keys.push_back(randomBfloat(backend, ringElements + tailElements, random,
+                                "draft keys"));
+    values.push_back(randomBfloat(backend, ringElements + tailElements, random,
+                                  "draft values"));
+    for (const MetalBuffer &tensor : {keys.back(), values.back()})
+      std::fill_n(static_cast<uint16_t *>(tensor.contents()) + ringElements,
+                  tailElements, uint16_t{0x7FC0});
+  }
+  MetalBuffer queryKeys = randomBfloat(
+      backend, uint64_t{lanes} * kvHeads * kRows * headDim, random,
+      "draft query keys");
+  MetalBuffer queryValues = randomBfloat(
+      backend, uint64_t{lanes} * kvHeads * headDim * kRows, random,
+      "draft query values");
+  std::vector<uint16_t> input(
+      static_cast<const uint16_t *>(queries.contents()),
+      static_cast<const uint16_t *>(queries.contents()) +
+          uint64_t{lanes} * kRows * attention);
+
+  CommandGraph graph;
+  DraftAttention::addDecode(graph,
+      {queries, keys, values, queryKeys, queryValues},
+      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+
+  const auto *output = static_cast<const uint16_t *>(queries.contents());
+  std::vector<float> reference(uint64_t{groupRows} * headDim);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    for (const uint32_t head : {0U, kvHeads - 1}) {
+      const uint64_t queryOffset =
+          uint64_t{lane} * kRows * attention + uint64_t{head} * groupRows * headDim;
+      const uint32_t commonStart =
+          cacheLengths[lane] >= kWindow - 1 ? cacheLengths[lane] - (kWindow - 1) : 0;
+      const uint32_t oldCount = cacheLengths[lane] - commonStart;
+      const uint16_t *qk = static_cast<const uint16_t *>(queryKeys.contents()) +
+                           (uint64_t{lane} * kvHeads + head) * kRows * headDim;
+      const uint16_t *qv = static_cast<const uint16_t *>(queryValues.contents()) +
+                           (uint64_t{lane} * kvHeads + head) * headDim * kRows;
+      const uint16_t *kk = static_cast<const uint16_t *>(keys[lane].contents()) +
+                           uint64_t{head} * kWindow * headDim;
+      const uint16_t *vv = static_cast<const uint16_t *>(values[lane].contents()) +
+                           uint64_t{head} * kWindow * headDim;
+      for (uint32_t row = 0; row < groupRows; ++row) {
+        const uint32_t proposal = row % kRows;
+        const uint32_t queryPosition = cacheLengths[lane] + proposal;
+        const uint32_t rowStart =
+            queryPosition >= kWindow - 1 ? queryPosition - (kWindow - 1) : 0;
+        const uint32_t hiddenPrefix = rowStart - commonStart;
+        const uint16_t *query = input.data() + queryOffset + uint64_t{row} * headDim;
+        std::vector<double> scores(oldCount + kRows, -INFINITY);
+        double best = -INFINITY;
+        for (uint32_t key = 0; key < oldCount + kRows; ++key) {
+          double score = -INFINITY;
+          if (key >= oldCount) {
+            const uint32_t current = key - oldCount;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < headDim; ++d)
+              dot += double(tuning::bf16ToFloat(query[d])) *
+                     tuning::bf16ToFloat(qk[current * headDim + d]);
+            score = dot * scale;
+          } else if (key >= hiddenPrefix) {
+            const uint32_t slot = (commonStart + key) % kWindow;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < headDim; ++d)
+              dot += double(tuning::bf16ToFloat(query[d])) *
+                     tuning::bf16ToFloat(kk[uint64_t{slot} * headDim + d]);
+            score = dot * scale;
+          }
+          scores[key] = score;
+          best = std::max(best, score);
+        }
+        double sum = 0.0;
+        std::vector<double> accumulated(headDim, 0.0);
+        for (uint32_t key = 0; key < oldCount + kRows; ++key) {
+          if (scores[key] == -INFINITY)
+            continue;
+          const double probability = std::exp(scores[key] - best);
+          sum += probability;
+          for (uint32_t d = 0; d < headDim; ++d) {
+            const float value =
+                key >= oldCount
+                    ? tuning::bf16ToFloat(qv[uint64_t{d} * kRows + key - oldCount])
+                    : tuning::bf16ToFloat(vv[uint64_t{d} * kWindow +
+                                        (commonStart + key) % kWindow]);
+            accumulated[d] += probability * value;
+          }
+        }
+        for (uint32_t d = 0; d < headDim; ++d)
+          reference[uint64_t{row} * headDim + d] =
+              static_cast<float>(accumulated[d] / sum);
+      }
+      for (uint64_t index = 0; index < reference.size(); ++index) {
+        const float actual = tuning::bf16ToFloat(output[queryOffset + index]);
+        const float expected = reference[index];
+        if (!std::isfinite(actual) ||
+            std::fabs(actual - expected) > 0.02F + 0.02F * std::fabs(expected)) {
+          std::cerr << "generic lane " << lane << " head " << head
+                    << " length " << cacheLengths[lane] << " row "
+                    << index / headDim << " dim " << index % headDim << ": "
+                    << actual << " vs " << expected << '\n';
+          throw std::runtime_error("draft attention diverged from reference");
+        }
+      }
+    }
+  }
+}
+
 void planGeometry() {
   for (const auto shape : kShapes) {
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
@@ -635,6 +761,12 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    // The MiniCPM5 DSpark geometry: 16 query heads over 2 KV heads of 128.
+    const DraftAttentionShape dense{
+        2048, 0, 2560, 2048, 16, 2, 128};
+    runCaseGeneric(backend, 1, dense, {58, 0, 0, 0});
+    runCaseGeneric(backend, 2, dense, {2048, 2047, 0, 0});
+    runCaseGeneric(backend, 4, dense, {512, 513, 1024, 1536});
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {
