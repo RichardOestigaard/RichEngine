@@ -281,9 +281,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         super().end_headers()
 
-    def _send(self, status, data, content_type):
+    def _send(self, status, data, content_type, *, retry_after=False):
         self.send_response(status)
-        if status == 503:
+        if retry_after:
             self.send_header("Retry-After", "1")
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
@@ -302,7 +302,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, *, retry_after=False):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
@@ -312,9 +312,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self.route.startswith("/v1/messages"),
             )
             return
-        self._send(status, data, "application/json")
+        self._send(status, data, "application/json", retry_after=retry_after)
 
-    def _error(self, error, anthropic=False):
+    def _error(self, error, anthropic=False, *, retry_after=False):
         error_type = error.protocol_type(anthropic)
         message = error.message
         if anthropic and isinstance(error, ContextLengthError):
@@ -335,6 +335,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "code": error.code,
                 }
             },
+            retry_after=retry_after,
         )
 
     def _log_api_error(self, error):
@@ -347,7 +348,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if log:
             self._log_api_error(error)
         try:
-            self._error(error, anthropic)
+            self._error(error, anthropic, retry_after=error.retryable)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -461,6 +462,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(
                 200 if ready else 503,
                 {"status": "ready" if ready else "unavailable"},
+                retry_after=not ready,
             )
             return
         if path == "/status":
