@@ -245,6 +245,16 @@ struct NativeLoopTiming {
   double maxTickMilliseconds = 0.0;
 };
 
+// The model's weights as the native loop releases and restores them
+// (NativeRuntime::releaseIdleWeights).
+struct WeightsSnapshot {
+  // --idle-release: infinite while the engine keeps them.
+  double idleReleaseSeconds = 0.0;
+  bool released = false;
+  // The times they were written back, each for a request.
+  uint64_t restores = 0;
+};
+
 // Single source for /status and native protocol status events.
 [[nodiscard]] std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const EngineSnapshot &core,
@@ -254,6 +264,6 @@ struct NativeLoopTiming {
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
-    const NativeLoopTiming &loop);
+    const NativeLoopTiming &loop, const WeightsSnapshot &weights);
 
 } // namespace splash::engine

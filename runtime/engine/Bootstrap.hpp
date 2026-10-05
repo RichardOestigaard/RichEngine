@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
@@ -65,7 +66,7 @@ private:
 // opens a new window.
 class StartupRetryWindow final {
 public:
-    using Clock = std::chrono::steady_clock;
+    using Clock = AwakeClock;
 
     explicit StartupRetryWindow(Clock::duration length) noexcept
         : length_(length) {}

@@ -1910,12 +1910,18 @@ def _native_command(args):
         )
     if args.kv_format != "int4":
         command.extend(("--kv-format", args.kv_format))
+    if args.idle_release is not None:
+        command.extend(
+            ("--idle-release", serve_options.idle_release_text(args.idle_release))
+        )
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
     if args.max_image_pixels != image_input.MAX_PIXELS:
         command.extend(
             ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
         )
+    if args.allow_idle_sleep:
+        command.extend(("--idle-sleep", "allow"))
     return command
 
 

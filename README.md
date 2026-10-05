@@ -86,6 +86,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | Option | Purpose |
 | --- | --- |
 | `--max-memory 28G` | Cap Metal memory use. |
+| `--idle-release off` | Keep the model in memory while idle. Default: freed after 10 minutes without a request; a duration such as `2h` sets another time. |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format int8` | KV cache format: `int4` (default), `int8`, `bf16`, `fp8e4m3`. |

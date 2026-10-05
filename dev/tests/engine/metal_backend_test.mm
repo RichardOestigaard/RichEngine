@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -775,8 +776,7 @@ void residencyEndsWithoutBlits(const std::string &metallibPath) {
     ResidencyCalls calls;
     unsigned lapseCommits = 0, lapseComputes = 0;
     {
-        const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
-        MetalBackend backend(metallibPath);
+        MetalBackend backend(metallibPath, kKeepAliveSeconds);
         const uint64_t page = static_cast<uint64_t>(getpagesize());
         MetalBuffer lapsing = sharedBuffer(backend, page);
         (void)waitFor([] { return commits != 0; }, std::chrono::seconds(5));
@@ -829,8 +829,7 @@ void residencyReturnsRemovedBuffers(const std::string &metallibPath) {
 void buffersStayResident(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 1.0;
     ResidencyCalls calls;
-    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     const auto start = std::chrono::steady_clock::now();
     MetalBuffer dropped = backend.view(sharedBuffer(backend, page), 0, 64);
@@ -859,6 +858,30 @@ void buffersStayResident(const std::string &metallibPath) {
             "a command on a resident buffer produced the wrong result");
     std::cout << "PASS buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
               << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
+}
+
+// An infinite keep-alive (--idle-release off) holds the set while the backend
+// lives: the heartbeat goes on requesting residency and never ends it. A
+// keep-alive that is not positive is refused.
+void infiniteKeepAliveHoldsResidency(const std::string &metallibPath) {
+    ResidencyCalls calls;
+    {
+        MetalBackend backend(metallibPath, std::numeric_limits<double>::infinity());
+        MetalBuffer held = sharedBuffer(backend, static_cast<uint64_t>(getpagesize()));
+        require(waitFor([&] { return calls.requests >= 3; }, std::chrono::seconds(5)),
+                "the heartbeat stopped requesting an infinitely kept set");
+        require(calls.ends == 0, "an infinite keep-alive ended residency");
+    }
+    for (double keepAlive : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
+        bool refused = false;
+        try {
+            MetalBackend backend(metallibPath, keepAlive);
+        } catch (const MetalBackendError &) {
+            refused = true;
+        }
+        require(refused, "a keep-alive that is not positive was accepted");
+    }
+    std::cout << "PASS infinite keep-alive holds residency\n";
 }
 
 // Allocating into a held set wires the buffer at the set's commit: the
@@ -900,8 +923,7 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.05;
     constexpr int kRounds = 24;
     ResidencyCalls calls;
-    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
-    auto backend = std::make_unique<MetalBackend>(metallibPath);
+    auto backend = std::make_unique<MetalBackend>(metallibPath, kKeepAliveSeconds);
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = sharedBuffer(*backend, page);
     *static_cast<uint32_t *>(used.contents()) = 0;
@@ -967,8 +989,7 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
     constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
     ResidencyCalls calls;
-    const ScopedTestConfig seam({.residencyKeepAliveSeconds = kKeepAliveSeconds});
-    MetalBackend backend(metallibPath);
+    MetalBackend backend(metallibPath, kKeepAliveSeconds);
     MetalBuffer table = sharedBuffer(backend, kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
@@ -1558,6 +1579,7 @@ int main(int argc, const char *argv[]) {
             dispatchProfilingCoversEveryCommand(argv[1]);
             preparedPipelinesCompileAhead(argv[1]);
             buffersStayResident(argv[1]);
+            infiniteKeepAliveHoldsResidency(argv[1]);
             releasedMemory(argv[1]);
             allocationDoesNotRequestResidency(argv[1]);
             residencyRacesTheHeartbeat(argv[1]);

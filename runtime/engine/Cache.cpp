@@ -1,5 +1,6 @@
 #include "engine/Cache.hpp"
 
+#include "AwakeClock.hpp"
 #include "engine/DiskLabels.hpp"
 
 #include <algorithm>
@@ -697,7 +698,7 @@ CacheReclaimResult Cache::releaseExtent(bool keepRunway) {
 }
 
 bool Cache::compactExtent() {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = AwakeClock::now();
   std::vector<uint32_t> inTransfer;
   inTransfer.reserve(demotions_.size() + copies_.size() + restores_.size());
   for (const Demotion &demotion : demotions_)
@@ -724,11 +725,8 @@ bool Cache::compactExtent() {
     if (first < pages)
       pagesChanged(active, static_cast<uint32_t>(first));
   }
-  extentCompactMaxMilliseconds_ = std::max(
-      extentCompactMaxMilliseconds_,
-      std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - start)
-          .count());
+  extentCompactMaxMilliseconds_ =
+      std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
   return true;
 }
 

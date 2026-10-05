@@ -522,6 +522,7 @@ def main_args(**overrides):
             "default_reasoning_effort": None,
             "max_context": None,
             "max_memory": None,
+            "idle_release": None,
             "max_cache_disk": 0,
             "persistent_cache": False,
             "cache_dir": None,
@@ -533,6 +534,7 @@ def main_args(**overrides):
             "allowed_host": [],
             "allowed_origin": [],
             "api_key": None,
+            "allow_idle_sleep": False,
             "no_webui": False,
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
@@ -3558,6 +3560,14 @@ class ServerTest(unittest.TestCase):
             api._native_command(disk_bf16_args)[-3:],
             [str(5 * 1024**3), "--kv-format", "bf16"],
         )
+        # The engine keeps its own default unless told one.
+        self.assertIsNone(args.idle_release)
+        self.assertNotIn("--idle-release", api._native_command(args))
+        for value, text in (("30m", "1800.0"), ("off", "off")):
+            release_args = api.parse_args([*required, "--idle-release", value])
+            self.assertEqual(
+                api._native_command(release_args)[-2:], ["--idle-release", text]
+            )
         self.assertIsNone(args.decode_share)
         self.assertNotIn("--decode-share", api._native_command(args))
         share_args = api.parse_args(
@@ -3575,6 +3585,11 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(
                 api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
             )
+        self.assertNotIn("--idle-sleep", api._native_command(args))
+        sleep_args = api.parse_args([*required, "--allow-idle-sleep"])
+        self.assertEqual(
+            api._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
+        )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")

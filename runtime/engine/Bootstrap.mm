@@ -140,7 +140,7 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
-      nativeLoop_->resourceWaitSnapshot(), loop);
+      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot());
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
@@ -339,6 +339,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
     config.nativeLoop.weights = &resources->weightImages();
+    config.nativeLoop.idleReleaseSeconds = config.resources.idleReleaseSeconds;
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
