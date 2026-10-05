@@ -299,3 +299,21 @@ vocab projection already runs only on per-sequence final rows
   under concurrency (no cold-TTFT change).
 - Upstream context discipline: keep prompt prefixes byte-stable and batch
   tool-result appends — every uncached token is ~0.8-2 ms of TTFT.
+
+### int8 activation x int4 weight — measured, fails exactness
+
+MPP `matmul2d` supports `int8_t/uint8_t` A x `int4b/uint4b` B -> int32
+(`__tensorops_impl_matmul2d_op_run_cooperative_*_i8_*_i4_i32`, all address
+spaces). Microbenchmark, ffn_up shape M=2048 N=17408 K=5120: 29.1 TFLOPS
+bf16xuint4 -> **119.4 TFLOPS uint8xuint4** (~4x the integer NA rate).
+
+Accuracy gate on Ornith-1.5-9B-MLX-4bit (249 patched projections, per-64
+group quant, 4 prompts x 256 greedy tokens): symmetric int8 diverges at
+tokens 0/31/45/126; asymmetric (min/max + zero point) at 11/26/43/194.
+KL up to 0.023. **Fails the greedy-identity contract.** Valid only as a
+future opt-in approximate mode (~3x end-to-end TTFT cut if accepted).
+
+NOTE on method: quantized-module patching must traverse
+`model.named_modules()` — MLX module children are not visible via
+`vars()`/`__dict__` traversal; an earlier gate that reported
+"greedy-identical" had patched 0 modules.

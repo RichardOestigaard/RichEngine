@@ -409,17 +409,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        try:
-            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-            payload.clear()
-            body = json_codec.loads(text)
-        except (ValueError, RecursionError):
-            # Text that is not JSON, or JSON nested deeper than the parser
-            # reads.
-            raise RequestValidationError(
-                [field_error([], "invalid JSON request body")]
-            ) from None
-        return body
+        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+        payload.clear()
+        return json_codec.loads(text)
 
     def do_HEAD(self):
         self.do_GET()
@@ -726,6 +718,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
+        except (ValueError, RecursionError):
+            if submitted:
+                self.app.backend.cancel(job)
+            if systemone:
+                self._systemone_error(
+                    judgments.SystemOneError(
+                        [judgments.detail([], "invalid JSON request body")]
+                    )
+                )
+            else:
+                error = APIError(400, "invalid JSON request body")
+                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
