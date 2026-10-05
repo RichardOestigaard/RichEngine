@@ -126,6 +126,20 @@ class PromptTokenizer:
                         self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
         return tokens + self._encode(text[boundary:])
 
+    def split(self, text):
+        """`text` cut just past its last MARKER where the tokenizer splits it
+        there: the tokens before the cut, and the text after it, which
+        encodes on its own. No tokens and all of `text` where it does not."""
+        boundary = text.rfind(self.MARKER)
+        if self.enabled and boundary >= 0:
+            boundary += len(self.MARKER)
+            head = self._encode(text[:boundary])
+            # As in encode, another added token may consume part of the
+            # marker, which is then no boundary.
+            if head and head[-1] == self.marker_id:
+                return head, text[boundary:]
+        return [], text
+
     def stats(self):
         with self.lock:
             return {

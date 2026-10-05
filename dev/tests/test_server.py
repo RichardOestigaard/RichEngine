@@ -1506,6 +1506,25 @@ class ServerTest(unittest.TestCase):
         # The prepare pass and one boundary check; all 17 ran before the fix.
         self.assertEqual(tokenizer.prompt_encodes, 2)
 
+    def test_client_disconnect_stops_the_slot_boundary_pass(self):
+        tokenizer = self.BoundaryCountingTokenizer()
+        app = make_frontend(tokenizer, None, "test-model", 8192, 10, 2, vision=True)
+        body = self.judgment_body(
+            options=[
+                {"id": f"opt{index}", "description": f"case {index}"}
+                for index in range(16)
+            ]
+        )
+        # Connected through admission and the first boundary check.
+        disconnected = iter((False, False, True))
+        with self.assertRaises(ConnectionResetError):
+            app.prepare_judgment(
+                body, deadline=FOREVER, disconnected=lambda: next(disconnected)
+            )
+        # The prepare pass and one boundary check, and the slot returned.
+        self.assertEqual(tokenizer.prompt_encodes, 2)
+        self.assertEqual(app.preparation_active, 0)
+
     def test_judgment_context_budget_precedes_the_slot_boundary_pass(self):
         tokenizer = self.BoundaryCountingTokenizer()
         app = make_frontend(tokenizer, None, "test-model", 8, 10, 2, vision=True)

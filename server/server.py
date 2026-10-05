@@ -620,7 +620,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._json(200, {"input_tokens": tokens})
                 return
             if path == "/v1/judgments":
-                job, row = self.app.prepare_judgment(body, deadline=deadline)
+                job, row = self.app.prepare_judgment(
+                    body, deadline=deadline,
+                    disconnected=self._client_disconnected
+                )
                 remaining_request_time(deadline)
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
@@ -752,7 +755,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _systemone(self, body, deadline):
         active_job = None
         try:
-            entries = self.app.prepare_systemone(body, deadline=deadline)
+            entries = self.app.prepare_systemone(
+                body, deadline=deadline, disconnected=self._client_disconnected
+            )
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
