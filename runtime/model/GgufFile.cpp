@@ -159,8 +159,11 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   const uint64_t tensorCount = reader.scalar<uint64_t>();
   const uint64_t keyCount = reader.scalar<uint64_t>();
   if (tensorCount > 16384 || keyCount > 16384) throw GgufError("implausible GGUF header counts");
+  // A key holds one value, as llama.cpp's reader and install/gguf.py require.
+  std::set<std::string, std::less<>> keys;
   for (uint64_t i = 0; i < keyCount; ++i) {
     const std::string key = reader.string();
+    if (!keys.insert(key).second) throw GgufError("duplicate GGUF metadata key: " + key);
     const uint32_t type = reader.scalar<uint32_t>();
     switch (type) {
     case kUint8: unsigned_[key] = reader.scalar<uint8_t>(); break;

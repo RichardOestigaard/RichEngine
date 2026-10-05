@@ -75,6 +75,13 @@ int main() {
     rejects("truncated tensor", truncated, pastEnd);
     const gguf::Tensor block{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)};
     rejects("duplicate name", gguf::file({}, {block, block}), "duplicate GGUF tensor: weight");
+    // Whatever the types of the two values, and for an array too.
+    rejects("duplicate key",
+            gguf::file({gguf::uint32Key("fixture.block_count", 2), gguf::stringKey("fixture.block_count", "2")}, {}),
+            "duplicate GGUF metadata key: fixture.block_count");
+    rejects("duplicate array key",
+            gguf::file({gguf::int32ArrayKey("fixture.widths", {1}), gguf::int32ArrayKey("fixture.widths", {2})}, {}),
+            "duplicate GGUF metadata key: fixture.widths");
     rejects("overflowing array size", emptyUint64Array(uint64_t{1} << 62), overflow);
     rejects("truncated array", emptyUint64Array(100), "GGUF header is truncated");
     gguf::Bytes nested;
