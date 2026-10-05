@@ -46,6 +46,7 @@ from jinja2.ext import Extension
 from jinja2.lexer import Token
 
 from .serve_options import REASONING_EFFORTS
+from .tool_schema import detect_tool_dialect
 
 # Template arguments request preparation sets itself, and apply_chat_template's
 # own controls: a request's template kwargs cannot set them.
@@ -134,6 +135,9 @@ class ChatTemplate:
     generation_prompts: dict
     # The same for other options, probed on first use.
     probe: Callable
+    # The tool-call framing the template renders, None where no canary call
+    # rendered a known one (requests then keep the default dialect).
+    dialect: object = None
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -260,7 +264,19 @@ def _prepare(render, encode, source):
         original,
         _generation_prompts(render, encode, source),
         probe,
+        _tool_dialect(render, source),
     )
+
+
+def _tool_dialect(render, source):
+    """The tool-call framing a template writes, detected from a canary call:
+    how it renders one assistant tool call settles the spelling the grammar
+    writes and the output projector reads."""
+    try:
+        rendered = render(source, [_ASK, _CALL], {"add_generation_prompt": False})
+    except Exception:
+        return None
+    return detect_tool_dialect(rendered)
 
 
 # Probe conversations. Leading system messages are already merged, as request

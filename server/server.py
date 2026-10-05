@@ -1966,6 +1966,18 @@ def main():
         contract = validate_tokenizer(tokenizer, args.tokenizer)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
+        # Special tokens the output parser needs as text: the dialect's call
+        # markup, and the think-close token where it is a special token.
+        visible_token_ids = {contract.think_end_id}
+        for template in chat_templates.templates.values():
+            dialect = template.dialect
+            if dialect is None:
+                continue
+            for marker in dialect.structural:
+                ids = tokenizer.encode(marker, add_special_tokens=False)
+                if len(ids) == 1:
+                    visible_token_ids.add(ids[0])
+        visible_token_ids.discard(None)
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
             startup_timeout=NATIVE_START_TIMEOUT,
@@ -1977,6 +1989,7 @@ def main():
             tokenizer,
             request_logger=print_request,
             think_end_id=contract.think_end_id,
+            visible_token_ids=visible_token_ids,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")

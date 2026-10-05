@@ -3725,6 +3725,7 @@ class ServerTest(unittest.TestCase):
             tokenizer,
             request_logger=diagnostics.print_request,
             think_end_id=validate.return_value.think_end_id,
+            visible_token_ids=mock.ANY,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.

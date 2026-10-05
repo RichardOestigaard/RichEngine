@@ -11,12 +11,8 @@ from . import json_codec
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
-    FUNCTION_CLOSE,
-    FUNCTION_OPEN,
-    PARAMETER_CLOSE,
-    PARAMETER_OPEN,
+    QWEN3_XML,
     THINK_END,
-    TOOL_CALL_OPEN,
     json_value,
     raw_string_schema,
 )
@@ -95,9 +91,17 @@ class ReasoningSplitter:
         return [(kind, text)]
 
 
-class StreamingToolCallProjector:
-    """Parse Qwen tool XML as it arrives into OpenAI JSON argument deltas,
-    for streamed and complete responses alike.
+def StreamingToolCallProjector(policy, request_id, structured=False):
+    """The output projector for the policy's tool-call dialect."""
+    dialect = getattr(policy, "dialect", None) or QWEN3_XML
+    if dialect.kind == "python":
+        return _PythonCallProjector(policy, request_id, structured, dialect)
+    return _XmlToolCallProjector(policy, request_id, structured, dialect)
+
+
+class _ProjectorBase:
+    """Parse a model's tool-call framing as it arrives into OpenAI JSON
+    argument deltas, for streamed and complete responses alike.
 
     Emit function names before their arguments finish. Validate each closed
     call before its closing JSON brace, then validate the complete response
@@ -105,8 +109,9 @@ class StreamingToolCallProjector:
     call as before one.
     """
 
-    def __init__(self, policy, request_id, structured=False):
+    def __init__(self, policy, request_id, structured, dialect):
         self.policy = policy
+        self.dialect = dialect
         self.request_id = request_id
         self.pending = ""
         self.state = "output" if structured else "content"
@@ -159,18 +164,14 @@ class StreamingToolCallProjector:
     def _streamed_content(self):
         return "".join(self.content_fragments[: self.streamed_count])
 
-    def _begin_call(self, events):
-        name_end = self.pending.find(">\n")
-        if name_end < 0:
-            return False
-        name = self.pending[:name_end]
+    def _open_call(self, name, events):
+        """The tool delta and state that begin a call of `name`."""
         if not name or self.policy.validators.get(name) is None:
             raise APIError(
                 500,
                 f"model called unknown tool {name}",
                 "invalid_model_output",
             )
-        self.pending = self.pending[name_end + 2 :]
         if not self.streamed_count:
             # Whitespace before the first text only framed the calls.
             self.content_fragments.clear()
@@ -192,8 +193,6 @@ class StreamingToolCallProjector:
         events.append(
             ("tool", {"index": self.call_index, "function": {"arguments": "{"}})
         )
-        self.state = "body"
-        return True
 
     def _emit_argument(self, fragment, events):
         self.argument_fragments.append(fragment)
@@ -213,41 +212,6 @@ class StreamingToolCallProjector:
             return
         self.parameter_value_fragments.append(value)
         self._emit_argument(_tool_json(value)[1:-1], events)
-
-    def _finish_parameter(self, events):
-        # Only text that may begin the closing marker stays pending, so each
-        # character of a value is scanned and copied a bounded number of times.
-        value_end = self.pending.find(PARAMETER_CLOSE)
-        if value_end < 0:
-            ready, self.pending = hold_partial(self.pending, PARAMETER_CLOSE)
-            if self.streaming_string:
-                self._emit_string_value(ready, events)
-            elif ready:
-                self.parameter_value_fragments.append(ready)
-            return False
-        tail = self.pending[:value_end]
-        self.pending = self.pending[value_end + len(PARAMETER_CLOSE) :]
-        if self.streaming_string:
-            self._emit_string_value(tail, events)
-            value = "".join(self.parameter_value_fragments)
-            self._emit_argument('"', events)
-        else:
-            self.parameter_value_fragments.append(tail)
-            value = _typed_tool_value(
-                "".join(self.parameter_value_fragments), self.string_schema
-            )
-            prefix = "" if len(self.arguments) == 0 else ","
-            fragment = (
-                prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
-            )
-            self._emit_argument(fragment, events)
-        self.arguments[self.parameter_name] = value
-        self.parameter_name = None
-        self.string_schema = None
-        self.parameter_value_fragments = []
-        self.streaming_string = False
-        self.state = "body"
-        return True
 
     def _finish_call(self, events):
         arguments = _tool_json(self.arguments)
@@ -276,88 +240,59 @@ class StreamingToolCallProjector:
         self.text_visible = False
         self.state = "content"
 
-    def put(self, text):
-        self.pending += text
-        events = []
-        while self.pending:
-            if self.state == "output":
-                first = self.pending.lstrip()
-                if not first:
-                    break
-                # A structured answer is one JSON value or tool calls. Once
-                # JSON starts, XML spellings inside its strings are just data.
-                self.state = "content" if first.startswith("<") else "json"
-            if self.state == "json":
-                self._emit_content(self.pending, events)
-                self.pending = ""
-                break
-            if self.state == "content":
-                start = self.pending.find(TOOL_CALL_OPEN)
-                if start >= 0:
-                    self._emit_content(self.pending[:start], events)
-                    self.pending = self.pending[start + len(TOOL_CALL_OPEN) :]
-                    self.state = "function_prefix"
-                    continue
-                ready, self.pending = hold_partial(self.pending, TOOL_CALL_OPEN)
-                self._emit_content(ready, events)
-                break
-            if self.state == "function_prefix":
-                if not self._literal(FUNCTION_OPEN):
-                    break
-                self.state = "function_name"
-                continue
-            if self.state == "function_name":
-                if not self._begin_call(events):
-                    break
-                continue
-            if self.state == "body":
-                if self.pending.startswith(PARAMETER_OPEN):
-                    self.pending = self.pending[len(PARAMETER_OPEN) :]
-                    self.state = "parameter_name"
-                    continue
-                if self.pending.startswith(FUNCTION_CLOSE):
-                    self.pending = self.pending[len(FUNCTION_CLOSE) :]
-                    self._finish_call(events)
-                    continue
-                if any(
-                    marker.startswith(self.pending)
-                    for marker in (PARAMETER_OPEN, FUNCTION_CLOSE)
-                ):
-                    break
-                self._malformed()
-            if self.state == "parameter_name":
-                name_end = self.pending.find(">\n")
-                if name_end < 0:
-                    break
-                name = self.pending[:name_end]
-                if not name or name in self.arguments:
-                    raise APIError(
-                        500,
-                        "model repeated a tool parameter",
-                        "invalid_model_output",
-                    )
-                self.pending = self.pending[name_end + 2 :]
-                self.parameter_name = name
-                self.string_schema = raw_string_schema(
-                    _tool_property_schema(self.policy, self.function_name, name)
-                )
-                self.streaming_string = (
-                    self.string_schema is not None and self.string_schema[0] == "raw"
-                )
-                self.parameter_value_fragments = []
-                if self.streaming_string:
-                    prefix = "" if len(self.arguments) == 0 else ","
-                    self._emit_argument(
-                        prefix + _tool_json(name) + ':"',
-                        events,
-                    )
-                self.state = "parameter_value"
-                continue
-            if self.state == "parameter_value":
-                if not self._finish_parameter(events):
-                    break
-                continue
-        return events
+    def _begin_parameter(self, name, events):
+        if not name or name in self.arguments:
+            raise APIError(
+                500,
+                "model repeated a tool parameter",
+                "invalid_model_output",
+            )
+        self.parameter_name = name
+        self.string_schema = raw_string_schema(
+            _tool_property_schema(self.policy, self.function_name, name),
+            self.dialect.value_barrier,
+        )
+        self.streaming_string = (
+            self.string_schema is not None and self.string_schema[0] == "raw"
+        )
+        self.parameter_value_fragments = []
+        if self.streaming_string:
+            prefix = "" if len(self.arguments) == 0 else ","
+            self._emit_argument(
+                prefix + _tool_json(name) + ':"',
+                events,
+            )
+
+    def _end_parameter(self, value, events):
+        """Publish a complete parameter value as an arguments fragment."""
+        self.arguments[self.parameter_name] = value
+        self.parameter_name = None
+        self.string_schema = None
+        self.parameter_value_fragments = []
+        self.streaming_string = False
+
+    def _content_state(self, events):
+        """The "content" state shared by every dialect: emit text up to the
+        next call's opening marker, and skip a separator between calls."""
+        separator = self.dialect.call_separator
+        if separator and self.pending.startswith(separator):
+            self.pending = self.pending[len(separator) :]
+            return True
+        start = self.pending.find(self.dialect.call_open)
+        if start >= 0:
+            self._emit_content(self.pending[:start], events)
+            self.pending = self.pending[start + len(self.dialect.call_open) :]
+            self.state = "call_started"
+            return True
+        # Hold the longest suffix that may begin a call marker or separator.
+        markers = (self.dialect.call_open,) + ((separator,) if separator else ())
+        held_len = max(
+            len(hold_partial(self.pending, marker)[1]) for marker in markers
+        )
+        ready = self.pending[:-held_len] if held_len else self.pending
+        self.pending = self.pending[len(ready) :]
+        self._emit_content(ready, events)
+        return False
 
     def finish(self, incomplete):
         """The content and calls of the output, and the content the stream
@@ -372,7 +307,7 @@ class StreamingToolCallProjector:
         or unfinished call header."""
         if self.state in ("content", "output", "json"):
             if self.pending and not (
-                incomplete and TOOL_CALL_OPEN.startswith(self.pending)
+                incomplete and self.dialect.call_open.startswith(self.pending)
             ):
                 self.content_fragments.append(self.pending)
             elif self.closed_calls:
@@ -396,6 +331,329 @@ class StreamingToolCallProjector:
         streamed = self._streamed_content()
         content = streamed if calls and incomplete else "".join(self.content_fragments)
         return content, calls, content[len(streamed) :]
+
+
+_CDATA_OPEN = "<![CDATA["
+
+
+class _XmlToolCallProjector(_ProjectorBase):
+    """The projector of an XML dialect: calls are elements whose parameters
+    are elements wrapping a raw or JSON-encoded value."""
+
+    def _begin_call(self, events):
+        name_end = self.pending.find(self.dialect.name_close)
+        if name_end < 0:
+            return False
+        name = self.pending[:name_end]
+        self.pending = self.pending[name_end + len(self.dialect.name_close) :]
+        self._open_call(name, events)
+        self.state = "body"
+        return True
+
+    def _finish_parameter(self, events):
+        # Only text that may begin the closing marker stays pending, so each
+        # character of a value is scanned and copied a bounded number of times.
+        if self.dialect.cdata:
+            # A value may open as a CDATA section; wait until that much text
+            # has arrived or ruled it out before streaming the value.
+            if not self.parameter_value_fragments and not self.cdata_open:
+                if self.pending.startswith(_CDATA_OPEN):
+                    self.pending = self.pending[len(_CDATA_OPEN) :]
+                    self.cdata_open = True
+                elif _CDATA_OPEN.startswith(self.pending):
+                    return False
+            close = (
+                "]]>" + self.dialect.param_close
+                if self.cdata_open
+                else self.dialect.param_close
+            )
+        else:
+            close = self.dialect.param_close
+        value_end = self.pending.find(close)
+        if value_end < 0:
+            ready, self.pending = hold_partial(self.pending, close)
+            if self.streaming_string:
+                self._emit_string_value(ready, events)
+            elif ready:
+                self.parameter_value_fragments.append(ready)
+            return False
+        tail = self.pending[:value_end]
+        self.pending = self.pending[value_end + len(close) :]
+        self.cdata_open = False
+        if self.streaming_string:
+            self._emit_string_value(tail, events)
+            value = "".join(self.parameter_value_fragments)
+            self._emit_argument('"', events)
+        else:
+            self.parameter_value_fragments.append(tail)
+            value = _typed_tool_value(
+                "".join(self.parameter_value_fragments), self.string_schema
+            )
+            prefix = "" if len(self.arguments) == 0 else ","
+            fragment = (
+                prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value)
+            )
+            self._emit_argument(fragment, events)
+        self._end_parameter(value, events)
+        self.state = "body"
+        return True
+
+    def put(self, text):
+        self.pending += text
+        events = []
+        while self.pending:
+            if self.state == "output":
+                first = self.pending.lstrip()
+                if not first:
+                    break
+                # A structured answer is one JSON value or tool calls. Once
+                # JSON starts, call spellings inside its strings are just data.
+                self.state = "content" if first.startswith("<") else "json"
+            if self.state == "json":
+                self._emit_content(self.pending, events)
+                self.pending = ""
+                break
+            if self.state == "content":
+                if not self._content_state(events):
+                    break
+                continue
+            if self.state == "call_started":
+                if not self._literal(self.dialect.name_prefix):
+                    break
+                self.state = "function_name"
+                continue
+            if self.state == "function_name":
+                if not self._begin_call(events):
+                    break
+                continue
+            if self.state == "body":
+                if self.pending.startswith(self.dialect.param_open):
+                    self.pending = self.pending[len(self.dialect.param_open) :]
+                    self.state = "parameter_name"
+                    continue
+                if self.pending.startswith(self.dialect.call_close):
+                    self.pending = self.pending[len(self.dialect.call_close) :]
+                    self._finish_call(events)
+                    continue
+                if any(
+                    marker.startswith(self.pending)
+                    for marker in (self.dialect.param_open, self.dialect.call_close)
+                ):
+                    break
+                self._malformed()
+            if self.state == "parameter_name":
+                name_end = self.pending.find(self.dialect.param_name_close)
+                if name_end < 0:
+                    break
+                name = self.pending[:name_end]
+                self.pending = self.pending[
+                    name_end + len(self.dialect.param_name_close) :
+                ]
+                self._begin_parameter(name, events)
+                self.cdata_open = False
+                self.state = "parameter_value"
+                continue
+            if self.state == "parameter_value":
+                if not self._finish_parameter(events):
+                    break
+                continue
+        return events
+
+
+class _PythonCallProjector(_ProjectorBase):
+    """The projector of a python-call dialect: ``[name(arg='v', ...)]``
+    between the call-list tokens. Bare values read to the next ``, `` or
+    ``)`` at bracket depth zero; quoted strings stream their decoded
+    characters."""
+
+    def _begin_call(self, events):
+        name_end = self.pending.find("(")
+        if name_end < 0:
+            return False
+        name = self.pending[:name_end]
+        self.pending = self.pending[name_end + 1 :]
+        self._open_call(name, events)
+        self.state = "argument_head"
+        return True
+
+    def _begin_argument(self, events):
+        # The name ends at "="; "(", ")" or "," first is malformed.
+        equals = self.pending.find("=")
+        earlier = [
+            found
+            for character in "(),"
+            if (found := self.pending.find(character)) >= 0
+        ]
+        if equals < 0:
+            if earlier:
+                self._malformed()
+            return False
+        if earlier and min(earlier) < equals:
+            self._malformed()
+        name = self.pending[:equals]
+        self.pending = self.pending[equals + 1 :]
+        self._begin_parameter(name, events)
+        self.state = "argument_value"
+        return True
+
+    _ESCAPES = {"\\": "\\", "'": "'", "n": "\n", "r": "\r"}
+
+    def _finish_string(self, events):
+        """Stream decoded characters of a quoted string to its close quote."""
+        decoded = []
+        index = 0
+        while index < len(self.pending):
+            character = self.pending[index]
+            if character == "'":
+                self.pending = self.pending[index + 1 :]
+                if decoded:
+                    self._emit_string_value("".join(decoded), events)
+                value = "".join(self.parameter_value_fragments)
+                self._emit_argument('"', events)
+                self._end_parameter(value, events)
+                self.state = "argument_sep"
+                return True
+            if character == "\\":
+                if index + 1 >= len(self.pending):
+                    break
+                escaped = self._ESCAPES.get(self.pending[index + 1])
+                if escaped is None:
+                    self._malformed()
+                decoded.append(escaped)
+                index += 2
+                continue
+            decoded.append(character)
+            index += 1
+        self.pending = self.pending[index:]
+        if decoded:
+            self._emit_string_value("".join(decoded), events)
+        return False
+
+    def _finish_value(self, events):
+        """Read a bare value to its ``, `` or ``)`` delimiter at depth zero,
+        honoring JSON strings and containers, then emit it."""
+        depth = 0
+        quote = None
+        index = 0
+        while index < len(self.pending):
+            character = self.pending[index]
+            if quote is not None:
+                if character == "\\":
+                    index += 1
+                elif character == quote:
+                    quote = None
+            elif character in "'\"":
+                quote = character
+            elif character in "[{":
+                depth += 1
+            elif character in "]}":
+                depth -= 1
+            elif character in ",)" and depth == 0:
+                break
+            index += 1
+        else:
+            return False
+        token = self.pending[:index]
+        self.pending = self.pending[index:]
+        value = _python_call_value(token)
+        prefix = "" if len(self.arguments) == 0 else ","
+        self._emit_argument(
+            prefix + _tool_json(self.parameter_name) + ":" + _tool_json(value),
+            events,
+        )
+        self._end_parameter(value, events)
+        self.state = "argument_sep"
+        return True
+
+    def put(self, text):
+        self.pending += text
+        events = []
+        while self.pending:
+            if self.state == "output":
+                first = self.pending.lstrip()
+                if not first:
+                    break
+                self.state = "content" if first.startswith("<") else "json"
+            if self.state == "json":
+                self._emit_content(self.pending, events)
+                self.pending = ""
+                break
+            if self.state == "content":
+                if not self._content_state(events):
+                    break
+                continue
+            if self.state == "call_started":
+                # ", " joins calls; the space may arrive after the comma.
+                stripped = self.pending.lstrip(" ")
+                if stripped != self.pending:
+                    self.pending = stripped
+                    continue
+                if not self._begin_call(events):
+                    break
+                continue
+            if self.state == "argument_head":
+                stripped = self.pending.lstrip(" ")
+                if stripped != self.pending:
+                    self.pending = stripped
+                    continue
+                if self.pending.startswith(")"):
+                    self.pending = self.pending[1:]
+                    self._finish_call(events)
+                    self.state = "call_sep"
+                    continue
+                if not self._begin_argument(events):
+                    break
+                continue
+            if self.state == "argument_value":
+                # A quote opens a streamed string; anything else is a bare
+                # literal or JSON container read to its delimiter.
+                if self.pending.startswith("'"):
+                    self.pending = self.pending[1:]
+                    self.state = "argument_string"
+                    continue
+                if not self._finish_value(events):
+                    break
+                continue
+            if self.state == "argument_string":
+                if not self._finish_string(events):
+                    break
+                continue
+            if self.state == "argument_sep":
+                if self.pending.startswith(","):
+                    self.pending = self.pending[1:]
+                    self.state = "argument_head"
+                    continue
+                if self.pending.startswith(")"):
+                    self.pending = self.pending[1:]
+                    self._finish_call(events)
+                    self.state = "call_sep"
+                    continue
+                if ",)".find(self.pending[0]) < 0:
+                    self._malformed()
+                break
+            if self.state == "call_sep":
+                if self.pending.startswith(","):
+                    self.pending = self.pending[1:]
+                    self.state = "call_started"
+                    continue
+                if self._literal(self.dialect.call_close):
+                    self.state = "content"
+                    continue
+                break
+        return events
+
+
+def _python_call_value(token):
+    """A bare argument value of a python-call dialect: the template's scalar
+    spellings, or JSON for containers and quoted strings."""
+    token = token.strip()
+    if token == "True":
+        return True
+    if token == "False":
+        return False
+    if token == "None":
+        return None
+    return json_value(token)
 
 
 def argument_deltas(arguments):

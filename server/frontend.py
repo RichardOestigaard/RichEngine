@@ -34,11 +34,10 @@ from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer
 from .tool_schema import (
+    QWEN3_XML,
     THINK_END,
     THINK_END_TOKEN_ID,
-    TOOL_CALL_OPEN,
     ToolPolicy,
-    function_opening,
     json_grammar,
     normalize_response_format,
     normalize_tools,
@@ -805,6 +804,7 @@ class Frontend:
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
+            self.chat_templates.select(body.get("tools")).dialect,
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
@@ -1026,11 +1026,12 @@ class Frontend:
         names are all possible next, so a tool with more of them than the
         parser admits fails there."""
         reasoning = [self.think_end_id] if thinking else []
+        dialect = policy.dialect or QWEN3_XML
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + function_opening(name), add_special_tokens=False
+                    dialect.call_opening(name), add_special_tokens=False
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

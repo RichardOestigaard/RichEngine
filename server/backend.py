@@ -121,12 +121,21 @@ class Job:
 
 class CallbackStreamer:
     def __init__(
-        self, tokenizer, callback, stop_sequences=(), on_stop=None, think_end_id=None
+        self,
+        tokenizer,
+        callback,
+        stop_sequences=(),
+        on_stop=None,
+        think_end_id=None,
+        visible_token_ids=(),
     ):
         self.tokenizer = tokenizer
         self.think_end_id = (
             THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         )
+        # Special tokens whose text the output parser needs, such as a tool
+        # dialect's call markup, decoded despite skip_special_tokens.
+        self.visible_token_ids = frozenset(visible_token_ids)
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
         self.on_stop = on_stop
@@ -188,19 +197,46 @@ class CallbackStreamer:
                     raise
                 self.decode_stream = None
                 continue
+            if not text and token_id in self.visible_token_ids:
+                text = self.tokenizer.decode(
+                    [token_id], skip_special_tokens=False
+                )
             if text:
                 self._emit(text)
                 if self.stop_sequence is not None:
                     break
 
+    def _decode_all(self):
+        """The whole output as text, keeping the special tokens the output
+        parser needs while other specials stay skipped."""
+        keep = self.visible_token_ids
+        if not keep:
+            return self.tokenizer.decode(
+                self.token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+        parts, run = [], []
+        for token_id in self.token_ids:
+            if token_id in keep:
+                if run:
+                    parts.append(
+                        self.tokenizer.decode(run, skip_special_tokens=True)
+                    )
+                    run = []
+                parts.append(
+                    self.tokenizer.decode([token_id], skip_special_tokens=False)
+                )
+            else:
+                run.append(token_id)
+        if run:
+            parts.append(self.tokenizer.decode(run, skip_special_tokens=True))
+        return "".join(parts)
+
     def end(self):
         if self.stop_sequence is not None:
             return
-        decoded = self.tokenizer.decode(
-            self.token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
+        decoded = self._decode_all()
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
@@ -250,10 +286,14 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger, think_end_id=None):
+    def __init__(
+        self, runtime, tokenizer, request_logger, think_end_id=None,
+        visible_token_ids=(),
+    ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.think_end_id = think_end_id
+        self.visible_token_ids = frozenset(visible_token_ids)
         self.request_logger = request_logger
         self.active = {}
         self.closing = False
@@ -610,6 +650,7 @@ class NativeBackend:
             job.stop_sequences,
             stop_matched,
             think_end_id=self.think_end_id,
+            visible_token_ids=self.visible_token_ids,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)

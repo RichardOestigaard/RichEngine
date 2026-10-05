@@ -192,3 +192,110 @@ prefill) and only if a supported CoreML path ever batches it.
   per `DEVELOPMENT.md#local-benchmarks`.
 - `/status` `model_timing.prefill.total_gpu_ms` delta around a fixed
   8,058-token request — the harness used for the baseline above.
+
+## Measured outcomes (M5 Pro, 2026-10-05)
+
+Every lever from the plan has now been measured on hardware. Results:
+
+### Chunked-parallel GDN scan — implemented, slower, flag left off
+
+`SPLASH_GDN_CHUNKED={32,64,128}` dispatches the WY/UT kernels
+(`gdn_chunked.metal`, `PrefillTensor::GdnChunkScratch`, `GDNChunkedParams`).
+2048-token chunk, best of 5 (`dev/benchmarks/gdn_chunked_bench.mm`):
+
+| Shape | Serial | C=32 | C=64 | C=128 |
+| --- | ---: | ---: | ---: | ---: |
+| vh48 (27B) | 3.85 ms | 3.94 | 4.89 | 11.76 |
+| vh32 (Ornith 9B) | 2.62 ms | 2.83 | 3.40 | 8.12 |
+
+The prep phase round-trips ~200-380 MB fp32 scratch per (head, chunk); at
+273 GB/s that alone is ~1.5 ms, and Splash's serial scan is already tiled
+(128 threads x state rows), so the sequential depth is not the bottleneck
+the literature assumes. C=128 also loses accuracy on strong-decay heads
+(rowErr 0.08). Code stays behind the flag for a future device where the
+tradeoff flips.
+
+### fp8e4m3 prefill activations — dead at two levels
+
+Accuracy gate (Ornith-1.5-9B-MLX-4bit, group-64 absmax): last-token argmax
+agrees, KL 0.0003, cosine 0.9915, but greedy continuation diverges at
+token 3 — fails the exactness contract.
+
+And it is unreachable anyway: MPP `matmul2d` rejects the fp8e4m3-A x
+uint4b-B operand pair (compile-time `static_assert "Unsupported type"`).
+Available narrow formats are int2b/int4b/uint2b/uint4b/fp4_e2m1/fp8e4m3/
+fp8e5m2 — no int8, so int8 activations are also impossible. fp8xfp8 would
+need fp8-weight storage (2x weight bandwidth): net negative.
+
+### Prefill chunk budget — flat
+
+2048 vs 4096 on a 9,886-token cold prompt: 21.30 s vs 21.80 s. Compile-time
+`SPLASH_PREFILL_TOKEN_BUDGET`; package manifest `execution_geometry`
+validates it. Reverted to 2048.
+
+### GPU-driven dispatch — no gap to recover
+
+/status on a 9,862-token prefill: `total_gpu_ms` 30,913 vs `total_wall_ms`
+30,929 — host encoding is 0.05% of prefill wall, already fully overlapped.
+MTL4 queue/argument-table plumbing exists (`SPLASH_MTL4_AVAILABLE`), and
+decode already uses baked ICB spans; prefill gains ~nothing.
+
+### Per-dispatch attribution (decode-profile, 512-row prefill, 27B)
+
+| Kernel class | Share |
+| --- | ---: |
+| `prefill_linear_q4_*_sg4` GEMMs (all) | ~93% |
+| `prefill_gdn_scan` (48 layers) | 4.1% |
+| attention split/reduce/store (q8) | ~1% |
+| norms, gates, captures, embedding, head | ~2% |
+
+The GEMMs run at 26-30 effective TFLOPS (`q4_prefill_profile`, rows=2048),
+which is the bf16 x int4 tensor-op ceiling on this part. Prefill is
+GEMM-bound at the hardware floor.
+
+### Assembly-level paths — none exist
+
+AGX ISA is private; `air-objdump` shows the kernels already lower to the
+hardware tensor-op builtin (`__tensorops_impl_matmul2d_op_run_cooperative_
+dv_b16_dv_ui4_f32_v2`). The authored floor is AIR/MSL; nothing below
+`matmul2d` is authorable.
+
+### Kernel policy tuning — decode wins only
+
+`make tune-kernels` (88 keys, 27B; 72 keys, Ornith 9B): every prefill key
+kept its default. Decode-side winners are encoded as exact-shape
+`kMeasuredOverrides` in `runtime/ops/Linear.cpp` — +5.1%..+18.7% GPU on
+the 27B, +6.7%..+24.0% on Ornith (incl. its {4096,32768} draft capture
+projection).
+
+### Acceptance-path flags on Ornith-1.5-9B — all neutral-to-negative
+
+3-rep median decode tok/s, 256-token completions, cached prompt:
+
+| Flag | Open-ended | Grounded |
+| --- | ---: | ---: |
+| baseline | 89.4 | 134.8 |
+| `SPLASH_VERIFY_TREE=1` | 89.3 | 134.0 |
+| `SPLASH_ADAPTIVE_PROPOSALS=1` | — | 121.7 |
+| `SPLASH_NGRAM_PREDRAFT=1` | 88.6 | 120.3 |
+
+Outputs byte-identical; no flag earns auto-enable on this model (plain
+transformer draft has no tree worth verifying; n-gram traffic doesn't
+overlap). Flags stay opt-in.
+
+### Verified structure
+
+Prefill attention is flash-chunked already (`paged_attention_tile.h`:
+page-split online softmax, rescale, int8 KV). The ~1,700 -> ~1,080 tok/s
+slope from 8K->60K context is linear KV-read growth, not recompute. The
+vocab projection already runs only on per-sequence final rows
+(`addHeadBatch`), not all chunk rows.
+
+## Remaining levers
+
+- fp4_e2m1 weight format: same 4 bits, drops the group scale/bias
+  epilogue — low single-digit % at best; needs a new package format.
+- Finer prefill chunks under `--decode-share` for queued-request TTFT
+  under concurrency (no cold-TTFT change).
+- Upstream context discipline: keep prompt prefixes byte-stable and batch
+  tool-result appends — every uncached token is ~0.8-2 ms of TTFT.
