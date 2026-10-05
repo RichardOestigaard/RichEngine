@@ -340,12 +340,18 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
 }
 // The affine prefill's norm, with bf16 weights only, whose rows need not fill
 // its 32-row sum tiles. Its rows equal the plain norm's bit for bit, which a
-// prefill whose consumer reads no sums runs instead.
+// prefill whose consumer reads no sums runs instead. F32 weights, which have
+// no kernel, are refused before anything is encoded.
 void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   const NormCase c=normCase(backend,k,rows,false);
   auto output=test::sharedBuffer(backend, k*rows*2), plain=test::sharedBuffer(backend, k*rows*2);
   auto sums=test::sharedBuffer(backend, (rows+31)/32*32*(k/64)*4);
   metal::CommandGraph graph;
+  const NormCase f32=normCase(backend,k,rows,true);
+  bool refused=false;
+  try { Normalization::addRmsWithQ4Sums(graph,f32.input,f32.weight,output,sums,k,rows); }
+  catch (const std::invalid_argument &) { refused=true; }
+  require(refused && graph.empty(),"the Q4-sum norm took F32 weights");
   Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
   Normalization::addRms(graph,c.input,c.weight,plain,k,rows);
   require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==

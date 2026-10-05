@@ -42,7 +42,8 @@ public:
                               LinearInput layout = LinearInput::Plain);
 
   // Fused RMS normalization plus Q4 input-group sums for an affine prefill
-  // projection; its norm weights are bf16.
+  // projection, of whole 64-input groups. Its norm weights are bf16: F32
+  // norms come only from GGUF targets, whose projections read no sums.
   static void addRmsWithQ4Sums(metal::CommandGraph &graph,
                                metal::MetalBuffer input,
                                const NormWeights &weight,
