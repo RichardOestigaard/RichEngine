@@ -53,36 +53,6 @@ void projection(Image &image, std::initializer_list<std::pair<std::string, uint3
 }
 
 template<class Layout>
-void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &layout) {
-  const std::pair<const char *, double> fields[] = {
-      {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
-      {"vocab_size", layout.vocabularySize}, {"head_dim", layout.attentionHeadDimension},
-      {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
-      {"linear_num_key_heads", layout.gdnKeyHeads}, {"linear_num_value_heads", layout.gdnValueHeads},
-      {"linear_key_head_dim", layout.gdnHeadDimension}, {"linear_value_head_dim", layout.gdnHeadDimension},
-      {"linear_conv_kernel_dim", kGdnConvolutionTaps}, {"full_attention_interval", layout.fullAttentionPeriod},
-      {"rms_norm_eps", 1e-6}, {"attention_bias", 0}, {"attn_output_gate", 1},
-      {"tie_word_embeddings", 0}, {"rope_parameters.rope_theta", layout.rotaryTheta},
-      {"rope_parameters.partial_rotary_factor", double(layout.rotaryPairs * 2) / layout.attentionHeadDimension}};
-  for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
-  source.requireConfigString("hidden_act", "silu");
-  // Transformers also reads the rope type from the older `type` key, which
-  // fine-tunes such as Ornith 1.5 still write.
-  source.requireConfigString("rope_parameters.rope_type", "default", "rope_parameters.type");
-  source.requireLayerTypes(layout.layers, layout.fullAttentionPeriod);
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
-    source.requireConfigString("model_type", "qwen3_5_moe_text");
-    source.requireConfigNumber("num_experts", layout.experts);
-    source.requireConfigNumber("num_experts_per_tok", layout.expertsPerToken);
-    source.requireConfigNumber("moe_intermediate_size", layout.expertIntermediateSize);
-    source.requireConfigNumber("shared_expert_intermediate_size", layout.expertIntermediateSize);
-  } else {
-    source.requireConfigString("model_type", "qwen3_5_text");
-    source.requireConfigNumber("intermediate_size", layout.intermediateSize);
-  }
-}
-
-template<class Layout>
 Image layerImage(const Layout &layout, uint32_t layer) {
   const bool full = layout.isFullAttentionLayer(layer);
   Image result = image("layer-" + std::to_string(layer) + ".bin", Layout::layerMagic, layer, full ? 1u : 0u);
@@ -389,11 +359,11 @@ std::shared_ptr<affine::PlannedCheckpoint> planImages(const std::filesystem::pat
   return planned;
 }
 
-// The checkpoint at directory with every image of layout bound to it.
+// The checkpoint at directory with every image of layout bound to it. Its
+// config.json is the model's, which inspectModelPackage checks.
 template<class Layout>
 std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &directory, const Layout &layout) {
   auto planned = std::make_shared<affine::PlannedCheckpoint>(directory);
-  validateConfiguration(planned->source, layout);
   planned->images = images(layout);
   for (Image &image : planned->images) affine::bind(image, planned->source);
   return planned;

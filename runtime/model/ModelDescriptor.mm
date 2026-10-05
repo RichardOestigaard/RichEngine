@@ -3,15 +3,19 @@
 #include "PlainDraft.hpp"
 #include "QwenVision.hpp"
 #include "WeightStore.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 
 #import <Foundation/Foundation.h>
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <initializer_list>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace splash::model {
@@ -22,10 +26,20 @@ struct GeometryField final {
   uint64_t value;
 };
 
+// A model's records and configurations are kilobytes of JSON: a file past
+// this is not one and is not read, as a checkpoint's config.json is not
+// (SafetensorsCheckpoint.mm).
+constexpr uint64_t kMaximumJsonBytes = 1 << 20;
+
 // The JSON object of the file at path; with sha256, the SHA-256 of its bytes
 // too.
 NSDictionary *readObject(const std::filesystem::path &path,
                          std::string_view label, std::string *sha256 = nullptr) {
+  std::error_code sizeError;
+  const uintmax_t bytes = std::filesystem::file_size(path, sizeError);
+  if (!sizeError && bytes > kMaximumJsonBytes)
+    throw std::invalid_argument(std::string(label) + " exceeds " +
+                                std::to_string(kMaximumJsonBytes) + " bytes");
   NSString *nativePath = [NSString stringWithUTF8String:path.c_str()];
   if (!nativePath)
     throw std::invalid_argument(std::string(label) +
@@ -128,6 +142,82 @@ void requireEqual(std::string_view actual, std::string_view expected,
   }
 }
 
+// The one rule every number of a record or configuration is checked by: a
+// JSON number, never a boolean, equal to the value expected. A config saved
+// from Python may write a whole number as a float, rope_theta=1e7 as
+// 10000000.0, which equals that integer; every value expected is exact as a
+// double.
+void requireNumber(id value, double expected, std::string_view label) {
+  if (![value isKindOfClass:[NSNumber class]] ||
+      CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
+    throw std::invalid_argument(std::string(label) + " must be a number");
+  if ([value doubleValue] != expected)
+    throw std::invalid_argument(std::string(label) + " mismatch: package " +
+                                [value description].UTF8String + ", runtime " +
+                                @(expected).description.UTF8String);
+}
+
+// A key and the number it must hold.
+struct ExpectedNumber final {
+  template <class Number>
+  ExpectedNumber(const char *key, Number value)
+      : key(key), value(static_cast<double>(value)) {}
+  const char *key;
+  double value;
+};
+
+// The numbers object holds at the keys, which errors name after `where`.
+void requireNumbers(NSDictionary *object, std::string_view where,
+                    std::initializer_list<ExpectedNumber> fields) {
+  for (const ExpectedNumber &field : fields)
+    requireNumber(object[@(field.key)], field.value,
+                  std::string(where) + " " + field.key);
+}
+
+// The numbers of an array, in order.
+void requireNumbers(NSArray *values, std::span<const uint32_t> expected,
+                    std::string_view label) {
+  if (values.count != expected.size())
+    throw std::invalid_argument(std::string(label) + " count mismatch: package " +
+                                std::to_string(values.count) + ", runtime " +
+                                std::to_string(expected.size()));
+  for (size_t index = 0; index < expected.size(); ++index)
+    requireNumber(values[index], expected[index],
+                  std::string(label) + " " + std::to_string(index));
+}
+
+// The JSON booleans, never numbers, object holds at the keys.
+void requireBooleans(NSDictionary *object, std::string_view where,
+                     std::initializer_list<std::pair<const char *, bool>> fields) {
+  for (const auto &[key, expected] : fields) {
+    id value = object[@(key)];
+    if (![value isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() ||
+        [value boolValue] != expected)
+      throw std::invalid_argument(std::string(where) + " " + key + " must be " +
+                                  (expected ? "true" : "false"));
+  }
+}
+
+// Each layer's type in a layer_types array, as the array names a
+// full-attention layer and a GDN layer.
+template <class Target>
+void requireLayerTypes(NSArray *types, const Target &target,
+                       NSString *attention, NSString *gdn,
+                       std::string_view label) {
+  if (types.count != target.layers)
+    throw std::invalid_argument(std::string(label) + " count mismatch: package " +
+                                std::to_string(types.count) + ", runtime " +
+                                std::to_string(target.layers));
+  for (uint32_t layer = 0; layer < target.layers; ++layer) {
+    NSString *expected = target.isFullAttentionLayer(layer) ? attention : gdn;
+    if (![types[layer] isEqual:expected])
+      throw std::invalid_argument(std::string(label) + " " +
+                                  std::to_string(layer) + " must be " +
+                                  expected.UTF8String);
+  }
+}
+
 // A package records the execution geometry it was published with. Its draft
 // was trained for blocks of draft_query_rows rows, the anchor and
 // draft_proposal_tokens proposals, over draft_sliding_window context tokens,
@@ -135,23 +225,18 @@ void requireEqual(std::string_view actual, std::string_view expected,
 // page and verify rows it records were that runtime's choices; this runtime
 // makes its own.
 void validateExecutionGeometry(NSDictionary *manifest) {
-  NSDictionary *geometry = requireObject(
-      manifest, @"execution_geometry", "model execution geometry");
-  for (const GeometryField &field : std::to_array<GeometryField>(
-           {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
-            {"draft_query_rows", ExecutionLimits::draftQueryRows},
-            {"draft_sliding_window", ExecutionLimits::draftContextTokens}})) {
-    NSString *key = [NSString stringWithUTF8String:field.name];
-    requireEqual(requireUnsigned(geometry, key, field.name), field.value,
-                 field.name);
-  }
+  requireNumbers(requireObject(manifest, @"execution_geometry",
+                               "model execution geometry"),
+                 "execution_geometry",
+                 {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
+                  {"draft_query_rows", ExecutionLimits::draftQueryRows},
+                  {"draft_sliding_window", ExecutionLimits::draftContextTokens}});
 }
 
 void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
                           std::string_view draftMagic) {
-  requireEqual(requireUnsigned(format, @"section_alignment_bytes",
-                               "section_alignment_bytes"),
-               kWeightFileAlignment, "section_alignment_bytes");
+  requireNumbers(format, "format",
+                 {{"section_alignment_bytes", kWeightFileAlignment}});
   requireEqual(requireString(format, @"target_layer_magic",
                              "target_layer_magic"),
                targetMagic, "target_layer_magic");
@@ -384,16 +469,14 @@ void validateTokenizer(const std::filesystem::path &root,
   if (![text isKindOfClass:[NSDictionary class]]) text = config;
   requireEqual(requireString(text, @"model_type", "text model type"),
                expectedTextModelType, "text model type");
-  requireEqual(requireUnsigned(text, @"hidden_size", "hidden_size"),
-               std::visit([](const auto &layout) { return layout.hiddenSize; },
-                          descriptor.target),
-               "hidden_size");
-  requireEqual(requireUnsigned(text, @"vocab_size", "vocab_size"),
-               descriptor.capabilities.vocabularySize, "vocab_size");
-  requireEqual(requireUnsigned(text, @"max_position_embeddings",
-                               "max_position_embeddings"),
-               descriptor.capabilities.maximumContextTokens,
-               "max_position_embeddings");
+  requireNumbers(
+      text, "tokenizer text config",
+      {{"hidden_size",
+        std::visit([](const auto &layout) { return layout.hiddenSize; },
+                   descriptor.target)},
+       {"vocab_size", descriptor.capabilities.vocabularySize},
+       {"max_position_embeddings",
+        descriptor.capabilities.maximumContextTokens}});
 }
 
 // The dense qwen3_5_text package format, shared by the 27B and Ornith 9B;
@@ -401,37 +484,18 @@ void validateTokenizer(const std::filesystem::path &root,
 void validateQwen38(NSDictionary *manifest,
                     const std::filesystem::path &root,
                     const ModelDescriptor &descriptor) {
-  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
-               3, "schema_version");
+  requireNumbers(manifest, "manifest", {{"schema_version", 3}});
   NSDictionary *format =
       requireObject(manifest, @"format", "model weight format");
-  requireEqual(requireUnsigned(format, @"q4_bits", "q4_bits"), 4,
-               "q4_bits");
-  requireEqual(requireUnsigned(format, @"q4_group_size", "q4_group_size"),
-               kQ4GroupElements, "q4_group_size");
-  requireEqual(requireUnsigned(format, @"q4_storage_n", "q4_storage_n"),
-               kQ4StorageN, "q4_storage_n");
+  requireNumbers(format, "format",
+                 {{"q4_bits", 4},
+                  {"q4_group_size", kQ4GroupElements},
+                  {"q4_storage_n", kQ4StorageN}});
   const std::string_view layerMagic = std::visit(
       [](const auto &layout) { return std::decay_t<decltype(layout)>::layerMagic; },
       descriptor.target);
   validateCommonFormat(format, layerMagic, draftLayerMagic(descriptor.draft));
   validateTokenizer(root, descriptor, "qwen3_5_text");
-}
-
-void validateLayerTypes(NSDictionary *target,
-                        const Qwen3_6MoeLayout &layout) {
-  NSArray *types = requireArray(target, @"layer_types", "target layer_types");
-  requireEqual(types.count, layout.layers, "target layer_types count");
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    id value = types[layer];
-    if (![value isKindOfClass:[NSString class]])
-      throw std::invalid_argument("target layer type must be a string");
-    const std::string expected =
-        layout.isFullAttentionLayer(layer) ? "attention" : "gdn";
-    const char *actual = static_cast<NSString *>(value).UTF8String;
-    requireEqual(actual ? actual : "", expected,
-                 "target layer " + std::to_string(layer));
-  }
 }
 
 void validateCaptureLayers(NSDictionary *draft, const Qwen3_6MoeLayout &layout) {
@@ -452,19 +516,14 @@ void validateCaptureLayers(NSDictionary *draft, const Qwen3_6MoeLayout &layout) 
 void validateQwen36(NSDictionary *manifest,
                     const std::filesystem::path &root,
                     const ModelDescriptor &descriptor) {
-  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
-               4, "schema_version");
+  requireNumbers(manifest, "manifest", {{"schema_version", 4}});
   NSDictionary *format =
       requireObject(manifest, @"format", "model weight format");
-  requireEqual(requireUnsigned(format, @"q4_bits", "q4_bits"), 4,
-               "q4_bits");
-  requireEqual(requireUnsigned(format, @"q8_bits", "q8_bits"), 8,
-               "q8_bits");
-  requireEqual(requireUnsigned(format, @"quant_group_size",
-                               "quant_group_size"),
-               kQ4GroupElements, "quant_group_size");
-  requireEqual(requireUnsigned(format, @"storage_n", "storage_n"),
-               kQ4StorageN, "storage_n");
+  requireNumbers(format, "format",
+                 {{"q4_bits", 4},
+                  {"q8_bits", 8},
+                  {"quant_group_size", kQ4GroupElements},
+                  {"storage_n", kQ4StorageN}});
   validateCommonFormat(format, Qwen3_6MoeLayout::layerMagic,
                        draftLayerMagic(descriptor.draft));
 
@@ -473,24 +532,20 @@ void validateQwen36(NSDictionary *manifest,
       requireObject(manifest, @"target", "target declaration");
   requireEqual(requireString(target, @"architecture", "target architecture"),
                "qwen3_5_moe", "target architecture");
-  for (const GeometryField &field : std::to_array<GeometryField>(
-           {{"layers", targetLayout.layers},
-            {"hidden_size", targetLayout.hiddenSize},
-            {"vocabulary_size", targetLayout.vocabularySize},
-            {"gdn_actual_width", targetLayout.actualGdnWidth()},
-            {"gdn_packed_width", targetLayout.packedGdnWidth},
-            {"attention_packed_width", targetLayout.packedFullWidth},
-            {"experts", targetLayout.experts},
-            {"experts_per_token", targetLayout.expertsPerToken},
-            {"moe_intermediate_size", targetLayout.expertIntermediateSize},
-            {"shared_expert_intermediate_size",
-             targetLayout.expertIntermediateSize}})) {
-    requireEqual(requireUnsigned(target,
-                                 [NSString stringWithUTF8String:field.name],
-                                 field.name),
-                 field.value, field.name);
-  }
-  validateLayerTypes(target, targetLayout);
+  requireNumbers(target, "target",
+                 {{"layers", targetLayout.layers},
+                  {"hidden_size", targetLayout.hiddenSize},
+                  {"vocabulary_size", targetLayout.vocabularySize},
+                  {"gdn_actual_width", targetLayout.actualGdnWidth()},
+                  {"gdn_packed_width", targetLayout.packedGdnWidth},
+                  {"attention_packed_width", targetLayout.packedFullWidth},
+                  {"experts", targetLayout.experts},
+                  {"experts_per_token", targetLayout.expertsPerToken},
+                  {"moe_intermediate_size", targetLayout.expertIntermediateSize},
+                  {"shared_expert_intermediate_size",
+                   targetLayout.expertIntermediateSize}});
+  requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
+                    targetLayout, @"attention", @"gdn", "target layer_types");
 
   const DFlashDraftLayout &draftLayout = descriptor.draft;
   NSDictionary *draft =
@@ -654,10 +709,117 @@ void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> f
     requireEqual(requireUnsigned(object, [NSString stringWithUTF8String:field.name], field.name), field.value, field.name);
 }
 
+// The target's text configuration. Every one holds the sizes the descriptor
+// shares with it. An MLX target's config.json, which is target/config.json
+// too and which its images are planned from, also holds the rest of what the
+// kernels compute; a GGUF's is what the installer derived from the GGUF's
+// metadata, which the GGUF planner checks.
+template <class Layout>
+void validateTextConfig(NSDictionary *text, const Layout &target,
+                        TargetSource source) {
+  requireNumbers(text, "text config",
+                 {{"hidden_size", target.hiddenSize},
+                  {"num_hidden_layers", target.layers},
+                  {"vocab_size", target.vocabularySize},
+                  {"max_position_embeddings", target.maximumContextTokens},
+                  {"num_attention_heads", target.attentionQueryHeads},
+                  {"num_key_value_heads", target.attentionKvHeads},
+                  {"head_dim", target.attentionHeadDimension}});
+  if (source != TargetSource::Mlx) return;
+  requireNumbers(text, "text config",
+                 {{"linear_num_key_heads", target.gdnKeyHeads},
+                  {"linear_num_value_heads", target.gdnValueHeads},
+                  {"linear_key_head_dim", target.gdnHeadDimension},
+                  {"linear_value_head_dim", target.gdnHeadDimension},
+                  {"linear_conv_kernel_dim", kGdnConvolutionTaps},
+                  {"full_attention_interval", target.fullAttentionPeriod},
+                  {"rms_norm_eps", 1e-6}});
+  if constexpr (std::decay_t<Layout>::ffnKind == QwenFfnKind::SparseMoe)
+    requireNumbers(text, "text config",
+                   {{"num_experts", target.experts},
+                    {"num_experts_per_tok", target.expertsPerToken},
+                    {"moe_intermediate_size", target.expertIntermediateSize},
+                    {"shared_expert_intermediate_size",
+                     target.expertIntermediateSize}});
+  else
+    requireNumbers(text, "text config",
+                   {{"intermediate_size", target.intermediateSize}});
+  requireBooleans(text, "text config",
+                  {{"attention_bias", false},
+                   {"attn_output_gate", true},
+                   {"tie_word_embeddings", false}});
+  requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
+               "silu", "text config hidden_act");
+  requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
+                    target, @"full_attention", @"linear_attention",
+                    "text config layer_types");
+  NSDictionary *rope =
+      requireObject(text, @"rope_parameters", "text config rope_parameters");
+  requireNumbers(rope, "text config rope_parameters",
+                 {{"rope_theta", target.rotaryTheta},
+                  {"partial_rotary_factor", 2.0 * target.rotaryPairs /
+                                                target.attentionHeadDimension}});
+  // Transformers also reads the rope type from the older `type` key, which
+  // fine-tunes such as Ornith 1.5 still write.
+  NSString *typeKey = rope[@"rope_type"] ? @"rope_type" : @"type";
+  const std::string typeLabel =
+      std::string("text config rope_parameters ") + typeKey.UTF8String;
+  requireEqual(requireString(rope, typeKey, typeLabel), "default", typeLabel);
+}
+
+// A DFlash2 checkpoint's config: the draft's layout; the block, window,
+// convolutions and selector the draft kernels are built for; and the target's
+// mask token and the layers the draft reads.
+void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
+                         uint32_t maskToken,
+                         std::span<const uint32_t> captureLayers) {
+  NSArray *architectures =
+      requireArray(draft, @"architectures", "draft architectures");
+  if (architectures.count != 1 ||
+      ![architectures[0] isEqual:@"DFlash2DraftModel"])
+    throw std::invalid_argument("draft is not a DFlash2 model");
+  requireNumbers(draft, "draft config",
+                 {{"num_hidden_layers", layout.layers},
+                  {"hidden_size", layout.hiddenSize},
+                  {"vocab_size", layout.vocabularySize},
+                  {"intermediate_size", layout.intermediateSize},
+                  {"num_attention_heads",
+                   layout.attentionSize / layout.attentionHeadDimension},
+                  {"num_key_value_heads", layout.kvHeads},
+                  {"head_dim", layout.attentionHeadDimension},
+                  {"sliding_window", ExecutionLimits::draftContextTokens},
+                  {"rms_norm_eps", 1e-6}});
+  requireBooleans(draft, "draft config",
+                  {{"is_causal", false},
+                   {"attention_bias", false},
+                   {"tie_word_embeddings", false}});
+  requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
+               "silu", "draft config hidden_act");
+  NSDictionary *rope =
+      requireObject(draft, @"rope_parameters", "draft config rope_parameters");
+  requireEqual(requireString(rope, @"rope_type",
+                             "draft config rope_parameters rope_type"),
+               "default", "draft config rope_parameters rope_type");
+  requireNumbers(rope, "draft config rope_parameters",
+                 {{"rope_theta", layout.rotaryTheta}});
+  NSDictionary *flash =
+      requireObject(draft, @"dflash_config", "draft config dflash_config");
+  requireNumbers(flash, "draft config dflash_config",
+                 {{"block_size", ExecutionLimits::draftQueryRows},
+                  {"conv_group_size", kDraftConvolutionGroup},
+                  {"conv_kernel_size", kDraftConvolutionTaps},
+                  {"selector_rank", layout.selectorRank},
+                  {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
+                  {"mask_token_id", maskToken}});
+  requireNumbers(requireArray(flash, @"target_layer_ids",
+                              "draft config target_layer_ids"),
+                 captureLayers, "draft config target_layer_ids");
+}
+
 ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   std::string sourceIdentity;
   NSDictionary *record = readObject(root / "model.json", "resolved model", &sourceIdentity);
-  requireEqual(requireUnsigned(record, @"version", "model record version"), 1, "model record version");
+  requireNumbers(record, "model record", {{"version", 1}});
   NSDictionary *config = readObject(root / "config.json", "upstream model config");
   // The Qwen families nest their text fields under text_config; MiniCPM5
   // ("minicpm") and LFM2 declare theirs flat.
@@ -670,8 +832,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     result = qwen36Descriptor(name);
   } else if (type == "qwen3_5_text") {
     // The dense families share a model type; the layer count names the model.
-    const uint64_t layers =
-        requireUnsigned(text, @"num_hidden_layers", "num_hidden_layers");
+    // validateTextConfig rules it a JSON number; here it only picks a family.
+    const id layersValue = text[@"num_hidden_layers"];
+    requireNumber(layersValue, [layersValue doubleValue],
+                  "text config num_hidden_layers");
+    const uint64_t layers = [layersValue unsignedLongLongValue];
     if (layers == Qwen3_8Layout{}.layers) result = qwen38Descriptor(name);
     else if (layers == Ornith9BLayout{}.layers) result = ornithDescriptor(name);
     else throw std::invalid_argument("unsupported qwen3_5_text layer count: " +
@@ -739,18 +904,21 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         requireEqual(actual ? actual : "", expected,
                      "target layer " + std::to_string(layer));
       }
-    } else {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
-          {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
-          {"head_dim", layout.attentionHeadDimension}});
     }
+    // The Qwen families' text config is checked by validateTextConfig once
+    // the target format is known.
   }, result.target);
   const auto target = requireString(record, @"target_format", "target format");
   if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + target);
-
+  std::visit([&](const auto &layout) {
+    using Layout = std::decay_t<decltype(layout)>;
+    if constexpr (std::is_same_v<Layout, Qwen3_8Layout> ||
+                  std::is_same_v<Layout, Ornith9BLayout> ||
+                  std::is_same_v<Layout, Qwen3_6MoeLayout>)
+      validateTextConfig(text, layout, result.targetSource);
+  }, result.target);
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1)
@@ -778,6 +946,14 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         result.target);
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
+  }
+  // A DFlash2 draft's config is the checkpoint's: one rule checks it before
+  // the dialect parsers below read the fields it names.
+  if (!plainDraft && !dsparkDraft) {
+    std::visit([&](const auto &layout) {
+      validateDraftConfig(draft, result.draft, layout.maskToken,
+                          layout.hiddenCaptureLayers);
+    }, result.target);
   }
   if (plainDraft) {
     // The plain transformer draft: the layout is read from the config.
@@ -1004,7 +1180,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     else throw std::invalid_argument("unsupported vision source format: " + vision);
     NSDictionary *v = requireObject(config, @"vision_config", "vision config");
     const auto &l = result.vision;
-    requireNumbers(v, {{"depth", l.depth}, {"hidden_size", l.hiddenSize}, {"num_heads", l.heads},
+    requireNumbers(v, "vision config", {{"depth", l.depth}, {"hidden_size", l.hiddenSize}, {"num_heads", l.heads},
         {"intermediate_size", l.intermediateSize}, {"out_hidden_size", l.outputHiddenSize},
         {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
         {"temporal_patch_size", 2}, {"in_channels", 3}, {"num_position_embeddings", l.positionGridSide * l.positionGridSide}});
