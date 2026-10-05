@@ -31,22 +31,22 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::BlockMoeWeights;
-using splash::ops::MoE;
-using splash::ops::MoeBuffers;
-using splash::ops::MoeConfig;
-using splash::ops::MoeScratchField;
-using splash::ops::kMoeScratchFields;
-using splash::ops::MoeGgufTile;
-using splash::ops::MoePlan;
-using splash::ops::MoeShape;
-using splash::ops::MoeWeights;
-using splash::ops::QuantizedSegment;
-using splash::ops::WeightLayout;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::BlockMoeWeights;
+using richengine::ops::MoE;
+using richengine::ops::MoeBuffers;
+using richengine::ops::MoeConfig;
+using richengine::ops::MoeScratchField;
+using richengine::ops::kMoeScratchFields;
+using richengine::ops::MoeGgufTile;
+using richengine::ops::MoePlan;
+using richengine::ops::MoeShape;
+using richengine::ops::MoeWeights;
+using richengine::ops::QuantizedSegment;
+using richengine::ops::WeightLayout;
 using namespace gguf_reference;
 
 float bf16(double value) { return float(__bf16(float(value))); }
@@ -98,8 +98,8 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
     const uint64_t parameters = uint64_t{n} * k / 64;
     const uint16_t scale = std::bit_cast<uint16_t>(__bf16(0.01f)), bias = std::bit_cast<uint16_t>(__bf16(-0.05f));
-    return splash::test::expertSlabs(
-        backend, experts, n, k, "affine-experts", [&](uint32_t, const splash::test::AffineQ4Planes &planes) {
+    return richengine::test::expertSlabs(
+        backend, experts, n, k, "affine-experts", [&](uint32_t, const richengine::test::AffineQ4Planes &planes) {
           for (uint64_t i = 0; i < parameters * 32; ++i) planes.weights[i] = uint8_t(local());
           std::fill_n(planes.scales, parameters, scale);
           std::fill_n(planes.biases, parameters, bias);
@@ -117,9 +117,9 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
       w[(uint64_t(e / 64) * 256 + e) * 64 + e % 64] = 1;
       sc[(e / 64) * 256 + e] = __bf16(4.0f);
     }
-    return splash::ops::Q8Projection{{weights, scales, biases}, 256, H};
+    return richengine::ops::Q8Projection{{weights, scales, biases}, 256, H};
   };
-  MoeWeights affine = splash::ops::AffineMoeWeights{
+  MoeWeights affine = richengine::ops::AffineMoeWeights{
       .router = affineRouter(true),
       .expertGate = affineExperts(E, I, H),
       .expertUp = affineExperts(E, I, H),
@@ -162,7 +162,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   MoeBuffers b;
   b.residual = zeros(backend, uint64_t{kRowsMax} * H * 2, "residual");
   b.output = zeros(backend, uint64_t{kRowsMax} * H * 2, "output");
-  const splash::ops::ExecutionPlans plans(backend.capabilities());
+  const richengine::ops::ExecutionPlans plans(backend.capabilities());
   const auto time = [&](const MoeWeights &weights, const MoePlan &plan) {
     allocate(backend, b, plan);
     CommandGraph graph;
@@ -175,7 +175,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
   };
-  const MoeGgufTile device = splash::ops::moeGgufTile(backend.capabilities().appleGpuFamily, ggufShape);
+  const MoeGgufTile device = richengine::ops::moeGgufTile(backend.capabilities().appleGpuFamily, ggufShape);
   const MoeGgufTile other = device == MoeGgufTile::Register ? MoeGgufTile::Staged : MoeGgufTile::Register;
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
@@ -219,7 +219,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     MoE::add(graph, b, *weights, plan);
     std::map<std::string, double> spent;
     for (uint32_t i = 0; i < rounds; ++i)
-      for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
+      for (const auto &[name, seconds] : richengine::benchmark::replayDispatches(backend, graph.dispatches()))
         spent[name] += seconds * 1e3 / rounds;
     printf("  %s:", label);
     for (const auto &[name, ms] : spent) printf(" %s %.3f", name.c_str(), ms);

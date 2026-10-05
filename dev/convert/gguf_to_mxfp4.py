@@ -1,4 +1,4 @@
-"""Convert an F16/BF16 GGUF to an MXFP4-target GGUF Splash can serve.
+"""Convert an F16/BF16 GGUF to an MXFP4-target GGUF RichEngine can serve.
 
 Rewrites every tensor whose slot accepts a quantized format
 (install/gguf.py's loaded_tensors) as GGML type 39 (MXFP4): 17-byte blocks

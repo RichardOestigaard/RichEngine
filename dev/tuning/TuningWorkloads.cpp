@@ -4,7 +4,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 using ops::tuning::LinearTuningInput;
@@ -107,27 +107,29 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
   }, package.target);
 
   std::visit([&](const auto &draft) {
-    if (draft.layers.empty())
-      throw std::invalid_argument("operator probes require draft layers");
-    bothPhases(draft.contextProjection);
-    for (const auto &layer : draft.layers) {
-      bothPhases(layer.qkvProjection);
-      if constexpr (std::is_same_v<std::decay_t<decltype(draft)>,
-                                   DFlashDraftWeights>) {
-        for (const auto *weight : {&layer.attentionDynamic, &layer.mlpDynamic,
-                                   &layer.outputProjection, &layer.downProjection})
-          projection(*weight, LinearPhase::Decode, LinearEpilogue::None);
-      } else {
-        bothPhases(layer.outputProjection, LinearEpilogue::Residual);
-        bothPhases(layer.downProjection, LinearEpilogue::Residual);
+    if constexpr (!std::is_same_v<std::decay_t<decltype(draft)>, NullDraftWeights>) {
+      if (draft.layers.empty())
+        throw std::invalid_argument("operator probes require draft layers");
+      bothPhases(draft.contextProjection);
+      for (const auto &layer : draft.layers) {
+        bothPhases(layer.qkvProjection);
+        if constexpr (std::is_same_v<std::decay_t<decltype(draft)>,
+                                     DFlashDraftWeights>) {
+          for (const auto *weight : {&layer.attentionDynamic, &layer.mlpDynamic,
+                                     &layer.outputProjection, &layer.downProjection})
+            projection(*weight, LinearPhase::Decode, LinearEpilogue::None);
+        } else {
+          bothPhases(layer.outputProjection, LinearEpilogue::Residual);
+          bothPhases(layer.downProjection, LinearEpilogue::Residual);
+        }
+        projection(layer.upProjection, LinearPhase::Decode,
+                   LinearEpilogue::GateUp, &layer.gateProjection);
       }
-      projection(layer.upProjection, LinearPhase::Decode,
-                 LinearEpilogue::GateUp, &layer.gateProjection);
+      if constexpr (std::is_same_v<std::decay_t<decltype(draft)>,
+                                   DFlashDraftWeights>)
+        projection(draft.selectorProjection, LinearPhase::Decode,
+                   LinearEpilogue::None);
     }
-    if constexpr (std::is_same_v<std::decay_t<decltype(draft)>,
-                                 DFlashDraftWeights>)
-      projection(draft.selectorProjection, LinearPhase::Decode,
-                 LinearEpilogue::None);
   }, package.draft);
 
   std::vector<LinearTuningInput> result;
@@ -139,4 +141,4 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
   return result;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

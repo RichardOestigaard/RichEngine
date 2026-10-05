@@ -160,12 +160,18 @@ LFM2_PATTERNS = (
     r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+",
 )
-# Each tokenizer.ggml.pre profile Splash can rebuild: its Split patterns in
+# Each tokenizer.ggml.pre profile RichEngine can rebuild: its Split patterns in
 # application order and whether the input is NFC-normalized first.
+# The granite-docling profile is the original GPT-2 pattern, unchanged.
+GRANITE_DOCLING_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+"
+    r"| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
+)
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "minicpm5": (MINICPM5_PATTERNS, False),
     "lfm2": (LFM2_PATTERNS, False),
+    "granite-docling": ((GRANITE_DOCLING_PATTERN,), False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -307,12 +313,13 @@ def tokenizer_files(metadata):
     }
 
 
-# The GGUF text architectures Splash serves, and the model type of each one's
+# The GGUF text architectures RichEngine serves, and the model type of each one's
 # text configuration.
 TEXT_MODEL_TYPES = {
     "qwen35": "qwen3_5_text",
     "qwen35moe": "qwen3_5_moe_text",
     "llama": "llama",
+    "granite": "granite",
     "lfm2": "lfm2",
     "lfm2moe": "lfm2_moe",
 }
@@ -349,9 +356,9 @@ def model_config(metadata, vision=None):
                 )
             # Every attention layer shares one KV head count.
             value = max(value)
-        elif value is None and name == "head_dim" and arch in ("lfm2", "lfm2moe"):
-            # lfm2 states no key_length; its head width divides the hidden
-            # size evenly across the attention heads.
+        elif value is None and name == "head_dim" and arch in ("lfm2", "lfm2moe", "granite"):
+            # lfm2 and granite state no key_length; their head width divides
+            # the hidden size evenly across the attention heads.
             continue
         if type(value) is not int or value <= 0:
             raise ModelError(
@@ -369,10 +376,34 @@ def model_config(metadata, vision=None):
         model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
-    if arch in ("llama", "lfm2", "lfm2moe"):
+    if arch in ("llama", "lfm2", "lfm2moe", "granite"):
         text["intermediate_size"] = metadata.positive(
             arch + ".feed_forward_length"
         )
+    if arch == "granite":
+        # The runtime's config check reads rope_theta and the fixed softmax
+        # multiplier.
+        theta = metadata.values.get(arch + ".rope.freq_base")
+        if type(theta) is not float or theta <= 0:
+            raise ModelError("missing or invalid GGUF metadata: " + arch + ".rope.freq_base")
+        text["rope_theta"] = theta
+        scale = metadata.values.get(arch + ".attention.scale")
+        if type(scale) is not float or scale <= 0:
+            raise ModelError("missing or invalid GGUF metadata: " + arch + ".attention.scale")
+        text["attention_multiplier"] = scale
+        # Only the attention multiplier reaches the kernels. A granite that
+        # also scales embeddings, residuals or logits (the 3.x series) would
+        # generate silently wrong output, so refuse it here.
+        for other in ("embedding_scale", "residual_scale", "logit_scale"):
+            value = metadata.values.get(arch + "." + other)
+            if value is not None and (type(value) is not float or value != 1.0):
+                raise ModelError(
+                    "unsupported GGUF metadata: "
+                    + arch
+                    + "."
+                    + other
+                    + " must be 1.0"
+                )
     if arch == "lfm2moe":
         text["num_experts"] = metadata.positive(arch + ".expert_count")
         text["num_experts_per_tok"] = metadata.positive(
@@ -629,7 +660,7 @@ def loaded_tensors(metadata):
     names its conv (0) and attention layers."""
     arch = text_architecture(metadata)
     layers = loaded_layers(metadata, arch)
-    if arch == "llama":
+    if arch in ("llama", "granite"):
         tensors = dict(MODEL_TENSORS)
         for layer in range(layers):
             for name, types in (
@@ -712,7 +743,7 @@ def require_rotation(metadata):
         )
     ):
         raise ModelError(
-            "this GGUF's input rotation is not one Splash runs; choose another variant"
+            "this GGUF's input rotation is not one RichEngine runs; choose another variant"
         )
 
 
@@ -742,5 +773,5 @@ def require_loadable(metadata):
             for (tensor, found), count in sorted(unsupported.items())
         )
         raise ModelError(
-            f"this GGUF stores tensors Splash cannot load: {listed}; choose another variant"
+            f"this GGUF stores tensors RichEngine cannot load: {listed}; choose another variant"
         )

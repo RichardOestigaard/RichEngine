@@ -29,18 +29,18 @@
 
 namespace {
 
-using splash::metal::AllocationFailure;
-using splash::metal::BackendInstrumentation;
-using splash::metal::MetalAllocationError;
-using splash::metal::BufferBinding;
-using splash::metal::BufferStorage;
-using splash::metal::BytesBinding;
-using splash::metal::ComputeDispatch;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBackendError;
-using splash::test::ScopedTestConfig;
-using splash::test::sharedBuffer;
-using splash::metal::MetalBuffer;
+using richengine::metal::AllocationFailure;
+using richengine::metal::BackendInstrumentation;
+using richengine::metal::MetalAllocationError;
+using richengine::metal::BufferBinding;
+using richengine::metal::BufferStorage;
+using richengine::metal::BytesBinding;
+using richengine::metal::ComputeDispatch;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBackendError;
+using richengine::test::ScopedTestConfig;
+using richengine::test::sharedBuffer;
+using richengine::metal::MetalBuffer;
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -54,7 +54,7 @@ void require(bool condition, const std::string &message) {
 struct TemporaryMetallib final {
     TemporaryMetallib()
         : path((std::filesystem::temp_directory_path() /
-                "splash-metal-backend.XXXXXX").string()) {
+                "richengine-metal-backend.XXXXXX").string()) {
         const int descriptor = ::mkstemp(path.data());
         if (descriptor < 0)
             throw std::runtime_error("could not create temporary metallib");
@@ -278,7 +278,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
         buffer = {};
         require(backend.memoryStats().allocatedBytes == 0,
                 "terminal ticket retained allocations until the callback returned");
-        splash::metal::CommandTicket next;
+        richengine::metal::CommandTicket next;
         if (!failed) {
             buffer = sharedBuffer(backend, sizeof(uint32_t));
             *static_cast<uint32_t *>(buffer.contents()) = 0;
@@ -349,7 +349,7 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     id<MTLCommandQueue> queue = [device newCommandQueue];
     id<MTLCommandBuffer> command = [queue commandBuffer];
     commandWatchdogGate = [device newSharedEvent];
-    splash::metal::CommandTicket ticket;
+    richengine::metal::CommandTicket ticket;
     {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
@@ -443,7 +443,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
     id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
     commandWatchdogGate = [device newSharedEvent];
     std::atomic<bool> completed{false};
-    splash::metal::CommandTicket ticket;
+    richengine::metal::CommandTicket ticket;
     {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
@@ -454,7 +454,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
     requireBackendError([&] { backend.checkHealth(); },
                         "the watchdog did not give up on a pending command");
     auto destroyed = std::async(std::launch::async, [&ticket] {
-        splash::metal::CommandTicket dropped = std::move(ticket);
+        richengine::metal::CommandTicket dropped = std::move(ticket);
     });
     require(destroyed.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
             "destroying an abandoned ticket waited for its command");
@@ -555,7 +555,7 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
     commandWatchdogGate = [device newSharedEvent];
-    splash::metal::CommandTicket ticket;
+    richengine::metal::CommandTicket ticket;
     {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
@@ -563,7 +563,7 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
         ticket = backend.submitAsync(dispatch);
     }
     auto destroyed = std::async(std::launch::async, [&ticket] {
-        splash::metal::CommandTicket dropped = std::move(ticket);
+        richengine::metal::CommandTicket dropped = std::move(ticket);
     });
     // Longer than a wait slice, after which a wait for wait() would give up.
     const bool waited = destroyed.wait_for(std::chrono::milliseconds(1500)) ==
@@ -601,7 +601,7 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return true;
     });
-    splash::metal::CommandTicket ticket;
+    richengine::metal::CommandTicket ticket;
     {
         MethodReplacement commit(command, @selector(commit),
                                  reinterpret_cast<IMP>(commitBehindWatchdogGate));
@@ -1196,7 +1196,7 @@ void run(const std::string &metallibPath) {
             "threadgroup memory capability is insufficient");
     require(capabilities.maxThreadgroupWidth >= 256,
             "threadgroup thread capability is insufficient");
-    const auto probed = splash::metal::probeDeviceCapabilities();
+    const auto probed = richengine::metal::probeDeviceCapabilities();
     require(probed.deviceName == capabilities.deviceName &&
                 probed.appleGpuFamily == capabilities.appleGpuFamily &&
                 probed.macosVersion() == capabilities.macosVersion() &&
@@ -1274,7 +1274,7 @@ void run(const std::string &metallibPath) {
         backend.setOperationGuard({});
 
         for (int runIndex = 0; runIndex < 2; ++runIndex) {
-            splash::metal::CommandTiming timing;
+            richengine::metal::CommandTiming timing;
             if (!runIndex) {
                 timing = backend.submit(dispatch);
             } else {
@@ -1282,9 +1282,13 @@ void run(const std::string &metallibPath) {
                 auto notified = completion.get_future();
                 auto ticket = backend.submitCommandAsync(
                     {&dispatch, 1}, [&] { completion.set_value(); });
+                // The submit-ahead ring admits a second in-flight command;
+                // a third is still refused.
+                auto second = backend.submitCommandAsync({&dispatch, 1}, [] {});
                 requireBackendError(
-                    [&] { (void)backend.submit(dispatch); },
-                    "a second in-flight command was accepted");
+                    [&] { (void)backend.submitCommandAsync({&dispatch, 1}, [] {}); },
+                    "a third in-flight command was accepted");
+                (void)second.wait();
                 timing = ticket.wait();
                 require(ticket.ready(),
                         "completed async ticket is not ready");
@@ -1305,7 +1309,7 @@ void run(const std::string &metallibPath) {
         }
     }
 
-    require(BackendInstrumentation::submittedCommands(backend) == 2,
+    require(BackendInstrumentation::submittedCommands(backend) == 3,
             "successful submissions were not counted");
     require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "pipeline cache did not reuse the pipeline");
@@ -1313,7 +1317,7 @@ void run(const std::string &metallibPath) {
         require(values[i] == i, "dispatch wrote before the buffer view");
     }
     for (uint32_t i = kViewElementCount; i < kElementCount; ++i) {
-        require(values[i] == i + 2 * kIncrement,
+        require(values[i] == i + 3 * kIncrement,
                 "dispatch produced an incorrect result");
     }
 
@@ -1330,10 +1334,10 @@ void run(const std::string &metallibPath) {
         std::vector<ComputeDispatch> command{first, first};
         (void)backend.submitCommand(command);
     }
-    require(BackendInstrumentation::submittedCommands(backend) == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 4,
             "explicit operation list did not use one command buffer");
     for (uint32_t i = kViewElementCount; i < kElementCount; ++i) {
-        require(values[i] == i + 4 * kIncrement,
+        require(values[i] == i + 5 * kIncrement,
                 "multi-dispatch command produced an incorrect result");
     }
 
@@ -1364,7 +1368,7 @@ void run(const std::string &metallibPath) {
             "a descriptor error incorrectly poisoned the backend");
     require(backend.unhealthyReason().empty(),
             "healthy backend has an unhealthy reason");
-    require(BackendInstrumentation::submittedCommands(backend) == 3,
+    require(BackendInstrumentation::submittedCommands(backend) == 4,
             "failed pre-commit dispatch was counted as submitted");
     require(BackendInstrumentation::cachedPipelines(backend) == 1,
             "failed pipeline lookup polluted the cache");
@@ -1415,7 +1419,7 @@ void run(const std::string &metallibPath) {
             wordsA[i] = 1000 + i;
             wordsB[i] = 2000 + i;
         }
-        splash::metal::CommandGraph graph;
+        richengine::metal::CommandGraph graph;
         // Outside the span, feeding its first dispatch: the replay must
         // still order after this write.
         graph.add("test_copy_u32", {sourceA, copied}, kElementCount,
@@ -1437,7 +1441,7 @@ void run(const std::string &metallibPath) {
         }
         // Same span shape and position, a different bound buffer: the
         // snapshot mismatches and the span re-bakes rather than replaying.
-        splash::metal::CommandGraph drifted;
+        richengine::metal::CommandGraph drifted;
         drifted.add("test_copy_u32", {sourceB, copied}, kElementCount,
                     {1, 1, 1}, {kElementCount, 1, 1});
         drifted.beginBakedSpan();
@@ -1469,7 +1473,7 @@ void run(const std::string &metallibPath) {
             uint32_t count;
         };
         const auto fillGraph = [&](uint32_t value, bool patchable) {
-            splash::metal::CommandGraph graph;
+            richengine::metal::CommandGraph graph;
             graph.beginBakedSpan();
             if (patchable) {
                 graph.addPatchable("test_fill_u32", {filled},
@@ -1513,12 +1517,12 @@ void run(const std::string &metallibPath) {
     {
         // Encode-cost probe: a decode-step-shaped command of 40 baked spans
         // among 320 dispatches, timed over the submit calls alone. Run the
-        // test with and without SPLASH_ICB_OFF for the replay delta.
+        // test with and without RICHENGINE_ICB_OFF for the replay delta.
         MetalBuffer words = backend.allocateBuffer(
             kAllocationBytes, BufferStorage::Shared, "baked-timing");
         MetalBuffer wordsOut = backend.allocateBuffer(
             kAllocationBytes, BufferStorage::Shared, "baked-timing-out");
-        splash::metal::CommandGraph graph;
+        richengine::metal::CommandGraph graph;
         for (uint32_t span = 0; span < 40; ++span) {
             graph.beginBakedSpan();
             for (uint32_t dispatch = 0; dispatch < 7; ++dispatch)

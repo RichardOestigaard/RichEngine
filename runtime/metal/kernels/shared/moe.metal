@@ -335,7 +335,7 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     for (uint partial = 0; partial < Simdgroups; ++partial)
       total += scalar_partials[partial];
     selected[row_routes + params.top_k] = params.experts;
-    routing_weights[row_routes + params.top_k] = splash_sigmoid(total);
+    routing_weights[row_routes + params.top_k] = richengine_sigmoid(total);
   }
   if (simd_group != 0)
     return;
@@ -565,7 +565,7 @@ kernel void moe_route_select_sigmoid(
   threadgroup float ordered[256];
   const bool live = thread_index < params.experts;
   const float prob =
-      live ? splash_sigmoid(scores[ulong(row) * StorageN + thread_index])
+      live ? richengine_sigmoid(scores[ulong(row) * StorageN + thread_index])
            : 0.0f;
   row_probs[thread_index] = prob;
   row_keys[thread_index] =
@@ -686,7 +686,7 @@ kernel void moe_route_group_sigmoid(
       const uint expert = simd_lane + 32 * slot;
       const bool live = expert < params.route.experts;
       const float prob =
-          live ? splash_sigmoid(scores[ulong(row) * StorageN + expert])
+          live ? richengine_sigmoid(scores[ulong(row) * StorageN + expert])
                : 0.0f;
       lane_probs[slot] = prob;
       lane_keys[slot] = live ? prob + expert_bias[expert]

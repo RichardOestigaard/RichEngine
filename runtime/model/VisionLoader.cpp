@@ -8,7 +8,7 @@
 #include <cmath>
 #include <set>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 using vision::Plan;
@@ -204,4 +204,4 @@ void requireVisionLayout(const ops::VisionLayout &layout) {
     throw WeightStoreError("Qwen vision layout is inconsistent");
 }
 
-} // namespace splash::model
+} // namespace richengine::model

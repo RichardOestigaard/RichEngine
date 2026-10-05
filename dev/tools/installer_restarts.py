@@ -106,7 +106,7 @@ def check(arguments, run=run_installer, hub_cache=None):
         # A local draft directory is no Hub repository.
         repositories = [s["repo"] for s in sources.values() if s["revision"]]
         started = (
-            f"Splash model {selection.model} is already installed in {selection.link}"
+            f"RichEngine model {selection.model} is already installed in {selection.link}"
         )
         # A commit revision starts without asking the Hub.
         fallback = (

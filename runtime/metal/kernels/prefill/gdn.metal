@@ -5,7 +5,7 @@
 
 constant constexpr uint GdnScanBlock = 16;
 
-// One threadgroup carries SPLASH_GDN_SCAN_STATE_ROWS rows of a value head's
+// One threadgroup carries RICHENGINE_GDN_SCAN_STATE_ROWS rows of a value head's
 // 128 x 128 fp32 recurrent state through the whole chunk, token by token:
 // S = d S; m = S k; S += k (v - m) beta; o = S q. A lane owns sixteen key
 // columns of one row, so eight lanes share a row and each key-dimension dot
@@ -26,8 +26,8 @@ inline void gdn_scan_prefill_phase(
     uint simd_group) {
   constexpr uint Columns = 16;
   constexpr uint LanesPerRow = HeadDim / Columns;
-  constexpr uint Rows = SPLASH_GDN_SCAN_STATE_ROWS;
-  constexpr uint Threads = SPLASH_GDN_SCAN_THREADS;
+  constexpr uint Rows = RICHENGINE_GDN_SCAN_STATE_ROWS;
+  constexpr uint Threads = RICHENGINE_GDN_SCAN_THREADS;
   constexpr uint Block = GdnScanBlock;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint GroupsPerHead = HeadDim / Rows;
@@ -175,7 +175,7 @@ inline void gdn_scan_prefill_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
     threadgroup float keys[GdnScanBlock * HeadDim];                           \
     threadgroup float queries[GdnScanBlock * HeadDim];                        \
-    threadgroup float values[GdnScanBlock * SPLASH_GDN_SCAN_STATE_ROWS];    \
+    threadgroup float values[GdnScanBlock * RICHENGINE_GDN_SCAN_STATE_ROWS];    \
     threadgroup float gates[2 * GdnScanBlock];                                \
     gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim>(                    \
         q, k, v, decay, beta, state_in, state_out, output, params.tokens,     \

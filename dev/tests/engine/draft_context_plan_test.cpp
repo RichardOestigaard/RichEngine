@@ -11,12 +11,12 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 using benchmark::draftContextRows;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
   return planDraftContext(replayBegin, replayEnd, {});

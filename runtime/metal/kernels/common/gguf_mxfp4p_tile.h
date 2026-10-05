@@ -89,7 +89,7 @@ inline void gguf_decode_mxfp4p_tile(device half *packed, device uchar *exponents
 // rows, padding rows included, exactly as the staged tile does; the pack
 // dispatch covers the chunk's rows rounded up to Rows.
 //
-// Kept for benchmarks (SPLASH_GGUF_PACKED_ON, ops/Linear.cpp's
+// Kept for benchmarks (RICHENGINE_GGUF_PACKED_ON, ops/Linear.cpp's
 // packedPrefillEnabled): unlike the memory-bound decode this tile loses to
 // the staged prefill tile — the compute-bound GEMM pays the fp4 matmul's
 // halved rate without winning back the stage dequantization (mxfp4

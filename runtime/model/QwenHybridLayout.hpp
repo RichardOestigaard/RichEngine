@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
@@ -89,4 +89,4 @@ template <size_t CaptureLayers> struct QwenHybridLayout {
   bool operator==(const QwenHybridLayout &) const = default;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

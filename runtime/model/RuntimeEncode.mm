@@ -1,6 +1,6 @@
 #include "model/RuntimeImpl.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
   void Runtime::Impl::addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
                      uint32_t targetRows, MetalBuffer draftPositions,
@@ -189,6 +189,48 @@ namespace splash::model {
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
+    // The fused greedy head runs when every lane is greedy, unconstrained
+    // and unpenalized on a chain batch — the vocabulary projection then
+    // argmaxes in-kernel and the logits buffer is never written.
+    const ops::Projection &headShape = targetModel.vocabularyProjection();
+    // The affine fused head takes a 128-column tile, the single-segment GGUF
+    // one (gguf_decode_*_m*_amax) a 64-column tile; both need whole tiles and
+    // 64-input spans.
+    const bool ggufHead =
+        headShape.layout() == ops::WeightLayout::Block32 &&
+        headShape.blocks().segments.size() == 1 &&
+        !headShape.blocks().segments.front().isFloat() &&
+        headShape.outputSize % 64 == 0 &&
+        headShape.inputSize % 64 == 0;
+    static const bool headFusedOff = envFlag("RICHENGINE_HEAD_FUSED_OFF");
+    buffers.fusedHead = !headFusedOff &&
+        !tree && uint64_t{lanes} * ExecutionLimits::targetVerifyRows <= 32 &&
+        ((headShape.layout() == ops::WeightLayout::Affine64 &&
+          headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0) ||
+         ggufHead);
+    buffers.headArgs.output_size = geometry.target.vocabularySize;
+    buffers.headArgs.input_size = geometry.target.hiddenSize;
+    buffers.headArgs.rows = ExecutionLimits::targetVerifyRows;
+    buffers.headArgs.stop_token_0 = geometry.target.stopTokens[0];
+    buffers.headArgs.stop_token_1 = geometry.target.stopTokens[1];
+    for (uint32_t lane = 0; lane < lanes && buffers.fusedHead; ++lane) {
+      const ops::SamplingPolicy policy = samplingPolicy(*entries[lane]);
+      if (policy.samples() || policy.constrained || policy.penalties.active()) {
+        buffers.fusedHead = false;
+        break;
+      }
+      if (policy.excludesStopTokens)
+        buffers.headArgs.exclude_stop_mask |= uint32_t{1} << lane;
+      buffers.headArgs.live_rows[lane] =
+          lane < liveRows.size()
+              ? std::clamp(liveRows[lane], uint32_t{1},
+                           ExecutionLimits::targetVerifyRows)
+              : ExecutionLimits::targetVerifyRows;
+    }
+    if (buffers.fusedHead) {
+      buffers.headArgmaxValues = d(DecodeTensor::HeadArgmaxValues);
+      buffers.headArgmaxIndices = d(DecodeTensor::HeadArgmaxIndices);
+    }
     buffers.denseGateScratch = decodeArena->gateScratch();
     buffers.gdnPacked = gdnPacked;
     buffers.gdnMixed = gdnMixed;
@@ -214,8 +256,9 @@ namespace splash::model {
                      items[lane].logicalPosition,
                      static_cast<uint32_t>(items[lane].pageTable.size()));
     bindPageTables(entries, buffers.pageTables);
-    bindGdnStates(entries, buffers.currentGdnStates,
-                  buffers.nextGdnStates);
+    if (gdnLayers)
+      bindGdnStates(entries, buffers.currentGdnStates,
+                    buffers.nextGdnStates);
     for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
       gdnPacked[layer] = decodeArena->gdnBatchSlice(
           DecodeTensor::VerifyPackedBase, layer, storage);
@@ -239,7 +282,7 @@ namespace splash::model {
 
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
   // lanes' strides, while the row-indexed logits and the argmax output take
-  // the tree's SPLASH_TREE_VERIFY_NODES stride.
+  // the tree's RICHENGINE_TREE_VERIFY_NODES stride.
   ops::SamplingBuffers Runtime::Impl::samplingTreeBuffers(uint32_t lanes) const {
     ops::SamplingBuffers buffers = samplingBuffers(lanes);
     buffers.logits =
@@ -273,11 +316,41 @@ namespace splash::model {
                              geometry.target.stopTokens[1]);
       return;
     }
+    const ops::Projection &headShape = targetModel.vocabularyProjection();
+    static const bool headFusedOff = envFlag("RICHENGINE_HEAD_FUSED_OFF");
+    const bool ggufHead =
+        !headFusedOff &&
+        headShape.layout() == ops::WeightLayout::Block32 &&
+        headShape.blocks().segments.size() == 1 &&
+        !headShape.blocks().segments.front().isFloat() &&
+        headShape.outputSize % 64 == 0 &&
+        headShape.inputSize % 64 == 0;
+    uint32_t fusedHead = headFusedOff ? 0 :
+        headShape.layout() == ops::WeightLayout::Affine64 &&
+                headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0
+            ? 1
+            : ggufHead ? 2 : 0;
+    for (uint32_t lane = 0; lane < lanes && fusedHead; ++lane) {
+      if (policies[lane].samples() || policies[lane].constrained ||
+          policies[lane].penalties.active()) {
+        fusedHead = false;
+        break;
+      }
+    }
+    auto vBuffers = samplingBuffers(lanes);
+    if (fusedHead) {
+      vBuffers.headArgmaxValues =
+          decodeArena->packed(DecodeTensor::HeadArgmaxValues,
+                              targetModel.decodeStorageLanes(lanes));
+      vBuffers.headArgmaxIndices =
+          decodeArena->packed(DecodeTensor::HeadArgmaxIndices,
+                              targetModel.decodeStorageLanes(lanes));
+    }
     sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), geometry.target.stopTokens[0],
+                       vBuffers, geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
                        {penaltyTable, std::span(stateLanes).first(lanes)},
-                       liveRows);
+                       liveRows, fusedHead);
   }
 
   void Runtime::Impl::encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -398,7 +471,7 @@ namespace splash::model {
                                   uint32_t lanes) {
     if (!lanes || lanes > kLaneCount / 2)
       throw std::invalid_argument("invalid verify-tree input batch width");
-    uint32_t base[SPLASH_MAXIMUM_BATCH_WIDTH][3]{};
+    uint32_t base[RICHENGINE_MAXIMUM_BATCH_WIDTH][3]{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const std::array<uint32_t, 3> rotary =
           ropePosition(*entries[lane], items[lane].logicalPosition);
@@ -467,4 +540,4 @@ namespace splash::model {
     targetModel.addStateCommit(graph, std::move(buffers), width);
   }
 
-} // namespace splash::model
+} // namespace richengine::model

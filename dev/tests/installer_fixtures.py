@@ -22,7 +22,7 @@ MOE = families.named("Qwen3.6-35B-A3B")
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # The commit the main branch of every family's draft repository names.
 DRAFT_COMMIT = "d" * 40
-# The image preprocessing Splash implements (server/images.py).
+# The image preprocessing RichEngine implements (server/images.py).
 PROCESSOR = {
     "patch_size": 16,
     "temporal_patch_size": 2,
@@ -181,6 +181,8 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
+        if family.draft is None:
+            continue
         fake.publish(family.draft.repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
     return fake
 
@@ -192,4 +194,4 @@ def cached_snapshot(cache, repo_id, commit, build):
 
 
 def pins(cache):
-    return sorted(ref.name for ref in cache.glob("*/refs/splash/*/*"))
+    return sorted(ref.name for ref in cache.glob("*/refs/richengine/*/*"))

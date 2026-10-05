@@ -191,7 +191,7 @@ void checkRotary(const std::filesystem::path &directory) {
   const model::gguf::TargetGeometry &g = target.geometry;
   const auto path = directory / "rotary.gguf";
   const auto planned = [&](const std::vector<test_gguf::Key> &keys) {
-    splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
+    richengine::test::writeFile(path, test_gguf::file(keys, target.tensors));
     return plan(path, g);
   };
   const std::string scaling = g.architecture() + std::string(".rope.scaling.type");
@@ -268,7 +268,7 @@ void checkRotation(const std::filesystem::path &directory) {
     keys.push_back(test_gguf::int32ArrayKey(key("sign_values"), std::vector<int32_t>(GGUF_ROTATION_BLOCK, 1)));
     keys.push_back(test_gguf::stringArrayKey(key("weight_names"), weights));
     keys.push_back(test_gguf::stringArrayKey(key("inverse_weight_names"), {"token_embd.weight"}));
-    splash::test::writeFile(path, test_gguf::file(keys, tensors));
+    richengine::test::writeFile(path, test_gguf::file(keys, tensors));
     return plan(path, g);
   };
   const Plan floats = planned(model::ggml::kF32, false);
@@ -286,7 +286,7 @@ void checkRotation(const std::filesystem::path &directory) {
 
 int main() {
   @autoreleasepool {
-    const splash::test::TemporaryDirectory directory("splash-gguf-planner");
+    const richengine::test::TemporaryDirectory directory("richengine-gguf-planner");
     guarded("planner on the dense target", [&] { checkDense(directory.path()); });
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
     guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });

@@ -18,8 +18,8 @@ struct DraftConvBatchParams {
 static_assert(sizeof(DraftConvBatchParams) == 4,
               "Draft convolution parameters are 4 bytes on both sides");
 
-// The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
-// rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.
+// The attention core's split count (RICHENGINE_DRAFT_ATTENTION_SPLITS) and its
+// rings' slots per KV head (RICHENGINE_DRAFT_SLIDING_WINDOW) are compiled in.
 // value_stride, the values ring's stride between head dimensions, is the
 // window too (the op passes nothing else) but stays a run-time value: with it
 // compiled into the value tiles, the split kernel returns wrong rows at random
@@ -33,7 +33,7 @@ struct DraftAttentionBatchParams {
   // Nonzero masks the eight current rows causally (a plain DFlash draft's
   // sliding layers); zero keeps the DFlash2 block-bidirectional pattern.
   uint32_t causal;
-  uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t cache_length[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(DraftAttentionBatchParams) == 28,
@@ -48,7 +48,7 @@ static_assert(sizeof(DraftContextParams) == 8,
               "Draft context prefill parameters are 8 bytes on both sides");
 
 struct DraftContextBatchParams {
-  uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t start_position[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(DraftContextBatchParams) == 16,

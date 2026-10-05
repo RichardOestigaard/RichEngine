@@ -92,7 +92,7 @@ class WeightBytesTests(unittest.TestCase):
             output = Path(directory).resolve() / "release/model"
             environment = weights.baseline_environment(output)
             cache = output / "baseline-weights"
-            self.assertEqual(environment, {"SPLASH_WEIGHT_CACHE": str(cache)})
+            self.assertEqual(environment, {"RICHENGINE_WEIGHT_CACHE": str(cache)})
             self.assertTrue(cache.is_dir())
             self.assertEqual(weights.prepared(environment, PACKAGE), {})
 
@@ -135,7 +135,7 @@ class WeightBytesTests(unittest.TestCase):
             (baseline / weights.IDENTITY_HEADER).parent.mkdir(parents=True)
             (baseline / weights.IDENTITY_HEADER).write_text("")
             entry(
-                Path(environment["SPLASH_WEIGHT_CACHE"]),
+                Path(environment["RICHENGINE_WEIGHT_CACHE"]),
                 "1" * 64,
                 B,
                 provenance("target/layer-0.bin"),

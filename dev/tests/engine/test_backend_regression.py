@@ -258,7 +258,7 @@ class BackendRegressionTests(unittest.TestCase):
         that digest; without, it has none, as a build of an earlier release."""
         checkout = root / name
         (checkout / "build/engine-tests").mkdir(parents=True)
-        (checkout / "build/splash.metallib").write_text("")
+        (checkout / "build/richengine.metallib").write_text("")
         if digest:
             tool = checkout / "build" / weights.WEIGHT_DIGESTS
             image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
@@ -278,7 +278,7 @@ class BackendRegressionTests(unittest.TestCase):
             "    raise SystemExit(2)\n"
             "scenarios = sys.argv[sys.argv.index('--scenario') + 1].split(',')\n"
             f"with open({str(root / 'calls.jsonl')!r}, 'a') as log:\n"
-            f"    log.write(json.dumps([{name!r}, scenarios, os.environ.get('SPLASH_WEIGHT_CACHE')]) + '\\n')\n"
+            f"    log.write(json.dumps([{name!r}, scenarios, os.environ.get('RICHENGINE_WEIGHT_CACHE')]) + '\\n')\n"
             f"document = json.loads({json.dumps(json.dumps(benchmark_document(build=name)))})\n"
             "if 'decode' not in scenarios: document['decode_throughput']['samples'] = []\n"
             "if 'partial' not in scenarios: document['measurements'] = []\n"
@@ -291,7 +291,7 @@ class BackendRegressionTests(unittest.TestCase):
     def run_main(root: Path) -> int:
         """main on the fake checkouts under root and a legacy package."""
         models = root / "models"
-        package = models / "incoai/Qwen3.8-27B-Splash"
+        package = models / "incoai/Qwen3.8-27B-RichEngine"
         package.mkdir(parents=True)
         (package / "manifest.json").write_text("{}")
         arguments = [
@@ -306,7 +306,7 @@ class BackendRegressionTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
-            mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "cache")}),
+            mock.patch.dict(os.environ, {"RICHENGINE_WEIGHT_CACHE": str(root / "cache")}),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):

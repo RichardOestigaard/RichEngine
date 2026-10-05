@@ -16,12 +16,12 @@
 #include <type_traits>
 #include <utility>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 // Host aliases for the layouts shared with Metal; containers require these traits.
-using ChunkedPrefillParams = ::SplashChunkedPrefillParams;
-using VerifyAttentionParams = ::SplashVerifyAttentionParams;
-using PrefillAttentionParams = ::SplashPrefillAttentionParams;
+using ChunkedPrefillParams = ::RichChunkedPrefillParams;
+using VerifyAttentionParams = ::RichVerifyAttentionParams;
+using PrefillAttentionParams = ::RichPrefillAttentionParams;
 
 static_assert(std::is_standard_layout_v<ChunkedPrefillParams>);
 static_assert(std::is_trivially_copyable_v<ChunkedPrefillParams>);
@@ -30,12 +30,12 @@ static_assert(std::is_trivially_copyable_v<VerifyAttentionParams>);
 static_assert(std::is_standard_layout_v<PrefillAttentionParams>);
 static_assert(std::is_trivially_copyable_v<PrefillAttentionParams>);
 
-inline constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kVerifyRows = RICHENGINE_TARGET_VERIFY_ROWS;
 inline constexpr uint32_t kVerifyMaximumSplits =
-    SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
+    RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS;
 // Rows per KV head (and per query group) of one lane's verify chunk
 // staging: one KV block, which holds the lane's verify rows.
-inline constexpr uint32_t kVerifyChunkStride = SPLASH_VERIFY_CHUNK_STRIDE;
+inline constexpr uint32_t kVerifyChunkStride = RICHENGINE_VERIFY_CHUNK_STRIDE;
 static_assert(kVerifyChunkStride >= kVerifyRows &&
               kVerifyChunkStride % kPageTokens == 0);
 // Verify attention runs one split per kVerifyPagesPerSplit visible Page32
@@ -50,7 +50,7 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // and never more than the maximum the partial workspace is sized for. It
 // depends only on the lane's own history, so batching never changes a
 // lane's arithmetic. `rows` is the lane's live row count: kVerifyRows for
-// a chain, SPLASH_TREE_VERIFY_NODES - 1 for a tree lane.
+// a chain, RICHENGINE_TREE_VERIFY_NODES - 1 for a tree lane.
 [[nodiscard]] constexpr uint32_t
 verifyAttentionSplits(uint32_t committedTokens,
                       uint32_t rows = kVerifyRows) noexcept {
@@ -63,9 +63,9 @@ verifyAttentionSplits(uint32_t committedTokens,
 }
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows =
-    SPLASH_PREFILL_TOKEN_BUDGET;
+    RICHENGINE_PREFILL_TOKEN_BUDGET;
 inline constexpr uint32_t kPrefillAttentionTileRows =
-    SPLASH_PREFILL_ATTENTION_TILE_ROWS;
+    RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
 
 [[nodiscard]] constexpr uint32_t
 prefillAttentionTiles(uint32_t rows) noexcept {
@@ -94,9 +94,9 @@ chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
   return {};
 }
 
-} // namespace splash::kv
+} // namespace richengine::kv
 
-namespace splash::ops {
+namespace richengine::ops {
 
 struct AttentionWorkspace final {
   uint64_t partialsBytes = 0;
@@ -117,19 +117,22 @@ struct PrefillAttentionPlan final {
   const metal::DispatchSize reduceGroups;
   // The reduce threadgroup: one thread per head-dimension element.
   const metal::DispatchSize reduceThreads;
+  // The q*k softmax scale the kernels apply; zero selects 1/sqrt(d).
+  const float scoreScale;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       metal::DispatchSize reduceThreads, kv::Format format)
+                       metal::DispatchSize reduceThreads, kv::Format format,
+                       float scoreScale = 0.0F)
       : format(format), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
-        reduceThreads(reduceThreads) {}
+        reduceThreads(reduceThreads), scoreScale(scoreScale) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -138,16 +141,18 @@ struct VerifyAttentionPlan final {
   // Each lane's history-scaled split count; splits is their maximum, the
   // split grid and the slot stride of every lane's partials. The workspace
   // covers the maximum split count for every lane regardless of history.
-  const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits;
+  const std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits;
   const uint32_t splits;
   const AttentionWorkspace workspace;
   const std::string splitPipeline;
   const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
-  // The tile's row capacity per lane: SPLASH_TARGET_VERIFY_ROWS for the
-  // chain plan, SPLASH_TREE_VERIFY_NODES for a tree plan.
+  // The tile's row capacity per lane: RICHENGINE_TARGET_VERIFY_ROWS for the
+  // chain plan, RICHENGINE_TREE_VERIFY_NODES for a tree plan.
   const uint32_t rowCapacity;
+  // The q*k softmax scale the kernels apply; zero selects 1/sqrt(d).
+  const float scoreScale;
 
 private:
   friend class PagedAttention;
@@ -157,20 +162,20 @@ private:
   // The reduce threadgroup: one thread per head-dimension element.
   const metal::DispatchSize reduceThreads_;
   VerifyAttentionPlan(uint32_t lanes,
-                      std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
+                      std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string splitPipeline, std::string reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       std::string storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads,
                       metal::DispatchSize reduceThreads, kv::Format format,
-                      uint32_t rowCapacity)
+                      uint32_t rowCapacity, float scoreScale = 0.0F)
       : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
-        rowCapacity(rowCapacity),
+        rowCapacity(rowCapacity), scoreScale(scoreScale),
         storePipeline_(std::move(storePipeline)), storeGroups_(storeGroups),
         storeThreads_(storeThreads), reduceThreads_(reduceThreads) {}
 };
@@ -198,7 +203,7 @@ public:
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
   // historyTokens holds each lane's committed tokens before its verify rows,
-  // one entry per lane. A tree plan selects the SPLASH_TREE_VERIFY_NODES-row
+  // one entry per lane. A tree plan selects the RICHENGINE_TREE_VERIFY_NODES-row
   // kernels and workspaces; fp8 KV has none and throws.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
@@ -239,7 +244,7 @@ public:
                                  uint32_t stride, uint32_t queryHeads,
                                  kv::Layout layout);
   // `rows` is the lanes' row count of this verify step:
-  // SPLASH_TARGET_VERIFY_ROWS chain, SPLASH_TREE_VERIFY_NODES tree.
+  // RICHENGINE_TARGET_VERIFY_ROWS chain, RICHENGINE_TREE_VERIFY_NODES tree.
   static void
   addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
                       const NormWeights &queryNorm, const NormWeights &keyNorm,
@@ -272,7 +277,7 @@ public:
   [[nodiscard]] static kv::ChunkedPrefillParams
   verifyTreeParams(uint64_t logicalPosition, uint32_t pageTableEntries);
 
-  static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
+  static void addPrefillStore(metal::CommandGraph &graph, RichKvLayer layer,
                               metal::MetalBuffer chunkKeys,
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
@@ -283,7 +288,7 @@ public:
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
   // prefillWorkspace() bounds every legal history for the command's largest
   // sequence.
-  static void addPrefill(metal::CommandGraph &graph, SplashKvLayer layer,
+  static void addPrefill(metal::CommandGraph &graph, RichKvLayer layer,
                          metal::MetalBuffer queries, metal::MetalBuffer output,
                          metal::MetalBuffer partials,
                          metal::MetalBuffer statistics,
@@ -298,7 +303,7 @@ public:
   // attention-row round trip, bitwise identical. With `gateHidden` bound and
   // `gatePacked` empty the no-gate fusion runs instead: the reduce writes
   // `gateHidden` directly (verify_attention_reduce_gather_*, chain plans).
-  static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
+  static void addVerify(metal::CommandGraph &graph, RichKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
                         const VerifyAttentionPlan &plan,
@@ -310,7 +315,7 @@ public:
   // committed + i, skipping slots already correct. Encode after
   // decode_accept_tree wrote retained/retainedPath.
   static void
-  addVerifyTreeCompact(metal::CommandGraph &graph, SplashKvLayer layer,
+  addVerifyTreeCompact(metal::CommandGraph &graph, RichKvLayer layer,
                        std::span<const metal::MetalBuffer> pageTables,
                        metal::MetalBuffer retainedPath,
                        metal::MetalBuffer retained,
@@ -318,4 +323,4 @@ public:
                        uint32_t lanes, kv::Layout layout);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

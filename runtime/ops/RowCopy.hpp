@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // Rows of `stride` bf16 values from row `row` of a buffer, of which a copy
 // reads or writes the values from `column` on.
@@ -27,4 +27,4 @@ public:
                   uint32_t rows, uint32_t width);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

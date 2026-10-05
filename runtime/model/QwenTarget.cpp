@@ -4,6 +4,7 @@
 #include "metal/abi/GDN.h"
 #include "model/Dense.hpp"
 #include "model/Lfm2.hpp"
+#include "model/Granite.hpp"
 #include "model/Lfm2Moe.hpp"
 #include "model/Ornith9B.hpp"
 #include "model/Qwen3_6Moe.hpp"
@@ -20,7 +21,7 @@
 #include <utility>
 #include <variant>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 template <class Layout>
@@ -82,6 +83,18 @@ QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
 
 // The pure dense target: every layer full attention, no recurrent slots.
 QwenTargetGeometry geometryFor(const DenseLayout &layout) {
+  QwenTargetGeometry result = commonGeometry(layout);
+  result.denseIntermediateSize = layout.intermediateSize;
+  result.gdnLayers = 0;
+  result.convLayers = 0;
+  result.convolutionTaps = 0;
+  result.ropeAxes = 1;
+  return result;
+}
+
+// Granite 4.2: the same all-attention target; its kvLayout carries the
+// attention_multiplier into the kernels' softmax scale.
+QwenTargetGeometry geometryFor(const GraniteLayout &layout) {
   QwenTargetGeometry result = commonGeometry(layout);
   result.denseIntermediateSize = layout.intermediateSize;
   result.gdnLayers = 0;
@@ -156,6 +169,8 @@ template QwenTarget::QwenTarget(const DenseWeights &, const QwenTargetGeometry &
 template QwenTarget::QwenTarget(const Lfm2Weights &, const QwenTargetGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 template QwenTarget::QwenTarget(const Lfm2MoeWeights &, const QwenTargetGeometry &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &);
+template QwenTarget::QwenTarget(const GraniteWeights &, const QwenTargetGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 
 namespace {
@@ -267,6 +282,7 @@ template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
 template QwenTargetGeometry qwenTargetGeometry(const DenseWeights &);
 template QwenTargetGeometry qwenTargetGeometry(const Lfm2Weights &);
 template QwenTargetGeometry qwenTargetGeometry(const Lfm2MoeWeights &);
+template QwenTargetGeometry qwenTargetGeometry(const GraniteWeights &);
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
@@ -324,7 +340,7 @@ struct QwenTarget::PrefillStep {
   const QwenTargetPrefillBuffers &buffers;
   std::span<const QwenTargetPrefillSequence> sequences;
   uint32_t rows;
-  std::span<const SplashKvLayer> kvLayers;
+  std::span<const RichKvLayer> kvLayers;
   // Each sequence's attention plan, which every attention layer runs.
   std::vector<ops::PrefillAttentionPlan> attention{};
   std::optional<ops::MoePlan> moe{};
@@ -335,7 +351,7 @@ struct QwenTarget::PrefillStep {
 struct QwenTarget::VerifyStep {
   metal::CommandGraph &graph;
   const QwenTargetVerifyBuffers &buffers;
-  std::span<const SplashKvLayer> kvLayers;
+  std::span<const RichKvLayer> kvLayers;
   std::span<const kv::ChunkedPrefillParams> chunks;
   uint32_t lanes;
   uint32_t rows;
@@ -355,7 +371,7 @@ struct QwenTarget::VerifyStep {
 metal::MetalBuffer QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const SplashKvLayer> kvLayers) const {
+    std::span<const RichKvLayer> kvLayers) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -547,11 +563,14 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, const ops::NormWeights &n
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   addPrefillNorm(step, residual, norm, gate.layout());
-  linear.addPrefill(step.graph, b.normalized, gate, b.denseGateScratch, b.projectionSums,
-                    step.rows, b.linearScratch);
+  // The gate's rotated rows stand in the scratch for the up pass, whose
+  // projection reads the same input and rotation signs.
+  const ops::PreparedInput rotatedInput =
+      linear.addPrefill(step.graph, b.normalized, gate, b.denseGateScratch, b.projectionSums,
+                        step.rows, b.linearScratch);
   linear.addPrefillUpWithGate(step.graph, b.normalized, up, b.denseGateScratch,
                               b.denseIntermediate, b.projectionSums, b.downProjectionSums, step.rows,
-                              b.linearScratch);
+                              b.linearScratch, rotatedInput);
   linear.addPrefillResidual(step.graph, b.denseIntermediate, down, residual, output,
                             b.downProjectionSums, step.rows, b.linearScratch);
 }
@@ -591,7 +610,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Lfm2MoeLayerWeights &lay
 
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-    std::span<const SplashKvLayer> kvLayers,
+    std::span<const RichKvLayer> kvLayers,
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
     bool tree, std::span<const uint32_t> liveRows) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
@@ -605,7 +624,7 @@ void QwenTarget::addVerify(
       buffers.chunkValues.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
   }
-  // A tree lane doubles its row block: SPLASH_TREE_VERIFY_NODES rows, of
+  // A tree lane doubles its row block: RICHENGINE_TREE_VERIFY_NODES rows, of
   // which nodes 1..15 hold the emitted tree. Tree mode supports the GDN and
   // attention mixers only — LFM2 convolutions stay on the chain path.
   if (tree &&
@@ -615,7 +634,7 @@ void QwenTarget::addVerify(
     throw std::invalid_argument("invalid Qwen tree verify batch");
   }
   const uint32_t rowCapacity =
-      tree ? uint32_t{SPLASH_TREE_VERIFY_NODES}
+      tree ? uint32_t{RICHENGINE_TREE_VERIFY_NODES}
            : ExecutionLimits::targetVerifyRows;
   const uint32_t rows = lanes * rowCapacity;
   const uint32_t planLanes = tree ? 2 * lanes : lanes;
@@ -652,7 +671,7 @@ void QwenTarget::addVerify(
     requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   }, weights_);
   addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, planLanes,
-               buffers.linearScratch);
+               buffers.linearScratch, &buffers);
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -769,7 +788,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual);
   ops::PreparedInput hidden;
-  static const bool noFusedGate = envFlag("SPLASH_NO_FUSED_GATE");
+  static const bool noFusedGate = envFlag("RICHENGINE_NO_FUSED_GATE");
   // A Plain-input out-projection folds its operand pass into the attention
   // reduce: the query gate of the gated targets, the hidden-row gather of
   // the no-gate ones (chain verifies only — tree plans keep the two-pass
@@ -875,8 +894,44 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &layer
 
 void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                               metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
-                              ops::LinearScratch scratch) const {
+                              ops::LinearScratch scratch,
+                              const QwenTargetVerifyBuffers *fused) const {
   const ops::Linear &linear = operators_.linear();
+  const ops::Projection &head = vocabularyProjection();
+  // Fused greedy head: the Ornith-9B {248320, 4096} affine projection runs
+  // decode_head_argmax_q4, which argmaxes its logits tiles in-kernel and
+  // writes partials the sampling reduce turns into tokens — the fp32 logits
+  // buffer is never touched on an all-greedy chain-verify step.
+  if (fused && fused->fusedHead) {
+    const ops::NormWeights &norm = weightsBase_.finalNorm;
+    graph.beginBakedSpan();
+    ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
+                               geometry_.hiddenSize,
+                               lanes * ExecutionLimits::targetVerifyRows,
+                               scratch, ops::LinearInput::Plain);
+    if (head.layout() == ops::WeightLayout::Block32) {
+      // The GGUF head's staged decode argmaxes per 64-column tile; the
+      // logits buffer is never written.
+      if (linear.addGgufHeadArgmax(graph, finalHidden, head, lanes,
+                                   fused->headArgmaxValues,
+                                   fused->headArgmaxIndices, fused->headArgs,
+                                   scratch)) {
+        graph.endBakedSpan();
+        return;
+      }
+      // Not a fused-capable segment: the span keeps the norm and the logits
+      // path adds the projection below.
+    } else {
+      const ops::AffineWeights &w = head.affine();
+      graph.add("decode_head_argmax_q4",
+                {finalHidden, w.weights, w.scales, w.biases,
+                 fused->headArgmaxValues, fused->headArgmaxIndices},
+                fused->headArgs, {head.outputSize / 128, 1, 1}, {256, 1, 1});
+      graph.endBakedSpan();
+      return;
+    }
+    graph.endBakedSpan();
+  }
   const ops::LinearPlan logitsPlan = linear.decodePlan(vocabularyProjection(), lanes);
   // The final norm and vocabulary projection replay from a baked span.
   graph.beginBakedSpan();
@@ -983,4 +1038,4 @@ void QwenTarget::addStateCommitTree(metal::CommandGraph &graph,
        geometry_.stateLayout.convolutionBytes()});
 }
 
-} // namespace splash::model
+} // namespace richengine::model

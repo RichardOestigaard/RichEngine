@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 struct DraftAttentionShape final {
   uint32_t hiddenSize = 0;
@@ -129,4 +129,4 @@ public:
       std::span<const uint32_t> startPositions, DraftAttentionShape shape);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

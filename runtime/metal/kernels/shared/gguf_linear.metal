@@ -96,6 +96,112 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
   GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
+// The fused greedy head: the staged decode with an argmax tail instead of
+// logits stores — one partial per (row, GGUF_TILE_COLUMNS tile), reduced by
+// decode_head_argmax_reduce_tiles_gguf. Same mask semantics as the affine
+// fused head: dead rows write -inf partials; the excluded stop tokens never
+// win.
+template <class F, ushort Rows>
+kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                             device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                             device float *argmax_values [[buffer(4)]], device uint *argmax_indices [[buffer(5)]],
+                             device coherent(device) float *partials [[buffer(6)]],
+                             device atomic_uint *counters [[buffer(7)]],
+                             constant GgufHeadArgmaxParams &hp [[buffer(8)]],
+                             uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                             uint simd_group [[simdgroup_index_in_threadgroup]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup half2 tl[F::Kind == QuantCodebook && !F::Native ? kQuantPairTableEntries : 1];
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
+  threadgroup half stage[kStagedStages];
+  threadgroup uint arrival;
+  // One winner per simdgroup per row: the 256-thread table this replaces
+  // (GGUF_STAGED_THREADS * Rows float+uint pairs) cost the tile its
+  // occupancy and roughly doubled the fused head's time.
+  threadgroup float amax_v[GGUF_STAGED_THREADS / 32 * Rows];
+  threadgroup uint amax_i[GGUF_STAGED_THREADS / 32 * Rows];
+  const uint per = hp.decode.input_size / GGUF_STAGED_STEP / hp.decode.splits,
+             origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS,
+             column0 = hp.decode.out_offset + origin;
+  threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, hp.decode.input_size, my);
+  gguf_zero(acc);
+  staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, hp.decode.input_size, origin, my,
+                                                                  tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
+  // The thread's per-row best within its own fragment columns; the argmax
+  // reducer folds the threads' pairs after the barrier.
+  float best[Rows];
+  uint besti[Rows];
+#pragma unroll
+  for (ushort r = 0; r < Rows; ++r) {
+    best[r] = -INFINITY;
+    besti[r] = 0xffffffffu;
+  }
+  const uint tiles = hp.decode.out_stride / GGUF_TILE_COLUMNS;
+  const uint ptile = hp.decode.out_offset / GGUF_TILE_COLUMNS + group.x;
+  gguf_store_sums<Rows>(
+      acc, hp.decode.splits, group.y, partials,
+      counters + hp.decode.out_offset / GGUF_TILE_COLUMNS + group.x, hp.decode.out_stride, column0,
+      simd_group * 32 + simd_lane, &arrival, [&](uint row, uint column, float v) {
+        const uint token = column0 + column;
+        const uint lane_index = row / 8;
+        if (row % 8 >= hp.head.live_rows[lane_index]) return;
+        if ((hp.head.exclude_stop_mask & (1u << lane_index)) &&
+            (token == hp.head.stop_token_0 || token == hp.head.stop_token_1))
+          return;
+        if (v > best[row] || (v == best[row] && token < besti[row])) {
+          best[row] = v;
+          besti[row] = token;
+        }
+      });
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+  for (ushort r = 0; r < Rows; ++r) {
+    float v = best[r];
+    uint ix = besti[r];
+#pragma unroll
+    for (ushort step = 16; step; step >>= 1) {
+      const float ov = simd_shuffle_xor(v, step);
+      const uint oi = simd_shuffle_xor(ix, step);
+      if (ov > v || (ov == v && oi < ix)) {
+        v = ov;
+        ix = oi;
+      }
+    }
+    if (simd_lane == 0) {
+      amax_v[simd_group * Rows + r] = v;
+      amax_i[simd_group * Rows + r] = ix;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < Rows) {
+    float v = -INFINITY;
+    uint ix = 0xffffffffu;
+    for (uint t = 0; t < GGUF_STAGED_THREADS / 32; ++t) {
+      const float cv = amax_v[t * Rows + tid];
+      const uint ci = amax_i[t * Rows + tid];
+      if (cv > v || (cv == v && ci < ix)) {
+        v = cv;
+        ix = ci;
+      }
+    }
+    argmax_values[tid * tiles + ptile] = v;
+    argmax_indices[tid * tiles + ptile] = ix;
+  }
+}
+using GgufArgmaxKernel =
+    void(device bfloat *, device uchar *, device uchar *, device uchar *, device float *, device uint *,
+         device coherent(device) float *, device atomic_uint *, constant GgufHeadArgmaxParams &, uint2, uint, uint,
+         uint);
+#define GGUF_DECODE_AMAX(F, f, R) \
+  template [[host_name("gguf_decode_" #f "_m" #R "_amax")]] kernel GgufArgmaxKernel gguf_decode_amax<F, R>;
+#define GGUF_DECODE_AMAX_ROWS(F, f) \
+  GGUF_DECODE_AMAX(F, f, 8) GGUF_DECODE_AMAX(F, f, 16) GGUF_DECODE_AMAX(F, f, 32)
+QUANT_FORMATS(GGUF_DECODE_AMAX_ROWS)
+GGUF_DECODE_AMAX_ROWS(FmtMXFP4N, mxfp4n)
+#undef GGUF_DECODE_AMAX_ROWS
+#undef GGUF_DECODE_AMAX
+
 // The native MXFP4 decoders, dispatched on Apple GPU family 10 and up only.
 GGUF_DECODE_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_DECODE_FORMAT

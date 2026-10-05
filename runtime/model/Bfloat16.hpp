@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace splash::model {
+namespace richengine::model {
 
 // The bf16 bits of value when it is exactly a bf16: preparation never rounds
 // a weight.
@@ -14,4 +14,4 @@ namespace splash::model {
   return static_cast<uint16_t>(bits >> 16);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

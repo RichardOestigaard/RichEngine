@@ -13,9 +13,9 @@ from dev.tests import agent_real as agent
 from server import serve_options
 
 MODEL_IDS = (
-    "incoai/Qwen3.8-27B-Splash",
-    "incoai/Qwen3.6-35B-A3B-Splash",
-    "community/custom-splash",
+    "incoai/Qwen3.8-27B-RichEngine",
+    "incoai/Qwen3.6-35B-A3B-RichEngine",
+    "community/custom-richengine",
 )
 
 
@@ -204,7 +204,7 @@ class AgentRunnerTests(unittest.TestCase):
             (generated / "build-identity.json").write_bytes(
                 agent.build_identity.stamp_bytes(identity)
             )
-            binary = root / "build/splash"
+            binary = root / "build/richengine"
             binary.write_bytes(identity.encode())
             with mock.patch.object(agent, "ROOT", root):
                 self.assertEqual(agent.current_build_id(), identity)
@@ -216,7 +216,7 @@ class AgentRunnerTests(unittest.TestCase):
                     agent.current_build_id()
 
     def test_mismatched_existing_server_is_rejected_without_stopping_it(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "incoai/Qwen3.8-27B-RichEngine"
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
@@ -280,9 +280,9 @@ class AgentRunnerTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     agent.parse_args(arguments)
 
-    def test_real_harnesses_accept_exactly_the_ids_splash_serve_accepts(self):
+    def test_real_harnesses_accept_exactly_the_ids_richengine_serve_accepts(self):
         parsers = {
-            "splash serve": lambda model: agent.launcher.parse_args(
+            "richengine serve": lambda model: agent.launcher.parse_args(
                 ["serve", "--model", model]
             ),
             "agent_real": lambda model: agent.parse_args(["--model", model]),
@@ -539,7 +539,7 @@ class AgentRunnerTests(unittest.TestCase):
                 os.environ.pop("HERMES_HOME", None)
                 profiles = Path(directory, ".hermes/profiles")
                 if existed:
-                    (profiles / "splash").mkdir(parents=True)
+                    (profiles / "richengine").mkdir(parents=True)
                 runner = agent.ClientRun(
                     "hermes",
                     "hermes",
@@ -549,7 +549,7 @@ class AgentRunnerTests(unittest.TestCase):
                     10,
                     ["text"],
                 )
-                self.assertRegex(runner.hermes_profile, r"^splash-test-[0-9a-f]{8}$")
+                self.assertRegex(runner.hermes_profile, r"^richengine-test-[0-9a-f]{8}$")
                 self.assertEqual(runner.hermes_home, profiles / runner.hermes_profile)
                 runner.hermes_home.mkdir(parents=True)
                 (runner.hermes_home / "state.db").write_bytes(b"sessions")
@@ -563,7 +563,7 @@ class AgentRunnerTests(unittest.TestCase):
                     ["profiles"] if existed else [],
                 )
                 if existed:
-                    self.assertEqual([p.name for p in profiles.iterdir()], ["splash"])
+                    self.assertEqual([p.name for p in profiles.iterdir()], ["richengine"])
 
     def test_hermes_phase_without_a_session_record_reports_the_exit(self):
         # Hermes creates state.db with its first session; its absence is not
@@ -821,7 +821,7 @@ class AgentRunnerTests(unittest.TestCase):
                     runner.codex_home = Path(directory) / "codex-home"
                     runner.pi_home = Path(directory) / "pi-agent"
                     runner.opencode_data = Path(directory) / "opencode-data"
-                    runner.hermes_profile = "splash-test-0123abcd"
+                    runner.hermes_profile = "richengine-test-0123abcd"
                     runner.session = session
                     runner.version = 2 if name == "opencode" else None
 
@@ -885,7 +885,7 @@ class AgentRunnerTests(unittest.TestCase):
                             expected += ["--resume", session]
                         self.assertEqual(argv[1:], expected)
 
-    def test_opencode_runs_as_splash_launches_it(self):
+    def test_opencode_runs_as_richengine_launches_it(self):
         # OpenCode 2 reaches the inline configuration only through a private
         # server, whose flag follows the subcommand; a background service
         # would outlive the run. Version 1 rejects the flag.
@@ -1186,7 +1186,7 @@ class AgentRunnerTests(unittest.TestCase):
                 agent.main(
                     [
                         "--model",
-                        "incoai/Qwen3.8-27B-Splash",
+                        "incoai/Qwen3.8-27B-RichEngine",
                         "--clients",
                         "codex",
                     ]
@@ -1212,7 +1212,7 @@ class AgentRunnerTests(unittest.TestCase):
                             "--clients",
                             "claude",
                             "--model",
-                            "incoai/Qwen3.8-27B-Splash",
+                            "incoai/Qwen3.8-27B-RichEngine",
                             "--preflight-only",
                             "--output",
                             str(report),
@@ -1254,7 +1254,7 @@ class AgentRunnerTests(unittest.TestCase):
                     "--clients",
                     "opencode",
                     "--model",
-                    "incoai/Qwen3.8-27B-Splash",
+                    "incoai/Qwen3.8-27B-RichEngine",
                     "--preflight-only",
                     "--output",
                     str(report),
@@ -1269,7 +1269,7 @@ class AgentRunnerTests(unittest.TestCase):
                 self.assertEqual(entries["opencode"]["major_version"], major)
 
     def test_opencode_runs_with_the_major_version_preflight_read(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "incoai/Qwen3.8-27B-RichEngine"
         identity = "src-" + "a" * 64
         initial = {
             "instance": {"model": model},
@@ -1321,7 +1321,7 @@ class AgentRunnerTests(unittest.TestCase):
                 agent.main(
                     [
                         "--model",
-                        "incoai/Qwen3.8-27B-Splash",
+                        "incoai/Qwen3.8-27B-RichEngine",
                         "--clients",
                         value,
                     ]

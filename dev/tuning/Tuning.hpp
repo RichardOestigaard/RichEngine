@@ -5,7 +5,7 @@
 #include <span>
 #include <string_view>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 // IDs refer to operator-owned typed configurations. This helper never
 // interprets a kernel configuration or encodes GPU work.
@@ -120,4 +120,4 @@ struct Selection final {
 selectCandidate(std::span<const CandidateMeasurements> candidates,
                 const Policy &policy = {}) noexcept;
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

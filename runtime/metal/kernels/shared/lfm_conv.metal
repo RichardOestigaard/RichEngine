@@ -77,7 +77,7 @@ template <uint Vec>
 static inline void prefill_impl(
     device const bfloat *packed, device const bfloat *weights,
     device const bfloat *state_in, device bfloat *state_out,
-    device bfloat *output, constant SplashLfmConvParams &params, uint task) {
+    device bfloat *output, constant RichLfmConvParams &params, uint task) {
   using V = LfmVec<Vec>;
   const uint dimension = params.dimension;
   const uint rows = params.rows;
@@ -127,7 +127,7 @@ kernel void prefill_lfm_conv(
     device const bfloat *state_in [[buffer(2)]],
     device bfloat *state_out [[buffer(3)]],
     device bfloat *output [[buffer(4)]],
-    constant SplashLfmConvParams &params [[buffer(5)]],
+    constant RichLfmConvParams &params [[buffer(5)]],
     uint task [[thread_position_in_grid]]) {
   prefill_impl<1>(packed, weights, state_in, state_out, output, params, task);
 }
@@ -138,7 +138,7 @@ kernel void prefill_lfm_conv_v4(
     device const bfloat *state_in [[buffer(2)]],
     device bfloat *state_out [[buffer(3)]],
     device bfloat *output [[buffer(4)]],
-    constant SplashLfmConvParams &params [[buffer(5)]],
+    constant RichLfmConvParams &params [[buffer(5)]],
     uint task [[thread_position_in_grid]]) {
   prefill_impl<4>(packed, weights, state_in, state_out, output, params, task);
 }
@@ -156,7 +156,7 @@ kernel void verify_lfm_conv(
     device const bfloat *state3 [[buffer(5)]],
     device bfloat *mixed [[buffer(6)]],
     device bfloat *output [[buffer(7)]],
-    constant SplashLfmConvParams &params [[buffer(8)]],
+    constant RichLfmConvParams &params [[buffer(8)]],
     uint task [[thread_position_in_grid]]) {
   const uint dimension = params.dimension;
   const uint rows = params.rows;
@@ -215,7 +215,7 @@ kernel void verify_lfm_conv_v4(
     device const bfloat *state3 [[buffer(5)]],
     device bfloat *mixed [[buffer(6)]],
     device bfloat *output [[buffer(7)]],
-    constant SplashLfmConvParams &params [[buffer(8)]],
+    constant RichLfmConvParams &params [[buffer(8)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]) {
   const uint dimension = params.dimension;
@@ -274,7 +274,7 @@ static inline void commit_impl(
     device const bfloat *state2_in, device const bfloat *state3_in,
     device bfloat *state0_out, device bfloat *state1_out,
     device bfloat *state2_out, device bfloat *state3_out,
-    constant SplashLfmConvParams &params, uint task) {
+    constant RichLfmConvParams &params, uint task) {
   using V = LfmVec<Vec>;
   const uint dimension = params.dimension;
   const uint taps = params.taps;
@@ -325,7 +325,7 @@ kernel void commit_lfm_conv(
     device bfloat *state1_out [[buffer(7)]],
     device bfloat *state2_out [[buffer(8)]],
     device bfloat *state3_out [[buffer(9)]],
-    constant SplashLfmConvParams &params [[buffer(10)]],
+    constant RichLfmConvParams &params [[buffer(10)]],
     uint task [[thread_position_in_grid]]) {
   commit_impl<1>(mixed, retained, state0_in, state1_in, state2_in, state3_in,
                  state0_out, state1_out, state2_out, state3_out, params, task);
@@ -342,7 +342,7 @@ kernel void commit_lfm_conv_v4(
     device bfloat *state1_out [[buffer(7)]],
     device bfloat *state2_out [[buffer(8)]],
     device bfloat *state3_out [[buffer(9)]],
-    constant SplashLfmConvParams &params [[buffer(10)]],
+    constant RichLfmConvParams &params [[buffer(10)]],
     uint task [[thread_position_in_grid]]) {
   commit_impl<4>(mixed, retained, state0_in, state1_in, state2_in, state3_in,
                  state0_out, state1_out, state2_out, state3_out, params, task);

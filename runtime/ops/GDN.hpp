@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // Tensor geometry mapped to a compiled Metal variant during graph construction.
 struct GdnShape final {
@@ -63,7 +63,7 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentRows;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
-  // WY/UT scratch for the chunkwise-parallel scan (SPLASH_GDN_CHUNKED); an
+  // WY/UT scratch for the chunkwise-parallel scan (RICHENGINE_GDN_CHUNKED); an
   // empty buffer keeps the serial prefill_gdn_scan.
   metal::MetalBuffer chunkScratch;
 };
@@ -99,7 +99,7 @@ public:
   // out-projection's input sums beside the gated rows, so the mixer output
   // needs no sums pass of its own.
   // Floats of WY/UT scratch the chunked scan needs for `tokens` rows
-  // (`factor` is the SPLASH_GDN_CHUNKED chunk size; 0 disables it).
+  // (`factor` is the RICHENGINE_GDN_CHUNKED chunk size; 0 disables it).
   static uint64_t chunkScratchFloats(const GdnShape &shape, uint32_t tokens,
                                      uint32_t factor);
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
@@ -109,14 +109,14 @@ public:
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.
   // liveRows bounds each lane's serial verify scan (adaptive proposal
-  // budgets); empty scans all SPLASH_TARGET_VERIFY_ROWS rows.
+  // budgets); empty scans all RICHENGINE_TARGET_VERIFY_ROWS rows.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input,
                                  std::span<const uint32_t> liveRows = {});
-  // The tree-verify variants: SPLASH_TREE_VERIFY_NODES rows per lane, the
+  // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.
   static PreparedInput addDecodeTree(metal::CommandGraph &graph,
@@ -136,4 +136,4 @@ public:
                             GdnStateStrides state);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

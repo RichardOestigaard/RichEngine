@@ -9,7 +9,7 @@
 #include <span>
 #include <vector>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 // Storage for paged KV in extents: ordinary shared Metal buffers of
 // extentPages pages each, which KvPool alone allocates and releases: its
@@ -66,7 +66,7 @@ public:
   // std::out_of_range for a page past the pool.
   void copyPages(std::span<const PageCopy> copies) override;
   // Where each attention layer's region sits in every extent, by layer.
-  [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {
+  [[nodiscard]] std::span<const RichKvLayer> layers() const noexcept {
     return layers_;
   }
 
@@ -81,24 +81,24 @@ public:
   // The page's memory as the host reaches it, and the only code that names
   // it: the page's bytes of each tensor in every layer's region, layer by
   // layer as keys, key scales, values and value scales, where
-  // splash_kv_offset places them for the kernels. BF16 pages have no scale
+  // richengine_kv_offset places them for the kernels. BF16 pages have no scale
   // bytes. Throws std::logic_error for a page whose extent is not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
 
 private:
   [[nodiscard]] size_t extentIndex(uint32_t page) const;
-  [[nodiscard]] SplashKvPage entry(uint32_t page) const;
+  [[nodiscard]] RichKvPage entry(uint32_t page) const;
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;
   Layout layout_;
   uint32_t pageCount_ = 0;
   uint32_t extentPages_ = 0;
-  std::vector<SplashKvLayer> layers_;
+  std::vector<RichKvLayer> layers_;
   // Empty while the extent is not allocated.
   std::vector<metal::MetalBuffer> extents_;
   // Each extent's GPU address, zero while it is not allocated.
   std::vector<uint64_t> extentAddresses_;
 };
 
-} // namespace splash::kv
+} // namespace richengine::kv

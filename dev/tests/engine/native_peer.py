@@ -8,7 +8,7 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHHHQI")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQBIII")
+_REQUEST = struct.Struct("<QBBQQIIIffIffffQBIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
@@ -126,7 +126,7 @@ def serialize_event(event: wire.EngineEvent) -> bytes:
     validation, so fakes can send the server invalid events."""
     frame_type, payload = _event_payload(event)
     header = _HEADER.pack(
-        b"SPLH",
+        b"RICH",
         wire.PROTOCOL_VERSION,
         wire.FRAME_HEADER_BYTES,
         frame_type,
@@ -157,6 +157,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         score_count,
         generation_prompt_tokens,
         flags,
+        shared_prefix_tokens,
     ) = _REQUEST.unpack_from(payload)
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
@@ -187,6 +188,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         scores,
         generation_prompt_tokens,
         wire.RequestFlag(flags),
+        shared_prefix_tokens,
     )
 
 
@@ -223,7 +225,7 @@ class ClientFrameReader:
                 _HEADER.unpack_from(self._buffer)
             )
             if (magic, version, header_bytes) != (
-                b"SPLH",
+                b"RICH",
                 wire.PROTOCOL_VERSION,
                 wire.FRAME_HEADER_BYTES,
             ):

@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 inline constexpr uint32_t kQ4GroupElements = 64;
 inline constexpr uint64_t kBFloat16Bytes = 2;
@@ -37,4 +37,4 @@ inline constexpr std::string_view kVisionMagic = "MDFV0001";
   return header;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

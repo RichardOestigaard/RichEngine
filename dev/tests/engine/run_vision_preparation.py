@@ -198,7 +198,7 @@ def main():
     # Every fixture prepares the same file: the values do not depend on the
     # source format or the dtypes.
     golden = json.loads(Path(sys.argv[2]).read_text())["vision_image"]
-    with tempfile.TemporaryDirectory(prefix="splash-vision-preparation-") as temp:
+    with tempfile.TemporaryDirectory(prefix="richengine-vision-preparation-") as temp:
         root = Path(temp)
         for source in ("mlx", "gguf"):
             mlx = source == "mlx"

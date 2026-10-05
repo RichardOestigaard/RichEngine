@@ -1,11 +1,11 @@
 #pragma once
 
-#include "engine/Cache.hpp"
+#include "engine/cache/Cache.hpp"
 
 #include <cstdint>
 #include <span>
 
-namespace splash::test {
+namespace richengine::test {
 
 // Publishes the request's committed blocks and returns the deepest one, 0
 // while no block is complete.
@@ -20,4 +20,4 @@ inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
              : cache.blockAt(requestId, committedTokens / pageTokens * pageTokens);
 }
 
-} // namespace splash::test
+} // namespace richengine::test

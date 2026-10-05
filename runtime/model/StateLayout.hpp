@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace splash::model {
+namespace richengine::model {
 
 // The GDN short convolution has four taps; the recurrent state keeps the
 // three previous inputs.
@@ -61,7 +61,7 @@ struct GdnStateLayout final {
   bool operator==(const GdnStateLayout &) const = default;
 };
 
-// One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
+// One ring of RICHENGINE_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
 // one for the values of every draft layer.
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
@@ -74,7 +74,7 @@ struct DraftStateLayout final {
     return layers && kvHeads && headDimension;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
+    return uint64_t{kvHeads} * RICHENGINE_DRAFT_SLIDING_WINDOW * headDimension *
            bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
@@ -104,4 +104,4 @@ struct CompositeStateLayout final {
   bool operator==(const CompositeStateLayout &) const = default;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

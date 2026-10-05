@@ -19,7 +19,7 @@
 
 namespace {
 
-using namespace splash;
+using namespace richengine;
 using ops::tuning::HostKvExtents;
 using ops::tuning::bf16ToFloat;
 using ops::tuning::floatToBf16;
@@ -32,7 +32,7 @@ static_assert(!std::is_aggregate_v<ops::VerifyAttentionPlan> &&
               !std::is_default_constructible_v<ops::VerifyAttentionPlan> &&
               !std::is_copy_assignable_v<ops::VerifyAttentionPlan>);
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -187,7 +187,7 @@ struct Case final {
   uint32_t rows;
   uint32_t stride;
   HostKvExtents pool;
-  SplashKvLayer layer{};
+  RichKvLayer layer{};
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
@@ -218,78 +218,78 @@ struct Case final {
   float keyScale(uint32_t lane, uint32_t head, uint32_t token) const {
     if (layout.format == kv::Format::BFloat16) return 1.0f;
     const uint32_t id = page(lane, token);
-    return pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[
-        splash_kv_scale_element(head, token % 32)];
+    return pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[
+        richengine_kv_scale_element(head, token % 32)];
   }
 
   float valueScale(uint32_t lane, uint32_t head, uint32_t token) const {
     if (layout.format == kv::Format::BFloat16) return 1.0f;
     const uint32_t id = page(lane, token);
-    return pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[
-        splash_kv_scale_element(head, token % 32)];
+    return pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[
+        richengine_kv_scale_element(head, token % 32)];
   }
 
   float keyCode(uint32_t lane, uint32_t head, uint32_t token,
                 uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = splash_kv_key_element(head, token % 32, dimension);
+    const uint64_t index = richengine_kv_key_element(head, token % 32, dimension);
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_KEYS, id)[index]);
     if (layout.format == kv::Format::Int4)
       return packed4Code(
-          pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[index / 2],
+          pool.slab<uint8_t>(kLayer, RICHENGINE_KV_KEYS, id)[index / 2],
           uint32_t(index & 1));
-    return float(pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+    return float(pool.slab<int8_t>(kLayer, RICHENGINE_KV_KEYS, id)[index]);
   }
 
   float valueCode(uint32_t lane, uint32_t head, uint32_t token,
                   uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = splash_kv_value_element(head, token % 32, dimension);
+    const uint64_t index = richengine_kv_value_element(head, token % 32, dimension);
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_VALUES, id)[index]);
     if (layout.format == kv::Format::Int4) {
       const uint64_t byte =
-          splash_kv_key_element(head, token % 32, dimension) / 2;
+          richengine_kv_key_element(head, token % 32, dimension) / 2;
       return packed4Code(
-          pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[byte], dimension & 1);
+          pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[byte], dimension & 1);
     }
-    return float(pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+    return float(pool.slab<int8_t>(kLayer, RICHENGINE_KV_VALUES, id)[index]);
   }
 
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = splash_kv_key_element(head, token % 32, dimension);
-    const uint64_t scale = splash_kv_scale_element(head, token % 32);
+    const uint64_t index = richengine_kv_key_element(head, token % 32, dimension);
+    const uint64_t scale = richengine_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_KEYS, id)[index]);
     if (layout.format == kv::Format::Int4)
-      return packed4Code(pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[index / 2],
+      return packed4Code(pool.slab<uint8_t>(kLayer, RICHENGINE_KV_KEYS, id)[index / 2],
                          uint32_t(index & 1)) *
-             pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[scale];
-    return pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index] *
-           pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[scale];
+             pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[scale];
+    return pool.slab<int8_t>(kLayer, RICHENGINE_KV_KEYS, id)[index] *
+           pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[scale];
   }
 
   float value(uint32_t lane, uint32_t head, uint32_t token,
                uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = splash_kv_value_element(head, token % 32, dimension);
-    const uint64_t scale = splash_kv_scale_element(head, token % 32);
+    const uint64_t index = richengine_kv_value_element(head, token % 32, dimension);
+    const uint64_t scale = richengine_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
-      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_VALUES, id)[index]);
     if (layout.format == kv::Format::Int4) {
       // Values pack dim pairs at one token, token-major like the keys:
       // byte [head][token][dim/2].
       const uint64_t byte =
-          splash_kv_key_element(head, token % 32, dimension) / 2;
-      return packed4Code(pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[byte],
+          richengine_kv_key_element(head, token % 32, dimension) / 2;
+      return packed4Code(pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[byte],
                          dimension & 1) *
-             pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[scale];
+             pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[scale];
     }
-    return pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index] *
-           pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[scale];
+    return pool.slab<int8_t>(kLayer, RICHENGINE_KV_VALUES, id)[index] *
+           pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[scale];
   }
 };
 
@@ -336,7 +336,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     data.pages[lane].assign(ids.begin() + firstPage,
                             ids.begin() + firstPage + pageCounts[lane]);
     firstPage += pageCounts[lane];
-    data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
+    data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(RichKvPage));
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] =
         verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane])
@@ -345,15 +345,15 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
       const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
-        const uint64_t slot = splash_kv_scale_element(head, token % 32);
+        const uint64_t slot = richengine_kv_scale_element(head, token % 32);
         if (layout.format == kv::Format::Int4) {
           // INT4 codes are 16x smaller than INT8's; a realistic scale keeps
           // decoded magnitudes comparable so output rounding noise is too.
-          data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.096f;
-          data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.112f;
+          data.pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[slot] = 0.096f;
+          data.pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[slot] = 0.112f;
         } else if (layout.format == kv::Format::Int8) {
-          data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.006f;
-          data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.007f;
+          data.pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[slot] = 0.006f;
+          data.pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[slot] = 0.007f;
         }
         for (uint32_t dimension = 0; dimension < 256; dimension += 2) {
           const auto keyCode = [&](uint32_t d) {
@@ -372,13 +372,13 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
           };
           if (layout.format == kv::Format::Int4) {
             const uint64_t keyByte =
-                splash_kv_key_element(head, token % 32, dimension) / 2;
+                richengine_kv_key_element(head, token % 32, dimension) / 2;
             const uint64_t valueByte =
-                splash_kv_key_element(head, token % 32, dimension) / 2;
-            data.pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[keyByte] =
+                richengine_kv_key_element(head, token % 32, dimension) / 2;
+            data.pool.slab<uint8_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyByte] =
                 uint8_t((keyCode(dimension) & 0xF) |
                         (keyCode(dimension + 1) & 0xF) << 4);
-            data.pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[valueByte] =
+            data.pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[valueByte] =
                 uint8_t((valueCode(dimension) & 0xF) |
                         (valueCode(dimension + 1) & 0xF) << 4);
             continue;
@@ -386,15 +386,15 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
           for (const uint32_t d : {dimension, dimension + 1}) {
             const int key = keyCode(d);
             const int value = valueCode(d);
-            const uint64_t keyIndex = splash_kv_key_element(head, token % 32, d);
-            const uint64_t valueIndex = splash_kv_value_element(head, token % 32, d);
+            const uint64_t keyIndex = richengine_kv_key_element(head, token % 32, d);
+            const uint64_t valueIndex = richengine_kv_value_element(head, token % 32, d);
             if (layout.format == kv::Format::Int8) {
-              data.pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = key;
-              data.pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = value;
+              data.pool.slab<int8_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyIndex] = key;
+              data.pool.slab<int8_t>(kLayer, RICHENGINE_KV_VALUES, id)[valueIndex] = value;
             } else {
-              data.pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] =
+              data.pool.slab<uint16_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyIndex] =
                   floatToBf16(key * 0.006f);
-              data.pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] =
+              data.pool.slab<uint16_t>(kLayer, RICHENGINE_KV_VALUES, id)[valueIndex] =
                   floatToBf16(value * 0.007f);
             }
           }
@@ -542,12 +542,12 @@ std::vector<std::vector<std::byte>> expectedBf16Store(const Case &data) {
         const uint32_t token = data.stores[lane].committed_tokens + row;
         const uint32_t id = data.page(lane, token);
         const auto *page = data.pool.slab<uint16_t>(
-            kLayer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, id);
+            kLayer, tensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS, id);
         const uint32_t extent = id / data.pool.extentPages();
         for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
           for (uint32_t d = 0; d < 256; ++d) {
-            const uint64_t element = tensor ? splash_kv_value_element(head, token % 32, d)
-                                            : splash_kv_key_element(head, token % 32, d);
+            const uint64_t element = tensor ? richengine_kv_value_element(head, token % 32, d)
+                                            : richengine_kv_key_element(head, token % 32, d);
             const auto offset = reinterpret_cast<const std::byte *>(page + element) -
                                 data.pool.bytes(extent).data();
             const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) * data.stride * 256;
@@ -601,18 +601,18 @@ std::vector<std::vector<std::byte>> expectedInt4Store(const Case &data) {
                        : std::clamp(int(std::rint(element(d) * 7.0f / maximum)),
                                     -7, 7);
           };
-          const uint64_t scaleIndex = splash_kv_scale_element(head, token % 32);
+          const uint64_t scaleIndex = richengine_kv_scale_element(head, token % 32);
           const auto *scalePage = data.pool.slab<float>(
-              kLayer, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, id);
+              kLayer, tensor ? RICHENGINE_KV_VALUE_SCALES : RICHENGINE_KV_KEY_SCALES, id);
           const auto scaleOffset =
               reinterpret_cast<const std::byte *>(scalePage + scaleIndex) -
               data.pool.bytes(extent).data();
           std::memcpy(result[extent].data() + scaleOffset, &scale, sizeof(float));
           for (uint32_t d = 0; d < 256; d += 2) {
             const uint64_t element =
-                splash_kv_key_element(head, token % 32, d) / 2;
+                richengine_kv_key_element(head, token % 32, d) / 2;
             const auto *page = data.pool.slab<uint8_t>(
-                kLayer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, id);
+                kLayer, tensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS, id);
             const auto offset =
                 reinterpret_cast<const std::byte *>(page + element) -
                 data.pool.bytes(extent).data();

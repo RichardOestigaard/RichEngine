@@ -13,7 +13,7 @@
 #include <iostream>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 
 void compare(model::WeightFile file, const std::filesystem::path &target, uint64_t decayOffset = 0, uint32_t decayHeads = 0) {
   const auto &record = file.record();

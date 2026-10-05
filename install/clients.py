@@ -63,10 +63,10 @@ class _Server:
 
     @property
     def name(self):
-        """splash for the default port, 8000, and splash-<port> for another,
+        """richengine for the default port, 8000, and richengine-<port> for another,
         so a client's session keeps the server it was started for."""
         port = urllib.parse.urlsplit(self.base_url).port
-        return "splash" if port == 8000 else f"splash-{port}"
+        return "richengine" if port == 8000 else f"richengine-{port}"
 
 
 def find_executable(name):
@@ -136,7 +136,7 @@ def command(
     ):
         raise ClientError(
             "The server did not report its input modalities; it predates this "
-            "launcher, so restart it with this version of Splash"
+            "launcher, so restart it with this version of RichEngine"
         )
     environment = dict(os.environ if environment is None else environment)
     server = _Server(
@@ -144,7 +144,7 @@ def command(
         model,
         context,
         input_modalities,
-        environment.get("SPLASH_API_KEY") or "local",
+        environment.get("RICHENGINE_API_KEY") or "local",
     )
     # Each launch configures the private environment copy in place.
     match name:
@@ -204,7 +204,7 @@ def _opencode(path, server, environment, arguments, version):
         raise ClientError(OPENCODE_CONFIG_ERROR) from error
     if not isinstance(config, dict):
         raise ClientError(OPENCODE_CONFIG_ERROR)
-    served = f"splash/{server.model}"
+    served = f"richengine/{server.model}"
     config.update(model=served, small_model=served)
     # A user's global config may pin a model per agent, and an agent-level
     # model outranks the top-level one; point the built-in agents at the
@@ -214,11 +214,11 @@ def _opencode(path, server, environment, arguments, version):
         agents[agent] = {**_opencode_object(agents, agent), "model": served}
     provider = config["provider"] = _opencode_object(config, "provider")
     variants = {effort: {"reasoningEffort": effort} for effort in OPENCODE_EFFORTS}
-    variants |= _opencode_object(provider, "splash", "models", server.model, "variants")
+    variants |= _opencode_object(provider, "richengine", "models", server.model, "variants")
     output = server.response_tokens
-    provider["splash"] = {
+    provider["richengine"] = {
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Splash",
+        "name": "RichEngine",
         "options": {"baseURL": server.endpoint, "apiKey": server.api_key},
         "models": {
             server.model: {
@@ -278,14 +278,14 @@ def _selects_opencode_server(arguments):
 
 
 def _codex(path, server, environment, arguments):
-    environment["SPLASH_API_KEY"] = server.api_key
+    environment["RICHENGINE_API_KEY"] = server.api_key
     settings = {
         "model": json.dumps(server.model),
         "web_search": json.dumps("disabled"),
-        "model_provider": json.dumps("splash"),
-        "model_providers.splash": (
-            f'{{name="Splash",base_url={json.dumps(server.endpoint)},'
-            'env_key="SPLASH_API_KEY",wire_api="responses"}'
+        "model_provider": json.dumps("richengine"),
+        "model_providers.richengine": (
+            f'{{name="RichEngine",base_url={json.dumps(server.endpoint)},'
+            'env_key="RICHENGINE_API_KEY",wire_api="responses"}'
         ),
         "model_context_window": str(server.context),
         # Override a possible threshold from the user's other model. The
@@ -449,7 +449,7 @@ def _write_pi_provider(path, provider, server, environment):
         raise ClientError(invalid)
     # Pi expands the variable for each request. The server's key is never
     # saved, nor run as a command when it begins with "!".
-    api_key = "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
+    api_key = "$RICHENGINE_API_KEY" if environment.get("RICHENGINE_API_KEY") else "local"
     # Pi accepts only text and image input; any other entry invalidates the
     # user's whole models.json.
     vision = "image" in server.input_modalities

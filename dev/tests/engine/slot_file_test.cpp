@@ -23,17 +23,17 @@
 #include <utility>
 #include <vector>
 
-using splash::kHostPageBytes;
-using splash::model::DiskBudget;
-using splash::model::SlotFile;
-using splash::model::SlotRecord;
+using richengine::kHostPageBytes;
+using richengine::model::DiskBudget;
+using richengine::model::SlotFile;
+using richengine::model::SlotRecord;
 
 // A slot is its payload rounded up to whole host pages, as uncached IO wants.
 static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes) == kHostPageBytes &&
               SlotFile::slotBytesFor(kHostPageBytes + 1) == 2 * kHostPageBytes);
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Exception, typename Call>
 static bool throws(Call call) {
@@ -141,7 +141,7 @@ static void testScatteredSpans() {
 using Shape = std::vector<std::pair<size_t, bool>>;
 static std::vector<std::span<std::byte>> placeSpans(std::vector<std::byte> &storage,
                                                     const Shape &shape) {
-  const auto room = [](size_t bytes) { return splash::alignUp(bytes + 1); };
+  const auto room = [](size_t bytes) { return richengine::alignUp(bytes + 1); };
   size_t total = kHostPageBytes;
   for (const auto &[bytes, aligned] : shape) total += room(bytes);
   storage.assign(total, std::byte{0});
@@ -287,7 +287,7 @@ static void testPunchedSlotIsReusable() {
 class Directory final {
 public:
   Directory() {
-    std::string name = (std::filesystem::temp_directory_path() / "splash-slots-XXXXXX").string();
+    std::string name = (std::filesystem::temp_directory_path() / "richengine-slots-XXXXXX").string();
     require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
     path_ = name;
   }

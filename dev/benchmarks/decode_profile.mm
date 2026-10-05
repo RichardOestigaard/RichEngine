@@ -9,13 +9,13 @@
 // the gap between the sum of parts and the fused command shows how much a
 // cycle pays in dispatch boundaries rather than kernel work.
 
-#include "engine/Types.hpp"
+#include "engine/wire/Types.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
-#include "engine/MemoryGovernor.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
 
 #import <Foundation/Foundation.h>
@@ -34,8 +34,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 using metal::BackendInstrumentation;
 
 namespace {

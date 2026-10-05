@@ -1,9 +1,9 @@
-"""The model families Splash serves: each architecture's signature and the
+"""The model families RichEngine serves: each architecture's signature and the
 DFlash2 draft trained for it.
 
 A target is identified by its own configuration, never by its repository's
 name: an MLX config.json states it, and gguf.model_config derives the same
-fields from a GGUF header. Legacy Splash packages pack these same layouts.
+fields from a GGUF header. Legacy RichEngine packages pack these same layouts.
 """
 
 from __future__ import annotations
@@ -88,7 +88,9 @@ class ModelFamily:
     # states them and as gguf.model_config derives them from a GGUF header,
     # including every one the native source model inspection requires.
     signature: tuple[tuple[str, object], ...]
-    draft: Draft
+    # None for a family with no GPU draft; the n-gram predraft proposes
+    # for it.
+    draft: Draft | None = None
     # Whether the runtime serves this family's vision tower; a family without
     # one is installed text-only whatever --language-only says.
     vision: bool = True
@@ -109,6 +111,43 @@ FAMILIES = (
         ),
         Draft(
             "incoai/Qwen3.8-27B-DFlash2",
+            DFLASH2
+            + (
+                ("num_hidden_layers", 5),
+                ("hidden_size", 5120),
+                ("vocab_size", 248320),
+                ("intermediate_size", 17408),
+                ("num_attention_heads", 32),
+                ("num_key_value_heads", 8),
+                ("head_dim", 128),
+                ("dflash_config.selector_rank", 256),
+                ("dflash_config.mask_token_id", 248070),
+                ("dflash_config.target_layer_ids", (5, 19, 33, 47, 61)),
+            ),
+        ),
+    ),
+    # Prism ML's ternary Bonsai 2 is a Qwen3.8-27B (the GGUF's qwen35
+    # header states the same fields); its name alone selects it, so the
+    # signature's fields must not distinguish it. Its draft was continued
+    # on the ternary target (ProCreations/Ternary-Bonsai-2-27B-DFlash2,
+    # DFlash2DraftModel with the Qwen3.8 signature's field values).
+    ModelFamily(
+        "Bonsai-2-27B",
+        (
+            ("model_type", "qwen3_5_text"),
+            ("max_position_embeddings", 262144),
+            ("hidden_size", 5120),
+            ("num_hidden_layers", 64),
+            ("vocab_size", 248320),
+            ("num_attention_heads", 24),
+            ("num_key_value_heads", 4),
+            ("head_dim", 256),
+            # A field Qwen3.8-27B's signature omits keeps the otherwise
+            # identical geometry unambiguous: the longer signature wins.
+            ("partial_rotary_factor", 0.25),
+        ),
+        Draft(
+            "ProCreations/Ternary-Bonsai-2-27B-DFlash2",
             DFLASH2
             + (
                 ("num_hidden_layers", 5),
@@ -349,6 +388,42 @@ FAMILIES = (
                 ("dflash_config.num_target_layers", 24),
             ),
         ),
+        vision=False,
+    ),
+    ModelFamily(
+        "Granite-4.2-3B",
+        (
+            ("model_type", "granite"),
+            ("hidden_size", 2560),
+            ("num_hidden_layers", 40),
+            ("vocab_size", 100352),
+            ("num_attention_heads", 40),
+            ("num_key_value_heads", 8),
+            ("head_dim", 64),
+            ("intermediate_size", 8192),
+            ("max_position_embeddings", 131072),
+            ("rope_theta", 10000000.0),
+            ("attention_multiplier", 0.015625),
+        ),
+        None,
+        vision=False,
+    ),
+    ModelFamily(
+        "Granite-4.2-8B",
+        (
+            ("model_type", "granite"),
+            ("hidden_size", 4096),
+            ("num_hidden_layers", 40),
+            ("vocab_size", 100352),
+            ("num_attention_heads", 32),
+            ("num_key_value_heads", 8),
+            ("head_dim", 128),
+            ("intermediate_size", 12800),
+            ("max_position_embeddings", 131072),
+            ("rope_theta", 10000000.0),
+            ("attention_multiplier", 0.0078125),
+        ),
+        None,
         vision=False,
     ),
 )

@@ -11,7 +11,7 @@
 #include <optional>
 #include <sstream>
 
-namespace splash::model::gguf {
+namespace richengine::model::gguf {
 namespace {
 
 static_assert([] {
@@ -322,6 +322,14 @@ void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geomet
   expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
   if (arch == "lfm2" || arch == "lfm2moe")
     expect("shortconv.l_cache", geometry.convolutionTaps ? geometry.convolutionTaps : 3);
+  if (arch == "granite") {
+    // Granite's fixed softmax multiplier, and the unit scales we do not
+    // support: a 1.0 default may still be declared.
+    expectFloat("attention.scale", geometry.attentionScale);
+    expectFloat("embedding_scale", 1.0);
+    expectFloat("residual_scale", 1.0);
+    expectFloat("logit_scale", 1.0);
+  }
   if (arch == "lfm2moe") {
     // The sigmoid-gated MoE without a shared expert.
     expect("expert_count", geometry.experts);
@@ -342,7 +350,7 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   const std::string arch = geometry.architecture();
   if (file.architecture() != arch)
     throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
-  if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe") {
+  if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe" || arch == "granite") {
     requireNewTargetMetadata(file, geometry, arch);
     return;
   }
@@ -401,9 +409,9 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
   b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
   if (full) {
     // A "llama" GGUF stores each rotated head's q and k rows interleaved in
-    // rope pairs; the image deinterleaves them into splash's head-major
+    // rope pairs; the image deinterleaves them into richengine's head-major
     // order (gguf::RowOrder::rotaryInterleaved).
-    const RowOrder rope = arch == "llama"
+    const RowOrder rope = arch == "llama" || arch == "granite"
         ? RowOrder{0, g.attentionHeadDimension, 0, 0, true}
         : RowOrder{};
     b.quantized(p + "attn_q.weight",
@@ -513,4 +521,4 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
   return images;
 }
 
-} // namespace splash::model::gguf
+} // namespace richengine::model::gguf

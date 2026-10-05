@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 NativeRows::NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
   if (!gguf_embedding_format(formatId)) throw std::invalid_argument("unsupported native embedding format");
@@ -62,7 +62,7 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                metal::MetalBuffer proposedTokens,
                                metal::MetalBuffer verifyInputTokens,
                                uint32_t vocabulary, uint32_t lanes) {
-  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!vocabulary || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify input batch");
   const VerifyInputBatchParams params{vocabulary};
   // One static-parameter dispatch over stable arena buffers: replayable.
@@ -70,7 +70,7 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
+            params, {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS, 1, 1},
             {1, 1, 1});
   graph.endBakedSpan();
 }
@@ -81,7 +81,7 @@ void Embedding::addVerifyTreeInput(
     metal::MetalBuffer verifyInputTokens, metal::MetalBuffer positions,
     metal::MetalBuffer masks, const uint32_t base[][3], uint32_t vocabulary,
     uint32_t maskToken, uint32_t lanes) {
-  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !base)
+  if (!vocabulary || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !base)
     throw std::invalid_argument("invalid verify tree input batch");
   VerifyTreeInputParams params{};
   params.vocabulary = vocabulary;
@@ -94,21 +94,21 @@ void Embedding::addVerifyTreeInput(
              std::move(treeCounts), std::move(verifyInputTokens),
              std::move(positions), std::move(masks)},
             params,
-            {uint64_t{lanes} * SPLASH_TREE_VERIFY_NODES, 1, 1}, {1, 1, 1});
+            {uint64_t{lanes} * RICHENGINE_TREE_VERIFY_NODES, 1, 1}, {1, 1, 1});
 }
 
 void Embedding::addTreeCaptureGather(
     metal::CommandGraph &graph, metal::MetalBuffer source,
     metal::MetalBuffer retainedPath, metal::MetalBuffer retained,
     metal::MetalBuffer destination, uint32_t width, uint32_t lanes) {
-  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!width || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid tree capture gather");
   graph.add("tree_capture_gather",
             {std::move(source), std::move(retainedPath), std::move(retained),
              std::move(destination)},
             width,
-            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * width, 1, 1},
+            {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS * width, 1, 1},
             {1, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

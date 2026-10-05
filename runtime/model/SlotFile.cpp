@@ -24,7 +24,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct SlotFile::Backing {
   int descriptor = -1;
@@ -238,7 +238,7 @@ bool readAll(int descriptor, std::span<std::byte> bytes, off_t offset) {
 // The record file: a header naming what the slots are for, then one record
 // per slot index. A record is the payload's size and CRC-32C, the slot's
 // label, and a CRC-32C of all of that; an all-zero record is a free slot.
-// Fields are stored as this host lays them out: Splash runs on
+// Fields are stored as this host lays them out: RichEngine runs on
 // little-endian arm64 only.
 constexpr char kRecordsMagic[8] = {'S', 'P', 'L', 'A', 'S', 'H', 'S', 'F'};
 constexpr uint32_t kRecordsVersion = 1;
@@ -340,7 +340,7 @@ uint64_t fileBytes(int descriptor, const char *what) {
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
     : backing_(std::make_shared<Backing>()) {
   prepare(slotBytes, std::move(budget));
-  std::string name = (std::filesystem::temp_directory_path() / "splash-cache-XXXXXX").string();
+  std::string name = (std::filesystem::temp_directory_path() / "richengine-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)
     throw std::system_error(errno, std::generic_category(), "create slot file");
@@ -802,4 +802,4 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
   }, std::move(completion));
 }
 
-} // namespace splash::model
+} // namespace richengine::model

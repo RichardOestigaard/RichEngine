@@ -19,13 +19,13 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace splash::model {
+namespace richengine::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
 inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
 // Per-lane sampling uniforms handed to the sampler each cycle, in the
 // layout of metal/abi/Sampling.h.
-inline constexpr uint32_t kSamplingUniformCount = SPLASH_SAMPLING_UNIFORMS;
+inline constexpr uint32_t kSamplingUniformCount = RICHENGINE_SAMPLING_UNIFORMS;
 inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalTokens;
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
@@ -48,10 +48,15 @@ struct RuntimeGeometry final {
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = std::visit(
         [](const auto &weights) { return weights.layout; }, package.draft);
+    // A Null draft carries a placeholder layout only: it never encodes, so
+    // it needs no hidden/vocabulary agreement with the target. Real drafts
+    // still require a valid ring layout and matching sizes.
+    const bool nullDraft = result.draft.kind == DraftKind::Null;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize) {
+        (!nullDraft &&
+         (result.target.hiddenSize != result.draft.hiddenSize ||
+          result.target.vocabularySize != result.draft.vocabularySize ||
+          result.target.capturedHiddenSize() != result.draft.targetHiddenSize))) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     return result;
@@ -127,9 +132,16 @@ enum class PrefillTensor : uint32_t {
   // (ops::LinearScratch::input and ::sums, kernels/shared/gguf_mxfp4p.metal).
   LinearPacked,
   LinearExponents,
-  // WY/UT scratch of the chunked GDN scan (SPLASH_GDN_CHUNKED); zero-sized
+  // WY/UT scratch of the chunked GDN scan (RICHENGINE_GDN_CHUNKED); zero-sized
   // unless the flag selects a chunk factor.
   GdnChunkScratch,
+  // RICHENGINE_PREFILL_FAST_INT8 operand buffers: the two split terms' uint8
+  // codes (rows x inputSize) and their (scale, lo, Jx) float4 records
+  // (rows x inputSize/64); zero-sized unless the flag is set.
+  I8Codes,
+  I8CodesLo,
+  I8Params,
+  I8ParamsLo,
   Count,
 };
 
@@ -165,6 +177,26 @@ public:
     }
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
+    // The host writes these three tensors before every chunk; a submit-ahead
+    // chunk needs a bank the in-flight chunk does not read. Bank 0 is the
+    // arena view; bank 1 lives in its own small allocation.
+    uint64_t bankedBytes = 0;
+    for (const PrefillTensor tensor :
+         {PrefillTensor::InputTokens, PrefillTensor::TargetPositions,
+          PrefillTensor::DraftPositions})
+      bankedBytes += alignUp(sizes[static_cast<uint32_t>(tensor)]);
+    bankedBase_ = backend.allocateBuffer(bankedBytes, metal::BufferStorage::Shared,
+                                         "qwen-shared-prefill-inputs");
+    uint64_t bankedCursor = 0;
+    for (const PrefillTensor tensor :
+         {PrefillTensor::InputTokens, PrefillTensor::TargetPositions,
+          PrefillTensor::DraftPositions}) {
+      const uint32_t index = static_cast<uint32_t>(tensor);
+      if (sizes[index])
+        bankedTensors_[index] =
+            backend.view(bankedBase_, bankedCursor, sizes[index]);
+      bankedCursor += alignUp(sizes[index]);
+    }
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(
@@ -188,6 +220,14 @@ public:
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
     return tensors_[static_cast<uint32_t>(tensor)];
   }
+  // Bank 1 exists only for the host-written input tensors; every other
+  // tensor resolves to the same view at either bank.
+  [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor,
+                                       uint32_t bank) const {
+    const uint32_t index = static_cast<uint32_t>(tensor);
+    if (bank && bankedTensors_[index]) return bankedTensors_[index];
+    return tensors_[index];
+  }
   [[nodiscard]] ops::MoeScratch moeScratch() const {
     ops::MoeScratch scratch;
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
@@ -199,7 +239,9 @@ public:
 
 private:
   metal::MetalBuffer base_;
+  metal::MetalBuffer bankedBase_;
   std::array<metal::MetalBuffer, prefillTensorCount> tensors_{};
+  std::array<metal::MetalBuffer, prefillTensorCount> bankedTensors_{};
   uint64_t bytes_ = 0;
 };
 
@@ -234,6 +276,11 @@ enum class DecodeTensor : uint32_t {
   Logits,
   ArgmaxValues,
   ArgmaxIndices,
+  // The fused greedy head's per-(selected row, 128-column tile) argmax
+  // partials; sized rows * ceil(vocabulary / 128) each. Empty when the model
+  // never takes the fused path.
+  HeadArgmaxValues,
+  HeadArgmaxIndices,
   TargetPartialMasses,
   TargetVocabularyRows,
   TargetVocabularyRanges,
@@ -263,7 +310,7 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   // Verify-tree tables (draft_select_tree): packed node descriptors, node
-  // tokens and node counts, SPLASH_TREE_VERIFY_NODES-stride per lane.
+  // tokens and node counts, RICHENGINE_TREE_VERIFY_NODES-stride per lane.
   TreeNodes,
   TreeTokens,
   TreeCounts,
@@ -485,4 +532,4 @@ private:
   uint64_t bytes_ = 0;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

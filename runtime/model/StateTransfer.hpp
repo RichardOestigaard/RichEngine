@@ -2,7 +2,7 @@
 
 #include <memory>
 
-namespace splash {
+namespace richengine {
 
 class CompositeState;
 
@@ -33,4 +33,4 @@ public:
   state() const noexcept = 0;
 };
 
-} // namespace splash
+} // namespace richengine

@@ -5,6 +5,7 @@
 // kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal, and the
 // Apple9 register tile of kernels/decode/linear_gguf_sgmatrix.metal.
 #include "metal/abi/QuantFormat.h"
+#include "metal/abi/Sampling.h"
 
 // Vocabulary: a group is 32 inputs (the image's quantization unit), a span 64
 // (Table16's); a plane tile is QUANT_TILE_ROWS rows of the weight image, a
@@ -63,6 +64,15 @@ struct GgufDecodeParams {
   uint32_t out_offset;  // first destination column of the tensor
 };
 static_assert(sizeof(GgufDecodeParams) == 16, "GGUF decode parameters are 16 bytes on both sides");
+
+// The fused greedy head (gguf_decode_sg_*_l*_amax): the decode's parameters
+// plus the fused argmax's lane semantics, one payload for the kernel.
+struct GgufHeadArgmaxParams {
+  GgufDecodeParams decode;
+  HeadArgmaxParams head;
+};
+static_assert(sizeof(GgufHeadArgmaxParams) == 56,
+              "GGUF head argmax parameters are 56 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.

@@ -18,7 +18,7 @@
 #include <variant>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // A plain transformer DFlash draft (architectures: ["DFlashDraftModel"]):
 // per layer one fused QKV projection, per-head Q/K norms, an output
@@ -50,7 +50,7 @@ struct PlainDraftWeights final {
 
 inline constexpr std::string_view kPlainDraftMagic = "MDFP0005";
 
-// A Splash package's plain-draft files: layer-<N>.bin and model.bin, in the
+// An RichEngine package's plain-draft files: layer-<N>.bin and model.bin, in the
 // section order PlainDraft.cpp reads.
 struct PackedPlainDraftFiles final {
   WeightImages &images;
@@ -107,4 +107,4 @@ private:
   std::vector<ops::Projection> contextKvProjections_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

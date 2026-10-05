@@ -6,7 +6,7 @@
 #include <exception>
 #include <functional>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 struct RunTiming final {
   double gpuSeconds = 0;
@@ -114,4 +114,4 @@ measureWorkload(CandidateId candidate, const MeasurementRun &run,
                 const MeasurementOptions &options = {},
                 const MeasurementStop &shouldStop = {});
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

@@ -1,7 +1,7 @@
 """Compare a candidate build with a baseline build on one installed model.
 
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
---package MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
+--package MODEL_ROOT``. Each checkout's build/ holds richengine.metallib and
 engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
 too. The native benchmark's decode and partial scenarios run in ABBA order
 (baseline, candidate, candidate, baseline) on this machine, which must be
@@ -44,7 +44,7 @@ SCENARIOS = ("decode", "partial")
 WIDTHS = (1, 2, 3, 4)
 ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
-METALLIB = Path("build/splash.metallib")
+METALLIB = Path("build/richengine.metallib")
 PARTIAL = ("partial_4k_cold", "partial_4k_seed", "partial_4k_hit")
 
 

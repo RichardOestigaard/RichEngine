@@ -129,7 +129,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
       auto index = accumulated.get_multidimensional_index(i);
       float gate =
           float(auxiliary[index[1] * output_size + output_origin + index[0]]);
-      value = splash_silu(gate) * value;
+      value = richengine_silu(gate) * value;
     }
     if constexpr (AddResidual) {
       auto index = accumulated.get_multidimensional_index(i);

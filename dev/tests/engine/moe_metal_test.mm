@@ -31,30 +31,30 @@
 
 namespace {
 
-using splash::metal::BackendInstrumentation;
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::model::kBFloat16Bytes;
-using splash::model::q4PackedBytes;
-using splash::ops::AffineMoeWeights;
-using splash::ops::ExecutionPlans;
-using splash::ops::ExpertProjection;
-using splash::ops::kAssumedGpuCores;
-using splash::ops::kMoeScratchFields;
-using splash::ops::MoE;
-using splash::ops::MoeBuffers;
-using splash::ops::MoeConfig;
-using splash::ops::MoeScratchField;
-using splash::ops::MoeExpertSimdgroups;
-using splash::ops::MoeExpertTile;
-using splash::ops::MoePhase;
-using splash::ops::moeRouteWideRows;
-using splash::ops::MoePlan;
-using splash::ops::MoeShape;
-using splash::ops::MoeWeights;
-using splash::ops::Q8Projection;
+using richengine::metal::BackendInstrumentation;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::model::kBFloat16Bytes;
+using richengine::model::q4PackedBytes;
+using richengine::ops::AffineMoeWeights;
+using richengine::ops::ExecutionPlans;
+using richengine::ops::ExpertProjection;
+using richengine::ops::kAssumedGpuCores;
+using richengine::ops::kMoeScratchFields;
+using richengine::ops::MoE;
+using richengine::ops::MoeBuffers;
+using richengine::ops::MoeConfig;
+using richengine::ops::MoeScratchField;
+using richengine::ops::MoeExpertSimdgroups;
+using richengine::ops::MoeExpertTile;
+using richengine::ops::MoePhase;
+using richengine::ops::moeRouteWideRows;
+using richengine::ops::MoePlan;
+using richengine::ops::MoeShape;
+using richengine::ops::MoeWeights;
+using richengine::ops::Q8Projection;
 
 // 16 quant groups on the hidden side, so the 32-row expert tiles refill their
 // staged scales and biases several times, as the production shapes do.
@@ -97,7 +97,7 @@ private:
 // The production plans of a kGpuCores-core GPU of `family`: family 9 decodes
 // with the four-simdgroup 8-row tiles, other families with the shipped eight.
 ExecutionPlans plans(uint32_t family) {
-  splash::DeviceCapabilities device;
+  richengine::DeviceCapabilities device;
   device.appleGpuFamily = family;
   device.gpuCoreCount = kGpuCores;
   return ExecutionPlans(device);
@@ -148,7 +148,7 @@ ExpertSlab randomSlab(Random &random, uint32_t outputSize, uint32_t inputSize) {
   return slab;
 }
 
-void packSlab(const ExpertSlab &slab, const splash::test::AffineQ4Planes &planes) {
+void packSlab(const ExpertSlab &slab, const richengine::test::AffineQ4Planes &planes) {
   const uint32_t groups = slab.inputSize / 64;
   for (uint32_t n = 0; n < slab.outputSize; ++n) {
     for (uint32_t k = 0; k < slab.inputSize; ++k) {
@@ -225,8 +225,8 @@ Experts randomExperts(MetalBackend &backend, Random &random,
                       uint32_t experts, uint32_t outputSize,
                       uint32_t inputSize, const char *label) {
   Experts result;
-  result.projection = splash::test::expertSlabs(
-      backend, experts, outputSize, inputSize, label, [&](uint32_t, const splash::test::AffineQ4Planes &planes) {
+  result.projection = richengine::test::expertSlabs(
+      backend, experts, outputSize, inputSize, label, [&](uint32_t, const richengine::test::AffineQ4Planes &planes) {
         result.slabs.push_back(randomSlab(random, outputSize, inputSize));
         packSlab(result.slabs.back(), planes);
       });
@@ -527,7 +527,7 @@ template <class Function> void rejects(Function function, const char *label) {
 void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
-  const uint64_t tiles = splash::ops::moeMaximumTiles(plan.rows(), shape, plan.tileRows());
+  const uint64_t tiles = richengine::ops::moeMaximumTiles(plan.rows(), shape, plan.tileRows());
   const uint64_t grouped = tiles * plan.tileRows();
   const uint64_t routes = rows * shape.routesPerToken();
   const uint64_t outputWidth =
@@ -553,9 +553,9 @@ void planBounds() {
   // The wide-tile threshold scales with the planned core count.
   require(moeRouteWideRows(20) == 520 && moeRouteWideRows(40) == 1040 && moeRouteWideRows(10) == 260,
           "router wide-tile threshold does not scale with the core count");
-  require(splash::ops::moeRouteTile(519, 520).rows == 8 &&
-              splash::ops::moeRouteTile(520, 520).rows == 32 &&
-              splash::ops::moeRouteTile(832, moeRouteWideRows(kAssumedGpuCores)).rows == 32,
+  require(richengine::ops::moeRouteTile(519, 520).rows == 8 &&
+              richengine::ops::moeRouteTile(520, 520).rows == 32 &&
+              richengine::ops::moeRouteTile(832, moeRouteWideRows(kAssumedGpuCores)).rows == 32,
           "router tile selection ignores the configured threshold");
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                               MoeShape{2048, 256, 8, 512}}) {
@@ -595,10 +595,10 @@ void planBounds() {
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; an unknown family
   // and families 10 and later keep the shipped tile.
-  require(splash::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
-              splash::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
-              splash::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
+  require(richengine::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
+              richengine::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
+              richengine::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
+              richengine::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
           "decode expert simdgroups are not gated on GPU family 9");
 }
 
@@ -610,7 +610,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   require(dispatches.size() == 5 + expertPasses,
           "MoE plan must encode the entire operator");
   const auto route =
-      splash::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
+      richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
                                              : "moe_route_scores_q8_m32";
   const size_t experts = 4;
@@ -686,18 +686,18 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
       rejects([&] { MoE::add(graph, fixture.buffers, weights, plan); }, label);
       require(graph.empty(), "invalid weights partially encoded MoE");
     };
-    for (auto projection : {&splash::ops::AffineMoeWeights::router, &splash::ops::AffineMoeWeights::sharedScalarGate}) {
-      for (auto field : {&splash::ops::AffineWeights::weights, &splash::ops::AffineWeights::scales,
-                         &splash::ops::AffineWeights::biases}) {
+    for (auto projection : {&richengine::ops::AffineMoeWeights::router, &richengine::ops::AffineMoeWeights::sharedScalarGate}) {
+      for (auto field : {&richengine::ops::AffineWeights::weights, &richengine::ops::AffineWeights::scales,
+                         &richengine::ops::AffineWeights::biases}) {
         AffineMoeWeights shortWeights = fixture.weights.affine();
         auto &buffer = (shortWeights.*projection).planes.*field;
         buffer = backend.view(buffer, 0, buffer.sizeBytes() - 1);
         rejectWeights(shortWeights, "undersized Q8 weight view");
       }
     }
-    for (auto member : {&splash::ops::AffineMoeWeights::expertGate, &splash::ops::AffineMoeWeights::expertUp,
-                        &splash::ops::AffineMoeWeights::expertDown, &splash::ops::AffineMoeWeights::sharedGate,
-                        &splash::ops::AffineMoeWeights::sharedUp, &splash::ops::AffineMoeWeights::sharedDown}) {
+    for (auto member : {&richengine::ops::AffineMoeWeights::expertGate, &richengine::ops::AffineMoeWeights::expertUp,
+                        &richengine::ops::AffineMoeWeights::expertDown, &richengine::ops::AffineMoeWeights::sharedGate,
+                        &richengine::ops::AffineMoeWeights::sharedUp, &richengine::ops::AffineMoeWeights::sharedDown}) {
       const auto &source = fixture.weights.affine().*member;
       const uint64_t payload = q4PackedBytes(source.outputSize, source.inputSize);
       AffineMoeWeights changed = fixture.weights.affine();

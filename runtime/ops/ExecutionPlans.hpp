@@ -7,7 +7,7 @@
 
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The device's plans of every operator a model runs. One runtime owns this
 // object and production models borrow it; it never changes after creation.
@@ -51,4 +51,4 @@ private:
   uint32_t appleGpuFamily_ = 0;
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

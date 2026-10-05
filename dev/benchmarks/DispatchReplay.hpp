@@ -6,7 +6,7 @@
 #include <span>
 #include <string>
 
-namespace splash::benchmark {
+namespace richengine::benchmark {
 
 // GPU seconds per pipeline of a command whose every dispatch is submitted as
 // a command of its own.
@@ -19,4 +19,4 @@ replayDispatches(metal::MetalBackend &backend,
   return seconds;
 }
 
-} // namespace splash::benchmark
+} // namespace richengine::benchmark

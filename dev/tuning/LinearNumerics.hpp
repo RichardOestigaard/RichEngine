@@ -11,7 +11,7 @@
 // bf16 arithmetic and the split-K tolerance shared by the tuner's candidate
 // qualification and the Q4 kernel tests. Operand bounds use CPU-visible
 // buffers and do not submit GPU work.
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 inline float bf16ToFloat(uint16_t value) noexcept {
   return std::bit_cast<float>(uint32_t{value} << 16);
@@ -123,4 +123,4 @@ inline bool withinSplitTolerance(float actual, LinearEpilogue epilogue,
       std::fabs(actual - reference.value) <= splitTolerance(epilogue, reference, slack);
 }
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

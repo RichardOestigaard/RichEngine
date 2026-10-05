@@ -1,4 +1,4 @@
-"""Offline TurboQuant vs Splash int4/int8 KV experiment.
+"""Offline TurboQuant vs RichEngine int4/int8 KV experiment.
 
 Prefills a long prompt on mlx-community/Qwen3.8-27B-4bit, captures the KV
 cache, then for each quantization scheme: dequantize-in-place into the
@@ -19,7 +19,7 @@ DRAFT_TOKENS = 256
 
 
 def scalar_quant(x, bits):
-    """Splash-style symmetric quant, one fp32 scale per (token, head) vector."""
+    """RichEngine-style symmetric quant, one fp32 scale per (token, head) vector."""
     qmax = 2 ** (bits - 1) - 1
     scale = np.abs(x).max(axis=-1, keepdims=True) / qmax
     scale = np.maximum(scale, 1e-8)
@@ -118,7 +118,7 @@ def main():
 
     trial("bf16 (ref)")
     for b in (8, 4):
-        trial(f"splash int{b} K+V", lambda x, b=b: scalar_quant(x, b), lambda x, b=b: scalar_quant(x, b))
+        trial(f"richengine int{b} K+V", lambda x, b=b: scalar_quant(x, b), lambda x, b=b: scalar_quant(x, b))
     for kb, vb in ((4, 8), (6, 8), (4, 6), (8, 4), (8, 2), (4, 2)):
         trial(
             f"scalar K{kb} V{vb}",

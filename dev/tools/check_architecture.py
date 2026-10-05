@@ -226,7 +226,7 @@ def check() -> list[str]:
             if concrete_model_symbols.search(text):
                 errors.append(f"{name}: startup names a concrete model type")
         if name.startswith("runtime/engine/") and re.search(
-            r"^namespace splash\s*\{", text, re.MULTILINE
+            r"^namespace richengine\s*\{", text, re.MULTILINE
         ):
             errors.append(f"{name}: engine declarations leak into root namespace")
         if client_names.search(text):

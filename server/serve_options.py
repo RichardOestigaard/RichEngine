@@ -1,4 +1,4 @@
-"""The options `splash serve` and the server share: each flag's check, help
+"""The options `richengine serve` and the server share: each flag's check, help
 and default, and how the launcher passes a value on to the server.
 
 Standard library only, with the server modules that are too: the launcher
@@ -21,7 +21,7 @@ MAX_CONTEXT_TOKENS = 262144
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
 # Where --persistent-cache keeps its files unless --cache-dir says otherwise.
-DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/Splash/prefix-cache"
+DEFAULT_CACHE_DIR = Path.home() / "Library/Caches/RichEngine/prefix-cache"
 _SIZE_UNITS = {
     unit + suffix: 1024**power
     for power, unit in enumerate(("K", "M", "G"), 1)
@@ -276,9 +276,9 @@ SERVE_OPTIONS = (
             type=parse_reasoning_effort,
             metavar="{" + ",".join(REASONING_EFFORTS) + "}",
             help="Chat/Responses effort when unspecified (default: "
-            "SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+            "RICHENGINE_DEFAULT_REASONING_EFFORT or model template)",
         ),
-        environment="SPLASH_DEFAULT_REASONING_EFFORT",
+        environment="RICHENGINE_DEFAULT_REASONING_EFFORT",
     ),
     ServeOption(
         "--kv-format",
@@ -332,7 +332,7 @@ SERVE_OPTIONS = (
             default=None,
             metavar="DIRECTORY",
             help="where --persistent-cache keeps its files (default: "
-            "~/Library/Caches/Splash/prefix-cache)",
+            "~/Library/Caches/RichEngine/prefix-cache)",
         ),
     ),
     ServeOption(
@@ -417,9 +417,9 @@ SERVE_OPTIONS = (
         "--api-key",
         dict(
             type=parse_api_key,
-            help="API key (default: SPLASH_API_KEY environment variable)",
+            help="API key (default: RICHENGINE_API_KEY environment variable)",
         ),
-        environment="SPLASH_API_KEY",
+        environment="RICHENGINE_API_KEY",
         secret=True,
     ),
     ServeOption(
@@ -429,6 +429,16 @@ SERVE_OPTIONS = (
             default=False,
             help="let the Mac sleep automatically while requests run (default: it "
             "stays awake until they finish; the display may still sleep)",
+        ),
+    ),
+    ServeOption(
+        "--shared-prefix-state",
+        dict(
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="keep a reusable state where requests' shared system prompt "
+            "and tools end, so the next request with the same head resumes "
+            "there (default: on; --no-shared-prefix-state disables)",
         ),
     ),
     ServeOption(
@@ -466,9 +476,12 @@ def serve_argv(args):
         value = getattr(args, option.dest)
         if option.secret or value == option.default():
             continue
-        if option.options.get("action") == "store_true":
+        action = option.options.get("action")
+        if action == "store_true":
             argv.append(option.flag)
-        elif option.options.get("action") == "append":
+        elif action == argparse.BooleanOptionalAction:
+            argv.append(option.flag if value else f"--no-{option.flag[2:]}")
+        elif action == "append":
             argv.extend(f"{option.flag}={option.text(item)}" for item in value)
         else:
             argv.append(f"{option.flag}={option.text(value)}")

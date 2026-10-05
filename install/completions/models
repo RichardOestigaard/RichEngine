@@ -5,16 +5,16 @@ set -eu
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
 if [ -f "$root/release.json" ]; then
-    data_dir="$HOME/Library/Application Support/Splash"
+    data_dir="$HOME/Library/Application Support/RichEngine"
     models_dir="$data_dir/models"
 else
     data_dir="$root/build/runtime"
     models_dir="$root/install/models"
 fi
-# official-models.txt is generated from the Splash collection
+# official-models.txt is generated from the RichEngine collection
 # (dev/tools/update_model_catalog.py); suggested-models.txt names the upstream
 # models the README starts with. The cache is refreshed in the background by
-# `splash serve`; read as a union with the bundled catalogs so a missing or
+# `richengine serve`; read as a union with the bundled catalogs so a missing or
 # stale cache can only fail to add entries.
 cache_file="$data_dir/catalog/official-models.txt"
 
@@ -34,9 +34,9 @@ cache_file="$data_dir/catalog/official-models.txt"
         owner_directory=${directory%/*}
         printf '%s/%s\n' "${owner_directory##*/}" "$repository"
     done
-} | SPLASH_COMPLETION_PREFIX=${1-} LC_ALL=C awk '
+} | RICHENGINE_COMPLETION_PREFIX=${1-} LC_ALL=C awk '
     BEGIN {
-        prefix = ENVIRON["SPLASH_COMPLETION_PREFIX"]
+        prefix = ENVIRON["RICHENGINE_COMPLETION_PREFIX"]
         component = "^[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?$"
         variant = "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     }

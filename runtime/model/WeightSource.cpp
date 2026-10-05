@@ -10,7 +10,7 @@
 #include <string>
 #include <system_error>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 // A source is a model's own file, so its failures name it.
@@ -91,4 +91,4 @@ void SourceTensor::read(uint64_t at, std::span<uint8_t> destination) const {
   file->readData(offset + at, destination);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -1,1 +1,1 @@
-"""Splash development support."""
+"""RichEngine development support."""

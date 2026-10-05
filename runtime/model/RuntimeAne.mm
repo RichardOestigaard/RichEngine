@@ -1,6 +1,6 @@
 #include "model/RuntimeImpl.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
   // bf16 rows (the arena's hidden storage) to the fp16 the predictor
   // contracts name: a bf16 is the top half of a float's bits.
@@ -29,7 +29,7 @@ namespace splash::model {
     // The artifacts take fixed shapes: all kLaneCount lanes every call, the
     // unused tail zero-padded.
     input->lanes = kLaneCount;
-    input->hidden.resize(size_t{kLaneCount} * SPLASH_TARGET_VERIFY_ROWS *
+    input->hidden.resize(size_t{kLaneCount} * RICHENGINE_TARGET_VERIFY_ROWS *
                          hiddenSize);
     for (uint32_t lane = 0; lane < width; ++lane) {
       const DecodeLaneResult &result = lanes[lane];
@@ -38,7 +38,7 @@ namespace splash::model {
           decodeArena->get(lane, DecodeTensor::CapturedTargetHidden),
           "captured verify hidden");
       _Float16 *rows = input->hidden.data() +
-                       size_t{lane} * SPLASH_TARGET_VERIFY_ROWS * hiddenSize;
+                       size_t{lane} * RICHENGINE_TARGET_VERIFY_ROWS * hiddenSize;
       for (uint32_t row = 0; row < result.retained; ++row)
         bf16ToFp16Row(source + size_t{row} * hiddenSize,
                       rows + size_t{row} * hiddenSize, hiddenSize);
@@ -54,16 +54,16 @@ namespace splash::model {
       const uint32_t serial = ++medusaSerial_;
       aneMedusa_->submit([this, predictor, serial, input, hiddenSize] {
         std::vector<int32_t> tokens(
-            size_t{input->lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS, -1);
+            size_t{input->lanes} * RICHENGINE_DRAFT_PROPOSAL_TOKENS, -1);
         AneTensor hiddenIn{"hidden", AneDType::Float16,
-                           {input->lanes, SPLASH_TARGET_VERIFY_ROWS,
+                           {input->lanes, RICHENGINE_TARGET_VERIFY_ROWS,
                             static_cast<int64_t>(hiddenSize)},
                            input->hidden.data()};
         AneTensor retainedIn{"retained", AneDType::Int32,
                              {input->lanes},
                              const_cast<int32_t *>(input->retained.data())};
         AneTensor out{"leaf_tokens", AneDType::Int32,
-                      {input->lanes, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                      {input->lanes, RICHENGINE_DRAFT_PROPOSAL_TOKENS},
                       tokens.data()};
         const std::array<AneTensor, 2> inputs{hiddenIn, retainedIn};
         std::array<AneTensor, 1> outputs{out};
@@ -93,7 +93,7 @@ namespace splash::model {
       const uint32_t serial = ++predraftSerial_;
       anePredraft_->submit([this, predictor, serial, input, hiddenSize] {
         std::vector<int32_t> proposals(
-            size_t{input->lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS, -1);
+            size_t{input->lanes} * RICHENGINE_DRAFT_PROPOSAL_TOKENS, -1);
         std::array<int32_t, kLaneCount> anchors32{};
         std::array<int32_t, kLaneCount> positions32{};
         for (uint32_t lane = 0; lane < input->lanes; ++lane) {
@@ -106,13 +106,13 @@ namespace splash::model {
         AneTensor positionIn{"position", AneDType::Int32, {input->lanes},
                              positions32.data()};
         AneTensor hiddenIn{"hidden", AneDType::Float16,
-                           {input->lanes, SPLASH_TARGET_VERIFY_ROWS,
+                           {input->lanes, RICHENGINE_TARGET_VERIFY_ROWS,
                             static_cast<int64_t>(hiddenSize)},
                            input->hidden.data()};
         AneTensor retainedIn{"retained", AneDType::Int32, {input->lanes},
                              const_cast<int32_t *>(input->retained.data())};
         AneTensor out{"proposals", AneDType::Int32,
-                      {input->lanes, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                      {input->lanes, RICHENGINE_DRAFT_PROPOSAL_TOKENS},
                       proposals.data()};
         const std::array<AneTensor, 4> inputs{anchorIn, positionIn, hiddenIn,
                                               retainedIn};
@@ -128,8 +128,8 @@ namespace splash::model {
           if (ok) {
             for (uint32_t lane = 0; lane < input->lanes; ++lane)
               std::copy_n(proposals.data() +
-                              lane * SPLASH_DRAFT_PROPOSAL_TOKENS,
-                          SPLASH_DRAFT_PROPOSAL_TOKENS,
+                              lane * RICHENGINE_DRAFT_PROPOSAL_TOKENS,
+                          RICHENGINE_DRAFT_PROPOSAL_TOKENS,
                           aneProposals_[lane].data());
             predraftValid_ = true;
           }
@@ -186,9 +186,9 @@ namespace splash::model {
                       decodeArena->get(lane, DecodeTensor::ProposedTokens),
                       "ane proposals"),
                   aneProposals_[lane].data(),
-                  SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
+                  RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
     predraftValid_ = false;
     return true;
   }
 
-} // namespace splash::model
+} // namespace richengine::model

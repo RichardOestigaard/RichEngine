@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace splash::test {
+namespace richengine::test {
 
 // Prepares `lanes` verify blocks of the plain bf16 rows in `input`, `width`
 // wide, as the `layout` table and sums, with the dispatch the projections
@@ -38,4 +38,4 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
             {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
 }
 
-} // namespace splash::test
+} // namespace richengine::test

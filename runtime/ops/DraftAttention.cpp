@@ -9,16 +9,16 @@
 #include <utility>
 #include <vector>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
-constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
+constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kRows = RICHENGINE_DRAFT_QUERY_ROWS;
+constexpr uint32_t kWindow = RICHENGINE_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 // Each split leaves an (queries-per-KV-head x Rows) x (headDim + max + sum)
 // fp32 partial behind the grouped queries.
-constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+constexpr uint32_t kSplits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
 
 // The split partial block of one (lane, KV head, split): M = grouped query
 // rows (the head's query heads times the block rows), D = head dimension.
@@ -263,7 +263,7 @@ void DraftAttention::addDecode(
   requireBuffer(buffers.queryKeys, workspace.queryKeysBytes);
   requireBuffer(buffers.queryValues, workspace.queryValuesBytes);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    if (cacheLengths[lane] > SPLASH_MAXIMUM_CONTEXT_TOKENS)
+    if (cacheLengths[lane] > RICHENGINE_MAXIMUM_CONTEXT_TOKENS)
       throw std::invalid_argument("draft attention cache length exceeds limit");
     requireBuffer(buffers.persistentKeys[lane], ringBytes(shape));
     requireBuffer(buffers.persistentValues[lane], ringBytes(shape));
@@ -354,7 +354,7 @@ void DraftAttention::addContextCommit(
     throw std::invalid_argument("invalid draft context commit geometry");
   // Each lane commits up to its eight verify rows.
   requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
-                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+                       uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS, shape);
   requireBuffer(retainedCounts, uint64_t{lanes} * sizeof(uint32_t));
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBuffer(persistentKeys[lane], ringBytes(shape));
@@ -371,8 +371,8 @@ void DraftAttention::addContextCommit(
   bindings.push_back(std::move(retainedCounts));
   graph.add(headKernelName(headKernel(shape), "draft_context_kv_commit"),
             std::move(bindings), params,
-            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
+            {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
              1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

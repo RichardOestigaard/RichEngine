@@ -9,11 +9,11 @@
 
 namespace {
 
-using splash::engine::KvPool;
-using splash::metal::AllocationFailure;
-using splash::test::TestKvStorage;
+using richengine::engine::KvPool;
+using richengine::metal::AllocationFailure;
+using richengine::test::TestKvStorage;
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Error, typename Function>
 void requireThrows(Function &&function, const char *message) {
@@ -86,7 +86,7 @@ void testRunwayIsAllocatedThroughThePool() {
     bool refused = false;
     try {
         KvPool refusedPool(blocked, 4);
-    } catch (const splash::metal::MetalAllocationError &error) {
+    } catch (const richengine::metal::MetalAllocationError &error) {
         refused = error.failure() == AllocationFailure::EngineBudget;
     }
     require(refused, "a refused runway did not fail with the budget's cause");

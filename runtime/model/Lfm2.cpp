@@ -6,7 +6,7 @@
 #include <cstring>
 #include <type_traits>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 constexpr uint64_t kBfloat16 = kBFloat16Bytes;
@@ -129,4 +129,4 @@ Lfm2Weights loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
   return load(std::get<PackedTargetFiles<Lfm2Layout>>(files), affine);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

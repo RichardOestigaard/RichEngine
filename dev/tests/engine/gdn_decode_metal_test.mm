@@ -31,17 +31,17 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using namespace splash::ops;
-using namespace splash::test;
-using splash::ops::tuning::bf16ToFloat;
-using splash::ops::tuning::floatToBf16;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using namespace richengine::ops;
+using namespace richengine::test;
+using richengine::ops::tuning::bf16ToFloat;
+using richengine::ops::tuning::floatToBf16;
 
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
-constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kRows = RICHENGINE_TARGET_VERIFY_ROWS;
+constexpr uint32_t kMaxLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
@@ -96,14 +96,14 @@ double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
 // The production state cell layout: every layer's conv rows, then every
 // layer's recurrent state, both padded to 16 KiB.
 struct Cell final {
-  splash::model::GdnStateLayout layout;
+  richengine::model::GdnStateLayout layout;
   uint64_t convLayerBytes = 0;
   uint64_t recurrentLayerBytes = 0;
   uint64_t convBytes = 0;
   uint64_t bytes = 0;
 
   explicit Cell(const GdnShape &shape)
-      : layout{kLayers, splash::model::kGdnConvolutionTaps - 1, shape.convolutionDimension,
+      : layout{kLayers, richengine::model::kGdnConvolutionTaps - 1, shape.convolutionDimension,
                shape.valueHeads, shape.headDimension, shape.headDimension},
         convLayerBytes(layout.convolutionLayerBytes()),
         recurrentLayerBytes(layout.recurrentLayerBytes()),
@@ -716,7 +716,7 @@ void rejectsInvalid(MetalBackend &backend) {
     buffers.linearScratch.input = sharedBuffer(backend, 16);
     buffers.linearScratch.sums = sharedBuffer(backend, 4);
     GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
-                   splash::ops::LinearInput::Table64);
+                   richengine::ops::LinearInput::Table64);
   });
   rejects([&] {
     // Sums sized for the affine table are below the GGUF table's.

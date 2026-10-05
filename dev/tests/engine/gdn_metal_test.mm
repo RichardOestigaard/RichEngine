@@ -24,15 +24,15 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::GDN;
-using splash::ops::GdnHeadOrder;
-using splash::ops::GdnPrefillBuffers;
-using splash::ops::GdnShape;
-using splash::ops::NormWeights;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::GDN;
+using richengine::ops::GdnHeadOrder;
+using richengine::ops::GdnPrefillBuffers;
+using richengine::ops::GdnShape;
+using richengine::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
 constexpr double kEpsilon = 1e-6;
@@ -69,9 +69,9 @@ private:
 };
 
 uint16_t toBf16(double value) {
-  return splash::ops::tuning::floatToBf16(static_cast<float>(value));
+  return richengine::ops::tuning::floatToBf16(static_cast<float>(value));
 }
-double fromBf16(uint16_t value) { return splash::ops::tuning::bf16ToFloat(value); }
+double fromBf16(uint16_t value) { return richengine::ops::tuning::bf16ToFloat(value); }
 double roundBf16(double value) { return fromBf16(toBf16(value)); }
 double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
@@ -101,11 +101,11 @@ struct Worst final {
   }
 };
 
-// The WY/UT scratch of a chunked prefill (SPLASH_GDN_CHUNKED 32/64/128);
+// The WY/UT scratch of a chunked prefill (RICHENGINE_GDN_CHUNKED 32/64/128);
 // empty for the serial scan.
 MetalBuffer chunkScratch(MetalBackend &backend, const GdnShape &shape,
                          uint32_t tokens) {
-  const char *value = std::getenv("SPLASH_GDN_CHUNKED");
+  const char *value = std::getenv("RICHENGINE_GDN_CHUNKED");
   const uint32_t factor = value ? uint32_t(std::atoi(value)) : 0;
   if (factor != 32 && factor != 64 && factor != 128)
     return {};
@@ -185,7 +185,7 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
   auto *stateIn = data<float>(buffers.recurrentIn);
   for (uint64_t i = 0; i < stateElements; ++i)
     stateIn[i] = 0.05F * random.gauss();
-  buffers.mixerNorm = splash::test::makeNormWeights(backend, kHeadDim, float32, [&](uint32_t) {
+  buffers.mixerNorm = richengine::test::makeNormWeights(backend, kHeadDim, float32, [&](uint32_t) {
     return static_cast<float>(1.0 + 0.2 * random.gauss());
   });
   return buffers;
@@ -377,7 +377,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
     for (uint32_t head = 0; head < valueHeads; ++head) {
       const uint64_t base = (uint64_t{token} * valueHeads + head) * kHeadDim;
       const std::vector<double> normalized =
-          splash::test::rmsNorm(recurrent + base, buffers.mixerNorm, kHeadDim);
+          richengine::test::rmsNorm(recurrent + base, buffers.mixerNorm, kHeadDim);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
@@ -405,7 +405,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
         shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden sums out");
     MetalBuffer sums =
         shared(backend, uint64_t{tokens} * quantGroups * 4, "gate sums");
-    splash::metal::ComputeDispatch gate;
+    richengine::metal::ComputeDispatch gate;
     gate.pipelineName = std::string("prefill_gdn_gate_sums") +
                         (valueHeads == 32 ? "_vh32" : "") +
                         (float32 ? "_f32" : "");

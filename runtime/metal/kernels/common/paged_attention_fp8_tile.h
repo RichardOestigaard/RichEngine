@@ -12,7 +12,7 @@ using namespace mpp::tensor_ops;
 
 // Paged attention over FP8 E4M3 KV. The pages share the INT8 tier's layout:
 // one byte per element and one fp32 scale per (token, KV head), so the
-// SplashKvAddressing<int8_t> slabs address them — only the byte's meaning
+// RichKvAddressing<int8_t> slabs address them — only the byte's meaning
 // differs. matmul2d admits no bf16 left operand against an fp8 right
 // operand, so queries stage as fp16 (half x fp8 is a native operand pair);
 // a full-width fp16 query tile would overflow the 32 KB threadgroup budget
@@ -25,23 +25,23 @@ using namespace mpp::tensor_ops;
     defined(__HAVE_PACKED_NUMERIC_TYPE_PACK_UNPACK__)
 
 // Marker for FP8 KV pages: INT8 byte geometry and scales, e4m3 elements.
-struct SplashKvFp8E4m3 {};
+struct RichKvFp8E4m3 {};
 
 // The fp32 per-(token, head) scales keep the stored e4m3 codes in a range
 // where the format's 448 maximum is never reached and small elements keep
 // their mantissa bits. QK scores take the key scales exactly as the INT8
 // tile does; PV takes probability x value scale in fp16.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile,
-          uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-inline void splash_attention_page_softmax_fp8(
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+inline void richengine_attention_page_softmax_fp8(
     threadgroup const float *scores, threadgroup half *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start, uint fused_row_offset,
     uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index) {
-  constexpr uint N = SplashKvPageTokens;
+    uint thread_index, float qk_scale = 0.0f) {
+  constexpr uint N = RichKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = N / TokensPerLane;
@@ -67,7 +67,11 @@ inline void splash_attention_page_softmax_fp8(
     float4 low = scores4[0], high = scores4[1];
     low *= key_scales[vector];
     high *= key_scales[vector + 1];
-    constexpr float score_scale = HeadDim == 64 ? 0.125f : HeadDim == 128 ? 0.08838834764831845f : 0.0625f;
+    const float score_scale =
+        qk_scale != 0.0f ? qk_scale
+                         : (HeadDim == 64    ? 0.125f
+                            : HeadDim == 128 ? 0.08838834764831845f
+                                             : 0.0625f);
     low *= score_scale;
     high *= score_scale;
     score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
@@ -129,24 +133,24 @@ inline void splash_attention_page_softmax_fp8(
 // stage once per pass before the page loop: every page reads the same
 // MP x D tile, whose bf16 elements each convert once.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-inline void splash_paged_attention_tile_fp8(
-    device bfloat *tile_queries, device const SplashKvPage *page_table,
-    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+inline void richengine_paged_attention_tile_fp8(
+    device bfloat *tile_queries, device const RichKvPage *page_table,
+    RichKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup half *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     threadgroup half *staged_queries,
-    uint thread_index) {
+    uint thread_index, float qk_scale = 0.0f) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort MP = M / 2;
-  constexpr ushort N = SplashKvPageTokens;
+  constexpr ushort N = RichKvPageTokens;
   constexpr ushort D = HeadDim;
   static_assert(M % 2 == 0, "two row passes split the fused tile evenly");
   uint visible_tokens = committed_tokens + active_rows;
-  uint pages = splash_attention_pages(visible_tokens);
-  uint per_split = splash_attention_pages_per_split(pages, splits);
+  uint pages = richengine_attention_pages(visible_tokens);
+  uint per_split = richengine_attention_pages_per_split(pages, splits);
   uint page_begin = split * per_split;
   if (page_begin >= pages)
     return;
@@ -160,7 +164,7 @@ inline void splash_paged_attention_tile_fp8(
   auto pt =
       tensor(probabilities, dextents<int, 2>{N, MP}, array<int, 2>{1, N});
   auto p0 = pt.template slice<N, MP>(0, 0);
-  const SplashKvAddressing<KVHeads, int8_t, HeadDim> addressing(kv, kv_head);
+  const RichKvAddressing<KVHeads, int8_t, HeadDim> addressing(kv, kv_head);
   // QK writes a complete page score tile, the softmax applies an FP8 page's
   // key scales and PV accumulates the running output.
   constexpr auto qk_descriptor =
@@ -227,12 +231,12 @@ inline void splash_paged_attention_tile_fp8(
       if (thread_index == 0)
         atomic_store_explicit(rescale, 0u, memory_order_relaxed);
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      splash_attention_page_softmax_fp8<QueryHeadsPerKVHead, RowsPerTile / 2, HeadDim>(
+      richengine_attention_page_softmax_fp8<QueryHeadsPerKVHead, RowsPerTile / 2, HeadDim>(
           scores, probabilities, row_max, row_sum, previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales),
           reinterpret_cast<device const float4 *>(value_scales), token_start,
           row_offset, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          thread_index, qk_scale);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

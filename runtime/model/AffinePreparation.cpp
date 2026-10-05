@@ -10,7 +10,7 @@
 #include <functional>
 #include <stdexcept>
 
-namespace splash::model::affine {
+namespace richengine::model::affine {
 namespace {
 
 // Bytes per row of a 64-column group: codes, scales, biases.
@@ -271,4 +271,4 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
   parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
 }
 
-} // namespace splash::model::affine
+} // namespace richengine::model::affine

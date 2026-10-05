@@ -151,9 +151,9 @@ def dest(flag):
 
 class ServeOptionsTests(unittest.TestCase):
     def setUp(self):
-        # The parsers' defaults ignore the caller's Splash settings.
+        # The parsers' defaults ignore the caller's RichEngine settings.
         self.enterContext(mock.patch.dict(os.environ))
-        for name in ("SPLASH_API_KEY", "SPLASH_DEFAULT_REASONING_EFFORT"):
+        for name in ("RICHENGINE_API_KEY", "RICHENGINE_DEFAULT_REASONING_EFFORT"):
             os.environ.pop(name, None)
 
     def refuse(self, parse, arguments):
@@ -190,8 +190,8 @@ class ServeOptionsTests(unittest.TestCase):
 
     def test_both_parsers_check_defaults_from_the_environment(self):
         for name, value, flag in (
-            ("SPLASH_DEFAULT_REASONING_EFFORT", "low", "--default-reasoning-effort"),
-            ("SPLASH_API_KEY", "environment-key", "--api-key"),
+            ("RICHENGINE_DEFAULT_REASONING_EFFORT", "low", "--default-reasoning-effort"),
+            ("RICHENGINE_API_KEY", "environment-key", "--api-key"),
         ):
             for parse, required in PARSERS:
                 with (
@@ -247,7 +247,7 @@ class ServeOptionsTests(unittest.TestCase):
             },
         )
         self.assertFalse(any("secret-key" in argument for argument in argv))
-        self.assertEqual(environment, {"SPLASH_API_KEY": "secret-key"})
+        self.assertEqual(environment, {"RICHENGINE_API_KEY": "secret-key"})
         with mock.patch.dict(os.environ, environment):
             served = api.parse_args([*SERVER_ARGS, *argv])
         for option in serve_options.SERVE_OPTIONS:

@@ -1,8 +1,8 @@
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
-#include "engine/MemoryGovernor.hpp"
-#include "engine/MemoryPlan.hpp"
-#include "engine/Types.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
+#include "engine/memory/MemoryPlan.hpp"
+#include "engine/wire/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
@@ -29,10 +29,10 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 using metal::BackendInstrumentation;
-using splash::model::IdleMemory;
+using richengine::model::IdleMemory;
 
 namespace {
 
@@ -40,7 +40,7 @@ namespace {
   throw std::runtime_error(message);
 }
 
-using splash::test::require;
+using richengine::test::require;
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";

@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash {
+namespace richengine {
 
 // The server and this runtime write to the same stderr. Each line goes out
 // in one write, newline included, so that lines written at once stay whole.
@@ -27,4 +27,4 @@ inline void writeStderrLine(std::string_view text) noexcept {
   }
 }
 
-} // namespace splash
+} // namespace richengine

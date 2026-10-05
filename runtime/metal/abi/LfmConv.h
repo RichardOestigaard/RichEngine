@@ -13,7 +13,7 @@
 // and lane. `taps_major` records the conv weight's layout: [tap][channel]
 // when set, [channel][tap] otherwise — the order every current source
 // stores (a GGUF's squeezed [dim, 1, taps] HF tensor, packed and MLX).
-struct SplashLfmConvParams {
+struct RichLfmConvParams {
   uint32_t rows;            // rows this sequence or step computes
   uint32_t dimension;       // conv channels (the hidden size)
   uint32_t taps;            // kernel taps (3)
@@ -25,4 +25,4 @@ struct SplashLfmConvParams {
   uint64_t mixed_layer_stride; // bytes between layers' `mixed` blocks
 };
 
-typedef struct SplashLfmConvParams SplashLfmConvParams;
+typedef struct RichLfmConvParams RichLfmConvParams;

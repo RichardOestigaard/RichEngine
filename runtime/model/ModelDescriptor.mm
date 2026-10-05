@@ -18,7 +18,7 @@
 #include <system_error>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 struct GeometryField final {
@@ -139,6 +139,18 @@ void requireEqual(std::string_view actual, std::string_view expected,
     throw std::invalid_argument(std::string(label) + " mismatch: package " +
                                 std::string(actual) + ", runtime " +
                                 std::string(expected));
+  }
+}
+
+// A budget the source may declare smaller than the runtime's (an export
+// trimming the trained context); larger values are rejected.
+void requireAtMost(NSDictionary *object, NSString *key, uint64_t maximum,
+                   std::string_view label) {
+  const uint64_t actual = requireUnsigned(object, key, label);
+  if (actual > maximum) {
+    throw std::invalid_argument(std::string(label) + " mismatch: package " +
+                                std::to_string(actual) + ", runtime " +
+                                std::to_string(maximum));
   }
 }
 
@@ -450,6 +462,38 @@ ModelDescriptor lfm2moeDescriptor(std::string name) {
   return descriptor;
 }
 
+// Granite 4.2 ships no GPU draft (no DFlash/DSpark/MTP checkpoint exists);
+// the Null layout satisfies the geometry contract while the n-gram predraft
+// supplies every proposal.
+DFlashDraftLayout graniteNullDraftLayout(const GraniteLayout &target) {
+  // The planning paths still size draft workspaces from the layout, so it
+  // describes the compiled Q32K8D128 head even though nothing encodes.
+  DFlashDraftLayout layout;
+  layout.kind = DraftKind::Null;
+  layout.layers = 1;
+  layout.hiddenSize = target.hiddenSize;
+  layout.vocabularySize = target.vocabularySize;
+  layout.dynamicSize = 1280;
+  layout.qkvSize = 6144;
+  layout.attentionSize = 4096;
+  layout.intermediateSize = 17408;
+  layout.attentionHeadDimension = 128;
+  layout.targetHiddenSize = target.capturedHiddenSize();
+  layout.selectorRank = 256;
+  layout.kvHeads = 8;
+  return layout;
+}
+
+// The granite targets are text-only: no vision layout, no vision weights.
+ModelDescriptor graniteDescriptor(std::string name, const GraniteLayout &target) {
+  ops::VisionLayout vision;
+  vision.outputHiddenSize = target.hiddenSize;
+  ModelDescriptor descriptor = makeModelDescriptor(
+      std::move(name), target, graniteNullDraftLayout(target), vision);
+  descriptor.visionSource = VisionSource::None;
+  return descriptor;
+}
+
 ModelDescriptor qwen36Descriptor(std::string name) {
   constexpr Qwen3_6MoeLayout target;
   ops::VisionLayout vision;
@@ -474,9 +518,11 @@ void validateTokenizer(const std::filesystem::path &root,
       {{"hidden_size",
         std::visit([](const auto &layout) { return layout.hiddenSize; },
                    descriptor.target)},
-       {"vocab_size", descriptor.capabilities.vocabularySize},
-       {"max_position_embeddings",
-        descriptor.capabilities.maximumContextTokens}});
+       {"vocab_size", descriptor.capabilities.vocabularySize}});
+  // Exports disagree on the trained context (131072 vs 128000).
+  requireAtMost(text, @"max_position_embeddings",
+                descriptor.capabilities.maximumContextTokens,
+                "tokenizer max_position_embeddings");
 }
 
 // The dense qwen3_5_text package format, shared by the 27B and Ornith 9B;
@@ -654,7 +700,7 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
         d.causalLayers = 0;
         d.markovRank = static_cast<uint32_t>(
             requireUnsigned(draft, @"markov_rank", "draft markov_rank"));
-        requireEqual(d.markovRank, SPLASH_DRAFT_SELECTOR_RANK,
+        requireEqual(d.markovRank, RICHENGINE_DRAFT_SELECTOR_RANK,
                      "draft markov_rank");
         d.ropeInterleaved =
             [draft[@"rope_interleaved"] isEqual:@YES] ? 1 : 0;
@@ -809,7 +855,7 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
                   {"conv_group_size", kDraftConvolutionGroup},
                   {"conv_kernel_size", kDraftConvolutionTaps},
                   {"selector_rank", layout.selectorRank},
-                  {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
+                  {"selector_top_k", RICHENGINE_DRAFT_CANDIDATES},
                   {"mask_token_id", maskToken}});
   requireNumbers(requireArray(flash, @"target_layer_ids",
                               "draft config target_layer_ids"),
@@ -848,6 +894,20 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     result = lfm2Descriptor(name);
   } else if (type == "lfm2_moe") {
     result = lfm2moeDescriptor(name);
+  } else if (type == "granite") {
+    // Granite 4.2 3B/8B share model_type; hidden_size names the model.
+    const id hiddenValue = text[@"hidden_size"];
+    requireNumber(hiddenValue, [hiddenValue doubleValue],
+                  "text config hidden_size");
+    const uint64_t hidden = [hiddenValue unsignedLongLongValue];
+    if (hidden == GraniteLayout{}.hiddenSize) {
+      result = graniteDescriptor(name, GraniteLayout{});
+    } else if (hidden == granite8BLayout().hiddenSize) {
+      result = graniteDescriptor(name, granite8BLayout());
+    } else {
+      throw std::invalid_argument("unsupported granite hidden size: " +
+                                  std::to_string(hidden));
+    }
   } else {
     throw std::invalid_argument("unsupported model architecture: " + type);
   }
@@ -861,13 +921,32 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       // MiniCPM5's head_dim is implicit (hidden / heads).
       if (text[@"head_dim"])
         requireNumbers(text, {{"head_dim", layout.attentionHeadDimension}});
+    } else if constexpr (std::is_same_v<Layout, GraniteLayout>) {
+      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+          {"vocab_size", layout.vocabularySize},
+          {"num_attention_heads", layout.attentionQueryHeads},
+          {"num_key_value_heads", layout.attentionKvHeads},
+          {"intermediate_size", layout.intermediateSize},
+          {"max_position_embeddings", layout.maximumContextTokens},
+          {"rope_theta", 10000000u}});
+      // attention_multiplier is a float the GGUF metadata check verifies.
+      if (id value = text[@"attention_multiplier"];
+          [value isKindOfClass:[NSNumber class]] &&
+          std::abs([value doubleValue] - layout.attentionScale) >
+              layout.attentionScale * 1e-6)
+        throw std::invalid_argument(
+            "unsupported granite attention_multiplier: " +
+            std::to_string([value doubleValue]));
     } else if constexpr (std::is_same_v<Layout, Lfm2Layout>) {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+          {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads},
           {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2Layout::convolutionTaps},
           {"intermediate_size", layout.intermediateSize}});
+      // Exports disagree on the trained context (131072 vs 128000).
+      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                    "max_position_embeddings");
       // The conv/full_attention layer schedule of layer_types.
       NSArray *types = requireArray(text, @"layer_types", "target layer_types");
       requireEqual(types.count, layout.layers, "target layer_types count");
@@ -883,7 +962,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       }
     } else if constexpr (std::is_same_v<Layout, Lfm2MoeLayout>) {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+          {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads},
           {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2MoeLayout::convolutionTaps},
@@ -891,6 +970,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
           {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
           {"moe_intermediate_size", layout.expertIntermediateSize},
           {"num_dense_layers", Lfm2MoeLayout::denseLayers}});
+      // Exports disagree on the trained context (131072 vs 128000).
+      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                    "max_position_embeddings");
       // The conv/full_attention layer schedule of layer_types.
       NSArray *types = requireArray(text, @"layer_types", "target layer_types");
       requireEqual(types.count, layout.layers, "target layer_types count");
@@ -919,6 +1001,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
                   std::is_same_v<Layout, Qwen3_6MoeLayout>)
       validateTextConfig(text, layout, result.targetSource);
   }, result.target);
+  if (result.draft.kind != DraftKind::Null) {
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1)
@@ -1040,7 +1123,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.qkvSize = static_cast<uint32_t>((heads + 2 * kvHeads) * headDim);
     d.markovRank = static_cast<uint32_t>(
         requireUnsigned(draft, @"markov_rank", "draft markov_rank"));
-    requireEqual(d.markovRank, SPLASH_DRAFT_SELECTOR_RANK,
+    requireEqual(d.markovRank, RICHENGINE_DRAFT_SELECTOR_RANK,
                  "draft markov_rank");
     if (id markovType = draft[@"markov_head_type"])
       requireEqual(
@@ -1164,6 +1247,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
   }
+  }
 
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
@@ -1172,6 +1256,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     // runtime supports.
     if (std::holds_alternative<Ornith9BLayout>(result.target) ||
         std::holds_alternative<DenseLayout>(result.target) ||
+        std::holds_alternative<GraniteLayout>(result.target) ||
         std::holds_alternative<Lfm2Layout>(result.target) ||
         std::holds_alternative<Lfm2MoeLayout>(result.target))
       throw std::invalid_argument("unsupported vision source format: " + vision);
@@ -1245,8 +1330,14 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     const std::string format = requireString(
         requireObject(manifest, @"format", "model weight format"),
         @"name", "weight format");
+    // Packages published before the rename name their formats splash-packed-*;
+    // they are byte-identical to the richengine-packed-* names.
+    const std::string canonicalFormat =
+        format.starts_with("splash-packed-")
+            ? "richengine-packed-" + format.substr(14)
+            : format;
     ModelDescriptor descriptor;
-    if (format == "splash-packed-q4") {
+    if (canonicalFormat == "richengine-packed-q4") {
       // Both dense families share the packed format; the tokenizer config's
       // hidden size names the model.
       NSDictionary *tokenizerConfig =
@@ -1268,7 +1359,7 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
           weightFormat, descriptor, ornith ? &plainLayout : nullptr,
           ornith ? ornith9DFlash2DraftLayout() : DFlashDraftLayout{});
       validateQwen38(manifest, root, descriptor);
-    } else if (format == "splash-packed-q4-moe") {
+    } else if (canonicalFormat == "richengine-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
@@ -1276,19 +1367,19 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
       applyManifestDraftKind(weightFormat, descriptor, &plainLayout,
                              qwen36DraftLayout());
       validateQwen36(manifest, root, descriptor);
-    } else if (format == "splash-packed-q4-dense") {
+    } else if (canonicalFormat == "richengine-packed-q4-dense") {
       descriptor = denseDescriptor(model);
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
       applyDeclaredDraft(manifest, weightFormat, descriptor, denseDraftLayout());
       validateNewPackedFormat(manifest, root, descriptor, "minicpm");
-    } else if (format == "splash-packed-q4-lfm2") {
+    } else if (canonicalFormat == "richengine-packed-q4-lfm2") {
       descriptor = lfm2Descriptor(model);
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
       applyDeclaredDraft(manifest, weightFormat, descriptor, lfm2DraftLayout());
       validateNewPackedFormat(manifest, root, descriptor, "lfm2");
-    } else if (format == "splash-packed-q4-lfm2moe") {
+    } else if (canonicalFormat == "richengine-packed-q4-lfm2moe") {
       descriptor = lfm2moeDescriptor(model);
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
@@ -1304,4 +1395,4 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
   }
 }
 
-} // namespace splash::model
+} // namespace richengine::model

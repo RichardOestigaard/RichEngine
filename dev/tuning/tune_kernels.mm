@@ -4,8 +4,8 @@
 // one line per key: the winner with its paired GPU/wall gain, or "default
 // kept". With --candidates every timed candidate is listed, so a policy rule
 // can be judged by what it costs.
-#include "engine/MemoryGovernor.hpp"
-#include "engine/MemoryPlan.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "tuning/LinearTuning.hpp"
@@ -26,14 +26,14 @@
 #include <string_view>
 #include <vector>
 
-#ifndef SPLASH_BUILD_ID
+#ifndef RICHENGINE_BUILD_ID
 #error "tune-kernels requires the generated build identity"
 #endif
 
 namespace {
-using namespace splash;
-using namespace splash::ops;
-using namespace splash::ops::tuning;
+using namespace richengine;
+using namespace richengine::ops;
+using namespace richengine::ops::tuning;
 
 constexpr std::string_view kUsage =
     "usage: tune-kernels METALLIB MODEL_ROOT [--seconds PER_KEY] [--pairs N]\n"
@@ -246,7 +246,7 @@ int main(int argc, char **argv) {
 
       std::cout << "tune-kernels: " << device.deviceName << " (Apple GPU family "
                 << device.appleGpuFamily << "), model " << package->name() << ", build "
-                << SPLASH_BUILD_ID << "\n  " << options.measurement.samplePairs
+                << RICHENGINE_BUILD_ID << "\n  " << options.measurement.samplePairs
                 << " pairs per candidate, " << options.measurement.maximumWallSeconds
                 << " s per key\n";
       // The workloads keep only Affine64 weights, and a GGUF source prepares

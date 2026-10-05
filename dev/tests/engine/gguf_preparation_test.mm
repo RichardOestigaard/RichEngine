@@ -23,8 +23,8 @@ using namespace gguf_reference;
 
 namespace {
 
-namespace ops = splash::ops;
-using splash::metal::MetalBackend;
+namespace ops = richengine::ops;
+using richengine::metal::MetalBackend;
 
 // The source row image row n reads: order's grouped value heads read
 // llama.cpp's tiled ones.
@@ -411,7 +411,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
     input.insert(input.end(), native.begin(), native.end());
-    splash::test::writeFile(inputPath, input);
+    richengine::test::writeFile(inputPath, input);
     model::gguf::Repack step;
     step.format = f;
     step.rows = rows;
@@ -423,7 +423,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     model::gguf::Image plan;
     plan.bytes = bytes;
     plan.repacks.push_back(step);
-    const auto image = backend.allocateBuffer(bytes, splash::metal::BufferStorage::Shared, "repack-output");
+    const auto image = backend.allocateBuffer(bytes, richengine::metal::BufferStorage::Shared, "repack-output");
     // The writer writes every byte: none of these is left.
     std::memset(image.contents(), 0xFF, bytes);
     const auto before = backend.memoryStats();
@@ -465,7 +465,7 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "usage: gguf-preparation METALLIB GOLDENS\n");
       return 2;
     }
-    const splash::test::TemporaryDirectory directory("splash-gguf-preparation");
+    const richengine::test::TemporaryDirectory directory("richengine-gguf-preparation");
     const Goldens hashes = goldens(argv[2], @"gguf_images");
     MetalBackend backend(argv[1]);
     // First, so that the peak allocation it checks against is its own.

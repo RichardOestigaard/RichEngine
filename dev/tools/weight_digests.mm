@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 
 int main(int argc, char **argv) {
   @autoreleasepool {

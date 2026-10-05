@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
 
@@ -55,4 +55,4 @@ struct GgufPlaneBytes {
   return columns / format.block_elements * format.block_bytes;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

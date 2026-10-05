@@ -7,12 +7,13 @@
 #include <memory>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct Qwen3_8Layout;
 struct Ornith9BLayout;
 struct Qwen3_6MoeLayout;
 struct DenseLayout;
+struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
 
@@ -32,6 +33,7 @@ public:
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const DenseLayout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2Layout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2MoeLayout &layout);
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const GraniteLayout &layout);
   ~AffineTargetLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
@@ -49,5 +51,6 @@ private:
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const DenseLayout &layout);
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Lfm2Layout &layout);
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Lfm2MoeLayout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const GraniteLayout &layout);
 
-} // namespace splash::model
+} // namespace richengine::model

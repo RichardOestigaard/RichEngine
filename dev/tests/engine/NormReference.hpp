@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace splash::test {
+namespace richengine::test {
 
 // `size` weights holding value(0), value(1), ... in that order, stored as
 // F32 when `float32` and rounded to bf16 otherwise.
@@ -62,4 +62,4 @@ inline bool roundedOnceToBf16(uint16_t got, double exact) {
       0.5 * ops::tuning::ulpBf16(float(exact)) * (1 + 1.0 / 256);
 }
 
-} // namespace splash::test
+} // namespace richengine::test

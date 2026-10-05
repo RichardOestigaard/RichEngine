@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::test::gguf {
+namespace richengine::test::gguf {
 
 using Bytes = std::vector<uint8_t>;
 
@@ -115,4 +115,4 @@ inline Bytes file(const std::vector<Key> &keys, const std::vector<Tensor> &tenso
   return out;
 }
 
-} // namespace splash::test::gguf
+} // namespace richengine::test::gguf

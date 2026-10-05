@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 PageStorage::PageStorage(metal::MetalBackend &backend,
     metal::AllocationAdmission admitAllocation, Layout layout,
@@ -22,10 +22,10 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument("KV page storage layout is invalid");
     }
     // Page entries carry the index in an extent in their low bits, and
-    // SplashKvLayer places a layer's region with a 32-bit offset, so an
+    // RichKvLayer places a layer's region with a 32-bit offset, so an
     // extent stays below 4 GiB.
     if (!extentPages_ || extentPages_ % layout_.extentAlignmentPages() ||
-        extentPages_ > SPLASH_KV_PAGE_INDEX_MASK ||
+        extentPages_ > RICHENGINE_KV_PAGE_INDEX_MASK ||
         extentBytes() > std::numeric_limits<uint32_t>::max() ||
         extentBytes() > backend_.capabilities().maxBufferLengthBytes) {
         throw std::invalid_argument("KV extent geometry is invalid");
@@ -37,7 +37,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
+        layers_.push_back(richengine_kv_layer(extentPages_, data, scale, layer));
     extents_.resize(pageCount_ / extentPages_);
     extentAddresses_.resize(extents_.size());
 }
@@ -69,7 +69,7 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
         metal::MetalBuffer allocated = backend_.allocateBuffer(
             bytes, metal::BufferStorage::Shared,
             "kv-extent-" + std::to_string(extent * extentPages_));
-        if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
+        if (allocated.gpuAddress() & RICHENGINE_KV_PAGE_INDEX_MASK) {
             throw std::logic_error(
                 "KV extent address leaves no room for the page index");
         }
@@ -113,22 +113,22 @@ void PageStorage::copyPages(std::span<const PageCopy> copies) {
     }
 }
 
-SplashKvPage PageStorage::entry(uint32_t page) const {
+RichKvPage PageStorage::entry(uint32_t page) const {
     const size_t extent = extentIndex(page);
     const uint64_t address = extentAddresses_[extent];
     if (!address) {
         throw std::logic_error("KV page " + std::to_string(page) +
                                " is in an extent that is not allocated");
     }
-    return splash_kv_page_entry(
+    return richengine_kv_page_entry(
         address, page - static_cast<uint32_t>(extent) * extentPages_);
 }
 
 void PageStorage::writeEntries(std::span<const uint32_t> pages,
                                uint32_t first,
                                const metal::MetalBuffer &table) const {
-    auto *entries = static_cast<SplashKvPage *>(table.contents());
-    if (!entries || table.sizeBytes() / sizeof(SplashKvPage) < pages.size()) {
+    auto *entries = static_cast<RichKvPage *>(table.contents());
+    if (!entries || table.sizeBytes() / sizeof(RichKvPage) < pages.size()) {
         throw std::logic_error(
             "KV page table is not CPU-visible or too small for its entries");
     }
@@ -153,10 +153,10 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     std::vector<std::span<std::byte>> result;
     result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
+        for (uint32_t tensor = RICHENGINE_KV_KEYS; tensor <= RICHENGINE_KV_VALUE_SCALES;
              ++tensor) {
-            if (const uint32_t bytes = splash_kv_page_bytes(data, scale, tensor)) {
-                result.emplace_back(extent + splash_kv_offset(extentPages_, data,
+            if (const uint32_t bytes = richengine_kv_page_bytes(data, scale, tensor)) {
+                result.emplace_back(extent + richengine_kv_offset(extentPages_, data,
                                                               scale, layer,
                                                               tensor, index),
                                     bytes);
@@ -166,4 +166,4 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     return result;
 }
 
-}  // namespace splash::kv
+}  // namespace richengine::kv

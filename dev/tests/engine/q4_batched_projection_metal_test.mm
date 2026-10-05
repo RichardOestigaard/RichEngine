@@ -22,10 +22,10 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::ComputeDispatch;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
+using richengine::metal::BufferStorage;
+using richengine::metal::ComputeDispatch;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
 
 constexpr uint32_t kRows = 8;
 constexpr uint32_t kMaximumBatch = 4;
@@ -131,19 +131,19 @@ struct Guarded final {
 };
 
 struct SplitCase final {
-  splash::ops::LinearMatrix matrix;
-  splash::ops::LinearEpilogue epilogue;
-  splash::ops::FloatOutput destination;
+  richengine::ops::LinearMatrix matrix;
+  richengine::ops::LinearEpilogue epilogue;
+  richengine::ops::FloatOutput destination;
   uint32_t splits;
 };
 
 std::string describe(const SplitCase &c) {
-  using splash::ops::LinearEpilogue;
+  using richengine::ops::LinearEpilogue;
   return "Split128 " + std::to_string(c.matrix.outputSize) + "x" + std::to_string(c.matrix.inputSize) + " S" +
          std::to_string(c.splits) +
          (c.epilogue == LinearEpilogue::Residual ? " residual" : c.epilogue == LinearEpilogue::GateUp ? " gate/up"
                                                                                                         : " plain") +
-         (c.destination == splash::ops::FloatOutput::Float32 ? " fp32" : "");
+         (c.destination == richengine::ops::FloatOutput::Float32 ? " fp32" : "");
 }
 
 // Runs `plan` over `rows` rows of the operands (`input`, and `residual` for a
@@ -154,11 +154,11 @@ std::string describe(const SplitCase &c) {
 // the plan's, and its guard band, hold bf16 NaN, so a read past the plan's
 // rows or inputs that reaches a stored element poisons it. Fails on a write
 // past any buffer or a counter left nonzero.
-std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Linear &linear,
-                                  const splash::ops::LinearPlan &plan, const SplitCase &c,
-                                  const splash::ops::Projection &up, const splash::ops::Projection &gate,
+std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const richengine::ops::Linear &linear,
+                                  const richengine::ops::LinearPlan &plan, const SplitCase &c,
+                                  const richengine::ops::Projection &up, const richengine::ops::Projection &gate,
                                   const uint16_t *input, const uint16_t *residual, const MetalBuffer &poison) {
-  using namespace splash::ops;
+  using namespace richengine::ops;
   const auto [n, k] = c.matrix;
   const uint32_t rows = plan.storageRows();
   const LinearScratchSize scratch = plan.scratchSize();
@@ -179,11 +179,11 @@ std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Line
   LinearBuffers buffers{operand(input, k), output.view, {}, residualEpilogue ? operand(residual, n) : MetalBuffer{},
                         gateScratch ? gateScratch->view : MetalBuffer{}, {},
                         LinearScratch{{}, {}, partials.view, counters.view}};
-  splash::metal::CommandGraph projection;
+  richengine::metal::CommandGraph projection;
   linear.add(projection, buffers, up, plan, c.epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
   // The poison before each of the plan's dispatches (gate/up runs two), and
   // the output's before the second run.
-  splash::metal::CommandGraph poisoning;
+  richengine::metal::CommandGraph poisoning;
   poisoning.add("test_copy_u32", {poison, partials.view}, uint32_t(scratch.partials / 4),
                 {uint32_t((scratch.partials / 4 + 255) / 256), 1, 1}, {256, 1, 1});
   poisoning.add("test_copy_u32", {poison, output.view}, uint32_t(output.bytes / 4),
@@ -211,12 +211,12 @@ std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const splash::ops::Line
 // (N256 for fused gate/up, with the exact gate and up projections of the
 // plain N128 tile), tuning/LinearNumerics.hpp.
 void splitCase(MetalBackend &backend, const SplitCase &c) {
-  using namespace splash::ops;
-  using namespace splash::ops::tuning;
+  using namespace richengine::ops;
+  using namespace richengine::ops::tuning;
   const auto [n, k] = c.matrix;
   const Linear linear(backend.capabilities());
-  const Projection up = splash::test::deterministicQ4Projection(backend, c.matrix, 31);
-  const Projection gate = splash::test::deterministicQ4Projection(backend, c.matrix, 157);
+  const Projection up = richengine::test::deterministicQ4Projection(backend, c.matrix, 31);
+  const Projection gate = richengine::test::deterministicQ4Projection(backend, c.matrix, 157);
   MetalBuffer input = shared(backend, uint64_t{kSplitMaximumRows} * k * 2, "q4-split-input");
   MetalBuffer residual = shared(backend, uint64_t{kSplitMaximumRows} * n * 2, "q4-split-residual");
   std::mt19937 random(n * 31 + k);
@@ -257,7 +257,7 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
                      {tile, n / (tile == LinearTile::N256 ? 256 : 128)}, FloatOutput::BFloat16);
     MetalBuffer output = shared(backend, uint64_t{kRows} * n * 2, "q4-split-reference");
     MetalBuffer gateScratch = shared(backend, std::max<uint64_t>(reference.gateScratchBytes(), 2), "q4-split-gate");
-    splash::metal::CommandGraph graph;
+    richengine::metal::CommandGraph graph;
     linear.add(graph, {input, output, {}, epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
                        reference.gateScratchBytes() ? gateScratch : MetalBuffer{}, {}},
                weights, reference, epilogue == LinearEpilogue::GateUp ? &gate : nullptr);
@@ -298,15 +298,15 @@ void splitCase(MetalBackend &backend, const SplitCase &c) {
 }
 
 void splitTiles(MetalBackend &backend) {
-  using splash::ops::FloatOutput;
-  using splash::ops::LinearEpilogue;
+  using richengine::ops::FloatOutput;
+  using richengine::ops::LinearEpilogue;
   // The 35B mixer output; 17408 inputs in 8 or 9 blocks per partition; 25600
   // inputs, the largest production K (the 27B draft's context projection), in
   // 25 blocks per partition at four splits and 12 or 13 at eight; 5 and 9
   // blocks, partitions of one to three; the 248320-column vocabulary head, the
   // largest N, over two single-block partitions.
   struct Shape {
-    splash::ops::LinearMatrix matrix;
+    richengine::ops::LinearMatrix matrix;
     std::vector<uint32_t> splits;
   };
   for (const Shape &shape : {Shape{{2048, 4096}, {2, 4, 8}}, Shape{{512, 17408}, {8}}, Shape{{256, 25600}, {4, 8}},

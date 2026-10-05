@@ -5,7 +5,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 ops::VisionAffine readAffine(WeightFile &file, uint32_t outputSize,
@@ -91,4 +91,4 @@ QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImag
   return readVision(backend, images, source.image(), source.layout());
 }
 
-} // namespace splash::model
+} // namespace richengine::model

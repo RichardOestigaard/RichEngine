@@ -4,7 +4,7 @@
 
 #include <chrono>
 
-namespace splash {
+namespace richengine {
 
 // The clock the runtime measures every duration, timeout and keep-alive on:
 // the time the Mac has been awake. The standard library's steady clock reads
@@ -31,4 +31,4 @@ struct AwakeClock final {
   return std::chrono::duration<double, std::milli>(AwakeClock::now() - start).count();
 }
 
-} // namespace splash
+} // namespace richengine

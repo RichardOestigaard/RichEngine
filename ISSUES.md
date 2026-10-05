@@ -59,12 +59,12 @@ Left in-tree for reference; serial scan remains the production path.
 ### Native MXFP4 prefill slower than staged
 `gguf_prefill_mxfp4p`/`gguf_decode_mxfp4p` p-path loses ~11–13% vs the staged
 fp16 prefill tile (compute-bound — fp4 operands don't help there). Kept
-opt-in under `SPLASH_GGUF_PACKED_ON`.
+opt-in under `RICHENGINE_GGUF_PACKED_ON`.
 
 ### Packed GGUF decode formats slower
 Native operand kernels (q40m/q41m/q4km/q80m/pq20m) lose 2.5–4× when restaging
 and ~0–35% behind staged even with pre-packed activations. Kernels kept,
-dispatch stays staged; `SPLASH_GGUF_PACKED_ON` opts in.
+dispatch stays staged; `RICHENGINE_GGUF_PACKED_ON` opts in.
 
 ## Draft / model coverage
 
@@ -76,7 +76,7 @@ config doesn't contradict it. A GGUF mislabeled without any Ornith name
 still resolves to Qwen3.6.
 
 ### Ornith draft sliding-window depth
-Engine ring is `SPLASH_DRAFT_SLIDING_WINDOW`=2048; the Ornith drafts declare
+Engine ring is `RICHENGINE_DRAFT_SLIDING_WINDOW`=2048; the Ornith drafts declare
 4096. Draft quality degrades beyond 2048 ctx; verify correctness unaffected.
 
 ### `draft_select_plain` q-probabilities

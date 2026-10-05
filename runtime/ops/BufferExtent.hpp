@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The bytes from the start of a buffer to one past the last element of
 // `rows` rows of `width` elements of `elementBytes` bytes, `stride` elements
@@ -26,4 +26,4 @@ inline void requireBytes(const metal::MetalBuffer &buffer, uint64_t bytes, std::
                                 " bytes, needs " + std::to_string(bytes));
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

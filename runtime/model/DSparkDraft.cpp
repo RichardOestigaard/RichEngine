@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
@@ -19,9 +19,9 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.kvHeads || !layout.markovRank) {
     throw WeightStoreError("DSpark draft layout contains a zero dimension");
   }
-  if (layout.markovRank != SPLASH_DRAFT_SELECTOR_RANK) {
+  if (layout.markovRank != RICHENGINE_DRAFT_SELECTOR_RANK) {
     throw WeightStoreError("the DSpark selector kernel is compiled for rank " +
-                           std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
+                           std::to_string(RICHENGINE_DRAFT_SELECTOR_RANK));
   }
   validateQ4Layout(layout.qkvSize, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, layout.attentionSize);
@@ -91,7 +91,8 @@ void DSparkDraft::addContextPrefill(
   operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
                                      weights_.contextProjection, rows);
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows);
+                                 buffers.projected, buffers.projectionSums, rows,
+                                 buffers.linearScratch);
   ops::Normalization::addRmsWithQ4Sums(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
       buffers.projectionSums, layout.hiddenSize, rows);
@@ -99,7 +100,8 @@ void DSparkDraft::addContextPrefill(
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addPrefill(graph, buffers.hidden,
                       contextKvProjections_[layer],
-                      buffers.contextKv, buffers.projectionSums, rows);
+                      buffers.contextKv, buffers.projectionSums, rows,
+                      buffers.linearScratch);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -170,11 +172,11 @@ void DSparkDraft::addDecode(
         cacheLengths, attentionPlan, causal);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
-    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
-               weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
-    ops::DraftAttention::addResidual(graph, buffers.projected,
-                                     buffers.hidden[current],
-                                     buffers.residual, attentionPlan);
+    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.residual,
+                       .residual = buffers.hidden[current], .scratch = scratch},
+               weights.outputProjection,
+               linear.decodePlan(weights.outputProjection, lanes,
+                                 ops::LinearEpilogue::Residual));
     const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
@@ -186,11 +188,11 @@ void DSparkDraft::addDecode(
                weights.upProjection,
                linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
                &weights.gateProjection);
-    linear.add(graph, {.input = buffers.intermediate, .output = buffers.projected, .scratch = scratch},
-               weights.downProjection, linear.decodePlan(weights.downProjection, lanes));
-    ops::DraftAttention::addResidual(graph, buffers.projected,
-                                     buffers.residual,
-                                     buffers.hidden[next], attentionPlan);
+    linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
+                       .residual = buffers.residual, .scratch = scratch},
+               weights.downProjection,
+               linear.decodePlan(weights.downProjection, lanes,
+                                 ops::LinearEpilogue::Residual));
   }
 
   // The final norm feeds the shared vocabulary head; the DSpark selector
@@ -339,4 +341,4 @@ DSparkDraftWeights loadDSparkDraftWeights(metal::MetalBackend &backend,
   return readDraft(backend, std::get<PackedDSparkDraftFiles>(files), layout);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

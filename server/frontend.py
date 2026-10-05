@@ -7,6 +7,7 @@ import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
@@ -53,7 +54,7 @@ _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPrior
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 FLOAT32_MAX = float.fromhex("0x1.fffffep127")
 # vLLM raises a nonzero temperature below this to it (_MAX_TEMP in
-# vllm/sampling_params.py); Splash does the same.
+# vllm/sampling_params.py); RichEngine does the same.
 MIN_SAMPLING_TEMPERATURE = 0.01
 
 # The sampling numbers a request may set: each with its default (Qwen's
@@ -115,8 +116,13 @@ def _drop_nulls(body, extras):
 COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
+# What follows the leading system prompt and tools in the probe that finds
+# their shared prefix: a first turn no request's own is likely to begin with.
+SHARED_PREFIX_PROBE = {"role": "user", "content": "⁣"}
+
+
 # A stable marker lets repeated image requests reuse the compiled template.
-IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+IMAGE_RENDER_MARKER = f"__richengine_image_{secrets.token_hex(16)}__"
 
 
 def _generation_prompt(probed, rendered, tokens):
@@ -225,7 +231,7 @@ class Prompt:
     # The request's own chat_template_kwargs enable_thinking, which outranks
     # its reasoning effort (template_options); None where it sets none.
     enable_thinking: bool | None = None
-    # Its other template variables, which outrank Splash's own.
+    # Its other template variables, which outrank RichEngine's own.
     template_kwargs: dict = field(default_factory=dict)
 
 
@@ -238,6 +244,9 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Leading tokens other requests with the same system prompt and tools
+    # share; zero unless requested, or when an image lies within them.
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -271,6 +280,7 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         contract=None,
+        shared_prefix_states=False,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -300,7 +310,7 @@ class Frontend:
         # The name generation and scoring responses report.
         self.response_model = served[0] if announce_served_name else model
         # /v1/models order: the name responses report first, so a client
-        # configured from data[0] (splash <client>) requests the name it gets
+        # configured from data[0] (richengine <client>) requests the name it gets
         # back. Every name stays accepted.
         self.model_names = tuple(dict.fromkeys((self.response_model, model, *served)))
         if (
@@ -322,6 +332,11 @@ class Frontend:
         self.preparation_waiting = 0
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
+        self.shared_prefix_states = shared_prefix_states
+        # Agents repeat a few system prompts and tool sets.
+        self._shared_prefix_probe = lru_cache(maxsize=8)(
+            self._render_shared_prefix_probe
+        )
 
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
@@ -853,8 +868,39 @@ class Frontend:
         with self.latencies.measure("template"):
             return render_chat_template(self.tokenizer, messages, template)
 
+    def _render_shared_prefix_probe(self, key):
+        """The tokens of a request's leading system message and template
+        options followed by the probe turn instead of its own; empty where
+        the template cannot render it."""
+        head, template = json.loads(key)
+        try:
+            text = self._apply_chat_template([*head, SHARED_PREFIX_PROBE], template)
+        except Exception:
+            return ()
+        return tuple(self._tokenize(text, add_special_tokens=False)["input_ids"])
+
+    def _shared_prefix_probe_tokens(self, messages, template):
+        """The tokens of the prompt's leading system message, tools and
+        template options followed by a probe turn; empty without a system
+        message or tools."""
+        head = messages[:1] if messages and messages[0]["role"] == "system" else []
+        if head and not isinstance(head[0]["content"], str):
+            return ()
+        if not head and "tools" not in template:
+            return ()
+        # Key order is kept: templates render tools in the request's order.
+        return self._shared_prefix_probe(
+            json.dumps([head, template], ensure_ascii=False)
+        )
+
     def _render_prompt(
-        self, prompt, deadline, *, check_context=True, add_generation_prompt=True
+        self,
+        prompt,
+        deadline,
+        *,
+        check_context=True,
+        add_generation_prompt=True,
+        shared_prefix=False,
     ):
         chat_template = self.chat_templates.select(prompt.tools)
         if not chat_template.accepts(prompt.messages):
@@ -872,6 +918,12 @@ class Frontend:
             ),
             **prompt.template_kwargs,
         }
+        # Rendered first, so the request's own rendering stays the latest.
+        shared_prefix_probe = (
+            self._shared_prefix_probe_tokens(prompt.messages, template)
+            if shared_prefix
+            else None
+        )
         with self.latencies.measure("images"):
             images = self._prepare_images(
                 prompt.messages, deadline, check_context=check_context
@@ -922,8 +974,27 @@ class Frontend:
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
             )
+        # The leading tokens that depend only on the system message, tools
+        # and template options, which an agent repeats across requests: the
+        # prompt's common prefix with the probe. The engine keeps a reusable
+        # state there, so the next such request resumes after the head
+        # whatever follows it. No template structure is assumed.
+        shared_prefix_tokens = 0
+        for ours, probed in zip(tokens, shared_prefix_probe or ()):
+            if ours != probed:
+                break
+            shared_prefix_tokens += 1
+        # Expanding an image before it would move it.
+        if positions and positions[0] < shared_prefix_tokens:
+            shared_prefix_tokens = 0
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            shared_prefix_tokens,
         )
 
     def _prepare(
@@ -985,7 +1056,9 @@ class Frontend:
                 "ignore_eos cannot be combined with constrained tool calls, "
                 "tool_choice none or structured output",
             )
-        rendered = self._render_prompt(prompt, deadline)
+        rendered = self._render_prompt(
+            prompt, deadline, shared_prefix=self.shared_prefix_states
+        )
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
@@ -1050,6 +1123,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            shared_prefix_tokens=rendered.shared_prefix_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 
@@ -1102,7 +1176,7 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
-        # Splash does not implement logit_bias, so only an empty one (null or
+        # RichEngine does not implement logit_bias, so only an empty one (null or
         # {}) is accepted; a non-empty one is refused rather than ignored.
         if body.get("logit_bias") not in (None, {}):
             raise APIError(400, "logit_bias is not supported")

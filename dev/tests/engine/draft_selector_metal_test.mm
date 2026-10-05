@@ -26,19 +26,19 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using namespace splash::ops;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using namespace richengine::ops;
 
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
-constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
-constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kRows = RICHENGINE_DRAFT_QUERY_ROWS;
+constexpr uint32_t kPositions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+constexpr uint32_t kCandidates = RICHENGINE_DRAFT_CANDIDATES;
+constexpr uint32_t kRank = RICHENGINE_DRAFT_SELECTOR_RANK;
+constexpr uint32_t kLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -163,16 +163,16 @@ void runCase(MetalBackend &backend, const Case &c) {
       allocate(backend, workspace.unaryBytes),
       selectorHidden,
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+               uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
+  for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
   std::vector<SamplingPolicy> policies(c.lanes);
@@ -258,8 +258,8 @@ void runCase(MetalBackend &backend, const Case &c) {
           reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
           sum += reference[rank];
         }
-        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
-                                       SPLASH_UNIFORM_PROPOSALS + position];
+        const float uniform = uniforms[lane * RICHENGINE_SAMPLING_UNIFORMS +
+                                       RICHENGINE_UNIFORM_PROPOSALS + position];
         std::array<double, kCandidates> cumulative{};
         uint32_t expectedSelection = kCandidates - 1;
         for (uint32_t rank = 0; rank < kCandidates; ++rank) {
@@ -301,19 +301,19 @@ void runCase(MetalBackend &backend, const Case &c) {
       predecessor = token;
     }
 
-    const uint32_t laneBase = lane * SPLASH_TREE_VERIFY_NODES;
+    const uint32_t laneBase = lane * RICHENGINE_TREE_VERIFY_NODES;
     const bool treeLane = !c.sampling && (treeMask & (1U << lane));
     require(treeTokens[laneBase] == anchors[lane] &&
-                SPLASH_TREE_NODE_PARENT(treeNodes[laneBase]) ==
-                    SPLASH_TREE_NODE_NONE &&
-                SPLASH_TREE_NODE_DEPTH(treeNodes[laneBase]) == 0,
+                RICHENGINE_TREE_NODE_PARENT(treeNodes[laneBase]) ==
+                    RICHENGINE_TREE_NODE_NONE &&
+                RICHENGINE_TREE_NODE_DEPTH(treeNodes[laneBase]) == 0,
             "verify tree anchor node is malformed");
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t row = laneBase + position + 1;
       require(treeTokens[row] == tokens[lane * kPositions + position] &&
-                  SPLASH_TREE_NODE_PARENT(treeNodes[row]) == position &&
-                  SPLASH_TREE_NODE_DEPTH(treeNodes[row]) == position + 1 &&
-                  SPLASH_TREE_NODE_POSITION(treeNodes[row]) == position,
+                  RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) == position &&
+                  RICHENGINE_TREE_NODE_DEPTH(treeNodes[row]) == position + 1 &&
+                  RICHENGINE_TREE_NODE_POSITION(treeNodes[row]) == position,
               "verify tree chain node is malformed");
     }
     const uint32_t expectedCount =
@@ -323,11 +323,11 @@ void runCase(MetalBackend &backend, const Case &c) {
     for (uint32_t leaf = 0; leaf < expectedLeaves.size(); ++leaf) {
       const uint32_t row = laneBase + kPositions + 1 + leaf;
       require(treeTokens[row] == expectedLeaves[leaf] &&
-                  SPLASH_TREE_NODE_PARENT(treeNodes[row]) ==
+                  RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) ==
                       expectedLeafParents[leaf] &&
-                  SPLASH_TREE_NODE_DEPTH(treeNodes[row]) ==
+                  RICHENGINE_TREE_NODE_DEPTH(treeNodes[row]) ==
                       expectedLeafParents[leaf] + 1 &&
-                  SPLASH_TREE_NODE_POSITION(treeNodes[row]) ==
+                  RICHENGINE_TREE_NODE_POSITION(treeNodes[row]) ==
                       expectedLeafParents[leaf],
               "verify tree leaf node is malformed");
     }
@@ -365,16 +365,16 @@ void runDSparkCase(MetalBackend &backend, const Case &c) {
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{rows} * kRank * sizeof(uint16_t)),
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+               uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
+  for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
   std::vector<SamplingPolicy> policies(c.lanes);
@@ -446,8 +446,8 @@ void runDSparkCase(MetalBackend &backend, const Case &c) {
           reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
           sum += reference[rank];
         }
-        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
-                                       SPLASH_UNIFORM_PROPOSALS + position];
+        const float uniform = uniforms[lane * RICHENGINE_SAMPLING_UNIFORMS +
+                                       RICHENGINE_UNIFORM_PROPOSALS + position];
         std::array<double, kCandidates> cumulative{};
         uint32_t expectedSelection = kCandidates - 1;
         for (uint32_t rank = 0; rank < kCandidates; ++rank) {
@@ -490,11 +490,11 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{kRows} * kRank * 2),
-      allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
-      allocate(backend, kLanes * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
-      allocate(backend, kLanes * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, kLanes * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, kLanes * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend, kLanes * sizeof(uint32_t))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{1024} * kRank * 2),
                                  allocate(backend, uint64_t{1024} * kRank * 2)};

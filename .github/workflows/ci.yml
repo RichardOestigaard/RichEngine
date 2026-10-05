@@ -1,4 +1,4 @@
-name: Splash runtime CI
+name: RichEngine runtime CI
 
 on:
   pull_request:
@@ -71,13 +71,13 @@ jobs:
       fail-fast: false
       matrix:
         runner_label:
-          - splash-m3-max-48
-          - splash-m4-pro-48
-          - splash-m4-max-64plus
-          - splash-m5-pro-48
-          - splash-m5-pro-64
-          - splash-m5-max-48
-          - splash-m5-max-64plus
+          - richengine-m3-max-48
+          - richengine-m4-pro-48
+          - richengine-m4-max-64plus
+          - richengine-m5-pro-48
+          - richengine-m5-pro-64
+          - richengine-m5-max-48
+          - richengine-m5-max-64plus
     runs-on: [self-hosted, macOS, ARM64, "${{ matrix.runner_label }}"]
     env:
       PYTHON_CANDIDATES: python3
@@ -121,11 +121,11 @@ jobs:
           make install release-check BASELINE="$RUNNER_BASELINE"
           MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
           REVISION=a483e9e6cbd595906af30beda3187c2663a1118c
-      - name: incoai/Qwen3.8-27B-Splash
+      - name: incoai/Qwen3.8-27B-RichEngine
         if: ${{ !cancelled() }}
         run: >-
           make install release-check BASELINE="$RUNNER_BASELINE"
-          MODEL=incoai/Qwen3.8-27B-Splash
+          MODEL=incoai/Qwen3.8-27B-RichEngine
       - name: Preserve release reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

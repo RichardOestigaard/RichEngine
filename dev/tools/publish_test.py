@@ -13,14 +13,14 @@ ROOT = Path(__file__).resolve().parents[2]
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--repo", required=True, help="e.g. owner/splash-releases")
+    parser.add_argument("--repo", required=True, help="e.g. owner/richengine-releases")
     parser.add_argument(
         "--no-latest",
         action="store_true",
         help="upload without moving the `latest` pointer",
     )
     args = parser.parse_args(argv)
-    archive = ROOT / "dist" / f"splash-{args.version}-arm64-macos26.tar.gz"
+    archive = ROOT / "dist" / f"richengine-{args.version}-arm64-macos26.tar.gz"
     checksum = archive.with_suffix(archive.suffix + ".sha256")
     installer = ROOT / "dev/tools/install.sh"
     for path in (archive, checksum, installer):
@@ -47,12 +47,12 @@ def main(argv=None):
         )
         print(f"latest -> {args.version}")
     print(
-        "testers set SPLASH_TOKEN to the supplied read token, then run:\n"
-        "export SPLASH_TOKEN\n"
+        "testers set RICHENGINE_TOKEN to the supplied read token, then run:\n"
+        "export RICHENGINE_TOKEN\n"
         "curl -qfsSL --config - "
         f"https://huggingface.co/{args.repo}/resolve/main/install.sh <<EOF"
-        f" | SPLASH_REPO={args.repo} sh\n"
-        'header = "Authorization: Bearer $SPLASH_TOKEN"\n'
+        f" | RICHENGINE_REPO={args.repo} sh\n"
+        'header = "Authorization: Bearer $RICHENGINE_TOKEN"\n'
         "EOF"
     )
 

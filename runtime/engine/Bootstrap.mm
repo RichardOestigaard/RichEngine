@@ -6,7 +6,7 @@
 #include <sstream>
 #include <utility>
 
-namespace splash::engine {
+namespace richengine::engine {
 namespace {
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
@@ -384,4 +384,4 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
                            std::move(nativeLoop), std::move(report)));
 }
 
-} // namespace splash::engine
+} // namespace richengine::engine

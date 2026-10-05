@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 using metal::CommandGraph;
@@ -220,4 +220,4 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
           kMergerRowTile, kMergerColumnTile);
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

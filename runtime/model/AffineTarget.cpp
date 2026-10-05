@@ -1,4 +1,5 @@
 #include "model/AffineTarget.hpp"
+#include "model/Granite.hpp"
 #include "Checked.hpp"
 #include "model/AffinePlan.hpp"
 #include "model/Dense.hpp"
@@ -11,7 +12,7 @@
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 using affine::append;
@@ -163,10 +164,10 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Lfm2Layout
       {"num_key_value_heads", layout.attentionKvHeads},
       {"intermediate_size", layout.intermediateSize},
       {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2Layout::convolutionTaps},
-      {"norm_eps", layout.rmsEpsilon}, {"tie_word_embeddings", 1},
-      {"rope_parameters.rope_theta", layout.rotaryTheta},
-      {"max_position_embeddings", layout.maximumContextTokens}};
+      {"norm_eps", 1e-5}, {"tie_word_embeddings", 1},
+      {"rope_parameters.rope_theta", layout.rotaryTheta}};
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  source.requireConfigNumberAtMost("max_position_embeddings", layout.maximumContextTokens);
   source.requireConfigString("model_type", "lfm2");
   source.requireLayerTypeMask(layout.layers, Lfm2Layout::attentionMask, "full_attention", "conv");
 }
@@ -251,13 +252,10 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Lfm2MoeLay
       {"num_key_value_heads", layout.attentionKvHeads},
       {"intermediate_size", layout.intermediateSize},
       {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2MoeLayout::convolutionTaps},
-      {"norm_eps", layout.rmsEpsilon}, {"tie_word_embeddings", 1},
-      {"rope_parameters.rope_theta", layout.rotaryTheta},
-      {"max_position_embeddings", layout.maximumContextTokens},
-      {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
-      {"moe_intermediate_size", layout.expertIntermediateSize},
-      {"num_dense_layers", Lfm2MoeLayout::denseLayers}};
+      {"norm_eps", 1e-5}, {"tie_word_embeddings", 1},
+      {"rope_parameters.rope_theta", layout.rotaryTheta}};
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  source.requireConfigNumberAtMost("max_position_embeddings", layout.maximumContextTokens);
   source.requireConfigString("model_type", "lfm2_moe");
   source.requireLayerTypeMask(layout.layers, Lfm2MoeLayout::attentionMask, "full_attention", "conv");
 }
@@ -396,6 +394,10 @@ std::vector<Image> affineTargetImages(const Lfm2MoeLayout &layout) {
   return result;
 }
 
+std::vector<Image> affineTargetImages(const GraniteLayout &) {
+  throw std::invalid_argument("Granite targets load from packed or GGUF sources only");
+}
+
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
                                        const Qwen3_8Layout &layout)
     : images_(images), planned_(plan(directory, layout)) {}
@@ -414,6 +416,12 @@ AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesyst
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
                                        const Lfm2MoeLayout &layout)
     : images_(images), planned_(planImages(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &,
+                                       const GraniteLayout &)
+    : images_(images) {
+  throw std::invalid_argument("Granite targets load from packed or GGUF sources only");
+}
+
 AffineTargetLoader::~AffineTargetLoader() = default;
 WeightFile AffineTargetLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 2) throw WeightStoreError("target layer is out of range");
@@ -426,4 +434,4 @@ WeightFile AffineTargetLoader::embedding() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "target"));
 }
 
-} // namespace splash::model
+} // namespace richengine::model

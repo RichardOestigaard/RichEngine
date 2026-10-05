@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and verify the deterministic Splash production build identity."""
+"""Create and verify the deterministic RichEngine production build identity."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
-DOMAIN = b"splash-production-build-identity-v1\0"
+DOMAIN = b"richengine-production-build-identity-v1\0"
 BUILD_ID_PATTERN = re.compile(rb"src-[0-9a-f]{64}")
 
 
@@ -89,8 +89,8 @@ def header_bytes(identity: str) -> bytes:
     digest = identity.removeprefix("src-")
     return (
         "#pragma once\n"
-        f'#define SPLASH_BUILD_ID "{identity}"\n'
-        f'#define SPLASH_BUILD_SOURCE_SHA256 "{digest}"\n'
+        f'#define RICHENGINE_BUILD_ID "{identity}"\n'
+        f'#define RICHENGINE_BUILD_SOURCE_SHA256 "{digest}"\n'
     ).encode()
 
 

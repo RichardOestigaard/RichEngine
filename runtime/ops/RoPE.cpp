@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 void RoPE::addTables(
     metal::CommandGraph &graph, metal::MetalBuffer targetPositions,
@@ -32,4 +32,4 @@ void RoPE::addTables(
             rows, {(elements + 255) / 256, 1, 1}, {256, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

@@ -15,9 +15,9 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace splash::model;
-using splash::test::rejects;
-using splash::test::require;
+using namespace richengine::model;
+using richengine::test::rejects;
+using richengine::test::require;
 
 namespace {
 
@@ -47,7 +47,7 @@ void aWriteToTheOpenFileIsRejected(const std::filesystem::path &path) {
 void aNewFileAtThePathChangesNothing(const std::filesystem::path &path) {
   const WeightSource source(path);
   const auto replacement = path.parent_path() / "replacement";
-  splash::test::writeFile(replacement, std::vector<uint8_t>(kBytes.size(), 0));
+  richengine::test::writeFile(replacement, std::vector<uint8_t>(kBytes.size(), 0));
   std::filesystem::rename(replacement, path);
   source.checkUnchanged();
   std::array<uint8_t, 1> byte{};
@@ -72,12 +72,12 @@ void aFailingSourceIsNamed(const std::filesystem::path &path) {
 
 int main() {
   try {
-    const splash::test::TemporaryDirectory directory("splash-weight-source");
+    const richengine::test::TemporaryDirectory directory("richengine-weight-source");
     const auto path = directory.path() / "source.bin";
-    splash::test::writeFile(path, kBytes);
+    richengine::test::writeFile(path, kBytes);
     readsTensorDataAfterItsOffset(path);
     aWriteToTheOpenFileIsRejected(path);
-    splash::test::writeFile(path, kBytes);
+    richengine::test::writeFile(path, kBytes);
     aNewFileAtThePathChangesNothing(path);
     aFailingSourceIsNamed(path);
     std::cout << "weight source: reads, writes to the open file, replacement and naming PASS\n";

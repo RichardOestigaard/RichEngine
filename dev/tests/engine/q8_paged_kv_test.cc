@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace splash::kv;
+using namespace richengine::kv;
 
 namespace {
 
@@ -61,16 +61,16 @@ void testByteAccounting() {
 }
 
 void testLayouts() {
-  assert(splash_kv_key_element(0, 0, 1) == splash_kv_key_element(0, 0, 0) + 1);
-  assert(splash_kv_key_element(0, 1, 0) ==
-         splash_kv_key_element(0, 0, 0) + kHeadDimension);
-  assert(splash_kv_value_element(0, 1, 0) ==
-         splash_kv_value_element(0, 0, 0) + 1);
-  assert(splash_kv_value_element(0, 0, 1) ==
-         splash_kv_value_element(0, 0, 0) + kPageTokens);
-  assert(splash_kv_key_element(kKvHeads - 1, kPageTokens - 1,
+  assert(richengine_kv_key_element(0, 0, 1) == richengine_kv_key_element(0, 0, 0) + 1);
+  assert(richengine_kv_key_element(0, 1, 0) ==
+         richengine_kv_key_element(0, 0, 0) + kHeadDimension);
+  assert(richengine_kv_value_element(0, 1, 0) ==
+         richengine_kv_value_element(0, 0, 0) + 1);
+  assert(richengine_kv_value_element(0, 0, 1) ==
+         richengine_kv_value_element(0, 0, 0) + kPageTokens);
+  assert(richengine_kv_key_element(kKvHeads - 1, kPageTokens - 1,
                                kHeadDimension - 1) == kElementsPerLayerPage - 1);
-  assert(splash_kv_value_element(kKvHeads - 1, kPageTokens - 1,
+  assert(richengine_kv_value_element(kKvHeads - 1, kPageTokens - 1,
                                  kHeadDimension - 1) == kElementsPerLayerPage - 1);
 }
 
@@ -115,8 +115,8 @@ void testQuantization(uint32_t validTokens) {
     for (uint32_t head = 0; head < kKvHeads; ++head) {
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
         uint64_t logical = logicalIndex(token, head, dimension);
-        float keyScale = page->keyScales[splash_kv_scale_element(head, token)];
-        float valueScale = page->valueScales[splash_kv_scale_element(head, token)];
+        float keyScale = page->keyScales[richengine_kv_scale_element(head, token)];
+        float valueScale = page->valueScales[richengine_kv_scale_element(head, token)];
         assert(std::abs(decodedKeys[logical] - keys[logical]) <=
                keyScale * 0.51f + 1.0e-7f);
         assert(std::abs(decodedValues[logical] - values[logical]) <=

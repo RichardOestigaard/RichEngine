@@ -1,7 +1,7 @@
 #include "engine/RuntimeResources.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
-#include "engine/DiskLabels.hpp"
+#include "engine/cache/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "engine/StartupLog.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -18,23 +18,23 @@
 #include <sstream>
 #include <utility>
 
-namespace splash::engine {
+namespace richengine::engine {
 namespace {
 
 static_assert(model::ExecutionLimits::maximumBatchWidth ==
-              SPLASH_MAXIMUM_BATCH_WIDTH);
+              RICHENGINE_MAXIMUM_BATCH_WIDTH);
 static_assert(model::ExecutionLimits::prefillTokenBudget ==
-              SPLASH_PREFILL_TOKEN_BUDGET);
+              RICHENGINE_PREFILL_TOKEN_BUDGET);
 static_assert(model::ExecutionLimits::draftQueryRows ==
-              SPLASH_DRAFT_QUERY_ROWS);
+              RICHENGINE_DRAFT_QUERY_ROWS);
 static_assert(model::ExecutionLimits::draftProposalTokens ==
-              SPLASH_DRAFT_PROPOSAL_TOKENS);
+              RICHENGINE_DRAFT_PROPOSAL_TOKENS);
 static_assert(model::ExecutionLimits::targetVerifyRows ==
-              SPLASH_TARGET_VERIFY_ROWS);
+              RICHENGINE_TARGET_VERIFY_ROWS);
 static_assert(model::ExecutionLimits::draftContextTokens ==
-              SPLASH_DRAFT_SLIDING_WINDOW);
+              RICHENGINE_DRAFT_SLIDING_WINDOW);
 static_assert(model::ExecutionLimits::speculativeScratchTokens ==
-              SPLASH_SPECULATIVE_SCRATCH_TOKENS);
+              RICHENGINE_SPECULATIVE_SCRATCH_TOKENS);
 
 std::string errorText(RuntimeResourceStage stage, std::string_view message,
                       std::string_view budgetDescription) {
@@ -153,7 +153,8 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
-      !package.draftActualAllocatedBytes() ||
+      (package.descriptor.draft.kind != model::DraftKind::Null &&
+       !package.draftActualAllocatedBytes()) ||
       (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
@@ -207,7 +208,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   const model::GdnStateLayout &gdn = states.target;
   const model::DraftStateLayout &draft = states.draft;
   std::ostringstream canonical;
-  canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
+  canonical << "richengine-persistent-cache-v" << kPersistentCacheFormat << '\n'
             << identity.modelLayoutSha256 << '\n'
             << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
             << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
@@ -215,7 +216,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n';
+            << RICHENGINE_DRAFT_SLIDING_WINDOW << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, 32);
 }
@@ -411,6 +412,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       package.draftActualAllocatedBytes(),
       package.vision.actualAllocatedBytes,
       modelMemoryPlan,
+      package.descriptor.draft.kind != model::DraftKind::Null,
       stateStagingBytes,
   };
 
@@ -670,4 +672,4 @@ void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
   config.serving = [&governor](bool serving) { governor.setServing(serving); };
 }
 
-} // namespace splash::engine
+} // namespace richengine::engine

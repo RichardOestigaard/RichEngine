@@ -3,6 +3,7 @@
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -12,7 +13,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The instance of kernel `name` that writes `destination`: a plain decode
 // kernel's fp32 instance is "<name>_f32".
@@ -62,7 +63,7 @@ enum class LinearTile : uint8_t {
 };
 // The decode tiles hold at most a full decode batch; GGUF prefill chunks of up
 // to this many rows run the staged tile (Linear::ggufBaseline).
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kMaximumDecodeTileRows = RICHENGINE_MAXIMUM_BATCH_WIDTH * RICHENGINE_TARGET_VERIFY_ROWS;
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
 // register tiles build from grid lookups beside their matrix operations
@@ -114,6 +115,13 @@ struct LinearScratch final {
   // The bf16 input rows a rotated projection's quantized segments read
   // (ProjectionShape::rotated), sized by decode/prefillScratchSize(shape).rotated.
   metal::MetalBuffer rotated{};
+  // RICHENGINE_PREFILL_FAST_INT8 operand buffers: two-term uint8 codes and
+  // (scale, lo, Jx) float4 records of the projection input. Empty when the
+  // flag is off.
+  metal::MetalBuffer i8codes{};
+  metal::MetalBuffer i8codesLo{};
+  metal::MetalBuffer i8params{};
+  metal::MetalBuffer i8paramsLo{};
 };
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
@@ -141,6 +149,10 @@ enum class LinearInput : uint8_t {
   // exponent bytes in ::sums, which a producer can emit beside its bf16 rows
   // instead of a gguf_pack_half dispatch.
   Packed,
+  // LinearScratch::rotated holds H (D source): no producer emits it — a
+  // rotated projection's own gguf_rotate dispatch writes it, and a second
+  // rotated projection of the same source and signs reuses it.
+  Rotated,
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -160,6 +172,8 @@ void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint3
 struct PreparedInput final {
   metal::MetalBuffer source;
   LinearInput layout = LinearInput::Plain;
+  // For layout == Rotated only: the sign vector the scratch rotation used.
+  metal::MetalBuffer signs{};
 };
 
 class LinearPlan final {
@@ -287,16 +301,33 @@ public:
                       const Projection &consumer, uint32_t rows) const;
   // The projections of `rows` rows through their own matrix. `scratch` holds
   // the partials and counters of split plans (GGUF chunks of up to 32 rows);
-  // reused serially within one command stream, as in decode.
-  void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                  metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                  LinearScratch scratch = {}) const;
-  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
-                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch) const;
-  void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                          metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
-                          uint32_t rows, LinearScratch scratch) const;
+  // reused serially within one command stream, as in decode. `prepared`
+  // describes the scratch as a producer left it (the rotated rows of a
+  // rotated projection just run on `input`), and each returns what it
+  // describes after its dispatch.
+  PreparedInput addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
+                           metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
+                           LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+  PreparedInput addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
+                                     metal::MetalBuffer gateScratch, metal::MetalBuffer output,
+                                     metal::MetalBuffer sums, metal::MetalBuffer downSums, uint32_t rows,
+                                     LinearScratch scratch, PreparedInput prepared = {}) const;
+  PreparedInput addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                   const Projection &projection, metal::MetalBuffer residual,
+                                   metal::MetalBuffer output, metal::MetalBuffer sums,
+                                   uint32_t rows, LinearScratch scratch, PreparedInput prepared = {}) const;
+
+  // The fused greedy head of a block projection (gguf_decode_*_m*_amax in
+  // shared/gguf_linear.metal): the vocabulary projection's staged decode,
+  // writing per-(row, GGUF_TILE_COLUMNS) argmax partials instead of logits.
+  // One quantized segment, decode rows; a rotated input is rotated into
+  // scratch.rotated first. Returns false when the projection cannot run it —
+  // a float segment or several segments — and the caller falls back to the
+  // logits path.
+  [[nodiscard]] bool addGgufHeadArgmax(metal::CommandGraph &graph,
+                                       metal::MetalBuffer input, const Projection &projection, uint32_t lanes,
+                                       metal::MetalBuffer argmaxValues, metal::MetalBuffer argmaxIndices,
+                                       const HeadArgmaxParams &headParams, LinearScratch scratch) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it
@@ -325,4 +356,4 @@ private:
   uint32_t gpuCores_ = 0;
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

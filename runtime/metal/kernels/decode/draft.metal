@@ -9,7 +9,7 @@ inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *residual,
                              device bfloat *output, bool finish, uint group,
                              uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr uint ConvGroups = Hidden / 16;
   constexpr uint Dynamic = 4 * ConvGroups;
   const uint element = group * 256 + thread_index;
@@ -44,7 +44,7 @@ inline void draft_qkv_prepare_phase(
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr uint QWidth = QHeads * HeadDim, KWidth = KVHeads * HeadDim;
   constexpr uint PackedWidth = QWidth + 2 * KWidth;
   constexpr uint QueryTasks = Rows * QHeads;
@@ -117,7 +117,7 @@ inline void draft_context_kv_commit_impl(
     constant DraftContextBatchParams &params,
     threadgroup float *reductions, threadgroup bfloat *normalized, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   // A context row's keys and values (draft_context_kv_phase).
   constexpr uint RowWidth = 2 * KVHeads * HeadDim;
   constexpr uint RopeLaneStride = Rows * (HeadDim / 2);
@@ -188,8 +188,8 @@ inline void draft_attention_split_phase(
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort TileK = 64;
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS, Window = RICHENGINE_DRAFT_SLIDING_WINDOW,
+                 Splits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
   constexpr float InvSqrtD = D == 64 ? 0.125f : 0.08838834765f;
   static_assert(D == 128 || D == 64, "uncompiled draft head dimension");
   static_assert(M % 8 == 0 && N % TileK == 0, "draft attention tile alignment");
@@ -440,7 +440,7 @@ inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
                                          uint thread_index) {
   constexpr uint Stride = M * D + 2 * M,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+                 Splits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
   constexpr uint Chunk = D / 8;
   for (uint row = thread_index / 8; row < M; row += 32) {
     uint dim = (thread_index % 8) * Chunk;
@@ -472,7 +472,7 @@ template <uint QHeads, uint HeadDim>
 inline void draft_attention_reorder_phase(device const bfloat *grouped,
                                           device bfloat *row_major, uint group,
                                           uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   const uint element = group * 256 + thread_index;
   if (element >= Rows * QHeads * HeadDim)
     return;
@@ -490,7 +490,7 @@ inline void draft_conv_decode_batch_impl(
     device const bfloat *base, device const bfloat *residual,
     device bfloat *output, constant DraftConvBatchParams &params, uint2 group,
     uint thread_index) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr ulong Dynamic = Hidden / 4;
   uint batch = group.y;
   draft_conv_phase<Hidden>(input + batch * Rows * Hidden,
@@ -538,7 +538,7 @@ inline void draft_attention_qkv_impl(
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint2 group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr ulong Packed = (ulong(QHeads) + 2 * KVHeads) * HeadDim;
   constexpr ulong Attention = ulong(QHeads) * HeadDim;
   constexpr ulong RopeStride = Rows * (HeadDim / 2);
@@ -590,10 +590,10 @@ inline void draft_attention_split_impl(
     device bfloat *query_keys, device bfloat *query_values,
     constant DraftAttentionBatchParams &params, threadgroup float *workspace,
     uint3 group, uint thread_index, uint lane, uint simd_group) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   // The lane's grouped query rows: M / Rows query heads per KV head.
   constexpr ulong Attention = ulong(M) / Rows * KVHeads * HeadDim;
-  constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr ulong Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y;
   device bfloat *keys =
@@ -605,7 +605,7 @@ inline void draft_attention_split_impl(
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
-      ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) *
+      ((batch * KVHeads + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS + group.z) *
           PartialFloats;
   draft_attention_split_phase<M, N, HeadDim>(
       queries + batch * Rows * Attention + group.x * M * HeadDim,
@@ -689,14 +689,14 @@ template <uint M, uint KVHeads, uint HeadDim>
 inline void draft_attention_reduce_impl(device bfloat *queries,
                                         constant DraftAttentionBatchParams &params,
                                         uint2 group, uint thread_index) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = ulong(M) / Rows * KVHeads * HeadDim;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y;
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
-      (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
+      (batch * KVHeads + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS *
           PartialFloats;
   draft_attention_reduce_phase<M, HeadDim>(
       partials,
@@ -722,7 +722,7 @@ template <uint QHeads, uint HeadDim>
 inline void draft_attention_reorder_impl(device const bfloat *grouped,
                                          device bfloat *row_major, uint2 group,
                                          uint thread_index) {
-  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = ulong(QHeads) * HeadDim;
   uint batch = group.y;
   draft_attention_reorder_phase<QHeads, HeadDim>(

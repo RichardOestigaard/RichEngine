@@ -17,7 +17,7 @@
 #include <system_error>
 #include <vector>
 
-namespace splash::test {
+namespace richengine::test {
 
 // A new directory under the system temporary directory, removed with its
 // contents when this is destroyed.
@@ -58,4 +58,4 @@ inline std::vector<uint8_t> readFile(const std::filesystem::path &path) {
   return {std::istreambuf_iterator<char>(file), {}};
 }
 
-} // namespace splash::test
+} // namespace richengine::test

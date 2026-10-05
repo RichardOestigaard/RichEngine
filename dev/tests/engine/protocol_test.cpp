@@ -1,5 +1,5 @@
 #include "ProtocolPeer.hpp"
-#include "engine/Protocol.hpp"
+#include "engine/wire/Protocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,14 +21,14 @@
 
 namespace {
 
-using namespace splash::protocol;
-using splash::ConstraintMode;
-using splash::ImageSpan;
-using splash::RequestIgnoreEndOfSequence;
-using splash::SamplingParameters;
-using splash::engine::EngineFinishReason;
-using splash::engine::RequestPriority;
-using splash::model::ExecutionLimits;
+using namespace richengine::protocol;
+using richengine::ConstraintMode;
+using richengine::ImageSpan;
+using richengine::RequestIgnoreEndOfSequence;
+using richengine::SamplingParameters;
+using richengine::engine::EngineFinishReason;
+using richengine::engine::RequestPriority;
+using richengine::model::ExecutionLimits;
 
 int failures = 0;
 
@@ -67,7 +67,8 @@ constexpr size_t returnProgress = seed + 8;
 constexpr size_t scoreCount = returnProgress + 1;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
-static_assert(flags + 4 == kRequestFixedBytes);
+constexpr size_t sharedPrefix = flags + 4;
+static_assert(sharedPrefix + 4 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -747,9 +748,9 @@ void testPromptAndImageSpanRejections() {
     result.promptTokens.resize(1 + result.imageSpans[0].tokens, 7);
     return result;
   };
-  const RequestFrame largest = withGrid(splash::ops::kMaximumImagePatches / 2);
+  const RequestFrame largest = withGrid(richengine::ops::kMaximumImagePatches / 2);
   CHECK(test, roundTrip(largest) == largest);
-  expectRequestIssue(test, withGrid(splash::ops::kMaximumImagePatches / 2 + 2),
+  expectRequestIssue(test, withGrid(richengine::ops::kMaximumImagePatches / 2 + 2),
                      IssueCode::InvalidCount);
   // A grid whose patch count would wrap to zero in 32 bits, as its pixel
   // bytes do in 64, with no tokens or pixels.

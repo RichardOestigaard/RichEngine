@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::model::affine {
+namespace richengine::model::affine {
 
 // An image of a header block; append places each section after it.
 [[nodiscard]] inline Image image(std::string name, std::string_view magic, uint32_t layer, uint32_t type) {
@@ -45,6 +45,17 @@ inline void copy(Image &image, const std::string &name, std::vector<uint64_t> sh
   append(image, std::move(section));
 }
 
+// A shape's dimensions of size one dropped: [2048,3,1] and [2048,1,3]
+// describe the same contiguous rows, and exports disagree on the conv
+// weight's axis order.
+inline std::vector<uint64_t> squeezed(std::span<const uint64_t> shape) {
+  std::vector<uint64_t> result;
+  result.reserve(shape.size());
+  for (uint64_t dimension : shape)
+    if (dimension != 1) result.push_back(dimension);
+  return result;
+}
+
 // Binds every input of image to its checkpoint tensor, which must have one of
 // the input's dtypes and its shape, once the checkpoint states the
 // quantization of every affine module the image reads.
@@ -52,7 +63,7 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
   const auto bindInput = [&](Input &input) {
     const SourceTensor &tensor = source.require(input.name);
     if (std::find(input.dtypes.begin(), input.dtypes.end(), tensor.dtype) == input.dtypes.end() ||
-        tensor.shape != input.shape)
+        squeezed(tensor.shape) != squeezed(input.shape))
       throw WeightStoreError("source tensor type or shape does not match: " + input.name);
     input.tensor = &tensor;
   };
@@ -84,4 +95,4 @@ struct PlannedCheckpoint final {
           }};
 }
 
-} // namespace splash::model::affine
+} // namespace richengine::model::affine

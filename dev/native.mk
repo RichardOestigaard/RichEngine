@@ -27,19 +27,19 @@ TUNING_SOURCES := \
 # Control-plane tests compile the runtime sources they check: their sanitizer
 # builds cannot use the unsanitized engine library, and none links a framework.
 CACHE_SOURCES := \
-	runtime/engine/KvPool.cpp \
-	runtime/engine/KvCache.cpp \
-	runtime/engine/StateCache.cpp \
-	runtime/engine/Cache.cpp \
-	runtime/engine/WriteBehind.cpp
+	runtime/engine/cache/KvPool.cpp \
+	runtime/engine/cache/KvCache.cpp \
+	runtime/engine/cache/StateCache.cpp \
+	runtime/engine/cache/Cache.cpp \
+	runtime/engine/memory/WriteBehind.cpp
 BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	$(CACHE_SOURCES) \
 	runtime/engine/Engine.cpp
 NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
-	runtime/engine/Protocol.cpp \
-	runtime/engine/NativeRuntime.cpp
+	runtime/engine/wire/Protocol.cpp \
+	runtime/engine/wire/NativeRuntime.cpp
 TEST_SLOT_FILE_ASAN := $(ENGINE_SANITIZER_BUILD)/slot-file-asan-ubsan
 TEST_SLOT_FILE_TSAN := $(ENGINE_SANITIZER_BUILD)/slot-file-tsan
 TEST_CACHE_DIRECTORY_ASAN := $(ENGINE_SANITIZER_BUILD)/cache-directory-asan-ubsan
@@ -118,6 +118,7 @@ TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
+TEST_GGUF_DECODE_SWEEP := $(ENGINE_TEST_BUILD)/gguf-decode-sweep
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
@@ -232,7 +233,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
-	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GGUF_DECODE_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_MTL4_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
@@ -309,12 +310,12 @@ $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp \
+		runtime/engine/memory/MemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
-		runtime/engine/KvCache.cpp \
+$(TEST_KV_PAGE_CACHE_TEST): runtime/engine/cache/KvPool.cpp \
+		runtime/engine/cache/KvCache.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -331,17 +332,17 @@ $(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) runtime/model/SlotFile.cpp \
 		dev/tests/engine/kv_first_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_ELASTIC_KV_TEST): runtime/engine/KvPool.cpp \
+$(TEST_ELASTIC_KV_TEST): runtime/engine/cache/KvPool.cpp \
 		dev/tests/engine/elastic_kv_pool_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_PROTOCOL_TEST): runtime/engine/Protocol.cpp \
+$(TEST_PROTOCOL_TEST): runtime/engine/wire/Protocol.cpp \
 		dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/protocol_test.cpp \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_NATIVE_LOOP_TEST): $(NATIVE_RUNTIME_SOURCES) \
-		runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp \
+		runtime/engine/memory/MemoryGovernor.cpp runtime/engine/memory/MemoryControl.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_engine_loop_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
@@ -371,12 +372,12 @@ $(TEST_MODEL_PACKAGE_TEST): dev/tests/engine/model_package_test.cpp \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_MEMORY_AUDIT_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
+		runtime/engine/memory/MemoryPlan.cpp runtime/engine/memory/MemoryAudit.cpp \
 		dev/tests/engine/memory_audit_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp \
+		runtime/engine/memory/MemoryPlan.cpp runtime/engine/memory/MemoryGovernor.cpp \
 		dev/tests/engine/memory_governor_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -386,8 +387,8 @@ $(TEST_QWEN_STATE_TEST): dev/tests/engine/qwen_state_storage_test.mm \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
-		runtime/engine/Status.cpp \
+		runtime/engine/memory/MemoryPlan.cpp runtime/engine/memory/MemoryAudit.cpp \
+		runtime/engine/wire/Status.cpp \
 		dev/tests/engine/runtime_status_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -575,6 +576,11 @@ $(TEST_Q4_DECODE_PROFILE): dev/benchmarks/q4_decode_profile.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_GGUF_DECODE_SWEEP): dev/benchmarks/gguf_decode_sweep.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LINKFLAGS) -o $@
@@ -757,7 +763,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 
 .PHONY: test-real
 # The vision fixture is named after the installed model's family: model.json
-# for an upstream model, the manifest's model for a Splash package. Nothing is
+# for an upstream model, the manifest's model for a RichEngine package. Nothing is
 # printed when the installation serves no vision (model.json's vision_format
 # is none: --language-only, or a GGUF without an mmproj); every package has it.
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; root = pathlib.Path(sys.argv[1]); \
@@ -817,7 +823,7 @@ benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 .PHONY: benchmark-mtl4
 benchmark-mtl4: $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
 	$(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB) $(MTL4_BENCHMARK_ARGS)
-	SPLASH_MTL4=1 $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB) \
+	RICHENGINE_MTL4=1 $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB) \
 		$(MTL4_BENCHMARK_ARGS)
 
 # CPU tests that also run under the sanitizers: each is built three times
@@ -825,7 +831,7 @@ benchmark-mtl4: $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
 $(TEST_SLOT_FILE) $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN): \
 		runtime/model/SlotFile.cpp dev/tests/engine/slot_file_test.cpp
 $(TEST_CACHE_DIRECTORY) $(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN): \
-		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
+		runtime/engine/cache/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
 $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
@@ -834,7 +840,7 @@ $(TEST_KV_FIRST_ENGINE_TEST) $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN): \
 		dev/tests/engine/kv_first_engine_test.cpp
 $(TEST_FD_TRANSPORT_TEST) $(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN): \
 		$(NATIVE_RUNTIME_SOURCES) \
-		runtime/engine/FdTransport.cpp \
+		runtime/engine/wire/FdTransport.cpp \
 		dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/native_fd_transport_test.cpp
 $(TEST_OPERATOR_TUNING) $(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN): \

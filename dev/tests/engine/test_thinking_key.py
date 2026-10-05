@@ -30,7 +30,7 @@ class ThinkingKeyTests(unittest.TestCase):
             signature = codec.encode("private reasoning")
             replacement = ThinkingCodec(load_thinking_key())
         self.assertEqual(replacement.decode(signature), "private reasoning")
-        path = self.home / "Library/Application Support/Splash/thinking.key"
+        path = self.home / "Library/Application Support/RichEngine/thinking.key"
         self.assertEqual(path.read_bytes(), key)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(path.stat().st_uid, os.getuid())

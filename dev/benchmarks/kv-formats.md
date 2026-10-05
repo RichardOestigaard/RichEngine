@@ -98,9 +98,9 @@ arithmetic was changed to make the new test pass.
 
 A separate diagnostic compared the exact failing eight-token sample with
 unmodified MLX-LM 0.31.3 / MLX 0.32.0, after checking 677 target-weight sections.
-Both Splash paths and MLX's aligned batch/single-token paths chose the same top
+Both RichEngine paths and MLX's aligned batch/single-token paths chose the same top
 token at all eight positions. Mean KL against those references was
-0.0000594–0.0002685; mean Splash cross-phase KL was 0.0001955. Repeated captures
+0.0000594–0.0002685; mean RichEngine cross-phase KL was 0.0001955. Repeated captures
 were byte-identical and retained the original state-cosine failure. This is a
 focused reproducer check, not a general task-quality or long-generation bound.
 Diagnostic capture code and model tensors are not part of production sources.

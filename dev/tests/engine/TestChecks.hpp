@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::test {
+namespace richengine::test {
 
 inline void require(bool value, std::string_view message) {
   if (!value) throw std::runtime_error(std::string(message));
@@ -25,4 +25,4 @@ template <class F> void rejects(F run, std::string_view expected, const std::str
   throw std::runtime_error(message);
 }
 
-} // namespace splash::test
+} // namespace richengine::test

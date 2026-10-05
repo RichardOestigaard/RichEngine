@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/KvTier.hpp"
+#include "engine/cache/KvTier.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <set>
 #include <vector>
 
-namespace splash::test {
+namespace richengine::test {
 
 // A KV disk tier without a disk: slots count against a quota, a bounded
 // number of transfers is in flight, and transfers finish when the test says
@@ -126,4 +126,4 @@ private:
   std::set<const Slot *> live_;
 };
 
-} // namespace splash::test
+} // namespace richengine::test

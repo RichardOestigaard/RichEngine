@@ -13,9 +13,9 @@
 #include <utility>
 #include <vector>
 
-using namespace splash::model;
-using splash::test::rejects;
-using splash::test::require;
+using namespace richengine::model;
+using richengine::test::rejects;
+using richengine::test::require;
 namespace {
 void shard(const std::filesystem::path &path, std::string_view header, size_t bytes = 16) {
   const uint64_t length = header.size();
@@ -23,15 +23,15 @@ void shard(const std::filesystem::path &path, std::string_view header, size_t by
   std::memcpy(file.data(), &length, sizeof length);
   file.insert(file.end(), header.begin(), header.end());
   for (size_t i = 0; i < bytes; ++i) file.push_back(static_cast<uint8_t>(i + 1));
-  splash::test::writeFile(path, file);
+  richengine::test::writeFile(path, file);
 }
 constexpr auto valid = R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]}})";
 }
 int main() {
   try {
-    const splash::test::TemporaryDirectory directory("splash-affine-checkpoint");
+    const richengine::test::TemporaryDirectory directory("richengine-affine-checkpoint");
     const std::filesystem::path &root = directory.path();
-    splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}}})");
+    richengine::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
     source.requireQuantization("projection", 4);

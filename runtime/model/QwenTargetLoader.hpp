@@ -20,7 +20,7 @@
 #include <string_view>
 #include <variant>
 
-namespace splash::model {
+namespace richengine::model {
 
 // How a target's files store its tensors; loadQwenTarget pairs each source's
 // files with their format. Affine files, packed or written from MLX, hold
@@ -218,4 +218,4 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
                                         readFfn);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

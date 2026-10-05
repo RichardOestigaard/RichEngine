@@ -1,6 +1,6 @@
 #include "TestBuffers.hpp"
 #include "ops/PageStorage.hpp"
-#include "engine/MemoryGovernor.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
@@ -15,13 +15,13 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
-using splash::test::entryOf;
+using namespace richengine;
+using namespace richengine::engine;
+using richengine::test::entryOf;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Exception, typename Function>
 void requireThrows(Function &&function, const char *message) {
@@ -80,10 +80,10 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
 // are, and refuses an index past the pages.
 void entriesFromFirst(const kv::PageStorage &storage, const metal::MetalBuffer &table) {
     constexpr std::array<uint32_t, 3> pages{5, 200, 255};
-    auto *entries = static_cast<SplashKvPage *>(table.contents());
+    auto *entries = static_cast<RichKvPage *>(table.contents());
     storage.writeEntries(pages, 0, table);
-    const std::array<SplashKvPage, 3> written{entries[0], entries[1], entries[2]};
-    constexpr SplashKvPage kSentinel = ~SplashKvPage{0};
+    const std::array<RichKvPage, 3> written{entries[0], entries[1], entries[2]};
+    constexpr RichKvPage kSentinel = ~RichKvPage{0};
     std::fill_n(entries, 3, kSentinel);
     storage.writeEntries(pages, 1, table);
     require(entries[0] == kSentinel && entries[1] == written[1] && entries[2] == written[2],
@@ -148,8 +148,8 @@ void run(const std::string &metallib) {
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
         "an extent of a part of an alignment unit was accepted");
 
-    metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(SplashKvPage));
-    const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(SplashKvPage));
+    metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(RichKvPage));
+    const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(RichKvPage));
     metal::MetalBuffer word = test::sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 384, 128);
@@ -165,13 +165,13 @@ void run(const std::string &metallib) {
             "the first Q8 extent was not the one allocated");
     requireThrows<std::logic_error>([&] { (void)storage.allocateExtent(0); },
                                     "an allocated extent was allocated again");
-    const SplashKvLayer layer = storage.layers()[15];
+    const RichKvLayer layer = storage.layers()[15];
     require(storage.layers().size() == kvLayout.attentionLayers && layer.extent_pages == 128 &&
                 layer.offset == 15 * 128 * kvLayout.bytesPerLayerPage(),
             "a layer's region does not follow the layers before it");
 
-    const SplashKvPage runwayPage = entryOf(storage, 5, probe);
-    require(runwayPage && (runwayPage & SPLASH_KV_PAGE_INDEX_MASK) == 5,
+    const RichKvPage runwayPage = entryOf(storage, 5, probe);
+    require(runwayPage && (runwayPage & RICHENGINE_KV_PAGE_INDEX_MASK) == 5,
             "a page entry does not carry the page's index in its extent");
     requireThrows<std::logic_error>([&] { (void)storage.spans(200); },
                                     "a page of an unallocated extent received host memory");
@@ -187,13 +187,13 @@ void run(const std::string &metallib) {
                 backend.memoryStats().allocatedBytes == before + 2 * extentBytes,
             "growth did not add exactly one extent");
     storage.writeEntries(std::array<uint32_t, 4>{200, 5, 255, 128}, 0, table);
-    const auto *entries = static_cast<const SplashKvPage *>(table.contents());
+    const auto *entries = static_cast<const RichKvPage *>(table.contents());
     // Pages 200, 255 and 128 share the second extent, at indices 72, 127, 0.
     require(entries[0] == entryOf(storage, 200, probe) &&
-                (entries[0] & SPLASH_KV_PAGE_INDEX_MASK) == 72 &&
+                (entries[0] & RICHENGINE_KV_PAGE_INDEX_MASK) == 72 &&
                 entries[1] == runwayPage && entries[2] == entries[0] + 55 &&
-                entries[3] == entries[0] - 72 && (runwayPage & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}) !=
-                                                     (entries[3] & ~uint64_t{SPLASH_KV_PAGE_INDEX_MASK}),
+                entries[3] == entries[0] - 72 && (runwayPage & ~uint64_t{RICHENGINE_KV_PAGE_INDEX_MASK}) !=
+                                                     (entries[3] & ~uint64_t{RICHENGINE_KV_PAGE_INDEX_MASK}),
             "a page table does not hold the entries of its pages");
 
     // A command reaches extents through its tables without retaining them:
@@ -215,7 +215,7 @@ void run(const std::string &metallib) {
     requireThrows<std::logic_error>([&] { storage.releaseExtent(1); },
                                     "an unallocated extent was released again");
     require(storage.allocateExtent(1) &&
-                (entryOf(storage, 255, probe) & SPLASH_KV_PAGE_INDEX_MASK) == 127,
+                (entryOf(storage, 255, probe) & RICHENGINE_KV_PAGE_INDEX_MASK) == 127,
             "a released extent could not be allocated again");
     entriesFromFirst(storage, table);
     entriesFollowAReallocatedExtent(backend, storage, table);
@@ -273,7 +273,7 @@ void run(const std::string &metallib) {
         const uint32_t extent = layout.minimumExtentPages();
         kv::PageStorage bf16(backend, governor.allocationAdmission(), layout,
                              2 * extent, extent);
-        const SplashKvLayer bf16Layer = bf16.layers()[layout.attentionLayers - 1];
+        const RichKvLayer bf16Layer = bf16.layers()[layout.attentionLayers - 1];
         require(bf16Layer.offset == (layout.attentionLayers - 1) * extent * 2 *
                                                layout.dataBytesPerLayerPage(),
                 "BF16 regions hold quantization scales or misplace a layer");

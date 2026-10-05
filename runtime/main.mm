@@ -1,8 +1,8 @@
 #include "AwakeClock.hpp"
 #include "StderrLine.hpp"
-#include "engine/FdTransport.hpp"
+#include "engine/wire/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
-#include "engine/Status.hpp"
+#include "engine/wire/Status.hpp"
 #include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
 
@@ -33,11 +33,11 @@
 #include <utility>
 #include <vector>
 
-#ifndef SPLASH_BUILD_ID
+#ifndef RICHENGINE_BUILD_ID
 #error "production build requires the generated BuildIdentity.hpp"
 #endif
 
-namespace splash {
+namespace richengine {
 namespace {
 
 // Temporary host/driver allocation failures can recover during startup.
@@ -77,7 +77,7 @@ public:
   explicit MemoryPressureMonitor(std::function<void()> notify)
       : pending_(std::make_shared<std::atomic<engine::MemoryPressure>>(
             engine::MemoryPressure::Normal)),
-        queue_(dispatch_queue_create("com.splash.memory-pressure",
+        queue_(dispatch_queue_create("com.richengine.memory-pressure",
                                      DISPATCH_QUEUE_SERIAL)) {
     source_ = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
@@ -154,7 +154,7 @@ public:
     }
     const IOReturn result = IOPMAssertionCreateWithName(
         kIOPMAssertPreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
-        CFSTR("Splash is serving a request"), &assertion_);
+        CFSTR("RichEngine is serving a request"), &assertion_);
     if (result == kIOReturnSuccess)
       return;
     assertion_ = kIOPMNullAssertionID;
@@ -164,7 +164,7 @@ public:
     // Formatted without allocating: hold() must not throw.
     char line[160];
     std::snprintf(line, sizeof line,
-                  "Splash cannot keep the Mac awake while requests run (%s); "
+                  "RichEngine cannot keep the Mac awake while requests run (%s); "
                   "it may sleep during one.",
                   mach_error_string(result));
     writeStderrLine(line);
@@ -251,11 +251,10 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw UsageError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
+  // A draft-less model (Granite) holds target/ alone.
+  if (!std::filesystem::is_directory(root / "target", error))
+    throw UsageError(
+        "MODEL_DIRECTORY must hold the model's target/ directory");
   return root;
 }
 
@@ -331,10 +330,10 @@ engine::RuntimeBootstrapConfig
 bootstrapConfig(const NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
   config.resources.metallibPath =
-      executablePath().parent_path() / "splash.metallib";
+      executablePath().parent_path() / "richengine.metallib";
   config.resources.modelRoot = arguments.modelRoot;
   config.resources.model = arguments.model;
-  config.resources.buildId = SPLASH_BUILD_ID;
+  config.resources.buildId = RICHENGINE_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
@@ -519,32 +518,32 @@ int checkDevice() {
 }
 
 } // namespace
-} // namespace splash
+} // namespace richengine
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
-        return splash::checkDevice();
-      splash::NativeArguments arguments = splash::parseArguments(argc, argv);
-      return splash::runNative(arguments);
-    } catch (const splash::UsageError &error) {
-      splash::writeStderrLine(std::string("error: ") + error.what());
-      splash::printUsage(argc > 0 ? argv[0] : "splash");
+        return richengine::checkDevice();
+      richengine::NativeArguments arguments = richengine::parseArguments(argc, argv);
+      return richengine::runNative(arguments);
+    } catch (const richengine::UsageError &error) {
+      richengine::writeStderrLine(std::string("error: ") + error.what());
+      richengine::printUsage(argc > 0 ? argv[0] : "richengine");
       return static_cast<int>(
-          splash::engine::NativeProcessExit::ProtocolFailure);
-    } catch (const splash::engine::RuntimeBootstrapError &error) {
-      splash::printBootstrapError(error.report());
+          richengine::engine::NativeProcessExit::ProtocolFailure);
+    } catch (const richengine::engine::RuntimeBootstrapError &error) {
+      richengine::printBootstrapError(error.report());
       return static_cast<int>(
-          splash::engine::NativeProcessExit::EngineFailure);
+          richengine::engine::NativeProcessExit::EngineFailure);
     } catch (const std::system_error &error) {
-      splash::writeStderrLine(
+      richengine::writeStderrLine(
           std::string("error: native runtime I/O failed: ") + error.what());
-      return static_cast<int>(splash::engine::NativeProcessExit::IoFailure);
+      return static_cast<int>(richengine::engine::NativeProcessExit::IoFailure);
     } catch (const std::exception &error) {
-      splash::writeStderrLine(std::string("error: ") + error.what());
+      richengine::writeStderrLine(std::string("error: ") + error.what());
       return static_cast<int>(
-          splash::engine::NativeProcessExit::EngineFailure);
+          richengine::engine::NativeProcessExit::EngineFailure);
     }
   }
 }

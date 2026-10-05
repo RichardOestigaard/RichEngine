@@ -31,8 +31,8 @@
 
 namespace gguf_fixtures {
 
-namespace model = splash::model;
-namespace test_gguf = splash::test::gguf;
+namespace model = richengine::model;
+namespace test_gguf = richengine::test::gguf;
 using gguf_reference::Fmt;
 using test_gguf::Tensor;
 
@@ -321,7 +321,7 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
 // Writes a GGUF of the tensors declaring the geometry.
 inline void writeGguf(const std::filesystem::path &path, const std::vector<Tensor> &tensors,
                       const model::gguf::TargetGeometry &geometry) {
-  splash::test::writeFile(path, test_gguf::file(metadata(geometry), tensors));
+  richengine::test::writeFile(path, test_gguf::file(metadata(geometry), tensors));
 }
 
 // The plan's copy of the named tensor, or nullptr.

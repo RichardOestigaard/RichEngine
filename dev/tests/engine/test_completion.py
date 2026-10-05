@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
 OFFICIAL = ("official/Model-A", "official/Model-B")
 SUGGESTED = ("suggested/Model-4bit",)
-LOCAL = ("community/custom-splash", "community/linked-splash")
+LOCAL = ("community/custom-richengine", "community/linked-richengine")
 GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
 UPSTREAM = (*GGUF, "mlx-community/Model-4bit")
 
@@ -24,7 +24,7 @@ def bash_paths():
         "/bin/bash",
         "/opt/homebrew/bin/bash",
         "/usr/local/bin/bash",
-        os.environ.get("SPLASH_TEST_BASH", ""),
+        os.environ.get("RICHENGINE_TEST_BASH", ""),
     )
     return tuple(dict.fromkeys(path for path in candidates if os.access(path, os.X_OK)))
 
@@ -33,7 +33,7 @@ FISH = next(
     (
         path
         for path in (
-            os.environ.get("SPLASH_TEST_FISH", ""),
+            os.environ.get("RICHENGINE_TEST_FISH", ""),
             shutil.which("fish") or "",
             "/opt/homebrew/bin/fish",
             "/usr/local/bin/fish",
@@ -46,7 +46,7 @@ FISH = next(
 
 class CompletionTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="splash completion ")
+        self.temporary = tempfile.TemporaryDirectory(prefix="richengine completion ")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.home = self.root / "user home"
@@ -63,7 +63,7 @@ class CompletionTests(unittest.TestCase):
             "curl",
             "wget",
             "uv",
-            "splash",
+            "richengine",
         ):
             executable = blocked / name
             executable.write_text(
@@ -96,7 +96,7 @@ class CompletionTests(unittest.TestCase):
         (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
         if release:
             (root / "release.json").write_text("{}")
-            models = self.home / "Library/Application Support/Splash/models"
+            models = self.home / "Library/Application Support/RichEngine/models"
         else:
             models = root / "install/models"
         for model in (*OFFICIAL, LOCAL[0]):
@@ -166,11 +166,11 @@ class CompletionTests(unittest.TestCase):
         if unbroken:
             setup += f"COMP_WORDBREAKS=${{COMP_WORDBREAKS//[{unbroken}]/}}\n"
         program = (
-            'source "$1"\nshift\n' + setup + "registration=$(complete -p splash)\n"
+            'source "$1"\nshift\n' + setup + "registration=$(complete -p richengine)\n"
             "function=${registration##* -F }\nfunction=${function%% *}\n"
             'COMP_WORDS=("$@")\nCOMP_CWORD=$((${#COMP_WORDS[@]} - 1))\n'
             'COMP_LINE="${COMP_WORDS[*]}"\nCOMP_POINT=${#COMP_LINE}\n'
-            '"$function" splash "${COMP_WORDS[COMP_CWORD]}" '
+            '"$function" richengine "${COMP_WORDS[COMP_CWORD]}" '
             '"${COMP_WORDS[COMP_CWORD-1]}"\n'
             'if ((${#COMPREPLY[@]})); then printf "%s\\0" "${COMPREPLY[@]}"; fi\n'
         )
@@ -232,7 +232,7 @@ class CompletionTests(unittest.TestCase):
             with self.subTest(release=release):
                 root, directory = self.layout(str(release), release=release)
                 data = (
-                    self.home / "Library/Application Support/Splash"
+                    self.home / "Library/Application Support/RichEngine"
                     if release
                     else root / "build/runtime"
                 )
@@ -258,61 +258,61 @@ class CompletionTests(unittest.TestCase):
         _, directory = self.layout()
         cases = (
             (
-                ["splash", ""],
-                ["serve", "claude", "codex", "opencode", "hermes", "pi"],
+                ["richengine", ""],
+                ["serve", "models", "status", "flags", "doctor", "disk", "claude", "codex", "opencode", "hermes", "pi"],
             ),
-            (["splash", "co"], ["codex"]),
+            (["richengine", "co"], ["codex"]),
             (
-                ["splash", "serve", "--model", ""],
+                ["richengine", "serve", "--model", ""],
                 sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
             ),
-            (["splash", "serve", "--model", "community/l"], [LOCAL[1]]),
-            (["splash", "serve", "--model=community/l"], [LOCAL[1]]),
-            (["splash", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
+            (["richengine", "serve", "--model", "community/l"], [LOCAL[1]]),
+            (["richengine", "serve", "--model=community/l"], [LOCAL[1]]),
+            (["richengine", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
             (
-                ["splash", "serve", "--model", "="],
+                ["richengine", "serve", "--model", "="],
                 sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
             ),
-            (["splash", "serve", "--", "--model", ""], []),
-            (["splash", "serve", "--max-context", ""], []),
+            (["richengine", "serve", "--", "--model", ""], []),
+            (["richengine", "serve", "--max-context", ""], []),
             # Bash 3.2 keeps owner/repo:VARIANT in one word, and readline
             # replaces only the text after its ':'.
-            (["splash", "serve", "--model", "unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
-            (["splash", "serve", "--model=unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
+            (["richengine", "serve", "--model", "unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
+            (["richengine", "serve", "--model=unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
             # Bash 4 and later also split the word at the ':'.
             (
-                ["splash", "serve", "--model", "unsloth/Model-GGUF", ":", "UD"],
+                ["richengine", "serve", "--model", "unsloth/Model-GGUF", ":", "UD"],
                 ["UD-Q4_K_M"],
             ),
             (
-                ["splash", "serve", "--model", "unsloth/Model-GGUF", ":"],
+                ["richengine", "serve", "--model", "unsloth/Model-GGUF", ":"],
                 ["Q8_0", "UD-Q4_K_M"],
             ),
             (
-                ["splash", "serve", "--model", "=", "unsloth/Model-GGUF", ":", "UD"],
+                ["richengine", "serve", "--model", "=", "unsloth/Model-GGUF", ":", "UD"],
                 ["UD-Q4_K_M"],
             ),
             (
-                ["splash", "serve", "--max-context", "unsloth/Model-GGUF", ":", "UD"],
+                ["richengine", "serve", "--max-context", "unsloth/Model-GGUF", ":", "UD"],
                 [],
             ),
-            (["splash", "serve", "unsloth/Model-GGUF", ":"], []),
+            (["richengine", "serve", "unsloth/Model-GGUF", ":"], []),
         )
         # Words as they are split once these characters leave COMP_WORDBREAKS.
         unbroken_cases = (
-            (["splash", "serve", "--model=community/l"], "=", [f"--model={LOCAL[1]}"]),
+            (["richengine", "serve", "--model=community/l"], "=", [f"--model={LOCAL[1]}"]),
             (
-                ["splash", "serve", "--model=unsloth/Model-GGUF", ":", "UD"],
+                ["richengine", "serve", "--model=unsloth/Model-GGUF", ":", "UD"],
                 "=",
                 ["UD-Q4_K_M"],
             ),
             (
-                ["splash", "serve", "--model", "unsloth/Model-GGUF:UD"],
+                ["richengine", "serve", "--model", "unsloth/Model-GGUF:UD"],
                 ":",
                 ["unsloth/Model-GGUF:UD-Q4_K_M"],
             ),
             (
-                ["splash", "serve", "--model=unsloth/Model-GGUF:UD"],
+                ["richengine", "serve", "--model=unsloth/Model-GGUF:UD"],
                 "=:",
                 ["--model=unsloth/Model-GGUF:UD-Q4_K_M"],
             ),
@@ -321,14 +321,14 @@ class CompletionTests(unittest.TestCase):
             for words, expected in cases:
                 with self.subTest(shell=shell, words=words):
                     self.assertEqual(
-                        self.bash_complete(shell, directory / "splash.bash", words),
+                        self.bash_complete(shell, directory / "richengine.bash", words),
                         expected,
                     )
             for words, unbroken, expected in unbroken_cases:
                 with self.subTest(shell=shell, words=words, unbroken=unbroken):
                     self.assertEqual(
                         self.bash_complete(
-                            shell, directory / "splash.bash", words, unbroken=unbroken
+                            shell, directory / "richengine.bash", words, unbroken=unbroken
                         ),
                         expected,
                     )
@@ -337,8 +337,8 @@ class CompletionTests(unittest.TestCase):
                     self.assertEqual(
                         self.bash_complete(
                             shell,
-                            directory / "splash.bash",
-                            ["splash", agent, "--model", ""],
+                            directory / "richengine.bash",
+                            ["richengine", agent, "--model", ""],
                         ),
                         [],
                     )
@@ -354,8 +354,8 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(
                     self.bash_complete(
                         shell,
-                        link / "install/completions/splash.bash",
-                        ["splash", "serve", "--model", "community/l"],
+                        link / "install/completions/richengine.bash",
+                        ["richengine", "serve", "--model", "community/l"],
                         upgrade=(link, new, old),
                     ),
                     [LOCAL[1]],
@@ -408,12 +408,12 @@ class CompletionTests(unittest.TestCase):
                 keys = b"\t\x18"
             else:
                 # Enter runs this test-only argv recorder, never the real launcher.
-                recorder = self.root / "splash"
+                recorder = self.root / "richengine"
                 recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$@" ' + publish + "\n")
                 recorder.chmod(0o755)
                 setup = (
                     'source "$COMPLETION_SCRIPT"; '
-                    'splash() { printf "%s\\n" "$@" ' + publish + "; }; "
+                    'richengine() { printf "%s\\n" "$@" ' + publish + "; }; "
                 )
                 if unbroken:
                     setup += f"COMP_WORDBREAKS=${{COMP_WORDBREAKS//[{unbroken}]/}}; "
@@ -421,11 +421,11 @@ class CompletionTests(unittest.TestCase):
                 keys = b"\t\n"
             # Typing waits for the prompt: keys that arrive before the line
             # editor takes the terminal go through its line discipline instead.
-            os.write(master, b"PS1='[splash-test] '; " + setup.encode())
+            os.write(master, b"PS1='[richengine-test] '; " + setup.encode())
             deadline = time.monotonic() + 15
             ready = b"COMPLETION_READY\r\n"
             while ready not in output or (
-                b"[splash-test] " not in output[output.index(ready) :]
+                b"[richengine-test] " not in output[output.index(ready) :]
             ):
                 self.assertLess(
                     time.monotonic(), deadline, output.decode(errors="replace")
@@ -467,28 +467,28 @@ class CompletionTests(unittest.TestCase):
     def test_actual_zsh_tab(self):
         _, directory = self.layout()
         for line, expected in (
-            ("splash se", "splash serve "),
-            ("splash p", "splash pi "),
-            ("splash serve --model community/l", f"splash serve --model {LOCAL[1]} "),
-            ("splash serve --model=community/l", f"splash serve --model={LOCAL[1]} "),
+            ("richengine se", "richengine serve "),
+            ("richengine p", "richengine pi "),
+            ("richengine serve --model community/l", f"richengine serve --model {LOCAL[1]} "),
+            ("richengine serve --model=community/l", f"richengine serve --model={LOCAL[1]} "),
             (
-                "splash serve --model unsloth/Model-GGUF:UD",
-                f"splash serve --model {GGUF[1]} ",
+                "richengine serve --model unsloth/Model-GGUF:UD",
+                f"richengine serve --model {GGUF[1]} ",
             ),
-            ("splash claude --model community/l", "splash claude --model community/l"),
-            ("splash pi --model community/l", "splash pi --model community/l"),
+            ("richengine claude --model community/l", "richengine claude --model community/l"),
+            ("richengine pi --model community/l", "richengine pi --model community/l"),
         ):
             with self.subTest(line=line):
-                self.assertEqual(self.shell_tab(directory / "_splash", line), expected)
+                self.assertEqual(self.shell_tab(directory / "_richengine", line), expected)
 
     def test_actual_bash_tab_wordbreaks(self):
         _, directory = self.layout()
         for shell in bash_paths():
             for unbroken in ("", "=", ":"):
                 for command, option in (
-                    ("splash", "--model="),
-                    ("splash", "--model "),
-                    ("./splash", "--model="),
+                    ("richengine", "--model="),
+                    ("richengine", "--model "),
+                    ("./richengine", "--model="),
                 ):
                     for typed, model in (
                         ("community/l", LOCAL[1]),
@@ -502,7 +502,7 @@ class CompletionTests(unittest.TestCase):
                             typed=typed,
                         ):
                             actual = self.shell_tab(
-                                directory / "splash.bash",
+                                directory / "richengine.bash",
                                 f"{command} serve {option}{typed}",
                                 shell=shell,
                                 unbroken=unbroken,
@@ -523,11 +523,11 @@ class CompletionTests(unittest.TestCase):
         link.symlink_to(old, target_is_directory=True)
         self.assertEqual(
             self.shell_tab(
-                link / "install/completions/_splash",
-                "splash serve --model community/l",
+                link / "install/completions/_richengine",
+                "richengine serve --model community/l",
                 upgrade=(link, new, old),
             ),
-            f"splash serve --model {LOCAL[1]} ",
+            f"richengine serve --model {LOCAL[1]} ",
         )
 
     @unittest.skipUnless(os.access("/bin/zsh", os.X_OK), "Zsh is not installed")
@@ -535,20 +535,20 @@ class CompletionTests(unittest.TestCase):
         old, _ = self.layout("old keg", release=True)
         new = self.root / "new keg"
         shutil.copytree(old, new)
-        opt = self.root / "opt/splash"
+        opt = self.root / "opt/richengine"
         opt.parent.mkdir()
         opt.symlink_to(old, target_is_directory=True)
-        entry = self.root / "share/zsh/site-functions/_splash"
+        entry = self.root / "share/zsh/site-functions/_richengine"
         entry.parent.mkdir(parents=True)
-        entry.symlink_to(opt / "install/completions/_splash")
+        entry.symlink_to(opt / "install/completions/_richengine")
         self.assertEqual(
             self.shell_tab(
                 entry,
-                "splash serve --model=community/l",
+                "richengine serve --model=community/l",
                 upgrade=(opt, new, old),
                 autoload=True,
             ),
-            f"splash serve --model={LOCAL[1]} ",
+            f"richengine serve --model={LOCAL[1]} ",
         )
 
     @unittest.skipUnless(FISH, "fish is not installed")
@@ -557,30 +557,30 @@ class CompletionTests(unittest.TestCase):
         models = sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM))
         cases = (
             (
-                "splash ",
-                sorted(("serve", "claude", "codex", "opencode", "hermes", "pi")),
+                "richengine ",
+                sorted(("serve", "models", "status", "flags", "doctor", "disk", "claude", "codex", "opencode", "hermes", "pi")),
             ),
-            ("splash co", ["codex"]),
-            ("splash serve --model ", models),
-            ("splash serve --model community/l", [LOCAL[1]]),
-            ("splash serve --model=community/l", [f"--model={LOCAL[1]}"]),
-            ("splash serve --model unsloth/Model-GGUF:UD", [GGUF[1]]),
+            ("richengine co", ["codex"]),
+            ("richengine serve --model ", models),
+            ("richengine serve --model community/l", [LOCAL[1]]),
+            ("richengine serve --model=community/l", [f"--model={LOCAL[1]}"]),
+            ("richengine serve --model unsloth/Model-GGUF:UD", [GGUF[1]]),
             (
-                "splash serve --model=unsloth/Model-GGUF:",
+                "richengine serve --model=unsloth/Model-GGUF:",
                 [f"--model={model}" for model in GGUF],
             ),
-            ("splash serve --port 8001 --model community/l", [LOCAL[1]]),
-            ("splash serve -- --model ", []),
-            ("splash serve --max-context ", []),
+            ("richengine serve --port 8001 --model community/l", [LOCAL[1]]),
+            ("richengine serve -- --model ", []),
+            ("richengine serve --max-context ", []),
             # Neither model IDs as arguments nor option names, as in Bash.
-            ("splash serve ", []),
-            ("splash serve -", []),
+            ("richengine serve ", []),
+            ("richengine serve -", []),
             # A command only as the first word, and serve's --model only
             # after serve as the first word.
-            ("splash --version s", []),
-            ("splash opencode serve --model ", []),
+            ("richengine --version s", []),
+            ("richengine opencode serve --model ", []),
             *(
-                (f"splash {agent} --model ", [])
+                (f"richengine {agent} --model ", [])
                 for agent in ("claude", "codex", "opencode", "hermes", "pi")
             ),
         )
@@ -590,7 +590,7 @@ class CompletionTests(unittest.TestCase):
                     self.fish_complete(
                         "source $argv[2]; complete -C $argv[1]",
                         line,
-                        directory / "splash.fish",
+                        directory / "richengine.fish",
                     ),
                     expected,
                 )
@@ -604,10 +604,10 @@ class CompletionTests(unittest.TestCase):
         link.symlink_to(old, target_is_directory=True)
         self.assertEqual(
             self.fish_complete(
-                "source $argv[2]/install/completions/splash.fish; "
+                "source $argv[2]/install/completions/richengine.fish; "
                 "/bin/rm $argv[2]; /bin/ln -s $argv[3] $argv[2]; /bin/rm -rf $argv[4]; "
                 "complete -C $argv[1]",
-                "splash serve --model community/l",
+                "richengine serve --model community/l",
                 link,
                 new,
                 old,
@@ -620,20 +620,20 @@ class CompletionTests(unittest.TestCase):
         old, _ = self.layout("old keg", release=True)
         new = self.root / "new keg"
         shutil.copytree(old, new)
-        opt = self.root / "opt/splash"
+        opt = self.root / "opt/richengine"
         opt.parent.mkdir()
         opt.symlink_to(old, target_is_directory=True)
-        entry = self.root / "share/fish/vendor_completions.d/splash.fish"
+        entry = self.root / "share/fish/vendor_completions.d/richengine.fish"
         entry.parent.mkdir(parents=True)
-        entry.symlink_to(opt / "install/completions/splash.fish")
+        entry.symlink_to(opt / "install/completions/richengine.fish")
         # fish autoloads completions only for a command it finds: the blocked
-        # splash on PATH stands in for the launcher, which never runs.
+        # richengine on PATH stands in for the launcher, which never runs.
         self.assertEqual(
             self.fish_complete(
                 "set -p fish_complete_path $argv[2]; complete -C $argv[1] >/dev/null; "
                 "/bin/rm $argv[3]; /bin/ln -s $argv[4] $argv[3]; /bin/rm -rf $argv[5]; "
                 "complete -C $argv[1]",
-                "splash serve --model=community/l",
+                "richengine serve --model=community/l",
                 entry.parent,
                 opt,
                 new,

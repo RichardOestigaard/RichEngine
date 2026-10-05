@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
@@ -85,7 +85,8 @@ void PlainDraft::addContextPrefill(
   operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
                                      weights_.contextProjection, rows);
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows);
+                                 buffers.projected, buffers.projectionSums, rows,
+                                 buffers.linearScratch);
   ops::Normalization::addRmsWithQ4Sums(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
       buffers.projectionSums, layout.hiddenSize, rows);
@@ -93,7 +94,8 @@ void PlainDraft::addContextPrefill(
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addPrefill(graph, buffers.hidden,
                       contextKvProjections_[layer],
-                      buffers.contextKv, buffers.projectionSums, rows);
+                      buffers.contextKv, buffers.projectionSums, rows,
+                      buffers.linearScratch);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -164,11 +166,11 @@ void PlainDraft::addDecode(
         cacheLengths, attentionPlan, causal);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
-    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
-               weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes));
-    ops::DraftAttention::addResidual(graph, buffers.projected,
-                                     buffers.hidden[current],
-                                     buffers.residual, attentionPlan);
+    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.residual,
+                       .residual = buffers.hidden[current], .scratch = scratch},
+               weights.outputProjection,
+               linear.decodePlan(weights.outputProjection, lanes,
+                                 ops::LinearEpilogue::Residual));
     const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes);
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
@@ -180,11 +182,11 @@ void PlainDraft::addDecode(
                weights.upProjection,
                linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
                &weights.gateProjection);
-    linear.add(graph, {.input = buffers.intermediate, .output = buffers.projected, .scratch = scratch},
-               weights.downProjection, linear.decodePlan(weights.downProjection, lanes));
-    ops::DraftAttention::addResidual(graph, buffers.projected,
-                                     buffers.residual,
-                                     buffers.hidden[next], attentionPlan);
+    linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
+                       .residual = buffers.residual, .scratch = scratch},
+               weights.downProjection,
+               linear.decodePlan(weights.downProjection, lanes,
+                                 ops::LinearEpilogue::Residual));
   }
 
   // The final norm feeds the shared vocabulary head; the plain selector
@@ -314,4 +316,4 @@ PlainDraftWeights loadPlainDraftWeights(metal::MetalBackend &backend,
   return readDraft(backend, std::get<PackedPlainDraftFiles>(files), layout);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

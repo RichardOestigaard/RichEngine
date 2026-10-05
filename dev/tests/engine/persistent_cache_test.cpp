@@ -4,9 +4,9 @@
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
-#include "engine/Cache.hpp"
-#include "engine/DiskLabels.hpp"
-#include "engine/WriteBehind.hpp"
+#include "engine/cache/Cache.hpp"
+#include "engine/cache/DiskLabels.hpp"
+#include "engine/memory/WriteBehind.hpp"
 #include "model/SlotFile.hpp"
 
 #include <unistd.h>
@@ -24,12 +24,12 @@
 #include <utility>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 // Where a persistent tier keeps state copies in these tests: each copy on
 // disk keeps the label its write gave it while it lives, as a slot file's
@@ -425,7 +425,7 @@ private:
 // copies go until the rest fits.
 void testAdoptionTrimsToTheQuota() {
   const std::filesystem::path directory =
-      std::filesystem::temp_directory_path() / ("splash-adoption-" + std::to_string(::getpid()));
+      std::filesystem::temp_directory_path() / ("richengine-adoption-" + std::to_string(::getpid()));
   std::filesystem::create_directories(directory);
   const model::SlotFile::Persistence persistence{
       directory / "state.slots", directory / "state.records", {}, sizeof(StateLabel)};

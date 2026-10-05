@@ -2,7 +2,7 @@
 #include "TestChecks.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
-#include "engine/MemoryPlan.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -17,10 +17,10 @@
 
 namespace {
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
-using splash::test::require;
+using richengine::test::require;
 
 class TemporaryModelRoot final {
 public:
@@ -29,7 +29,7 @@ public:
   explicit TemporaryModelRoot(uint64_t bytesPerComponent = 16 * 1024)
       : fileBytes(bytesPerComponent), packageBytes(3 * bytesPerComponent) {
     path = std::filesystem::temp_directory_path() /
-           ("splash-budget-" +
+           ("richengine-budget-" +
             std::string([NSUUID UUID].UUIDString.UTF8String));
     for (const char *component : {"target", "draft", "vision"}) {
       std::filesystem::create_directories(path / component);

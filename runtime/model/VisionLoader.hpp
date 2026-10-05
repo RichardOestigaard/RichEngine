@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <memory>
 
-namespace splash::model {
+namespace richengine::model {
 
 // Source adapter for the vision tower: the vision_tower.* tensors of an MLX
 // checkpoint or a GGUF mmproj, both written into the packed vision/model.bin
@@ -38,4 +38,4 @@ private:
 // the patch embedding's width that of two frames of RGB patches.
 void requireVisionLayout(const ops::VisionLayout &layout);
 
-} // namespace splash::model
+} // namespace richengine::model

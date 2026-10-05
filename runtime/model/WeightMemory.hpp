@@ -1,6 +1,6 @@
 #pragma once
 
-namespace splash::model {
+namespace richengine::model {
 
 // The memory of a model's weights, which can be given back and written
 // again from the weights' sources: WeightImages, or a test's stand-in.
@@ -16,4 +16,4 @@ public:
   [[nodiscard]] virtual bool restore() = 0;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

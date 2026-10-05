@@ -19,7 +19,7 @@
 #include <variant>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // A DSpark draft (architectures: "Qwen3DSparkModel"/"Lfm2DSparkDraftModel"):
 // the plain transformer draft's layer stack — one fused QKV projection,
@@ -49,7 +49,7 @@ struct DSparkDraftWeights final {
 
 inline constexpr std::string_view kDSparkDraftMagic = "MDFS0006";
 
-// A Splash package's DSpark-draft files: layer-<N>.bin and model.bin, in the
+// An RichEngine package's DSpark-draft files: layer-<N>.bin and model.bin, in the
 // section order DSparkDraft.cpp reads.
 struct PackedDSparkDraftFiles final {
   WeightImages &images;
@@ -106,4 +106,4 @@ private:
   std::vector<ops::Projection> contextKvProjections_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

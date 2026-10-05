@@ -11,7 +11,7 @@
 
 struct QuantFormat;
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // Physical layout, independent of the checkpoint container and compute tile.
 enum class WeightLayout : uint8_t { Affine64, Block32 };
@@ -192,4 +192,4 @@ public:
   InputRotation rotation;
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

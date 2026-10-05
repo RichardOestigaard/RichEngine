@@ -21,7 +21,7 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));
-  return bfloat(splash_silu(value));
+  return bfloat(richengine_silu(value));
 }
 
 // Row `row` of the carried state after consumed_tokens: the last three inputs
@@ -40,7 +40,7 @@ inline bfloat gdn_conv_carry(device const bfloat *packed,
 // the node's path, not the adjacent DFS rows.
 inline uint gdn_tree_ancestor(device const uint *nodes, uint row, uint hops) {
   for (uint i = 0; i < hops; ++i)
-    row = SPLASH_TREE_NODE_PARENT(nodes[row]);
+    row = RICHENGINE_TREE_NODE_PARENT(nodes[row]);
   return row;
 }
 
@@ -52,7 +52,7 @@ inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
                                  device const bfloat *conv_weights,
                                  uint packed_width, uint conv_dim, uint row,
                                  uint channel, device const uint *nodes) {
-  const uint depth = SPLASH_TREE_NODE_DEPTH(nodes[row]);
+  const uint depth = RICHENGINE_TREE_NODE_DEPTH(nodes[row]);
   float value = 0.0f;
   for (uint tap = 0; tap < 4; ++tap) {
     const int position = int(depth) + int(tap);
@@ -65,7 +65,7 @@ inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));
-  return bfloat(splash_silu(value));
+  return bfloat(richengine_silu(value));
 }
 
 // The tree counterpart of gdn_conv_carry: the consumed prefix is the
@@ -95,7 +95,7 @@ inline GdnGates gdn_gates(device const bfloat *packed_row,
                           uint a_offset, uint head) {
   float b = float(packed_row[b_offset + head]);
   GdnGates gates;
-  gates.beta = bfloat(splash_sigmoid(b));
+  gates.beta = bfloat(richengine_sigmoid(b));
   bfloat x = bfloat(float(packed_row[a_offset + head]) + float(dt_bias[head]));
   float xf = float(x);
   bfloat softplus =
@@ -143,6 +143,6 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = splash_silu(gate);
+  float silu = richengine_silu(gate);
   hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
 }

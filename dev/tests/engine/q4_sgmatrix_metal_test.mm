@@ -21,10 +21,10 @@
 #include <utility>
 #include <vector>
 
-using namespace splash;
-using namespace splash::ops;
-using namespace splash::ops::tuning;
-using namespace splash::test;
+using namespace richengine;
+using namespace richengine::ops;
+using namespace richengine::ops::tuning;
+using namespace richengine::test;
 namespace {
 struct Guarded {
   metal::MetalBuffer backing, view;
@@ -327,7 +327,7 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   metal::CommandGraph graph;
   require(Normalization::addRms(graph,c.input,c.weight,output,k,rows).layout==LinearInput::Plain,
           "plain norm claimed a table");
-  require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==(k<=SPLASH_STAGED_NORM_WIDTH),
+  require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==(k<=RICHENGINE_STAGED_NORM_WIDTH),
           "plain norm staged the wrong widths");
   addReferencePreparation(graph,layout,output,a,sa,k,rows/8);
   const PreparedInput prepared=Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
@@ -355,7 +355,7 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
   Normalization::addRms(graph,c.input,c.weight,plain,k,rows);
   require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==
-              (rows<=SPLASH_STAGED_NORM_ROWS && k<=SPLASH_STAGED_NORM_WIDTH),
+              (rows<=RICHENGINE_STAGED_NORM_ROWS && k<=RICHENGINE_STAGED_NORM_WIDTH),
           "plain norm staged the wrong rows");
   (void)backend.submitCommand(graph.dispatches());
   requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");

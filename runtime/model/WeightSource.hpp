@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // Bytes [offset, offset + size) of the file open at descriptor.
 void readWeightBytes(int descriptor, uint64_t offset, std::span<uint8_t> bytes);
@@ -51,4 +51,4 @@ struct SourceTensor final {
   void read(uint64_t at, std::span<uint8_t> destination) const;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -435,7 +435,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def version_string(self):
-        return "Splash"
+        return "RichEngine"
 
     def do_GET(self):
         path = self.route
@@ -482,7 +482,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "id": name,
                     "object": "model",
                     "created": 0,
-                    "owned_by": "splash",
+                    "owned_by": "richengine",
                     "max_model_len": self.app.max_context,
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
@@ -500,7 +500,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 typed = [
                     {
                         "name": item["id"],
-                        "description": "Splash resident model",
+                        "description": "RichEngine resident model",
                         "release_date": "",
                     }
                     for item in models
@@ -1170,7 +1170,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # chat and text completion streams until the request starts, the
         # Responses stream once output has begun.
         self._start_event_stream()
-        self._write_sse(b": splash-keepalive\n\n")
+        self._write_sse(b": richengine-keepalive\n\n")
 
     def _sse_error(self, error):
         self._sse(
@@ -1898,7 +1898,7 @@ def parse_args(argv=None):
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
     )
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    parser.add_argument("--binary", default=str(ROOT / "build" / "richengine"))
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
@@ -2045,6 +2045,7 @@ def main():
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
             contract=contract,
+            shared_prefix_states=args.shared_prefix_state,
         )
         server.app = app
         server.server_activate()
@@ -2056,6 +2057,11 @@ def main():
         )
         mode = "" if readiness.vision else " · language only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
+        if sys.stdout.isatty():
+            print_status(
+                f"Next · open {address} or connect an agent: "
+                "richengine opencode / claude / codex / hermes / pi"
+            )
         server.serve_forever()
     except (
         engine_runtime.EngineRuntimeError,

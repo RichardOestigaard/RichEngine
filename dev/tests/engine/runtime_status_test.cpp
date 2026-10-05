@@ -2,7 +2,7 @@
 #include "TestModel.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "StderrLine.hpp"
-#include "engine/Status.hpp"
+#include "engine/wire/Status.hpp"
 
 #include <unistd.h>
 
@@ -16,12 +16,12 @@
 #include <thread>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 EngineMemoryPlan plan() {
   DeviceCapabilities device;

@@ -785,7 +785,7 @@ class RuntimeTests(unittest.TestCase):
         process.send(wire.MaskRequestEvent(call.request_id, 987, 2, (5, 6, 7)))
         response = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertTrue(provider_called.is_set())
-        self.assertTrue(provider_thread[0].startswith("splash-mask"))
+        self.assertTrue(provider_thread[0].startswith("richengine-mask"))
         self.assertEqual(response.request_id, call.request_id)
         self.assertEqual(response.mask_request_id, 987)
         self.assertEqual(response.mask_words, array("I", range(1, 9)).tobytes())
@@ -1296,7 +1296,7 @@ class RuntimeTests(unittest.TestCase):
         with mock.patch.object(runtime._crash_trace, "dump"):
             factory.processes[0].kill()
             with self.assertRaisesRegex(
-                engine_runtime.EngineUnhealthy, "restart the Splash server"
+                engine_runtime.EngineUnhealthy, "restart the RichEngine server"
             ):
                 runtime.wait_ready(1)
         self.assertIsInstance(runtime.fatal_error, engine_runtime.EngineUnhealthy)
@@ -1419,7 +1419,7 @@ class RuntimeTests(unittest.TestCase):
         factory = FakeFactory()
         with (
             TemporaryDirectory() as temporary,
-            mock.patch.dict(os.environ, {"SPLASH_CRASH_TRACE": "1"}),
+            mock.patch.dict(os.environ, {"RICHENGINE_CRASH_TRACE": "1"}),
             mock.patch.object(
                 crash_trace,
                 "DEFAULT_TRACE_DIRECTORY",
@@ -1444,7 +1444,7 @@ class RuntimeTests(unittest.TestCase):
         failures = []
         with (
             TemporaryDirectory() as temporary,
-            mock.patch.dict(os.environ, {"SPLASH_CRASH_TRACE": "1"}),
+            mock.patch.dict(os.environ, {"RICHENGINE_CRASH_TRACE": "1"}),
             mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", Path(temporary)),
             mock.patch.object(crash_trace.base64, "b64encode", side_effect=MemoryError),
         ):

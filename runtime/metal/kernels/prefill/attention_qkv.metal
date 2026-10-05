@@ -86,6 +86,34 @@ PREFILL_ATTENTION_QKV_HD64(prefill_attention_qkv_hd64, bfloat)
 PREFILL_ATTENTION_QKV_HD64(prefill_attention_qkv_hd64_f32, float)
 #undef PREFILL_ATTENTION_QKV_HD64
 
+// Granite's KV8 groups without per-head norms: 3B's 40 query heads of 64
+// (group 5) and 8B's 32 of 128 (group 4), both fully rotated.
+#define PREFILL_ATTENTION_QKV_GRANITE(Name, QHeads, HeadDim)                     \
+  kernel void Name(                                                            \
+      device const bfloat *qkv [[buffer(0)]],                                  \
+      device const bfloat *q_norm [[buffer(1)]],                               \
+      device const bfloat *k_norm [[buffer(2)]],                               \
+      device const float *rope_cos [[buffer(3)]],                              \
+      device const float *rope_sin [[buffer(4)]],                              \
+      device bfloat *queries [[buffer(5)]],                                    \
+      device bfloat *chunk_keys [[buffer(6)]],                                 \
+      device bfloat *chunk_values [[buffer(7)]],                               \
+      constant FullPrefillParams &params [[buffer(8)]],                        \
+      uint task [[threadgroup_position_in_grid]],                              \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint lane [[thread_index_in_simdgroup]],                                 \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    threadgroup float reductions[8];                                           \
+    threadgroup bfloat normalized[HeadDim];                                    \
+    full_qkv_storage_phase<QHeads, 8, HeadDim, HeadDim / 2, false, false>(     \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys,          \
+        chunk_values, params, reductions, normalized, task, thread_index,      \
+        lane, simd_group, 1e-5f);                                              \
+  }
+PREFILL_ATTENTION_QKV_GRANITE(prefill_attention_qkv_k8q5d64, 40, 64)
+PREFILL_ATTENTION_QKV_GRANITE(prefill_attention_qkv_k8q4d128, 32, 128)
+#undef PREFILL_ATTENTION_QKV_GRANITE
+
 template <uint QHeads, uint KHeads, uint HeadDim = 256, bool Gate = true>
 inline void full_attention_gate_prefill_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
@@ -104,7 +132,7 @@ inline void full_attention_gate_prefill_phase(
     if constexpr (Gate) {
       float gate = float(packed_qkv[ulong(row) * PackedStride +
                                     query_head * QStride + HeadDim + dim]);
-      gate_scale = splash_sigmoid(gate);
+      gate_scale = richengine_sigmoid(gate);
     }
     uint kv_head = query_head / HeadsPerKV;
     uint local_head = query_head % HeadsPerKV;
@@ -204,4 +232,6 @@ PREFILL_ATTENTION_GATE_SUMS(prefill_attention_gate_sums_kv2_g8, 16, 2)
   }
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd128, 16, 2, 128)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd64, 32, 8, 64)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q5d64, 40, 8, 64)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q4d128, 32, 8, 128)
 #undef PREFILL_ATTENTION_GATHER

@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::metal {
+namespace richengine::metal {
 
 // An ordered dispatch list for one command buffer. Buffers bind at indices
 // 0..n-1; an optional parameter struct binds at index n and is copied into
@@ -52,7 +52,7 @@ public:
   // Like add(), but marks the dispatch's parameter payload as changing
   // between submissions: a baked span containing it replays with the
   // payload rewritten in place rather than re-baking (see
-  // ComputeDispatch::patchableBytes). SPLASH_PATCHABLE_OFF makes the
+  // ComputeDispatch::patchableBytes). RICHENGINE_PATCHABLE_OFF makes the
   // dispatch non-bakeable instead — the pre-patchable behavior of a
   // suspension — for A/B measurement.
   template <class Params>
@@ -61,7 +61,7 @@ public:
                     DispatchSize threads = {kDefaultThreads, 1, 1}) {
     add(std::move(pipeline), std::move(buffers), params, groups, threads);
     static const bool disabled =
-        std::getenv("SPLASH_PATCHABLE_OFF") != nullptr;
+        std::getenv("RICHENGINE_PATCHABLE_OFF") != nullptr;
     if (disabled) {
       dispatches_.back().bakeable = false;
     } else {
@@ -119,4 +119,4 @@ private:
   std::vector<ComputeDispatch> dispatches_;
 };
 
-} // namespace splash::metal
+} // namespace richengine::metal

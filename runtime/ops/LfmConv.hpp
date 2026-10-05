@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The LFM2 short-convolution mixer's shape: the double-gated causal
 // depthwise convolution of `dimension` channels over `taps` taps, fed the
@@ -69,4 +69,4 @@ public:
                         uint64_t mixedLayerStride, bool tapsMajor);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

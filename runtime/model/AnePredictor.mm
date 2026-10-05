@@ -7,7 +7,7 @@
 #include <dispatch/dispatch.h>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct AnePredictor::Impl {
   MLModel *model = nil;
@@ -79,7 +79,7 @@ AnePredictor::load(std::string_view path, std::string &error) {
     Impl *impl = new Impl;
     impl->model = model;
     impl->queue =
-        dispatch_queue_create("splash.ane.predictor", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_create("richengine.ane.predictor", DISPATCH_QUEUE_SERIAL);
     return std::unique_ptr<AnePredictor>(new AnePredictor(impl));
   }
 }
@@ -194,4 +194,4 @@ bool AnePredictor::predict(std::span<const AneTensor> inputs,
   }
 }
 
-} // namespace splash::model
+} // namespace richengine::model

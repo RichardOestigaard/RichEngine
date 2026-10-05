@@ -3,7 +3,7 @@
 #include "TestChecks.hpp"
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
-#include "engine/Cache.hpp"
+#include "engine/cache/Cache.hpp"
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
@@ -17,12 +17,12 @@
 #include <utility>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Error, typename Function>
 void requireThrows(Function &&function, const char *message) {

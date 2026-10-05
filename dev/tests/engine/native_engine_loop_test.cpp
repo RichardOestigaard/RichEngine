@@ -6,9 +6,9 @@
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
 #include "TestStatus.hpp"
-#include "engine/Cache.hpp"
-#include "engine/MemoryControl.hpp"
-#include "engine/NativeRuntime.hpp"
+#include "engine/cache/Cache.hpp"
+#include "engine/memory/MemoryControl.hpp"
+#include "engine/wire/NativeRuntime.hpp"
 #include "metal/CommandWatchdog.hpp"
 
 #include <algorithm>
@@ -24,8 +24,8 @@
 #include <unordered_set>
 #include <utility>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
@@ -186,7 +186,7 @@ private:
   uint32_t restored_ = 0;
 };
 
-using splash::test::require;
+using richengine::test::require;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::NativeRuntime &loop) {

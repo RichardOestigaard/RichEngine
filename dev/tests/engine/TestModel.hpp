@@ -1,11 +1,11 @@
 #pragma once
 
-#include "engine/MemoryPlan.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 
 #include <stdexcept>
 #include <utility>
 
-namespace splash::test {
+namespace richengine::test {
 
 // Synthetic nonzero allocations for planner/status tests. Production obtains
 // these values from the loaded model and plannedRuntimeMemory().
@@ -40,4 +40,4 @@ requireMemoryPlan(const DeviceCapabilities &device,
   return std::move(*result.plan);
 }
 
-} // namespace splash::test
+} // namespace richengine::test

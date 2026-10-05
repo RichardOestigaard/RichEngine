@@ -60,7 +60,7 @@ def current_build_id():
             argparse.Namespace(
                 header=directory / "BuildIdentity.hpp",
                 stamp=stamp,
-                binary=[ROOT / "build/splash"],
+                binary=[ROOT / "build/richengine"],
             ),
             identity,
         )
@@ -343,9 +343,9 @@ def prefix_reuse(before, after):
 def pressure_stop_level():
     """macOS pressure level at which a client workflow stops: 1 normal, 2
     warning, 4 critical. The default stops at any warning; set
-    SPLASH_TEST_PRESSURE_STOP=4 to observe how the engine sheds cache under
+    RICHENGINE_TEST_PRESSURE_STOP=4 to observe how the engine sheds cache under
     warning pressure and stop only when the OS reports critical."""
-    return int(os.environ.get("SPLASH_TEST_PRESSURE_STOP", "2"))
+    return int(os.environ.get("RICHENGINE_TEST_PRESSURE_STOP", "2"))
 
 
 def memory_sample():
@@ -499,7 +499,7 @@ class ClientRun:
         # What the served model accepts, as /v1/models reports it.
         self.input_modalities = input_modalities
         # The client's major version, on which only OpenCode's launch depends,
-        # as for splash.
+        # as for richengine.
         self.version = version
         self.workspace = (folder / "project").resolve()
         self.session = None
@@ -511,7 +511,7 @@ class ClientRun:
         # home for a root of its own, where it would install its tools and to
         # which it would point the developer's hermes command. finish_hermes
         # moves it into this folder.
-        self.hermes_profile = f"splash-test-{secrets.token_hex(4)}"
+        self.hermes_profile = f"richengine-test-{secrets.token_hex(4)}"
         self.hermes_home = clients.hermes_profile_home(os.environ, self.hermes_profile)
         self.hermes_profiles_existed = self.hermes_home.parent.is_dir()
         # OpenCode's record of the session, as the last phase exported it.
@@ -546,7 +546,7 @@ class ClientRun:
                 "exec",
                 "--sandbox",
                 "workspace-write",
-                *os.environ.get("SPLASH_TEST_CODEX_ARGS", "").split(),
+                *os.environ.get("RICHENGINE_TEST_CODEX_ARGS", "").split(),
             ]
             if self.session:
                 arguments += ["resume", self.session]
@@ -562,7 +562,7 @@ class ClientRun:
         return self.command(arguments)
 
     def command(self, arguments):
-        """The client's command, as `splash NAME -- ARGUMENTS` runs it, with
+        """The client's command, as `richengine NAME -- ARGUMENTS` runs it, with
         the client's own state in this run's folder, leaving the developer's
         untouched: Pi's agent directory (providers, sessions, settings and
         extensions), Codex's home, and OpenCode's data directory, whose
@@ -686,7 +686,7 @@ class ClientRun:
                     if sample["pressure"] >= pressure_stop_level():
                         reason = (
                             f"OS memory pressure level {sample['pressure']} reached "
-                            f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}; "
+                            f"RICHENGINE_TEST_PRESSURE_STOP={pressure_stop_level()}; "
                             "stopped for desktop safety"
                         )
                         break
@@ -1037,7 +1037,7 @@ def parse_args(argv=None):
         type=launcher.model_artifacts.parse_model_id,
         required=True,
     )
-    # The installation's source options, which splash serve is given, and
+    # The installation's source options, which richengine serve is given, and
     # its selection link (install/models.py link), which they name by default.
     parser.add_argument("--revision")
     parser.add_argument(
@@ -1087,7 +1087,7 @@ def main(argv=None):
             "path": path,
             "version": (result.stdout or result.stderr).strip(),
         }
-        # OpenCode's launch depends on its major version, read as splash reads
+        # OpenCode's launch depends on its major version, read as richengine reads
         # it. The launcher starts a version it cannot read as OpenCode 1,
         # which would run OpenCode 2 through its background service.
         if name == "opencode":
@@ -1118,7 +1118,7 @@ def main(argv=None):
         identity = current_build_id()
         if launcher._request_json("/status") is None:
             command = [
-                str(ROOT / "splash"),
+                str(ROOT / "richengine"),
                 "serve",
                 "--max-context",
                 args.max_context,
@@ -1145,7 +1145,7 @@ def main(argv=None):
                 time.sleep(0.5)
         initial = idle_status()
         # Clients get the first entry, the name responses report, as with
-        # splash <client>; /status names the loaded model.
+        # richengine <client>; /status names the loaded model.
         served = launcher._request_json("/v1/models")["data"][0]
         model = served["id"]
         context = initial["maximum_context_tokens"]
@@ -1195,7 +1195,7 @@ def main(argv=None):
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():
                 raise AgentFailure(
                     "stopping remaining clients: OS memory pressure reached "
-                    f"SPLASH_TEST_PRESSURE_STOP={pressure_stop_level()}"
+                    f"RICHENGINE_TEST_PRESSURE_STOP={pressure_stop_level()}"
                 )
         document["final_status"] = idle_status()
         document["result"] = (

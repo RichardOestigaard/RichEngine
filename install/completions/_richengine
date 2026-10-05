@@ -1,0 +1,35 @@
+#compdef richengine
+
+# Keep the stable install path so an already-running shell survives upgrades.
+typeset -g _richengine_completion_source=${${(%):-%x}:a}
+
+_richengine() {
+    local word helper
+    local -a models
+    if (( CURRENT == 2 )); then
+        compadd -- serve models status flags doctor disk claude codex opencode hermes pi
+        return
+    fi
+    [[ $words[2] == serve ]] || return 0
+    for word in "${words[@]:2:$(( CURRENT - 3 ))}"; do
+        [[ $word == -- ]] && return 0
+    done
+    if [[ $words[CURRENT-1] == --model ]]; then
+        :
+    elif [[ $words[CURRENT] == --model=* ]]; then
+        compset -P '--model='
+    else
+        return 0
+    fi
+    helper="${_richengine_completion_source:A:h}/models"
+    [[ -x $helper ]] || return 0
+    models=(${(f)"$("$helper" "$PREFIX")"})
+    (( ${#models} )) && compadd -- "${models[@]}"
+    return 0
+}
+
+if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
+    _richengine "$@"
+elif (( $+functions[compdef] )); then
+    compdef _richengine richengine
+fi

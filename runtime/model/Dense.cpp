@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 // The dense attention mixer: a fused QKV projection (query rows alone), no
@@ -79,4 +79,4 @@ DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
                                              readFfn);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

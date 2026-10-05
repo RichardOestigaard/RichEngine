@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-namespace splash {
+namespace richengine {
 
 // Device features and memory limits used by runtime planning.
 struct DeviceCapabilities {
@@ -27,7 +27,7 @@ struct DeviceCapabilities {
     uint64_t recommendedMaxWorkingSetBytes = 0;
     uint64_t maxBufferLengthBytes = 0;
     uint64_t maxThreadgroupMemoryBytes = 0;
-    // Splash runtime only emits one-dimensional threadgroups. Metal exposes the
+    // RichEngine runtime only emits one-dimensional threadgroups. Metal exposes the
     // per-dimension limit as MTLSize; the pipeline state separately validates
     // the total thread count for every dispatch.
     uint64_t maxThreadgroupWidth = 0;
@@ -43,9 +43,9 @@ struct DeviceCapabilities {
 
     // Returns a stable machine-readable reason, or nullopt when valid.
     [[nodiscard]] std::optional<std::string> validationError() const;
-    // The same verdict as one line for a person: what Splash needs against
+    // The same verdict as one line for a person: what RichEngine needs against
     // what this Mac has, ending with the reason above.
     [[nodiscard]] std::optional<std::string> validationMessage() const;
 };
 
-} // namespace splash
+} // namespace richengine

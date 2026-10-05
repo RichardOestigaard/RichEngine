@@ -2,7 +2,7 @@
 # Invalid benchmark arguments must fail before a device or metallib is opened.
 set -eu
 binary=$1
-work=$(mktemp -d "${TMPDIR:-/tmp}/splash-sweep-cli.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/richengine-sweep-cli.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 reject() {

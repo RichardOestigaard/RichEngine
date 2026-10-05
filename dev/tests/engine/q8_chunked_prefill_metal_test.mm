@@ -21,8 +21,8 @@
 #include <string>
 #include <vector>
 
-using namespace splash::kv;
-using splash::ops::tuning::HostKvExtents;
+using namespace richengine::kv;
+using richengine::ops::tuning::HostKvExtents;
 
 namespace {
 
@@ -49,7 +49,7 @@ uint64_t attentionIndex(uint32_t stride, uint32_t head, uint32_t row,
          dimension;
 }
 
-using splash::test::require;
+using richengine::test::require;
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
   id<MTLBuffer> result =
@@ -188,7 +188,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
                    result.pool->pages->layer(kLayer)};
   require(chunkedPrefillValidationError(result.params).empty(),
           "invalid generated params");
-  result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
+  result.pageTableBuffer = makeBuffer(device, pages * sizeof(RichKvPage));
   result.pool->pages->writeTable(result.pageTable, result.pageTableBuffer.contents);
   uint64_t chunkElements = uint64_t{kKvHeads} * stride * kHeadDimension;
   result.chunkKeys = makeBuffer(device, chunkElements * sizeof(BFloat16Bits));
@@ -197,7 +197,7 @@ Case makeCase(id<MTLDevice> device, uint32_t committed, uint32_t chunk,
   uint64_t queryElements = uint64_t{kQueryHeads} * stride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   result.output = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
-  const auto workspace = splash::ops::PagedAttention::prefillWorkspace(
+  const auto workspace = richengine::ops::PagedAttention::prefillWorkspace(
       chunk, kQueryHeads, {1, kKvHeads, kHeadDimension});
   result.partials = makeBuffer(device, workspace.partialsBytes);
   result.statistics = makeBuffer(device, workspace.statisticsBytes);
@@ -231,13 +231,13 @@ void fillHistory(Case &data) {
     }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
     std::copy(quantized->keys.begin(), quantized->keys.end(),
-              data.slab<int8_t>(SPLASH_KV_KEYS, logicalPage));
+              data.slab<int8_t>(RICHENGINE_KV_KEYS, logicalPage));
     std::copy(quantized->keyScales.begin(), quantized->keyScales.end(),
-              data.slab<float>(SPLASH_KV_KEY_SCALES, logicalPage));
+              data.slab<float>(RICHENGINE_KV_KEY_SCALES, logicalPage));
     std::copy(quantized->values.begin(), quantized->values.end(),
-              data.slab<int8_t>(SPLASH_KV_VALUES, logicalPage));
+              data.slab<int8_t>(RICHENGINE_KV_VALUES, logicalPage));
     std::copy(quantized->valueScales.begin(), quantized->valueScales.end(),
-              data.slab<float>(SPLASH_KV_VALUE_SCALES, logicalPage));
+              data.slab<float>(RICHENGINE_KV_VALUE_SCALES, logicalPage));
   }
 }
 
@@ -287,7 +287,7 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      const PrefillAttentionParams *overrideParams = nullptr) {
-  const auto plan = splash::ops::PagedAttention::prefillPlan(
+  const auto plan = richengine::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
@@ -295,7 +295,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   const PrefillAttentionParams params = overrideParams ? *overrideParams :
       PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
-                              data.params.kv, plan.splits};
+                              data.params.kv, plan.splits, 0};
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.partials offset:0 atIndex:1];
@@ -320,10 +320,10 @@ float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES, logicalPage)[
-      splash_kv_scale_element(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_KEYS, logicalPage)[
-             splash_kv_key_element(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(RICHENGINE_KV_KEY_SCALES, logicalPage)[
+      richengine_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(RICHENGINE_KV_KEYS, logicalPage)[
+             richengine_kv_key_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -331,10 +331,10 @@ float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES, logicalPage)[
-      splash_kv_scale_element(head, pageToken)];
-  return float(data.slab<const int8_t>(SPLASH_KV_VALUES, logicalPage)[
-             splash_kv_value_element(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(RICHENGINE_KV_VALUE_SCALES, logicalPage)[
+      richengine_kv_scale_element(head, pageToken)];
+  return float(data.slab<const int8_t>(RICHENGINE_KV_VALUES, logicalPage)[
+             richengine_kv_value_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -505,15 +505,15 @@ void validateStoredRow(const Case &data, bool valueTensor,
   uint32_t logicalPage = logical / kPageTokens;
   uint32_t pageToken = logical % kPageTokens;
   const auto *scales = data.slab<const float>(
-      valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, logicalPage);
-  float observedScale = scales[splash_kv_scale_element(0, pageToken)];
+      valueTensor ? RICHENGINE_KV_VALUE_SCALES : RICHENGINE_KV_KEY_SCALES, logicalPage);
+  float observedScale = scales[richengine_kv_scale_element(0, pageToken)];
   require(std::abs(observedScale - expectedScale) <= 2e-7f,
           "stored Q8 row scale differs");
   const auto *stored = data.slab<const int8_t>(
-      valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, logicalPage);
+      valueTensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS, logicalPage);
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-    uint64_t index = valueTensor ? splash_kv_value_element(0, pageToken, dimension)
-                                 : splash_kv_key_element(0, pageToken, dimension);
+    uint64_t index = valueTensor ? richengine_kv_value_element(0, pageToken, dimension)
+                                 : richengine_kv_key_element(0, pageToken, dimension);
     require(stored[index] == expected[dimension],
             "stored Q8 row payload differs");
   }
@@ -677,7 +677,7 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
       const bool leased = std::find(data.pageTable.begin(), data.pageTable.end(),
                                     page) != data.pageTable.end();
       for (uint32_t layer = 0; layer <= kLayer; ++layer)
-        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
+        for (uint32_t tensor = RICHENGINE_KV_KEYS; tensor <= RICHENGINE_KV_VALUE_SCALES; ++tensor) {
           if (leased && layer == kLayer) continue;
           const auto *bytes = pages.slab<const uint8_t>(layer, tensor, page);
           const uint64_t pageBytes =
@@ -693,12 +693,12 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
 void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
-  const auto plan = splash::ops::PagedAttention::prefillPlan(
+  const auto plan = richengine::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension});
   const PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,
-      data.params.kv, plan.splits};
+      data.params.kv, plan.splits, 0};
   for (uint32_t invalidField = 0; invalidField < 3; ++invalidField) {
     auto params = valid;
     if (invalidField == 0) params.split_count = 0;
@@ -784,7 +784,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params[lane] = {committed, rows, stride, 2, pool.pages->layer(kLayer)};
     tables[lane] = {ids[lane * 2], ids[lane * 2 + 1]};
-    tableBuffers[lane] = makeBuffer(device, 2 * sizeof(SplashKvPage));
+    tableBuffers[lane] = makeBuffer(device, 2 * sizeof(RichKvPage));
     pool.pages->writeTable(tables[lane], tableBuffers[lane].contents);
     for (uint32_t head = 0; head < kKvHeads; ++head) {
       for (uint32_t token = 0; token < rows; ++token) {
@@ -839,8 +839,8 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
         }
         const float expectedScale = maximum / 127.0f;
         const float observedScale = reinterpret_cast<const float *>(
-            slab(valueTensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES))[
-            splash_kv_scale_element(0, pageToken)];
+            slab(valueTensor ? RICHENGINE_KV_VALUE_SCALES : RICHENGINE_KV_KEY_SCALES))[
+            richengine_kv_scale_element(0, pageToken)];
         require(std::abs(expectedScale - observedScale) <= 2e-7f,
                 "batched verify store scale differs");
         for (uint32_t dimension = 0; dimension < kHeadDimension;
@@ -849,10 +849,10 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
               int(std::nearbyint(source[dimension] * 127.0f / maximum)),
               -127, 127));
           const uint64_t index =
-              valueTensor ? splash_kv_value_element(0, pageToken, dimension)
-                          : splash_kv_key_element(0, pageToken, dimension);
+              valueTensor ? richengine_kv_value_element(0, pageToken, dimension)
+                          : richengine_kv_key_element(0, pageToken, dimension);
           require(reinterpret_cast<const int8_t *>(
-                      slab(valueTensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS))[index] ==
+                      slab(valueTensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS))[index] ==
                       expected,
                   "batched verify store payload differs");
         }
@@ -862,13 +862,14 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 void testContract() {
-  static_assert(sizeof(PrefillAttentionParams) == 28);
+  static_assert(sizeof(PrefillAttentionParams) == 32);
   static_assert(offsetof(PrefillAttentionParams, committed_tokens) == 0);
   static_assert(offsetof(PrefillAttentionParams, rows) == 4);
   static_assert(offsetof(PrefillAttentionParams, chunk_stride) == 8);
   static_assert(offsetof(PrefillAttentionParams, page_table_entries) == 12);
   static_assert(offsetof(PrefillAttentionParams, kv) == 16);
   static_assert(offsetof(PrefillAttentionParams, split_count) == 24);
+  static_assert(offsetof(PrefillAttentionParams, score_scale) == 28);
   ChunkedPrefillParams params{129, 8, 32, 5, {}};
   require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");
@@ -879,18 +880,18 @@ void testContract() {
           "short page table was accepted");
 
   ChunkedPrefillParams finalCycle{
-      splash::kv::kMaximumLogicalTokens - 1,
-      splash::kv::kVerifyRows,
+      richengine::kv::kMaximumLogicalTokens - 1,
+      richengine::kv::kVerifyRows,
       32,
-      (splash::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
+      (richengine::kv::kMaximumPhysicalTokens + kPageTokens - 1) /
           kPageTokens,
       {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
-  // The scratch runway is a tree verify's SPLASH_TREE_VERIFY_NODES - 1
+  // The scratch runway is a tree verify's RICHENGINE_TREE_VERIFY_NODES - 1
   // emitted rows, not a chain's seven.
   finalCycle.committed_tokens =
-      splash::kv::kMaximumPhysicalTokens - splash::kv::kVerifyRows + 1;
+      richengine::kv::kMaximumPhysicalTokens - richengine::kv::kVerifyRows + 1;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its speculative row allowance");
 }

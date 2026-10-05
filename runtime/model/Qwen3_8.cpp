@@ -4,7 +4,7 @@
 #include <cstring>
 #include <map>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 // Attaches a Prism ML GGUF's input rotation, which gguf::planImages checked
@@ -65,4 +65,4 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout la
   return weights;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -1,5 +1,5 @@
 #include "TestChecks.hpp"
-#include "engine/KvCache.hpp"
+#include "engine/cache/KvCache.hpp"
 #include "TestKvPool.hpp"
 
 #include <array>
@@ -9,12 +9,12 @@
 #include <random>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Exception, typename Function>
 void requireThrows(Function &&function, const char *message) {

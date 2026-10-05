@@ -1,6 +1,6 @@
 // Chunked-parallel GDN scan A/B: parity vs the serial prefill_gdn_scan and
 // GPU time per pass at 2048 tokens, for both compiled head layouts and each
-// SPLASH_GDN_CHUNKED factor (32/64/128). Usage:
+// RICHENGINE_GDN_CHUNKED factor (32/64/128). Usage:
 //   gdn_chunked_bench <metallib> [tokens] [reps]
 // Parity gate: max |out - ref| on bf16 recurrent rows and the fp32 state
 // (bf16-level tolerance — the chunked scan reassociates the recurrence).
@@ -23,15 +23,15 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::GDN;
-using splash::ops::GdnHeadOrder;
-using splash::ops::GdnPrefillBuffers;
-using splash::ops::GdnShape;
-using splash::ops::NormWeights;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::GDN;
+using richengine::ops::GdnHeadOrder;
+using richengine::ops::GdnPrefillBuffers;
+using richengine::ops::GdnShape;
+using richengine::ops::NormWeights;
 
 constexpr uint32_t kHeadDim = 128;
 
@@ -184,7 +184,7 @@ int main(int argc, const char *argv[]) {
             shared(backend, floats * 4, "chunk scratch");
         GdnPrefillBuffers chunked =
             outputs(backend, shape, tokens, in, scratch);
-        setenv("SPLASH_GDN_CHUNKED", std::to_string(factor).c_str(), 1);
+        setenv("RICHENGINE_GDN_CHUNKED", std::to_string(factor).c_str(), 1);
         const double ms = 1e3 * run(backend, chunked, shape, tokens, reps);
         // Parity: bf16 rows and fp32 state against the serial pass.
         double rowErr = 0, stateErr = 0;
@@ -202,7 +202,7 @@ int main(int argc, const char *argv[]) {
                shape.valueHeads, tokens, factor, ms, serialMs / ms, rowErr,
                stateErr);
       }
-      unsetenv("SPLASH_GDN_CHUNKED");
+      unsetenv("RICHENGINE_GDN_CHUNKED");
     }
   }
   return 0;

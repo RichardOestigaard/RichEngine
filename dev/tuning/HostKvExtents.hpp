@@ -14,12 +14,12 @@
 #include <utility>
 #include <vector>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 // The extents of a KV pool in CPU-visible memory, for the attention tuner,
 // kernel tests and benchmarks that fill and read pages on the host. Page p
 // sits in extent p / extentPages at index p % extentPages, and every
-// layer's region where splash_kv_offset places it, as in production
+// layer's region where richengine_kv_offset places it, as in production
 // extents; kernels reach a page only through its entry. The constructors
 // size each extent exactly, so an access past one fails under shader
 // validation; contiguous() extents lie extentStride() apart in one region,
@@ -39,7 +39,7 @@ public:
   // every extent starts 16 KiB-aligned, as page entries need.
   [[nodiscard]] static uint64_t extentStride(kv::Layout layout,
                                              uint32_t extentPages) noexcept {
-    constexpr uint64_t alignment = uint64_t{SPLASH_KV_PAGE_INDEX_MASK} + 1;
+    constexpr uint64_t alignment = uint64_t{RICHENGINE_KV_PAGE_INDEX_MASK} + 1;
     return (extentBytes(layout, extentPages) + alignment - 1) / alignment * alignment;
   }
 
@@ -51,7 +51,7 @@ public:
     uint32_t extents = 0;
   };
   [[nodiscard]] static Geometry spread(uint32_t pages) noexcept {
-    uint32_t extentPages = std::clamp((pages + 2) / 3, 3U, SPLASH_KV_PAGE_INDEX_MASK);
+    uint32_t extentPages = std::clamp((pages + 2) / 3, 3U, RICHENGINE_KV_PAGE_INDEX_MASK);
     if (std::has_single_bit(extentPages)) ++extentPages;
     return {extentPages, std::max(3U, (pages + extentPages - 1) / extentPages)};
   }
@@ -60,7 +60,7 @@ public:
   // production, and as few extents as the page index allows.
   [[nodiscard]] static Geometry aligned(kv::Layout layout, uint32_t pages) noexcept {
     const uint32_t unit = layout.extentAlignmentPages();
-    const uint32_t largest = SPLASH_KV_PAGE_INDEX_MASK / unit * unit;
+    const uint32_t largest = RICHENGINE_KV_PAGE_INDEX_MASK / unit * unit;
     const uint32_t extentPages = std::min(largest, (pages + unit - 1) / unit * unit);
     return {extentPages, (pages + extentPages - 1) / extentPages};
   }
@@ -113,14 +113,14 @@ public:
   [[nodiscard]] std::span<std::byte> bytes(uint32_t index) const {
     return {extents_.at(index).contents, extentBytes(layout_, extentPages_)};
   }
-  [[nodiscard]] SplashKvLayer layer(uint32_t index) const {
+  [[nodiscard]] RichKvLayer layer(uint32_t index) const {
     if (index >= layout_.attentionLayers)
       throw std::out_of_range("host KV layer is outside the layout");
-    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), index);
+    return richengine_kv_layer(extentPages_, dataBytes(), scaleBytes(), index);
   }
   // Writes the entries of `pages` to the start of a CPU-visible table.
   void writeTable(std::span<const uint32_t> pages, void *table) const {
-    auto *entries = static_cast<SplashKvPage *>(table);
+    auto *entries = static_cast<RichKvPage *>(table);
     for (size_t index = 0; index < pages.size(); ++index)
       entries[index] = entry(pages[index]);
   }
@@ -152,12 +152,12 @@ public:
 
 private:
   void validate() const {
-    if (!layout_.valid() || !extentPages_ || extentPages_ > SPLASH_KV_PAGE_INDEX_MASK ||
+    if (!layout_.valid() || !extentPages_ || extentPages_ > RICHENGINE_KV_PAGE_INDEX_MASK ||
         extents_.empty())
       throw std::invalid_argument("invalid host KV extent geometry");
     for (const Extent &extent : extents_) {
       if (!extent.contents || !extent.gpuAddress ||
-          extent.gpuAddress & SPLASH_KV_PAGE_INDEX_MASK)
+          extent.gpuAddress & RICHENGINE_KV_PAGE_INDEX_MASK)
         throw std::invalid_argument("host KV extent is not visible or not 16 KiB-aligned");
     }
   }
@@ -166,8 +166,8 @@ private:
       throw std::out_of_range("host KV page is outside the extents");
     return extents_[page / extentPages_];
   }
-  [[nodiscard]] SplashKvPage entry(uint32_t page) const {
-    return splash_kv_page_entry(extent(page).gpuAddress, page % extentPages_);
+  [[nodiscard]] RichKvPage entry(uint32_t page) const {
+    return richengine_kv_page_entry(extent(page).gpuAddress, page % extentPages_);
   }
   [[nodiscard]] uint32_t dataBytes() const noexcept {
     return static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
@@ -176,7 +176,7 @@ private:
     return static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
   }
   [[nodiscard]] uint64_t offset(uint32_t layer, uint32_t tensor, uint32_t index) const {
-    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layer, tensor, index);
+    return richengine_kv_offset(extentPages_, dataBytes(), scaleBytes(), layer, tensor, index);
   }
 
   kv::Layout layout_;
@@ -185,4 +185,4 @@ private:
   std::vector<metal::MetalBuffer> buffers_;
 };
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

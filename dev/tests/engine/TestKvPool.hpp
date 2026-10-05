@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/KvPool.hpp"
+#include "engine/cache/KvPool.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-namespace splash::test {
+namespace richengine::test {
 
 // Extents of extentPages pages, none allocated until the pool allocates
 // them (its runway first), as PageStorage. Growth is refused with
@@ -112,4 +112,4 @@ private:
     std::vector<bool> allocated_;
 };
 
-}  // namespace splash::test
+}  // namespace richengine::test

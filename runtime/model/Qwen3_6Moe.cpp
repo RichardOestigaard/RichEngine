@@ -3,7 +3,7 @@
 
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 // Affine files keep a Q8 router and shared-expert scalar gate and one Q4 slab
@@ -51,4 +51,4 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
       });
 }
 
-} // namespace splash::model
+} // namespace richengine::model

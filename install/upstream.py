@@ -282,7 +282,7 @@ def _safetensors_tensors(repo, name):
 
 
 def _validate_processor(config):
-    """Splash prepares images one way (server/images.py): 16-pixel patches in
+    """RichEngine prepares images one way (server/images.py): 16-pixel patches in
     two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
     configuration asking for another is rejected before any download; it is
     not installed, since nothing reads it."""
@@ -305,7 +305,7 @@ def prepare(selection):
     decides when none is made). The installed assembly of those commits
     starts; a new commit is installed and published atomically; when the Hub
     cannot answer, or a new commit cannot be installed, the verified
-    installation starts instead. A legacy Splash package is installed by
+    installation starts instead. A legacy RichEngine package is installed by
     legacy.prepare."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
@@ -333,7 +333,7 @@ def prepare(selection):
 
 
 def _is_legacy_package(repo, model):
-    """Whether the target repository is a legacy Splash package, whose
+    """Whether the target repository is a legacy RichEngine package, whose
     manifest.json names a package format."""
     if "manifest.json" not in repo.files:
         return False
@@ -373,7 +373,7 @@ def _start_installed(selection, target, installed):
         return
     if (replaced := _retain_installed(selection)) is None:
         print(
-            f"Splash model {selection.model} is already installed in {selection.link}",
+            f"RichEngine model {selection.model} is already installed in {selection.link}",
             flush=True,
         )
         return
@@ -451,7 +451,7 @@ def _install(selection, repo, installed, draft=None):
         draft, files = _draft(family, installed, draft)
         print(
             f"Installing {selection.model} as {family.name} ({target.format}); "
-            f"draft {draft.name}; "
+            f"draft {draft.name if draft else 'none'}; "
             f"vision {'disabled' if target.vision_format == 'none' else 'enabled'}.",
             flush=True,
         )
@@ -463,7 +463,8 @@ def _install(selection, repo, installed, draft=None):
         "family": family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": {"target": repo.identity()}
+        | ({"draft": draft.identity()} if draft else {}),
     }
     models_root = selection.models_root
     models_root.mkdir(parents=True, exist_ok=True)
@@ -501,8 +502,11 @@ def _changes(installed, family, draft):
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
-    recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
+    recorded = installed["sources"].get("draft")
+    if draft is None:
+        if recorded is not None:
+            changes.append("its draft is now none")
+    elif draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
             if draft.name == recorded["repo"]
@@ -522,8 +526,11 @@ def _resolve_draft(family, selection, installed, target):
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
     the reason, when the draft cannot be resolved."""
+    if family.draft is None:
+        # A draft-less family (Granite: n-gram predrafts).
+        return None
     name = selection.draft_model or family.draft.repo
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     asked = _answered(target)
     if recorded and not asked:
         return hub.Repository(recorded["repo"], recorded["revision"], frozenset())
@@ -553,7 +560,9 @@ def _draft(family, installed, draft):
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
     (downloaded and checked)."""
-    recorded = installed and installed["sources"]["draft"]
+    if draft is None:
+        return None, {}
+    recorded = installed and installed["sources"].get("draft")
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):

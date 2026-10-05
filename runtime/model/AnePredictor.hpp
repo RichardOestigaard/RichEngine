@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // A raw row-major tensor handed to or received from a CoreML model.
 enum class AneDType : uint8_t { Float16, Int32, Float32 };
@@ -48,4 +48,4 @@ private:
   Impl *impl_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

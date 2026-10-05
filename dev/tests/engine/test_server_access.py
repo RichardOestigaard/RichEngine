@@ -28,14 +28,14 @@ PARSERS = (
 class ServerAccessTests(unittest.TestCase):
     def test_wildcard_listener_keeps_host_and_api_key_validation(self):
         harness = self.harness(
-            host="0.0.0.0", allowed_hosts=("splash.local",), api_key="test-server-key"
+            host="0.0.0.0", allowed_hosts=("richengine.local",), api_key="test-server-key"
         )
         self.assertEqual(harness.server.server_address[0], "0.0.0.0")
         port = harness.server.server_address[1]
         for host, key, expected in (
             (f"127.0.0.1:{port}", "test-server-key", 200),
             (f"127.0.0.1:{port}", "wrong", 401),
-            (f"splash.local:{port}", "test-server-key", 200),
+            (f"richengine.local:{port}", "test-server-key", 200),
             (f"unknown.example:{port}", "test-server-key", 403),
         ):
             with self.subTest(host=host, expected=expected):
@@ -440,7 +440,7 @@ class ServerAccessTests(unittest.TestCase):
 
     def test_cli_key_precedence_and_validation(self):
         for parse, arguments in PARSERS:
-            with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "environment-key"}):
+            with mock.patch.dict(os.environ, {"RICHENGINE_API_KEY": "environment-key"}):
                 self.assertEqual(parse(arguments).api_key, "environment-key")
                 args = parse([*arguments, "--api-key", "argument-key", "--no-webui"])
                 self.assertEqual(args.api_key, "argument-key")
@@ -453,10 +453,10 @@ class ServerAccessTests(unittest.TestCase):
     def test_launcher_uses_key_and_reports_auth_failure(self):
         harness = self.harness(api_key="test-server-key")
         port = harness.server.server_port
-        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "test-server-key"}):
+        with mock.patch.dict(os.environ, {"RICHENGINE_API_KEY": "test-server-key"}):
             self.assertIn("data", launcher._request_json("/v1/models", port=port))
-        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "incorrect"}):
-            with self.assertRaisesRegex(launcher.LauncherError, "SPLASH_API_KEY"):
+        with mock.patch.dict(os.environ, {"RICHENGINE_API_KEY": "incorrect"}):
+            with self.assertRaisesRegex(launcher.LauncherError, "RICHENGINE_API_KEY"):
                 launcher._request_json("/v1/models", port=port)
 
     def test_unauthenticated_request_has_bearer_challenge(self):

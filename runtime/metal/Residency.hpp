@@ -11,7 +11,7 @@
 #include <mutex>
 #include <string_view>
 
-namespace splash::metal {
+namespace richengine::metal {
 
 // Holds every buffer of a backend in one residency set, wired between the
 // commands of its command queue. Metal wires them while a command runs and
@@ -52,7 +52,7 @@ public:
       throw MetalBackendError("unable to create the Metal residency set");
     [commands_ addResidencySet:set_];
     queue_ = dispatch_queue_create(
-        "splash.metal.residency",
+        "richengine.metal.residency",
         dispatch_queue_attr_make_with_autorelease_frequency(
             DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
     heartbeat_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue_);
@@ -161,4 +161,4 @@ private:
   bool held_ = false;
 };
 
-} // namespace splash::metal
+} // namespace richengine::metal

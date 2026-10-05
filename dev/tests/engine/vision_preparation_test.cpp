@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 
 namespace {
 

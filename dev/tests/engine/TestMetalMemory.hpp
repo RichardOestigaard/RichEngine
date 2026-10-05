@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-namespace splash::test {
+namespace richengine::test {
 
 // The memory statistics the stand-in backend below reports.
 [[nodiscard]] inline metal::MetalMemoryStats &metalStatistics() noexcept {
@@ -13,13 +13,13 @@ namespace splash::test {
   return statistics;
 }
 
-} // namespace splash::test
+} // namespace richengine::test
 
 // The memory governor and the control pass read nothing from the backend but
 // its memory statistics, so this stand-in lets a test set them without a GPU.
 // It defines the backend's members: one translation unit of a test that links
 // no Metal backend includes it.
-namespace splash::metal {
+namespace richengine::metal {
 
 struct MetalBackend::Impl {};
 MetalBackend::MetalBackend(std::string, double)
@@ -32,4 +32,4 @@ MetalMemoryStats MetalBackend::refreshMemoryStats() const noexcept {
   return test::metalStatistics();
 }
 
-} // namespace splash::metal
+} // namespace richengine::metal

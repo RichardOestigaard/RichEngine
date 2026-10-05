@@ -181,7 +181,8 @@ def _well_formed(record):
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        # A draft-less family (Granite) records its target source alone.
+        and set(sources) in ({"target"}, {"target", "draft"})
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}

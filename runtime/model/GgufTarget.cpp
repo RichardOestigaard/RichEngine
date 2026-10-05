@@ -1,10 +1,11 @@
 #include "model/GgufTarget.hpp"
 #include "model/Dense.hpp"
+#include "model/Granite.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/Lfm2.hpp"
 #include "model/Lfm2Moe.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
 gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout) {
   gguf::TargetGeometry geometry;
@@ -19,6 +20,28 @@ gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout) {
   geometry.rotaryPairs = layout.rotaryPairs;
   geometry.rotaryTheta = layout.rotaryTheta;
   geometry.fullAttentionPeriod = 1; // every layer attends
+  geometry.attentionQueryGate = false;
+  geometry.attentionQkNorm = false;
+  return geometry;
+}
+
+// Granite 4.2 ("granite" arch): llama tensors plus the fixed attention
+// multiplier and the unit embedding/residual/logit scales.
+gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.arch = "granite";
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.intermediateSize = layout.intermediateSize;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.rotaryPairs = layout.rotaryPairs;
+  geometry.rotaryTheta = layout.rotaryTheta;
+  geometry.fullAttentionPeriod = 1;
+  geometry.rmsEpsilon = layout.rmsEpsilon;
+  geometry.attentionScale = layout.attentionScale;
   geometry.attentionQueryGate = false;
   geometry.attentionQkNorm = false;
   return geometry;
@@ -115,4 +138,4 @@ WeightFile GgufTargetLoader::head() { return open(planned_->images.size() - 2); 
 
 WeightFile GgufTargetLoader::embedding() { return open(planned_->images.size() - 1); }
 
-} // namespace splash::model
+} // namespace richengine::model

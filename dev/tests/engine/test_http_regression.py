@@ -25,9 +25,9 @@ class CharacterTokenizer:
 class HttpRegressionTests(unittest.TestCase):
     def test_any_repository_selects_matching_package_and_api_name(self):
         for selected in (
-            "incoai/Qwen3.8-27B-Splash",
-            "incoai/Qwen3.6-35B-A3B-Splash",
-            "community/custom-splash",
+            "incoai/Qwen3.8-27B-RichEngine",
+            "incoai/Qwen3.6-35B-A3B-RichEngine",
+            "community/custom-richengine",
             "mlx-community/Qwen3.8-27B-4bit",
             "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
         ):
@@ -40,7 +40,7 @@ class HttpRegressionTests(unittest.TestCase):
                         smoke.model_artifacts.MODELS, selected
                     ),
                 )
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "incoai/Qwen3.8-27B-RichEngine"
         arguments = smoke.parse_args(["--package", "custom-package", "--model", model])
         self.assertEqual(str(arguments.package), "custom-package")
         self.assertEqual(arguments.model, model)
@@ -58,13 +58,13 @@ class HttpRegressionTests(unittest.TestCase):
     def test_benchmark_runs_any_installation_and_holds_its_assembly(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            binary = root / "splash"
+            binary = root / "richengine"
             binary.touch()
-            (root / "splash.metallib").touch()
+            (root / "richengine.metallib").touch()
             models = root / "models"
-            # A Splash package records manifest.json; an upstream selection
+            # An RichEngine package records manifest.json; an upstream selection
             # links an assembly that records model.json.
-            legacy = "incoai/Qwen3.6-35B-A3B-Splash"
+            legacy = "incoai/Qwen3.6-35B-A3B-RichEngine"
             (models / legacy).mkdir(parents=True)
             (models / legacy / "manifest.json").write_text("{}")
             upstream = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
@@ -292,7 +292,7 @@ class HttpRegressionTests(unittest.TestCase):
                 self.assertFalse(summary["keep"])
 
     def test_a_follow_up_needs_a_burst_of_two(self):
-        model = "incoai/Qwen3.8-27B-Splash"
+        model = "incoai/Qwen3.8-27B-RichEngine"
         for extra in (["--follow-up"], ["--burst", "1", "--follow-up"]):
             with (
                 self.subTest(extra=extra),

@@ -18,7 +18,7 @@
 #include <string>
 #include <type_traits>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 // E4M3: sign, four exponent bits (bias 7), three mantissa bits; the largest
 // finite magnitude is 448 (exponent field 15, mantissa 6; mantissa 7 is NaN).
@@ -154,16 +154,16 @@ inline float dequantizeFp8Key(const Fp8LayerPage &source, uint32_t head,
                               uint32_t token, uint32_t dimension) {
   fp8_reference_detail::checkElement(head, token, dimension);
   return fp8E4m3ToFloat(
-             source.keys[splash_kv_key_element(head, token, dimension)]) *
-         source.keyScales[splash_kv_scale_element(head, token)];
+             source.keys[richengine_kv_key_element(head, token, dimension)]) *
+         source.keyScales[richengine_kv_scale_element(head, token)];
 }
 
 inline float dequantizeFp8Value(const Fp8LayerPage &source, uint32_t head,
                                 uint32_t token, uint32_t dimension) {
   fp8_reference_detail::checkElement(head, token, dimension);
   return fp8E4m3ToFloat(
-             source.values[splash_kv_value_element(head, token, dimension)]) *
-         source.valueScales[splash_kv_scale_element(head, token)];
+             source.values[richengine_kv_value_element(head, token, dimension)]) *
+         source.valueScales[richengine_kv_scale_element(head, token)];
 }
 
 inline void quantizeFp8LayerPage(std::span<const float> logicalKeys,
@@ -186,16 +186,16 @@ inline void quantizeFp8LayerPage(std::span<const float> logicalKeys,
             valueMaximum,
             std::abs(logicalValues[fp8LogicalIndex(token, head, dimension)]));
       }
-      destination.keyScales[splash_kv_scale_element(head, token)] =
+      destination.keyScales[richengine_kv_scale_element(head, token)] =
           fp8_reference_detail::storedScale(keyMaximum);
-      destination.valueScales[splash_kv_scale_element(head, token)] =
+      destination.valueScales[richengine_kv_scale_element(head, token)] =
           fp8_reference_detail::storedScale(valueMaximum);
       for (uint32_t dimension = 0; dimension < kFp8HeadDimension; ++dimension) {
-        destination.keys[splash_kv_key_element(head, token, dimension)] =
+        destination.keys[richengine_kv_key_element(head, token, dimension)] =
             fp8_reference_detail::quantize(
                 logicalKeys[fp8LogicalIndex(token, head, dimension)],
                 keyMaximum);
-        destination.values[splash_kv_value_element(head, token, dimension)] =
+        destination.values[richengine_kv_value_element(head, token, dimension)] =
             fp8_reference_detail::quantize(
                 logicalValues[fp8LogicalIndex(token, head, dimension)],
                 valueMaximum);
@@ -226,4 +226,4 @@ inline void dequantizeFp8LayerPage(const Fp8LayerPage &source,
   }
 }
 
-} // namespace splash::kv
+} // namespace richengine::kv

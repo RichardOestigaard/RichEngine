@@ -13,7 +13,7 @@
 #include <tuple>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 
 namespace {
 
@@ -262,7 +262,7 @@ std::string weightManifestFingerprint(
                   return left.relativePath < right.relativePath;
               });
     std::ostringstream canonical;
-    canonical << "splash-packed-manifest-v1\n";
+    canonical << "richengine-packed-manifest-v1\n";
     for (const WeightFileRecord &record : sorted) {
         canonical << record.relativePath << '\t' << record.declaredBytes
                   << '\t' << record.magic << '\t' << record.layer << '\t'
@@ -290,4 +290,4 @@ std::string weightDigest(std::string_view text) {
     return weightDigest({reinterpret_cast<const uint8_t *>(text.data()), text.size()});
 }
 
-} // namespace splash::model
+} // namespace richengine::model

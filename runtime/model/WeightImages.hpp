@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // The source bytes a load task reads, or stages, at most.
 inline constexpr uint64_t kLoadStepBytes = 4 << 20;
@@ -83,7 +83,7 @@ private:
   size_t restored_ = 0;
 };
 
-// The image of a Splash package's packed file at path, read as it is.
+// The image of a RichEngine package's packed file at path, read as it is.
 [[nodiscard]] ImagePlan packedImage(const std::filesystem::path &path, std::string component,
                                     std::string_view magic, uint32_t layer, uint32_t type);
 
@@ -101,4 +101,4 @@ void parallelFor(size_t count, const std::function<void(size_t index, unsigned t
 // that its writer writes: the alignment between sections and any padding.
 void zeroUnwritten(std::span<uint8_t> image, std::vector<std::pair<uint64_t, uint64_t>> extents);
 
-} // namespace splash::model
+} // namespace richengine::model

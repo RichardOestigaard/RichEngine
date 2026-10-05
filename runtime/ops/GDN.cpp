@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
@@ -35,9 +35,9 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
   return shape == KernelLayout::Value48 ? value48 : value32;
 }
 
-// SPLASH_GDN_CHUNKED selects the WY/UT scan's chunk factor (32/64/128).
+// RICHENGINE_GDN_CHUNKED selects the WY/UT scan's chunk factor (32/64/128).
 [[nodiscard]] uint32_t gdnChunkFactor() {
-  const uint32_t parsed = envUint("SPLASH_GDN_CHUNKED", 0);
+  const uint32_t parsed = envUint("RICHENGINE_GDN_CHUNKED", 0);
   return parsed == 32 || parsed == 64 || parsed == 128 ? parsed : 0;
 }
 
@@ -101,9 +101,9 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                buffers.recurrentRows},
               params,
               {uint64_t{shape.valueHeads} * shape.headDimension /
-                   SPLASH_GDN_SCAN_STATE_ROWS,
+                   RICHENGINE_GDN_SCAN_STATE_ROWS,
                1, 1},
-              {SPLASH_GDN_SCAN_THREADS, 1, 1});
+              {RICHENGINE_GDN_SCAN_THREADS, 1, 1});
   }
   std::vector<metal::MetalBuffer> gateBindings{buffers.recurrentRows, buffers.packed,
                                                 buffers.mixerNorm.buffer, buffers.hidden};
@@ -117,7 +117,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                              GdnShape shape, uint32_t lanes, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input,
                              std::span<const uint32_t> liveRows) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
       (!liveRows.empty() && liveRows.size() != lanes))
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -126,7 +126,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * SPLASH_TARGET_VERIFY_ROWS);
+                        lanes * RICHENGINE_TARGET_VERIFY_ROWS);
   bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
@@ -141,12 +141,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
                               {}};
-  for (uint32_t lane = 0; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane)
+  for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] =
         lane < liveRows.size()
             ? std::clamp(liveRows[lane], uint32_t{1},
-                         uint32_t{SPLASH_TARGET_VERIFY_ROWS})
-            : SPLASH_TARGET_VERIFY_ROWS;
+                         uint32_t{RICHENGINE_TARGET_VERIFY_ROWS})
+            : RICHENGINE_TARGET_VERIFY_ROWS;
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
@@ -161,7 +161,7 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                                  uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state, GdnHeadOrder order,
                                  LinearInput input) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
       !treeNodes || !treeCounts)
     throw std::invalid_argument("invalid GDN tree decode geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -170,7 +170,7 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * SPLASH_TREE_VERIFY_NODES);
+                        lanes * RICHENGINE_TREE_VERIFY_NODES);
   bindings.reserve(prepare ? 21 : 19);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
@@ -185,8 +185,8 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
                               {}};
-  for (uint32_t lane = 0; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane)
-    params.live_rows[lane] = SPLASH_TARGET_VERIFY_ROWS;
+  for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
+    params.live_rows[lane] = RICHENGINE_TARGET_VERIFY_ROWS;
   const std::string name = std::string("verify_tree_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
@@ -197,7 +197,7 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                     GdnShape shape, uint32_t layers, uint32_t lanes,
                     GdnStateStrides state) {
-  if (!layers || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+  if (!layers || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       !state.valid())
     throw std::invalid_argument("invalid GDN commit geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -223,7 +223,7 @@ void GDN::addCommitTree(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         metal::MetalBuffer retainedPath, GdnShape shape,
                         uint32_t layers, uint32_t lanes,
                         GdnStateStrides state) {
-  if (!layers || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+  if (!layers || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       !state.valid() || !retainedPath)
     throw std::invalid_argument("invalid GDN tree commit geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -243,4 +243,4 @@ void GDN::addCommitTree(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   graph.endBakedSpan();
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

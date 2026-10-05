@@ -6,13 +6,13 @@
 #include <limits>
 #include <stdexcept>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kTargetShards = SPLASH_TARGET_SAMPLING_SHARDS;
-constexpr uint32_t kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
-constexpr uint32_t kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kTargetShards = RICHENGINE_TARGET_SAMPLING_SHARDS;
+constexpr uint32_t kVocabularyThreads = RICHENGINE_TARGET_VOCABULARY_THREADS;
+constexpr uint32_t kVocabularyGroups = RICHENGINE_TARGET_VOCABULARY_GROUPS;
 
 // A sampled lane keeps its topK most likely tokens, and every token for 0 or
 // a topK past the vocabulary (top-k disabled).
@@ -38,7 +38,7 @@ SamplingWorkspace Sampling::workspace(uint32_t rows) {
           shards * sizeof(uint32_t),
           shards * sizeof(TargetShardMass),
           uint64_t{rows} * sizeof(TargetVocabularyRow),
-          uint64_t{rows} * SPLASH_TARGET_VOCABULARY_RANGES *
+          uint64_t{rows} * RICHENGINE_TARGET_VOCABULARY_RANGES *
               sizeof(TargetVocabularyRange),
           uint64_t{rows} * sizeof(uint32_t)};
 }
@@ -58,7 +58,7 @@ void Sampling::rebuildPenaltyWords(std::span<uint32_t> words,
   std::fill(words.begin(), words.end(), 0U);
   if (markPrompt) {
     for (const uint32_t token : prompt)
-      words[token] |= SPLASH_PENALTY_PROMPT_BIT;
+      words[token] |= RICHENGINE_PENALTY_PROMPT_BIT;
   }
   for (const uint32_t token : history.subspan(prompt.size()))
     ++words[token];
@@ -88,7 +88,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
                             bool verify) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? SPLASH_TARGET_VERIFY_ROWS : 1;
+  params.rows = verify ? RICHENGINE_TARGET_VERIFY_ROWS : 1;
   params.row_offset = rowOffset;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
@@ -130,11 +130,11 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
-  if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
+  if (rowOffset >= RICHENGINE_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid initial sampling row");
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
   addSelection(graph, policies, buffers,
-               {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0,
+               {1, rowOffset, 0, RICHENGINE_UNIFORM_INITIAL, 0}, stopToken0,
                stopToken1);
 }
 
@@ -142,7 +142,8 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, uint32_t stopToken0,
                          uint32_t stopToken1, const PenaltyTable &penalties,
-                         std::span<const uint32_t> liveRows) const {
+                         std::span<const uint32_t> liveRows,
+                         uint32_t fusedHead) const {
   if (policies.empty() || policies.size() > kMaximumLanes ||
       (!liveRows.empty() && liveRows.size() != policies.size()))
     throw std::invalid_argument("invalid sampling batch width");
@@ -151,9 +152,9 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   // follows draft token r; every row draws with the lane's correction
   // uniform.
   addSelection(graph, policies, buffers,
-               {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION,
-                SPLASH_DRAFT_PROPOSAL_TOKENS},
-               stopToken0, stopToken1, liveRows);
+               {RICHENGINE_TARGET_VERIFY_ROWS, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
+                RICHENGINE_DRAFT_PROPOSAL_TOKENS},
+               stopToken0, stopToken1, liveRows, fusedHead);
 }
 
 void Sampling::addVerifyTree(metal::CommandGraph &graph,
@@ -166,8 +167,8 @@ void Sampling::addVerifyTree(metal::CommandGraph &graph,
     if (policy.samples() || policy.constrained || policy.penalties.active())
       throw std::invalid_argument("tree verify requires greedy lanes");
   addSelection(graph, policies, buffers,
-               {SPLASH_TREE_VERIFY_NODES, 0, 1, SPLASH_UNIFORM_CORRECTION,
-                SPLASH_DRAFT_PROPOSAL_TOKENS},
+               {RICHENGINE_TREE_VERIFY_NODES, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
+                RICHENGINE_DRAFT_PROPOSAL_TOKENS},
                stopToken0, stopToken1);
 }
 
@@ -176,7 +177,8 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                             const SamplingBuffers &buffers,
                             const TargetRows &rows, uint32_t stopToken0,
                             uint32_t stopToken1,
-                            std::span<const uint32_t> liveRows) const {
+                            std::span<const uint32_t> liveRows,
+                            uint32_t fusedHead) const {
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
@@ -212,14 +214,25 @@ void Sampling::addSelection(metal::CommandGraph &graph,
   // rows of every lane; the groups of the other kind's lanes return at once.
   const uint64_t selected = uint64_t{policies.size()} * rows.rows;
   if (greedy) {
-    graph.add("decode_sample_argmax_sharded",
-              {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
-               buffers.argmaxIndices},
-              params, {selected * kTargetShards, 1, 1});
-    graph.add("decode_sample_argmax_reduce",
-              {buffers.argmaxValues, buffers.argmaxIndices,
-               buffers.outputTokens},
-              params, {selected, 1, 1}, {32, 1, 1});
+    if (fusedHead) {
+      // The fused head wrote per-(row, column tile) argmax partials and
+      // skipped the logits entirely; reduce them directly. The tile width is
+      // the affine head's 128 (fusedHead 1) or the GGUF tile's 64 (2).
+      graph.add(fusedHead == 2 ? "decode_head_argmax_reduce_tiles_gguf"
+                              : "decode_head_argmax_reduce_tiles",
+                {buffers.headArgmaxValues, buffers.headArgmaxIndices,
+                 buffers.outputTokens},
+                params, {selected, 1, 1}, {32, 1, 1});
+    } else {
+      graph.add("decode_sample_argmax_sharded",
+                {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
+                 buffers.argmaxIndices},
+                params, {selected * kTargetShards, 1, 1});
+      graph.add("decode_sample_argmax_reduce",
+                {buffers.argmaxValues, buffers.argmaxIndices,
+                 buffers.outputTokens},
+                params, {selected, 1, 1}, {32, 1, 1});
+    }
   }
   if (params.sampling_mask) {
     graph.add("decode_sample_mass_sharded",
@@ -255,14 +268,14 @@ void Sampling::addAcceptance(
   params.stop_token_1 = stopToken1;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
-        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+        maximumRetained[lane] > RICHENGINE_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
     params.proposals[lane] =
         lane < proposals.size()
             ? std::min(proposals[lane],
-                       uint32_t{SPLASH_DRAFT_PROPOSAL_TOKENS})
-            : SPLASH_DRAFT_PROPOSAL_TOKENS;
+                       uint32_t{RICHENGINE_DRAFT_PROPOSAL_TOKENS})
+            : RICHENGINE_DRAFT_PROPOSAL_TOKENS;
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
@@ -291,7 +304,7 @@ void Sampling::addTreeAcceptance(
   params.lanes = lanes;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
-        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+        maximumRetained[lane] > RICHENGINE_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid tree retention limit");
     params.remaining[lane] = maximumRetained[lane];
   }
@@ -316,7 +329,7 @@ void Sampling::addTreeLeafPatch(metal::CommandGraph &graph,
             {std::move(treeTokens), std::move(medusaTokens),
              std::move(medusaFlag), std::move(treeCounts)},
             params,
-            {lanes * SPLASH_DRAFT_PROPOSAL_TOKENS, 1, 1}, {32, 1, 1});
+            {lanes * RICHENGINE_DRAFT_PROPOSAL_TOKENS, 1, 1}, {32, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

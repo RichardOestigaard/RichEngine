@@ -543,7 +543,7 @@ def main_args(**overrides):
             "no_webui": False,
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
-            "binary": "splash",
+            "binary": "richengine",
             "kv_format": "int4",
             **overrides,
         }
@@ -1093,7 +1093,7 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b'value="' + effort + b'"', payload)
         for label in (b"XHigh", b"Medium", b"Low", b"Off"):
             self.assertIn(b">" + label + b"</option>", payload)
-        for label in (b"Splash", b"New chat", b"Recents"):
+        for label in (b"RichEngine", b"New chat", b"Recents"):
             self.assertIn(label, payload)
         self.assertIn(b"reasoning_effort", payload)
         self.assertIn(b"include_usage", payload)
@@ -1236,64 +1236,64 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/plain; version=0.0.4; charset=utf-8")
         metrics = payload.decode().splitlines()
-        self.assertIn("splash_ready 1", metrics)
-        self.assertIn('splash_memory_pressure{state="normal"} 1', metrics)
-        self.assertIn("splash_requests_submitted_total 7", metrics)
-        self.assertIn("splash_scheduler_waiting_resources 3", metrics)
-        self.assertIn("splash_scheduler_waiting_prefix 2", metrics)
-        self.assertIn("splash_admission_waiting_memory 2", metrics)
-        self.assertIn("splash_admission_waiting_concurrency 1", metrics)
-        self.assertIn("splash_admission_held_behind_refusal 4", metrics)
-        self.assertIn("splash_admission_restoring 1", metrics)
-        self.assertIn("splash_admission_suspended 1", metrics)
-        self.assertIn("splash_admission_oldest_wait_milliseconds 1250.0", metrics)
-        self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
-        self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
-        self.assertIn("splash_kv_pages_allocated 8", metrics)
-        self.assertIn("splash_kv_free_allocated_pages 2", metrics)
-        self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
-        self.assertIn("splash_kv_allocated_bytes 8192", metrics)
-        self.assertIn("splash_kv_extent_allocate_max_milliseconds 2.5", metrics)
-        self.assertIn("splash_kv_extent_release_max_milliseconds 0.75", metrics)
-        self.assertIn("splash_kv_extent_compact_max_milliseconds 1.5", metrics)
+        self.assertIn("richengine_ready 1", metrics)
+        self.assertIn('richengine_memory_pressure{state="normal"} 1', metrics)
+        self.assertIn("richengine_requests_submitted_total 7", metrics)
+        self.assertIn("richengine_scheduler_waiting_resources 3", metrics)
+        self.assertIn("richengine_scheduler_waiting_prefix 2", metrics)
+        self.assertIn("richengine_admission_waiting_memory 2", metrics)
+        self.assertIn("richengine_admission_waiting_concurrency 1", metrics)
+        self.assertIn("richengine_admission_held_behind_refusal 4", metrics)
+        self.assertIn("richengine_admission_restoring 1", metrics)
+        self.assertIn("richengine_admission_suspended 1", metrics)
+        self.assertIn("richengine_admission_oldest_wait_milliseconds 1250.0", metrics)
+        self.assertIn("richengine_scheduler_prefill_rows_total 2048", metrics)
+        self.assertIn("richengine_scheduler_decode_b3_total 3", metrics)
+        self.assertIn("richengine_kv_pages_allocated 8", metrics)
+        self.assertIn("richengine_kv_free_allocated_pages 2", metrics)
+        self.assertFalse([line for line in metrics if "richengine_kv_pages_free" in line])
+        self.assertIn("richengine_kv_allocated_bytes 8192", metrics)
+        self.assertIn("richengine_kv_extent_allocate_max_milliseconds 2.5", metrics)
+        self.assertIn("richengine_kv_extent_release_max_milliseconds 0.75", metrics)
+        self.assertIn("richengine_kv_extent_compact_max_milliseconds 1.5", metrics)
         self.assertFalse([line for line in metrics if "_max_ms " in line])
-        self.assertIn("splash_state_entries 2", metrics)
-        self.assertIn("splash_state_in_use 1", metrics)
-        self.assertIn("splash_state_in_use_evictions_total 3", metrics)
-        self.assertIn("splash_state_active_lanes 2", metrics)
-        self.assertIn("splash_cache_hits_total 7", metrics)
-        self.assertIn("splash_cache_cold_misses_total 4", metrics)
-        self.assertIn("splash_cache_reused_tokens_total 1024", metrics)
-        self.assertIn("splash_cache_lazy_junctions_total 2", metrics)
-        self.assertIn("splash_cache_priority_suspensions_total 3", metrics)
-        self.assertIn("splash_target_prefill_rows_total 10000", metrics)
-        self.assertIn("splash_draft_context_prompt_end_rows_total 2048", metrics)
-        self.assertIn("splash_draft_context_avoided_rows_total 7921", metrics)
-        self.assertIn("splash_draft_state_restore_skipped_total 1", metrics)
-        self.assertIn("splash_constraint_mask_overlap_batches_total 5", metrics)
-        self.assertIn("splash_constraint_mask_overlap_requests_total 8", metrics)
+        self.assertIn("richengine_state_entries 2", metrics)
+        self.assertIn("richengine_state_in_use 1", metrics)
+        self.assertIn("richengine_state_in_use_evictions_total 3", metrics)
+        self.assertIn("richengine_state_active_lanes 2", metrics)
+        self.assertIn("richengine_cache_hits_total 7", metrics)
+        self.assertIn("richengine_cache_cold_misses_total 4", metrics)
+        self.assertIn("richengine_cache_reused_tokens_total 1024", metrics)
+        self.assertIn("richengine_cache_lazy_junctions_total 2", metrics)
+        self.assertIn("richengine_cache_priority_suspensions_total 3", metrics)
+        self.assertIn("richengine_target_prefill_rows_total 10000", metrics)
+        self.assertIn("richengine_draft_context_prompt_end_rows_total 2048", metrics)
+        self.assertIn("richengine_draft_context_avoided_rows_total 7921", metrics)
+        self.assertIn("richengine_draft_state_restore_skipped_total 1", metrics)
+        self.assertIn("richengine_constraint_mask_overlap_batches_total 5", metrics)
+        self.assertIn("richengine_constraint_mask_overlap_requests_total 8", metrics)
         self.assertIn(
-            "splash_constraint_mask_target_forward_gpu_milliseconds 72.5", metrics
+            "richengine_constraint_mask_target_forward_gpu_milliseconds 72.5", metrics
         )
-        self.assertIn("splash_constraint_mask_residual_wait_milliseconds 1.5", metrics)
-        self.assertIn("splash_prefill_input_tokens_total 2048", metrics)
-        self.assertIn("splash_prefill_tokens_per_second 4096.0", metrics)
-        self.assertIn("splash_decode_output_tokens_total 32", metrics)
-        self.assertIn("splash_decode_wall_milliseconds_total 64.0", metrics)
-        self.assertIn("splash_decode_cycle_milliseconds_total 80.0", metrics)
-        self.assertIn("splash_decode_tokens_per_second 500.0", metrics)
-        self.assertIn("splash_capacity_failures_total 1", metrics)
-        self.assertIn("splash_metal_failures_total 2", metrics)
-        self.assertIn("splash_response_store_entries 0", metrics)
-        self.assertIn("splash_memory_headroom_bytes 200", metrics)
-        self.assertIn("splash_ttft_p95_milliseconds 12.5", metrics)
-        self.assertIn("splash_draft_acceptance_ratio 0.875", metrics)
+        self.assertIn("richengine_constraint_mask_residual_wait_milliseconds 1.5", metrics)
+        self.assertIn("richengine_prefill_input_tokens_total 2048", metrics)
+        self.assertIn("richengine_prefill_tokens_per_second 4096.0", metrics)
+        self.assertIn("richengine_decode_output_tokens_total 32", metrics)
+        self.assertIn("richengine_decode_wall_milliseconds_total 64.0", metrics)
+        self.assertIn("richengine_decode_cycle_milliseconds_total 80.0", metrics)
+        self.assertIn("richengine_decode_tokens_per_second 500.0", metrics)
+        self.assertIn("richengine_capacity_failures_total 1", metrics)
+        self.assertIn("richengine_metal_failures_total 2", metrics)
+        self.assertIn("richengine_response_store_entries 0", metrics)
+        self.assertIn("richengine_memory_headroom_bytes 200", metrics)
+        self.assertIn("richengine_ttft_p95_milliseconds 12.5", metrics)
+        self.assertIn("richengine_draft_acceptance_ratio 0.875", metrics)
 
         status, _, payload = harness.request("GET", "/v1/models")
         self.assertEqual(status, 200)
         model = json.loads(payload)["data"][0]
         self.assertEqual(model["id"], "test-model")
-        self.assertEqual(model["owned_by"], "splash")
+        self.assertEqual(model["owned_by"], "richengine")
 
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body(seed=7)
@@ -3475,8 +3475,8 @@ class ServerTest(unittest.TestCase):
         )
         status, _, payload = harness.request("GET", "/metrics")
         self.assertEqual(status, 200, payload)
-        self.assertIn(b"splash_http_ttft_seconds_count 1", payload)
-        self.assertIn(b"splash_output_interval_seconds_count 1", payload)
+        self.assertIn(b"richengine_http_ttft_seconds_count 1", payload)
+        self.assertIn(b"richengine_output_interval_seconds_count 1", payload)
 
     def test_console_request_summary(self):
         record = {
@@ -3584,7 +3584,7 @@ class ServerTest(unittest.TestCase):
             self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 
     def test_server_requires_explicit_model_and_paths(self):
-        model = "community/custom-splash"
+        model = "community/custom-richengine"
         package = api.ROOT / "install/models" / model
         required = [
             str(package),
@@ -3676,7 +3676,7 @@ class ServerTest(unittest.TestCase):
         )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
-        self.assertEqual(Path(args.binary).name, "splash")
+        self.assertEqual(Path(args.binary).name, "richengine")
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(
             FakeRuntime(), tokenizer, lambda _record: None
@@ -3809,7 +3809,7 @@ class ServerTest(unittest.TestCase):
         runtime.kill.assert_called_once_with()
         runtime_type.assert_called_once_with(
             [
-                "splash",
+                "richengine",
                 "serve-native",
                 "model",
                 "auto",
@@ -4270,7 +4270,7 @@ class ServerTest(unittest.TestCase):
                 self.body(stream=True, reasoning_effort="none"),
             )
             try:
-                self.assertEqual(response.readline(), b": splash-keepalive\n")
+                self.assertEqual(response.readline(), b": richengine-keepalive\n")
                 self.assertFalse(plan.started.is_set())
                 plan.start_release.set()
                 role = json.loads(self.next_sse_data(response))
@@ -4304,7 +4304,7 @@ class ServerTest(unittest.TestCase):
                     try:
                         # A comment until the request starts, then a chunk
                         # that adds nothing.
-                        self.assertEqual(response.readline(), b": splash-keepalive\n")
+                        self.assertEqual(response.readline(), b": richengine-keepalive\n")
                         plan.start_release.set()
                         chunk = json.loads(self.next_sse_data(response))
                         if path == "/v1/chat/completions":
@@ -4429,8 +4429,8 @@ class ServerTest(unittest.TestCase):
         before_output, _, after_output = raw.partition(
             b"event: response.output_item.added\n"
         )
-        self.assertNotIn(b": splash-keepalive", before_output)
-        self.assertEqual(after_output.count(b": splash-keepalive"), 2)
+        self.assertNotIn(b": richengine-keepalive", before_output)
+        self.assertEqual(after_output.count(b": richengine-keepalive"), 2)
         self.assertEqual(kinds[-1], "response.completed")
         response = parsed[-1]["response"]
         self.assertEqual(response["id"], "resp_prefill-heartbeat")
@@ -4491,7 +4491,7 @@ class ServerTest(unittest.TestCase):
             ).tool_calls
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
-        self.assertGreaterEqual(snapshots[-3].count(b": splash-keepalive"), 3)
+        self.assertGreaterEqual(snapshots[-3].count(b": richengine-keepalive"), 3)
         self.assertNotIn(b"questions", snapshots[-3])
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"questions": ["a" * 24]}
@@ -5276,8 +5276,8 @@ class ServerTest(unittest.TestCase):
             text = json.dumps(value, separators=(",", ":"))
             self.assertIn(json.dumps(text), grammar)
         self.assertIn('"default":{"$ref":"https://example.com/x.json"}', grammar)
-        self.assertIn('"items":{"$ref":"#/$defs/__splash_root/$defs/x"}', grammar)
-        self.assertNotIn("__splash_root/x", grammar)
+        self.assertIn('"items":{"$ref":"#/$defs/__richengine_root/$defs/x"}', grammar)
+        self.assertNotIn("__richengine_root/x", grammar)
 
     def test_tool_parser_resolves_root_and_chained_string_refs(self):
         schema = {
@@ -7011,7 +7011,7 @@ class ServerTest(unittest.TestCase):
             "POST",
             "/v1/chat/completions",
             self.body(reasoning_effort="none"),
-            {"Content-Type": "application/vnd.splash+json; charset=utf-8"},
+            {"Content-Type": "application/vnd.richengine+json; charset=utf-8"},
         )
         self.assertEqual(status, 200)
 

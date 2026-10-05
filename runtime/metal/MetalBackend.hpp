@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::metal {
+namespace richengine::metal {
 
 enum class AllocationFailure : uint8_t {
   None,
@@ -322,4 +322,4 @@ private:
   friend class BackendInstrumentation;
 };
 
-} // namespace splash::metal
+} // namespace richengine::metal

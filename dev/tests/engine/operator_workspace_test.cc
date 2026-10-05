@@ -13,7 +13,7 @@
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -25,7 +25,7 @@ template <class Function> void rejects(Function function) {
 }
 
 void attention() {
-  using namespace splash;
+  using namespace richengine;
   for (const uint32_t queryHeads : {16U, 24U}) {
     const kv::Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
     uint32_t maximumSlots = 0;
@@ -51,9 +51,9 @@ void attention() {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace =
           ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
-      // The bound covers a tree lane's SPLASH_TREE_VERIFY_NODES row slots.
+      // The bound covers a tree lane's RICHENGINE_TREE_VERIFY_NODES row slots.
       const uint64_t values =
-          uint64_t{lanes} * SPLASH_TREE_VERIFY_NODES *
+          uint64_t{lanes} * RICHENGINE_TREE_VERIFY_NODES *
           kv::kVerifyMaximumSplits * queryHeads;
       require(workspace.partialsBytes == values * 256 * 4,
               "verify partial workspace is not sized for the maximum split count");
@@ -73,13 +73,13 @@ void attention() {
 // scores, one row of 256 per token. The split prefill plan parks its gate in
 // expertOutput, so that field spans the wider of the hidden and intermediate
 // widths.
-void checkMoe(splash::ops::MoeWorkspace workspace,
-              splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows,
+void checkMoe(richengine::ops::MoeWorkspace workspace,
+              richengine::ops::MoeShape shape, uint32_t rows, uint32_t tileRows,
               uint32_t outputWidth) {
-  using splash::model::kBFloat16Bytes;
+  using richengine::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
-  const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
+  const uint64_t tiles = richengine::ops::moeMaximumTiles(rows, shape, tileRows);
   const uint64_t grouped = tiles * tileRows;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
@@ -97,7 +97,7 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
 }
 
 void moe() {
-  using namespace splash::ops;
+  using namespace richengine::ops;
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                                MoeShape{2048, 256, 8, 512}}) {
     const uint32_t splitWidth =
@@ -122,8 +122,8 @@ void moe() {
 }
 
 void sampling() {
-  using splash::ops::DraftSelector;
-  using splash::ops::Sampling;
+  using richengine::ops::DraftSelector;
+  using richengine::ops::Sampling;
   // Independent ABI formulas, including one lane and B1-B4 packed
   // extents. No backend, allocation or GPU graph is needed to size buffers.
   for (uint32_t rows : {1U, 8U, 16U, 24U, 32U,

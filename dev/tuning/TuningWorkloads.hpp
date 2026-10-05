@@ -7,19 +7,19 @@
 #include <span>
 #include <vector>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 // Tune the full prefill budget plus the chunk sizes the scheduler actually
 // emits: contended halves of the budget, and the small tails around state
 // boundaries. Row counts outside this set keep the shipped operator defaults
 // and still execute their actual row count.
 inline constexpr std::array<uint32_t, 5> kPrefillProbeRows{
-    64, 256, 512, 1024, SPLASH_PREFILL_TOKEN_BUDGET};
+    64, 256, 512, 1024, RICHENGINE_PREFILL_TOKEN_BUDGET};
 inline constexpr std::array<uint32_t, 4> kDecodeProbeWidths{1, 2, 3, 4};
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning
 
-namespace splash::model {
+namespace richengine::model {
 
 // Describe the affine projections the loaded target/draft pair runs, one
 // input per workload in workload order. Operators supply the bounded probe
@@ -32,4 +32,4 @@ namespace splash::model {
     const ModelPackage &package, std::span<const uint32_t> prefillRows,
     std::span<const uint32_t> decodeWidths);
 
-} // namespace splash::model
+} // namespace richengine::model

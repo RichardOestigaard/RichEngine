@@ -25,7 +25,7 @@ from install import models as installer
 
 
 class ModelArtifactTest(unittest.TestCase):
-    MODEL_ID = "community/My-Splash.Model_1"
+    MODEL_ID = "community/My-RichEngine.Model_1"
     REVISION = "a" * 40
 
     def setUp(self):
@@ -98,7 +98,7 @@ class ModelArtifactTest(unittest.TestCase):
             "schema_version": schema,
             "model": "Community fine-tuned model",
             "format": {
-                "name": "splash-packed-q4" + ("-moe" if schema == 4 else ""),
+                "name": "richengine-packed-q4" + ("-moe" if schema == 4 else ""),
                 "section_alignment_bytes": legacy.ALIGNMENT,
                 "target_layer_magic": "MDFM0001" if schema == 4 else "MDFL0006",
                 "draft_layer_magic": "MDFD0004",
@@ -423,7 +423,7 @@ class ModelArtifactTest(unittest.TestCase):
                         snapshot / "target/embedding.bin"
                     )
                 )
-                self.assertEqual(len(list((repository / "refs/splash").glob("*/*"))), 1)
+                self.assertEqual(len(list((repository / "refs/richengine").glob("*/*"))), 1)
 
     def test_missing_or_oversize_remote_manifest_fails_before_any_download(self):
         snapshot, _ = self.package_fixture()
@@ -715,7 +715,7 @@ class ModelArtifactTest(unittest.TestCase):
 
     def test_link_prints_the_selection_link_of_the_source_options(self):
         # make's MODEL_ROOT is this output; a relative draft folder names the
-        # installation splash serve --draft-model selects from the same folder.
+        # installation richengine serve --draft-model selects from the same folder.
         models = self.root / "models"
         draft = self.root / "draft"
         draft.mkdir()
@@ -758,7 +758,7 @@ class ModelArtifactTest(unittest.TestCase):
             installer.link_selection(destination, snapshot)
 
     def test_legacy_packages_are_preserved_and_never_given_an_official_id(self):
-        model_id = "incoai/Qwen3.6-35B-A3B-Splash"
+        model_id = "incoai/Qwen3.6-35B-A3B-RichEngine"
         for kind in ("directory", "absolute link", "relative link"):
             with self.subTest(kind=kind):
                 old, manifest = self.package_fixture(schema=4)
@@ -838,7 +838,7 @@ class ModelArtifactTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
             download.assert_not_called()
-        refs = list((snapshot.parent.parent / "refs/splash").glob("*/*"))
+        refs = list((snapshot.parent.parent / "refs/richengine").glob("*/*"))
         self.assertEqual([ref.read_text() for ref in refs], [self.REVISION])
 
     def test_shared_hub_cache_keeps_each_installation_revision_pinned(self):

@@ -4,7 +4,7 @@
 
 #include <utility>
 
-namespace splash::test {
+namespace richengine::test {
 
 // Puts config in place of the test configuration until it goes out of scope,
 // then restores the one before. Construct it before the component that reads
@@ -21,4 +21,4 @@ private:
   TestConfig previous_;
 };
 
-} // namespace splash::test
+} // namespace richengine::test

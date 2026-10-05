@@ -4,7 +4,7 @@
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators) {
@@ -42,9 +42,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.gdnValueHeads));
   {
-    // SPLASH_GDN_CHUNKED (32/64/128) sizes the WY/UT scratch at this
+    // RICHENGINE_GDN_CHUNKED (32/64/128) sizes the WY/UT scratch at this
     // geometry's GDN shape; the serial scan binds nothing here.
-    const uint32_t factor = envUint("SPLASH_GDN_CHUNKED", 0);
+    const uint32_t factor = envUint("RICHENGINE_GDN_CHUNKED", 0);
     if (factor == 32 || factor == 64 || factor == 128) {
       put(PrefillTensor::GdnChunkScratch,
           bytesFor<float>(ops::GDN::chunkScratchFloats(
@@ -136,6 +136,16 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearPacked, linear.input);
     put(PrefillTensor::LinearExponents, linear.sums);
   }
+  if (envFlag("RICHENGINE_PREFILL_FAST_INT8")) {
+    const uint64_t inputWidth =
+        uint64_t{geometry.projectionSumsWidth()} * kQ4GroupElements;
+    put(PrefillTensor::I8Codes, uint64_t{kPrefillRows} * inputWidth);
+    put(PrefillTensor::I8CodesLo, uint64_t{kPrefillRows} * inputWidth);
+    put(PrefillTensor::I8Params,
+        uint64_t{kPrefillRows} * geometry.projectionSumsWidth() * 16);
+    put(PrefillTensor::I8ParamsLo,
+        uint64_t{kPrefillRows} * geometry.projectionSumsWidth() * 16);
+  }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);
@@ -182,11 +192,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      geometry.draft.kind == DraftKind::Null
+          ? ops::DraftAttentionWorkspace{}
+          : operators.draftAttentionWorkspacePerLane(
+                geometry.draft.attentionShape());
   // The sampling workspaces cover a tree lane's node count so the same
   // tensors serve chain (8-row) and tree (16-row) verify batches.
   const auto samplingWorkspace =
-      ops::Sampling::workspace(SPLASH_TREE_VERIFY_NODES);
+      ops::Sampling::workspace(RICHENGINE_TREE_VERIFY_NODES);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
@@ -253,6 +266,13 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(r * geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
+  // The fused greedy head's per-(row, column tile) partials: the affine
+  // kernel's tiles are 128 wide, the GGUF one's 64 — reserve the latter's.
+  const uint64_t headTiles = geometry.target.vocabularySize / 64;
+  put(DecodeTensor::HeadArgmaxValues,
+      bytesFor<float>(uint64_t{r} * headTiles));
+  put(DecodeTensor::HeadArgmaxIndices,
+      bytesFor<uint32_t>(uint64_t{r} * headTiles));
   put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
   put(DecodeTensor::TargetVocabularyRows, samplingWorkspace.vocabularyRowsBytes);
   put(DecodeTensor::TargetVocabularyRanges,
@@ -296,20 +316,20 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
   put(DecodeTensor::TreeNodes,
-      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+      bytesFor<uint32_t>(RICHENGINE_TREE_VERIFY_NODES));
   put(DecodeTensor::TreeTokens,
-      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+      bytesFor<uint32_t>(RICHENGINE_TREE_VERIFY_NODES));
   put(DecodeTensor::TreeCounts, bytesFor<uint32_t>(1));
   put(DecodeTensor::TreeMasks,
-      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+      bytesFor<uint32_t>(RICHENGINE_TREE_VERIFY_NODES));
   put(DecodeTensor::RetainedPath,
-      bytesFor<uint32_t>(SPLASH_TARGET_VERIFY_ROWS));
+      bytesFor<uint32_t>(RICHENGINE_TARGET_VERIFY_ROWS));
   put(DecodeTensor::TreeSelected,
-      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+      bytesFor<uint32_t>(RICHENGINE_TREE_VERIFY_NODES));
   put(DecodeTensor::CapturedPath,
-      bytesFor<uint16_t>(uint64_t{SPLASH_TREE_VERIFY_NODES} *
+      bytesFor<uint16_t>(uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
                          geometry.draft.targetHiddenSize));
-  put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
+  put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::VerifyPackedBase,
@@ -379,4 +399,4 @@ uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
                     "planned gate scratch");
 }
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -22,7 +22,7 @@ constant uint kDecodeSimdgroups = 8;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
 // head's v, the gates and the recurrent output rows.
-template <uint HeadDim, uint Rows = SPLASH_TARGET_VERIFY_ROWS>
+template <uint HeadDim, uint Rows = RICHENGINE_TARGET_VERIFY_ROWS>
 struct GdnDecodeShared {
   bfloat queries[Rows * HeadDim];
   bfloat keys[Rows * HeadDim];
@@ -47,7 +47,7 @@ inline void gdn_decode_prologue(
     device const bfloat *dt_bias, device float *decay, device bfloat *beta,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Tokens = RICHENGINE_TARGET_VERIFY_ROWS;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
@@ -266,7 +266,7 @@ gdn_commit_phase(device const bfloat *packed, device const bfloat *mixed_qkv,
   constexpr uint KeyWidth = KeyHeads * HeadDim;
 
   uint count = retained;
-  if (count == SPLASH_TARGET_VERIFY_ROWS)
+  if (count == RICHENGINE_TARGET_VERIFY_ROWS)
     return;
   for (uint element = group * 256 + thread_index; element < 3 * ConvDim;
        element += ValueHeads * 256) {
@@ -326,7 +326,7 @@ inline void gdn_commit_prefix_batch_phase(
     device uchar *next_3, device const uint *retained,
     constant GDNBatchCommitParams &params, uint3 group, uint thread_index,
     uint simd_lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   uint batch = group.z;
   uint layer = group.y;
   device const uchar *current = batch == 0   ? current_0
@@ -337,7 +337,7 @@ inline void gdn_commit_prefix_batch_phase(
                        : batch == 1 ? next_1
                        : batch == 2 ? next_2
                                     : next_3;
-  const ulong rows = (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * Rows;
+  const ulong rows = (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch) * Rows;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
   decay += rows * ValueHeads;
@@ -420,8 +420,8 @@ inline void gdn_commit_tree_phase(
   // A full retained chain (path[i] == i) already ended at the scan's
   // chain-row state; only a truncation or a leaf detour needs the replay.
   const bool full_chain =
-      count == SPLASH_TARGET_VERIFY_ROWS &&
-      path[SPLASH_TARGET_VERIFY_ROWS - 1] == SPLASH_TARGET_VERIFY_ROWS - 1;
+      count == RICHENGINE_TARGET_VERIFY_ROWS &&
+      path[RICHENGINE_TARGET_VERIFY_ROWS - 1] == RICHENGINE_TARGET_VERIFY_ROWS - 1;
   if (full_chain)
     return;
   for (uint task = group; task < ValueHeads * ValueBatches;
@@ -463,7 +463,7 @@ inline void gdn_commit_tree_phase(
 }
 
 // Grid {value heads, layers, lanes}; the lane's rows of a layer's packed,
-// mixed and gate tensors are SPLASH_TREE_VERIFY_NODES apart, and
+// mixed and gate tensors are RICHENGINE_TREE_VERIFY_NODES apart, and
 // retained_path holds the committed path's DFS rows.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth>
@@ -487,11 +487,11 @@ inline void gdn_commit_tree_batch_phase(
                        : batch == 1 ? next_1
                        : batch == 2 ? next_2
                                     : next_3;
-  // The arena's GDN tensors hold SPLASH_TARGET_VERIFY_ROWS-row units per
+  // The arena's GDN tensors hold RICHENGINE_TARGET_VERIFY_ROWS-row units per
   // lane slot; a tree lane's Rows rows occupy the units 2*batch, 2*batch+1.
   const ulong rows =
-      (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch * 2) *
-      SPLASH_TARGET_VERIFY_ROWS;
+      (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch * 2) *
+      RICHENGINE_TARGET_VERIFY_ROWS;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
   decay += rows * ValueHeads;
@@ -508,7 +508,7 @@ inline void gdn_commit_tree_batch_phase(
       ulong(layer) * params.recurrent_layer_bytes);
   gdn_commit_tree_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
       packed, mixed_qkv, decay, beta, conv_state_in, conv_state_out, state_in,
-      state_out, retained_path + batch * SPLASH_TARGET_VERIFY_ROWS,
+      state_out, retained_path + batch * RICHENGINE_TARGET_VERIFY_ROWS,
       retained[batch], group.x, thread_index, simd_lane, simd_group);
 }
 
@@ -563,7 +563,7 @@ inline void gdn_decode_batch_phase(
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
     TP *table, SP *sums) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
   device const uchar *current = batch == 0
@@ -688,7 +688,7 @@ GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed_vh32_f32, 16, 32, 128, 8192, 125
 #undef GDN_DECODE_BUFFERS
 
 // ---------------------------------------------------------------------------
-// Tree verify: one lane's SPLASH_TREE_VERIFY_NODES rows, the chain at rows
+// Tree verify: one lane's RICHENGINE_TREE_VERIFY_NODES rows, the chain at rows
 // 0..7 and each position's sibling leaf at row 8 + position. The prologue
 // takes a row's conv taps along its path; the scan runs the chain and
 // extends a register copy for each leaf, so the committed chain state is
@@ -705,10 +705,10 @@ inline void gdn_decode_tree_prologue(
     device const bfloat *conv_state_in, device bfloat *mixed_qkv,
     device const float *a_scale, device const bfloat *dt_bias,
     device float *decay, device bfloat *beta,
-    threadgroup GdnDecodeShared<HeadDim, SPLASH_TREE_VERIFY_NODES> &shared,
+    threadgroup GdnDecodeShared<HeadDim, RICHENGINE_TREE_VERIFY_NODES> &shared,
     device const uint *nodes, uint count, uint value_head, uint lane,
     uint simd_group) {
-  constexpr uint Rows = SPLASH_TREE_VERIFY_NODES;
+  constexpr uint Rows = RICHENGINE_TREE_VERIFY_NODES;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint BOffset = ConvDim + ValueHeads * HeadDim;
@@ -787,9 +787,9 @@ inline void gdn_decode_tree_prologue(
 template <uint HeadDim, uint RowsInFlight>
 inline void gdn_decode_tree_scan(
     device const float *state_in, device float *state_out,
-    threadgroup GdnDecodeShared<HeadDim, SPLASH_TREE_VERIFY_NODES> &shared,
+    threadgroup GdnDecodeShared<HeadDim, RICHENGINE_TREE_VERIFY_NODES> &shared,
     uint count, uint value_head, uint lane, uint simd_group) {
-  constexpr uint ChainRows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint ChainRows = RICHENGINE_TARGET_VERIFY_ROWS;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -862,7 +862,7 @@ inline void gdn_decode_tree_scan(
   }
 }
 
-// Grid {value heads, lanes}; strides are SPLASH_TREE_VERIFY_NODES per lane.
+// Grid {value heads, lanes}; strides are RICHENGINE_TREE_VERIFY_NODES per lane.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, uint RowsInFlight, class Table, class W,
           class TP, class SP>
@@ -877,9 +877,9 @@ inline void gdn_decode_tree_batch_phase(
     device const uint *tree_nodes, device const uint *tree_counts,
     constant GDNDecodeBatchParams &params, uint2 group, uint lane,
     uint simd_group,
-    threadgroup GdnDecodeShared<HeadDim, SPLASH_TREE_VERIFY_NODES> &shared,
+    threadgroup GdnDecodeShared<HeadDim, RICHENGINE_TREE_VERIFY_NODES> &shared,
     TP *table, SP *sums) {
-  constexpr uint Rows = SPLASH_TREE_VERIFY_NODES;
+  constexpr uint Rows = RICHENGINE_TREE_VERIFY_NODES;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
   device const uchar *current = batch == 0
@@ -954,7 +954,7 @@ inline void gdn_decode_tree_batch_phase(
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GDN_TREE_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
-    threadgroup GdnDecodeShared<HeadDim, SPLASH_TREE_VERIFY_NODES> shared; \
+    threadgroup GdnDecodeShared<HeadDim, RICHENGINE_TREE_VERIFY_NODES> shared; \
     gdn_decode_tree_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, \

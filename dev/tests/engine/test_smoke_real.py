@@ -129,7 +129,7 @@ class SmokeRealTests(unittest.TestCase):
     def test_server_paths_are_resolved_from_caller_directory(self):
         with TemporaryDirectory() as directory, contextlib.chdir(directory):
             package = Path("model package")
-            binary = Path("native build/splash")
+            binary = Path("native build/richengine")
             for absolute in (False, True):
                 with self.subTest(absolute=absolute):
                     arguments = SimpleNamespace(
@@ -341,7 +341,7 @@ class SmokeRealTests(unittest.TestCase):
     def test_requests_send_the_api_key_the_server_requires(self):
         for key in (None, "", "secret"):
             with self.subTest(key=key):
-                environment = {} if key is None else {"SPLASH_API_KEY": key}
+                environment = {} if key is None else {"RICHENGINE_API_KEY": key}
                 with (
                     mock.patch.dict(smoke_real.os.environ, environment, clear=True),
                     mock.patch.object(

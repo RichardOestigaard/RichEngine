@@ -39,14 +39,14 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
-using namespace splash::ops;
+using namespace richengine;
+using namespace richengine::ops;
 using namespace gguf_reference;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::tuning::bf16ToFloat;
-using splash::ops::tuning::floatToBf16;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::tuning::bf16ToFloat;
+using richengine::ops::tuning::floatToBf16;
 
 namespace {
 
@@ -785,11 +785,11 @@ void packedInput(MetalBackend &backend, const Linear &linear) {
     }
   // A prefill chunk plan of up to a decode batch's rows runs the same mxfp4p
   // decode tiles, so its producer can emit the packed operand the same way.
-  // The tiles stay behind SPLASH_GGUF_PACKED_ON: the fp4 multiplane matmul
+  // The tiles stay behind RICHENGINE_GGUF_PACKED_ON: the fp4 multiplane matmul
   // is not bitwise equal to the staged mxfp4n prefill tile's outputs.
   for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual})
     for (const uint32_t rows : {8u, 32u}) {
-      if (!std::getenv("SPLASH_GGUF_PACKED_ON")) break;
+      if (!std::getenv("RICHENGINE_GGUF_PACKED_ON")) break;
       const std::string what =
           "prefill " + std::string(epilogueName(epilogue)) + " rows=" + std::to_string(rows);
       const LinearPlan plan = linear.prefillPlan(up, rows, epilogue);

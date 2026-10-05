@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 class RoPE final {
 public:
@@ -19,4 +19,4 @@ public:
       RopeTableParams rows, uint32_t maximumRows);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

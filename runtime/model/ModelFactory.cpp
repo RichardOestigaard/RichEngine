@@ -1,5 +1,7 @@
 #include "ModelFactory.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/Granite.hpp"
+#include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
@@ -11,7 +13,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 void requireCompatibleModelPackage(const ModelPackage &package) {
   const DFlashDraftLayout &draftLayout =
@@ -64,6 +66,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2MoeLayout &layo
   return loadLfm2MoeWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const GraniteLayout &layout,
+                         const QwenTargetFiles<GraniteLayout> &files) {
+  return loadGraniteWeights(backend, layout, files);
+}
+
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
   uint64_t total = 0;
   for (const Image &image : images) total += image.bytes;
@@ -84,12 +91,13 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
+  const bool nullDraft = result.descriptor.draft.kind == DraftKind::Null;
   const bool plainDraft = result.descriptor.draft.kind == DraftKind::Plain;
   const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
   std::optional<DraftCheckpointLoader> draft;
   std::optional<PlainDraftCheckpointLoader> plainDraftLoader;
   std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
-  if (result.descriptor.draftFromCheckpoint()) {
+  if (result.descriptor.draftFromCheckpoint() && !nullDraft) {
     if (plainDraft)
       plainDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else if (dsparkDraft)
@@ -116,7 +124,9 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  if (plainDraft) {
+  if (nullDraft) {
+    result.draft = NullDraftWeights{result.descriptor.draft, {}, 0};
+  } else if (plainDraft) {
     result.draft = loadPlainDraftWeights(
         backend,
         plainDraftLoader
@@ -178,7 +188,8 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);
   }
-  if (descriptor.draftFromCheckpoint())
+  if (descriptor.draftFromCheckpoint() &&
+      descriptor.draft.kind != DraftKind::Null)
     bytes += descriptor.draft.kind == DraftKind::Plain
                  ? imageBytes(plainDraftCheckpointImages(descriptor.draft))
                  : descriptor.draft.kind == DraftKind::DSpark
@@ -201,4 +212,4 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   return bytes;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

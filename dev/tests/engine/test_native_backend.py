@@ -985,7 +985,7 @@ class NativeBackendContractTests(unittest.TestCase):
         start = threading.Thread.start
 
         def gated_start(thread):
-            if thread.name == "splash-engine-recovery":
+            if thread.name == "richengine-engine-recovery":
                 starting.set()
                 if not release_start.wait(2.0):
                     raise TimeoutError("test did not release the worker start")

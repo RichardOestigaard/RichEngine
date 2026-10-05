@@ -5,7 +5,7 @@
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
-#include "engine/Cache.hpp"
+#include "engine/cache/Cache.hpp"
 #include "engine/Bootstrap.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/Ornith9B.hpp"
@@ -30,17 +30,17 @@
 
 namespace {
 
-using namespace splash;
-using namespace splash::engine;
-namespace runtime = splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
+namespace runtime = richengine::engine;
 
-using splash::test::require;
+using richengine::test::require;
 
 class TemporaryModelRoot final {
 public:
   explicit TemporaryModelRoot(uint32_t hiddenSize = 5120) {
     path_ = std::filesystem::temp_directory_path() /
-            ("splash-geometry-" +
+            ("richengine-geometry-" +
              std::string([NSUUID UUID].UUIDString.UTF8String));
     if (!std::filesystem::create_directory(path_))
       throw std::runtime_error("unable to create temporary model root");
@@ -70,7 +70,7 @@ std::string executionManifest(uint32_t draftRows = 8,
                               std::string_view model = "Qwen3.8-27B-DFlash2") {
   std::ostringstream out;
   out << R"({"schema_version":3,"model":")" << model
-      << R"(","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
+      << R"(","format":{"name":"richengine-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
       << R"("draft_proposal_tokens":7,)"
       << "\"draft_query_rows\":" << draftRows << ','
       << R"("draft_sliding_window":2048,)"
@@ -195,7 +195,7 @@ void testSourceModelSelectsDenseFamilyByLayers() {
   public:
     SourceRoot() {
       path_ = std::filesystem::temp_directory_path() /
-              ("splash-source-" +
+              ("richengine-source-" +
                std::string([NSUUID UUID].UUIDString.UTF8String));
       if (!std::filesystem::create_directories(path_ / "draft"))
         throw std::runtime_error("unable to create source model root");
@@ -290,7 +290,7 @@ struct SourceModel final {
 // once, and each number by one rule: a JSON number, never a boolean, of the
 // model's value, which a whole number may also spell as a float.
 void testSourceModelConfigs() {
-  const test::TemporaryDirectory root("splash-source-model");
+  const test::TemporaryDirectory root("richengine-source-model");
   std::filesystem::create_directory(root.path() / "draft");
   const auto inspect = [&](const SourceModel &source) {
     test::writeFile(root.path() / "model.json", source.record);

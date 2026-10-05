@@ -8,7 +8,7 @@
 #include <cstring>
 #include <limits>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 enum ValueType : uint32_t {
@@ -353,4 +353,4 @@ const GgufTensor &GgufFile::require(std::string_view name) const {
   return *tensor;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

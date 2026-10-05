@@ -196,7 +196,7 @@ class ArchitectureTests(unittest.TestCase):
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
                 for relative in (
-                    "runtime/engine/FdTransport.cpp",
+                    "runtime/engine/wire/FdTransport.cpp",
                     "runtime/metal/MetalBackend.mm",
                     "runtime/main.mm",
                 ):
@@ -240,8 +240,8 @@ class ArchitectureTests(unittest.TestCase):
                         "runtime/engine/RuntimeResources.mm",
                         "wake.wait_for(lock, kProbation, stopped);\n",
                     ),
-                    ("runtime/engine/Cache.cpp", "mutex.try_lock_for(kWait);\n"),
-                    ("runtime/engine/KvPool.cpp", "slots.try_acquire_for(kWait);\n"),
+                    ("runtime/engine/cache/Cache.cpp", "mutex.try_lock_for(kWait);\n"),
+                    ("runtime/engine/cache/KvPool.cpp", "slots.try_acquire_for(kWait);\n"),
                 ):
                     with self.subTest(source=relative):
                         source = root / relative

@@ -25,7 +25,7 @@ from pathlib import Path
 
 WEIGHT_DIGESTS = Path("engine-tests/weight-digests")
 IDENTITY_HEADER = Path("engine/WeightPreparationIdentity.hpp")
-PROVENANCE = "splash-prepared-weight-v1"
+PROVENANCE = "richengine-prepared-weight-v1"
 DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
@@ -40,7 +40,7 @@ def digests(build: Path, package: Path) -> dict:
     engine loads from package."""
     tool = Path(build) / WEIGHT_DIGESTS
     result = subprocess.run(
-        [str(tool), str(Path(build) / "splash.metallib"), str(package)],
+        [str(tool), str(Path(build) / "richengine.metallib"), str(package)],
         capture_output=True,
         text=True,
     )
@@ -56,7 +56,7 @@ def baseline_environment(directory: Path) -> dict:
     its own, directory/baseline-weights, created now."""
     cache = (Path(directory) / "baseline-weights").resolve()
     cache.mkdir(parents=True, exist_ok=True)
-    return {"SPLASH_WEIGHT_CACHE": str(cache)}
+    return {"RICHENGINE_WEIGHT_CACHE": str(cache)}
 
 
 def prepared(environment: dict, package: Path) -> dict:
@@ -65,7 +65,7 @@ def prepared(environment: dict, package: Path) -> dict:
     complete entries whose source is under package."""
     root = str(package)
     images = {}
-    for entry in sorted(Path(environment["SPLASH_WEIGHT_CACHE"]).iterdir()):
+    for entry in sorted(Path(environment["RICHENGINE_WEIGHT_CACHE"]).iterdir()):
         if not DIGEST.fullmatch(entry.name):
             continue
         try:

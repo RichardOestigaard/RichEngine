@@ -714,7 +714,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 self.assertEqual(
                     (job.thinking, job.generation_prompt_tokens), (thinking, tokens)
                 )
-        # A switch Splash does not set, as DeepSeek's templates name it.
+        # A switch RichEngine does not set, as DeepSeek's templates name it.
         switch = (
             "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
             "{% if add_generation_prompt %}<|assistant|>"

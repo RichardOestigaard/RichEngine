@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 class VisionLoader;
 
@@ -31,4 +31,4 @@ loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
 [[nodiscard]] QwenVisionWeights
 loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images, const VisionLoader &source);
 
-} // namespace splash::model
+} // namespace richengine::model

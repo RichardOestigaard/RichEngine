@@ -65,7 +65,7 @@ M3 Max, 40 GPU cores, Apple9, macOS 27.0.0. Baseline: Q4/MoE integration
 `7a63b4c`; candidate: `2c788c0`, production build ID
 `src-c380c7f4024d8118a26d95b5ddaa32ce4eff149287e94c4cdd8db7f1ddd65566`.
 The candidate includes the later candidate-count fix and integration cleanup.
-The same local Splash packages, prompts, temperature 0, disabled reasoning,
+The same local RichEngine packages, prompts, temperature 0, disabled reasoning,
 256 generated tokens and 32768 context limit were used for both builds.
 Each fresh server had one 64-token warmup. ABBA order, two repetitions per
 scenario per phase: 32 measured requests per model, four per build/scenario.

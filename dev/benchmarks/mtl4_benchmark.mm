@@ -5,7 +5,7 @@
 // Submits a decode-shaped command graph (many small compute dispatches with
 // buffer and byte bindings) through MetalBackend::submitCommandAsync and
 // reports per-submission encode+commit wall time, end-to-end wall time and
-// GPU time. Run once normally and once with SPLASH_MTL4=1 to compare the
+// GPU time. Run once normally and once with RICHENGINE_MTL4=1 to compare the
 // encoders. Two graphs are measured: "direct" dispatches encode every
 // dispatch, while "icb" dispatches all carry bakeable so the baked-span
 // replay path covers them after the first submission.
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -152,9 +152,9 @@ int main(int argc, char **argv) {
     const RunStats icbStats = runGraph(backend, icb, rounds, checksum);
     report("icb", icbStats, icb.size(), checksum);
 
-    std::printf("path: %s (SPLASH_MTL4 %s)\n",
-                std::getenv("SPLASH_MTL4") ? "mtl4" : "mtl3",
-                std::getenv("SPLASH_MTL4") ? "set" : "unset");
+    std::printf("path: %s (RICHENGINE_MTL4 %s)\n",
+                std::getenv("RICHENGINE_MTL4") ? "mtl4" : "mtl3",
+                std::getenv("RICHENGINE_MTL4") ? "set" : "unset");
   } catch (const std::exception &error) {
     std::fprintf(stderr, "mtl4-benchmark: %s\n", error.what());
     return 1;

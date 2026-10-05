@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 // A chunk's rows, columns and row bytes are within the staging bound, so they
@@ -291,4 +291,4 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, co
   }
 }
 
-} // namespace splash::model
+} // namespace richengine::model

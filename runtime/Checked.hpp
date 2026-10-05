@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash {
+namespace richengine {
 
 // On overflow, the result is left untouched.
 [[nodiscard]] inline bool checkedAdd(uint64_t left, uint64_t right,
@@ -53,4 +53,4 @@ inline constexpr uint64_t kHostPageBytes = 16 * 1024;
   return (bytes + kHostPageBytes - 1) & ~(kHostPageBytes - 1);
 }
 
-} // namespace splash
+} // namespace richengine

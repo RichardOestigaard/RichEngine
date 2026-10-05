@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct Qwen3_8Layout final : QwenHybridLayout<5> {
   static constexpr std::string_view layerMagic = "MDFL0006";
@@ -56,4 +56,4 @@ using Qwen3_8Weights = QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights>;
 loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
                    const QwenTargetFiles<Qwen3_8Layout> &files);
 
-} // namespace splash::model
+} // namespace richengine::model

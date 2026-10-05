@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise SPLASH_NGRAM_PREDRAFT against a live server.
+"""Exercise RICHENGINE_NGRAM_PREDRAFT against a live server.
 
 A prompt that asks for a verbatim echo of a repeated block produces output
 whose closing 3-grams already occurred in the prompt, so the n-gram table
@@ -16,12 +16,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import smoke_real  # noqa: E402
 
-MODEL = "incoai/Qwen3.8-27B-Splash"
+MODEL = "incoai/Qwen3.8-27B-RichEngine"
 PACKAGE = (
     Path(__file__).resolve().parents[2]
-    / "install/models/incoai/Qwen3.8-27B-Splash"
+    / "install/models/incoai/Qwen3.8-27B-RichEngine"
 )
-BINARY = Path(__file__).resolve().parents[2] / "build/splash"
+BINARY = Path(__file__).resolve().parents[2] / "build/richengine"
 
 BLOCK = (
     "The quick brown fox jumps over the lazy dog near the river bank. "
@@ -89,7 +89,7 @@ def main() -> int:
     base, base_hits, _ = run({})
     print(f"baseline chars={len(base)} ngram-hits={base_hits}", flush=True)
     flagged, hits, log = run(
-        {"SPLASH_NGRAM_PREDRAFT": "1", "SPLASH_NGRAM_DEBUG": "1"}
+        {"RICHENGINE_NGRAM_PREDRAFT": "1", "RICHENGINE_NGRAM_DEBUG": "1"}
     )
     print(f"flagged  chars={len(flagged)} ngram-hits={hits}", flush=True)
     if flagged != base:

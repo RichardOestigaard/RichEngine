@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::model::affine {
+namespace richengine::model::affine {
 
 enum class SectionKind { Copy, Decay, Projection, Quantize };
 
@@ -60,4 +60,4 @@ struct Image {
 // Writes every byte of a bound image into destination, which is its size.
 void writeAffineImage(std::span<uint8_t> destination, const Image &image);
 
-} // namespace splash::model::affine
+} // namespace richengine::model::affine

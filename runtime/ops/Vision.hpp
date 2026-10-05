@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 struct VisionLayout final {
   uint32_t depth = 27;
@@ -153,4 +153,4 @@ private:
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

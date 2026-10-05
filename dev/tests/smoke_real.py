@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Small real-model smoke test for the generic Splash HTTP frontend."""
+"""Small real-model smoke test for the generic RichEngine HTTP frontend."""
 
 from __future__ import annotations
 
@@ -44,9 +44,9 @@ def available_port() -> int:
 
 def request_headers(payload: bool) -> dict:
     """The JSON content type of a body, and the key the server requires
-    when SPLASH_API_KEY is set: the server's --api-key defaults to it."""
+    when RICHENGINE_API_KEY is set: the server's --api-key defaults to it."""
     headers = {"Content-Type": "application/json"} if payload else {}
-    if key := os.environ.get("SPLASH_API_KEY"):
+    if key := os.environ.get("RICHENGINE_API_KEY"):
         headers["Authorization"] = f"Bearer {key}"
     return headers
 
@@ -89,7 +89,7 @@ class RealServer:
         binary = arguments.binary.resolve()
         self.port = available_port()
         self.log = tempfile.NamedTemporaryFile(
-            mode="w+", prefix="splash-http-smoke-", suffix=".log"
+            mode="w+", prefix="richengine-http-smoke-", suffix=".log"
         )
         command = [
             sys.executable,
@@ -1468,7 +1468,7 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
 
 
 def add_server_arguments(parser):
-    parser.add_argument("--binary", type=Path, default=ROOT / "build/splash")
+    parser.add_argument("--binary", type=Path, default=ROOT / "build/richengine")
     parser.add_argument(
         "--package",
         type=Path,
@@ -1493,7 +1493,7 @@ def resolve_server_arguments(arguments):
 
 
 def hold_package(arguments):
-    """As splash serve does, serve every server this process starts, and its
+    """As richengine serve does, serve every server this process starts, and its
     tokenizer, from one assembly, which installations keep while it is held:
     point arguments.package at the assembly it links now, held until the
     process exits by arguments.held_record (None for a legacy package). The

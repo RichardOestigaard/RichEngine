@@ -116,7 +116,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   if (gateUp) {
     const uint n = base + fm;
     const float2 gate = float2(bfloat2(acc[0])), up = float2(bfloat2(acc[1]));
-    const float2 value = splash_silu(gate) * up;
+    const float2 value = richengine_silu(gate) * up;
     out[fn * N + n] = bfloat(value.x);
     out[(fn + 1) * N + n] = bfloat(value.y);
   } else {

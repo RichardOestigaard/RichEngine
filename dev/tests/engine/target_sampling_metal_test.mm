@@ -47,22 +47,22 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using namespace splash::ops;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using namespace richengine::ops;
 
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
-constexpr uint32_t kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
+constexpr uint32_t kRows = RICHENGINE_TARGET_VERIFY_ROWS;
+constexpr uint32_t kPositions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+constexpr uint32_t kLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kUniforms = RICHENGINE_SAMPLING_UNIFORMS;
+constexpr uint32_t kDraftCandidates = RICHENGINE_DRAFT_CANDIDATES;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
 // Both stop tokens sit below every spike of fillRow.
 constexpr std::array<uint32_t, 2> kStopTokens{1, 2};
 
-using splash::test::require;
+using richengine::test::require;
 
 // Requires function to throw an Error itself, not a subclass of it.
 template <class Error = std::invalid_argument, class Function>
@@ -163,7 +163,7 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, proposals.candidatesBytes),
               allocate(backend, proposals.proposalProbabilitiesBytes),
               allocate(backend, space.vocabularyRangesBytes),
-              allocate(backend, space.vocabularyArrivalsBytes)},
+              allocate(backend, space.vocabularyArrivalsBytes), {}, {}},
           vocabulary, rows};
 }
 
@@ -385,7 +385,7 @@ void requireSampledRow(const Batch &batch, uint32_t index,
   requireMaximum(record, target, label);
   const uint32_t lane = index / kRows;
   const float uniform =
-      batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_CORRECTION];
+      batch.uniforms()[lane * kUniforms + RICHENGINE_UNIFORM_CORRECTION];
   const uint32_t token = batch.outputTokens()[index];
   if (row == kPositions) {
     requireDraw(token, target.probabilities, uniform, target.ambiguousMass,
@@ -422,7 +422,7 @@ void requireInitialDraw(const Batch &batch, uint32_t lane,
   requireArrivalsReturned(batch, lane, label);
   requireMaximum(batch.record(lane), target, label);
   requireDraw(batch.outputTokens()[lane], target.probabilities,
-              batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_INITIAL],
+              batch.uniforms()[lane * kUniforms + RICHENGINE_UNIFORM_INITIAL],
               target.ambiguousMass, label);
 }
 
@@ -474,11 +474,11 @@ MetalBuffer penaltyTable(MetalBackend &backend, uint32_t vocabulary) {
     std::span<uint32_t> words = tableRow(table, vocabulary, slot);
     for (uint32_t token = 0; token < vocabulary; ++token) {
       const uint32_t draw = random.next() % 64;
-      uint32_t word = draw < 8 + 6 * slot ? SPLASH_PENALTY_PROMPT_BIT : 0U;
+      uint32_t word = draw < 8 + 6 * slot ? RICHENGINE_PENALTY_PROMPT_BIT : 0U;
       if (draw % 3 == 0)
         word += 1 + draw % (slot + 3);
       if (draw == 63 && token % 7 == 0)
-        word = (word & SPLASH_PENALTY_PROMPT_BIT) + (1U << 20);
+        word = (word & RICHENGINE_PENALTY_PROMPT_BIT) + (1U << 20);
       words[token] = word;
     }
   }
@@ -509,9 +509,9 @@ void requirePenalizedRows(const Batch &batch, const std::vector<float> &original
       const float before = original[origin + token];
       const float after = batch.logits()[origin + token];
       const uint32_t word = words.empty() ? 0U : words[token];
-      const uint32_t count = (word & SPLASH_PENALTY_COUNT_MASK) +
+      const uint32_t count = (word & RICHENGINE_PENALTY_COUNT_MASK) +
                              (verify ? draftedCount(inputs, row, token) : 0U);
-      const bool prompt = (word & SPLASH_PENALTY_PROMPT_BIT) != 0;
+      const bool prompt = (word & RICHENGINE_PENALTY_PROMPT_BIT) != 0;
       require(penalties.active()
                   ? penaltyMatches(after, before, count, prompt, penalties)
                   : std::memcmp(&after, &before, sizeof(float)) == 0,
@@ -701,7 +701,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
     std::span<const uint32_t> words = tableRow(table, vocabulary, kSlots[lane]);
     std::vector<uint32_t> counts(vocabulary);
     for (uint32_t token = 0; token < vocabulary; ++token)
-      counts[token] = words[token] & SPLASH_PENALTY_COUNT_MASK;
+      counts[token] = words[token] & RICHENGINE_PENALTY_COUNT_MASK;
     uint32_t *inputs = batch.inputTokens() + lane * kRows;
     float *uniforms = batch.uniforms() + lane * kUniforms;
     inputs[0] = 5 + lane;
@@ -718,7 +718,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       for (uint32_t token = 0; token < vocabulary; ++token)
         penalized[token] = referencePenalty(
             logits[token], counts[token],
-            (words[token] & SPLASH_PENALTY_PROMPT_BIT) != 0, penalties[lane]);
+            (words[token] & RICHENGINE_PENALTY_PROMPT_BIT) != 0, penalties[lane]);
       const std::vector<uint32_t> order =
           referenceBest(penalized.data(), vocabulary, 8);
       require(penalized[order[0]] - penalized[order[1]] > 1e-4F,
@@ -740,12 +740,12 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       ++counts[draft];
       const double p = targets.back().probability(draft);
       // Accept a right token surely and refuse the wrong one.
-      uniforms[SPLASH_UNIFORM_ACCEPTANCE + row] =
+      uniforms[RICHENGINE_UNIFORM_ACCEPTANCE + row] =
           row < kWrongAt[lane] ? float(p * 0.5) : float(std::min(1.0, p * 2.0 + 0.01));
       require(!sampled || row >= kWrongAt[lane] || p > 1e-4,
               "a sampled lane drafted a token its target cannot accept");
     }
-    uniforms[SPLASH_UNIFORM_CORRECTION] = 0.37F;
+    uniforms[RICHENGINE_UNIFORM_CORRECTION] = 0.37F;
 
     // Acceptance as accept_greedy_lane and accept_sampled_lane define it.
     const uint32_t accepted = kWrongAt[lane];
@@ -763,7 +763,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       weights[inputs[accepted + 1]] = 0.0;
     const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
     const double threshold =
-        double(uniforms[SPLASH_UNIFORM_CORRECTION]) * total;
+        double(uniforms[RICHENGINE_UNIFORM_CORRECTION]) * total;
     double cumulative = 0.0;
     uint32_t token = 0;
     while (cumulative + weights[token] <= threshold)
@@ -830,11 +830,11 @@ void extremes(MetalBackend &backend) {
     float *row = batch.logits();
     for (uint32_t token = 0; token < vocabulary; ++token) {
       row[token] = -3.0F + float(token % 17) * 0.1F;
-      words[token] = token % 5 == 0 ? SPLASH_PENALTY_PROMPT_BIT : 0U;
+      words[token] = token % 5 == 0 ? RICHENGINE_PENALTY_PROMPT_BIT : 0U;
     }
     for (const uint32_t token : saturating) {
       row[token] = c.saturatingLogit + float(token % 3);
-      words[token] = SPLASH_PENALTY_PROMPT_BIT;
+      words[token] = RICHENGINE_PENALTY_PROMPT_BIT;
     }
     // The mask leaves only the saturating tokens.
     std::fill(batch.masks(), batch.masks() + batch.maskWords(), 0U);
@@ -849,7 +849,7 @@ void extremes(MetalBackend &backend) {
       for (const float uniform : {0.0F, 0.51F, 0.999F}) {
         std::copy(original.begin(), original.end(), row);
         batch.poison();
-        batch.uniforms()[SPLASH_UNIFORM_INITIAL] = uniform;
+        batch.uniforms()[RICHENGINE_UNIFORM_INITIAL] = uniform;
         const SamplingPolicy policy{temperature > 0.0F ? kTopK : 1U,
                                     temperature,
                                     1.0F,
@@ -1073,7 +1073,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   for (const SamplingPolicy &policy : initialPolicies) {
     for (const uint32_t offset : {1U, 4U}) {
       batch.poison();
-      batch.uniforms()[SPLASH_UNIFORM_INITIAL] =
+      batch.uniforms()[RICHENGINE_UNIFORM_INITIAL] =
           0.5F * (random.unit() + 1.0F);
       CommandGraph initial;
       sampling.addInitial(initial, {&policy, 1}, batch.buffers, offset,
@@ -1341,7 +1341,7 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
     for (const float temperature : {0.0F, 0.8F}) {
       for (const float uniform : {0.0F, 0.5F, 0.999F}) {
         batch.poison();
-        uniforms[SPLASH_UNIFORM_INITIAL] = uniform;
+        uniforms[RICHENGINE_UNIFORM_INITIAL] = uniform;
         CommandGraph initial;
         const SamplingPolicy policy{32, temperature, 1.0F, false, excludes};
         sampling.addInitial(initial, {&policy, 1}, batch.buffers, kRows - 1,
@@ -1480,7 +1480,7 @@ void ties(MetalBackend &backend) {
         logits[token] = -12.0F + random.unit();
       for (const uint32_t token : tied) {
         logits[token] = saturated ? 45.0F + float(token % 5) : 2.0F;
-        words[token] = saturated ? SPLASH_PENALTY_PROMPT_BIT : 0U;
+        words[token] = saturated ? RICHENGINE_PENALTY_PROMPT_BIT : 0U;
       }
       for (uint32_t index = 0; index < c.above; ++index)
         logits[5 + index * 13] = 5.0F + float(index);
@@ -1628,7 +1628,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
   std::array<std::array<uint32_t, kRows>, lanes> expectedOutput{};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     float *uniforms = batch.uniforms() + lane * kUniforms;
-    uniforms[SPLASH_UNIFORM_CORRECTION] = 0.5F * (random.unit() + 1.0F);
+    uniforms[RICHENGINE_UNIFORM_CORRECTION] = 0.5F * (random.unit() + 1.0F);
     uint32_t *inputs = batch.inputTokens() + lane * kRows;
     inputs[0] = 9;
     for (uint32_t row = 0; row < kRows; ++row) {
@@ -1649,7 +1649,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
         proposed[lane * kPositions + row] = draft;
         candidates[(lane * kPositions + row) * kDraftCandidates] = draft;
         proposal[(lane * kPositions + row) * kDraftCandidates] = 1.0F;
-        uniforms[SPLASH_UNIFORM_ACCEPTANCE + row] =
+        uniforms[RICHENGINE_UNIFORM_ACCEPTANCE + row] =
             right ? float(p * 0.5) : float(std::min(1.0, p * 2.0 + 0.01));
         if (right)
           expectedOutput[lane][row] = draft;
@@ -1663,7 +1663,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
       if (row < kPositions)
         weights[inputs[row + 1]] = 0.0;
       const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
-      const double threshold = uniforms[SPLASH_UNIFORM_CORRECTION] * total;
+      const double threshold = uniforms[RICHENGINE_UNIFORM_CORRECTION] * total;
       const double slack = (1e-5 + target.ambiguousMass) * total;
       double cumulative = 0.0;
       uint32_t token = 0;
@@ -1758,7 +1758,7 @@ void overProposedResidual(MetalBackend &backend) {
     // The first draft token is rejected: 0.9 * 0.9 exceeds its probability.
     for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
       batch.uniforms()[uniform] = 0.9F;
-    batch.uniforms()[SPLASH_UNIFORM_CORRECTION] = correction;
+    batch.uniforms()[RICHENGINE_UNIFORM_CORRECTION] = correction;
     batch.poison();
     CommandGraph graph;
     sampling.addVerify(graph, {&policy, 1}, batch.buffers, kStopTokens[0],
@@ -1795,7 +1795,7 @@ void extremeSearches(MetalBackend &backend) {
   // which repetition scales into the tail, and some of its spikes.
   std::span<uint32_t> words = tableRow(table, vocabulary, tableRows[0]);
   for (uint32_t token = 0; token < vocabulary; token += 4)
-    words[token] = SPLASH_PENALTY_PROMPT_BIT;
+    words[token] = RICHENGINE_PENALTY_PROMPT_BIT;
   Random random(0x65787472);
   for (uint32_t row = 0; row < kRows; ++row)
     fillRow(batch.row(row), vocabulary, random);
@@ -1929,7 +1929,7 @@ void penaltyWords() {
   // A prompt of 1, 3, 3, 7, then the generated 3, 5, 5, 0.
   const std::vector<uint32_t> history{1, 3, 3, 7, 3, 5, 5, 0};
   Sampling::rebuildPenaltyWords(words, history, 4, std::nullopt, true);
-  constexpr uint32_t kPrompt = SPLASH_PENALTY_PROMPT_BIT;
+  constexpr uint32_t kPrompt = RICHENGINE_PENALTY_PROMPT_BIT;
   require(words == std::vector<uint32_t>{1, kPrompt, 0, kPrompt + 1, 0, 2, 0,
                                          kPrompt},
           "penalty words with prompt bits differ");

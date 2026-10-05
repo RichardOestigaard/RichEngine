@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Install and verify the model a Splash selection names.
+"""Install and verify the model a RichEngine selection names.
 
 Terms the installer modules share:
 - selection: what `--model OWNER/REPO[:VARIANT]` and its source options name
@@ -8,7 +8,7 @@ Terms the installer modules share:
   serves it.
 - assembly: the directory an upstream model is served from, of links to
   source snapshot files and its record, model.json (assembly.py), built and
-  published by upstream.py. A legacy Splash package is served from its own
+  published by upstream.py. A legacy RichEngine package is served from its own
   Hub snapshot instead (legacy.py).
 - source snapshot: a repository at one commit in the Hub cache, or a local
   draft directory (hub.py).
@@ -234,7 +234,7 @@ class Selection:
 
 def installation_kind(link: Path):
     """What serves a selection link: an assembly (its model.json), a legacy
-    Splash package (its manifest.json), or nothing (None)."""
+    RichEngine package (its manifest.json), or nothing (None)."""
     if (link / "model.json").exists():
         return ASSEMBLY
     if (link / "manifest.json").exists():
@@ -251,7 +251,7 @@ def installation_lock(models: Path):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(
-                "Another Splash model installation is running; waiting...",
+                "Another RichEngine model installation is running; waiting...",
                 flush=True,
             )
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -280,7 +280,7 @@ def link_selection(link: Path, target: Path):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Install Splash runtime weights")
+    parser = argparse.ArgumentParser(description="Install RichEngine runtime weights")
     parser.add_argument("--models", type=Path, default=MODELS)
     parser.add_argument(
         "--model",
@@ -336,7 +336,7 @@ def main(argv=None):
             else:
                 raise ModelError(f"{args.model} is not installed in {args.models}")
             print(
-                f"Splash model {args.model} preflight passed "
+                f"RichEngine model {args.model} preflight passed "
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:

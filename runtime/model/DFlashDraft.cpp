@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
@@ -18,9 +18,9 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.kvHeads) {
     throw WeightStoreError("DFlash draft layout contains a zero dimension");
   }
-  if (layout.selectorRank != SPLASH_DRAFT_SELECTOR_RANK) {
+  if (layout.selectorRank != RICHENGINE_DRAFT_SELECTOR_RANK) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
-                           std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
+                           std::to_string(RICHENGINE_DRAFT_SELECTOR_RANK));
   }
   validateQ4Layout(layout.dynamicSize, layout.hiddenSize);
   validateQ4Layout(layout.qkvSize, layout.hiddenSize);
@@ -127,7 +127,8 @@ void DFlashDraft::addContextPrefill(
   operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
                                      weights_.contextProjection, rows);
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows);
+                                 buffers.projected, buffers.projectionSums, rows,
+                                 buffers.linearScratch);
   ops::Normalization::addRmsWithQ4Sums(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
       buffers.projectionSums, layout.hiddenSize, rows);
@@ -135,7 +136,8 @@ void DFlashDraft::addContextPrefill(
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addPrefill(graph, buffers.hidden,
                       contextKvProjections_[layer],
-                      buffers.contextKv, buffers.projectionSums, rows);
+                      buffers.contextKv, buffers.projectionSums, rows,
+                      buffers.linearScratch);
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -400,4 +402,4 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   return readDraft(backend, std::get<PackedDraftFiles>(files), layout);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

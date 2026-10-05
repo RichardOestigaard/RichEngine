@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 // The pure dense transformer target (MiniCPM5-2B): 42 full-attention layers
 // of hidden 2048, 16x2 heads of 128, a full rotary of 64 pairs at theta 5e6,
@@ -80,4 +80,4 @@ using DenseWeights = QwenTargetWeights<DenseLayout, Qwen3_8LayerWeights>;
 loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
                  const QwenTargetFiles<DenseLayout> &files);
 
-} // namespace splash::model
+} // namespace richengine::model

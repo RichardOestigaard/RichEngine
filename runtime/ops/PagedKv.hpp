@@ -9,7 +9,7 @@
 #include <span>
 #include <string_view>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 // Selected once for a runtime and its entire page pool. Weight storage is
 // independent of the KV format; requests never change it while serving.
@@ -76,11 +76,11 @@ public:
 };
 
 // Shared cache format and execution limits; model dimensions live in Layout.
-inline constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
+inline constexpr uint32_t kPageTokens = RICHENGINE_TARGET_KV_BLOCK_TOKENS;
 inline constexpr uint32_t kMaximumLogicalTokens =
-    SPLASH_MAXIMUM_CONTEXT_TOKENS;
+    RICHENGINE_MAXIMUM_CONTEXT_TOKENS;
 inline constexpr uint32_t kMaximumPhysicalTokens =
-    SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS;
+    RICHENGINE_MAXIMUM_PHYSICAL_KV_TOKENS;
 inline constexpr int32_t kQuantizedMinimum = -127;
 inline constexpr int32_t kQuantizedMaximum = 127;
 // Every tensor region of an extent starts on this boundary. The attention
@@ -127,6 +127,10 @@ struct Layout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   Format format = Format::Int8;
+  // The q*k softmax scale the attention kernels apply; zero selects the
+  // head dimension's default 1/sqrt(d). Granite declares a fixed
+  // attention_multiplier (1/d) instead.
+  float scoreScale = 0.0F;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format);
@@ -227,4 +231,4 @@ struct Layout final {
   bool operator==(const Layout &) const = default;
 };
 
-} // namespace splash::kv
+} // namespace richengine::kv

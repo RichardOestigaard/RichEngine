@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace splash::model {
+namespace richengine::model {
 
 // The Metal staging of the rows of one repack step, whatever the tensor,
 // layer or expert count.
@@ -17,4 +17,4 @@ inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
 void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, const metal::MetalBuffer &image,
                     const gguf::Image &plan);
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -16,7 +16,7 @@ using namespace metal;
 #if defined(__HAVE_METAL_FP8_E4M3_FORMAT_TYPE__) && \
     defined(__HAVE_PACKED_NUMERIC_TYPE_PACK_UNPACK__)
 
-inline uchar splash_fp8_encode(float scaled) {
+inline uchar richengine_fp8_encode(float scaled) {
   // pack converts four floats; this row element keeps the first byte. The
   // oracle encodes the same value through the same instruction, so the two
   // agree bit for bit.
@@ -24,23 +24,23 @@ inline uchar splash_fp8_encode(float scaled) {
 }
 
 // One lane per dimension stores a current row in its final page slot, like
-// splash_store_kv_row's INT8 branch with an fp8 code in place of the int8.
-template <uint KVHeads, uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-__attribute__((always_inline)) inline void splash_store_kv_row_fp8(
+// richengine_store_kv_row's INT8 branch with an fp8 code in place of the int8.
+template <uint KVHeads, uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+__attribute__((always_inline)) inline void richengine_store_kv_row_fp8(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
-    device const SplashKvPage *page_table,
-    constant SplashChunkedPrefillParams &params, threadgroup float *maxima,
+    device const RichKvPage *page_table,
+    constant RichChunkedPrefillParams &params, threadgroup float *maxima,
     bool value_tensor, uint head, uint chunk_token, uint dimension,
     uint simd_lane, uint simd_group) {
   uint logical_token = params.committed_tokens + chunk_token;
-  const SplashKvPage page = page_table[logical_token / SplashKvPageTokens];
-  const SplashKvPageTensors<int8_t> slab =
-      SplashKvAddressing<KVHeads, int8_t, HeadDim>(params.kv, head).page(page);
-  uint page_token = logical_token % SplashKvPageTokens;
+  const RichKvPage page = page_table[logical_token / RichKvPageTokens];
+  const RichKvPageTensors<int8_t> slab =
+      RichKvAddressing<KVHeads, int8_t, HeadDim>(params.kv, head).page(page);
+  uint page_token = logical_token % RichKvPageTokens;
   ulong source_index =
-      value_tensor ? splash_current_value_index<HeadDim>(params.chunk_stride, head,
+      value_tensor ? richengine_current_value_index<HeadDim>(params.chunk_stride, head,
                                                   chunk_token, dimension)
-                   : splash_current_key_index<HeadDim>(params.chunk_stride, head,
+                   : richengine_current_key_index<HeadDim>(params.chunk_stride, head,
                                                 chunk_token, dimension);
   bfloat source =
       value_tensor ? chunk_values[source_index] : chunk_keys[source_index];
@@ -62,18 +62,18 @@ __attribute__((always_inline)) inline void splash_store_kv_row_fp8(
   float maximum = maxima[0];
   float scale = maximum == 0.0f ? 0.0f : maximum / 448.0f;
   uchar code =
-      maximum == 0.0f ? uchar(0) : splash_fp8_encode(value * 448.0f / maximum);
+      maximum == 0.0f ? uchar(0) : richengine_fp8_encode(value * 448.0f / maximum);
 
   if (value_tensor) {
     reinterpret_cast<device uchar *>(slab.values)[
-        splash_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = code;
+        richengine_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = code;
     if (dimension == 0)
-      slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+      slab.value_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
   } else {
     reinterpret_cast<device uchar *>(slab.keys)[
-        splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = code;
+        richengine_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = code;
     if (dimension == 0)
-      slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+      slab.key_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
   }
 }
 

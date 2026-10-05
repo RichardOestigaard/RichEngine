@@ -167,7 +167,7 @@ inline void gguf_decode_mxfp4_tile(device bfloat *input, device uchar *w0, devic
 // a simdgroup staging column c's coefficient of the next group. `sums` is
 // [2][Rows], the staged row sums, only read when the format has a Zero or m.
 //
-// Measured verdict (ops::LinearGguf keeps these for SPLASH_GGUF_PACKED_ON
+// Measured verdict (ops::LinearGguf keeps these for RICHENGINE_GGUF_PACKED_ON
 // benchmarks; dispatch is staged): unlike MXFP4, whose staged decode pays a
 // codebook unpack per element, these formats' staged dequant is a cheap
 // linear scale, so the restaged-A-plus-epilogue tile reads the same weight

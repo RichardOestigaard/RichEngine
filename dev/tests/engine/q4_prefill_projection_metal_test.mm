@@ -13,10 +13,10 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::ComputeDispatch;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
+using richengine::metal::BufferStorage;
+using richengine::metal::ComputeDispatch;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
 
 constexpr uint32_t kQuantGroup = 64;
 constexpr uint32_t kTileRows = 32;

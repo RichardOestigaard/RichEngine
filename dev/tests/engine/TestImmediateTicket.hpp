@@ -1,13 +1,13 @@
 #pragma once
 
-#include "engine/Types.hpp"
+#include "engine/wire/Types.hpp"
 
 #include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
 
-namespace splash::test {
+namespace richengine::test {
 
 class ImmediateTicket final : public ModelBatchTicket {
 public:
@@ -57,4 +57,4 @@ immediateTicket(std::vector<ModelStepResult> results,
   return std::make_unique<ImmediateTicket>(std::move(results));
 }
 
-} // namespace splash::test
+} // namespace richengine::test

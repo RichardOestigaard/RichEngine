@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace splash::model::vision {
+namespace richengine::model::vision {
 
 // A source tensor and the name it has in its file.
 struct Input {
@@ -43,4 +43,4 @@ struct Plan {
 // Writes every byte of a bound plan into destination, which is its size.
 void writeVision(std::span<uint8_t> destination, const Plan &plan);
 
-} // namespace splash::model::vision
+} // namespace richengine::model::vision

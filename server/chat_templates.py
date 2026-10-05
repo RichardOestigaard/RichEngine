@@ -2,7 +2,7 @@
 
 Agent clients add instructions during a conversation: a system message after
 the first message (request preparation merges the leading system and developer
-messages into one, so every later one follows another role). Splash renders
+messages into one, so every later one follows another role). RichEngine renders
 it where it occurs, as a system turn in the template's own markup. Upstream
 templates differ: the official Qwen templates raise for it and Unsloth's
 Qwen3.6 GGUF template skips it silently.
@@ -69,7 +69,7 @@ _HISTORY_OPTIONS = RESERVED_TEMPLATE_KWARGS | {"preserve_thinking"}
 # Combinations of other template variables whose generation prompts are kept.
 _PROBED_OPTIONS = 64
 
-# What Splash does with a later system message.
+# What RichEngine does with a later system message.
 NATIVE = "native"
 PATCHED = "patched"
 UNSUPPORTED = "unsupported"
@@ -85,7 +85,7 @@ LATER_SYSTEM_UNSUPPORTED = (
 
 
 class ChatTemplateError(ValueError):
-    """The tokenizer has no chat template Splash can serve."""
+    """The tokenizer has no chat template RichEngine can serve."""
 
 
 # What a template that rejects one of the REASONING_EFFORTS renders instead;
@@ -300,7 +300,7 @@ def _tool_dialect(render, source):
 
 # Probe conversations. Leading system messages are already merged, as request
 # preparation merges them; images use the canonical request part.
-_MARKER = "Splash later-system canary 5d0c8e"
+_MARKER = "RichEngine later-system canary 5d0c8e"
 _SYSTEM = {"role": "system", "content": "Leading instructions"}
 _ASK = {"role": "user", "content": "First question"}
 _ANSWER = {"role": "assistant", "content": "First answer"}

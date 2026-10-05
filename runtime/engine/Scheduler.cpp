@@ -4,7 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace splash::engine {
+namespace richengine::engine {
 namespace {
 
 // A lane yields to later arrivals at most this many prefill commands in a
@@ -43,6 +43,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
+  request.promptPlanned = processed;
   request.decodeStage = DecodeStage::Regular;
   request.phase =
       processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
@@ -68,6 +69,7 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
     throw std::invalid_argument("resource replay must leave an input token");
   request.spec.prefillTokens = replayTokens;
   request.promptProcessed = processed;
+  request.promptPlanned = processed;
   request.phase = Phase::Prefill;
   request.suspended = false;
 }
@@ -128,13 +130,11 @@ void Scheduler::fail(uint64_t id) {
 }
 
 void Scheduler::remove(uint64_t id) {
-  if (active_) {
-    for (const BatchItem &item : active_->items) {
+  for (const Active &active : active_)
+    for (const BatchItem &item : active.plan.items)
       if (item.requestId == id) {
         throw std::logic_error("cannot remove an active batch member");
       }
-    }
-  }
   auto found = requests_.find(id);
   if (found == requests_.end() || !terminal(found->second.phase)) {
     throw std::logic_error("only terminal requests can be removed");
@@ -145,7 +145,7 @@ void Scheduler::remove(uint64_t id) {
 void Scheduler::setPrefillBoundary(uint64_t id,
                                          std::optional<uint32_t> boundary) {
   Request &request = get(id);
-  if (boundary && (*boundary <= request.promptProcessed ||
+  if (boundary && (*boundary <= request.promptPlanned ||
                    *boundary > request.spec.prefillTokens)) {
     throw std::invalid_argument("invalid prefill boundary");
   }
@@ -155,11 +155,13 @@ void Scheduler::setPrefillBoundary(uint64_t id,
 bool Scheduler::expireDeadlines(double now) {
   bool changed = false;
   for (auto &[_, request] : requests_) {
-    const bool inFlight =
-        active_ && std::any_of(active_->items.begin(), active_->items.end(),
-                               [&](const BatchItem &item) {
-                                 return item.requestId == request.spec.id;
-                               });
+    const bool inFlight = std::any_of(
+        active_.begin(), active_.end(), [&](const Active &active) {
+          return std::any_of(active.plan.items.begin(), active.plan.items.end(),
+                             [&](const BatchItem &item) {
+                               return item.requestId == request.spec.id;
+                             });
+        });
     if (!inFlight && !terminal(request.phase) &&
         request.spec.deadlineMilliseconds <= now) {
       request.phase = Phase::Failed;
@@ -206,7 +208,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
   ready.reserve(requests_.size());
   for (const auto &[_, request] : requests_)
     if (request.phase == Phase::Prefill)
-      ready.push_back({&request, request.promptProcessed});
+      ready.push_back({&request, request.promptPlanned});
   for (const auto &request : pending)
     ready.push_back(request);
   std::vector<uint64_t> result;
@@ -235,7 +237,13 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
 }
 
 std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
-  if (active_)
+  if (!active_.empty())
+    return std::nullopt;
+  return nextAhead(excluded);
+}
+
+std::optional<BatchPlan> Scheduler::nextAhead(std::span<const uint64_t> excluded) const {
+  if (active_.size() >= 2)
     return std::nullopt;
   auto decode = nextDecode(excluded);
   auto prefill = nextPrefill(excluded);
@@ -267,7 +275,7 @@ std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> exclud
   std::vector<PrefillRequestView> ready;
   for (const auto &[id, request] : requests_) {
     if (request.phase == Phase::Prefill && !listed(excluded, id))
-      ready.push_back({&request, request.promptProcessed});
+      ready.push_back({&request, request.promptPlanned});
   }
   return planPrefill(std::move(ready));
 }
@@ -394,25 +402,27 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
 }
 
 void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded) {
-  if (active_ || plan.empty() ||
+  if (active_.size() >= 2 || plan.empty() ||
       plan.width() > model::ExecutionLimits::maximumBatchWidth) {
     throw std::logic_error("invalid scheduler commit");
   }
   for (const BatchItem &item : plan.items) {
-    const Request &request = get(item.requestId);
+    Request &request = get(item.requestId);
     const Phase expected =
         plan.kind == WorkKind::Prefill ? Phase::Prefill : Phase::Decode;
     if (request.phase != expected ||
         (plan.kind == WorkKind::Prefill &&
-         (!item.tokenCount || item.promptOffset != request.promptProcessed)) ||
+         (!item.tokenCount || item.promptOffset != request.promptPlanned)) ||
         (plan.kind == WorkKind::Decode &&
          (item.tokenCount || item.promptOffset ||
           request.decodeStage != plan.decodeStage))) {
       throw std::logic_error("batch no longer matches scheduler state");
     }
+    // Rows the in-flight commands claim: the next chunk plans past them.
+    if (plan.kind == WorkKind::Prefill)
+      request.promptPlanned += item.tokenCount;
   }
-  excluded_.assign(excluded.begin(), excluded.end());
-  active_ = plan;
+  active_.push_back({plan, {excluded.begin(), excluded.end()}});
   lastCommittedKind_ = plan.kind;
   if (plan.kind == WorkKind::Prefill) {
     ++counters_.prefillBatches;
@@ -447,8 +457,8 @@ void Scheduler::complete(const BatchPlan &plan,
                          std::span<const StepResult> results,
                          double wallMilliseconds,
                          bool representativePrefillTiming) {
-  if (!active_ || active_->kind != plan.kind ||
-      active_->items.size() != plan.items.size() ||
+  if (active_.empty() || active_.front().plan.kind != plan.kind ||
+      active_.front().plan.items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
     throw std::logic_error("completion does not match active batch");
   }
@@ -459,12 +469,20 @@ void Scheduler::complete(const BatchPlan &plan,
       throw std::logic_error("completion request order changed");
     }
     Request &request = get(item.requestId);
+    // A lane settled while this command was in flight (the submit-ahead
+    // ring allows a second pending command) keeps its end; the provisional
+    // result drops.
+    if (terminal(request.phase))
+      continue;
     if (plan.kind == WorkKind::Prefill) {
       if (result.consumedPromptTokens != item.tokenCount ||
           item.promptOffset != request.promptProcessed) {
         throw std::logic_error("prefill completion row count changed");
       }
       request.promptProcessed += result.consumedPromptTokens;
+      if (request.promptProcessed > request.promptPlanned) {
+        throw std::logic_error("prefill completion exceeds planned rows");
+      }
       if (request.prefillBoundary &&
           request.promptProcessed == *request.prefillBoundary) {
         request.prefillBoundary.reset();
@@ -509,15 +527,14 @@ void Scheduler::complete(const BatchPlan &plan,
           requests_.begin(), requests_.end(), [&](const auto &entry) {
             const auto &[id, peer] = entry;
             return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
-                   !listed(excluded_, id);
+                   !listed(active_.front().excluded, id);
           });
       if (contended)
         decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
   dropStaleDecodeDebt();
-  excluded_.clear();
-  active_.reset();
+  active_.pop_front();
 }
 
 void Scheduler::dropStaleDecodeDebt() noexcept {
@@ -610,4 +627,4 @@ bool Scheduler::byPriorityThenOrder(const Request *a,
   return a->order < b->order;
 }
 
-} // namespace splash::engine
+} // namespace richengine::engine

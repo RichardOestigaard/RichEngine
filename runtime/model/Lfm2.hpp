@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 // LiquidAI's LFM2 hybrid target (LFM2.5-2.6B): 30 layers of hidden 2048 —
 // 22 double-gated short convolutions over a taps-3 FIFO state and 8 full
@@ -95,4 +95,4 @@ using Lfm2Weights = QwenTargetWeights<Lfm2Layout, Qwen3_8LayerWeights>;
 loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
                 const QwenTargetFiles<Lfm2Layout> &files);
 
-} // namespace splash::model
+} // namespace richengine::model

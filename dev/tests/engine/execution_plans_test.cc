@@ -8,10 +8,10 @@
 #include <stdexcept>
 
 namespace {
-using namespace splash;
-using namespace splash::ops;
+using namespace richengine;
+using namespace richengine::ops;
 
-using splash::test::require;
+using richengine::test::require;
 template <typename Function> void rejects(Function function) {
   bool rejected = false;
   try { function(); }
@@ -282,10 +282,10 @@ void workspaceBounds() {
           "verify policy did not resolve one history per lane");
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
-                  uint64_t{SPLASH_TREE_VERIFY_NODES} *
+                  uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
                       kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
-                  uint64_t{SPLASH_TREE_VERIFY_NODES} *
+                  uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
                       kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.

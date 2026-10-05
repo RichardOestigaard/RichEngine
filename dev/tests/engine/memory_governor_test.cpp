@@ -1,8 +1,8 @@
 #include "TestChecks.hpp"
 #include "TestMetalMemory.hpp"
 #include "TestModel.hpp"
-#include "engine/MemoryGovernor.hpp"
-#include "engine/MemoryPlan.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 
 #include <cstdlib>
 #include <functional>
@@ -12,12 +12,12 @@
 #include <stdexcept>
 #include <string>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 // Admits bytes through the governor's one admission path, running allocate
 // while they are reserved.

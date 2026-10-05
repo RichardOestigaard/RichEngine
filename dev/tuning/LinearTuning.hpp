@@ -6,7 +6,7 @@
 #include <optional>
 #include <vector>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 inline constexpr size_t kMaximumLinearTuningRepresentatives = 8;
 
@@ -76,4 +76,4 @@ struct LinearTuningResult final {
     const MeasurementStop &underPressure = {},
     const MeasurementStop &shouldStop = {});
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

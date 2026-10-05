@@ -1,7 +1,7 @@
 # Contributing
 
 Issues are welcome here: bugs, model requests, and questions about running
-Splash on your machine. Include the Splash version, the Mac and macOS version,
+RichEngine on your machine. Include the RichEngine version, the Mac and macOS version,
 and the model you were serving.
 
 This repository is a mirror of our development branch, published as a single

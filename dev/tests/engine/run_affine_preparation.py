@@ -368,7 +368,7 @@ def main():
     parser.add_argument("goldens", type=Path)
     args = parser.parse_args()
     goldens = json.loads(args.goldens.read_text())["affine_images"]
-    with tempfile.TemporaryDirectory(prefix="splash-affine-preparation-") as directory:
+    with tempfile.TemporaryDirectory(prefix="richengine-affine-preparation-") as directory:
         root = Path(directory) / "draft"
         root.mkdir()
         draft_fixture(root)
@@ -381,8 +381,9 @@ def main():
         root.mkdir()
         fixture(root)
         command = prepare(args.binary, args.metallib, root, "dense", goldens["dense"])
-        # Raw checkpoints need a different normalization convention. Refuse
-        # their unsanitized convolution layout.
+        # Exports disagree on the conv weight's axis order: [512,1,4] and
+        # [512,4,1] are the same contiguous rows, so the planner accepts the
+        # unsanitized layout too.
         source = root / "model.safetensors"
         header, payload = read_safetensors(source)
         header["language_model.model.layers.0.linear_attn.conv1d.weight"]["shape"] = [
@@ -392,10 +393,8 @@ def main():
         ]
         source.write_bytes(safetensors_bytes(header, payload))
         result = subprocess.run(command, capture_output=True, text=True, check=False)
-        assert result.returncode != 0 and "conv1d.weight" in result.stderr, (
-            result.stderr
-        )
-        print("affine preparation: raw checkpoint rejected PASS")
+        assert result.returncode == 0, result.stderr
+        print("affine preparation: squeezed conv layout accepted PASS")
 
 
 if __name__ == "__main__":

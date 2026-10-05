@@ -222,7 +222,7 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
 #undef GGUF_EMBEDDING_ENTRY
 
-// A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the
+// A verify step's input tokens, RICHENGINE_TARGET_VERIFY_ROWS per lane: the
 // lane's anchor, row 0 of its draft input, then the draft's proposals, each
 // clamped into the vocabulary.
 kernel void verify_input_tokens(
@@ -231,16 +231,16 @@ kernel void verify_input_tokens(
     device uint *verify_input [[buffer(2)]],
     constant VerifyInputBatchParams &params [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
-  uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
-  uint row = index % SPLASH_TARGET_VERIFY_ROWS;
+  uint batch = index / RICHENGINE_TARGET_VERIFY_ROWS;
+  uint row = index % RICHENGINE_TARGET_VERIFY_ROWS;
   uint token = row == 0
-                   ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
-                   : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
+                   ? draft_input[batch * RICHENGINE_TARGET_VERIFY_ROWS]
+                   : draft_tokens[batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);
 }
 
-// A tree-verify step's inputs, SPLASH_TREE_VERIFY_NODES per lane: each live
+// A tree-verify step's inputs, RICHENGINE_TREE_VERIFY_NODES per lane: each live
 // node's token from draft_select_tree's tables, its rope position (the
 // lane's base triple plus the node's depth) and the ancestor bitmask the
 // attention tiles test for its visible rows. Dead rows take the mask token,
@@ -254,16 +254,16 @@ kernel void verify_input_tree_tokens(
     device uint *masks [[buffer(5)]],
     constant VerifyTreeInputParams &params [[buffer(6)]],
     uint index [[thread_position_in_grid]]) {
-  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
+  constexpr uint Nodes = RICHENGINE_TREE_VERIFY_NODES;
   const uint batch = index / Nodes;
   const uint row = index % Nodes;
   device const uint *nodes = tree_nodes + batch * Nodes;
   const uint descriptor = nodes[row];
-  const uint depth = SPLASH_TREE_NODE_DEPTH(descriptor);
+  const uint depth = RICHENGINE_TREE_NODE_DEPTH(descriptor);
   const bool live =
       row < tree_counts[batch] &&
       (row == 0 ||
-       SPLASH_TREE_NODE_PARENT(descriptor) != SPLASH_TREE_NODE_NONE);
+       RICHENGINE_TREE_NODE_PARENT(descriptor) != RICHENGINE_TREE_NODE_NONE);
   const uint token = live ? tree_tokens[index] : params.mask_token;
   verify_input[index] = min(token, params.vocabulary - 1u);
   for (uint a = 0; a < 3; ++a)
@@ -271,10 +271,10 @@ kernel void verify_input_tree_tokens(
   uint mask = 0u;
   if (live) {
     mask = 1u << row;
-    uint parent = SPLASH_TREE_NODE_PARENT(descriptor);
-    while (parent != SPLASH_TREE_NODE_NONE) {
+    uint parent = RICHENGINE_TREE_NODE_PARENT(descriptor);
+    while (parent != RICHENGINE_TREE_NODE_NONE) {
       mask |= 1u << parent;
-      parent = SPLASH_TREE_NODE_PARENT(nodes[parent]);
+      parent = RICHENGINE_TREE_NODE_PARENT(nodes[parent]);
     }
   }
   masks[index] = mask;
@@ -289,8 +289,8 @@ kernel void tree_capture_gather(
     device bfloat *destination [[buffer(3)]],
     constant uint &width [[buffer(4)]],
     uint element [[thread_position_in_grid]]) {
-  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
-  constexpr uint Emitted = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Nodes = RICHENGINE_TREE_VERIFY_NODES;
+  constexpr uint Emitted = RICHENGINE_TARGET_VERIFY_ROWS;
   const uint lane = element / (Emitted * width);
   const uint row = (element / width) % Emitted;
   const uint dim = element % width;

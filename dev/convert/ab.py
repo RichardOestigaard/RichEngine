@@ -18,9 +18,9 @@ def run(port, model, n=3, tokens=400):
             f"http://127.0.0.1:{port}/v1/completions", data=body,
             headers={"Content-Type": "application/json"})).read()
     a = metrics(port)
-    steps = a["splash_scheduler_decode_batches_total"] - b["splash_scheduler_decode_batches_total"]
-    wall = (a["splash_decode_wall_milliseconds_total"] - b["splash_decode_wall_milliseconds_total"]) / 1000
-    toks = a["splash_decode_output_tokens_total"] - b["splash_decode_output_tokens_total"]
+    steps = a["richengine_scheduler_decode_batches_total"] - b["richengine_scheduler_decode_batches_total"]
+    wall = (a["richengine_decode_wall_milliseconds_total"] - b["richengine_decode_wall_milliseconds_total"]) / 1000
+    toks = a["richengine_decode_output_tokens_total"] - b["richengine_decode_output_tokens_total"]
     print(f"{port} {model}: {steps/wall:.1f} steps/s, {toks/wall:.1f} tok/s", flush=True)
 
 pairs = [(int(p), m) for p, m in (x.split(" ", 1) for x in sys.argv[1:])]

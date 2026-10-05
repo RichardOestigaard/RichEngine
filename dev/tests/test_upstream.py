@@ -50,7 +50,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft.repo for family in families.FAMILIES]
+        repos = [family.draft.repo for family in families.FAMILIES if family.draft]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -152,14 +152,14 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(fake.requests, [("someone/renamed-27b", None)])
         self.assertEqual(fake.downloads, ["someone/renamed-27b/config.json"])
 
-    def test_only_a_splash_manifest_makes_a_legacy_package(self):
+    def test_only_a_richengine_manifest_makes_a_legacy_package(self):
         def target(root):
             mlx_target(root, DENSE)
             (root / "manifest.json").write_text(json.dumps({"name": "a tool's file"}))
 
         fake = fake_hub(self, self.cache)
         fake.publish(MODEL, "b" * 40, target)
-        package = {"format": {"name": "splash-packed-q4"}}
+        package = {"format": {"name": "richengine-packed-q4"}}
         fake.publish(
             "someone/package",
             "c" * 40,
@@ -186,7 +186,7 @@ class UpstreamTest(unittest.TestCase):
             lambda p: (
                 p.mkdir(parents=True),
                 (p / "manifest.json").write_text(
-                    json.dumps({"format": {"name": "splash-packed-q4"}})
+                    json.dumps({"format": {"name": "richengine-packed-q4"}})
                 ),
             ),
         )
@@ -820,12 +820,12 @@ class UpstreamTest(unittest.TestCase):
             self.prepare(chosen)
             refs = sorted(
                 (
-                    self.cache / "models--mlx-community--Qwen3.8-27B-4bit/refs/splash"
+                    self.cache / "models--mlx-community--Qwen3.8-27B-4bit/refs/richengine"
                 ).glob("*/*")
             )
             self.assertEqual([ref.name for ref in refs], [commit])
             draft_refs = sorted(
-                (self.cache / hub.folder_name(DENSE.draft.repo) / "refs/splash").glob(
+                (self.cache / hub.folder_name(DENSE.draft.repo) / "refs/richengine").glob(
                     "*/*"
                 )
             )
@@ -864,7 +864,7 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pinned.call_count, 2)
         self.assertEqual(pins(self.cache), expected)
         # A verified start restores lost pins.
-        for ref in self.cache.glob("*/refs/splash/*/*"):
+        for ref in self.cache.glob("*/refs/richengine/*/*"):
             ref.unlink()
         with mock.patch.object(hub, "pin", side_effect=locked):
             self.prepare(chosen)
@@ -874,7 +874,7 @@ class UpstreamTest(unittest.TestCase):
         fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
-        for ref in self.cache.glob("*/refs/splash/*/*"):
+        for ref in self.cache.glob("*/refs/richengine/*/*"):
             ref.unlink()
         with mock.patch.object(
             hub.os, "link", side_effect=OSError(errno.EROFS, "read only")
@@ -885,7 +885,7 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pins(self.cache), [])
 
     def test_a_packed_draft_installation_is_installed_again(self):
-        # Assemblies linked Splash-DFlash2's packed drafts before drafts were
+        # Assemblies linked RichEngine-DFlash2's packed drafts before drafts were
         # prepared from their checkpoints; the runtime loads those no more.
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -896,7 +896,7 @@ class UpstreamTest(unittest.TestCase):
             for name, entry in record["files"].items()
             if not name.startswith("draft/")
         }
-        packed_repo = "company/Splash-DFlash2"
+        packed_repo = "company/RichEngine-DFlash2"
         packed = hub.snapshot(packed_repo, "c" * 40)
         packed.mkdir(parents=True)
         for name in ("config.json", "model.bin", "layer-0.bin"):

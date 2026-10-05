@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <optional>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 uint32_t measurementBatchRepetitions(double baselineGpuSeconds) noexcept {
   constexpr double targetSeconds = 0.005;
@@ -133,4 +133,4 @@ MeasurementResult measureWorkload(CandidateId candidate, const MeasurementRun &r
   return finish();
 }
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

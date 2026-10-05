@@ -36,9 +36,9 @@ INSTALL_FILES = (
 )
 COMPLETION_FILES = (
     "models",
-    "_splash",
-    "splash.bash",
-    "splash.fish",
+    "_richengine",
+    "richengine.bash",
+    "richengine.fish",
     "official-models.txt",
     "suggested-models.txt",
 )
@@ -73,7 +73,7 @@ SERVER_FILES = (
     "chat.html",
     "favicon.svg",
 )
-# Splash's license and the notices of the third-party code it ships.
+# RichEngine's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
 
 
@@ -87,7 +87,7 @@ def stage_runtime(destination, version):
         ("install", INSTALL_FILES),
         ("install/completions", COMPLETION_FILES),
         ("server", SERVER_FILES),
-        ("engine", ("splash", "splash.metallib")),
+        ("engine", ("richengine", "richengine.metallib")),
     ):
         (destination / folder).mkdir()
         source = ROOT / ("build" if folder == "engine" else folder)
@@ -99,8 +99,8 @@ def stage_runtime(destination, version):
         json.dumps(
             {
                 "version": version,
-                "binary_sha256": digest(destination / "engine/splash"),
-                "metallib_sha256": digest(destination / "engine/splash.metallib"),
+                "binary_sha256": digest(destination / "engine/richengine"),
+                "metallib_sha256": digest(destination / "engine/richengine.metallib"),
             },
             indent=2,
         )
@@ -116,49 +116,49 @@ def formula(version, url, checksum, macos_min):
         escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("#{", "\\#{")
         return '"' + escaped + '"'
 
-    return f"""class SplashMacOSRequirement < Requirement
+    return f"""class RichMacOSRequirement < Requirement
   fatal true
   satisfy(build_env: false) {{ OS.mac? && MacOS.full_version >= {quote(macos_min)} }}
 
   def message
-    {quote(f"Splash requires macOS {macos_min} or newer.")}
+    {quote(f"RichEngine requires macOS {macos_min} or newer.")}
   end
 end
 
-class Splash < Formula
+class RichEngine < Formula
   desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/incoai/splash"
+  homepage "https://github.com/incoai/richengine"
   url {quote(url)}
   sha256 {quote(checksum)}
   license "Apache-2.0"
 
   depends_on arch: :arm64
   depends_on macos: :tahoe
-  depends_on SplashMacOSRequirement
+  depends_on RichMacOSRequirement
 
   def install
     libexec.install Dir["*"]
-    (bin/"splash").write <<~SH
+    (bin/"richengine").write <<~SH
       #!/bin/sh
       export PYTHONDONTWRITEBYTECODE=1
       exec "#{{opt_libexec}}/python/bin/python3" -u "#{{opt_libexec}}/install/launcher.py" "$@"
     SH
-    chmod 0755, bin/"splash"
-    zsh_completion.install_symlink libexec/"install/completions/_splash"
-    bash_completion.install_symlink libexec/"install/completions/splash.bash" => "splash"
-    fish_completion.install_symlink libexec/"install/completions/splash.fish"
+    chmod 0755, bin/"richengine"
+    zsh_completion.install_symlink libexec/"install/completions/_richengine"
+    bash_completion.install_symlink libexec/"install/completions/richengine.bash" => "richengine"
+    fish_completion.install_symlink libexec/"install/completions/richengine.fish"
   end
 
   def caveats
     <<~CAVEAT
       Serve a model:
-        splash serve --model mlx-community/Qwen3.8-27B-4bit
+        richengine serve --model mlx-community/Qwen3.8-27B-4bit
     CAVEAT
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/splash --version")
-    assert_match "serve", shell_output("#{{bin}}/splash --help")
+    assert_match version.to_s, shell_output("#{{bin}}/richengine --version")
+    assert_match "serve", shell_output("#{{bin}}/richengine --help")
   end
 end
 """
@@ -176,7 +176,7 @@ def main(argv=None):
         parser.error("invalid release version")
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
-    name = f"splash-{args.version}-arm64-macos26"
+    name = f"richengine-{args.version}-arm64-macos26"
     archive = dist / f"{name}.tar.gz"
     if archive.exists():
         parser.error(f"release already exists: {archive}")
@@ -253,9 +253,9 @@ def main(argv=None):
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (
         args.url
-        or f"https://github.com/incoai/splash/releases/download/{args.version}/{archive.name}"
+        or f"https://github.com/incoai/richengine/releases/download/{args.version}/{archive.name}"
     )
-    (dist / "splash.rb").write_text(
+    (dist / "richengine.rb").write_text(
         formula(args.version, url, checksum, args.macos_min)
     )
     print(

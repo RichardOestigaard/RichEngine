@@ -145,7 +145,7 @@ class ServerRecoveryTests(unittest.TestCase):
         refusal = backend.refusal()
         self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
         self.assertIn("failed 3 times in a row", refusal.message)
-        self.assertRegex(refusal.message, "Crash trace|SPLASH_CRASH_TRACE")
+        self.assertRegex(refusal.message, "Crash trace|RICHENGINE_CRASH_TRACE")
         self.assertEqual(
             console.call_args_list[-1].args[0], f"Engine stopped · {refusal.message}"
         )
@@ -240,7 +240,7 @@ class ServerRecoveryTests(unittest.TestCase):
         self.assertEqual(
             backend.fatal_error,
             "native context window, concurrency or vision changed; "
-            "restart the Splash server",
+            "restart the RichEngine server",
         )
         transport = backend.status()["transport"]
         self.assertTrue(transport["stopped"])
@@ -563,7 +563,7 @@ class ServerRecoveryTests(unittest.TestCase):
 
         def launch():
             if factory.processes:
-                raise FileNotFoundError("splash")
+                raise FileNotFoundError("richengine")
             return factory()
 
         runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
@@ -585,7 +585,7 @@ class ServerRecoveryTests(unittest.TestCase):
 
         def launch():
             if factory.processes:
-                raise FileNotFoundError("splash")
+                raise FileNotFoundError("richengine")
             return factory()
 
         runtime = engine_runtime.MultiplexedRuntime(process_factory=launch)
@@ -720,7 +720,7 @@ class ServerRecoveryTests(unittest.TestCase):
                             for _ in range(2):
                                 with self.assertRaisesRegex(
                                     engine_runtime.EngineUnhealthy,
-                                    "restart the Splash server",
+                                    "restart the RichEngine server",
                                 ):
                                     runtime.wait_ready(1)
                             self.assertFalse(runtime.ready)

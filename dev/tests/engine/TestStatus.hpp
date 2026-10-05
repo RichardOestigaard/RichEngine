@@ -1,10 +1,10 @@
 #pragma once
 
-#include "engine/Protocol.hpp"
+#include "engine/wire/Protocol.hpp"
 
 #include <string>
 
-namespace splash::test {
+namespace richengine::test {
 
 // What a ready runtime's status provider returns, at the current schema.
 inline std::string readyStatusJson() {
@@ -12,4 +12,4 @@ inline std::string readyStatusJson() {
          std::to_string(protocol::kStatusSchemaVersion) + ",\"ready\":true}";
 }
 
-} // namespace splash::test
+} // namespace richengine::test

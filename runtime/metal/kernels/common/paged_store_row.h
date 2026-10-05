@@ -7,35 +7,35 @@
 
 using namespace metal;
 
-constant uint SplashChunkMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
-constant uint SplashChunkMaximumPhysicalTokens =
-    SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS;
+constant uint RichChunkMaximumRows = RICHENGINE_PREFILL_TOKEN_BUDGET;
+constant uint RichChunkMaximumPhysicalTokens =
+    RICHENGINE_MAXIMUM_PHYSICAL_KV_TOKENS;
 
 inline bool
-splash_chunk_contract_valid(constant SplashChunkedPrefillParams &params) {
+richengine_chunk_contract_valid(constant RichChunkedPrefillParams &params) {
   uint required_pages = (params.committed_tokens + params.chunk_tokens +
-                         SplashKvPageTokens - 1) /
-                        SplashKvPageTokens;
-  return params.committed_tokens <= SplashChunkMaximumPhysicalTokens &&
+                         RichKvPageTokens - 1) /
+                        RichKvPageTokens;
+  return params.committed_tokens <= RichChunkMaximumPhysicalTokens &&
          params.chunk_tokens > 0 &&
-         params.chunk_tokens <= SplashChunkMaximumRows &&
+         params.chunk_tokens <= RichChunkMaximumRows &&
          params.committed_tokens + params.chunk_tokens <=
-             SplashChunkMaximumPhysicalTokens &&
+             RichChunkMaximumPhysicalTokens &&
          params.chunk_stride >= params.chunk_tokens &&
-         params.chunk_stride <= SplashChunkMaximumRows &&
-         params.chunk_stride % SPLASH_TARGET_KV_BLOCK_TOKENS == 0 &&
+         params.chunk_stride <= RichChunkMaximumRows &&
+         params.chunk_stride % RICHENGINE_TARGET_KV_BLOCK_TOKENS == 0 &&
          params.page_table_entries >= required_pages &&
          params.kv.extent_pages > 0;
 }
 
-template <uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-inline ulong splash_current_key_index(uint stride, uint head, uint token,
+template <uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+inline ulong richengine_current_key_index(uint stride, uint head, uint token,
                                         uint dimension) {
   return (ulong(head) * stride + token) * HeadDim + dimension;
 }
 
-template <uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-inline ulong splash_current_value_index(uint stride, uint head, uint token,
+template <uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+inline ulong richengine_current_value_index(uint stride, uint head, uint token,
                                           uint dimension) {
   return (ulong(head) * HeadDim + dimension) * stride + token;
 }
@@ -45,32 +45,32 @@ inline ulong splash_current_value_index(uint stride, uint head, uint token,
 // addressed inside the head's slab of the page: the page index functions at
 // page zero and head zero.
 template <uint KVHeads, typename CacheElement,
-          uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
-__attribute__((always_inline)) inline void splash_store_kv_row(
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+__attribute__((always_inline)) inline void richengine_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
-    device const SplashKvPage *page_table,
-    constant SplashChunkedPrefillParams &params, threadgroup float *maxima,
+    device const RichKvPage *page_table,
+    constant RichChunkedPrefillParams &params, threadgroup float *maxima,
     bool value_tensor, uint head, uint chunk_token, uint dimension,
     uint simd_lane, uint simd_group) {
   uint logical_token = params.committed_tokens + chunk_token;
-  const SplashKvPage page = page_table[logical_token / SplashKvPageTokens];
-  const SplashKvPageTensors<CacheElement> slab =
-      SplashKvAddressing<KVHeads, CacheElement, HeadDim>(params.kv, head).page(page);
-  uint page_token = logical_token % SplashKvPageTokens;
+  const RichKvPage page = page_table[logical_token / RichKvPageTokens];
+  const RichKvPageTensors<CacheElement> slab =
+      RichKvAddressing<KVHeads, CacheElement, HeadDim>(params.kv, head).page(page);
+  uint page_token = logical_token % RichKvPageTokens;
   ulong source_index =
-      value_tensor ? splash_current_value_index<HeadDim>(params.chunk_stride, head,
+      value_tensor ? richengine_current_value_index<HeadDim>(params.chunk_stride, head,
                                                   chunk_token, dimension)
-                   : splash_current_key_index<HeadDim>(params.chunk_stride, head,
+                   : richengine_current_key_index<HeadDim>(params.chunk_stride, head,
                                                 chunk_token, dimension);
   bfloat source = value_tensor ? chunk_values[source_index] : chunk_keys[source_index];
 
   if constexpr (is_same<CacheElement, bfloat>::value) {
     if (value_tensor)
-      slab.values[splash_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
+      slab.values[richengine_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
     else
-      slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
+      slab.keys[richengine_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
     return;
-  } else if constexpr (is_same<CacheElement, SplashKvPacked4>::value) {
+  } else if constexpr (is_same<CacheElement, RichKvPacked4>::value) {
     constexpr uint Groups = HeadDim / 32;
     float value = float(source);
     float local_maximum = simd_max(abs(value));
@@ -102,13 +102,13 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
         slab.values[(page_token * HeadDim + dimension) / 2] =
             uchar(nibble | (partner << 4));
       if (dimension == 0)
-        slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+        slab.value_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     } else {
       if ((dimension & 1) == 0)
-        slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension) / 2] =
+        slab.keys[richengine_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension) / 2] =
             uchar(nibble | (partner << 4));
       if (dimension == 0)
-        slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+        slab.key_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     }
   } else {
 
@@ -133,15 +133,15 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
                         : clamp(int(rint(value * 127.0f / maximum)), -127, 127);
 
     if (value_tensor) {
-      slab.values[splash_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
+      slab.values[richengine_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
           char(quantized);
       if (dimension == 0)
-        slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+        slab.value_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     } else {
-      slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
+      slab.keys[richengine_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
           char(quantized);
       if (dimension == 0)
-        slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+        slab.key_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     }
   }
 }

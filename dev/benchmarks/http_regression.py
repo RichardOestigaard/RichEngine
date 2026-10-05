@@ -371,7 +371,7 @@ def parse_args(argv=None):
     if len(set(args.contexts)) != len(args.contexts):
         parser.error("contexts must be unique")
     for binary in (args.baseline_binary, args.binary):
-        for path in (binary, binary.parent / "splash.metallib"):
+        for path in (binary, binary.parent / "richengine.metallib"):
             if not path.is_file():
                 parser.error(f"missing retained executable/library: {path}")
     if not weights.loads_in_memory(args.binary.resolve().parent):

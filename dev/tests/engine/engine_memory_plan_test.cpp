@@ -1,5 +1,5 @@
 #include "TestChecks.hpp"
-#include "engine/MemoryPlan.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 #include "TestModel.hpp"
 
 #include <array>
@@ -8,12 +8,12 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
   DeviceCapabilities result;
@@ -327,7 +327,7 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
   require(!device().validationMessage(),
           "the reference device has a validation message");
   const std::string needs =
-      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 27.0 "
+      "RichEngine needs Apple GPU family 9 or newer (M3 or later) on macOS 27.0 "
       "or newer; this Mac has ";
   DeviceCapabilities m2 = device();
   m2.deviceName = "Apple M2 Max";

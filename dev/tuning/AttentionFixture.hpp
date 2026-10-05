@@ -22,7 +22,7 @@
 // The paged-attention fixture attention-sweep times: deterministic Page32
 // history of every lane in the extents of a pool, one chunk of rows per lane
 // with its queries, and the production store and attention graph over them.
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 
 // The target attention layer a fixture holds: its query and KV heads and its
 // cache format.
@@ -46,8 +46,8 @@ struct AttentionFixtureGeometry final {
 // shared allocation that holds the pool's extents and, after them, the
 // tensors.
 struct AttentionFixturePlan final {
-  static constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-  static constexpr uint32_t kHeadDimension = SPLASH_KV_HEAD_DIMENSION;
+  static constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+  static constexpr uint32_t kHeadDimension = RICHENGINE_KV_HEAD_DIMENSION;
   static constexpr uint64_t kAlignment = 16 * 1024;
   // Table0 is lane 0's page table; every other lane's follows it.
   enum class Tensor : uint32_t {
@@ -121,11 +121,11 @@ struct AttentionFixturePlan final {
         !pool.valid() ||
         geometry.layer >= geometry.poolLayers || !geometry.extentPages ||
         geometry.extentPages % pool.extentAlignmentPages() ||
-        geometry.extentPages > SPLASH_KV_PAGE_INDEX_MASK)
+        geometry.extentPages > RICHENGINE_KV_PAGE_INDEX_MASK)
       throw std::invalid_argument("attention fixture geometry is invalid");
     plan.stride = (rows + kv::kPageTokens - 1) / kv::kPageTokens * kv::kPageTokens;
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      plan.size(table(lane), uint64_t{plan.pages[lane]} * sizeof(SplashKvPage));
+      plan.size(table(lane), uint64_t{plan.pages[lane]} * sizeof(RichKvPage));
     plan.extents = (plan.poolPages + geometry.extentPages - 1) / geometry.extentPages;
     plan.poolBytes =
         uint64_t{plan.extents} * HostKvExtents::extentStride(pool, geometry.extentPages);
@@ -235,8 +235,8 @@ public:
                         uint64_t{token} * d * 5 + lane * 19) % 255) - 127;
           };
           if (plan_.shape.format == kv::Format::Int8) {
-            *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0.006f;
-            *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0.007f;
+            *scale(lane, RICHENGINE_KV_KEY_SCALES, head, token) = 0.006f;
+            *scale(lane, RICHENGINE_KV_VALUE_SCALES, head, token) = 0.007f;
             auto *keys = keyRow<int8_t>(lane, head, token);
             auto *values = valueColumn<int8_t>(lane, head, token);
             for (uint32_t d = 0; d < dimensions; ++d) {
@@ -309,23 +309,23 @@ public:
 
   // A lane's token in its page: one KV head's row of keys, its column of
   // values (one element every page token), and its scale of keys or values
-  // (SPLASH_KV_KEY_SCALES or SPLASH_KV_VALUE_SCALES), INT8 only.
+  // (RICHENGINE_KV_KEY_SCALES or RICHENGINE_KV_VALUE_SCALES), INT8 only.
   template <typename T>
   [[nodiscard]] T *keyRow(uint32_t lane, uint32_t head, uint32_t token) const {
-    return slab<T>(lane, SPLASH_KV_KEYS, token) +
-           splash_kv_key_element_dim(head, token % kv::kPageTokens, 0,
+    return slab<T>(lane, RICHENGINE_KV_KEYS, token) +
+           richengine_kv_key_element_dim(head, token % kv::kPageTokens, 0,
                                      plan_.shape.headDimension);
   }
   template <typename T>
   [[nodiscard]] T *valueColumn(uint32_t lane, uint32_t head, uint32_t token) const {
-    return slab<T>(lane, SPLASH_KV_VALUES, token) +
-           splash_kv_value_element_dim(head, token % kv::kPageTokens, 0,
+    return slab<T>(lane, RICHENGINE_KV_VALUES, token) +
+           richengine_kv_value_element_dim(head, token % kv::kPageTokens, 0,
                                        plan_.shape.headDimension);
   }
   [[nodiscard]] float *scale(uint32_t lane, uint32_t tensor, uint32_t head,
                              uint32_t token) const {
     return slab<float>(lane, tensor, token) +
-           splash_kv_scale_element(head, token % kv::kPageTokens);
+           richengine_kv_scale_element(head, token % kv::kPageTokens);
   }
 
 private:
@@ -340,10 +340,10 @@ private:
   AttentionFixturePlan plan_;
   metal::MetalBuffer base_;
   HostKvExtents pages_;
-  SplashKvLayer layer_;
+  RichKvLayer layer_;
   std::array<metal::MetalBuffer, static_cast<size_t>(Tensor::Count)> buffers_{};
   std::array<std::vector<uint32_t>, AttentionFixturePlan::kMaximumLanes> pageIds_;
   std::array<metal::MetalBuffer, AttentionFixturePlan::kMaximumLanes> tables_{};
 };
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

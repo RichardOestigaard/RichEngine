@@ -1,18 +1,18 @@
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
-#include "engine/MemoryAudit.hpp"
+#include "engine/memory/MemoryAudit.hpp"
 
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
                       uint64_t stateStagingBytes = 0) {

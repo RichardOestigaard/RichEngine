@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The per-channel multipliers of an RMS norm as stored: bf16 in the packed
 // formats, F32 in a GGUF, which keeps its norms unquantized as llama.cpp
@@ -52,4 +52,4 @@ public:
                                uint32_t rows);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

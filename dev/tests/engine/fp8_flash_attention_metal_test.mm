@@ -21,15 +21,15 @@
 #include <string>
 #include <vector>
 
-using namespace splash::kv;
-using splash::ops::tuning::HostKvExtents;
+using namespace richengine::kv;
+using richengine::ops::tuning::HostKvExtents;
 
 namespace {
 
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
-static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
+static_assert(kStride == RICHENGINE_VERIFY_CHUNK_STRIDE);
 
 // The three production GQA geometries. The group size selects the kernel
 // specialization; the suffix names its pipelines.
@@ -44,7 +44,7 @@ struct Shape {
 constexpr std::array<Shape, 3> kShapes{
     {{4, 6, ""}, {4, 4, "_kv4_g4"}, {2, 8, "_kv2_g8"}}};
 
-using splash::test::require;
+using richengine::test::require;
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
   id<MTLBuffer> result =
@@ -158,10 +158,10 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pool = std::make_unique<HostKvExtents>(layout, spread.extentPages,
                                                 std::move(extents));
   result.pageTable = HostKvExtents::mixedPages(spread, pages, committed + activeRows);
-  result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
+  result.pageTableBuffer = makeBuffer(device, pages * sizeof(RichKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
   result.params = {committed, activeRows, kStride, pages,
-                   result.pool->layer(kLayer), splits};
+                   result.pool->layer(kLayer), splits, 0};
   uint64_t queryElements =
       uint64_t{shape.queryHeads()} * kQueryStride * kFp8HeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
@@ -200,13 +200,13 @@ void fill(Case &data) {
     const uint64_t elements = layout.elementsPerLayerPage();
     const uint64_t scales = layout.scalesPerTensorLayerPage();
     std::copy_n(quantized->keys.begin(), elements,
-                data.slab<uint8_t>(SPLASH_KV_KEYS, logicalPage));
+                data.slab<uint8_t>(RICHENGINE_KV_KEYS, logicalPage));
     std::copy_n(quantized->keyScales.begin(), scales,
-                data.slab<float>(SPLASH_KV_KEY_SCALES, logicalPage));
+                data.slab<float>(RICHENGINE_KV_KEY_SCALES, logicalPage));
     std::copy_n(quantized->values.begin(), elements,
-                data.slab<uint8_t>(SPLASH_KV_VALUES, logicalPage));
+                data.slab<uint8_t>(RICHENGINE_KV_VALUES, logicalPage));
     std::copy_n(quantized->valueScales.begin(), scales,
-                data.slab<float>(SPLASH_KV_VALUE_SCALES, logicalPage));
+                data.slab<float>(RICHENGINE_KV_VALUE_SCALES, logicalPage));
   }
 
   auto *queries = static_cast<BFloat16Bits *>(data.queries.contents);
@@ -221,10 +221,10 @@ float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_KEY_SCALES, logicalPage)[
-      splash_kv_scale_element(head, pageToken)];
-  return fp8E4m3ToFloat(data.slab<const uint8_t>(SPLASH_KV_KEYS, logicalPage)[
-             splash_kv_key_element(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(RICHENGINE_KV_KEY_SCALES, logicalPage)[
+      richengine_kv_scale_element(head, pageToken)];
+  return fp8E4m3ToFloat(data.slab<const uint8_t>(RICHENGINE_KV_KEYS, logicalPage)[
+             richengine_kv_key_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -232,10 +232,10 @@ float loadValue(const Case &data, uint32_t token, uint32_t head,
                 uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
   uint32_t pageToken = token % kPageTokens;
-  float scale = data.slab<const float>(SPLASH_KV_VALUE_SCALES, logicalPage)[
-      splash_kv_scale_element(head, pageToken)];
-  return fp8E4m3ToFloat(data.slab<const uint8_t>(SPLASH_KV_VALUES, logicalPage)[
-             splash_kv_value_element(head, pageToken, dimension)]) *
+  float scale = data.slab<const float>(RICHENGINE_KV_VALUE_SCALES, logicalPage)[
+      richengine_kv_scale_element(head, pageToken)];
+  return fp8E4m3ToFloat(data.slab<const uint8_t>(RICHENGINE_KV_VALUES, logicalPage)[
+             richengine_kv_value_element(head, pageToken, dimension)]) *
          scale;
 }
 
@@ -358,7 +358,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, 8, 8});
+               data.params.kv, splits, splits, 8, 8, 0});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -493,7 +493,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              bool qualityGate = true, uint32_t splits = kVerifySplits) {
   require(width >= 1 && width <= 4 &&
               (activeRows == kRows ||
-               (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
+               (width == 1 && splits <= RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
           "invalid attention case");
   Case data = makeCase(device, shape, committed, activeRows, splits);
   fill(data);
@@ -535,7 +535,7 @@ void benchmark(id<MTLDevice> device, id<MTLCommandQueue> queue,
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, 8, 8});
+               data.params.kv, splits, splits, 8, 8, 0});
   const uint64_t kvBytes =
       uint64_t{committed + kRows} * shape.kvHeads * kFp8HeadDimension * 2;
   for (const char *base :

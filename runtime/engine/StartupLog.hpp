@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::engine {
+namespace richengine::engine {
 
 template <typename... Parts>
 void logStartup(const Parts &...parts) noexcept {
@@ -33,4 +33,4 @@ void logStartup(const Parts &...parts) noexcept {
   }
 }
 
-} // namespace splash::engine
+} // namespace richengine::engine

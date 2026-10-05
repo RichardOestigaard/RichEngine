@@ -3,7 +3,7 @@
 A source is one repository at one commit (Repository): listed by the Hub,
 read from that commit's snapshot in the Hub cache, or a local draft
 directory. An installation pins every snapshot it links with a ref of its
-own, refs/splash/<installation>/<commit>, so neither pruning the cache nor
+own, refs/richengine/<installation>/<commit>, so neither pruning the cache nor
 another installation can remove its files.
 
 huggingface_hub is imported where it is used: the launcher imports the
@@ -106,7 +106,7 @@ def snapshot_of(path) -> Path | None:
 
 
 def pin_owner(installation: Path) -> str:
-    """The refs/splash folder holding an installation's pins. Each
+    """The refs/richengine folder holding an installation's pins. Each
     installation owns its references; Hub branch updates and other
     installations must not unpin this installation's current weights."""
     owner = installation.parent.resolve() / installation.name
@@ -115,8 +115,8 @@ def pin_owner(installation: Path) -> str:
 
 def pinned(path: Path, installation: Path) -> Path:
     """installation's pin of the snapshot at path, the reference pin writes:
-    refs/splash/<installation>/<commit> in its repository's folder."""
-    return path.parent.parent / "refs" / "splash" / pin_owner(installation) / path.name
+    refs/richengine/<installation>/<commit> in its repository's folder."""
+    return path.parent.parent / "refs" / "richengine" / pin_owner(installation) / path.name
 
 
 def pin(path: Path, repo_id: str, installation: Path) -> Path:
@@ -377,8 +377,8 @@ def _cached_commits(name, revision, installation):
     """The commits of name whose cached snapshots may stand in for revision
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
-    (refs/splash); then the commit the cache recorded for the branch or tag.
-    Splash downloads by commit, which never records a branch. The record is
+    (refs/richengine); then the commit the cache recorded for the branch or tag.
+    RichEngine downloads by commit, which never records a branch. The record is
     read as it is: this is how a damaged installation is rebuilt."""
     if models.is_hex_digest(revision, 40):
         return [revision.lower()]
@@ -394,7 +394,7 @@ def _cached_commits(name, revision, installation):
                 for source in sources.values()
                 if isinstance(source, dict) and source.get("repo") == name
             ]
-        pins = folder(name) / "refs" / "splash" / pin_owner(installation)
+        pins = folder(name) / "refs" / "richengine" / pin_owner(installation)
         if pins.is_dir():
             commits += [
                 ref.name

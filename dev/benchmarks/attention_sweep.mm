@@ -1,4 +1,4 @@
-// Times Splash's production attention kernels on one layer of Page32 KV
+// Times RichEngine's production attention kernels on one layer of Page32 KV
 // across cache lengths, for the prefill chunk (2048 rows), and the DFlash
 // verify batch (8 rows per lane, one and four lanes). Each case builds the same
 // store + attention graph the executor encodes, reports the fused GPU time of
@@ -43,16 +43,16 @@
 
 namespace {
 
-using namespace splash;
-using namespace splash::ops;
+using namespace richengine;
+using namespace richengine::ops;
 
 using tuning::AttentionFixture;
 using tuning::AttentionFixturePlan;
 using tuning::AttentionShape;
 
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
-constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
+constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kVerifyRows = RICHENGINE_TARGET_VERIFY_ROWS;
+constexpr uint32_t kPrefillRows = RICHENGINE_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.
 constexpr uint32_t kLayer = 1;
@@ -272,7 +272,7 @@ int main(int argc, const char *argv[]) {
       else if (option == "--repeat")
         repeat = parseCount(argv[index + 1], 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
-        extentPages = parseCount(argv[index + 1], 1, SPLASH_KV_PAGE_INDEX_MASK, option);
+        extentPages = parseCount(argv[index + 1], 1, RICHENGINE_KV_PAGE_INDEX_MASK, option);
       else if (option == "--kv-format") {
         const std::string_view value(argv[index + 1]);
         if (value != "int8" && value != "bf16")

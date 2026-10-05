@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/Protocol.hpp"
+#include "engine/wire/Protocol.hpp"
 
 #include <cstdint>
 #include <span>
@@ -8,7 +8,7 @@
 
 // The server's side of the native wire, for tests that drive the engine;
 // production is server/protocol.py.
-namespace splash::protocol::peer {
+namespace richengine::protocol::peer {
 
 // Header and payload exactly as server/protocol.py writes them, without
 // validation, so tests can send the engine invalid frames.
@@ -31,4 +31,4 @@ private:
   std::vector<uint8_t> pending_;
 };
 
-} // namespace splash::protocol::peer
+} // namespace richengine::protocol::peer

@@ -14,7 +14,7 @@ inline void full_qkv_decode_phase(
     uint simd_group) {
   constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
+  constexpr uint Stride = RICHENGINE_VERIFY_CHUNK_STRIDE;
   const uint rows = params.rows;
   uint batch = group.y;
   const ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
@@ -73,7 +73,7 @@ inline void full_qkv_decode_phase_hd(
     uint simd_group, float eps) {
   constexpr uint RotaryPairs = HeadDim / 2;
   constexpr uint PackedStride = QHeads * HeadDim + 2 * KHeads * HeadDim;
-  constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
+  constexpr uint Stride = RICHENGINE_VERIFY_CHUNK_STRIDE;
   const uint rows = params.rows;
   uint batch = group.y;
   const ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
@@ -114,6 +114,10 @@ inline void full_qkv_decode_phase_hd(
 VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd128, 16, 2, 128, false, bfloat, 1e-6f)
 VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd64, 32, 8, 64, true, bfloat, 1e-5f)
 VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd64_f32, 32, 8, 64, true, float, 1e-5f)
+// Granite's KV8 groups: 3B's 40 query heads of 64 (group 5, full rotary of
+// 32 pairs) and 8B's 32 of 128 (group 4, 64 pairs); neither carries norms.
+VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_k8q5d64, 40, 8, 64, false, bfloat, 1e-5f)
+VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_k8q4d128, 32, 8, 128, false, bfloat, 1e-5f)
 #undef VERIFY_ATTENTION_QKV_HD
 
 template <uint QHeads, uint KHeads, uint HeadDim = 256, bool Gate = true>
@@ -135,12 +139,12 @@ inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
     float gate = float(
         packed_qkv[(ulong(batch) * rows + row) * PackedStride +
                    query_head * QStride + HeadDim + dim]);
-    gate_scale = splash_sigmoid(gate);
+    gate_scale = richengine_sigmoid(gate);
   }
   uint kv_head = query_head / HeadsPerKV;
   uint local_head = query_head % HeadsPerKV;
   ulong attention_index =
-      (((ulong(batch) * KHeads + kv_head) * SPLASH_VERIFY_CHUNK_STRIDE + row) *
+      (((ulong(batch) * KHeads + kv_head) * RICHENGINE_VERIFY_CHUNK_STRIDE + row) *
            HeadsPerKV +
        local_head) *
           HeadDim +
@@ -223,6 +227,10 @@ ATTENTION_GATE_TABLE(verify_attention_gather_table64_hd128, 16, 2, q4sg::Table64
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_hd128, 16, 2, gguf_sg::Table16, 128, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table64_hd64, 32, 8, q4sg::Table64, 64, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_hd64, 32, 8, gguf_sg::Table16, 64, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q5d64, 40, 8, q4sg::Table64, 64, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q5d64, 40, 8, gguf_sg::Table16, 64, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q4d128, 32, 8, q4sg::Table64, 128, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q4d128, 32, 8, gguf_sg::Table16, 128, false)
 #undef ATTENTION_GATE_TABLE
 
 // The mxfp4p-operand variant (LinearInput::Packed): the same two elements per
@@ -252,6 +260,8 @@ ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv4_g4, 16, 4, 256, true)
 ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv2_g8, 16, 2, 256, true)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd128, 16, 2, 128, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd64, 32, 8, 64, false)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_k8q5d64, 40, 8, 64, false)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_k8q4d128, 32, 8, 128, false)
 #undef ATTENTION_GATE_PACKED
 
 // The no-gate gather of a Plain-input out-projection: attention rows as
@@ -269,4 +279,6 @@ ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd64, 32, 8, 64, false)
   }
 VERIFY_ATTENTION_GATHER(verify_attention_gather_hd128, 16, 2, 128)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_hd64, 32, 8, 64)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q5d64, 40, 8, 64)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q4d128, 32, 8, 128)
 #undef VERIFY_ATTENTION_GATHER

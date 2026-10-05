@@ -5,3 +5,5 @@ ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit
 openbmb/MiniCPM5-2B-MLX
 openbmb/MiniCPM5-2B-GGUF:Q4_K_M
 LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M
+ibm-granite/granite-4.2-3b-GGUF:Q4_K_M
+ibm-granite/granite-4.2-8b-GGUF:Q4_K_M

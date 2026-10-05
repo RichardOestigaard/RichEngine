@@ -3,7 +3,7 @@
 
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 
 ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                          std::string_view,
@@ -64,4 +64,4 @@ template QwenMixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &
 template QwenMixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
                                         const QwenMixerGeometry &, bool);
 
-} // namespace splash::model
+} // namespace richengine::model

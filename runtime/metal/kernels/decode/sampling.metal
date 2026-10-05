@@ -1,4 +1,6 @@
+#include "metal/abi/Gguf.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/q4_mpp_tiles.h"
 #include "metal/kernels/common/split_reduce.h"
 
 // The rows of the target policy. A greedy lane takes each row's argmax. A
@@ -56,13 +58,13 @@ inline bool row_dead(constant TargetSamplingParams &params, uint s) {
 // Selected row s of a dispatch (TargetSamplingParams). The per-lane stride of
 // the logits and mask buffers is the larger of the chain's eight rows and
 // the dispatch's rows, which a tree batch widens to
-// SPLASH_TREE_VERIFY_NODES.
+// RICHENGINE_TREE_VERIFY_NODES.
 inline TargetRow selected_row(device const float *logits,
                               device const uint *token_mask,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
-  const uint stride = max(params.rows, SPLASH_TARGET_VERIFY_ROWS);
+  const uint stride = max(params.rows, RICHENGINE_TARGET_VERIFY_ROWS);
   return {logits + (ulong(lane) * stride + params.logits_row + index) *
                        params.vocabulary,
           token_mask + (ulong(lane) * (stride + 1) + params.mask_row + index) *
@@ -103,7 +105,7 @@ inline void shard_mass(TargetRow row, uint shard,
                        device TargetShardMass &partial,
                        threadgroup TargetShardMass *group_masses,
                        uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
+  constexpr uint Shards = RICHENGINE_TARGET_SAMPLING_SHARDS;
   TargetShardMass mass{-FLT_MAX, 0.0f, 0};
   for (uint token = shard * 256 + thread_index; token < row.vocabulary;
        token += Shards * 256) {
@@ -144,21 +146,21 @@ kernel void decode_sample_mass_sharded(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup TargetShardMass group_masses[8];
-  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
+  const uint s = group / RICHENGINE_TARGET_SAMPLING_SHARDS;
   if (!lane_samples(params, s) || row_dead(params, s))
     return;
   shard_mass(selected_row(logits, token_mask, params, s),
-             group % SPLASH_TARGET_SAMPLING_SHARDS, partial_masses[group],
+             group % RICHENGINE_TARGET_SAMPLING_SHARDS, partial_masses[group],
              group_masses, thread_index, lane, simd_group);
 }
 
 // The groups that search and draw a sampled row.
-constant constexpr uint kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
+constant constexpr uint kVocabularyThreads = RICHENGINE_TARGET_VOCABULARY_THREADS;
 constant constexpr uint kVocabularySimdgroups = kVocabularyThreads / 32;
-constant constexpr uint kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+constant constexpr uint kVocabularyGroups = RICHENGINE_TARGET_VOCABULARY_GROUPS;
 // The draw's ranges of the vocabulary; the last group loads them one per
 // thread.
-constant constexpr uint kVocabularyRanges = SPLASH_TARGET_VOCABULARY_RANGES;
+constant constexpr uint kVocabularyRanges = RICHENGINE_TARGET_VOCABULARY_RANGES;
 static_assert(kVocabularyRanges <= kVocabularyThreads,
               "a group holds one draw range per thread");
 // Pivots per pass: each pass splits a bracket sixteen ways. In logit order
@@ -166,7 +168,7 @@ static_assert(kVocabularyRanges <= kVocabularyThreads,
 // scale (place_pivots).
 constant constexpr uint kPivots = 15;
 constant constexpr uint kKeyPivots = 4;
-constant constexpr uint kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
+constant constexpr uint kDraftCandidates = RICHENGINE_DRAFT_CANDIDATES;
 
 // The order of the logits as an unsigned key: a larger logit has a larger
 // key, and -0 and +0, which compare equal, share one. Every logit's key is
@@ -845,7 +847,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
                        threadgroup VocabularyScratch &scratch,
                        uint thread_index, uint lane, uint simd_group) {
   const TargetShardMass merged =
-      merge_masses(masses, SPLASH_TARGET_SAMPLING_SHARDS, row.temperature);
+      merge_masses(masses, RICHENGINE_TARGET_SAMPLING_SHARDS, row.temperature);
   row.maximum = merged.maximum;
   const OrderBoundary end =
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
@@ -871,7 +873,7 @@ kernel void decode_sample_vocabulary_search(
     return;
   const uint batch = selected_lane(params, s);
   search_row(selected_row(logits, token_mask, params, s),
-             partial_masses + ulong(s) * SPLASH_TARGET_SAMPLING_SHARDS,
+             partial_masses + ulong(s) * RICHENGINE_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
              vocabulary_rows[s], scratch, thread_index, lane, simd_group);
 }
@@ -913,7 +915,7 @@ kernel void decode_sample_vocabulary_draw(
   const bool drafted =
       index < params.drafted_rows && (!live || index + 1 < live);
   const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
+      ulong(batch) * RICHENGINE_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
   uint token;
   float draft_probability;
   if (vocabulary_draw(
@@ -921,7 +923,7 @@ kernel void decode_sample_vocabulary_draw(
           drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
+          uniforms[ulong(batch) * RICHENGINE_SAMPLING_UNIFORMS + params.uniform],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
           token, draft_probability) &&
@@ -958,13 +960,13 @@ inline void penalize_token(device float *logits, device const uint *words,
     return;
   device float *column =
       logits +
-      (ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS +
+      (ulong(params.logits_lane[entry]) * RICHENGINE_TARGET_VERIFY_ROWS +
        params.row_offset) * params.vocabulary +
       token;
   for (uint row = 0; row < params.rows; ++row) {
-    const uint count = (word & SPLASH_PENALTY_COUNT_MASK) +
+    const uint count = (word & RICHENGINE_PENALTY_COUNT_MASK) +
                        popcount(drafted & ((2u << row) - 2u));
-    if (!count && !(word & SPLASH_PENALTY_PROMPT_BIT))
+    if (!count && !(word & RICHENGINE_PENALTY_PROMPT_BIT))
       continue;
     device float &logit = column[ulong(row) * params.vocabulary];
     logit = penalize_logit(logit, count, params.repetition[entry],
@@ -996,9 +998,9 @@ kernel void decode_sample_penalize_verify(
   if (token >= params.vocabulary || entry >= params.entries)
     return;
   device const uint *inputs =
-      input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
+      input_tokens + ulong(params.logits_lane[entry]) * RICHENGINE_TARGET_VERIFY_ROWS;
   uint drafted = 0;
-  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
+  for (uint row = 1; row < RICHENGINE_TARGET_VERIFY_ROWS; ++row)
     drafted |= uint(inputs[row] == token) << row;
   penalize_token(logits, words, token, entry, drafted, params);
 }
@@ -1060,10 +1062,10 @@ inline void draft_top16_sharded_phase(
     threadgroup float *maxima, threadgroup float *thresholds,
     threadgroup float *round_values, threadgroup uint *round_ids, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr uint K = RICHENGINE_DRAFT_CANDIDATES;
   constexpr uint VectorTokens = 4, ChunkVectors = 16;
   uint batch = group / (Positions * Shards);
   uint local = group % (Positions * Shards);
@@ -1225,8 +1227,8 @@ inline void top16_merge_shards(device const uint *partial_ids,
                                device const float *partial_values,
                                uint row, uint lane, thread float &value,
                                thread uint &token) {
-  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint K = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint Entries = Shards * K / 32;
   uint origin = row * Shards * K + lane * Entries;
   float values[Entries];
@@ -1268,11 +1270,11 @@ kernel void draft_select_edges(
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
   uint batch = row / Positions;
   uint position = row % Positions;
   threadgroup uint successors[Candidates];
@@ -1352,15 +1354,15 @@ kernel void draft_select_dflash(
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
   candidates += batch * Positions * Candidates;
   unary += batch * Positions * Candidates;
   device const float *tables = partial_values +
                                params.lanes * Positions * Shards * Candidates +
                                batch * Positions * Candidates * Candidates;
-  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
+  uniforms += batch * RICHENGINE_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
 
@@ -1391,7 +1393,7 @@ kernel void draft_select_dflash(
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&
-            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
+            cumulative > uniforms[RICHENGINE_UNIFORM_PROPOSALS + position]) {
           selected = i;
         }
       }
@@ -1412,8 +1414,8 @@ kernel void draft_select_dflash(
 // as a sibling leaf at the fixed row 8 + position (parent = the
 // predecessor's chain row). tokens[] still receives the chain so every
 // chain-mode consumer is unchanged; tree_counts is 8 for a chain lane
-// (anchor + 7 proposals) and SPLASH_TREE_VERIFY_NODES - 1 for a tree lane,
-// whose row 15 stays a dead SPLASH_TREE_NODE_NONE descriptor.
+// (anchor + 7 proposals) and RICHENGINE_TREE_VERIFY_NODES - 1 for a tree lane,
+// whose row 15 stays a dead RICHENGINE_TREE_NODE_NONE descriptor.
 kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1425,25 +1427,25 @@ kernel void draft_select_tree(
     device uint *tree_counts [[buffer(8)]],
     constant SelectorBatchParams &params [[buffer(9)]],
     uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
   candidates += batch * Positions * Candidates;
   unary += batch * Positions * Candidates;
   device const float *tables = partial_values +
                                params.lanes * Positions * Shards * Candidates +
                                batch * Positions * Candidates * Candidates;
-  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
+  uniforms += batch * RICHENGINE_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
-  tree_tokens += batch * SPLASH_TREE_VERIFY_NODES;
-  tree_nodes += batch * SPLASH_TREE_VERIFY_NODES;
+  tree_tokens += batch * RICHENGINE_TREE_VERIFY_NODES;
+  tree_nodes += batch * RICHENGINE_TREE_VERIFY_NODES;
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
   tree_tokens[0] = params.anchor[batch];
-  tree_nodes[0] = SPLASH_TREE_NODE_NONE |
-                  (SPLASH_TREE_NODE_NONE << 16);
+  tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
+                  (RICHENGINE_TREE_NODE_NONE << 16);
   uint leaves [[maybe_unused]] = 0;
   uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
@@ -1472,7 +1474,7 @@ kernel void draft_select_tree(
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&
-            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
+            cumulative > uniforms[RICHENGINE_UNIFORM_PROPOSALS + position]) {
           selected = i;
         }
       }
@@ -1496,7 +1498,7 @@ kernel void draft_select_tree(
                             (position << 16);
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
-    const uint leaf_row = SPLASH_TARGET_VERIFY_ROWS + position;
+    const uint leaf_row = RICHENGINE_TARGET_VERIFY_ROWS + position;
     if (tree && runner != Candidates) {
       tree_tokens[leaf_row] = candidates[position * Candidates + runner];
       // The leaf's parent is the chain node that was this position's
@@ -1505,17 +1507,17 @@ kernel void draft_select_tree(
       ++leaves;
     } else {
       tree_tokens[leaf_row] = 0;
-      tree_nodes[leaf_row] = SPLASH_TREE_NODE_NONE |
-                             (SPLASH_TREE_NODE_NONE << 8) |
-                             (SPLASH_TREE_NODE_NONE << 16);
+      tree_nodes[leaf_row] = RICHENGINE_TREE_NODE_NONE |
+                             (RICHENGINE_TREE_NODE_NONE << 8) |
+                             (RICHENGINE_TREE_NODE_NONE << 16);
     }
   }
-  tree_tokens[SPLASH_TREE_VERIFY_NODES - 1] = 0;
-  tree_nodes[SPLASH_TREE_VERIFY_NODES - 1] =
-      SPLASH_TREE_NODE_NONE | (SPLASH_TREE_NODE_NONE << 8) |
-      (SPLASH_TREE_NODE_NONE << 16);
+  tree_tokens[RICHENGINE_TREE_VERIFY_NODES - 1] = 0;
+  tree_nodes[RICHENGINE_TREE_VERIFY_NODES - 1] =
+      RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 8) |
+      (RICHENGINE_TREE_NODE_NONE << 16);
   tree_counts[batch] =
-      tree ? SPLASH_TREE_VERIFY_NODES - 1 : 1 + Positions;
+      tree ? RICHENGINE_TREE_VERIFY_NODES - 1 : 1 + Positions;
 }
 
 // The plain DFlash draft's per-position policy, the DFlash2 walk without the
@@ -1533,8 +1535,8 @@ kernel void draft_select_plain(
     constant SelectorBatchParams &params [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
   const uint batch = row / Positions;
   const uint position = row % Positions;
   float value;
@@ -1555,8 +1557,8 @@ kernel void draft_select_plain(
 
   uint selected = 0;
   if (sampling) {
-    const float uniform = uniforms[batch * SPLASH_SAMPLING_UNIFORMS +
-                                   SPLASH_UNIFORM_PROPOSALS + position];
+    const float uniform = uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                                   RICHENGINE_UNIFORM_PROPOSALS + position];
     const float prefix = simd_prefix_inclusive_sum(probability);
     const bool hit =
         lane < Candidates && prefix - probability <= uniform && prefix > uniform;
@@ -1591,10 +1593,10 @@ kernel void dspark_select_edges(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
   const uint batch = row / Positions;
   const uint position = row % Positions;
   threadgroup uint successors[Candidates];
@@ -1660,9 +1662,9 @@ kernel void draft_select_dspark(
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
-  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   device const float *tables =
       partial_values +
       ulong(params.lanes) * Positions * Shards * Candidates +
@@ -1691,8 +1693,8 @@ kernel void draft_select_dspark(
 
     uint selected;
     if (sampling) {
-      const float uniform = uniforms[batch * SPLASH_SAMPLING_UNIFORMS +
-                                     SPLASH_UNIFORM_PROPOSALS + position];
+      const float uniform = uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                                     RICHENGINE_UNIFORM_PROPOSALS + position];
       const float prefix = simd_prefix_inclusive_sum(probability);
       const bool hit = lane < Candidates &&
                        prefix - probability <= uniform && prefix > uniform;
@@ -1767,7 +1769,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                             draft_probs + accepted * kDraftCandidates,
                             kDraftCandidates, token);
     float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
+    if (!(uniforms[RICHENGINE_UNIFORM_ACCEPTANCE + accepted] * q < p))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -1782,7 +1784,7 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
                          device uint &partial_index,
                          threadgroup float *group_values,
                          threadgroup uint *group_indices, uint thread_index) {
-  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
+  constexpr uint Shards = RICHENGINE_TARGET_SAMPLING_SHARDS;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
   for (uint token = shard * 256 + thread_index; token < row.vocabulary;
@@ -1828,11 +1830,11 @@ kernel void decode_sample_argmax_sharded(
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float group_values[8];
   threadgroup uint group_indices[8];
-  const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
+  const uint s = group / RICHENGINE_TARGET_SAMPLING_SHARDS;
   if (lane_samples(params, s) || row_dead(params, s))
     return;
   argmax_shard(selected_row(logits, token_mask, params, s),
-               group % SPLASH_TARGET_SAMPLING_SHARDS, partial_values[group],
+               group % RICHENGINE_TARGET_SAMPLING_SHARDS, partial_values[group],
                partial_indices[group], group_values, group_indices,
                thread_index);
 }
@@ -1841,7 +1843,7 @@ kernel void decode_sample_argmax_sharded(
 inline uint argmax_reduce(device const float *partial_values,
                           device const uint *partial_indices, uint row,
                           uint lane) {
-  constexpr uint Shards = SPLASH_TARGET_SAMPLING_SHARDS;
+  constexpr uint Shards = RICHENGINE_TARGET_SAMPLING_SHARDS;
   float value = lane < Shards ? partial_values[row * Shards + lane] : -INFINITY;
   float best = simd_max(value);
   uint index = lane < Shards && value == best
@@ -1894,20 +1896,20 @@ kernel void decode_accept_dflash(
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1,
                            params.proposals[batch]
-                               ? min(uint(SPLASH_DRAFT_PROPOSAL_TOKENS),
+                               ? min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
                                      params.proposals[batch])
-                               : uint(SPLASH_DRAFT_PROPOSAL_TOKENS)};
+                               : uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS)};
   device const uint *lane_draft =
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
+      draft_tokens + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =
-      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;
+      target_tokens + batch * RICHENGINE_TARGET_VERIFY_ROWS;
   if (params.sampling_mask & (1u << batch)) {
     accept_sampled_lane(
         lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
-        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
+        draft_ids + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
+        draft_probs + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
+        target_rows + batch * RICHENGINE_TARGET_VERIFY_ROWS,
+        uniforms + batch * RICHENGINE_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
   } else {
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
@@ -1933,8 +1935,8 @@ kernel void decode_accept_tree(
     device uint *retained_path [[buffer(7)]],
     constant TreeAcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
-  constexpr uint Emitted = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Nodes = RICHENGINE_TREE_VERIFY_NODES;
+  constexpr uint Emitted = RICHENGINE_TARGET_VERIFY_ROWS;
   tree_tokens += batch * Nodes;
   tree_nodes += batch * Nodes;
   target_tokens += batch * Nodes;
@@ -1947,14 +1949,14 @@ kernel void decode_accept_tree(
   path[0] = 0;
   uint count = 1;
   uint cursor = 0;
-  // Only the chain rows 0..SPLASH_DRAFT_PROPOSAL_TOKENS - 1 have children:
+  // Only the chain rows 0..RICHENGINE_DRAFT_PROPOSAL_TOKENS - 1 have children:
   // the chain successor at cursor + 1 and the sibling leaf at row Emitted +
   // cursor. The last chain row and every leaf are the comb's teeth — a
   // leaf's walk ends, and row 7's only would-be child row is the first leaf
   // row, which is not its descendant. The path also stops at Emitted rows,
   // the committed block's capacity.
   while (count < Emitted && count <= remaining &&
-         cursor < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+         cursor < RICHENGINE_DRAFT_PROPOSAL_TOKENS) {
     const uint selected = target_tokens[cursor];
     uint next = Nodes;
     if (tree_tokens[cursor + 1] == selected) {
@@ -1962,8 +1964,8 @@ kernel void decode_accept_tree(
     } else {
       const uint leaf = Emitted + cursor;
       if (leaf < node_count &&
-          SPLASH_TREE_NODE_PARENT(tree_nodes[leaf]) !=
-              SPLASH_TREE_NODE_NONE &&
+          RICHENGINE_TREE_NODE_PARENT(tree_nodes[leaf]) !=
+              RICHENGINE_TREE_NODE_NONE &&
           tree_tokens[leaf] == selected) {
         next = leaf;
       }
@@ -1979,7 +1981,7 @@ kernel void decode_accept_tree(
     output_tokens[count - 1] = target_tokens[cursor];
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1,
-                           SPLASH_DRAFT_PROPOSAL_TOKENS};
+                           RICHENGINE_DRAFT_PROPOSAL_TOKENS};
   finish_acceptance(output_tokens, count - 1, lane_params, retained[batch],
                     accepted_count[batch]);
   for (uint i = 0; i < retained[batch]; ++i)
@@ -2003,15 +2005,138 @@ kernel void tree_leaf_patch(
   if (atomic_load_explicit(medusa_flag, memory_order_acquire,
                            mem_flags::mem_device) != params.expected)
     return;
-  constexpr uint Leaves = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Leaves = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   const uint lane = index / Leaves;
   const uint slot = index % Leaves;
   if (lane >= params.lanes)
     return;
-  const uint row = SPLASH_TARGET_VERIFY_ROWS + slot;
+  const uint row = RICHENGINE_TARGET_VERIFY_ROWS + slot;
   if (row >= tree_counts[lane])
     return;
   const uint token = medusa_tokens[index];
   if (token != 0xffffffffu)
-    tree_tokens[lane * SPLASH_TREE_VERIFY_NODES + row] = token;
+    tree_tokens[lane * RICHENGINE_TREE_VERIFY_NODES + row] = token;
+}
+
+// ---------------------------------------------------------------------------
+// Fused vocabulary head + argmax (the Ornith-9B head shape): each
+// threadgroup computes one 32 x 128 logits tile with the q4_mpp tile and
+// holds it in threadgroup memory; threads 0-31 scan one row's 128 logits
+// once for the maximum and its index — lowest id on ties, matching
+// argmax_shard — writing per-(selected row, column tile) partials that
+// decode_head_argmax_reduce_tiles reduces. Runs only on all-greedy
+// unconstrained chain-verify steps, so the logits buffer is never written
+// or read.
+constant constexpr ushort kHeadArgmaxRows = 32;
+constant constexpr ushort kHeadArgmaxCols = 128;
+
+kernel void decode_head_argmax_q4(
+    device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
+    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device float *partial_values [[buffer(4)]],
+    device uint *partial_indices [[buffer(5)]],
+    constant HeadArgmaxParams &params [[buffer(6)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr ushort M = kHeadArgmaxRows, TN = kHeadArgmaxCols;
+  threadgroup float tg_tile[M * TN];
+  threadgroup float input_sums[8 * M];
+  const uint col0 = tile * TN;
+  q4_mpp_tile_sums<M, TN, false, 8, false>(
+      input, weights, scales, biases, weights, scales, biases,
+      params.input_size, input_sums, col0, 0, params.input_size / 64,
+      simd_lane, simd_group,
+      [&](thread auto &sums_0,
+          thread auto &sums_1 [[maybe_unused]],
+          Q4Traversal traversal) __attribute__((always_inline)) {
+        q4_visit(sums_0, traversal, [&](ushort i)
+                 __attribute__((always_inline)) {
+          auto index = sums_0.get_multidimensional_index(i);
+          tg_tile[index[1] * TN + index[0]] = sums_0[i];
+        });
+      });
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index >= M) return;
+  const uint s = thread_index;
+  const uint tiles = params.output_size / TN;
+  float best = -INFINITY;
+  uint best_index = 0xffffffffu;
+  const uint live = params.live_rows[s / params.rows];
+  if (!live || s % params.rows < live) {
+    const uint lane = s / params.rows;
+    const bool exclude_stop =
+        (params.exclude_stop_mask & (1u << lane)) != 0;
+    for (uint col = 0; col < TN; ++col) {
+      const uint token = col0 + col;
+      if (exclude_stop &&
+          (token == params.stop_token_0 || token == params.stop_token_1))
+        continue;
+      const float value = tg_tile[s * TN + col];
+      if (value > best || (value == best && token < best_index)) {
+        best = value;
+        best_index = token;
+      }
+    }
+  }
+  partial_values[s * tiles + tile] = best;
+  partial_indices[s * tiles + tile] = best_index;
+}
+
+// Reduces the fused head's per-(row, column tile) partials to each selected
+// greedy row's token, lowest id on ties.
+kernel void decode_head_argmax_reduce_tiles(
+    device const float *partial_values [[buffer(0)]],
+    device const uint *partial_indices [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    constant TargetSamplingParams &params [[buffer(3)]],
+    uint s [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  if (lane_samples(params, s) || row_dead(params, s))
+    return;
+  const uint tiles = params.vocabulary / kHeadArgmaxCols;
+  float best = -INFINITY;
+  uint best_index = 0xffffffffu;
+  for (uint t = lane; t < tiles; t += 32) {
+    const float value = partial_values[s * tiles + t];
+    const uint index = partial_indices[s * tiles + t];
+    if (value > best || (value == best && index < best_index)) {
+      best = value;
+      best_index = index;
+    }
+  }
+  const float group_best = simd_max(best);
+  const uint group_index =
+      simd_min(best == group_best ? best_index : 0xffffffffu);
+  if (lane == 0)
+    tokens[s] = group_index;
+}
+
+// The GGUF fused head's partial tiles are GGUF_TILE_COLUMNS wide.
+kernel void decode_head_argmax_reduce_tiles_gguf(
+    device const float *partial_values [[buffer(0)]],
+    device const uint *partial_indices [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    constant TargetSamplingParams &params [[buffer(3)]],
+    uint s [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  if (lane_samples(params, s) || row_dead(params, s))
+    return;
+  const uint tiles = params.vocabulary / GGUF_TILE_COLUMNS;
+  float best = -INFINITY;
+  uint best_index = 0xffffffffu;
+  for (uint t = lane; t < tiles; t += 32) {
+    const float value = partial_values[s * tiles + t];
+    const uint index = partial_indices[s * tiles + t];
+    if (value > best || (value == best && index < best_index)) {
+      best = value;
+      best_index = index;
+    }
+  }
+  const float group_best = simd_max(best);
+  const uint group_index =
+      simd_min(best == group_best ? best_index : 0xffffffffu);
+  if (lane == 0)
+    tokens[s] = group_index;
 }

@@ -584,7 +584,7 @@ def responses_to_chat_body(body, items):
     if response_format is not None:
         chat["response_format"] = response_format
     aliases = {"max_output_tokens": "max_completion_tokens"}
-    # Chat validates what it receives, so a field Splash cannot honor, such
+    # Chat validates what it receives, so a field RichEngine cannot honor, such
     # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
@@ -667,7 +667,7 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
     chat, thinking_display = _anthropic_chat(body, thinking_resolver)
-    # Anthropic continues a final assistant message (a prefill); Splash would
+    # Anthropic continues a final assistant message (a prefill); RichEngine would
     # close that turn and start another, so it refuses it.
     if body["messages"][-1]["role"] == "assistant":
         raise APIError(

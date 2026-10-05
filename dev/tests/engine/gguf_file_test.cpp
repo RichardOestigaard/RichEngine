@@ -10,12 +10,12 @@
 #include <vector>
 
 namespace {
-namespace gguf = splash::test::gguf;
-using splash::test::require;
-using splash::model::ggml::kF32;
+namespace gguf = richengine::test::gguf;
+using richengine::test::require;
+using richengine::model::ggml::kF32;
 
 constexpr uint32_t kQ4_K = 12;
-static_assert(std::string_view(splash::model::ggmlTypeTraits(kQ4_K)->name) == "Q4_K");
+static_assert(std::string_view(richengine::model::ggmlTypeTraits(kQ4_K)->name) == "Q4_K");
 constexpr uint64_t kQ4KBlockBytes = 144;
 
 // A file of one tensor, "weight", with one Q4_K block of data.
@@ -38,21 +38,21 @@ gguf::Bytes emptyUint64Array(uint64_t count) {
 
 int main() {
   try {
-    const splash::test::TemporaryDirectory directory("splash-gguf-file");
+    const richengine::test::TemporaryDirectory directory("richengine-gguf-file");
     const auto path = directory.path() / "test.gguf";
     // Parsing data must fail with the expected error.
     const auto rejects = [&](const char *name, const gguf::Bytes &data, std::string_view expected) {
-      splash::test::writeFile(path, data);
-      splash::test::rejects([&] {
-        splash::model::WeightSource source(path);
-        splash::model::GgufFile file(source);
+      richengine::test::writeFile(path, data);
+      richengine::test::rejects([&] {
+        richengine::model::WeightSource source(path);
+        richengine::model::GgufFile file(source);
       }, expected, std::string("accepted invalid GGUF: ") + name);
     };
-    splash::test::writeFile(path, gguf::file({gguf::stringKey("general.architecture", "fixture"),
+    richengine::test::writeFile(path, gguf::file({gguf::stringKey("general.architecture", "fixture"),
                                               gguf::uint32Key("fixture.block_count", 2)},
                                              {{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)}}));
-    splash::model::WeightSource source(path);
-    splash::model::GgufFile valid(source);
+    richengine::model::WeightSource source(path);
+    richengine::model::GgufFile valid(source);
     require(valid.architecture() == "fixture" && valid.unsignedValue("fixture.block_count") == 2,
             "metadata values changed");
     const auto &weight = valid.require("weight");

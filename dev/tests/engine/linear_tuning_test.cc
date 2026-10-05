@@ -16,14 +16,14 @@
 #include <string_view>
 
 namespace {
-using namespace splash;
-using namespace splash::ops;
-using namespace splash::ops::tuning;
-using splash::metal::BackendInstrumentation;
-using splash::test::deterministicQ4Projection;
-using splash::test::mix;
+using namespace richengine;
+using namespace richengine::ops;
+using namespace richengine::ops::tuning;
+using richengine::metal::BackendInstrumentation;
+using richengine::test::deterministicQ4Projection;
+using richengine::test::mix;
 
-using splash::test::require;
+using richengine::test::require;
 template <class Function> void rejects(Function function) {
   try { function(); }
   catch (const std::invalid_argument &) { return; }

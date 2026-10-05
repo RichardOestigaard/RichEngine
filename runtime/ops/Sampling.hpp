@@ -8,7 +8,7 @@
 #include <optional>
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The sampling penalties, which rewrite a lane's target logits before its
 // policy selects from them: repetition scales the logit of every token the
@@ -92,6 +92,11 @@ struct SamplingBuffers final {
   // finished: a count every draw returns to zero, where it starts.
   metal::MetalBuffer vocabularyRanges;
   metal::MetalBuffer vocabularyArrivals;
+  // The fused greedy head's per-(row, 128-column tile) argmax partials
+  // (decode_head_argmax_q4), bound by the verify path when the head ran
+  // fused; empty otherwise.
+  metal::MetalBuffer headArgmaxValues;
+  metal::MetalBuffer headArgmaxIndices;
 };
 
 struct AcceptanceBuffers final {
@@ -151,13 +156,14 @@ public:
                   const PenaltyTable &penalties) const;
   // liveRows, when nonempty, gives each lane's live verify row count
   // (proposal budget + 1): selection skips rows at or past it. Empty means
-  // every lane keeps all SPLASH_TARGET_VERIFY_ROWS rows.
+  // every lane keeps all RICHENGINE_TARGET_VERIFY_ROWS rows.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties,
-                 std::span<const uint32_t> liveRows = {}) const;
-  // The tree batch's selection: SPLASH_TREE_VERIFY_NODES argmax rows per
+                 std::span<const uint32_t> liveRows = {},
+                 uint32_t fusedHead = 0) const;
+  // The tree batch's selection: RICHENGINE_TREE_VERIFY_NODES argmax rows per
   // lane. Tree mode is greedy-only — a sampled, constrained or penalized
   // lane throws (the runtime falls back to the chain batch).
   void addVerifyTree(metal::CommandGraph &graph,
@@ -165,7 +171,7 @@ public:
                      SamplingBuffers buffers, uint32_t stopToken0,
                      uint32_t stopToken1) const;
   // proposals, when nonempty, caps each lane's accepted draft tokens at its
-  // adaptive budget; empty means SPLASH_DRAFT_PROPOSAL_TOKENS for all.
+  // adaptive budget; empty means RICHENGINE_DRAFT_PROPOSAL_TOKENS for all.
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
@@ -221,10 +227,11 @@ private:
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const TargetRows &rows,
                     uint32_t stopToken0, uint32_t stopToken1,
-                    std::span<const uint32_t> liveRows = {}) const;
+                    std::span<const uint32_t> liveRows = {},
+                    uint32_t fusedHead = 0) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

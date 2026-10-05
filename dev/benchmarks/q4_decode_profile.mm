@@ -15,14 +15,14 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::ComputeDispatch;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
+using richengine::metal::BufferStorage;
+using richengine::metal::ComputeDispatch;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
 
 constexpr uint32_t kQuantGroup = 64;
 
-enum class Contract : uint8_t { Affine, Residual, GateUp, UpSilu };
+enum class Contract : uint8_t { Affine, Residual, GateUp, UpSilu, AffineSplit, ResidualSplit };
 
 struct Pipeline final {
   const char *name;
@@ -57,6 +57,16 @@ constexpr Pipeline kPipelines[] = {
     {"decode_linear_q4_n256_m32", Contract::Affine, 32, 256},
     {"decode_linear_q4_n128_residual_m32", Contract::Residual, 32, 128},
     {"decode_linear_q4_n256_up_silu_m32", Contract::UpSilu, 32, 256},
+    // Split128: K partitioned over grid.y, fp32 partials and one counter per
+    // column tile; the sweep iterates splits instead of persistent groups.
+    {"decode_linear_q4_n128_split", Contract::AffineSplit, 8, 128},
+    {"decode_linear_q4_n128_split_residual", Contract::ResidualSplit, 8, 128},
+    {"decode_linear_q4_n128_split_m16", Contract::AffineSplit, 16, 128},
+    {"decode_linear_q4_n128_split_residual_m16", Contract::ResidualSplit, 16, 128},
+    {"decode_linear_q4_n128_split_m24", Contract::AffineSplit, 24, 128},
+    {"decode_linear_q4_n128_split_residual_m24", Contract::ResidualSplit, 24, 128},
+    {"decode_linear_q4_n128_split_m32", Contract::AffineSplit, 32, 128},
+    {"decode_linear_q4_n128_split_residual_m32", Contract::ResidualSplit, 32, 128},
 };
 
 struct WeightSet final {
@@ -107,6 +117,8 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
   const uint32_t tiles = shape.outputSize / pipeline.tileColumns;
   if (tiles * pipeline.tileColumns != shape.outputSize)
     return;
+  const bool splitsK = pipeline.contract == Contract::AffineSplit ||
+                       pipeline.contract == Contract::ResidualSplit;
   const std::string label = std::string(shape.label) + " " + pipeline.name;
   MetalBuffer input = backend.allocateBuffer(
       uint64_t{pipeline.rows} * shape.inputSize * sizeof(__bf16),
@@ -138,10 +150,48 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
                         {6, second.scales}, {7, second.biases}};
     parameterIndex = 8;
     break;
+  default:
+    break;
   }
   const uint64_t bytes =
       pipeline.contract == Contract::GateUp ? 2 * first.bytes : first.bytes;
   dispatch.threadsPerThreadgroup = {256, 1, 1};
+
+  if (splitsK) {
+    // [split][row][column] fp32 partials plus one counter per column tile.
+    const uint32_t maxSplits = 8;
+    MetalBuffer partials = backend.allocateBuffer(
+        uint64_t{maxSplits} * pipeline.rows * shape.outputSize * sizeof(float),
+        BufferStorage::Shared, label + " partials");
+    MetalBuffer counters = backend.allocateBuffer(
+        uint64_t{tiles} * sizeof(uint32_t), BufferStorage::Shared,
+        label + " counters");
+    const bool residual = pipeline.contract == Contract::ResidualSplit;
+    dispatch.buffers = residual
+        ? std::vector<richengine::metal::BufferBinding>{{0, input}, {1, first.weights}, {2, first.scales},
+                      {3, first.biases}, {4, extra}, {5, output},
+                      {6, partials}, {7, counters}}
+        : std::vector<richengine::metal::BufferBinding>{{0, input}, {1, first.weights}, {2, first.scales},
+                      {3, first.biases}, {4, output}, {5, partials},
+                      {6, counters}};
+    parameterIndex = residual ? 8 : 7;
+    for (uint32_t splits : {2u, 4u, 8u}) {
+      if (shape.inputSize / 256 < splits) continue;
+      Q4Params params{shape.outputSize, shape.inputSize};
+      dispatch.bytes = {{parameterIndex, &params, sizeof(params)}};
+      dispatch.threadgroups = {tiles, splits, 1};
+      for (uint32_t warmup = 0; warmup < 2; ++warmup)
+        static_cast<void>(backend.submit(dispatch));
+      std::vector<double> samples;
+      for (uint32_t repeat = 0; repeat < 9; ++repeat)
+        samples.push_back(backend.submit(dispatch).gpuSeconds);
+      const double seconds = median(samples);
+      std::cout << shape.label << ' ' << pipeline.name << " splits=" << splits
+                << " ms=" << seconds * 1e3
+                << " GB/s=" << double(bytes) / seconds / 1e9 << '\n';
+    }
+    return;
+  }
 
   for (uint32_t groups : groupCandidates(tiles, shape.referenceGroups)) {
     Q4PersistentParams params{shape.outputSize, shape.inputSize, groups};
@@ -173,10 +223,31 @@ void run(const std::string &metallibPath) {
       {"ffn_down", 5'120, 17'408, 80},
       {"draft_context", 5'120, 25'600, 80},
       {"lm_head", 248'320, 5'120, 1'940},
+      // MiniCPM5-2B (dense 2048): fused QKV, attention out, SwiGLU, head.
+      {"dense_qkv", 2'560, 2'048, 12},
+      {"dense_attn_out", 2'048, 2'048, 10},
+      {"dense_ffn", 6'144, 2'048, 36},
+      {"dense_down", 2'048, 6'144, 28},
+      {"dense_head", 130'560, 2'048, 1'020},
+      // LFM2.5-2.6B (2048): 3072-wide QKV, wider FFN, 128000-head.
+      {"lfm_qkv", 3'072, 2'048, 14},
+      {"lfm_ffn", 10'752, 2'048, 60},
+      {"lfm_down", 2'048, 10'752, 48},
+      {"lfm_head", 128'000, 2'048, 1'000},
+      // LFM2.5 DSpark draft (affine, 5 layers, 2048-wide, SwiGLU 6144) and
+      // its context projection fc.
+      {"draft_q", 2'048, 2'048, 10},
+      {"draft_kv", 512, 2'048, 4},
+      {"draft_attn_out", 2'048, 2'048, 10},
+      {"draft_ffn", 6'144, 2'048, 36},
+      {"draft_down", 2'048, 6'144, 28},
+      {"draft_fc", 2'048, 10'240, 48},
   };
   for (const Shape &shape : shapes) {
     const WeightSet first = allocateWeights(backend, shape, shape.label);
-    const bool gateUp = std::string(shape.label) == "ffn_gate_up";
+    const std::string label = shape.label;
+    const bool gateUp = label == "ffn_gate_up" || label == "dense_ffn" ||
+                        label == "lfm_ffn" || label == "draft_ffn";
     const WeightSet second =
         gateUp ? allocateWeights(backend, shape, std::string(shape.label) + " up")
                : WeightSet{};

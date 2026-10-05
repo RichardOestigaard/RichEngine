@@ -8,28 +8,28 @@ tools.
 ## Build and run
 
 ```sh
-git clone https://github.com/incoai/splash.git
-cd splash
+git clone https://github.com/incoai/richengine.git
+cd richengine
 make -j4
-./splash serve --model mlx-community/Qwen3.8-27B-4bit
+./richengine serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
 `--model` names an upstream Hugging Face model: an MLX affine 4-bit, group-64
 repository such as `mlx-community/Qwen3.8-27B-4bit`, or a GGUF repository and
 variant, `OWNER/REPO:VARIANT`, such as `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
-Splash identifies the model from its own metadata and pairs the DFlash2 draft
+RichEngine identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
 ([Weight loading](#weight-loading)) and follows the model's revision
-([Revisions](#revisions)). Legacy Splash packages remain loadable
-([Legacy Splash packages](#legacy-splash-packages)). Public repositories need
+([Revisions](#revisions)). Legacy RichEngine packages remain loadable
+([Legacy RichEngine packages](#legacy-richengine-packages)). Public repositories need
 no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
 An engine that fails is restarted at once. If it fails again within 60 s of
 starting, the next restart waits 5 s; after a third such failure (failed
-restarts count) Splash stops restarting it, and requests get 500
+restarts count) RichEngine stops restarting it, and requests get 500
 `engine_failed` naming the crash trace until the server is restarted.
 Meanwhile generation requests get 503 `engine_recovering`, whose message names
 the last failure. An engine whose loop leaves a status request unanswered for
@@ -37,18 +37,18 @@ the last failure. An engine whose loop leaves a status request unanswered for
 is failed and restarted by the same rules.
 
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
-when the Mac sleeps continues when it wakes. While requests run, Splash keeps
+when the Mac sleeps continues when it wakes. While requests run, RichEngine keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
 
 Use `--max-context 100K` or `--max-memory 28G` to set optional limits. Memory
 limits cap Metal allocations, not combined process RSS. Agents must already be
-installed; `./splash claude|opencode|codex|hermes|pi` connects to the running server.
-Arguments pass through, for example `./splash codex resume --last` or
-`./splash hermes chat -q "Hello"`.
+installed; `./richengine claude|opencode|codex|hermes|pi` connects to the running server.
+Arguments pass through, for example `./richengine codex resume --last` or
+`./richengine hermes chat -q "Hello"`.
 
-Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
+Set `RICHENGINE_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. API requests
 then require `Authorization: Bearer KEY` (or Anthropic's `x-api-key`). Health
 and readiness probes and the chat page remain public; enter the key in the
@@ -79,10 +79,10 @@ stopped reading, past `--request-timeout` too, and the request counts against
 `--queue-size` until then.
 `/status` reports `http.request_body_bytes` and `http.max_request_bytes`.
 
-Source `install/completions/splash.bash` for Bash,
-`install/completions/_splash` for Zsh after `compinit`, or
-`install/completions/splash.fish` for fish. Completion suggests
-commands, the official model IDs (bundled, and as `splash serve` last refreshed
+Source `install/completions/richengine.bash` for Bash,
+`install/completions/_richengine` for Zsh after `compinit`, or
+`install/completions/richengine.fish` for fish. Completion suggests
+commands, the official model IDs (bundled, and as `richengine serve` last refreshed
 them), the upstream models the README starts with and installed models, a
 GGUF's `OWNER/REPO:VARIANT` included, without network access.
 
@@ -91,7 +91,7 @@ GGUF's `OWNER/REPO:VARIANT` included, without network access.
 The default listener is `127.0.0.1:8000`. To accept LAN connections:
 
 ```sh
-splash serve --model mlx-community/Qwen3.8-27B-4bit --host 0.0.0.0 --api-key YOUR_KEY
+richengine serve --model mlx-community/Qwen3.8-27B-4bit --host 0.0.0.0 --api-key YOUR_KEY
 ```
 
 Connect to the server's LAN IP. `--host` selects the IPv4 bind address;
@@ -119,14 +119,14 @@ bare `'*'` admits every origin. With `'*'` every page open in a browser that
 reaches the server can use it, so set `--api-key` too; the server warns at
 startup without one.
 
-Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
-`SPLASH_PORT` in the local agent shell. Separate ports allow separate servers;
+Use `--port 8001` or set `RICHENGINE_PORT=8001` to select another port. Set the same
+`RICHENGINE_PORT` in the local agent shell. Separate ports allow separate servers;
 their memory limits are independent. The packaged agent launchers connect to
 loopback, so use a listener that includes loopback when launching agents locally.
 
 ### Server options
 
-`splash serve --help` lists all options and examples. Common options:
+`richengine serve --help` lists all options and examples. Common options:
 
 | Option | Default | Purpose |
 | --- | --- | --- |
@@ -135,13 +135,13 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--host` | `127.0.0.1` | HTTP bind address. |
-| `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
+| `--port` | `RICHENGINE_PORT` or `8000` | HTTP port. |
 | `--max-memory` | Auto | Ceiling on Metal allocations, e.g. `28G`; not combined process RSS. |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights: seconds, or with an `s`, `m` or `h` suffix, e.g. `30m`; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-context` | Auto | Context limit, up to `256K`, e.g. `100K`. |
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
-| `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files. |
+| `--cache-dir` | `~/Library/Caches/RichEngine/prefix-cache` | Where `--persistent-cache` keeps its files. |
 | `--kv-format` | `int4` | Target KV storage: `int4`, `int8`, `bf16`, or `fp8e4m3`. See [KV cache formats](README.md#kv-cache-formats). |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
@@ -149,7 +149,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
-| `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
+| `--api-key` | `RICHENGINE_API_KEY` or none | Require a bearer token or `x-api-key`. |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 | `--no-webui` | Off | Disable the chat page. |
 
@@ -161,32 +161,32 @@ full native window with `--max-context 256K`. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model
 cannot fit, startup prints a memory budget breakdown and stops.
 
-`splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
+`richengine pi` adds a `richengine` provider to Pi's `models.json` (`richengine-<port>` for
 a server on another port), preserving other providers, settings and sessions.
 The browser chat and agent launchers connect to the running server; a model
 need not appear in a client's catalog to serve it by its full repository ID.
-`splash opencode`, `pi` and `hermes` configure an output limit per response
+`richengine opencode`, `pi` and `hermes` configure an output limit per response
 of 32K tokens (`CLIENT_RESPONSE_TOKENS` in `install/clients.py`); OpenCode and
 Hermes, which reserve it out of the context they compact at, get a quarter of
 a context under 128K instead. Hermes 2026.9.7 and later ignore it and, like
 Codex, leave the limit to the server; Claude Code keeps its own, which
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` raises.
 
-`splash hermes` runs Hermes in the `splash` profile (`splash-<port>`) of the
+`richengine hermes` runs Hermes in the `richengine` profile (`richengine-<port>`) of the
 user's Hermes root, `~/.hermes` or the root `HERMES_HOME` belongs to, and
 creates it with `hermes profile create` on first use. It writes only the
 profile's model settings; Hermes's tools and the root's `config.yaml` remain
 the user's.
 
 Earlier versions gave Hermes a home of its own, `install/agents/hermes` in a
-checkout or `~/Library/Application Support/Splash/runtime/hermes` in a
+checkout or `~/Library/Application Support/RichEngine/runtime/hermes` in a
 release, which Hermes took for a root: a Hermes that manages its own runtime
 installed its tools there and pointed the `hermes` command at them. While that
 directory still exists, run `hermes pm install` once in a normal shell; it
 installs Hermes's tools under `~/.hermes/tools` and points the `hermes` and
 `hermes-acp` launchers in `~/.hermes/hermes-agent/.hermes/bin` at them. Once
 those launchers no longer name the old directory, or do not exist, as with
-Hermes before its managed runtime, delete it with the sessions Splash started
+Hermes before its managed runtime, delete it with the sessions RichEngine started
 there.
 
 ### KV cache precision
@@ -194,7 +194,7 @@ there.
 Select the target KV format when starting the server:
 
 ```bash
-splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
+richengine serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 ```
 
 BF16 avoids target KV quantization, uses approximately twice the target KV
@@ -219,11 +219,11 @@ reject the real ID. For them, add `--announce-served-name`, which requires
 `--served-model-name`: responses then report the first alias, whichever
 accepted name the request used, and `/v1/models` lists that alias first and
 gives every other entry, the real ID included, that alias as its `root`, so
-`splash <client>` configures clients with it. `/status` keeps reporting the
+`richengine <client>` configures clients with it. `/status` keeps reporting the
 loaded model.
 
 ```sh
-splash serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
+richengine serve --model mlx-community/Qwen3.8-27B-4bit --served-model-name local-qwen
 ```
 
 Aliases cannot contain whitespace, control characters, `\`, `%`, `?`, `#`,
@@ -231,7 +231,7 @@ or empty, `.` or `..` path segments. This keeps model discovery URLs unambiguous
 
 ## Default reasoning effort
 
-`--default-reasoning-effort` (or `SPLASH_DEFAULT_REASONING_EFFORT`) sets the
+`--default-reasoning-effort` (or `RICHENGINE_DEFAULT_REASONING_EFFORT`) sets the
 fallback for Chat `reasoning_effort` and Responses `reasoning.effort` when absent
 or null. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 `max`. An explicit request value wins; the CLI flag takes precedence over the
@@ -243,7 +243,7 @@ renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
 rejects `none` renders by `enable_thinking` alone while thinking is off.
 
 ```sh
-splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
+richengine serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
@@ -255,7 +255,7 @@ passed to the template as variables and outrank the effort, so
 `{"enable_thinking": false}` turns reasoning off and reaches the template as
 `reasoning_effort` `none` too, as effort `none` does, and `true` turns it on,
 at the template's default effort where the effort is `none`. `enable_thinking`
-must be a boolean; null leaves it to the effort. They cannot set what Splash
+must be a boolean; null leaves it to the effort. They cannot set what RichEngine
 passes itself, such as `tools` or `add_generation_prompt`.
 
 ## Tool calls
@@ -291,12 +291,12 @@ the Hub. The result is an assembly, a local directory of links to the sources'
 Hub snapshots, published atomically. The other installer modules each own one
 part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
 assembly layout, its build, verification and garbage collection, and the
-metadata derived from a GGUF; `families.py` the registry; `legacy.py` Splash
+metadata derived from a GGUF; `families.py` the registry; `legacy.py` RichEngine
 packages; and `models.py` model IDs, selections, the installation lock and the
 command line (`install/models.py --model ID prepare|verify|link`, where `link`
 prints the selection link). The assembly's
 `model.json` records the resolved sources and selected formats. The native
-loader reads it, and `splash serve`, `test-http-real` and the HTTP regression
+loader reads it, and `richengine serve`, `test-http-real` and the HTTP regression
 benchmark hold it while they run, so a concurrent installation cannot collect
 the assembly they serve. It is local installation metadata, not a file model
 publishers supply.
@@ -312,9 +312,9 @@ tensor shapes and draft compatibility again before execution. Remote Python
 code is not loaded.
 
 ```bash
-splash serve --model mlx-community/Qwen3.6-35B-A3B-4bit
-splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
-splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only
+richengine serve --model mlx-community/Qwen3.6-35B-A3B-4bit
+richengine serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+richengine serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 ```
 
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
@@ -325,7 +325,7 @@ separate installation from the same ID without them.
 Installation resolves each source's revision to a commit once, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix
 files from different revisions. It pins those snapshots in the Hub cache
-(`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
+(`refs/richengine/<installation>/<commit>`), so pruning the cache cannot remove files
 an installed model links. Publishing a new assembly retires the installation's
 other pins, in the repositories it links and in those its predecessor linked,
 so pruning can free what no installation links any more.
@@ -363,10 +363,10 @@ never rewrites upstream files.
 
 Allow space for the target and BF16 draft downloads: up to about 21 GB for the
 Qwen3.8-27B 4-bit examples and 24 GB for Qwen3.6-35B-A3B. Other variants have
-different sizes. Downloads use the Hugging Face cache, and `brew upgrade splash`
-preserves models and agent sessions. Splash keeps no other copy of the weights
+different sizes. Downloads use the Hugging Face cache, and `brew upgrade richengine`
+preserves models and agent sessions. RichEngine keeps no other copy of the weights
 on disk. Earlier releases kept prepared copies in
-`~/Library/Caches/Splash/weights` (or the directory `SPLASH_WEIGHT_CACHE`
+`~/Library/Caches/RichEngine/weights` (or the directory `RICHENGINE_WEIGHT_CACHE`
 named), which nothing reads now and which can be deleted.
 
 ### Model cache
@@ -374,12 +374,12 @@ named), which nothing reads now and which can be deleted.
 To download new models to another disk, set the cache location before serving:
 
 ```sh
-HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen3.8-27B-4bit
+HF_HUB_CACHE=/Volumes/Models/huggingface richengine serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
 `HF_HOME` to relocate the Hugging Face home directory, including its default
-`hub` cache. Model links and agent sessions stay in Splash's data directory;
+`hub` cache. Model links and agent sessions stay in RichEngine's data directory;
 existing downloads are not moved.
 
 ### Drafts
@@ -395,11 +395,11 @@ family's draft signature (`Draft.signature`), every field and value native
 loading requires, so a draft of another architecture never replaces one that
 loads. Native loading validates the configuration against the target and
 loads the draft like a target ([Weight loading](#weight-loading)):
-`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a Splash
+`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a RichEngine
 package's packed draft files, `layer-<N>.bin` and `model.bin`, and
 `AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
 MLX's affine quantization rounds it and copies every other tensor as stored.
-For both families the images are byte for byte the Q4 drafts of the Splash
+For both families the images are byte for byte the Q4 drafts of the RichEngine
 packages.
 
 ### Tokenizer and chat templates
@@ -429,7 +429,7 @@ markup.
 `server/chat_templates.py` probes each of the tokenizer's templates, including
 each named variant such as `tool_use`, once at startup, right after the
 tokenizer is validated and before the native runtime starts, so a tokenizer
-without a template Splash can serve stops startup before any weights load. The
+without a template RichEngine can serve stops startup before any weights load. The
 probe renders a canary conversation whose later system message carries a
 marker. Startup logs the outcome (`Chat template · ...`), and `/status` reports
 it as `chat_template.later_system`:
@@ -463,7 +463,7 @@ repository's root projector, a GGUF whose name holds `mmproj` (as
 projector whose weights are BF16, or F32; BF16 is preferred. F16 has a narrower
 exponent than BF16, so an F16 projector has already rounded small weights and
 is not used. The processor configuration (MLX `preprocessor_config.json`, the
-GGUF's `clip.vision` metadata) must describe the one preprocessing Splash
+GGUF's `clip.vision` metadata) must describe the one preprocessing RichEngine
 implements (`server/images.py`); it is checked before any weight download and
 not installed.
 
@@ -490,7 +490,7 @@ launchers configure OpenCode, Hermes and Pi without attachments.
 
 Every start writes a model's target, draft and vision tensors into weight
 images in memory, in the layouts the kernels read: an MLX target, the DFlash2
-draft and any vision tower in the packed layouts of Splash packages, which run
+draft and any vision tower in the packed layouts of RichEngine packages, which run
 the same kernels, and a GGUF target in the `MDGG0001` layout of the GGUF
 kernels. Each source adapter is a loader, which validates the source's metadata
 and plans its images, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
@@ -759,7 +759,7 @@ tiles, each output inside the fp64 bound of `GgufFormatReference.hpp`; and `gguf
 projections on both float tiles and the MoE layer on every GGUF plan, the staged 8- and 32-row
 tiles and the Apple9 register tile whatever GPU runs it, in every format, against fp64. The
 goldens and how to regenerate them are in `dev/tests/fixtures/weight-goldens/`; with
-`SPLASH_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
+`RICHENGINE_GGML_ORACLE=<libggml-base.dylib>`, `gguf-reference` also compares the reference with
 GGML directly and prints GGML's hashes.
 
 Two benchmark tools repeat the measurements behind the GGUF split tiers and MoE plans, with the
@@ -771,14 +771,14 @@ prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape, GGUF against affine Q4, on the
 device's plans and the other GGUF tile.
 
-## Legacy Splash packages
+## Legacy RichEngine packages
 
-Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
+RichEngine packages, such as `incoai/Qwen3.8-27B-RichEngine`, are the prebuilt format
 that predates upstream loading, and `--model` still accepts them. They contain
 `manifest.json`, packed `target/`, `draft/` and `vision/` weights and
 `tokenizer/`; the manifest lists artifact paths, sizes and SHA-256 hashes.
-Qwen3.8-27B packages use schema 3 / `splash-packed-q4`, Qwen3.6-35B-A3B
-packages schema 4 / `splash-packed-q4-moe`. Compatible community fine-tunes may
+Qwen3.8-27B packages use schema 3 / `richengine-packed-q4`, Qwen3.6-35B-A3B
+packages schema 4 / `richengine-packed-q4-moe`. Compatible community fine-tunes may
 use any nonempty manifest model name. Native loading validates geometry, tensor
 sizes, binary headers, tokenizer and target/draft compatibility, and reads the
 packed files into memory as they are. `install/legacy.py` installs a package
@@ -811,7 +811,7 @@ importing the HTTP entry module, and keeps one import style in `server/` and
 runs as `python -m server.server`; `install/launcher.py`, `install/models.py`
 and `install/catalog.py`, which run as scripts, import their siblings through
 a PEP 366 header. `serve_options.py` defines the options
-`splash serve` shares with the server once, each with its check, default and
+`richengine serve` shares with the server once, each with its check, default and
 help, and how the launcher passes it on; it imports only the standard library,
 since the launcher parses them before `.venv` exists.
 
@@ -940,7 +940,7 @@ one for every token of the prompt or of the output so far, and presence and
 frequency lower the logit of every output token by `presence_penalty` plus
 `frequency_penalty` times its count. Speculative decoding stays exact: each
 verified draft position counts the draft tokens before it, so a penalized
-request samples as it would without a draft. Splash does not implement
+request samples as it would without a draft. RichEngine does not implement
 `logit_bias`: a non-empty one returns 400; `null` and `{}` are accepted. Like
 vLLM and HF, repetition counts every prompt token: with the Qwen templates
 that includes the tool-call syntax every tool-enabled system prompt carries,
@@ -1009,7 +1009,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or RichEngine stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
 
 `GET /ready` is 200 while the engine's own `ready` is true. While the engine
 loop is busy, `/ready` keeps its last answer until the loop has left status
@@ -1017,8 +1017,8 @@ requests unanswered for 30 s; a loop that leaves a status refresh unanswered
 that long fails the engine, which then restarts.
 
 `GET /metrics` exposes the same counters in Prometheus text format.
-`splash_kv_free_allocated_pages` counts free pages of allocated extents, not
-remaining capacity; memory headroom is `splash_memory_headroom_bytes`. Both
+`richengine_kv_free_allocated_pages` counts free pages of allocated extents, not
+remaining capacity; memory headroom is `richengine_memory_headroom_bytes`. Both
 endpoints require the API key when authentication is enabled. Consumers should
 tolerate missing native fields while the engine is unavailable, and counter
 resets after an engine restart. Chat and text completion streams include token
@@ -1056,7 +1056,7 @@ process and survive a native engine restart.
 HTTP bodies require Content-Length, and a browser's
 Origin must match Host or be one `--allowed-origin` names. `--allowed-host`
 permits additional hostnames. Request
-logs omit bodies; full crash traces require explicit `SPLASH_CRASH_TRACE=1` and
+logs omit bodies; full crash traces require explicit `RICHENGINE_CRASH_TRACE=1` and
 can contain private conversation data. A frame over 16 MiB, such as a request
 with large images, is kept only as a marker with its size and SHA-256
 (`omitted_frames` counts them), and a trace missing engine input that way
@@ -1230,7 +1230,7 @@ counters include:
 restart, an upgrade or a crash keeps conversations' prefixes. It needs
 `--max-cache-disk` and shares its quota.
 
-Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
+Files live in `~/Library/Caches/RichEngine/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root). The namespace digests the model manifests, the KV
 and state layouts and the cache format, so no model reads another's cache. One
 engine holds a directory at a time; another waits 20 s, then uses temporary
@@ -1262,7 +1262,7 @@ from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
 with TypeSafeClient(
     base_url="http://127.0.0.1:8000",
-    api_key="local",  # Use SPLASH_API_KEY's value if server authentication is on.
+    api_key="local",  # Use RICHENGINE_API_KEY's value if server authentication is on.
     model="mlx-community/Qwen3.8-27B-4bit",
 ) as client:
     result = client.system_one(
@@ -1327,7 +1327,7 @@ Prompts that exceed the context limit are rejected, not truncated.
 
 System One validation uses 422 `detail` arrays; successful responses contain
 `model`, `answers`, and `usage`, plus an `x-typesafe-request-id` header. SDK model
-discovery reports an empty `release_date` because Splash records none for a model.
+discovery reports an empty `release_date` because RichEngine records none for a model.
 The official SDK is a client only, not a server dependency. API compatibility does
 not imply Jev weights, accuracy, proprietary confidence semantics or calibration.
 
@@ -1368,7 +1368,7 @@ resource check without it. They
 include loading small synthetic MLX, GGUF and vision sources and the GGUF
 kernels on synthetic tensors. Hosted CI runs CPU checks and sanitizers.
 
-The real-model targets take `MODEL` exactly as `splash serve --model` does,
+The real-model targets take `MODEL` exactly as `richengine serve --model` does,
 and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 `--draft-model` and `--language-only`, and run the installation
 `make install MODEL=...` with the same options prepared in this checkout's
@@ -1379,13 +1379,13 @@ and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`) |
-| `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
-| `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
+| `test-agent-real` | the five official clients through `richengine serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
+| `test-release-real` | the HTTP smoke and all five clients on one `richengine serve` |
 | `test-performance-real` | the native decode and partial-prefix benchmark, or with `BASELINE` its ABBA comparison with that build (`dev/benchmarks/backend_regression.py`) |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` runs Hermes in a profile of its own in the developer's Hermes
-root, `splash-test-<id>`, which moves into the run's folder under
+root, `richengine-test-<id>`, which moves into the run's folder under
 `build/release` when Hermes finishes.
 
 Each phase's record keeps what its requests reused of the cache (`reuse`).
@@ -1399,10 +1399,10 @@ evicted during a phase only print a warning.
 `benchmark-backend`, `benchmark-decode-profile` and `tune-kernels` take `MODEL`
 the same way. The models they are run with, one per family and source format:
 
-| Family | MLX | GGUF | Splash package |
+| Family | MLX | GGUF | RichEngine package |
 | --- | --- | --- | --- |
-| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-Splash` |
-| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-Splash` |
+| Qwen3.8-27B | `mlx-community/Qwen3.8-27B-4bit` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.8-27B-RichEngine` |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `incoai/Qwen3.6-35B-A3B-RichEngine` |
 
 The source formats load differently: an MLX target is written into the packed
 layout, a GGUF target into its own layout for the GGUF projection and MoE
@@ -1410,7 +1410,7 @@ kernels, and a package's packed files are read as they are.
 
 On a 24 GB Mac, `test-agent-real` stops a client's workflow at macOS's warning
 memory pressure, which the smaller GGUF variants such a Mac uses can reach under
-an agent's load; `SPLASH_TEST_PRESSURE_STOP=4` stops only at critical pressure,
+an agent's load; `RICHENGINE_TEST_PRESSURE_STOP=4` stops only at critical pressure,
 to observe how the engine sheds its cache. The runtime oracle in `test-real` has
 no production memory guard: the weights, and then what the runtime
 allocates as it runs, must fit in what macOS has available above its reserve,
@@ -1420,7 +1420,7 @@ only desktop applications open, a 24 GB Mac runs it for those variants.
 `make test-engine-cpu` builds the affine source oracle and `weight-digests` so
 they cannot break unnoticed. No target runs the oracle, as it needs real
 models: after `make all build/engine-tests/affine-source-oracle`, pass it
-`build/splash.metallib`, an installed MLX model's `target` directory and the
+`build/richengine.metallib`, an installed MLX model's `target` directory and the
 matching installed package to compare every byte of their images.
 
 Compare performance on the same idle Mac with the same model and workload.
@@ -1438,11 +1438,11 @@ and experiment notes out of the source tree and commits.
 
 A release is checked once per source identity, and then on each Apple GPU
 family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
-`BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
+`BASELINE`: a checkout whose `build/` holds `richengine`, `richengine.metallib`,
 `engine-tests/backend-benchmark` and, for a build that loads the weights into
 memory, `engine-tests/weight-digests`. `release-check` fails without it. The
 baseline must load the model: it is the previous release's build when that
-loads the model. Splash 1.0.x loads only Splash packages, so for 1.1, the
+loads the model. RichEngine 1.0.x loads only RichEngine packages, so for 1.1, the
 first release that loads upstream models, an upstream model's baseline is a
 build of the last commit before the change under test; the legacy package can
 always be compared with 1.0.2. From a clean checkout:
@@ -1450,11 +1450,11 @@ always be compared with 1.0.2. From a clean checkout:
 ```sh
 make check test-sanitizers                      # once, model-free
 make check-native-metal                         # once on each Mac
-make install release-check MODEL=mlx-community/Qwen3.8-27B-4bit REVISION=<commit> BASELINE=../splash-baseline
+make install release-check MODEL=mlx-community/Qwen3.8-27B-4bit REVISION=<commit> BASELINE=../richengine-baseline
 make install release-check MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M LANGUAGE_ONLY=1 REVISION=<commit> BASELINE=...
 make install release-check MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> BASELINE=...
 make install release-check MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> BASELINE=...
-make install release-check MODEL=incoai/Qwen3.8-27B-Splash BASELINE=../splash-1.0.2
+make install release-check MODEL=incoai/Qwen3.8-27B-RichEngine BASELINE=../richengine-1.0.2
 make install verify-models MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 make test-agent-real MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> AGENT_SCENARIO=smoke AGENT_CLIENTS=...
 ```
@@ -1499,7 +1499,7 @@ comparison and so make it inconclusive; rerun `make test-performance-real` for
 that model alone once the Mac has cooled.
 
 When the native wire layout or the status schema changed since the last
-release, bump `kProtocolVersion` (`runtime/engine/Protocol.hpp`) and
+release, bump `kProtocolVersion` (`runtime/engine/wire/Protocol.hpp`) and
 `PROTOCOL_VERSION` (`server/protocol.py`) together: builds between releases
 share a version while its layout changes, and a server refuses an engine of
 another version.
@@ -1528,8 +1528,8 @@ report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 
-For a same-machine HTTP regression check, retain a `splash` binary **and its
-adjacent `splash.metallib`** built from a checkout with the same native wire
+For a same-machine HTTP regression check, retain a `richengine` binary **and its
+adjacent `richengine.metallib`** built from a checkout with the same native wire
 version and status schema as this one (the server refuses any other), with
 `engine-tests/weight-digests` beside them when that build loads the weights
 into memory, then run from the candidate checkout, after
@@ -1538,7 +1538,7 @@ into memory, then run from the candidate checkout, after
 ```sh
 .venv/bin/python -m dev.benchmarks.http_regression \
   --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
-  --baseline-binary /path/to/baseline/build/splash \
+  --baseline-binary /path/to/baseline/build/richengine \
   --contexts 2048,10000 --samples 5
 ```
 
@@ -1557,7 +1557,7 @@ reports each build's replay points lost to the burst
 next turn and compares their time to first token and how many resumed at their
 replay point.
 It does not contact your running server. Use the same power mode and charger,
-stop other GPU workloads, and report chip/GPU cores, memory, Splash version,
+stop other GPU workloads, and report chip/GPU cores, memory, RichEngine version,
 model revision, actual input/output token counts, and cache hits with results.
 Keep cold prefill, cached TTFT and sustained decode separate; a UI token rate
 alone does not measure end-to-end agent performance.
@@ -1598,17 +1598,17 @@ make package-check RELEASE_VERSION=1.0.0
 The archive, checksum, formula and bottle go to `dist/`; these commands do not
 publish. Build bottles on the oldest supported macOS. Bottle/check commands use
 a temporary tap and remove their installation; they refuse to replace an existing
-Splash installation. The install check requires a poured bottle and runs the
+RichEngine installation. The install check requires a poured bottle and runs the
 bundled launcher without a compiler or separate Python installation.
 
-To publish, tag the verified release commit in `incoai/splash` with the
+To publish, tag the verified release commit in `incoai/richengine` with the
 version (no `v` prefix), preserving existing history and tags. Create a GitHub
 Release with the runtime archive, bottle, checksum files and `SHA256SUMS`.
-Open a pull request in `incoai/homebrew-tap` replacing `Formula/splash.rb`
-with `dist/splash.rb`; its URLs must point to the published release assets.
+Open a pull request in `incoai/homebrew-tap` replacing `Formula/richengine.rb`
+with `dist/richengine.rb`; its URLs must point to the published release assets.
 After the tap update merges, verify a fresh install and an upgrade from the
 previous release through the public tap, including a real model request and
-preservation of user data. Run `brew audit --strict --online incoai/tap/splash`.
+preservation of user data. Run `brew audit --strict --online incoai/tap/richengine`.
 
 Before publishing, verify that default model and draft repositories are
 publicly accessible. Check the installed bottle on a supported Mac without

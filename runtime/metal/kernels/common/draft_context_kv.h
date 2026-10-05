@@ -16,7 +16,7 @@ inline void draft_context_kv_phase(
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)

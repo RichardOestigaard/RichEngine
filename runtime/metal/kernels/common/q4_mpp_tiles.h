@@ -106,10 +106,10 @@ q4_store_output(thread Sums &sums_0, thread Sums &sums_1, ushort i,
   if constexpr (GateUp) {
     float gate = float(bfloat(sums_0[i]));
     float up = float(bfloat(sums_1[i]));
-    value = splash_silu(gate) * up;
+    value = richengine_silu(gate) * up;
   } else if constexpr (MultiplySiluGate) {
     float gate = float(auxiliary[index]);
-    value = splash_silu(gate) * float(bfloat(sums_0[i]));
+    value = richengine_silu(gate) * float(bfloat(sums_0[i]));
   } else if constexpr (is_same_v<Out, float>) {
     value = sums_0[i];
   } else {

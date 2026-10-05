@@ -13,11 +13,11 @@
 
 namespace {
 
-using namespace splash::ops::tuning;
+using namespace richengine::ops::tuning;
 
 constexpr CandidateId kCandidate{7};
 
-using splash::test::require;
+using richengine::test::require;
 
 RunTiming stableTiming(CandidateId candidate) {
   return candidate == kBaseline ? RunTiming{1, 2, false}

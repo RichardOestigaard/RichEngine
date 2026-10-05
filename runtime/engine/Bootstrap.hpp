@@ -1,10 +1,10 @@
 #pragma once
 
 #include "AwakeClock.hpp"
-#include "engine/MemoryControl.hpp"
-#include "engine/NativeRuntime.hpp"
+#include "engine/memory/MemoryControl.hpp"
+#include "engine/wire/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
-#include "engine/Status.hpp"
+#include "engine/wire/Status.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -15,7 +15,7 @@
 #include <string>
 #include <string_view>
 
-namespace splash::engine {
+namespace richengine::engine {
 
 enum class RuntimeBootstrapStage {
     ResourceAssembly,
@@ -161,4 +161,4 @@ private:
     RuntimeBootstrapReport report_;
 };
 
-}  // namespace splash::engine
+}  // namespace richengine::engine

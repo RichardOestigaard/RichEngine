@@ -1,6 +1,6 @@
 #include "model/RuntimeImpl.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
   void Runtime::Impl::noteNgramAt(Request &entry, uint32_t start) {
     auto &seen = entry.ngramIndex
@@ -14,7 +14,7 @@ namespace splash::model {
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
   // tokens then append through commitSelected.
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
-    if (!ngramPredraft_)
+    if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
       return;
     entry.ngramHistory.assign(prompt.begin(), prompt.end());
     entry.ngramIndex.clear();
@@ -27,7 +27,7 @@ namespace splash::model {
   }
 
   void Runtime::Impl::appendNgramTokens(Request &entry, std::span<const uint32_t> tokens) {
-    if (!ngramPredraft_)
+    if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
       return;
     for (const uint32_t token : tokens) {
       entry.ngramHistory.push_back(token);
@@ -70,7 +70,7 @@ namespace splash::model {
     if (!have)
       return 0;
     const uint32_t followers =
-        std::min<uint32_t>(SPLASH_DRAFT_PROPOSAL_TOKENS, bestFollowers);
+        std::min<uint32_t>(RICHENGINE_DRAFT_PROPOSAL_TOKENS, bestFollowers);
     std::copy_n(history.data() + best + 3, followers, out);
     return followers;
   }
@@ -96,22 +96,28 @@ namespace splash::model {
   // Greedy lanes only: injected proposals carry no probabilities.
   bool Runtime::Impl::applyNgramPredraft(std::span<Request *const> entries,
                           uint32_t width) {
-    if (!ngramPredraft_)
+    // A NullDraft model (Granite) has no GPU draft: the n-gram predraft is
+    // its only proposer, so the gates below do not veto it.
+    const bool nullDraft = std::holds_alternative<NullDraft>(draftModel);
+    if (!ngramPredraft_ && !nullDraft)
       return false;
-    std::array<std::array<uint32_t, SPLASH_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
+    std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
         proposals{};
     double score = 0;
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = *entries[lane];
-      if (samplingEnabled(entry))
+      // Sampled lanes cannot consume probability-free proposals; a Null
+      // draft still writes them (anchor repeats verify as the anchor or are
+      // rejected, wasting only rows).
+      if (samplingEnabled(entry) && !nullDraft)
         return false;
       const uint32_t found = ngramLookup(entry, proposals[lane].data());
       if (found) {
         // Repeat the last real candidate: a duplicate only loses its row.
-        for (uint32_t j = found; j < SPLASH_DRAFT_PROPOSAL_TOKENS; ++j)
+        for (uint32_t j = found; j < RICHENGINE_DRAFT_PROPOSAL_TOKENS; ++j)
           proposals[lane][j] = proposals[lane][found - 1];
       } else if (entry.pendingToken) {
-        std::fill_n(proposals[lane].data(), SPLASH_DRAFT_PROPOSAL_TOKENS,
+        std::fill_n(proposals[lane].data(), RICHENGINE_DRAFT_PROPOSAL_TOKENS,
                     *entry.pendingToken);
       }
       score += ngramLaneScore(entry, found != 0);
@@ -119,17 +125,17 @@ namespace splash::model {
         fprintf(stderr, "ngram-predraft lane=%u match=%u score=%.2f\n", lane,
                 found, ngramLaneScore(entry, found != 0));
     }
-    if (score < width * ngramDraftExpect_)
+    if (score < width * ngramDraftExpect_ && !nullDraft)
       return false;
     for (uint32_t lane = 0; lane < width; ++lane) {
       std::memcpy(contents<uint32_t>(
                       decodeArena->get(lane, DecodeTensor::ProposedTokens),
                       "ngram proposals"),
                   proposals[lane].data(),
-                  SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
+                  RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
       entries[lane]->ngramInFlight = true;
     }
     return true;
   }
 
-} // namespace splash::model
+} // namespace richengine::model

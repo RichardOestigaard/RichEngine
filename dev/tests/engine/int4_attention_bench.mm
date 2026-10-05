@@ -23,15 +23,15 @@
 #include <map>
 #include <vector>
 
-using namespace splash;
-using splash::ops::tuning::HostKvExtents;
+using namespace richengine;
+using richengine::ops::tuning::HostKvExtents;
 
 namespace {
 
 constexpr uint32_t kLayer = 0;
 constexpr uint32_t kKvHeads = 4, kQueryHeads = 24;   // 27b verify shape
 constexpr uint32_t kLanes = 4;
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kRows = RICHENGINE_TARGET_VERIFY_ROWS;
 
 metal::MetalBuffer alloc(metal::MetalBackend &backend, uint64_t bytes) {
   auto buffer = test::sharedBuffer(backend, bytes);
@@ -74,29 +74,29 @@ Result run(metal::MetalBackend &backend, uint32_t history, uint32_t lanes,
   std::array<metal::MetalBuffer, kLanes> tables;
   std::array<kv::ChunkedPrefillParams, kLanes> stores{};
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    tables[lane] = alloc(backend, pages * sizeof(SplashKvPage));
+    tables[lane] = alloc(backend, pages * sizeof(RichKvPage));
     pool.writeTable(std::span(pageIds).subspan(lane * pages, pages),
                     tables[lane].contents());
     stores[lane] = ops::PagedAttention::verifyParams(history, pages);
     for (uint32_t token = 0; token < history; ++token) {
       const uint32_t id = pageIds[lane * pages + token / 32];
       for (uint32_t head = 0; head < kKvHeads; ++head) {
-        const uint64_t slot = splash_kv_scale_element(head, token % 32);
-        pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.096f;
-        pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.112f;
+        const uint64_t slot = richengine_kv_scale_element(head, token % 32);
+        pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[slot] = 0.096f;
+        pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[slot] = 0.112f;
         for (uint32_t d = 0; d < 256; d += 2) {
           const uint8_t keyByte = uint8_t((code(token, head, d, lane, false) & 0xF) |
                                           (code(token, head, d + 1, lane, false) & 0xF) << 4);
           const uint8_t valueByte = uint8_t((code(token, head, d, lane, true) & 0xF) |
                                             (code(token, head, d + 1, lane, true) & 0xF) << 4);
-          const uint64_t keyIndex = splash_kv_key_element(head, token % 32, d) / 2;
+          const uint64_t keyIndex = richengine_kv_key_element(head, token % 32, d) / 2;
           // The unpack kernels' value order is dim-pair-major; the int4b
           // operand order is token-major like the keys.
           const uint64_t valueIndex =
               oldLayout ? uint64_t(head) * 4096 + (d / 2) * 32 + (token % 32)
-                        : splash_kv_key_element(head, token % 32, d) / 2;
-          pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = keyByte;
-          pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = valueByte;
+                        : richengine_kv_key_element(head, token % 32, d) / 2;
+          pool.slab<uint8_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyIndex] = keyByte;
+          pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[valueIndex] = valueByte;
         }
       }
     }
@@ -105,9 +105,9 @@ Result run(metal::MetalBackend &backend, uint32_t history, uint32_t lanes,
   const auto plan = ops::PagedAttention::verifyPlan(
       lanes, kQueryHeads, layout,
       std::vector<uint32_t>(lanes, history));
-  auto queries = alloc(backend, uint64_t(lanes) * kKvHeads * SPLASH_VERIFY_CHUNK_STRIDE *
+  auto queries = alloc(backend, uint64_t(lanes) * kKvHeads * RICHENGINE_VERIFY_CHUNK_STRIDE *
                                     (kQueryHeads / kKvHeads) * 256 * 2);
-  auto keys = alloc(backend, uint64_t(lanes) * kKvHeads * SPLASH_VERIFY_CHUNK_STRIDE * 256 * 2);
+  auto keys = alloc(backend, uint64_t(lanes) * kKvHeads * RICHENGINE_VERIFY_CHUNK_STRIDE * 256 * 2);
   auto values = alloc(backend, keys.sizeBytes());
   auto partials = alloc(backend, plan.workspace.partialsBytes);
   auto statistics = alloc(backend, plan.workspace.statisticsBytes);
@@ -120,7 +120,7 @@ Result run(metal::MetalBackend &backend, uint32_t history, uint32_t lanes,
       for (uint32_t head = 0; head < kQueryHeads; ++head)
         for (uint32_t d = 0; d < 256; ++d) {
           const uint64_t qi =
-              ((uint64_t{lane} * kKvHeads + head / 6) * SPLASH_VERIFY_CHUNK_STRIDE + row) * 6 +
+              ((uint64_t{lane} * kKvHeads + head / 6) * RICHENGINE_VERIFY_CHUNK_STRIDE + row) * 6 +
               head % 6;
           q[qi * 256 + d] =
               toBf16(float(int((row * 43 + head * 67 + d * 11) % 1019) - 509) / 1018.0f);
@@ -130,9 +130,9 @@ Result run(metal::MetalBackend &backend, uint32_t history, uint32_t lanes,
       for (uint32_t head = 0; head < kKvHeads; ++head)
         for (uint32_t d = 0; d < 256; ++d) {
           const uint64_t base = (uint64_t{lane} * kKvHeads + head) *
-                                SPLASH_VERIFY_CHUNK_STRIDE * 256;
+                                RICHENGINE_VERIFY_CHUNK_STRIDE * 256;
           ck[base + row * 256 + d] = toBf16(code(history + row, head, d, lane, false) * 0.096f);
-          cv[base + d * SPLASH_VERIFY_CHUNK_STRIDE + row] =
+          cv[base + d * RICHENGINE_VERIFY_CHUNK_STRIDE + row] =
               toBf16(code(history + row, head, d, lane, true) * 0.112f);
         }
 

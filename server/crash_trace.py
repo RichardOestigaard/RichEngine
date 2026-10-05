@@ -38,7 +38,7 @@ MAX_TRACE_FILES = 4
 MAX_TRACE_DISK_BYTES = 64 * 1024 * 1024
 REPLAY_TIMEOUT_SECONDS = 600
 SHUTDOWN_GRACE_SECONDS = 15.0
-DEFAULT_TRACE_DIRECTORY = Path.home() / "Library" / "Logs" / "Splash" / "crash"
+DEFAULT_TRACE_DIRECTORY = Path.home() / "Library" / "Logs" / "RichEngine" / "crash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +171,7 @@ class CrashTraceRing:
             DEFAULT_TRACE_DIRECTORY.mkdir(parents=True, exist_ok=True, mode=0o700)
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
             target = DEFAULT_TRACE_DIRECTORY / (
-                f"splash-crash-g{generation}-{timestamp}.json"
+                f"richengine-crash-g{generation}-{timestamp}.json"
             )
             descriptor, temporary = tempfile.mkstemp(
                 prefix=f".{target.name}.", dir=DEFAULT_TRACE_DIRECTORY
@@ -201,7 +201,7 @@ class CrashTraceRing:
     @staticmethod
     def _prune():
         files = sorted(
-            DEFAULT_TRACE_DIRECTORY.glob("splash-crash-g*-*.json"),
+            DEFAULT_TRACE_DIRECTORY.glob("richengine-crash-g*-*.json"),
             key=lambda path: path.stat().st_mtime_ns,
             reverse=True,
         )
@@ -218,7 +218,7 @@ def _load_trace(path: Path) -> dict:
         not isinstance(document, dict)
         or document.get("schema_version") != TRACE_SCHEMA_VERSION
     ):
-        raise ValueError("unsupported Splash crash trace")
+        raise ValueError("unsupported RichEngine crash trace")
     command = document.get("command")
     frames = document.get("frames")
     if (
@@ -300,7 +300,7 @@ def replay(path: Path) -> int:
                 suffix = "" if returncode is None else f" (exit status {returncode})"
                 raise RuntimeError(eof_message + suffix)
 
-        reader = threading.Thread(target=drain, name="splash-trace-replay", daemon=True)
+        reader = threading.Thread(target=drain, name="richengine-trace-replay", daemon=True)
         reader.start()
         with changed:
             if not changed.wait_for(
@@ -380,7 +380,7 @@ def replay(path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay a Splash native crash trace")
+    parser = argparse.ArgumentParser(description="Replay a RichEngine native crash trace")
     parser.add_argument("trace", type=Path)
     args = parser.parse_args()
     return replay(args.trace)

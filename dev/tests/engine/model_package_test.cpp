@@ -27,24 +27,24 @@
 
 namespace {
 
-using splash::model::DFlashDraftLayout;
-using splash::model::ModelDescriptor;
-using splash::model::WeightFile;
-using splash::model::WeightFileRecord;
-using splash::model::WeightStoreError;
-using splash::model::QwenAttentionWeights;
-using splash::model::QwenGdnWeights;
-using splash::model::Qwen3_8Layout;
-using splash::model::Qwen3_8Weights;
-using splash::ops::VisionLayout;
-using splash::model::kWeightFileAlignment;
-using splash::model::loadModelPackage;
-using splash::model::makeModelDescriptor;
-using splash::model::weightManifestFingerprint;
-using splash::metal::BufferStorage;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::test::sharedBuffer;
+using richengine::model::DFlashDraftLayout;
+using richengine::model::ModelDescriptor;
+using richengine::model::WeightFile;
+using richengine::model::WeightFileRecord;
+using richengine::model::WeightStoreError;
+using richengine::model::QwenAttentionWeights;
+using richengine::model::QwenGdnWeights;
+using richengine::model::Qwen3_8Layout;
+using richengine::model::Qwen3_8Weights;
+using richengine::ops::VisionLayout;
+using richengine::model::kWeightFileAlignment;
+using richengine::model::loadModelPackage;
+using richengine::model::makeModelDescriptor;
+using richengine::model::weightManifestFingerprint;
+using richengine::metal::BufferStorage;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::test::sharedBuffer;
 
 constexpr std::string_view kDraftLayerMagic = "MDFD0004";
 constexpr std::string_view kGgufImageMagic = "MDGG0001";
@@ -63,7 +63,7 @@ void require(bool condition, const std::string &message) {
 }
 
 void testStartupCapabilities() {
-    using splash::model::ExecutionLimits;
+    using richengine::model::ExecutionLimits;
     require(ExecutionLimits::maximumBatchWidth == 4 &&
                 ExecutionLimits::prefillTokenBudget == 2048 &&
                 ExecutionLimits::draftQueryRows == 8 &&
@@ -111,7 +111,7 @@ public:
     TempDirectory() {
         std::string pattern =
             (std::filesystem::temp_directory_path() /
-             "splash-model-package.XXXXXX").string();
+             "richengine-model-package.XXXXXX").string();
         char *created = mkdtemp(pattern.data());
         if (!created) fail("unable to create temporary directory");
         path_ = created;
@@ -336,7 +336,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
     const uint64_t baseline = backend.memoryStats().allocatedBytes;
     MetalBuffer retained;
     const auto readBack = [&] {
-        splash::metal::ComputeDispatch dispatch;
+        richengine::metal::ComputeDispatch dispatch;
         dispatch.pipelineName = "test_copy_u32";
         dispatch.buffers = {{0, retained}, {1, output}};
         dispatch.bytes = {{2, &elementCount, sizeof(elementCount)}};
@@ -347,9 +347,9 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         return std::memcmp(output.contents(), expected.data(), sizeof(expected)) == 0;
     };
     {
-        splash::model::WeightImages images(backend);
+        richengine::model::WeightImages images(backend);
         WeightFile file = images.load(
-            splash::model::packedImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
+            richengine::model::packedImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
         retained = file.section(sizeof(expected), "payload");
         require(retained.contents() != nullptr &&
                     reinterpret_cast<uintptr_t>(retained.contents()) % kWeightFileAlignment == 0,
@@ -364,7 +364,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         bool refused = false;
         try {
             (void)readBack();
-        } catch (const splash::metal::MetalBackendError &error) {
+        } catch (const richengine::metal::MetalBackendError &error) {
             refused = std::string_view(error.what()).find("binds released memory") != std::string_view::npos;
         }
         require(refused, "a command bound released image memory");
@@ -393,8 +393,8 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
 
     const auto load = [&](const std::filesystem::path &path, std::string_view magic, uint32_t layer,
                           uint32_t type) {
-        splash::model::WeightImages images(backend);
-        return images.load(splash::model::packedImage(path, "test/" + path.filename().string(), magic, layer, type));
+        richengine::model::WeightImages images(backend);
+        return images.load(richengine::model::packedImage(path, "test/" + path.filename().string(), magic, layer, type));
     };
     auto headerPath = root / "header.bin";
     writeWeightFile(headerPath, "TEST0001", 7, 9, sections);
@@ -456,22 +456,22 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
     constexpr uint32_t rows = 256, columns = 256;
     // Q8_0 planes and native rows as the planner lays them out.
     const QuantFormat &q80 = kQuantFormats[GGUF_FMT_Q80];
-    const splash::model::GgufPlaneBytes planes = splash::model::ggufPlaneBytes(q80, rows, columns);
+    const richengine::model::GgufPlaneBytes planes = richengine::model::ggufPlaneBytes(q80, rows, columns);
     const auto projection = writeGgufTensor(root / "projection.bin", q80.ggml_type, rows, columns,
                                             {q80.plane0_bytes, q80.plane1_bytes, q80.meta_bytes, q80.meta_groups},
                                             {planes.plane0, planes.plane1, planes.meta});
     const auto embedding = writeGgufTensor(root / "embedding.bin", q80.ggml_type, rows, columns, {0, 0, 0, 0},
-                                           {rows * splash::model::ggufRowBytes(q80, columns), 0, 0});
-    splash::model::WeightImages images(backend);
+                                           {rows * richengine::model::ggufRowBytes(q80, columns), 0, 0});
+    richengine::model::WeightImages images(backend);
     const auto loaded = [&](const std::filesystem::path &path) {
         return images.load(
-            splash::model::packedImage(path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0));
+            richengine::model::packedImage(path, "test/" + path.filename().string(), kGgufImageMagic, 0, 0));
     };
     {
         // finish() proves the reader took exactly the descriptor, plane0 and
         // meta sections; the segment's format comes from the descriptor.
         WeightFile file = loaded(projection);
-        const auto read = splash::model::readBlockProjection(file, rows, columns, "projection");
+        const auto read = richengine::model::readBlockProjection(file, rows, columns, "projection");
         file.finish();
         const auto &segment = read.blocks().segments.at(0);
         require(segment.formatId == GGUF_FMT_Q80 && !segment.plane1, "GGUF projection did not read a Q8_0 segment");
@@ -480,31 +480,31 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
         requirePackedError(
             [&] {
                 WeightFile file = loaded(projection);
-                (void)splash::model::readBlockProjection(file, output, input, "projection");
+                (void)richengine::model::readBlockProjection(file, output, input, "projection");
             },
             "GGUF projection of other sizes than the layout's was accepted");
         requirePackedError(
             [&] {
                 WeightFile file = loaded(embedding);
-                (void)splash::model::readBlockEmbedding(file, output, input, "embedding");
+                (void)richengine::model::readBlockEmbedding(file, output, input, "embedding");
             },
             "GGUF embedding of other sizes than the layout's was accepted");
     }
     WeightFile file = loaded(embedding);
-    const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
+    const auto table = richengine::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
     constexpr uint32_t gathered = 8;
     const MetalBuffer tokens = sharedBuffer(backend, gathered * sizeof(uint32_t));
     const MetalBuffer output =
-        sharedBuffer(backend, uint64_t{gathered} * columns * splash::model::kBFloat16Bytes);
-    splash::metal::CommandGraph graph;
-    splash::ops::Embedding::add(graph, tokens, table, output, gathered);
+        sharedBuffer(backend, uint64_t{gathered} * columns * richengine::model::kBFloat16Bytes);
+    richengine::metal::CommandGraph graph;
+    richengine::ops::Embedding::add(graph, tokens, table, output, gathered);
     for (const auto &[tokenBytes, outputBytes] :
          {std::pair{tokens.sizeBytes() - sizeof(uint32_t), output.sizeBytes()},
-          std::pair{tokens.sizeBytes(), output.sizeBytes() - splash::model::kBFloat16Bytes}}) {
+          std::pair{tokens.sizeBytes(), output.sizeBytes() - richengine::model::kBFloat16Bytes}}) {
         bool rejected = false;
         try {
-            splash::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
+            richengine::ops::Embedding::add(graph, backend.view(tokens, 0, tokenBytes), table,
                                         backend.view(output, 0, outputBytes), gathered);
         } catch (const std::invalid_argument &) {
             rejected = true;
@@ -569,7 +569,7 @@ void testSyntheticPackage(MetalBackend &backend,
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
-        require(std::get<splash::model::DFlashDraftWeights>(package.draft).layers.size() == draft.layers,
+        require(std::get<richengine::model::DFlashDraftWeights>(package.draft).layers.size() == draft.layers,
                 "draft layer vector is incomplete");
         require(std::holds_alternative<QwenGdnWeights>(
                     loadedTarget.layers[0].mixer),
@@ -579,18 +579,18 @@ void testSyntheticPackage(MetalBackend &backend,
                 "target full-attention layer has the wrong typed layout");
         require(loadedTarget.files.size() == target.layers + 2,
                 "target file records are incomplete");
-        require(std::get<splash::model::DFlashDraftWeights>(package.draft).files.size() == draft.layers + 1,
+        require(std::get<richengine::model::DFlashDraftWeights>(package.draft).files.size() == draft.layers + 1,
                 "draft file records are incomplete");
         require(declaredBytes(loadedTarget.files) == expected.targetBytes,
                 "target declared byte accounting is wrong");
-        require(declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files) == expected.draftBytes,
+        require(declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files) == expected.draftBytes,
                 "draft declared byte accounting is wrong");
         require(package.vision.tensors.blocks.size() == vision.depth &&
                     package.vision.files.size() == 1 &&
                     declaredBytes(package.vision.files) == expected.visionBytes,
                 "vision role records are incomplete");
         require(loadedTarget.actualAllocatedBytes +
-                    std::get<splash::model::DFlashDraftWeights>(package.draft).actualAllocatedBytes +
+                    std::get<richengine::model::DFlashDraftWeights>(package.draft).actualAllocatedBytes +
                     package.vision.actualAllocatedBytes ==
                     backend.memoryStats().allocatedBytes - baseline,
                 "actual package allocation accounting is wrong");
@@ -598,8 +598,8 @@ void testSyntheticPackage(MetalBackend &backend,
                 "manifest SHA-256 has the wrong length");
 
         std::vector<WeightFileRecord> records = loadedTarget.files;
-        records.insert(records.end(), std::get<splash::model::DFlashDraftWeights>(package.draft).files.begin(),
-                       std::get<splash::model::DFlashDraftWeights>(package.draft).files.end());
+        records.insert(records.end(), std::get<richengine::model::DFlashDraftWeights>(package.draft).files.begin(),
+                       std::get<richengine::model::DFlashDraftWeights>(package.draft).files.end());
         records.insert(records.end(), package.vision.files.begin(),
                        package.vision.files.end());
         require(weightManifestFingerprint(records) ==
@@ -624,9 +624,9 @@ void testSyntheticPackage(MetalBackend &backend,
                     package.manifestFingerprintSha256,
                 "manifest fingerprint ignores the sources' identity");
 
-        require(std::get<splash::model::DFlashDraftWeights>(package.draft).layers[0].attentionDynamic.outputSize ==
+        require(std::get<richengine::model::DFlashDraftWeights>(package.draft).layers[0].attentionDynamic.outputSize ==
                         draft.dynamicSize &&
-                    std::get<splash::model::DFlashDraftWeights>(package.draft).layers[0].downProjection.outputSize ==
+                    std::get<richengine::model::DFlashDraftWeights>(package.draft).layers[0].downProjection.outputSize ==
                         draft.hiddenSize,
                 "draft projections lost their logical dimensions");
         actualTrackedBytes =
@@ -643,7 +643,7 @@ void testSyntheticPackage(MetalBackend &backend,
         package.images->release();
         require(backend.memoryStats().allocatedBytes - baseline ==
                     actualTrackedBytes - declaredBytes(loadedTarget.files) -
-                        declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files) - declaredBytes(package.vision.files),
+                        declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files) - declaredBytes(package.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
         require(!package.images->restore() && !package.images->contents()[0].bytes.empty() &&
@@ -679,16 +679,16 @@ void validateRealPackage(MetalBackend &backend,
     std::string fingerprint;
     std::string name;
     {
-        auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root));
+        auto package = loadModelPackage(backend, root, richengine::model::inspectModelPackage(root));
         targetBytes = declaredBytes(package.targetFiles());
-        draftBytes = declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files);
+        draftBytes = declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files);
         visionBytes = declaredBytes(package.vision.files);
         const uint32_t targetLayers = std::visit(
             [](const auto &weights) { return weights.layout.layers; },
             package.target);
         require(package.targetFiles().size() == targetLayers + 2,
                 "real target file set is incomplete");
-        require(std::get<splash::model::DFlashDraftWeights>(package.draft).files.size() == std::get<splash::model::DFlashDraftWeights>(package.draft).layout.layers + 1,
+        require(std::get<richengine::model::DFlashDraftWeights>(package.draft).files.size() == std::get<richengine::model::DFlashDraftWeights>(package.draft).layout.layers + 1,
                 "real draft file set is incomplete");
         require(package.vision.files.size() == 1,
                 "real vision file set is incomplete");
@@ -716,7 +716,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     require(bool(input), "unable to read model manifest for format test");
     const std::string original{std::istreambuf_iterator<char>(input),
                                std::istreambuf_iterator<char>()};
-    const std::string_view originalPrefix = "splash-packed-q4";
+    const std::string_view originalPrefix = "richengine-packed-q4";
     const size_t offset = original.find(originalPrefix);
     require(offset != std::string::npos, "model manifest lacks a known format");
 
@@ -724,10 +724,10 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     std::filesystem::create_directory(temporary.path() / "tokenizer");
     std::filesystem::copy_file(root / "tokenizer/config.json",
                                temporary.path() / "tokenizer/config.json");
-    const auto expected = splash::model::inspectModelPackage(root);
+    const auto expected = richengine::model::inspectModelPackage(root);
     for (std::string_view name : {std::string_view(expected.name),
                                   std::string_view("Community fine-tune")}) {
-        for (std::string_view prefix : {"splash-packed-q4", "unknown-packed-q4"}) {
+        for (std::string_view prefix : {"richengine-packed-q4", "unknown-packed-q4"}) {
             std::string manifest = original;
             manifest.replace(offset, originalPrefix.size(), prefix);
             const std::string originalName = '"' + expected.name + '"';
@@ -743,7 +743,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
             }
             try {
                 const auto descriptor =
-                    splash::model::inspectModelPackage(temporary.path());
+                    richengine::model::inspectModelPackage(temporary.path());
                 require(prefix != "unknown-packed-q4",
                         "unknown model format was accepted");
                 require(descriptor.name == name &&
@@ -771,7 +771,7 @@ void writeJson(const std::filesystem::path &path, std::string_view text) {
 // (MiniCPM5's flat fields, LFM2.5's dflash_config nesting) must parse to
 // their expected layouts.
 void testDSparkDescriptors(const std::filesystem::path &root) {
-    using splash::model::DraftKind;
+    using richengine::model::DraftKind;
     {
         const std::filesystem::path package = root / "minicpm5";
         std::filesystem::create_directories(package / "draft");
@@ -781,8 +781,8 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                   R"({"model_type":"llama","hidden_size":2048,"num_hidden_layers":42,"vocab_size":130560,"max_position_embeddings":131072,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144})");
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144,"vocab_size":130560,"hidden_act":"silu","rms_norm_eps":1e-06,"attention_bias":false,"tie_word_embeddings":false,"rope_parameters":{"rope_theta":5000000,"rope_type":"default"},"block_size":7,"mask_token_id":75982,"target_layer_ids":[1,10,20,30,39],"num_target_layers":42,"projector_type":"dspark","markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"confidence_head_alpha":1.0,"attention_mode":"gqa","layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"]})");
-        const auto descriptor = splash::model::inspectModelPackage(package);
-        require(std::holds_alternative<splash::model::DenseLayout>(descriptor.target),
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(std::holds_alternative<richengine::model::DenseLayout>(descriptor.target),
                 "MiniCPM5 target is not the dense layout");
         require(descriptor.draft.kind == DraftKind::DSpark,
                 "MiniCPM5 draft is not a DSpark layout");
@@ -798,7 +798,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                     !d.dynamicSize,
                 "MiniCPM5 DSpark layout differs from the config");
         require(descriptor.stateLayout.draft ==
-                    splash::model::DraftStateLayout{5, 2, 128},
+                    richengine::model::DraftStateLayout{5, 2, 128},
                 "MiniCPM5 draft state layout mismatch");
         require(descriptor.valid(), "MiniCPM5 descriptor is invalid");
     }
@@ -827,8 +827,8 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                       layers + "}");
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":10000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,9,17,21,27],"num_target_layers":30},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
-        const auto descriptor = splash::model::inspectModelPackage(package);
-        require(std::holds_alternative<splash::model::Lfm2Layout>(descriptor.target),
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(std::holds_alternative<richengine::model::Lfm2Layout>(descriptor.target),
                 "LFM2.5 target is not the LFM2 layout");
         const auto &d = descriptor.draft;
         require(d.kind == DraftKind::DSpark && d.layers == 5 &&
@@ -840,7 +840,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                     d.rotaryTheta == 10'000'000.0F,
                 "LFM2.5 DSpark layout differs from the config");
         require(descriptor.stateLayout.draft ==
-                    splash::model::DraftStateLayout{5, 8, 64},
+                    richengine::model::DraftStateLayout{5, 8, 64},
                 "LFM2.5 draft state layout mismatch");
         require(descriptor.valid(), "LFM2.5 descriptor is invalid");
     }
@@ -875,11 +875,11 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                       layers + "}");
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":5000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,6,10,14,18],"num_target_layers":24},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
-        const auto descriptor = splash::model::inspectModelPackage(package);
-        require(std::holds_alternative<splash::model::Lfm2MoeLayout>(descriptor.target),
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(std::holds_alternative<richengine::model::Lfm2MoeLayout>(descriptor.target),
                 "LFM2.5-8B target is not the LFM2-MoE layout");
         const auto &target =
-            std::get<splash::model::Lfm2MoeLayout>(descriptor.target);
+            std::get<richengine::model::Lfm2MoeLayout>(descriptor.target);
         require(target.layers == 24 && target.experts == 32 &&
                     target.expertsPerToken == 4 &&
                     target.expertIntermediateSize == 1792 &&

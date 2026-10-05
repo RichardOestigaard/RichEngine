@@ -4,7 +4,7 @@
 
 Shell completion must never block and must work offline, so it only ever reads
 files. The bundled catalog is versioned with the source; the cache is
-refreshed in the background by `splash serve` and lives
+refreshed in the background by `richengine serve` and lives
 under the per-user data directory.
 
 Readers take the union of the two. A cache that is missing, stale, empty or
@@ -35,7 +35,7 @@ from . import paths
 from .models import ModelError, validate_repo_id
 
 # The collection is the source of truth for which packages are official.
-COLLECTION = "incoai/splash-6aac69afeba907af0511ec14"
+COLLECTION = "incoai/richengine-6aac69afeba907af0511ec14"
 HUB_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
 BUNDLED = paths.ROOT / "install/completions/official-models.txt"
@@ -169,7 +169,7 @@ def _offline() -> bool:
 def spawn_refresh() -> None:
     """Refresh the cache in a detached child, if it looks stale.
 
-    `splash serve` replaces itself with the server via execve, so this cannot
+    `richengine serve` replaces itself with the server via execve, so this cannot
     be a thread. It is deliberately fire-and-forget: the caller never learns
     the outcome, and a failure is indistinguishable from not having run.
     """

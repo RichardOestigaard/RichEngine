@@ -42,39 +42,39 @@
 
 namespace {
 
-using splash::DeviceCapabilities;
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::FloatOutput;
-using splash::ops::FloatTile;
-using splash::ops::BlockExpertProjection;
-using splash::ops::BlockMoeWeights;
-using splash::ops::QuantizedSegment;
-using splash::ops::MoE;
-using splash::ops::MoeBuffers;
-using splash::ops::MoeConfig;
-using splash::ops::MoeScratchField;
-using splash::ops::kAssumedGpuCores;
-using splash::ops::kMoeScratchFields;
-using splash::ops::MoeExpertSimdgroups;
-using splash::ops::MoeExpertTile;
-using splash::ops::MoeGgufTile;
-using splash::ops::MoePlan;
-using splash::ops::MoeShape;
-using splash::ops::MoeWeights;
-using splash::ops::moeRouteWideRows;
-using splash::ops::LinearEpilogue;
-using splash::ops::LinearMatrix;
-using splash::ops::LinearPhase;
-using splash::ops::LinearPlan;
-using splash::ops::LinearScratch;
-using splash::ops::LinearScratchSize;
-using splash::ops::Linear;
-using splash::ops::PreparedInput;
-using splash::ops::Projection;
-using splash::ops::WeightLayout;
+using richengine::DeviceCapabilities;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::FloatOutput;
+using richengine::ops::FloatTile;
+using richengine::ops::BlockExpertProjection;
+using richengine::ops::BlockMoeWeights;
+using richengine::ops::QuantizedSegment;
+using richengine::ops::MoE;
+using richengine::ops::MoeBuffers;
+using richengine::ops::MoeConfig;
+using richengine::ops::MoeScratchField;
+using richengine::ops::kAssumedGpuCores;
+using richengine::ops::kMoeScratchFields;
+using richengine::ops::MoeExpertSimdgroups;
+using richengine::ops::MoeExpertTile;
+using richengine::ops::MoeGgufTile;
+using richengine::ops::MoePlan;
+using richengine::ops::MoeShape;
+using richengine::ops::MoeWeights;
+using richengine::ops::moeRouteWideRows;
+using richengine::ops::LinearEpilogue;
+using richengine::ops::LinearMatrix;
+using richengine::ops::LinearPhase;
+using richengine::ops::LinearPlan;
+using richengine::ops::LinearScratch;
+using richengine::ops::LinearScratchSize;
+using richengine::ops::Linear;
+using richengine::ops::PreparedInput;
+using richengine::ops::Projection;
+using richengine::ops::WeightLayout;
 using namespace gguf_reference;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
@@ -208,7 +208,7 @@ int floatProjection(MetalBackend &backend) {
                                                         "float-output");
             std::memset(output.contents(), 0x7F, output.sizeBytes());
             CommandGraph graph;
-            splash::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type, tile);
+            richengine::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type, tile);
             static_cast<void>(backend.submitCommand(graph.dispatches()));
             size_t outside = 0, touched = 0;
             for (uint32_t r = 0; r <= rows; ++r)
@@ -268,9 +268,9 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
   const Tensor q80 = quantized(backend, Q80, 256, K), q4k = quantized(backend, Q4K, 256, K);
   const Tensor gates = floating(backend, floatColumns, K, 0.05f);
   const auto at = [](QuantizedSegment s, uint32_t offset) { s.columnOffset = offset; return s; };
-  Projection full(N, K, splash::ops::BlockWeights{{at(q80.segment, 0),
+  Projection full(N, K, richengine::ops::BlockWeights{{at(q80.segment, 0),
       at(q4k.segment, 256), at(gates.segment, kFloatColumn)}});
-  Projection quantizedOnly(N, K, splash::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
+  Projection quantizedOnly(N, K, richengine::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
   int failures = 0;
   for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
     DeviceCapabilities device = backend.capabilities();
@@ -351,8 +351,8 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
 int floatOnlyChain(MetalBackend &backend) {
   constexpr uint32_t K = 1024, N = 256;
   const Tensor gates = floating(backend, N, K, 0.05f), q4k = quantized(backend, Q4K, N, K);
-  const Projection floats(N, K, splash::ops::BlockWeights{{gates.segment}});
-  const Projection blocks(N, K, splash::ops::BlockWeights{{q4k.segment}});
+  const Projection floats(N, K, richengine::ops::BlockWeights{{gates.segment}});
+  const Projection blocks(N, K, richengine::ops::BlockWeights{{q4k.segment}});
   DeviceCapabilities device = backend.capabilities();
   device.appleGpuFamily = 9;
   const Linear linear(device);

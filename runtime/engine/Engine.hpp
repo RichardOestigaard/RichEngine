@@ -1,14 +1,15 @@
 #pragma once
 
 #include "ops/Vision.hpp"
-#include "engine/Cache.hpp"
-#include "engine/MemoryGovernor.hpp"
+#include "engine/cache/Cache.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
 #include "engine/Scheduler.hpp"
-#include "engine/Types.hpp"
-#include "engine/WriteBehind.hpp"
+#include "engine/wire/Types.hpp"
+#include "engine/memory/WriteBehind.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -17,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace splash::engine {
+namespace richengine::engine {
 
 // Prefill checkpoints sit at multiples of this many tokens
 // (plannedCheckpoints): two draft windows balance recovery granularity and
@@ -151,11 +152,11 @@ public:
 
   [[nodiscard]] bool tick(double nowMilliseconds);
   [[nodiscard]] bool commandInFlight() const noexcept {
-    return pending_.has_value();
+    return !pending_.empty();
   }
   // No request is waiting, running or draining.
   [[nodiscard]] bool idle() const noexcept {
-    return requests_.empty() && !pending_;
+    return requests_.empty() && pending_.empty();
   }
   [[nodiscard]] std::optional<double> nextWakeupMilliseconds() const;
   [[nodiscard]] EngineSnapshot snapshot() const;
@@ -341,7 +342,11 @@ private:
                                      uint32_t promptProcessed, double nowMilliseconds);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,
                                  std::vector<ModelBatchItem> &items,
-                                 double nowMilliseconds);
+                                 double nowMilliseconds, bool forAhead = false);
+  // Commits the next command behind the running one when the submit-ahead
+  // rules allow it: a prefill plan behind an in-flight prefill, with the
+  // model holding a free host-input bank for it.
+  [[nodiscard]] bool trySubmitAhead(double now);
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the
@@ -496,7 +501,9 @@ private:
                                     std::optional<RequestPriority> tier,
                                     bool draining) const;
   std::function<void()> completionNotifier_;
-  std::optional<Pending> pending_;
+  // Commands submitted, oldest first: the running command plus at most one
+  // chunk submitted ahead of it (the submit-ahead ring).
+  std::deque<Pending> pending_;
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
   // The lanes admit() has obtained so far, including those it gave back when
@@ -513,4 +520,4 @@ private:
   EngineSnapshot counters_;
 };
 
-} // namespace splash::engine
+} // namespace richengine::engine

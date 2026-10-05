@@ -4,7 +4,7 @@
 #include <array>
 #include <cmath>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 namespace {
 
 bool validPolicy(const Policy &policy) noexcept {
@@ -145,4 +145,4 @@ Selection selectCandidate(std::span<const CandidateMeasurements> candidates,
   return result;
 }
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

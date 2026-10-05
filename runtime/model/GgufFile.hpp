@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 class GgufError : public std::runtime_error {
 public:
@@ -122,4 +122,4 @@ private:
   std::map<std::string, size_t, std::less<>> index_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 // Ornith 1.5 9B: a dense qwen3_5_text hybrid like the 27B, with 32 layers of
 // hidden 4096, 32 GDN value heads and the DFlash2 draft's eight capture
@@ -50,4 +50,4 @@ using Ornith9BWeights = QwenTargetWeights<Ornith9BLayout, Qwen3_8LayerWeights>;
 loadOrnith9BWeights(metal::MetalBackend &backend, Ornith9BLayout layout,
                     const QwenTargetFiles<Ornith9BLayout> &files);
 
-} // namespace splash::model
+} // namespace richengine::model

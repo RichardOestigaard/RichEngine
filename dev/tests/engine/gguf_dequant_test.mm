@@ -15,10 +15,10 @@
 #include <vector>
 
 using namespace gguf_reference;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::test::sharedBuffer;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::test::sharedBuffer;
 
 namespace {
 

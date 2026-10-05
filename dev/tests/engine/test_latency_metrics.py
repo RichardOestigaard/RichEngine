@@ -9,7 +9,7 @@ from server.metrics import prometheus_metrics
 
 class LatencyTests(unittest.TestCase):
     def test_scheduler_metric_preserves_zero_and_missing_status(self):
-        name = "splash_scheduler_decode_batches_total"
+        name = "richengine_scheduler_decode_batches_total"
         self.assertIn(
             name + " 0",
             prometheus_metrics({"scheduler": {"decode_batches": 0}}).splitlines(),
@@ -25,9 +25,9 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual(list(sample["buckets"].values())[:2], [2, 3])
         self.assertEqual(sample["buckets"]["+Inf"], 4)
         text = prometheus_metrics({"latency": metrics.snapshot()})
-        self.assertIn('splash_http_ttft_seconds_bucket{le="0.001"} 2', text)
-        self.assertIn('splash_http_ttft_seconds_bucket{le="+Inf"} 4', text)
-        self.assertIn("splash_http_ttft_seconds_count 4", text)
+        self.assertIn('richengine_http_ttft_seconds_bucket{le="0.001"} 2', text)
+        self.assertIn('richengine_http_ttft_seconds_bucket{le="+Inf"} 4', text)
+        self.assertIn("richengine_http_ttft_seconds_count 4", text)
         self.assertEqual(len(sample["buckets"]), len(BUCKETS) + 1)
 
     def test_timer_records_failures_and_native_batches_are_not_individual_tokens(self):

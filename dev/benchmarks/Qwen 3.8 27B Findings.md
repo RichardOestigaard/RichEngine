@@ -64,7 +64,7 @@ attention layer of the model's store + attention graph:
   the 287 GB/s the m8 tiles sustain above.
 - "fp32 split partials scale linearly in history" is only true below ~65k
   tokens: `kv::verifyAttentionSplits` takes one split per 16 pages, capped at
-  128 (`SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS`). At 131k the partials are a
+  128 (`RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS`). At 131k the partials are a
   fixed ~25 MB per layer (~9% of the KV traffic); the linear cost at 131k is
   the KV read itself running at half bandwidth.
 - The model has 16 full-attention layers (64 layers, full-attention period

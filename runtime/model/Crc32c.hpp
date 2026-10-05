@@ -7,7 +7,7 @@
 #include <cstring>
 #include <span>
 
-namespace splash::model {
+namespace richengine::model {
 
 // CRC-32C (Castagnoli), which a persistent slot file keeps for each slot's
 // payload and record. A running value continues across calls:
@@ -27,4 +27,4 @@ namespace splash::model {
   return ~state;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

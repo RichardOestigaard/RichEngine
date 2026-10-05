@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace splash::test {
+namespace richengine::test {
 
 // A 32-bit integer hash for deterministic fixture values.
 inline uint32_t mix(uint32_t value) {
@@ -71,4 +71,4 @@ ops::ExpertProjection expertSlabs(metal::MetalBackend &backend, uint32_t experts
   return {packed, experts, outputSize, inputSize, stride};
 }
 
-} // namespace splash::test
+} // namespace richengine::test

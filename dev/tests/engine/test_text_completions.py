@@ -405,7 +405,7 @@ class TextCompletionLifecycleTests(unittest.TestCase):
                         self.assertEqual(response.status, 200)
                         if before_start:
                             self.assertEqual(
-                                response.readline(), b": splash-keepalive\n"
+                                response.readline(), b": richengine-keepalive\n"
                             )
                             self.assertFalse(plan.started.is_set())
                             plan.start_release.set()

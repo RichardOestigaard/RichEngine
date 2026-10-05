@@ -235,7 +235,7 @@ class HttpBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             with mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", directory):
-                ring = crash_trace.CrashTraceRing(("splash", "serve-native"))
+                ring = crash_trace.CrashTraceRing(("richengine", "serve-native"))
                 ring.start_generation(1, 1)
                 ring.record_bytes(1, "client_to_engine", b"private synthetic content")
                 self.assertIsNone(
@@ -256,7 +256,7 @@ class HttpBoundaryTests(unittest.TestCase):
                 mock.patch.object(crash_trace, "MAX_TRACE_FILES", 2),
             ):
                 ring = crash_trace.CrashTraceRing(
-                    ("splash", "serve-native"), enabled=True
+                    ("richengine", "serve-native"), enabled=True
                 )
                 for generation in range(1, 5):
                     ring.start_generation(generation, 1)

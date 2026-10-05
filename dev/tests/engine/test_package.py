@@ -26,7 +26,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
-                ("build", ("splash", "splash.metallib")),
+                ("build", ("richengine", "richengine.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -65,7 +65,7 @@ class PackageTests(unittest.TestCase):
                     package.main(["--version", version, "--macos-min", "26.4"])
                 self.assertEqual(run.call_count, 4)
                 with tarfile.open(
-                    root / f"dist/splash-{version}-arm64-macos26.tar.gz"
+                    root / f"dist/richengine-{version}-arm64-macos26.tar.gz"
                 ) as archive:
                     for member in archive.getmembers():
                         self.assertNotIn("download-token", member.name)
@@ -74,7 +74,7 @@ class PackageTests(unittest.TestCase):
                             self.assertNotIn(b"hf_legacycredential", content)
                             self.assertNotIn(b"hf_testcredential", content)
                     with archive.extractfile(
-                        f"splash-{version}-arm64-macos26/install/completions/official-models.txt"
+                        f"richengine-{version}-arm64-macos26/install/completions/official-models.txt"
                     ) as catalog:
                         self.assertEqual(catalog.read(), b"company/Published\n")
 
@@ -86,7 +86,7 @@ class PackageTests(unittest.TestCase):
             for folder, names in (
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
-                ("build", ("splash", "splash.metallib")),
+                ("build", ("richengine", "richengine.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -97,9 +97,9 @@ class PackageTests(unittest.TestCase):
             completions.mkdir()
             completion_names = {
                 "models",
-                "_splash",
-                "splash.bash",
-                "splash.fish",
+                "_richengine",
+                "richengine.bash",
+                "richengine.fish",
                 "official-models.txt",
                 "suggested-models.txt",
             }
@@ -165,7 +165,7 @@ class PackageTests(unittest.TestCase):
                     namespace = {"__file__": str(prefix / "install/paths.py")}
                     exec(compile(source, "paths.py", "exec"), namespace)
                     self.assertTrue(namespace["PACKAGED"])
-                    self.assertEqual(namespace["BINARY"], prefix / "engine/splash")
+                    self.assertEqual(namespace["BINARY"], prefix / "engine/richengine")
                     self.assertEqual(namespace["PYTHON"], prefix / "python/bin/python3")
                     results.append((namespace["MODELS"], namespace["RUNTIME"]))
                 self.assertEqual(results[0], results[1])
@@ -176,7 +176,7 @@ class PackageTests(unittest.TestCase):
             "1.0", "https://example.org/release.tar.gz", "a" * 64, "26.4"
         )
         self.assertIn("depends_on macos: :tahoe", text)
-        self.assertIn("depends_on SplashMacOSRequirement", text)
+        self.assertIn("depends_on RichMacOSRequirement", text)
         self.assertIn(
             'satisfy(build_env: false) { OS.mac? && MacOS.full_version >= "26.4" }',
             text,
@@ -190,7 +190,7 @@ class PackageTests(unittest.TestCase):
         self.assertNotIn("pip install", text)
         self.assertNotIn("download-token", text)
         self.assertIn('"$@"', text)
-        self.assertIn('chmod 0755, bin/"splash"', text)
+        self.assertIn('chmod 0755, bin/"richengine"', text)
 
     @unittest.skipUnless(shutil.which("ruby"), "Ruby is needed to exercise the formula")
     def test_formula_checks_minimum_os_without_running_install(self):
@@ -218,7 +218,7 @@ module MacOS
   def self.full_version; Version.new(ENV.fetch("TEST_VERSION")); end
 end
 eval STDIN.read
-puts SplashMacOSRequirement.check
+puts RichMacOSRequirement.check
 """
         formula = package.formula(
             "1.0", "https://example.org/a.tar.gz", "a" * 64, "26.4"
@@ -247,18 +247,18 @@ puts SplashMacOSRequirement.check
 
     @unittest.skipUnless(shutil.which("ruby"), "Ruby is needed to exercise the formula")
     def test_formula_completion_links_survive_upgrading_an_existing_keg(self):
-        with tempfile.TemporaryDirectory(prefix="splash formula ") as temporary:
+        with tempfile.TemporaryDirectory(prefix="richengine formula ") as temporary:
             root = Path(temporary)
             brew = root / "homebrew prefix"
-            previous = brew / "Cellar/splash/old"
-            prefix = brew / "Cellar/splash/new"
-            opt = brew / "opt/splash"
+            previous = brew / "Cellar/richengine/old"
+            prefix = brew / "Cellar/richengine/new"
+            opt = brew / "opt/richengine"
             opt.parent.mkdir(parents=True)
             opt.symlink_to(previous)
             completion_entries = (
-                ("share/zsh/site-functions/_splash", "_splash"),
-                ("etc/bash_completion.d/splash", "splash.bash"),
-                ("share/fish/vendor_completions.d/splash.fish", "splash.fish"),
+                ("share/zsh/site-functions/_richengine", "_richengine"),
+                ("etc/bash_completion.d/richengine", "richengine.bash"),
+                ("share/fish/vendor_completions.d/richengine.fish", "richengine.fish"),
             )
             old_assets = previous / "libexec/install/completions"
             old_assets.mkdir(parents=True)
@@ -278,19 +278,19 @@ puts SplashMacOSRequirement.check
             assets = source / "install/completions"
             assets.mkdir(parents=True)
             for name in (
-                "_splash",
-                "splash.bash",
-                "splash.fish",
+                "_richengine",
+                "richengine.bash",
+                "richengine.fish",
                 "official-models.txt",
             ):
                 (assets / name).write_text(f"fixture {name}\n")
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
             (assets / "models").chmod(0o755)
             prefix.mkdir()
-            formula = root / "splash.rb"
+            formula = root / "richengine.rb"
             formula.write_text(
                 package.formula(
-                    "test", "https://example.org/splash.tar.gz", "a" * 64, "26.4"
+                    "test", "https://example.org/richengine.tar.gz", "a" * 64, "26.4"
                 )
             )
             # Match Homebrew's parent realpath and relative install_symlink
@@ -339,7 +339,7 @@ class Formula
   def odie(message); raise message; end
 end
 load ARGV[0]
-Splash.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
+RichEngine.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
 """
             subprocess.run(
                 ["ruby", "-e", driver, str(formula), str(prefix), str(opt)],
@@ -382,16 +382,16 @@ class InstallerTests(unittest.TestCase):
         self.bin = self.root / "bin"
         for folder in (self.root / "home", self.releases, self.bin):
             folder.mkdir()
-        self.app = self.root / "home/Library/Application Support/Splash/app"
-        self.command = self.bin / "splash"
+        self.app = self.root / "home/Library/Application Support/RichEngine/app"
+        self.command = self.bin / "richengine"
 
     def publish(
         self,
         version,
         help_status=0,
-        completions=("splash.bash", "_splash", "splash.fish"),
+        completions=("richengine.bash", "_richengine", "richengine.fish"),
     ):
-        name = f"splash-{version}-arm64-macos26"
+        name = f"richengine-{version}-arm64-macos26"
         staging = self.root / "staging"
         release = staging / name
         (release / "python/bin").mkdir(parents=True)
@@ -410,7 +410,7 @@ class InstallerTests(unittest.TestCase):
             assets.mkdir()
             for asset in completions:
                 (assets / asset).write_text(
-                    f"SPLASH_COMPLETION_TEST_VERSION='{version}'\n"
+                    f"RICHENGINE_COMPLETION_TEST_VERSION='{version}'\n"
                 )
             helper = assets / "models"
             helper.write_text("#!/bin/sh\nprintf '%s\\n' fixture/model\n")
@@ -433,9 +433,9 @@ class InstallerTests(unittest.TestCase):
             env={
                 "PATH": str(self.root / "commands") + os.pathsep + os.environ["PATH"],
                 "HOME": str(self.root / "home"),
-                "SPLASH_TOKEN": "test-token",
-                "SPLASH_BIN_DIR": str(self.bin),
-                "SPLASH_BASE_URL": self.releases.as_uri(),
+                "RICHENGINE_TOKEN": "test-token",
+                "RICHENGINE_BIN_DIR": str(self.bin),
+                "RICHENGINE_BASE_URL": self.releases.as_uri(),
             },
             capture_output=True,
             text=True,
@@ -450,14 +450,14 @@ class InstallerTests(unittest.TestCase):
         return Path(os.readlink(self.app / "current")).name
 
     def completion_version(self):
-        script = self.app / "current/install/completions/splash.bash"
+        script = self.app / "current/install/completions/richengine.bash"
         result = subprocess.run(
             [
                 "/bin/bash",
                 "--noprofile",
                 "--norc",
                 "-c",
-                'source "$1"; printf "%s" "$SPLASH_COMPLETION_TEST_VERSION"',
+                'source "$1"; printf "%s" "$RICHENGINE_COMPLETION_TEST_VERSION"',
                 "bash",
                 str(script),
             ],
@@ -469,7 +469,7 @@ class InstallerTests(unittest.TestCase):
 
     def assertKeepsFirstVersion(self, result, command):
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.current(), "richengine-1.0-arm64-macos26")
         self.assertEqual(self.command.read_text(), command)
         self.assertEqual(self.completion_version(), "1.0")
 
@@ -477,25 +477,25 @@ class InstallerTests(unittest.TestCase):
         self.publish("1.0")
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.installed(), ["richengine-1.0-arm64-macos26"])
+        self.assertEqual(self.current(), "richengine-1.0-arm64-macos26")
         self.assertIn("app/current/install/launcher.py", self.command.read_text())
         self.assertTrue(os.access(self.command, os.X_OK))
         self.assertEqual(self.completion_version(), "1.0")
         self.assertIn(
-            'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"',
+            'source "$HOME/Library/Application Support/RichEngine/app/current/install/completions/richengine.bash"',
             first.stdout,
         )
         self.assertIn(
-            'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"',
+            'source "$HOME/Library/Application Support/RichEngine/app/current/install/completions/richengine.fish"',
             first.stdout,
         )
         self.assertIn("Zsh needs compinit initialized", first.stdout)
         self.publish("2.0")
         upgrade = self.install()
         self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
-        self.assertEqual(self.installed(), ["splash-2.0-arm64-macos26"])
-        self.assertEqual(self.current(), "splash-2.0-arm64-macos26")
+        self.assertEqual(self.installed(), ["richengine-2.0-arm64-macos26"])
+        self.assertEqual(self.current(), "richengine-2.0-arm64-macos26")
         self.assertEqual(self.completion_version(), "2.0")
         self.assertTrue(
             os.access(self.app / "current/install/completions/models", os.X_OK)
@@ -515,16 +515,16 @@ class InstallerTests(unittest.TestCase):
                     fcntl.flock(lock, mode | fcntl.LOCK_NB)
                     blocked = self.install()
                     self.assertKeepsFirstVersion(blocked, command)
-                    self.assertIn("stop the running Splash server", blocked.stderr)
-                    self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+                    self.assertIn("stop the running RichEngine server", blocked.stderr)
+                    self.assertEqual(self.installed(), ["richengine-1.0-arm64-macos26"])
                     fcntl.flock(lock, fcntl.LOCK_UN)
         self.assertEqual(self.install().returncode, 0)
-        self.assertEqual(self.current(), "splash-2.0-arm64-macos26")
+        self.assertEqual(self.current(), "richengine-2.0-arm64-macos26")
 
     def test_running_incomplete_same_version_is_not_replaced(self):
         self.publish("1.0")
         self.assertEqual(self.install().returncode, 0)
-        release = self.app / "splash-1.0-arm64-macos26"
+        release = self.app / "richengine-1.0-arm64-macos26"
         (release / "release.json").unlink()
         marker = release / "in-use"
         marker.write_text("preserve")
@@ -532,7 +532,7 @@ class InstallerTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             blocked = self.install()
         self.assertEqual(blocked.returncode, 1, blocked.stderr)
-        self.assertIn("stop the running Splash server", blocked.stderr)
+        self.assertIn("stop the running RichEngine server", blocked.stderr)
         self.assertEqual(marker.read_text(), "preserve")
         self.assertFalse((release / "release.json").exists())
         self.assertEqual(self.current(), release.name)
@@ -544,7 +544,7 @@ class InstallerTests(unittest.TestCase):
         commands = self.root / "commands"
         commands.mkdir()
         proof = self.root / "lock-proof"
-        old = self.app / "splash-1.0-arm64-macos26"
+        old = self.app / "richengine-1.0-arm64-macos26"
         lock = self.app.parent / "runtime/serve.lock"
         shim = commands / "rm"
         shim.write_text(
@@ -574,22 +574,22 @@ class InstallerTests(unittest.TestCase):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("source ", result.stdout)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.current(), "richengine-1.0-arm64-macos26")
 
     def test_release_without_fish_completion_still_offers_bash_and_zsh(self):
-        self.publish("1.0", completions=("splash.bash", "_splash"))
+        self.publish("1.0", completions=("richengine.bash", "_richengine"))
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("completions/splash.bash", result.stdout)
-        self.assertIn("completions/_splash", result.stdout)
-        self.assertNotIn("splash.fish", result.stdout)
+        self.assertIn("completions/richengine.bash", result.stdout)
+        self.assertIn("completions/_richengine", result.stdout)
+        self.assertNotIn("richengine.fish", result.stdout)
 
     def test_failed_same_version_check_preserves_absolute_and_relative_current(self):
         self.publish("1.0")
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
         command = self.command.read_text()
-        release = self.app / "splash-1.0-arm64-macos26"
+        release = self.app / "richengine-1.0-arm64-macos26"
         (release / "python/bin/python3").write_text("#!/bin/sh\nexit 1\n")
         current = self.app / "current"
 
@@ -599,7 +599,7 @@ class InstallerTests(unittest.TestCase):
                 current.symlink_to(target)
                 failed = self.install()
                 self.assertKeepsFirstVersion(failed, command)
-                self.assertIn("fails 'splash --help'", failed.stderr)
+                self.assertIn("fails 'richengine --help'", failed.stderr)
                 self.assertEqual(os.readlink(current), target)
                 self.assertTrue(release.is_dir())
                 self.assertEqual(current.resolve(strict=True), release.resolve())
@@ -608,7 +608,7 @@ class InstallerTests(unittest.TestCase):
         self.publish("1.0", help_status=1)
         failed = self.install()
         self.assertEqual(failed.returncode, 1, failed.stderr)
-        self.assertIn("fails 'splash --help'", failed.stderr)
+        self.assertIn("fails 'richengine --help'", failed.stderr)
         self.assertEqual(self.installed(), [])
         self.assertFalse((self.app / "current").exists())
         self.assertFalse(self.command.exists())
@@ -622,8 +622,8 @@ class InstallerTests(unittest.TestCase):
         self.publish("2.0", help_status=1)
         smoke = self.install()
         self.assertKeepsFirstVersion(smoke, command)
-        self.assertIn("fails 'splash --help'", smoke.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+        self.assertIn("fails 'richengine --help'", smoke.stderr)
+        self.assertEqual(self.installed(), ["richengine-1.0-arm64-macos26"])
 
         self.publish("3.0")
         foreign = "#!/bin/sh\necho not the installer's\n"
@@ -631,16 +631,16 @@ class InstallerTests(unittest.TestCase):
         conflict = self.install()
         self.assertKeepsFirstVersion(conflict, foreign)
         self.assertIn("was not created by this installer", conflict.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+        self.assertEqual(self.installed(), ["richengine-1.0-arm64-macos26"])
         self.command.write_text(command)
 
-        (self.bin / "splash.tmp").mkdir()
+        (self.bin / "richengine.tmp").mkdir()
         blocked = self.install()
         self.assertKeepsFirstVersion(blocked, command)
         self.assertIn("could not write", blocked.stderr)
         self.assertEqual(
             self.installed(),
-            ["splash-1.0-arm64-macos26", "splash-3.0-arm64-macos26"],
+            ["richengine-1.0-arm64-macos26", "richengine-3.0-arm64-macos26"],
         )
 
     def test_printed_tester_instructions_install_from_the_published_repo(self):
@@ -653,7 +653,7 @@ class InstallerTests(unittest.TestCase):
         hub.mkdir()
 
         def upload(path_or_fileobj, path_in_repo, repo_id):
-            self.assertEqual(repo_id, "owner/splash-releases")
+            self.assertEqual(repo_id, "owner/richengine-releases")
             data = path_or_fileobj
             if not isinstance(data, bytes):
                 data = Path(data).read_bytes()
@@ -666,7 +666,7 @@ class InstallerTests(unittest.TestCase):
             contextlib.redirect_stdout(printed),
         ):
             api.return_value.upload_file.side_effect = upload
-            publish_test.main(["--version", "1.0", "--repo", "owner/splash-releases"])
+            publish_test.main(["--version", "1.0", "--repo", "owner/richengine-releases"])
         # This curl serves the uploaded files only to requests that carry the
         # token, as the private repo does.
         commands = self.root / "commands"
@@ -679,7 +679,7 @@ class InstallerTests(unittest.TestCase):
             "config = arguments[arguments.index('--config') + 1]\n"
             "header = (sys.stdin if config == '-' else open(config)).read()\n"
             "if 'Authorization: Bearer test-token' not in header: sys.exit(22)\n"
-            "prefix = 'https://huggingface.co/owner/splash-releases/resolve/main/'\n"
+            "prefix = 'https://huggingface.co/owner/richengine-releases/resolve/main/'\n"
             "if not arguments[-1].startswith(prefix): sys.exit(22)\n"
             f"source = open({str(hub)!r} + '/' + arguments[-1][len(prefix):], 'rb')\n"
             "target = sys.stdout.buffer\n"
@@ -693,14 +693,14 @@ class InstallerTests(unittest.TestCase):
             env={
                 "PATH": str(commands) + os.pathsep + os.environ["PATH"],
                 "HOME": str(self.root / "home"),
-                "SPLASH_TOKEN": "test-token",
-                "SPLASH_BIN_DIR": str(self.bin),
+                "RICHENGINE_TOKEN": "test-token",
+                "RICHENGINE_BIN_DIR": str(self.bin),
             },
             capture_output=True,
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.current(), "richengine-1.0-arm64-macos26")
         self.assertIn("app/current/install/launcher.py", self.command.read_text())
 
 

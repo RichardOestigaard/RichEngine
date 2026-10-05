@@ -15,7 +15,7 @@
 #include <string_view>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct GdnParityBuffers final {
   metal::MetalBuffer stateBase;
@@ -288,4 +288,4 @@ private:
   std::shared_ptr<StateStaging> staging_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

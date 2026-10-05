@@ -20,7 +20,7 @@
 #include <variant>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct DFlashDraftRingLayer final {
   // K is [head][ring_position][dimension].
@@ -58,7 +58,7 @@ private:
 // like DFlash2, plus a sequential Markov head that corrects each proposal
 // position's logits with a low-rank bias of the previously sampled token and
 // a confidence head the runtime loads but does not score).
-enum class DraftKind : uint8_t { DFlash2, Plain, DSpark };
+enum class DraftKind : uint8_t { DFlash2, Plain, DSpark, Null };
 
 // The dynamic convolutions of every DFlash2 draft layer, as the draft
 // kernels run them (decode/draft.metal): two taps, a row and the one before
@@ -167,6 +167,8 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer contextKv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
+  // RICHENGINE_PREFILL_FAST_INT8 operand buffers (empty when the flag is off).
+  ops::LinearScratch linearScratch{};
 };
 
 struct DFlashDraftLayerWeights final {
@@ -200,7 +202,7 @@ struct DFlashDraftWeights final {
 
 inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
 
-// A Splash package's draft files: layer-<N>.bin and model.bin.
+// An RichEngine package's draft files: layer-<N>.bin and model.bin.
 struct PackedDraftFiles final {
   WeightImages &images;
   std::filesystem::path directory;
@@ -255,4 +257,4 @@ private:
   std::vector<ops::Projection> contextKvProjections_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

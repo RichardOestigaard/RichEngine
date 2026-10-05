@@ -13,7 +13,7 @@
 #include <string>
 #include <type_traits>
 
-namespace splash::kv {
+namespace richengine::kv {
 
 using BFloat16Bits = uint16_t;
 
@@ -128,15 +128,15 @@ inline void checkElement(uint32_t head, uint32_t token, uint32_t dimension) {
 inline float dequantizeKey(const Q8LayerPage &source, uint32_t head,
                            uint32_t token, uint32_t dimension) {
   reference_detail::checkElement(head, token, dimension);
-  return float(source.keys[splash_kv_key_element(head, token, dimension)]) *
-         source.keyScales[splash_kv_scale_element(head, token)];
+  return float(source.keys[richengine_kv_key_element(head, token, dimension)]) *
+         source.keyScales[richengine_kv_scale_element(head, token)];
 }
 
 inline float dequantizeValue(const Q8LayerPage &source, uint32_t head,
                              uint32_t token, uint32_t dimension) {
   reference_detail::checkElement(head, token, dimension);
-  return float(source.values[splash_kv_value_element(head, token, dimension)]) *
-         source.valueScales[splash_kv_scale_element(head, token)];
+  return float(source.values[richengine_kv_value_element(head, token, dimension)]) *
+         source.valueScales[richengine_kv_scale_element(head, token)];
 }
 
 inline void quantizeLayerPage(std::span<const float> logicalKeys,
@@ -159,15 +159,15 @@ inline void quantizeLayerPage(std::span<const float> logicalKeys,
             valueMaximum,
             std::abs(logicalValues[logicalIndex(token, head, dimension)]));
       }
-      destination.keyScales[splash_kv_scale_element(head, token)] =
+      destination.keyScales[richengine_kv_scale_element(head, token)] =
           reference_detail::storedScale(keyMaximum);
-      destination.valueScales[splash_kv_scale_element(head, token)] =
+      destination.valueScales[richengine_kv_scale_element(head, token)] =
           reference_detail::storedScale(valueMaximum);
       for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-        destination.keys[splash_kv_key_element(head, token, dimension)] =
+        destination.keys[richengine_kv_key_element(head, token, dimension)] =
             reference_detail::quantize(
                 logicalKeys[logicalIndex(token, head, dimension)], keyMaximum);
-        destination.values[splash_kv_value_element(head, token, dimension)] =
+        destination.values[richengine_kv_value_element(head, token, dimension)] =
             reference_detail::quantize(
                 logicalValues[logicalIndex(token, head, dimension)],
                 valueMaximum);
@@ -198,4 +198,4 @@ inline void dequantizeLayerPage(const Q8LayerPage &source,
   }
 }
 
-} // namespace splash::kv
+} // namespace richengine::kv

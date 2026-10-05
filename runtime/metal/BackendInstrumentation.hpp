@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace splash::metal {
+namespace richengine::metal {
 
 // GPU time of one dispatch committed as its own command while profiling.
 struct DispatchTiming {
@@ -17,7 +17,7 @@ struct DispatchTiming {
 
 // What tests and benchmarks observe of a MetalBackend beyond its serving
 // API. Only the instrumented build of MetalBackend.mm
-// (SPLASH_BACKEND_INSTRUMENTATION) defines these; production binaries never
+// (RICHENGINE_BACKEND_INSTRUMENTATION) defines these; production binaries never
 // link it.
 class BackendInstrumentation final {
 public:
@@ -33,4 +33,4 @@ public:
   takeDispatchProfile(MetalBackend &backend);
 };
 
-} // namespace splash::metal
+} // namespace richengine::metal

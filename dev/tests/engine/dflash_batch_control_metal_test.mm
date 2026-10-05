@@ -18,19 +18,19 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::ComputeDispatch;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::RowCopy;
-using splash::ops::RowRegion;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::ComputeDispatch;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::RowCopy;
+using richengine::ops::RowRegion;
 
-constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
+constexpr uint32_t kRows = richengine::model::ExecutionLimits::targetVerifyRows;
 constexpr uint32_t kProposals =
-    splash::model::ExecutionLimits::draftProposalTokens;
+    richengine::model::ExecutionLimits::draftProposalTokens;
 constexpr uint32_t kLanes =
-    splash::model::ExecutionLimits::maximumBatchWidth;
+    richengine::model::ExecutionLimits::maximumBatchWidth;
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   return backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -40,7 +40,7 @@ template <class T> T *contents(const MetalBuffer &buffer) {
   return static_cast<T *>(buffer.contents());
 }
 
-using splash::test::require;
+using richengine::test::require;
 
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
@@ -60,7 +60,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
       shared(backend, kLanes * kRows * sizeof(TargetVocabularyRow),
              "accept-target-rows");
   MetalBuffer uniforms =
-      shared(backend, kLanes * SPLASH_SAMPLING_UNIFORMS * sizeof(float),
+      shared(backend, kLanes * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float),
              "accept-uniforms");
   MetalBuffer output = shared(backend, kLanes * kRows * sizeof(uint32_t),
                               "accept-output");

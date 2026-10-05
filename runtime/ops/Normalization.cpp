@@ -6,7 +6,7 @@
 #include <utility>
 #include <stdexcept>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 std::string normKernel(std::string_view name, const NormWeights &weights, uint32_t width) {
   if (!weights.buffer || weights.buffer.sizeBytes() < weights.bytes(width))
@@ -31,9 +31,9 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
               {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
     return {std::move(output), layout};
   }
-  if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0)
+  if (rows <= RICHENGINE_STAGED_NORM_ROWS && width <= RICHENGINE_STAGED_NORM_WIDTH && width % 4 == 0)
     graph.add(normKernel("norm_rms_staged", weight, width), {std::move(input), weight.buffer, output},
-              width, {rows, 1, 1}, {SPLASH_STAGED_NORM_THREADS, 1, 1});
+              width, {rows, 1, 1}, {RICHENGINE_STAGED_NORM_THREADS, 1, 1});
   else
     graph.add(normKernel("norm_rms", weight, width), {std::move(input), weight.buffer, output},
               width, {rows, 1, 1});
@@ -59,4 +59,4 @@ void Normalization::addRmsWithQ4Sums(
             width, {rows, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

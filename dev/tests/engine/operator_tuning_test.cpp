@@ -11,9 +11,9 @@
 
 namespace {
 
-using namespace splash::ops::tuning;
+using namespace richengine::ops::tuning;
 
-using splash::test::require;
+using richengine::test::require;
 
 std::vector<PairedTiming> timings(double gain, size_t count = 12) {
   std::vector<PairedTiming> result;

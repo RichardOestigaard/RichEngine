@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 static_assert(offsetof(MoeExpertParams, expert_stride_bytes_0) == 16);
@@ -18,7 +18,7 @@ static_assert(offsetof(MoeExpertParams, expert_stride_bytes_0) == 16);
 // A kill switch for the packed expert paths, read once (the decode plan
 // calls this per step).
 bool packedDisabled() {
-  static const bool off = envFlag("SPLASH_MOE_PACKED_OFF");
+  static const bool off = envFlag("RICHENGINE_MOE_PACKED_OFF");
   return off;
 }
 
@@ -475,15 +475,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
-  if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
+  if (!rows || rows > RICHENGINE_PREFILL_TOKEN_BUDGET)
     throw std::invalid_argument("invalid MoE prefill rows");
   return MoePlan(shape, rows, config, MoePhase::Prefill);
 }
 
 MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid MoE decode batch width");
-  return MoePlan(shape, lanes * SPLASH_TARGET_VERIFY_ROWS, config, MoePhase::Decode);
+  return MoePlan(shape, lanes * RICHENGINE_TARGET_VERIFY_ROWS, config, MoePhase::Decode);
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

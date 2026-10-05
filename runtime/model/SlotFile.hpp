@@ -14,7 +14,7 @@
 #include <thread>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 // Bytes one disk quota may hold, shared by every slot file of the cache
 // tier. Reservations and releases come from the engine thread and from
@@ -255,4 +255,4 @@ private:
   std::vector<bool> adopted_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

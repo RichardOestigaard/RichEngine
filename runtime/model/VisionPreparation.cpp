@@ -9,7 +9,7 @@
 #include <functional>
 #include <span>
 
-namespace splash::model::vision {
+namespace richengine::model::vision {
 namespace {
 
 uint32_t elementBytes(const SourceTensor &tensor) { return tensor.dtype == "F32" ? 4 : 2; }
@@ -108,4 +108,4 @@ void writeVision(std::span<uint8_t> destination, const Plan &plan) {
   parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
 }
 
-} // namespace splash::model::vision
+} // namespace richengine::model::vision

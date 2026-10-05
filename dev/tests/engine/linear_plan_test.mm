@@ -33,11 +33,11 @@
 
 namespace {
 
-using namespace splash;
-using namespace splash::ops;
+using namespace richengine;
+using namespace richengine::ops;
 using test::mix;
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -157,6 +157,11 @@ LinearConfig measuredOverride(LinearMatrix matrix, uint32_t rows,
         {{12288, 4096}, 16, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
         {{12544, 4096}, 8, LinearEpilogue::None, {LinearTile::Paired256, 49, LinearSimdgroups::Four, 1}},
         {{12544, 4096}, 16, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{6144, 2048}, 32, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{2048, 2048}, 32, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{2048, 10240}, 8, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
+        {{2048, 10752}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
+        {{512, 2048}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
   };
   for (const Override &o : overrides)
     if (matrix == o.matrix && rows == o.rows && epilogue == o.epilogue)
@@ -179,7 +184,7 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
     return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, selected};
   }
   if (family >= 10) {
-    if (const LinearConfig config = measuredOverride(matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue);
+    if (const LinearConfig config = measuredOverride(matrix, lanes * RICHENGINE_TARGET_VERIFY_ROWS, epilogue);
         config.tile != LinearTile(255))
       return config;
     if (const uint32_t splits = expectedApple10Splits(cores, matrix); splits > 1)
@@ -216,7 +221,25 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
 // rule: N256 for the fused up projection and once the N256 grid holds eight
 // threadgroups per core.
 LinearConfig expectedPrefill(uint32_t family, uint32_t cores, LinearWorkload w) {
-  if (family >= 10 || cores <= 32) return {LinearTile::N128, 0, LinearSimdgroups::Four};
+  if (family >= 10) {
+    // The measured prefill overrides restated, as measuredOverride does
+    // for decode.
+    struct Override {
+      LinearMatrix matrix;
+      uint32_t rows;
+      LinearEpilogue epilogue;
+      LinearConfig config;
+    };
+    static constexpr Override overrides[] = {
+        {{2048, 10240}, 64, LinearEpilogue::None, {LinearTile::N128, 0, LinearSimdgroups::Eight, 1}},
+        {{2048, 10752}, 64, LinearEpilogue::Residual, {LinearTile::N128, 0, LinearSimdgroups::Eight, 1}},
+    };
+    for (const Override &o : overrides)
+      if (w.matrix == o.matrix && w.rows == o.rows && w.epilogue == o.epilogue)
+        return o.config;
+    return {LinearTile::N128, 0, LinearSimdgroups::Four};
+  }
+  if (cores <= 32) return {LinearTile::N128, 0, LinearSimdgroups::Four};
   const uint64_t grid = uint64_t{(w.rows + 31) / 32} * (w.matrix.outputSize / 256);
   return {w.epilogue == LinearEpilogue::UpWithGate || grid >= 8ULL * cores ? LinearTile::N256
                                                                            : LinearTile::N128, 0};
@@ -464,7 +487,7 @@ void baselinePlans() {
               configured(9, 40, {{5120, 6144}, 24, LinearPhase::Decode, LinearEpilogue::Residual}) ==
                   LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 8} &&
               configured(10, 20, {{6144, 2048}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}) ==
-                  LinearConfig{LinearTile::N256, 24},
+                  LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},
           "one-lane fallbacks or multi-lane rules changed");
   // Balanced two-tile groups above one wave: 130 paired tiles keep three
   // groups per core on 20 cores and one full wave of longer chains on 16; 98
@@ -849,17 +872,44 @@ constexpr auto kNone = LinearEpilogue::None, kResidual = LinearEpilogue::Residua
 // projection kind.
 constexpr std::array kStagedSplitAnchors{
     SplitAnchor{"27B down", 16, 5120, 17408, 8, kResidual, 1, 2},
-    SplitAnchor{"27B down", 20, 5120, 17408, 8, kResidual, 1, 2},
+    SplitAnchor{"27B down", 20, 5120, 17408, 8, kResidual, 1, 8},
     SplitAnchor{"27B down", 10, 5120, 17408, 8, kResidual, 1, 1},
     SplitAnchor{"27B down", 40, 5120, 17408, 8, kResidual, 1, 4},
     SplitAnchor{"35B output projection", 16, 2048, 4096, 8, kResidual, 1, 4},
-    SplitAnchor{"35B shared-expert gate/up", 16, 512, 2048, 8, kGateUp, 1, 4},
+    // The measured overrides of LinearGguf.cpp's kMeasuredStagedSplits restate
+    // these rows: {512, 2048} at 8 rows takes 8 splits, not the tier's 4, and
+    // the PQ2_0 27B shapes take their entries on the 20-core M5 Pro.
+    SplitAnchor{"35B shared-expert gate/up", 16, 512, 2048, 8, kGateUp, 1, 8},
     SplitAnchor{"27B gate/up", 16, 17408, 5120, 8, kGateUp, 1, 1},
+    SplitAnchor{"27B gate/up", 20, 17408, 5120, 8, kGateUp, 1, 4},
+    SplitAnchor{"27B three-segment attention input", 20, 14336, 5120, 8, kNone, 3, 4},
     SplitAnchor{"two-segment fused projection", 16, 4096, 5120, 8, kNone, 2, 2},
+    SplitAnchor{"27B three-segment GDN input", 20, 16640, 5120, 8, kNone, 3, 4},
     SplitAnchor{"27B three-segment GDN input", 40, 16640, 5120, 8, kNone, 3, 1},
     SplitAnchor{"27B vocabulary head", 16, 248320, 5120, 8, kNone, 1, 1},
     SplitAnchor{"narrow 1024 x 256 tensor", 16, 1024, 256, 8, kNone, 1, 1},
     SplitAnchor{"narrow 1024 x 3072 tensor", 16, 1024, 3072, 8, kNone, 1, 4}};
+
+// The measured staged-tile splits of LinearGguf.cpp's kMeasuredStagedSplits,
+// restated: output, input, tile rows (8, 16 or 32), splits and the core count
+// the entry applies to (zero for every count). Returns 0 when none applies.
+uint32_t ggufMeasuredSplits(uint32_t n, uint32_t k, uint32_t tileRows, uint32_t cores) {
+  constexpr struct {
+    uint32_t output, input, tileRows, splits, cores;
+  } kEntries[] = {
+      {2'048, 2'048, 8, 4, 0},   {2'048, 2'048, 16, 4, 0}, {2'048, 2'048, 32, 4, 0},
+      {512, 2'048, 8, 8, 0},     {512, 2'048, 16, 4, 0},   {512, 2'048, 32, 4, 0},
+      {1'024, 2'048, 8, 8, 0},   {1'024, 2'048, 16, 4, 0}, {1'024, 2'048, 32, 4, 0},
+      {17'408, 5'120, 8, 4, 20}, {17'408, 5'120, 16, 4, 20},
+      {5'120, 17'408, 8, 8, 20}, {5'120, 17'408, 16, 8, 20},
+      {14'336, 5'120, 8, 4, 20}, {14'336, 5'120, 16, 4, 20},
+      {16'640, 5'120, 8, 4, 20}, {16'640, 5'120, 16, 4, 20},
+  };
+  for (const auto &e : kEntries)
+    if (n == e.output && k == e.input && tileRows == e.tileRows && (!e.cores || e.cores == cores))
+      return e.splits;
+  return 0;
+}
 
 // One wave (four threadgroups per core) down to one 256-input unit per
 // partition, eight waves while partitions keep 1024 inputs, at most eight.
@@ -1151,9 +1201,18 @@ void ggufCoreLaws() {
               };
               const LinearPlan one = plan(linear, n, 8);
               const LinearConfig c = one.configuration();
+              // The measured staged-tile overrides are keyed on the tile's
+              // row count and the core count: a shape one names is exempt
+              // from the batch-width and per-core laws here, like the affine
+              // measured overrides in apple10AffineCoreLaws.
+              bool overridden = false;
+              for (const uint32_t w : {n, 2 * n})
+                for (const uint32_t rows : {8U, 16U, 32U})
+                  for (const uint32_t cc : {cores, cores + 1, 2 * cores})
+                    overridden |= ggufMeasuredSplits(w, k, rows, cc) != 0;
               for (const uint32_t rows : {16U, 24U, 32U}) {
                 const LinearPlan wider = plan(linear, n, rows);
-                require(wider.configuration() == c && wider.input() == one.input(),
+                require((wider.configuration() == c || overridden) && wider.input() == one.input(),
                         "GGUF decode plan depends on the batch width");
               }
               const uint32_t s = c.splits;
@@ -1162,11 +1221,14 @@ void ggufCoreLaws() {
                           c.groups == 0 && one.groups() == n / 64 && s >= 1 && s <= 8 &&
                           (s & (s - 1)) == 0,
                       "GGUF decode plan tile or split count");
-              require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
+              // A measured staged split may go below the tier's 512-input
+              // floor (the override was measured faster there).
+              require(s == 1 || (staged ? (k / s >= 512 || overridden) && (k / 32) % s == 0
+                                        : k / 256 / s >= 1),
                       "GGUF decode partition below the kernel floor");
               require(one.storageRows() == 8 && plan(linear, n, 24).storageRows() == (staged ? 32U : 24U),
                       "GGUF decode tile rows");
-              if (cores) {
+              if (cores && !overridden) {
                 require(plan(twice, 2 * n, 8).configuration().splits == s,
                         "GGUF split count depends on more than the grid per core");
                 require(plan(more, n, 8).configuration().splits >= s,
@@ -1370,7 +1432,7 @@ void producerTableContract(metal::MetalBackend &backend) {
   }
   {
     const GdnShape shape{16, 32, 128, 8192, 12544};
-    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{};
+    const std::array<metal::MetalBuffer, RICHENGINE_MAXIMUM_BATCH_WIDTH> states{};
     GdnDecodeBuffers buffers;
     buffers.currentStates = states;
     buffers.nextStates = states;
@@ -1585,7 +1647,7 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
       rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums,
                                          Projection(matrix.outputSize, matrix.inputSize, p.affine()),
                                          workload.rows); });
-    for (uint32_t rows : {0U, SPLASH_PREFILL_TOKEN_BUDGET + 1U})
+    for (uint32_t rows : {0U, RICHENGINE_PREFILL_TOKEN_BUDGET + 1U})
       rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums, p, rows); });
     require(graph.empty(), "invalid prefill sums input partially encoded graph");
   }

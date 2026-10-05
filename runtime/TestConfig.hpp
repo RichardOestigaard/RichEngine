@@ -5,7 +5,7 @@
 #include <functional>
 #include <optional>
 
-namespace splash {
+namespace richengine {
 
 // Values production holds constant, or measures live, that a test
 // substitutes. Every field is empty in production, where the component's
@@ -39,4 +39,4 @@ inline TestConfig &testConfigStorage() noexcept {
   return detail::testConfigStorage();
 }
 
-} // namespace splash
+} // namespace richengine

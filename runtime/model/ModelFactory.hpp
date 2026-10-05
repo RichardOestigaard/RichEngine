@@ -12,6 +12,8 @@
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
+#include "model/Granite.hpp"
+#include "model/NullDraft.hpp"
 #include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -21,15 +23,16 @@
 #include <string>
 #include <variant>
 
-namespace splash::model {
+namespace richengine::model {
 
 class QwenStateStorage;
 
 using TargetWeights =
     std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
-                 DenseWeights, Lfm2Weights, Lfm2MoeWeights>;
+                 DenseWeights, Lfm2Weights, Lfm2MoeWeights, GraniteWeights>;
 using DraftWeights =
-    std::variant<DFlashDraftWeights, PlainDraftWeights, DSparkDraftWeights>;
+    std::variant<NullDraftWeights, DFlashDraftWeights, PlainDraftWeights,
+                 DSparkDraftWeights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;
@@ -119,4 +122,4 @@ plannedRuntimeMemory(const DeviceCapabilities &device,
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 
-} // namespace splash::model
+} // namespace richengine::model

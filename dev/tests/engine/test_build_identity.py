@@ -88,12 +88,12 @@ class BuildIdentityTests(unittest.TestCase):
             sources = root / "runtime" / "metal" / "abi"
             sources.mkdir(parents=True)
             geometry = sources / "ExecutionGeometry.h"
-            geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 8\n")
+            geometry.write_text("#define RICHENGINE_DFLASH_QUERY_ROWS 8\n")
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             tool.write_text("fixture tool")
             first = build_identity.build_id(root)
-            geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 7\n")
+            geometry.write_text("#define RICHENGINE_DFLASH_QUERY_ROWS 7\n")
             self.assertNotEqual(first, build_identity.build_id(root))
 
     def test_alternate_root_shader_add_edit_and_remove_change_identity(self):
@@ -159,7 +159,7 @@ class BuildIdentityTests(unittest.TestCase):
 
 class CompileConfigurationTests(unittest.TestCase):
     FLAG_SETS = (
-        ("ENGINE_CXXFLAGS", "engine/engine/Status.o"),
+        ("ENGINE_CXXFLAGS", "engine/engine/wire/Status.o"),
         ("PROD_METALFLAGS", "metal/shared/rope.air"),
         ("ENGINE_TEST_CXXFLAGS", "engine-tests/operator-tuning"),
         ("TEST_METALFLAGS", "engine-tests/metal-backend.air"),
@@ -262,7 +262,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 return log.read_text().splitlines()
 
             outputs = (
-                "splash",
+                "richengine",
                 "engine-tests/vision-encoder",
                 "engine-tests/attention-sweep",
                 "engine-tests/metal-backend.metallib",
@@ -300,10 +300,10 @@ class CompileConfigurationTests(unittest.TestCase):
                         self.assertIn(linked, calls()[start:])
                         if linked == targets[0]:
                             self.assertIn(
-                                str(build / "engine/libsplash.a"), calls()[start:]
+                                str(build / "engine/librichengine.a"), calls()[start:]
                             )
                             self.assertIn(
-                                str(build / "splash.metallib"), calls()[start:]
+                                str(build / "richengine.metallib"), calls()[start:]
                             )
                         if linked == targets[3]:
                             self.assertIn(
@@ -345,7 +345,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 residency_source,
                 removed_source,
                 removed_header,
-                Path("runtime/engine/Status.cpp"),
+                Path("runtime/engine/wire/Status.cpp"),
                 Path("dev/tests/engine/metal_backend_test.metal"),
             ):
                 path = root / relative
@@ -358,9 +358,9 @@ class CompileConfigurationTests(unittest.TestCase):
                 f"{name}={sys.executable} {compiler}"
                 for name in ("CXX", "METAL", "METALLIB", "AR")
             ]
-            library = str(build / "splash.metallib")
+            library = str(build / "richengine.metallib")
             attention = str(build / "engine-tests/q8-attention.metallib")
-            native = str(build / "engine/engine/Status.o")
+            native = str(build / "engine/engine/wire/Status.o")
             unrelated = str(build / "engine-tests/metal-backend.metallib")
             targets = (library, attention, native, unrelated)
             production_airs = {

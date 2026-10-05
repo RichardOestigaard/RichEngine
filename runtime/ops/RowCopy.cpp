@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
@@ -36,4 +36,4 @@ void RowCopy::add(metal::CommandGraph &graph, metal::MetalBuffer source,
             {kThreads, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

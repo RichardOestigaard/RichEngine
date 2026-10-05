@@ -10,7 +10,7 @@
 #include <string_view>
 #include <variant>
 
-namespace splash::model {
+namespace richengine::model {
 
 // LiquidAI's LFM2.5-8B-A1B (arch "lfm2moe"): 24 layers of hidden 2048 — 18
 // double-gated short convolutions over a taps-3 FIFO state and 6 full
@@ -127,4 +127,4 @@ using Lfm2MoeWeights =
 loadLfm2MoeWeights(metal::MetalBackend &backend, Lfm2MoeLayout layout,
                    const QwenTargetFiles<Lfm2MoeLayout> &files);
 
-} // namespace splash::model
+} // namespace richengine::model

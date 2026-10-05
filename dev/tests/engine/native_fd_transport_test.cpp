@@ -5,8 +5,8 @@
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "TestStatus.hpp"
-#include "engine/Cache.hpp"
-#include "engine/FdTransport.hpp"
+#include "engine/cache/Cache.hpp"
+#include "engine/wire/FdTransport.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -30,8 +30,8 @@
 #include <string>
 #include <thread>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
@@ -128,7 +128,7 @@ struct Pipes final {
   }
 };
 
-using splash::test::require;
+using richengine::test::require;
 
 // For a failure that leaves a thread blocked: unwinding would wait for it.
 [[noreturn]] void abandon(const char *message) {

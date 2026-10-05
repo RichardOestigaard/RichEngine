@@ -10,7 +10,7 @@
 #include <limits>
 #include <map>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 uint64_t number(id value) {
@@ -150,7 +150,13 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
 SafetensorsCheckpoint::~SafetensorsCheckpoint() = default;
 
 const SourceTensor *SafetensorsCheckpoint::find(std::string_view name) const noexcept {
-  const auto found = impl_->tensors.find(name);
+  auto found = impl_->tensors.find(name);
+  // Some exports nest the language model under "language_model." and some
+  // (the released MLX LFM2.5 checkpoints) ship the same tensors flat.
+  if (found == impl_->tensors.end() && name.starts_with("language_model.")) {
+    name.remove_prefix(std::string_view("language_model.").size());
+    found = impl_->tensors.find(name);
+  }
   return found == impl_->tensors.end() ? nullptr : &found->second;
 }
 const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const {
@@ -188,6 +194,13 @@ void SafetensorsCheckpoint::requireConfigNumber(std::string_view key, double exp
   @autoreleasepool {
     id value = configValue(impl_->textConfig, key);
     if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] != expected)
+      throw WeightStoreError("source model configuration does not match: " + std::string(key));
+  }
+}
+void SafetensorsCheckpoint::requireConfigNumberAtMost(std::string_view key, double maximum) const {
+  @autoreleasepool {
+    id value = configValue(impl_->textConfig, key);
+    if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] > maximum)
       throw WeightStoreError("source model configuration does not match: " + std::string(key));
   }
 }
@@ -230,4 +243,4 @@ void SafetensorsCheckpoint::requireLayerTypeMask(uint32_t layers, uint64_t atten
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 
-} // namespace splash::model
+} // namespace richengine::model

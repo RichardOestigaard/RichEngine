@@ -39,7 +39,7 @@ def _read_key(path):
 
 def load_thinking_key(path=None):
     path = (
-        Path.home() / "Library/Application Support/Splash/thinking.key"
+        Path.home() / "Library/Application Support/RichEngine/thinking.key"
         if path is None
         else Path(path)
     )

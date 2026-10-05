@@ -13,15 +13,15 @@
 
 namespace {
 
-using namespace splash::model;
-using namespace splash::ops;
-using splash::metal::BackendInstrumentation;
+using namespace richengine::model;
+using namespace richengine::ops;
+using richengine::metal::BackendInstrumentation;
 
 static_assert(!tuning::kPrefillProbeRows.empty() &&
               tuning::kPrefillProbeRows.back() == ExecutionLimits::prefillTokenBudget);
 static_assert(tuning::kDecodeProbeWidths == std::array<uint32_t, 4>{1, 2, 3, 4});
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -130,7 +130,7 @@ std::set<LinearWorkload> expectedLinear(
   const auto target = std::visit([](const auto &weights) {
     return qwenTargetGeometry(weights);
   }, package.target);
-  const auto &draft = std::get<splash::model::DFlashDraftWeights>(package.draft).layout;
+  const auto &draft = std::get<richengine::model::DFlashDraftWeights>(package.draft).layout;
   std::set<LinearWorkload> result;
   auto add = [&](LinearMatrix matrix, LinearPhase phase, LinearEpilogue epilogue) {
     for (uint32_t size : phase == LinearPhase::Prefill ? prefill : decode)
@@ -193,7 +193,7 @@ void checkPair(ModelPackage package) {
   std::visit([](auto &target) {
     target.layers.push_back(target.layers.front());
   }, package.target);
-  std::get<splash::model::DFlashDraftWeights>(package.draft).layers.push_back(std::get<splash::model::DFlashDraftWeights>(package.draft).layers.front());
+  std::get<richengine::model::DFlashDraftWeights>(package.draft).layers.push_back(std::get<richengine::model::DFlashDraftWeights>(package.draft).layers.front());
   const auto renamed = collectTuningWorkloads(package, prefill, decode);
   require(linearKeys(renamed) == keys,
           "dedup depends on layer count or model/weight names");
@@ -206,7 +206,7 @@ void checkPair(ModelPackage package) {
   rejects([&] { (void)collectTuningWorkloads(package, std::array{2049U}, decode); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{0U}); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{5U}); });
-  std::get<splash::model::DFlashDraftWeights>(package.draft).contextProjection.inputSize = 0;
+  std::get<richengine::model::DFlashDraftWeights>(package.draft).contextProjection.inputSize = 0;
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
@@ -295,14 +295,14 @@ void run() {
   sparse.draft = draftWeights(smallerDraft);
   checkPair(sparse);
 
-  std::get<splash::model::DFlashDraftWeights>(dense.draft).layers.clear();
+  std::get<richengine::model::DFlashDraftWeights>(dense.draft).layers.clear();
   rejects([&] { (void)collectTuningWorkloads(dense, std::array{32U}, std::array{1U}); });
   std::get<Qwen3_6MoeWeights>(sparse.target).layers.clear();
   rejects([&] { (void)collectTuningWorkloads(sparse, std::array{32U}, std::array{1U}); });
 }
 
 void metadataViews(const char *metallib) {
-  using namespace splash::metal;
+  using namespace richengine::metal;
   MetalBackend backend(metallib);
   const uint64_t submissions = BackendInstrumentation::submittedCommands(backend);
   // Metadata-only test: one small allocation, no data access or GPU command.
@@ -341,7 +341,7 @@ void metadataViews(const char *metallib) {
     }
     // Target and draft execute the same GateUp shape in this pair. They also
     // share a representative here, so this must not add another measurement.
-    for (auto &layer : std::get<splash::model::DFlashDraftWeights>(package.draft).layers) {
+    for (auto &layer : std::get<richengine::model::DFlashDraftWeights>(package.draft).layers) {
       layer.upProjection = target.layers.front().upProjection;
       layer.gateProjection = target.layers.front().gateProjection;
     }

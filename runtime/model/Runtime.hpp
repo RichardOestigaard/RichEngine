@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace splash::model {
+namespace richengine::model {
 
 class Runtime final : public RuntimeModel {
 public:
@@ -35,6 +35,7 @@ public:
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;
+  [[nodiscard]] bool prefillSubmitAheadAvailable() const noexcept override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<const CompositeState>
@@ -79,4 +80,4 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

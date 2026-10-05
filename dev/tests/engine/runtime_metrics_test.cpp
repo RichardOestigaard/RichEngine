@@ -1,6 +1,6 @@
 #include "ScopedTestConfig.hpp"
 #include "TestChecks.hpp"
-#include "engine/Status.hpp"
+#include "engine/wire/Status.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -9,10 +9,10 @@
 
 namespace {
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
-using splash::test::require;
+using richengine::test::require;
 
 bool close(double left, double right) { return std::abs(left - right) < 1e-9; }
 

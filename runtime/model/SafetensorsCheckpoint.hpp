@@ -6,7 +6,7 @@
 #include <memory>
 #include <string_view>
 
-namespace splash::model {
+namespace richengine::model {
 
 // A checkpoint's quantization configuration and safetensors index. Opening
 // parses only metadata; the images read tensor data in bounded slices,
@@ -20,6 +20,9 @@ public:
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
   void requireConfigNumber(std::string_view key, double expected) const;
+  // The source may declare a smaller value than `maximum` (e.g. a context
+  // budget narrower than the layout's); larger values are rejected.
+  void requireConfigNumberAtMost(std::string_view key, double maximum) const;
   // `legacyKey`, when given, names the field in configurations that predate `key`.
   void requireConfigString(std::string_view key, std::string_view expected,
                            std::string_view legacyKey = {}) const;
@@ -34,4 +37,4 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

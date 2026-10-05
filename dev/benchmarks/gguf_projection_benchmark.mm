@@ -24,12 +24,12 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
-using namespace splash::ops;
+using namespace richengine;
+using namespace richengine::ops;
 using namespace gguf_reference;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
 
 namespace {
 

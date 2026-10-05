@@ -4,7 +4,7 @@
   fixture of each GGUF format (`gguf-reference`). They pin the CPU reference
   (`dev/tests/engine/GgufFormatReference.hpp`) to llama.cpp 7ab4ee7, and
   PQ2_0, which upstream GGML lacks, to PrismML-Eng/llama.cpp 01ae597, so no
-  Splash change touches them.
+  RichEngine change touches them.
 - `gguf_images`: every image `gguf-preparation` writes from its dense and MoE
   GGUF fixtures.
 - `affine_images`: every image `run_affine_preparation.py` writes from its
@@ -27,13 +27,13 @@ to change them:
    failing line, and the vision and affine drivers come first.
 
    ```sh
-   make build/splash.metallib build/engine-tests/vision-preparation \
+   make build/richengine.metallib build/engine-tests/vision-preparation \
      build/engine-tests/affine-preparation build/engine-tests/gguf-preparation
    python3 dev/tests/engine/run_vision_preparation.py build/engine-tests/vision-preparation \
      dev/tests/fixtures/weight-goldens/goldens.json
    MTL_SHADER_VALIDATION=1 python3 dev/tests/engine/run_affine_preparation.py \
-     build/engine-tests/affine-preparation build/splash.metallib dev/tests/fixtures/weight-goldens/goldens.json
-   MTL_SHADER_VALIDATION=1 build/engine-tests/gguf-preparation build/splash.metallib \
+     build/engine-tests/affine-preparation build/richengine.metallib dev/tests/fixtures/weight-goldens/goldens.json
+   MTL_SHADER_VALIDATION=1 build/engine-tests/gguf-preparation build/richengine.metallib \
      dev/tests/fixtures/weight-goldens/goldens.json
    ```
 
@@ -46,5 +46,5 @@ to change them:
 The dequantization hashes change only with the fixture itself. Regenerate
 them with a libggml-base built from llama.cpp 7ab4ee7 (PrismML-Eng/llama.cpp
 01ae597 for PQ2_0; its other formats decode as upstream's):
-`SPLASH_GGML_ORACLE=<libggml-base.dylib> build/engine-tests/gguf-reference dev/tests/fixtures/weight-goldens/goldens.json`
+`RICHENGINE_GGML_ORACLE=<libggml-base.dylib> build/engine-tests/gguf-reference dev/tests/fixtures/weight-goldens/goldens.json`
 compares the reference with GGML and prints GGML's hash of each format.

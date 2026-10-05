@@ -1,4 +1,4 @@
-"""Thin multiplexed subprocess client for the Splash native protocol.
+"""Thin multiplexed subprocess client for the RichEngine native protocol.
 
 The native scheduler owns execution. Calls accepted under ``pending_limit``
 are written directly to the child; the Python executor handles CPU grammar masks.
@@ -453,7 +453,7 @@ class MultiplexedRuntime:
         self._mask_slots = threading.BoundedSemaphore(pending_limit)
         self._mask_executor = ThreadPoolExecutor(
             max_workers=self._mask_workers,
-            thread_name_prefix="splash-mask",
+            thread_name_prefix="richengine-mask",
         )
 
         self._state_lock = threading.RLock()
@@ -478,7 +478,7 @@ class MultiplexedRuntime:
         self._request_ids = itertools.count(1)
         self._status_ids = itertools.count(1)
         self._crash_trace = CrashTraceRing(
-            self._command, enabled=os.environ.get("SPLASH_CRASH_TRACE") == "1"
+            self._command, enabled=os.environ.get("RICHENGINE_CRASH_TRACE") == "1"
         )
         # Called with the failure and the seconds the engine served once an
         # engine that reached Ready has failed for any reason but close(). It
@@ -761,7 +761,7 @@ class MultiplexedRuntime:
                 threading.Thread(
                     target=self._run_startup_attempt,
                     args=(attempt, old_process, old_reader),
-                    name="splash-native-startup",
+                    name="richengine-native-startup",
                     daemon=True,
                 ).start()
             deadline = min(attempt.deadline, caller_deadline or attempt.deadline)
@@ -835,7 +835,7 @@ class MultiplexedRuntime:
                 self._stop_process(process, None)
             message = (
                 "native engine executable is missing; the installation may have been "
-                "upgraded or removed. Stop the server and restart Splash from the "
+                "upgraded or removed. Stop the server and restart RichEngine from the "
                 "current installation"
                 if isinstance(error, FileNotFoundError)
                 else f"could not launch native engine: {error}"
@@ -865,7 +865,7 @@ class MultiplexedRuntime:
                 reader = threading.Thread(
                     target=self._reader_loop,
                     args=(process, generation),
-                    name=f"splash-native-reader-{generation}",
+                    name=f"richengine-native-reader-{generation}",
                     daemon=True,
                 )
                 self._reader_thread = reader
@@ -1121,7 +1121,7 @@ class MultiplexedRuntime:
                     # relaunch would load the model to announce them again.
                     self._fatal_error = EngineUnhealthy(
                         "native context window, concurrency or vision "
-                        "changed; restart the Splash server"
+                        "changed; restart the RichEngine server"
                     )
                     raise self._fatal_error.restate()
                 self._ready_message = message

@@ -1,15 +1,15 @@
 #pragma once
 
 #include "ops/Vision.hpp"
-#include "engine/MemoryPlan.hpp"
-#include "engine/Cache.hpp"
-#include "engine/CacheDirectory.hpp"
-#include "engine/MemoryGovernor.hpp"
-#include "engine/KvPageTier.hpp"
+#include "engine/memory/MemoryPlan.hpp"
+#include "engine/cache/Cache.hpp"
+#include "engine/cache/CacheDirectory.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
+#include "engine/cache/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
-#include "engine/MemoryAudit.hpp"
+#include "engine/memory/MemoryAudit.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <condition_variable>
@@ -24,7 +24,7 @@
 #include <string_view>
 #include <thread>
 
-namespace splash::engine {
+namespace richengine::engine {
 
 struct EngineConfig;
 
@@ -251,4 +251,4 @@ private:
 // service makes. Every engine that runs against a governor connects through it.
 void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
-} // namespace splash::engine
+} // namespace richengine::engine

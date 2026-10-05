@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 [[nodiscard]] constexpr uint32_t elementwiseGroups(uint64_t elements) {
@@ -21,7 +21,7 @@ namespace {
 // Each query tile's history splits: the maximum shared out over the chunk's
 // tiles, at least one.
 [[nodiscard]] constexpr uint32_t prefillSplits(uint32_t tiles) {
-  constexpr uint32_t maximum = SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
+  constexpr uint32_t maximum = RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS;
   return std::clamp(maximum / tiles, 1u, maximum);
 }
 
@@ -39,7 +39,11 @@ enum class KernelLayout : uint8_t {
   Kv4Group4,
   Kv2Group8,
   Kv2Group8D128,
-  Kv8Group4D64
+  Kv8Group4D64,
+  // Granite's KV8 layouts: 3B's 40 query heads of 64 (group 5) and 8B's
+  // 32 of 128 (group 4).
+  Kv8Group5D64,
+  Kv8Group4D128
 };
 
 [[nodiscard]] constexpr uint32_t kernelLayoutHeadDim(KernelLayout layout) noexcept {
@@ -51,7 +55,10 @@ enum class KernelLayout : uint8_t {
   case KernelLayout::Kv2Group8D128:
     return 128;
   case KernelLayout::Kv8Group4D64:
+  case KernelLayout::Kv8Group5D64:
     return 64;
+  case KernelLayout::Kv8Group4D128:
+    return 128;
   }
   return 0;
 }
@@ -70,6 +77,10 @@ enum class KernelLayout : uint8_t {
     return "_hd128";
   case KernelLayout::Kv8Group4D64:
     return "_hd64";
+  case KernelLayout::Kv8Group5D64:
+    return "_k8q5d64";
+  case KernelLayout::Kv8Group4D128:
+    return "_k8q4d128";
   }
   return {};
 }
@@ -86,6 +97,8 @@ enum class KernelLayout : uint8_t {
     return KernelLayout::Kv2Group8D128;
   else if (layout.headDimension == 64 && layout.kvHeads == 8)
     return KernelLayout::Kv8Group4D64;
+  else if (layout.headDimension == 128 && layout.kvHeads == 8)
+    return KernelLayout::Kv8Group4D128;
   throw std::invalid_argument("unsupported attention layout");
 }
 
@@ -97,6 +110,7 @@ enum class KernelLayout : uint8_t {
          : layout.kvHeads == 2 ? "_kv2_g8" : throw std::invalid_argument("unsupported attention layout");
   if (layout.headDimension == 128 && layout.kvHeads == 2) return "_hd128";
   if (layout.headDimension == 64 && layout.kvHeads == 8) return "_hd64";
+  if (layout.headDimension == 128 && layout.kvHeads == 8) return "_k8d128";
   throw std::invalid_argument("unsupported attention layout");
 }
 
@@ -118,6 +132,10 @@ enum class KernelLayout : uint8_t {
     if (queryHeads == 16) return kernel;
     break;
   case KernelLayout::Kv8Group4D64:
+    if (queryHeads == 32) return kernel;
+    if (queryHeads == 40) return KernelLayout::Kv8Group5D64;
+    break;
+  case KernelLayout::Kv8Group4D128:
     if (queryHeads == 32) return kernel;
     break;
   default:
@@ -196,11 +214,11 @@ AttentionWorkspace PagedAttention::prefillWorkspace(uint32_t maximumRows, uint32
 AttentionWorkspace PagedAttention::verifyWorkspace(uint32_t lanes, uint32_t queryHeads,
                                                      kv::Layout layout) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
   // Sized for a tree lane's node capacity so one workspace covers both
   // verify modes.
-  return attentionWorkspace(uint64_t{lanes} * SPLASH_TREE_VERIFY_NODES *
+  return attentionWorkspace(uint64_t{lanes} * RICHENGINE_TREE_VERIFY_NODES *
                                 kv::kVerifyMaximumSplits * queryHeads,
                             kernelLayoutHeadDim(kernelLayout));
 }
@@ -224,7 +242,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
           {layout.kvHeads, tiles, splits},
           {layout.kvHeads, fusedRows, tiles},
           metal::DispatchSize{layout.headDimension, 1, 1},
-          layout.format};
+          layout.format, layout.scoreScale};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
@@ -235,14 +253,14 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     throw std::invalid_argument("paged attention requires a kv format");
   if (tree && layout.format == kv::Format::Float8E4M3)
     throw std::invalid_argument("tree verify has no fp8 kernels");
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       historyTokens.size() != lanes)
     throw std::invalid_argument("verify lane count is out of range");
   const uint32_t rows =
-      tree ? SPLASH_TREE_VERIFY_NODES : kv::kVerifyRows;
+      tree ? RICHENGINE_TREE_VERIFY_NODES : kv::kVerifyRows;
   const uint32_t liveRows =
-      tree ? SPLASH_TREE_VERIFY_NODES - 1 : kv::kVerifyRows;
-  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
+      tree ? RICHENGINE_TREE_VERIFY_NODES - 1 : kv::kVerifyRows;
+  std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (uint64_t{historyTokens[lane]} + liveRows > kv::kMaximumPhysicalTokens)
@@ -275,7 +293,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           metal::DispatchSize{layout.headDimension, 1, 1},
           metal::DispatchSize{layout.headDimension, 1, 1},
           layout.format,
-          rows};
+          rows, layout.scoreScale};
 }
 
 void PagedAttention::addPrefillProjection(
@@ -287,8 +305,6 @@ void PagedAttention::addPrefillProjection(
     uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   const bool hasNorms = queryNorm.buffer && keyNorm.buffer;
-  if (!hasNorms && kernelLayoutHeadDim(kernelLayout) != 128)
-    throw std::invalid_argument("per-head norms are required");
   std::string kernel = std::string("prefill_attention_qkv") +
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
@@ -322,7 +338,7 @@ void PagedAttention::addPrefillGateSums(
     metal::MetalBuffer sums, uint32_t tokens, uint32_t stride,
     uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
-  if (kernelLayoutHeadDim(kernelLayout) != SPLASH_KV_HEAD_DIMENSION)
+  if (kernelLayoutHeadDim(kernelLayout) != RICHENGINE_KV_HEAD_DIMENSION)
     throw std::invalid_argument("no paged prefill gate sums kernel for layout");
   FullPrefillParams params{.tokens = tokens, .stride = stride};
   graph.add(gateKernel("prefill_attention", true, kernelLayout, "_sums"),
@@ -341,8 +357,6 @@ void PagedAttention::addVerifyProjection(
     kv::Layout layout, uint32_t lanes, uint32_t rows) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   const bool hasNorms = queryNorm.buffer && keyNorm.buffer;
-  if (!hasNorms && kernelLayoutHeadDim(kernelLayout) != 128)
-    throw std::invalid_argument("per-head norms are required");
   std::string kernel = std::string("verify_attention_qkv") +
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
@@ -403,16 +417,16 @@ kv::ChunkedPrefillParams PagedAttention::verifyParams(
 
 kv::ChunkedPrefillParams PagedAttention::verifyTreeParams(
     uint64_t logicalPosition, uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, SPLASH_TREE_VERIFY_NODES - 1,
+  return prefillParams(logicalPosition, RICHENGINE_TREE_VERIFY_NODES - 1,
                        kv::kVerifyChunkStride, pageTableEntries);
 }
 
 void PagedAttention::addPrefillStore(
-    metal::CommandGraph &graph, SplashKvLayer layer, metal::MetalBuffer chunkKeys,
+    metal::CommandGraph &graph, RichKvLayer layer, metal::MetalBuffer chunkKeys,
     metal::MetalBuffer chunkValues, metal::MetalBuffer pageTable,
     const kv::ChunkedPrefillParams &params, kv::Layout layout) {
   (void)storageKernelLayout(layout);
-  SplashChunkedPrefillParams chunk{};
+  RichChunkedPrefillParams chunk{};
   chunk.committed_tokens = params.committed_tokens;
   chunk.chunk_tokens = params.chunk_tokens;
   chunk.chunk_stride = params.chunk_stride;
@@ -427,7 +441,7 @@ void PagedAttention::addPrefillStore(
 }
 
 void PagedAttention::addPrefill(
-    metal::CommandGraph &graph, SplashKvLayer layer, metal::MetalBuffer queries,
+    metal::CommandGraph &graph, RichKvLayer layer, metal::MetalBuffer queries,
     metal::MetalBuffer output, metal::MetalBuffer partials,
     metal::MetalBuffer statistics, metal::MetalBuffer pageTable,
     const kv::ChunkedPrefillParams &chunk, const PrefillAttentionPlan &plan) {
@@ -439,9 +453,9 @@ void PagedAttention::addPrefill(
   if (partials.sizeBytes() < plan.workspace.partialsBytes ||
       statistics.sizeBytes() < plan.workspace.statisticsBytes)
     throw std::invalid_argument("prefill attention scratch is smaller than its bound");
-  const SplashPrefillAttentionParams attention{
+  const RichPrefillAttentionParams attention{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, layer, plan.splits};
+      chunk.page_table_entries, layer, plan.splits, plan.scoreScale};
   graph.addPatchable(plan.splitPipeline,
             {queries, partials, statistics, pageTable}, attention,
             plan.splitGroups);
@@ -451,12 +465,12 @@ void PagedAttention::addPrefill(
 }
 
 void PagedAttention::addVerify(
-    metal::CommandGraph &graph, SplashKvLayer layer,
+    metal::CommandGraph &graph, RichKvLayer layer,
     PagedVerifyBuffers buffers,
     std::span<const kv::ChunkedPrefillParams> chunks,
     const VerifyAttentionPlan &plan, metal::MetalBuffer gatePacked,
     metal::MetalBuffer gateHidden) {
-  constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  constexpr uint32_t maximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes)
     throw std::invalid_argument("invalid paged verify batch");
   if (buffers.partials.sizeBytes() < plan.workspace.partialsBytes ||
@@ -473,7 +487,7 @@ void PagedAttention::addVerify(
                        plan.laneSplits[lane],
                        plan.splits,
                        chunks[lane].chunk_tokens,
-                       plan.rowCapacity};
+                       plan.rowCapacity, plan.scoreScale};
   }
   std::array<metal::MetalBuffer, 4> tables = {buffers.pageTables[0], buffers.pageTables[1],
                                               buffers.pageTables[2], buffers.pageTables[3]};
@@ -531,12 +545,12 @@ void PagedAttention::addVerify(
 }
 
 void PagedAttention::addVerifyTreeCompact(
-    metal::CommandGraph &graph, SplashKvLayer layer,
+    metal::CommandGraph &graph, RichKvLayer layer,
     std::span<const metal::MetalBuffer> pageTables,
     metal::MetalBuffer retainedPath, metal::MetalBuffer retained,
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
     kv::Layout layout) {
-  constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  constexpr uint32_t maximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   if (!lanes || lanes > maximumLanes || chunks.size() != lanes ||
       pageTables.size() != maximumLanes)
     throw std::invalid_argument("invalid tree verify compact batch");
@@ -558,4 +572,4 @@ void PagedAttention::addVerifyTreeCompact(
             metal::DispatchSize{layout.headDimension, 1, 1});
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

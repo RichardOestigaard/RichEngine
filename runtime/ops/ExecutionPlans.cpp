@@ -3,11 +3,11 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kDecodeRows = RICHENGINE_TARGET_VERIFY_ROWS;
 static_assert(kMaximumLanes == 4);
 
 template <typename Workspace, size_t N>
@@ -119,4 +119,4 @@ uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   return bound;
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

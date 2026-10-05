@@ -11,6 +11,7 @@
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
+#include "metal/abi/Sampling.h"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
@@ -29,6 +30,7 @@ struct Ornith9BLayout;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
 struct DenseLayout;
+struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
 struct Lfm2MoeLayerWeights;
@@ -299,6 +301,13 @@ struct QwenTargetVerifyBuffers final {
       nextGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
+  // Fused greedy head (Ornith-9B vocabulary shape): when fusedHead is set and
+  // every lane is greedy and unconstrained, the head writes per-tile argmax
+  // partials into these instead of materializing logits.
+  bool fusedHead = false;
+  metal::MetalBuffer headArgmaxValues;
+  metal::MetalBuffer headArgmaxIndices;
+  HeadArgmaxParams headArgs{};
   // Tree verify only: the selector's node tables, the input pass's ancestor
   // masks and the capture staging the post-acceptance gather reads. Empty in
   // a chain batch.
@@ -346,12 +355,12 @@ public:
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers) const;
+      std::span<const RichKvLayer> kvLayers) const;
   // liveRows, when nonempty, gives each chain lane's live verify row count
   // for the GDN scan (adaptive proposal budgets); ignored for tree batches.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-      std::span<const SplashKvLayer> kvLayers,
+      std::span<const RichKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, bool tree = false,
       std::span<const uint32_t> liveRows = {}) const;
@@ -359,13 +368,14 @@ public:
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                    uint32_t lanes, ops::LinearScratch scratch) const;
+                    uint32_t lanes, ops::LinearScratch scratch,
+                    const QwenTargetVerifyBuffers *fused = nullptr) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
                       metal::MetalBuffer verifyInput, uint32_t lanes) const;
-  // A tree batch's verify inputs: each lane's SPLASH_TREE_VERIFY_NODES nodes
+  // A tree batch's verify inputs: each lane's RICHENGINE_TREE_VERIFY_NODES nodes
   // supply the input tokens, rope positions and ancestor masks. `base` is
   // each lane's (t, h, w) rotary position at its committed length.
   void addVerifyTreeInput(metal::CommandGraph &graph,
@@ -394,7 +404,8 @@ private:
                    const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
                    const QwenTargetWeights<DenseLayout, Qwen3_8LayerWeights> *,
                    const QwenTargetWeights<Lfm2Layout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *>;
+                   const QwenTargetWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *,
+                   const QwenTargetWeights<GraniteLayout, Qwen3_8LayerWeights> *>;
   struct PrefillStep;
   struct VerifyStep;
 
@@ -446,4 +457,4 @@ private:
   const ops::ExecutionPlans &operators_;
 };
 
-} // namespace splash::model
+} // namespace richengine::model

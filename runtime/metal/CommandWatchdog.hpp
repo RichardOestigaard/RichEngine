@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace splash::metal {
+namespace richengine::metal {
 
 // Guarded by the backend's submission mutex. A completed GPU command stops
 // this clock even if its model ticket continues waiting for CPU work.
@@ -34,4 +34,4 @@ private:
   double deadlineSeconds_ = 0.0;
 };
 
-} // namespace splash::metal
+} // namespace richengine::metal

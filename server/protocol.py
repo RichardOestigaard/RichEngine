@@ -1,4 +1,4 @@
-"""The server's side of the Splash native protocol.
+"""The server's side of the RichEngine native protocol.
 
 It encodes client frames and decodes engine events; ``runtime/engine/
 Protocol.*`` does the reverse. ``dev/tests/engine/protocol_golden.txt`` pins
@@ -38,11 +38,11 @@ MAX_SIMULATION_TOKENS = 32
 MAX_IMAGE_SPANS = 64
 MAX_MASK_WORDS = 1 << 20
 
-_MAGIC = b"SPLH"
+_MAGIC = b"RICH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -62,7 +62,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 87
+assert _REQUEST.size == 91
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
@@ -256,6 +256,10 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
+    # Leading prompt tokens that later requests are expected to share, such
+    # as the chat template's system prompt and tools; zero when unknown. It
+    # must not exceed the prompt.
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -652,6 +656,9 @@ def _validated_request(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
+        shared = _u32(request.shared_prefix_tokens, "shared prefix tokens")
+        if shared > len(prompt):
+            raise ValueError("shared prefix must lie within the prompt")
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if scores and (
@@ -785,6 +792,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
         len(request.score_tokens),
         request.generation_prompt_tokens,
         request.flags,
+        request.shared_prefix_tokens,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(
@@ -1158,7 +1166,7 @@ class FrameParser:
             return _issue(
                 FailureClass.PROTOCOL_FATAL,
                 IssueCode.BAD_MAGIC,
-                "frame magic is not SPLH",
+                "frame magic is not RICH",
             )
         if version != PROTOCOL_VERSION:
             return _issue(

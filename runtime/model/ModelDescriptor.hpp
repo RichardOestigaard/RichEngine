@@ -2,6 +2,7 @@
 
 #include "DFlashDraft.hpp"
 #include "Dense.hpp"
+#include "Granite.hpp"
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
 #include "Model.hpp"
@@ -15,11 +16,11 @@
 #include <string>
 #include <variant>
 
-namespace splash::model {
+namespace richengine::model {
 
 using TargetLayout =
     std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout, DenseLayout,
-                 Lfm2Layout, Lfm2MoeLayout>;
+                 Lfm2Layout, Lfm2MoeLayout, GraniteLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX or GGUF checkpoint prepared into images when it loads. The vision
@@ -69,4 +70,4 @@ struct ModelDescriptor final {
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
 
-} // namespace splash::model
+} // namespace richengine::model

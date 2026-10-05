@@ -1,5 +1,5 @@
 #include "TestChecks.hpp"
-#include "engine/CacheDirectory.hpp"
+#include "engine/cache/CacheDirectory.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -20,8 +20,8 @@
 #include <system_error>
 #include <utility>
 
-using splash::engine::CacheDirectory;
-using splash::test::require;
+using richengine::engine::CacheDirectory;
+using richengine::test::require;
 using namespace std::chrono_literals;
 
 namespace {
@@ -30,7 +30,7 @@ namespace {
 class Root final {
 public:
   Root() {
-    std::string name = (std::filesystem::temp_directory_path() / "splash-cache-root-XXXXXX").string();
+    std::string name = (std::filesystem::temp_directory_path() / "richengine-cache-root-XXXXXX").string();
     require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
     path_ = std::filesystem::path(name) / "prefix-cache";
   }

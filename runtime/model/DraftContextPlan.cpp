@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace splash {
+namespace richengine {
 DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
                  std::span<const uint32_t> materializationBoundaries) {
@@ -121,4 +121,4 @@ draftCaptureSpansForDispatch(const DraftContextPlan &plan,
   return result;
 }
 
-} // namespace splash
+} // namespace richengine

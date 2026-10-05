@@ -1,4 +1,4 @@
-"""Legacy Splash packages: prebuilt packed weights published on the Hub with a
+"""Legacy RichEngine packages: prebuilt packed weights published on the Hub with a
 manifest.json, which predate upstream loading and stay installable.
 
 A package is installed as a selection link to its verified Hub snapshot,
@@ -35,8 +35,17 @@ class PackageFormat(NamedTuple):
 
 
 PACKAGE_FORMATS = {
+    # The splash-packed-* names are the same formats published before the
+    # rename.
     "splash-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
     "splash-packed-q4-moe": PackageFormat(
+        4,
+        "MDFM0001",
+        "Qwen3.6-35B-A3B",
+        {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
+    ),
+    "richengine-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
+    "richengine-packed-q4-moe": PackageFormat(
         4,
         "MDFM0001",
         "Qwen3.6-35B-A3B",
@@ -46,7 +55,7 @@ PACKAGE_FORMATS = {
 
 
 def is_package_manifest(manifest) -> bool:
-    """Whether a manifest.json names a Splash package format (another tool's
+    """Whether a manifest.json names a RichEngine package format (another tool's
     manifest.json does not)."""
     format_ = manifest.get("format")
     return isinstance(format_, dict) and format_.get("name") in PACKAGE_FORMATS
@@ -89,7 +98,7 @@ def validate_manifest(path: Path):
         or not manifest["model"].strip()
         or not isinstance(manifest.get("execution_geometry"), dict)
     ):
-        raise models.ModelError("repository is not a supported Splash runtime package")
+        raise models.ModelError("repository is not a supported RichEngine runtime package")
     expected_format = {
         "section_alignment_bytes": ALIGNMENT,
         "target_layer_magic": layout.target_layer_magic,
@@ -164,7 +173,7 @@ def installed_snapshot(link: Path) -> Path:
     """The Hub snapshot an installed package's selection link points to."""
     if not link.is_symlink():
         raise models.ModelError(
-            f"installed model root is not a Splash installation: {link}"
+            f"installed model root is not a RichEngine installation: {link}"
         )
     return link.resolve()
 
@@ -197,7 +206,7 @@ def _download_snapshot(repo_id: str, token):
         )
         if manifest_file is None:
             raise models.ModelError(
-                "repository has no Splash runtime package manifest.json"
+                "repository has no RichEngine runtime package manifest.json"
             )
         if (
             type(manifest_file.size) is not int
@@ -293,7 +302,7 @@ def resolve_snapshot(repo_id: str):
         token = hub.token()
     except ImportError as error:
         raise models.ModelError(
-            "missing dependency huggingface_hub; reinstall Splash"
+            "missing dependency huggingface_hub; reinstall RichEngine"
         ) from error
     import httpx
     from huggingface_hub.errors import OfflineModeIsEnabled
@@ -308,7 +317,7 @@ def resolve_snapshot(repo_id: str):
         if isinstance(error, models.ModelError):
             raise
         raise models.ModelError(
-            "could not download Splash runtime package "
+            "could not download RichEngine runtime package "
             f"{repo_id}@main: {hub.reason(error, token)}"
         ) from error
 
@@ -335,7 +344,7 @@ def prepare(selection):
                     f"cannot identify the local package at {link}; move it aside before installing"
                 ) from None
         else:
-            print(f"Splash model {selection.model} is already installed in {link}")
+            print(f"RichEngine model {selection.model} is already installed in {link}")
             hub.repair_pins(link, [(installed_snapshot(link), selection.repo_id)])
             return
     print(
@@ -347,5 +356,5 @@ def prepare(selection):
         pin = hub.pin(snapshot, selection.repo_id, link)
         models.link_selection(link, snapshot)
         verify(link, selection.repo_id, full=False)
-        print(f"Installed verified Splash model {selection.model} in {link}")
+        print(f"Installed verified RichEngine model {selection.model} in {link}")
         hub.retire_other_pins([pin])

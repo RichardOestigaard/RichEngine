@@ -2,7 +2,7 @@
 # Check the actual CLI parser without opening a Metal device or model.
 set -eu
 binary=$1
-work=$(mktemp -d "${TMPDIR:-/tmp}/splash-tuning-cli.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/richengine-tuning-cli.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 reject() {

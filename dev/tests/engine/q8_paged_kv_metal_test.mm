@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-using namespace splash::kv;
+using namespace richengine::kv;
 
 namespace {
 
@@ -97,11 +97,11 @@ void run(const char *libraryPath) {
         throw std::runtime_error(error.localizedDescription.UTF8String);
     }
     auto quantize = pipeline(
-        device, library, "splash_q8_quantize_kv_page");
+        device, library, "richengine_q8_quantize_kv_page");
     auto dequantize = pipeline(
-        device, library, "splash_q8_dequantize_kv_page");
+        device, library, "richengine_q8_dequantize_kv_page");
     auto gather = pipeline(
-        device, library, "splash_q8_gather_logical_kv_page");
+        device, library, "richengine_q8_gather_logical_kv_page");
 
     std::vector<float> logicalKeys(
         uint64_t{validTokens} * kKvHeads * kHeadDimension);
@@ -121,9 +121,9 @@ void run(const char *libraryPath) {
                 BFloat16Bits valueBits = floatToBFloat16(value);
                 logicalKeys[logical] = bfloat16ToFloat(keyBits);
                 logicalValues[logical] = bfloat16ToFloat(valueBits);
-                physicalKeys[splash_kv_key_element(head, token, dimension)] =
+                physicalKeys[richengine_kv_key_element(head, token, dimension)] =
                     keyBits;
-                physicalValues[splash_kv_value_element(head, token, dimension)] =
+                physicalValues[richengine_kv_value_element(head, token, dimension)] =
                     valueBits;
             }
         }
@@ -222,9 +222,9 @@ void run(const char *libraryPath) {
                 expectedLogicalKeys[logical] = key;
                 expectedLogicalValues[logical] = value;
                 expectedPhysicalKeys[
-                    splash_kv_key_element(head, token, dimension)] = key;
+                    richengine_kv_key_element(head, token, dimension)] = key;
                 expectedPhysicalValues[
-                    splash_kv_value_element(head, token, dimension)] = value;
+                    richengine_kv_value_element(head, token, dimension)] = value;
             }
         }
     }
@@ -245,7 +245,7 @@ void run(const char *libraryPath) {
         for (uint32_t head = 0; head < kKvHeads; ++head) {
             for (uint32_t dimension = 0; dimension < kHeadDimension;
                  ++dimension) {
-                physicalValues[splash_kv_value_element(head, token, dimension)] =
+                physicalValues[richengine_kv_value_element(head, token, dimension)] =
                     floatToBFloat16(1.0f);
             }
         }

@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace splash::model {
+namespace richengine::model {
 
 WeightFile WeightImages::load(ImagePlan image) {
   if (released_) throw std::logic_error("weights load while their memory is released");
@@ -106,4 +106,4 @@ void zeroUnwritten(std::span<uint8_t> image, std::vector<std::pair<uint64_t, uin
   std::memset(image.data() + written, 0, image.size() - written);
 }
 
-} // namespace splash::model
+} // namespace richengine::model

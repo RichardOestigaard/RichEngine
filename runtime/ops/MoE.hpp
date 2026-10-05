@@ -9,7 +9,7 @@
 #include <array>
 #include <cstdint>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 // The shared expert is an expert every row visits, so it has the routed
 // experts' intermediate width and runs through the same grouped tiles.
@@ -333,4 +333,4 @@ struct MoE final {
                   const MoeWeights &weights, const MoePlan &plan);
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

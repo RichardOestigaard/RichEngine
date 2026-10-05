@@ -13,7 +13,7 @@
 #include "model/QwenHybridLayout.hpp"
 #include "model/WeightImages.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
 // The single .gguf in a target directory (shards are not supported).
 [[nodiscard]] std::filesystem::path findTargetGguf(const std::filesystem::path &directory);
@@ -49,12 +49,14 @@ private:
 };
 
 struct DenseLayout;
+struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
 
 // The GGUF geometry of the dense ("llama"), LFM2 ("lfm2") and LFM2-MoE
 // ("lfm2moe") targets.
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout);
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout);
 
@@ -86,4 +88,4 @@ template <class Layout>
   return geometry;
 }
 
-} // namespace splash::model
+} // namespace richengine::model

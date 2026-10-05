@@ -206,7 +206,7 @@ const saved = JSON.stringify([{id: 'saved', title: 'Saved chat', updated: 1,
   messages: [{role: 'user', content: 'remembered message'}]}]);
 for (const writable of [true, false]) {
   const storage = new Map([
-    ['splash-chats', saved], ['splash-thinking-effort', 'low'],
+    ['richengine-chats', saved], ['richengine-thinking-effort', 'low'],
   ]);
   const chat = createChat(storage, writable);
   assert.equal(chat.elements.effort.value, 'low');
@@ -215,7 +215,7 @@ for (const writable of [true, false]) {
   setText(chat, 'continue');
   submit(chat);
   assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
-  assert.equal(storage.get('splash-thinking-effort'), 'low');
+  assert.equal(storage.get('richengine-thinking-effort'), 'low');
 }
 """)
 
@@ -255,7 +255,7 @@ for (const writable of [true, false]) {
     await flush();
     chat.elements['new-chat'].handlers.click();
   }
-  const saved = JSON.parse(storage.get('splash-chats'));
+  const saved = JSON.parse(storage.get('richengine-chats'));
   assert.deepEqual(saved.map(item => item.title).sort(), ['first chat', 'second chat']);
   assert.equal(new Set(saved.map(item => item.id)).size, 2);
   for (const {id} of saved) assert.match(id, /^[0-9a-f]{32}$/);
@@ -289,7 +289,7 @@ for (const writable of [true, false]) {
     const last = Date.now();
     while (Date.now() === last) await new Promise(resolve => setTimeout(resolve, 1));
   }
-  const saved = () => JSON.parse(storage.get('splash-chats'));
+  const saved = () => JSON.parse(storage.get('richengine-chats'));
   const notSaved = {type: 'text', text: '[Image not saved]'};
   const screenshot = 'S'.repeat(2000);
   await send('screenshot', screenshot);

@@ -9,29 +9,47 @@
 #endif
 
 // The uniforms one lane draws a decode cycle with, in [0, 1): the first
-// token after a prompt draws SPLASH_UNIFORM_INITIAL; the draft's sampled
-// proposal at position p draws SPLASH_UNIFORM_PROPOSALS + p; acceptance tests
-// draft token p against SPLASH_UNIFORM_ACCEPTANCE + p; and a sampled verify
+// token after a prompt draws RICHENGINE_UNIFORM_INITIAL; the draft's sampled
+// proposal at position p draws RICHENGINE_UNIFORM_PROPOSALS + p; acceptance tests
+// draft token p against RICHENGINE_UNIFORM_ACCEPTANCE + p; and a sampled verify
 // row draws its correction, or the bonus token after the whole draft, with
-// SPLASH_UNIFORM_CORRECTION. Lane l's uniforms start at
-// l * SPLASH_SAMPLING_UNIFORMS.
-#define SPLASH_UNIFORM_INITIAL 0u
-#define SPLASH_UNIFORM_PROPOSALS 1u
-#define SPLASH_UNIFORM_ACCEPTANCE                                          \
-  (SPLASH_UNIFORM_PROPOSALS + SPLASH_DRAFT_PROPOSAL_TOKENS)
-#define SPLASH_UNIFORM_CORRECTION                                          \
-  (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_PROPOSAL_TOKENS)
-#define SPLASH_SAMPLING_UNIFORMS (SPLASH_UNIFORM_CORRECTION + 1u)
+// RICHENGINE_UNIFORM_CORRECTION. Lane l's uniforms start at
+// l * RICHENGINE_SAMPLING_UNIFORMS.
+#define RICHENGINE_UNIFORM_INITIAL 0u
+#define RICHENGINE_UNIFORM_PROPOSALS 1u
+#define RICHENGINE_UNIFORM_ACCEPTANCE                                          \
+  (RICHENGINE_UNIFORM_PROPOSALS + RICHENGINE_DRAFT_PROPOSAL_TOKENS)
+#define RICHENGINE_UNIFORM_CORRECTION                                          \
+  (RICHENGINE_UNIFORM_ACCEPTANCE + RICHENGINE_DRAFT_PROPOSAL_TOKENS)
+#define RICHENGINE_SAMPLING_UNIFORMS (RICHENGINE_UNIFORM_CORRECTION + 1u)
 
-// One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
-// rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
-// SPLASH_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
-// lane s / rows: its logits row is lane * SPLASH_TARGET_VERIFY_ROWS +
-// logits_row + s % rows, its mask row lane * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+// One target-policy dispatch over lanes of RICHENGINE_TARGET_VERIFY_ROWS logits
+// rows, RICHENGINE_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
+// RICHENGINE_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
+// lane s / rows: its logits row is lane * RICHENGINE_TARGET_VERIFY_ROWS +
+// logits_row + s % rows, its mask row lane * (RICHENGINE_TARGET_VERIFY_ROWS + 1) +
 // mask_row + s % rows, and its draw takes uniform
-// lane * SPLASH_SAMPLING_UNIFORMS + uniform; workspaces and output tokens are
+// lane * RICHENGINE_SAMPLING_UNIFORMS + uniform; workspaces and output tokens are
 // indexed by s. Rows below drafted_rows follow draft token s % rows (verify
 // input row s % rows + 1).
+// The fused vocabulary-head argmax (decode_head_argmax_q4): one 32 x 128
+// logits tile per threadgroup, row maxima/index partials, no logits writes.
+// Emitted only on all-greedy unconstrained chain-verify steps — the
+// constraint mask is unused (no lane carries one), dead-row partials are
+// skipped by the tile reducer like the sharded argmax's.
+struct HeadArgmaxParams {
+  uint32_t output_size;
+  uint32_t input_size;
+  uint32_t rows;
+  uint32_t exclude_stop_mask;
+  uint32_t stop_token_0;
+  uint32_t stop_token_1;
+  uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(HeadArgmaxParams) == 40,
+              "Head argmax parameters are 40 bytes on both sides");
+
 struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;
@@ -40,10 +58,10 @@ struct TargetSamplingParams {
   uint32_t mask_row;
   uint32_t uniform;
   uint32_t drafted_rows;
-  uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float min_p[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t top_k[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float temperature[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float top_p[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float min_p[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   // Lanes that sample; the others take the argmax.
   uint32_t sampling_mask;
   uint32_t constrained_mask;
@@ -51,11 +69,11 @@ struct TargetSamplingParams {
   uint32_t exclude_stop_mask;
   uint32_t stop_token_0;
   uint32_t stop_token_1;
-  // Adaptive proposal budgets (SPLASH_ADAPTIVE_PROPOSALS): the lane's live
+  // Adaptive proposal budgets (RICHENGINE_ADAPTIVE_PROPOSALS): the lane's live
   // selected rows. A row s with s % rows >= live_rows[lane] is dead — the
   // selection kernels skip it. Unadapted dispatches fill every lane with
   // rows.
-  uint32_t live_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(TargetSamplingParams) == 128,
@@ -106,24 +124,24 @@ static_assert(sizeof(TargetVocabularyRange) == 8,
 // row of the penalty table (ops::Sampling::rebuildPenaltyWords): the
 // prompt bit marks a prompt token, and the count is how often the target
 // selected it.
-#define SPLASH_PENALTY_PROMPT_BIT 0x80000000u
-#define SPLASH_PENALTY_COUNT_MASK 0x7fffffffu
+#define RICHENGINE_PENALTY_PROMPT_BIT 0x80000000u
+#define RICHENGINE_PENALTY_COUNT_MASK 0x7fffffffu
 
 // The penalized lanes of one penalty dispatch. Each entry names the lane of
 // its logits and the penalty table row it reads; rows penalizes that many
-// rows of the lane's SPLASH_TARGET_VERIFY_ROWS, from row_offset.
+// rows of the lane's RICHENGINE_TARGET_VERIFY_ROWS, from row_offset.
 // repetition_inverse is 1 / repetition, saturated to the largest float.
 struct SamplingPenaltyParams {
   uint32_t vocabulary;
   uint32_t rows;
   uint32_t row_offset;
   uint32_t entries;
-  uint32_t logits_lane[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t table_row[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float repetition[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float repetition_inverse[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float presence[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t logits_lane[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t table_row[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float repetition[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float repetition_inverse[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float presence[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float frequency[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(SamplingPenaltyParams) == 112,
@@ -135,8 +153,8 @@ static_assert(sizeof(SamplingPenaltyParams) == 112,
 // emits sibling leaves beyond the chain (greedy, unconstrained lanes of a
 // tree-capable draft); sampled lanes always get a linear node table.
 struct SelectorBatchParams {
-  uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
-  float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t anchor[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float temperature[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
@@ -151,20 +169,20 @@ static_assert(sizeof(SelectorBatchParams) == 48,
 // position (0xFF for the anchor). Row 0 is the anchor, rows 1..7 the chain,
 // rows 8.. the sibling leaves. A node's row also indexes its verify input
 // token (TreeTokens), its logits row and its attention/GDN row.
-#define SPLASH_TREE_NODE_PARENT(node) ((node)&0xffu)
-#define SPLASH_TREE_NODE_DEPTH(node) (((node) >> 8) & 0xffu)
-#define SPLASH_TREE_NODE_POSITION(node) (((node) >> 16) & 0xffu)
-#define SPLASH_TREE_NODE_NONE 0xffu
+#define RICHENGINE_TREE_NODE_PARENT(node) ((node)&0xffu)
+#define RICHENGINE_TREE_NODE_DEPTH(node) (((node) >> 8) & 0xffu)
+#define RICHENGINE_TREE_NODE_POSITION(node) (((node) >> 16) & 0xffu)
+#define RICHENGINE_TREE_NODE_NONE 0xffu
 
 struct AcceptBatchParams {
-  uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t remaining[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;
   uint32_t stop_token_1;
   uint32_t sampling_mask;
   // Adaptive proposal budgets: the most draft tokens the lane may accept
-  // this step (SPLASH_DRAFT_PROPOSAL_TOKENS when unadapted). A lane's
+  // this step (RICHENGINE_DRAFT_PROPOSAL_TOKENS when unadapted). A lane's
   // retained count stays within proposals + 1 live rows.
-  uint32_t proposals[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t proposals[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(AcceptBatchParams) == 44,
@@ -176,7 +194,7 @@ static_assert(sizeof(AcceptBatchParams) == 44,
 struct VerifyTreeInputParams {
   uint32_t vocabulary;
   uint32_t mask_token;
-  uint32_t base[SPLASH_MAXIMUM_BATCH_WIDTH][3];
+  uint32_t base[RICHENGINE_MAXIMUM_BATCH_WIDTH][3];
 };
 
 static_assert(sizeof(VerifyTreeInputParams) == 56,
@@ -185,7 +203,7 @@ static_assert(sizeof(VerifyTreeInputParams) == 56,
 // decode_accept_tree walks one lane's tree: it shares the remaining/limits
 // fields of AcceptBatchParams and adds nothing else.
 struct TreeAcceptBatchParams {
-  uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t remaining[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;
   uint32_t stop_token_1;
   uint32_t lanes;

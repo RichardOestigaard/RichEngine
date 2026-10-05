@@ -8,12 +8,12 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 engine::RequestSpec
 request(uint64_t id, uint32_t prompt, bool constrained = false,

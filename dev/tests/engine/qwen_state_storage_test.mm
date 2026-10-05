@@ -1,5 +1,5 @@
 #include "Checked.hpp"
-#include "engine/MemoryGovernor.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
 #include "tests/engine/TestChecks.hpp"
@@ -24,8 +24,8 @@
 #include <utility>
 #include <vector>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 
 namespace {
 
@@ -34,7 +34,7 @@ constexpr model::DraftStateLayout kDraftState{5, 8, 128};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
-using splash::test::require;
+using richengine::test::require;
 
 template <typename Exception = std::exception>
 void requireThrows(const std::function<void()> &operation,
@@ -387,7 +387,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
 void testPersistentStateComesBack(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
-  std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
+  std::string name = (std::filesystem::temp_directory_path() / "richengine-states-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
   const model::SlotFile::Persistence persistence{directory / "state.slots",

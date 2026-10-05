@@ -101,7 +101,7 @@ def prometheus_latency(snapshot):
         values = snapshot.get(stage)
         if values is None:
             continue
-        name = f"splash_{stage}_seconds"
+        name = f"richengine_{stage}_seconds"
         lines.append(f"# TYPE {name} histogram")
         for bound, count in values["buckets"].items():
             lines.append(f'{name}_bucket{{le="{bound}"}} {count}')

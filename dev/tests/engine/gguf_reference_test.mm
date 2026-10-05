@@ -2,7 +2,7 @@
 // GGML's dequantization, per format.
 //   gguf-reference GOLDENS
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
-// how to update it. With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference
+// how to update it. With RICHENGINE_GGML_ORACLE=<libggml-base.dylib> the reference
 // is also compared with GGML directly and GGML's hashes are printed.
 #include "GgufFixtures.hpp"
 
@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
       return 2;
     }
     void *ggml = nullptr;
-    if (const char *oracle = std::getenv("SPLASH_GGML_ORACLE")) {
+    if (const char *oracle = std::getenv("RICHENGINE_GGML_ORACLE")) {
       ggml = dlopen(oracle, RTLD_NOW | RTLD_LOCAL);
       check(ggml, std::string("load ") + oracle + (ggml ? "" : std::string(": ") + dlerror()));
     }

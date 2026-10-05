@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-namespace splash {
+namespace richengine {
 
 enum class WorkKind : uint8_t { Prefill, Decode };
 
@@ -389,7 +389,7 @@ struct ExecutionLimits final {
   static constexpr uint32_t targetVerifyRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
   static constexpr uint32_t speculativeScratchTokens =
-      SPLASH_TREE_VERIFY_NODES - 1;
+      RICHENGINE_TREE_VERIFY_NODES - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
   static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
@@ -526,6 +526,13 @@ public:
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
+  // Whether a second prefill command may be submitted while one is still in
+  // flight: the model double-buffers the host-written inputs the running
+  // command reads. Decode commands never submit ahead — the next step's
+  // anchors are decided by the running step's results.
+  [[nodiscard]] virtual bool prefillSubmitAheadAvailable() const noexcept {
+    return false;
+  }
   // Copies the request's committed state at its current page-aligned
   // boundary into the cached state's buffers. Returns nullptr when the pool
   // has none free and the governor denies new ones; the caller may release a
@@ -577,4 +584,4 @@ public:
 };
 
 } // namespace model
-} // namespace splash
+} // namespace richengine

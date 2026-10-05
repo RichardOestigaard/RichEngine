@@ -1,16 +1,17 @@
 #pragma once
 
-#include "engine/Types.hpp"
+#include "engine/wire/Types.hpp"
 #include "model/Model.hpp"
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
-namespace splash::engine {
+namespace richengine::engine {
 
 enum class Phase : uint8_t {
   Queued,
@@ -99,6 +100,10 @@ public:
   // The next command, planned without the excluded lanes: those that wait
   // for memory on its way back and cannot run before it lands.
   [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
+  // The command behind a committed one (the submit-ahead ring): plans
+  // against promptPlanned, so a continuation chunk starts where the
+  // in-flight one ends.
+  [[nodiscard]] std::optional<BatchPlan> nextAhead(std::span<const uint64_t> excluded) const;
   // The excluded lanes are those the plan was made without: blocked, not
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
@@ -119,7 +124,12 @@ private:
   struct Request final {
     RequestSpec spec;
     Phase phase = Phase::Queued;
+    // Rows the completed commands reached. promptPlanned additionally counts
+    // the rows of commands committed and not yet completed (the submit-ahead
+    // ring); planning reads it so a follow-on chunk starts where the
+    // in-flight one ends.
     uint32_t promptProcessed = 0;
+    uint32_t promptPlanned = 0;
     std::optional<uint32_t> prefillBoundary;
     // Set by suspendForResources: the request comes back through
     // resumeFromResources, never through resourcesReady.
@@ -135,6 +145,13 @@ private:
   struct PrefillRequestView final {
     const Request *request = nullptr;
     uint32_t promptProcessed = 0;
+  };
+
+  // A committed, not yet completed batch: the submit-ahead ring holds at
+  // most two — a running command and the chunk planned behind it.
+  struct Active final {
+    BatchPlan plan;
+    std::vector<uint64_t> excluded;
   };
 
   [[nodiscard]] Request &get(uint64_t requestId);
@@ -159,9 +176,7 @@ private:
   void dropStaleDecodeDebt() noexcept;
 
   std::unordered_map<uint64_t, Request> requests_;
-  std::optional<BatchPlan> active_;
-  // The lanes the active command was planned without.
-  std::vector<uint64_t> excluded_;
+  std::deque<Active> active_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
@@ -174,4 +189,4 @@ private:
   SchedulerSnapshot counters_;
 };
 
-} // namespace splash::engine
+} // namespace richengine::engine

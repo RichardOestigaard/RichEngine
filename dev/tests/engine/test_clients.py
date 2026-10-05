@@ -19,7 +19,7 @@ import yaml
 
 from install import clients, launcher
 
-MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
+MODEL = "incoai/Qwen3.6-35B-A3B-RichEngine"
 
 
 def hermes_profile_create(argv, *, env, **options):
@@ -82,26 +82,26 @@ class ClientTests(unittest.TestCase):
         for name in clients.INSTALL_URLS:
             with self.subTest(client=name):
                 argv, env = self.command(
-                    name, env={"SPLASH_API_KEY": "test-server-key"}
+                    name, env={"RICHENGINE_API_KEY": "test-server-key"}
                 )
                 self.assertNotIn("test-server-key", " ".join(argv))
                 if name == "claude":
                     self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "test-server-key")
                 elif name == "codex":
-                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    self.assertEqual(env["RICHENGINE_API_KEY"], "test-server-key")
                 elif name == "opencode":
                     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
                     self.assertEqual(
-                        config["provider"]["splash"]["options"]["apiKey"],
+                        config["provider"]["richengine"]["options"]["apiKey"],
                         "test-server-key",
                     )
                 elif name == "pi":
                     # Pi reads the key from the environment for each request.
-                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    self.assertEqual(env["RICHENGINE_API_KEY"], "test-server-key")
                     self.assertNotIn("test-server-key", self.pi_models.read_text())
                     config = json.loads(self.pi_models.read_text())
                     self.assertEqual(
-                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
+                        config["providers"]["richengine"]["apiKey"], "$RICHENGINE_API_KEY"
                     )
                 else:
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
@@ -144,7 +144,7 @@ class ClientTests(unittest.TestCase):
             self.command("aider")
 
     def test_default_environment_is_a_copy_of_the_process_environment(self):
-        with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "process-key"}):
+        with mock.patch.dict(os.environ, {"RICHENGINE_API_KEY": "process-key"}):
             before = dict(os.environ)
             _, env = clients.command(
                 "codex",
@@ -206,7 +206,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(argv, ["/bin/opencode"])
         self.assertEqual(env.keys(), {"PATH", "OPENCODE_CONFIG_CONTENT"})
         self.assertEqual(env["PATH"], "/bin")
-        served = f"splash/{MODEL}"
+        served = f"richengine/{MODEL}"
         self.assertEqual(
             json.loads(env["OPENCODE_CONFIG_CONTENT"]),
             {
@@ -224,9 +224,9 @@ class ClientTests(unittest.TestCase):
                     )
                 },
                 "provider": {
-                    "splash": {
+                    "richengine": {
                         "npm": "@ai-sdk/openai-compatible",
-                        "name": "Splash",
+                        "name": "RichEngine",
                         "options": {
                             "baseURL": "http://127.0.0.1:8000/v1",
                             "apiKey": "local",
@@ -271,29 +271,29 @@ class ClientTests(unittest.TestCase):
                 "-c",
                 'web_search="disabled"',
                 "-c",
-                'model_provider="splash"',
+                'model_provider="richengine"',
                 "-c",
-                'model_providers.splash={name="Splash",'
+                'model_providers.richengine={name="RichEngine",'
                 'base_url="http://127.0.0.1:8000/v1",'
-                'env_key="SPLASH_API_KEY",wire_api="responses"}',
+                'env_key="RICHENGINE_API_KEY",wire_api="responses"}',
                 "-c",
                 "model_context_window=102400",
                 "-c",
                 "model_auto_compact_token_limit=92160",
             ],
         )
-        self.assertEqual(env, {"PATH": "/bin", "SPLASH_API_KEY": "local"})
+        self.assertEqual(env, {"PATH": "/bin", "RICHENGINE_API_KEY": "local"})
         self.assertEqual(
             tomllib.loads("\n".join(argv[2::2])),
             {
                 "model": MODEL,
                 "web_search": "disabled",
-                "model_provider": "splash",
+                "model_provider": "richengine",
                 "model_providers": {
-                    "splash": {
-                        "name": "Splash",
+                    "richengine": {
+                        "name": "RichEngine",
                         "base_url": "http://127.0.0.1:8000/v1",
-                        "env_key": "SPLASH_API_KEY",
+                        "env_key": "RICHENGINE_API_KEY",
                         "wire_api": "responses",
                     }
                 },
@@ -303,17 +303,17 @@ class ClientTests(unittest.TestCase):
         )
 
     def test_hermes_launch_writes_a_private_profile(self):
-        # The user's own configuration, which Splash leaves as it is.
+        # The user's own configuration, which RichEngine leaves as it is.
         self.hermes_root.mkdir()
         user = self.hermes_root / "config.yaml"
         user.write_text("model:\n  default: cloud-model\n  provider: anthropic\n")
         argv, env = self.command("hermes", env={"PATH": "/bin"})
-        home = self.hermes_root / "profiles/splash"
+        home = self.hermes_root / "profiles/richengine"
         self.assertEqual(
             self.created,
             [
                 (
-                    ["/bin/hermes", "profile", "create", "splash", "--no-alias"],
+                    ["/bin/hermes", "profile", "create", "richengine", "--no-alias"],
                     {"PATH": "/bin"},
                     {"capture_output": True, "text": True, "stdin": subprocess.DEVNULL},
                 )
@@ -370,7 +370,7 @@ class ClientTests(unittest.TestCase):
                 )
 
     def test_hermes_names_a_profile_per_port(self):
-        for port, name in ((8000, "splash"), (8001, "splash-8001")):
+        for port, name in ((8000, "richengine"), (8001, "richengine-8001")):
             with self.subTest(port=port):
                 _, env = clients.command(
                     "hermes",
@@ -401,7 +401,7 @@ class ClientTests(unittest.TestCase):
         ):
             with self.subTest(HERMES_HOME=configured):
                 _, env = self.command("hermes", env={"HERMES_HOME": configured})
-                home = root / "profiles/splash"
+                home = root / "profiles/richengine"
                 self.assertEqual(env["HERMES_HOME"], str(home))
                 self.assertEqual(self.created[-1][1], {"HERMES_HOME": configured})
                 config = yaml.safe_load((home / "config.yaml").read_text())
@@ -427,7 +427,7 @@ class ClientTests(unittest.TestCase):
         self.create.return_value = failed
         with self.assertRaisesRegex(
             clients.ClientError,
-            "hermes profile create splash failed: Error: permission denied$",
+            "hermes profile create richengine failed: Error: permission denied$",
         ):
             self.command("hermes")
         self.assertFalse(self.hermes_root.exists())
@@ -438,12 +438,12 @@ class ClientTests(unittest.TestCase):
     def test_hermes_profile_another_launch_created_is_configured(self):
         # Hermes refuses to create a profile that exists; a launch that lost
         # the race configures it.
-        home = self.hermes_root / "profiles/splash"
+        home = self.hermes_root / "profiles/richengine"
         home.mkdir(parents=True)
         (home / ".env").write_text("")
         self.create.side_effect = None
         self.create.return_value = subprocess.CompletedProcess(
-            [], 1, "", "Error: Profile 'splash' already exists\n"
+            [], 1, "", "Error: Profile 'richengine' already exists\n"
         )
         _, env = self.command("hermes")
         self.assertEqual(env["HERMES_HOME"], str(home))
@@ -452,13 +452,13 @@ class ClientTests(unittest.TestCase):
 
     def test_pi_launch_adds_the_served_model_to_the_users_pi_models(self):
         argv, env = self.command("pi", env={"PATH": "/bin"})
-        self.assertEqual(argv, ["/bin/pi", "--provider", "splash", "--model", MODEL])
+        self.assertEqual(argv, ["/bin/pi", "--provider", "richengine", "--model", MODEL])
         self.assertEqual(env, {"PATH": "/bin"})
         self.assertEqual(
             json.loads(self.pi_models.read_text()),
             {
                 "providers": {
-                    "splash": {
+                    "richengine": {
                         "baseUrl": "http://127.0.0.1:8000/v1",
                         "api": "openai-completions",
                         "apiKey": "local",
@@ -492,13 +492,13 @@ class ClientTests(unittest.TestCase):
             {},
             input_modalities=["text"],
         )
-        self.assertEqual(argv[:3], ["/bin/pi", "--provider", "splash-8001"])
+        self.assertEqual(argv[:3], ["/bin/pi", "--provider", "richengine-8001"])
         providers = json.loads(self.pi_models.read_text())["providers"]
         self.assertEqual(
             {name: provider["baseUrl"] for name, provider in providers.items()},
             {
-                "splash": "http://127.0.0.1:8000/v1",
-                "splash-8001": "http://127.0.0.1:8001/v1",
+                "richengine": "http://127.0.0.1:8000/v1",
+                "richengine-8001": "http://127.0.0.1:8001/v1",
             },
         )
 
@@ -506,19 +506,19 @@ class ClientTests(unittest.TestCase):
         self.command("pi", env={"PI_CODING_AGENT_DIR": "~/custom agent"})
         path = self.home / "custom agent/models.json"
         self.assertEqual(
-            json.loads(path.read_text())["providers"]["splash"]["models"][0]["id"],
+            json.loads(path.read_text())["providers"]["richengine"]["models"][0]["id"],
             MODEL,
         )
         self.assertFalse(self.pi_models.exists())
 
-    def test_pi_update_replaces_only_the_splash_provider(self):
+    def test_pi_update_replaces_only_the_richengine_provider(self):
         agent = self.pi_models.parent
         agent.mkdir(parents=True)
         other = {"baseUrl": "http://other/v1", "models": [{"id": "keep"}]}
         self.pi_models.write_text(
             json.dumps(
                 {
-                    "providers": {"other": other, "splash": {"baseUrl": "stale"}},
+                    "providers": {"other": other, "richengine": {"baseUrl": "stale"}},
                     "future": {"keep": True},
                 }
             )
@@ -526,15 +526,15 @@ class ClientTests(unittest.TestCase):
         for name in ("settings.json", "auth.json"):
             (agent / name).write_text('{"keep": true}')
         self.command("pi")
-        self.command("pi", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        self.command("pi", context=262144, model="incoai/Qwen3.8-27B-RichEngine")
         config = json.loads(self.pi_models.read_text())
         self.assertEqual(config["providers"]["other"], other)
         self.assertEqual(config["future"], {"keep": True})
-        splash = config["providers"]["splash"]
-        self.assertEqual(splash["baseUrl"], "http://127.0.0.1:8000/v1")
+        richengine = config["providers"]["richengine"]
+        self.assertEqual(richengine["baseUrl"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
-            [(m["id"], m["contextWindow"], m["maxTokens"]) for m in splash["models"]],
-            [("incoai/Qwen3.8-27B-Splash", 262144, 32768)],
+            [(m["id"], m["contextWindow"], m["maxTokens"]) for m in richengine["models"]],
+            [("incoai/Qwen3.8-27B-RichEngine", 262144, 32768)],
         )
         for name in ("settings.json", "auth.json"):
             self.assertEqual((agent / name).read_text(), '{"keep": true}')
@@ -572,7 +572,7 @@ class ClientTests(unittest.TestCase):
         self.command("pi")
         self.assertTrue(self.pi_models.is_symlink())
         config = json.loads((dotfiles / "models.json").read_text())
-        self.assertEqual(config["providers"]["splash"]["models"][0]["id"], MODEL)
+        self.assertEqual(config["providers"]["richengine"]["models"][0]["id"], MODEL)
         self.assertEqual([path.name for path in dotfiles.iterdir()], ["models.json"])
 
     def test_opencode_preserves_unrelated_inline_config(self):
@@ -590,7 +590,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(config["mcp"], user["mcp"])
         self.assertEqual(config["provider"]["other"], user["provider"]["other"])
         self.assertEqual(config["model"], config["small_model"])
-        provider = config["provider"]["splash"]
+        provider = config["provider"]["richengine"]
         self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
             provider["models"][MODEL]["limit"]["context"],
@@ -605,14 +605,14 @@ class ClientTests(unittest.TestCase):
         }
         user = {
             "agent": {"build": {"variant": "brief", "prompt": "Custom prompt"}},
-            "provider": {"splash": {"models": {MODEL: {"variants": variants}}}},
+            "provider": {"richengine": {"models": {MODEL: {"variants": variants}}}},
         }
         original = {"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
         before = dict(original)
         args = ["run", "--variant", "none", "A prompt"]
         argv, env = self.command("opencode", env=original, client_args=args)
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        configured = config["provider"]["splash"]["models"][MODEL]["variants"]
+        configured = config["provider"]["richengine"]["models"][MODEL]["variants"]
         self.assertEqual(configured["none"], {"reasoningEffort": "none"})
         self.assertEqual(configured["medium"], {"reasoningEffort": "medium"})
         self.assertEqual(configured["high"], {"reasoningEffort": "high"})
@@ -630,10 +630,10 @@ class ClientTests(unittest.TestCase):
         user = {
             "agent": {
                 "build": {
-                    "model": "splash/incoai/Qwen3.8-27B-Splash",
+                    "model": "richengine/incoai/Qwen3.8-27B-RichEngine",
                     "variant": "off",
                 },
-                "title": {"model": "splash/incoai/Qwen3.8-27B-Splash"},
+                "title": {"model": "richengine/incoai/Qwen3.8-27B-RichEngine"},
                 "compaction": {"model": "other/cloud-model", "temperature": 0.2},
                 "reviewer": {"model": "other/model", "prompt": "review"},
             }
@@ -643,7 +643,7 @@ class ClientTests(unittest.TestCase):
         )
         agents = json.loads(env["OPENCODE_CONFIG_CONTENT"])["agent"]
         for name in ("build", "plan", "general", "explore", "title", "compaction"):
-            self.assertEqual(agents[name]["model"], f"splash/{MODEL}")
+            self.assertEqual(agents[name]["model"], f"richengine/{MODEL}")
         self.assertEqual(agents["build"]["variant"], "off")
         self.assertEqual(agents["compaction"]["temperature"], 0.2)
         self.assertEqual(agents["reviewer"], user["agent"]["reviewer"])
@@ -655,7 +655,7 @@ class ClientTests(unittest.TestCase):
                 _, env = self.command("opencode", context=context)
                 config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
                 self.assertEqual(
-                    config["provider"]["splash"]["models"][MODEL]["limit"],
+                    config["provider"]["richengine"]["models"][MODEL]["limit"],
                     {"context": context, "input": context - output, "output": output},
                 )
                 self.assertNotIn("compaction", config)
@@ -666,7 +666,7 @@ class ClientTests(unittest.TestCase):
             with self.subTest(modalities=modalities):
                 _, env = self.command("opencode", input_modalities=modalities)
                 model = json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"][
-                    "splash"
+                    "richengine"
                 ]["models"][MODEL]
                 self.assertIs(model["attachment"], vision)
                 self.assertEqual(
@@ -680,7 +680,7 @@ class ClientTests(unittest.TestCase):
                 self.command("pi", input_modalities=modalities)
                 config = json.loads(self.pi_models.read_text())
                 self.assertEqual(
-                    config["providers"]["splash"]["models"][0]["input"],
+                    config["providers"]["richengine"]["models"][0]["input"],
                     ["text", "image"] if vision else ["text"],
                 )
         # Claude Code and Codex configurations declare no input modalities.
@@ -720,10 +720,10 @@ class ClientTests(unittest.TestCase):
             {"agent": {"plan": "custom"}},
             {"agent": {"compaction": []}},
             {"provider": []},
-            {"provider": {"splash": []}},
-            {"provider": {"splash": {"models": 1}}},
-            {"provider": {"splash": {"models": {MODEL: []}}}},
-            {"provider": {"splash": {"models": {MODEL: {"variants": None}}}}},
+            {"provider": {"richengine": []}},
+            {"provider": {"richengine": {"models": 1}}},
+            {"provider": {"richengine": {"models": {MODEL: []}}}},
+            {"provider": {"richengine": {"models": {MODEL: {"variants": None}}}}},
         ):
             value = config if isinstance(config, str) else json.dumps(config)
             with (
@@ -740,15 +740,15 @@ class ClientTests(unittest.TestCase):
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(config["agent"]["reviewer"], "custom")
         self.assertEqual(config["provider"]["other"], [])
-        # The served provider replaces a user's splash entry as a whole.
-        user = {"provider": {"splash": {"models": {"other-model": []}, "npm": 1}}}
+        # The served provider replaces a user's richengine entry as a whole.
+        user = {"provider": {"richengine": {"models": {"other-model": []}, "npm": 1}}}
         _, env = self.command(
             "opencode", env={"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
         )
         _, default = self.command("opencode")
         self.assertEqual(
-            json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["splash"],
-            json.loads(default["OPENCODE_CONFIG_CONTENT"])["provider"]["splash"],
+            json.loads(env["OPENCODE_CONFIG_CONTENT"])["provider"]["richengine"],
+            json.loads(default["OPENCODE_CONFIG_CONTENT"])["provider"]["richengine"],
         )
 
     def test_opencode_two_requests_a_private_server_for_the_inline_config(self):
@@ -858,11 +858,11 @@ class ClientTests(unittest.TestCase):
         config["mcp_servers"] = {"test": {"command": "test-server"}}
         path.write_text(yaml.safe_dump(config))
         (home / "state.db").write_bytes(b"session data")
-        self.command("hermes", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        self.command("hermes", context=262144, model="incoai/Qwen3.8-27B-RichEngine")
         changed = yaml.safe_load(path.read_text())
         self.assertEqual(changed["model"]["context_length"], 262144)
         self.assertEqual(changed["model"]["max_tokens"], 32768)
-        self.assertEqual(changed["model"]["default"], "incoai/Qwen3.8-27B-Splash")
+        self.assertEqual(changed["model"]["default"], "incoai/Qwen3.8-27B-RichEngine")
         self.assertTrue(changed["model"]["supports_vision"])
         self.assertEqual(changed["display"], config["display"])
         self.assertEqual(changed["mcp_servers"], config["mcp_servers"])
@@ -871,7 +871,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual({p.name for p in home.iterdir()}, {"state.db", "config.yaml"})
 
     def test_invalid_hermes_profile_is_not_overwritten(self):
-        home = self.hermes_root / "profiles/splash"
+        home = self.hermes_root / "profiles/richengine"
         home.mkdir(parents=True)
         path = home / "config.yaml"
         for profile in (
@@ -891,7 +891,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), profile)
 
     def test_empty_hermes_profile_is_configured_from_scratch(self):
-        home = self.hermes_root / "profiles/splash"
+        home = self.hermes_root / "profiles/richengine"
         home.mkdir(parents=True)
         path = home / "config.yaml"
         for profile, kept in (
@@ -908,7 +908,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(configured, kept)
 
     def test_failed_profile_replacement_keeps_the_previous_profile(self):
-        home = self.hermes_root / "profiles/splash"
+        home = self.hermes_root / "profiles/richengine"
         home.mkdir(parents=True)
         path = home / "config.yaml"
         path.write_text("display: {interface: tui}\n")
@@ -961,7 +961,7 @@ class ClientTests(unittest.TestCase):
                     argv, _ = self.command("codex", client_args=args)
                     self.assertEqual(argv[-len(prefix) - 1 :], [*prefix, args[-1]])
                     self.assertLess(
-                        argv.index('model_provider="splash"'),
+                        argv.index('model_provider="richengine"'),
                         argv.index('model_reasoning_effort="low"'),
                     )
                     self.assertNotIn("-c", argv[-len(prefix) - 1 :])
@@ -1015,7 +1015,7 @@ class ClientLifecycleTests(unittest.TestCase):
         if model is None:
             model = {
                 "id": MODEL,
-                "owned_by": "splash",
+                "owned_by": "richengine",
                 "input_modalities": ["text", "image", "pdf"],
             }
         # Pi's models.json and the Hermes root are in the home directory.
@@ -1074,7 +1074,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 launcher.parse_args(["serve", "--model", "community/model", *payload])
             self.assertEqual(error.exception.code, 2)
 
-    def test_splash_help_does_not_require_a_server(self):
+    def test_richengine_help_does_not_require_a_server(self):
         for arguments in (["--help"], ["serve", "--help"]):
             with (
                 self.subTest(arguments=arguments),
@@ -1139,7 +1139,7 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_launcher_configures_clients_from_the_served_input_modalities(self):
         for reported in (["text", "image", "pdf"], ["text"], None):
-            model = {"id": MODEL, "owned_by": "splash"}
+            model = {"id": MODEL, "owned_by": "richengine"}
             if reported is not None:
                 model["input_modalities"] = reported
             with (
@@ -1150,15 +1150,15 @@ class ClientLifecycleTests(unittest.TestCase):
             ):
                 result = launcher.main(["opencode"])
             if reported is None:
-                # A server started by an older Splash reports only vision.
+                # A server started by an older RichEngine reports only vision.
                 self.assertEqual(result, 1)
                 self.assertIn(
-                    "restart it with this version of Splash", error.getvalue()
+                    "restart it with this version of RichEngine", error.getvalue()
                 )
                 execute.assert_not_called()
                 continue
             config = json.loads(execute.call_args.args[2]["OPENCODE_CONFIG_CONTENT"])
-            served = config["provider"]["splash"]["models"][model["id"]]
+            served = config["provider"]["richengine"]["models"][model["id"]]
             self.assertIs(served["attachment"], "image" in reported)
             self.assertEqual(served["modalities"]["input"], reported)
 
@@ -1186,14 +1186,14 @@ class ClientLifecycleTests(unittest.TestCase):
             probe.assert_not_called()
 
     def test_hermes_runs_in_a_profile_of_the_users_hermes_root(self):
-        # Never in a directory of Splash's, which Hermes would take for its
+        # Never in a directory of RichEngine's, which Hermes would take for its
         # root: it would install its tools there and point the user's hermes
         # command at them.
-        model = {"id": MODEL, "owned_by": "splash", "input_modalities": ["text"]}
-        for port, name in ((launcher.PORT, "splash"), (8001, "splash-8001")):
+        model = {"id": MODEL, "owned_by": "richengine", "input_modalities": ["text"]}
+        for port, name in ((launcher.PORT, "richengine"), (8001, "richengine-8001")):
             with (
                 self.subTest(port=port),
-                mock.patch.dict(os.environ, {"SPLASH_PORT": str(port)}),
+                mock.patch.dict(os.environ, {"RICHENGINE_PORT": str(port)}),
                 self.ready_server("hermes", model=model) as execute,
             ):
                 launcher.main(["hermes"])
@@ -1214,7 +1214,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(launcher.main(["claude", *payload]), 1)
-            self.assertIn("splash serve", error.getvalue())
+            self.assertIn("richengine serve", error.getvalue())
             execute.assert_not_called()
             install.assert_not_called()
 
@@ -1224,8 +1224,8 @@ class ClientLifecycleTests(unittest.TestCase):
             {"data": None},
             {"data": []},
             {"data": [{"id": "other", "owned_by": "other", "context_length": 1}]},
-            {"data": [{"id": MODEL, "owned_by": "splash"}]},
-            {"data": [{"id": MODEL, "owned_by": "splash", "context_length": 0}]},
+            {"data": [{"id": MODEL, "owned_by": "richengine"}]},
+            {"data": [{"id": MODEL, "owned_by": "richengine", "context_length": 0}]},
         ):
             with (
                 self.subTest(catalog=catalog),
@@ -1241,12 +1241,12 @@ class ClientLifecycleTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("SPLASH_OPENCODE_BINARY"),
-    "set SPLASH_OPENCODE_BINARY for private-server configuration test",
+    os.environ.get("RICHENGINE_OPENCODE_BINARY"),
+    "set RICHENGINE_OPENCODE_BINARY for private-server configuration test",
 )
 class InstalledOpenCodeTests(unittest.TestCase):
     def test_private_server_configuration_is_isolated_from_the_existing_service(self):
-        binary = str(Path(os.environ["SPLASH_OPENCODE_BINARY"]).resolve())
+        binary = str(Path(os.environ["RICHENGINE_OPENCODE_BINARY"]).resolve())
         version = clients.probe_major_version(binary)
         self.assertIsNotNone(version)
         if version < 2:
@@ -1273,7 +1273,7 @@ class InstalledOpenCodeTests(unittest.TestCase):
                 return result.stdout
 
             query = [binary, "api", "GET", "/api/config"]
-            model = "incoai/Qwen3.8-27B-Splash"
+            model = "incoai/Qwen3.8-27B-RichEngine"
             argv, configured = clients.command(
                 "opencode",
                 binary,
@@ -1294,13 +1294,13 @@ class InstalledOpenCodeTests(unittest.TestCase):
                     source["info"]
                     for source in sources
                     if source.get("type") == "document"
-                    and "splash" in source["info"].get("providers", {})
+                    and "richengine" in source["info"].get("providers", {})
                 )
                 self.assertEqual(
-                    info["model"], {"providerID": "splash", "model": model}
+                    info["model"], {"providerID": "richengine", "model": model}
                 )
                 self.assertEqual(
-                    info["providers"]["splash"]["settings"]["baseURL"],
+                    info["providers"]["richengine"]["settings"]["baseURL"],
                     "http://127.0.0.1:18997/v1",
                 )
                 self.assertEqual(json.loads(run(query, environment)), before)
@@ -1309,8 +1309,8 @@ class InstalledOpenCodeTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("SPLASH_CODEX_BINARY"),
-    "set SPLASH_CODEX_BINARY for CLI routing test",
+    os.environ.get("RICHENGINE_CODEX_BINARY"),
+    "set RICHENGINE_CODEX_BINARY for CLI routing test",
 )
 class InstalledCodexTests(unittest.TestCase):
     def test_truncated_response_has_a_bounded_client_outcome(self):
@@ -1339,7 +1339,7 @@ class InstalledCodexTests(unittest.TestCase):
             )
             argv, environment = clients.command(
                 "codex",
-                os.environ["SPLASH_CODEX_BINARY"],
+                os.environ["RICHENGINE_CODEX_BINARY"],
                 base_url,
                 "test-model",
                 131072,
@@ -1357,7 +1357,7 @@ class InstalledCodexTests(unittest.TestCase):
                     "-c",
                     'cli_auth_credentials_store="ephemeral"',
                     "-c",
-                    "model_providers.splash.stream_max_retries=1",
+                    "model_providers.richengine.stream_max_retries=1",
                     "-",
                 ],
             )
@@ -1511,7 +1511,7 @@ class InstalledCodexTests(unittest.TestCase):
                     received.clear()
                     argv, environment = clients.command(
                         "codex",
-                        os.environ["SPLASH_CODEX_BINARY"],
+                        os.environ["RICHENGINE_CODEX_BINARY"],
                         base_url,
                         MODEL,
                         102400,
@@ -1550,7 +1550,7 @@ class InstalledCodexTests(unittest.TestCase):
                     # Metadata/update probes may run, but the inference
                     # provider must remain local. The proxy blocks all hosts.
                     self.assertNotIn("api.openai.com:443", external)
-                    self.assertIn("provider: splash", stderr)
+                    self.assertIn("provider: richengine", stderr)
                     for path, authorization, body in requests:
                         self.assertEqual(path, "/v1/responses")
                         self.assertEqual(authorization, "Bearer local")
@@ -1564,10 +1564,10 @@ class InstalledCodexTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("SPLASH_PI_BINARY"), "set SPLASH_PI_BINARY for Pi HTTP test"
+    os.environ.get("RICHENGINE_PI_BINARY"), "set RICHENGINE_PI_BINARY for Pi HTTP test"
 )
 class InstalledPiTests(unittest.TestCase):
-    def test_text_tools_and_session_resume_against_splash_http(self):
+    def test_text_tools_and_session_resume_against_richengine_http(self):
         from dev.tests.agent_real import events, executed_commands
         from dev.tests.test_server import (
             FakeRuntime,
@@ -1606,11 +1606,11 @@ class InstalledPiTests(unittest.TestCase):
                 PI_CODING_AGENT_DIR=str(work / "pi"),
                 PI_OFFLINE="1",
                 PI_TELEMETRY="0",
-                SPLASH_API_KEY=api_key,
+                RICHENGINE_API_KEY=api_key,
             )
             argv, environment = clients.command(
                 "pi",
-                os.environ["SPLASH_PI_BINARY"],
+                os.environ["RICHENGINE_PI_BINARY"],
                 f"http://127.0.0.1:{harness.server.server_port}",
                 "test-model",
                 131072,

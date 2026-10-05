@@ -4,7 +4,7 @@
 
 #include <stdexcept>
 
-namespace splash::ops {
+namespace richengine::ops {
 namespace {
 
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
@@ -14,10 +14,10 @@ constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 constexpr uint32_t kVerifyVecColumns = 32;
 constexpr uint32_t kVerifyChannelBlock = kVerifyVecColumns * 4;
 
-[[nodiscard]] SplashLfmConvParams params(uint32_t rows, const LfmConvShape &shape,
+[[nodiscard]] RichLfmConvParams params(uint32_t rows, const LfmConvShape &shape,
                                          bool tapsMajor, uint32_t layer,
                                          uint64_t stateLayerBytes, uint32_t lanes) {
-  SplashLfmConvParams result{};
+  RichLfmConvParams result{};
   result.rows = rows;
   result.dimension = shape.dimension;
   result.taps = shape.taps;
@@ -108,4 +108,4 @@ void LfmConv::addCommit(metal::CommandGraph &graph, const LfmConvCommitBuffers &
   }
 }
 
-} // namespace splash::ops
+} // namespace richengine::ops

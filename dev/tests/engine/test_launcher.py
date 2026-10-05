@@ -18,7 +18,7 @@ from unittest import mock
 from install import launcher
 from server import server as api
 
-MODEL_ID = "community/custom-splash"
+MODEL_ID = "community/custom-richengine"
 
 
 def with_stop_held(command, number):
@@ -55,9 +55,9 @@ def selection(models_root, **options):
 
 
 MODEL_IDS = (
-    "incoai/Qwen3.8-27B-Splash",
-    "incoai/Qwen3.6-35B-A3B-Splash",
-    "community/custom-splash",
+    "incoai/Qwen3.8-27B-RichEngine",
+    "incoai/Qwen3.6-35B-A3B-RichEngine",
+    "community/custom-richengine",
 )
 
 
@@ -69,15 +69,15 @@ def server_arguments(argv):
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and
-        # the launcher's defaults ignore the caller's Splash settings.
+        # the launcher's defaults ignore the caller's RichEngine settings.
         self.refresh = self.enterContext(
             mock.patch.object(launcher.catalog, "spawn_refresh")
         )
         self.enterContext(mock.patch.dict(os.environ))
         for name in (
-            "SPLASH_PORT",
-            "SPLASH_API_KEY",
-            "SPLASH_DEFAULT_REASONING_EFFORT",
+            "RICHENGINE_PORT",
+            "RICHENGINE_API_KEY",
+            "RICHENGINE_DEFAULT_REASONING_EFFORT",
         ):
             os.environ.pop(name, None)
         keep_stop_signals(self)
@@ -109,16 +109,17 @@ class LauncherTests(unittest.TestCase):
         for command in (
             "start",
             "stop",
-            "status",
             "logs",
-            "doctor",
             "model",
-            "models",
             "uninstall",
         ):
             with self.subTest(command=command), mock.patch("sys.stderr", io.StringIO()):
                 with self.assertRaises(SystemExit):
                     launcher.parse_args([command])
+        self.assertEqual(launcher.parse_args(["models"]).command, "models")
+        self.assertEqual(launcher.parse_args(["status"]).command, "status")
+        self.assertEqual(launcher.parse_args(["flags"]).command, "flags")
+        self.assertEqual(launcher.parse_args(["doctor"]).command, "doctor")
         args = launcher.parse_args(
             [
                 "serve",
@@ -301,7 +302,7 @@ class LauncherTests(unittest.TestCase):
                             1,
                         )
                 self.assertIn(
-                    "Splash is being upgraded; wait for the upgrade to finish",
+                    "RichEngine is being upgraded; wait for the upgrade to finish",
                     error.getvalue(),
                 )
                 self.assertNotIn("stale/model", error.getvalue())
@@ -314,7 +315,7 @@ class LauncherTests(unittest.TestCase):
             lock_path = runtime / "serve-8000.lock"
             owner = {
                 "pid": os.getpid(),
-                "model": "incoai/Qwen3.8-27B-Splash",
+                "model": "incoai/Qwen3.8-27B-RichEngine",
                 "port": 8000,
             }
             with lock_path.open("w+") as held:
@@ -330,7 +331,7 @@ class LauncherTests(unittest.TestCase):
                 ):
                     self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
                 self.assertIn(f"PID {os.getpid()}", error.getvalue())
-                self.assertIn("model incoai/Qwen3.8-27B-Splash", error.getvalue())
+                self.assertIn("model incoai/Qwen3.8-27B-RichEngine", error.getvalue())
                 self.assertIn("port 8000", error.getvalue())
                 self.assertEqual(json.loads(lock_path.read_text()), owner)
                 probe.assert_not_called()
@@ -369,7 +370,8 @@ class LauncherTests(unittest.TestCase):
                         )
                     self.assertEqual(
                         error.getvalue(),
-                        "error: Splash is already serving; stop it with Ctrl+C first\n",
+                        "error: RichEngine is already serving; stop it with Ctrl+C first\n"
+                        "hint: inspect it with 'richengine status'\n",
                     )
                     self.assertEqual(lock_path.read_bytes(), content)
                     install.assert_not_called()
@@ -482,7 +484,7 @@ class LauncherTests(unittest.TestCase):
                 execute.assert_not_called()
 
     def test_port_selection_validates_environment_and_explicit_override(self):
-        with mock.patch.dict(os.environ, {"SPLASH_PORT": "8123"}):
+        with mock.patch.dict(os.environ, {"RICHENGINE_PORT": "8123"}):
             self.assertEqual(
                 launcher.parse_args(["serve", "--model", MODEL_ID]).port, 8123
             )
@@ -499,7 +501,7 @@ class LauncherTests(unittest.TestCase):
         for value in ("", "0", "-1", "65536", "invalid", "1.5"):
             with (
                 self.subTest(value=value),
-                mock.patch.dict(os.environ, {"SPLASH_PORT": value}),
+                mock.patch.dict(os.environ, {"RICHENGINE_PORT": value}),
                 mock.patch("sys.stderr", io.StringIO()),
             ):
                 for arguments in (["serve", "--model", MODEL_ID], ["claude"]):
@@ -638,7 +640,7 @@ class LauncherTests(unittest.TestCase):
                     "data": [
                         {
                             "id": MODEL_ID,
-                            "owned_by": "splash",
+                            "owned_by": "richengine",
                             "context_length": 102400,
                             "input_modalities": ["text", "image", "pdf"],
                         }
@@ -665,8 +667,8 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.dict(
                         os.environ,
                         {
-                            "SPLASH_PORT": str(port),
-                            "SPLASH_API_KEY": "test-key",
+                            "RICHENGINE_PORT": str(port),
+                            "RICHENGINE_API_KEY": "test-key",
                             "PI_CODING_AGENT_DIR": str(Path(temporary) / "pi"),
                             # Hermes's root.
                             "HOME": temporary,
@@ -715,7 +717,7 @@ class LauncherTests(unittest.TestCase):
                         "data": [
                             {
                                 "id": MODEL_ID,
-                                "owned_by": "splash",
+                                "owned_by": "richengine",
                                 "context_length": 4096,
                                 "input_modalities": ["text"],
                             }
@@ -736,7 +738,7 @@ class LauncherTests(unittest.TestCase):
             try:
                 with (
                     mock.patch.dict(
-                        os.environ, {"SPLASH_PORT": str(server.server_port)}
+                        os.environ, {"RICHENGINE_PORT": str(server.server_port)}
                     ),
                     mock.patch.object(
                         launcher.clients, "find_executable", return_value="/bin/echo"
@@ -764,21 +766,21 @@ class LauncherTests(unittest.TestCase):
             )
             (checkout / ".venv/bin").mkdir(parents=True)
             (checkout / ".venv/bin/python").symlink_to(sys.executable)
-            script = checkout / "splash"
-            script.write_bytes((launcher.ROOT / "splash").read_bytes())
+            script = checkout / "richengine"
+            script.write_bytes((launcher.ROOT / "richengine").read_bytes())
             script.chmod(0o755)
             # A relative link into the checkout, reached through an absolute one.
             (root / "bin").mkdir()
-            (root / "bin/splash").symlink_to("../checkout/splash")
+            (root / "bin/richengine").symlink_to("../checkout/richengine")
             (root / "path").mkdir()
-            (root / "path/splash").symlink_to(root / "bin/splash")
+            (root / "path/richengine").symlink_to(root / "bin/richengine")
             # The relative link through a linked directory: its .. is physical.
             (root / "path/linked").symlink_to("../bin")
             for command in (
                 script,
-                root / "bin/splash",
-                root / "path/splash",
-                root / "path/linked/splash",
+                root / "bin/richengine",
+                root / "path/richengine",
+                root / "path/linked/richengine",
             ):
                 with self.subTest(command=command):
                     result = subprocess.run(
@@ -1152,13 +1154,13 @@ class LauncherTests(unittest.TestCase):
 
     def test_unsupported_mac_is_refused_before_any_download(self):
         reason = (
-            "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 27.0 "
+            "RichEngine needs Apple GPU family 9 or newer (M3 or later) on macOS 27.0 "
             "or newer; this Mac has Apple M2 Max (Apple GPU family 8) on macOS "
             "27.0.1 (apple_gpu_family_9_required)"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary, python, prepared = root / "splash", root / "python", root / "ran"
+            binary, python, prepared = root / "richengine", root / "python", root / "ran"
             python.write_text(f"#!/bin/sh\ntouch '{prepared}'\n")
             python.chmod(0o755)
             # The binary's own line is the error, without its error: prefix;

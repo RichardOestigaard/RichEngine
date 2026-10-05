@@ -14,7 +14,7 @@
 
 #include "model/GgufFile.hpp"
 
-namespace splash::model::gguf {
+namespace richengine::model::gguf {
 
 struct TargetGeometry {
   uint32_t layers = 0;
@@ -51,6 +51,9 @@ struct TargetGeometry {
   uint32_t convolutionTaps = 0;
   // The RMS norms' epsilon (1e-6, or LFM2's norm_eps 1e-5).
   float rmsEpsilon = 1e-6F;
+  // The q*k softmax scale (Granite's attention.scale); zero selects the
+  // head dimension's default.
+  float attentionScale = 0.0F;
   // Whether the packed query rows interleave a gate row each (Qwen) and
   // whether the q/k heads carry RMS norms (absent in the dense target).
   bool attentionQueryGate = true;
@@ -74,7 +77,7 @@ struct TargetGeometry {
 // The order of a tensor's rows in the image. Rows below `from` keep their
 // order; from there on, blocks of headRows rows are value heads, which
 // llama.cpp stores tiled (value head of its key head * keyHeads + key head)
-// and splash groups by key head (key head * valueHeadsPerKey + value head).
+// and richengine groups by key head (key head * valueHeadsPerKey + value head).
 // A rotaryInterleaved row order instead deinterleaves each headRows block:
 // a "llama" GGUF stores a rotated head's rows as rope pairs (HF dimension j
 // in stored row 2j, j + headRows/2 in 2j + 1); the image keeps HF order, so
@@ -139,4 +142,4 @@ struct Image {
 // missing tensor and every tensor of a type this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry);
 
-} // namespace splash::model::gguf
+} // namespace richengine::model::gguf

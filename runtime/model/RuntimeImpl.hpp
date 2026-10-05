@@ -5,9 +5,11 @@
 // RuntimeEncode.mm, RuntimeAne.mm and RuntimeNgram.mm.
 
 #include "model/Runtime.hpp"
+#include "model/RuntimeRequest.hpp"
 #include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
+#include "model/NullDraft.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -46,7 +48,7 @@
 #include <variant>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 using metal::BufferStorage;
 using metal::CommandGraph;
@@ -99,156 +101,12 @@ private:
 } // namespace detail
 
 
-namespace {
-
-inline bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
-  return token == geometry.target.stopTokens[0] ||
-         token == geometry.target.stopTokens[1];
-}
-
-inline void requireShared(const MetalBuffer &buffer, std::string_view label) {
-  if (!buffer || buffer.storage() != BufferStorage::Shared ||
-      !buffer.contents()) {
-    throw std::logic_error(std::string(label) + " is not CPU-visible");
-  }
-}
-
-template <class T>
-inline T *contents(const MetalBuffer &buffer, std::string_view label) {
-  requireShared(buffer, label);
-  return static_cast<T *>(buffer.contents());
-}
-
-[[maybe_unused]] inline void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-                  WorkKind expected) {
-  if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
-      items.size() != plan.items.size()) {
-    throw std::invalid_argument("model runtime received an invalid batch plan");
-  }
-  for (size_t index = 0; index < items.size(); ++index) {
-    if (items[index].requestId != plan.items[index].requestId ||
-        (expected == WorkKind::Prefill &&
-         (!plan.items[index].tokenCount ||
-          plan.items[index].tokenCount != items[index].tokenCount ||
-          items[index].inputTokens.size() != items[index].tokenCount)) ||
-        (expected == WorkKind::Decode &&
-         (plan.items[index].tokenCount || items[index].tokenCount ||
-          !items[index].inputTokens.empty()))) {
-      throw std::invalid_argument("batch items do not match explicit plan");
-    }
-  }
-}
-
-// The lane a start's admission gave it, or the cause of its refusal.
-inline StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult &result) {
-  if (result)
-    return {lane, StateFailure::None};
-  return {{}, StateFailure::MemoryPressure, result.failure};
-}
-
-// Any unassigned lane works: its buffers come from the storage's pool, and
-// the governor is asked only for what the pool lacks.
-template <class Activate>
-inline StateAdmission admitIdleLane(const QwenStateStorage &states,
-                             Activate activate) {
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-    if (!states.metadata(lane).assigned())
-      return activate(lane);
-  }
-  return {{}, StateFailure::ConcurrencyLimit};
-}
-
-} // namespace
 struct Runtime::Impl {  // An image by content: the fields a placement's span identifies it by.
-  struct ImageKey final {
-    uint64_t digestLo = 0;
-    uint64_t digestHi = 0;
-    uint32_t gridHeight = 0;
-    uint32_t gridWidth = 0;
-
-    bool operator==(const ImageKey &) const = default;
-  };
-  struct ImageKeyHash final {
-    // The digest is already a content hash.
-    size_t operator()(const ImageKey &key) const noexcept {
-      return static_cast<size_t>(key.digestLo ^ key.digestHi);
-    }
-  };
-  // One image's encoded rows, shared by every placement that still has rows
-  // to inject (repeated placements and concurrent requests alike) and by
-  // the embedding cache. Whichever placement's chunk reaches the image
-  // first encodes it and the others inject after it; the pixels go once
-  // the encode has completed.
-  struct ImageRows final {
-    ImageKey key;
-    MetalBuffer pixels;
-    MetalBuffer embeddings;
-    bool encoding = false;
-    bool encoded = false;
-    // Its entry in the embedding cache while the cache holds it.
-    std::optional<std::list<std::shared_ptr<ImageRows>>::iterator> cached;
-  };
-  // A placement keeps its rows until its last row is injected; its span
-  // stays, because rotary positions after it depend on its grid.
-  struct ImageState final {
-    ImageSpan span;
-    std::shared_ptr<ImageRows> rows;
-  };
-  struct Request final {
-    uint64_t id = 0;
-    uint32_t stateLane = 0;
-    bool resident = false;
-    bool promptComplete = false;
-    // Rebuild state from already-emitted tokens without sampling an initial
-    // anchor, consuming RNG, or replaying output to the caller.
-    bool replayingGeneration = false;
-    uint32_t promptTokens = 0;
-    uint32_t maxNewTokens = 0;
-    uint32_t generatedTokens = 0;
-    SamplingParameters sampling;
-    ConstraintMode constraint = ConstraintMode::None;
-    // RequestFlag bits.
-    uint32_t flags = 0;
-    std::optional<uint32_t> pendingToken;
-    // A constrained request's final prompt row, held from its prompt's end
-    // until its first token is selected under its first mask, suspensions
-    // included. Composite cache state never stores it; every cache hit
-    // replays one input token and regenerates this value.
-    std::vector<uint16_t> finalTargetHidden;
-    std::array<float, kSamplingUniformCount> cycleUniforms{};
-    // Nonempty selects score-only mode: the final prefill chunk computes raw
-    // logits at these token ids instead of selecting an anchor.
-    std::vector<uint32_t> scoreTokens;
-    std::vector<uint32_t> maskWords;
-    // Set only while the current scheduler-owned ticket overlaps grammar-mask
-    // computation with target verification. This is model runtime state, not a
-    // scheduler decode stage.
-    bool verifyMaskInFlight = false;
-    uint64_t rngCounter = 0;
-    DecodeStage decodeStage = DecodeStage::Regular;
-    std::optional<DraftContextPlan> draftContextPlan;
-    std::vector<ImageState> images;
-    // What its activation took from a cached state: the images that end
-    // there were left out (ModelRequest::restoredTokens).
-    uint32_t restoredTokens = 0;
-    // Learning-free predraft state (SPLASH_NGRAM_PREDRAFT): the lane's
-    // token stream and each 3-gram's last two starts.
-    std::vector<uint32_t> ngramHistory;
-    // Each 3-gram key keeps its last four starts; the lookup walks them all.
-    std::unordered_map<uint64_t, std::array<uint32_t, 4>> ngramIndex;
-    // Acceptance gating: EWMA of accepted tokens per n-gram round, set in
-    // finalizeDecode for steps where this lane's proposals were used.
-    uint32_t ngramRounds = 0;
-    double ngramAcceptedAvg = 0;
-    // Next generatedTokens count at which a gated-off lane may probe again.
-    uint32_t ngramProbeAt = 0;
-    bool ngramInFlight = false;
-    // Adaptive proposal length (opt-in, SPLASH_ADAPTIVE_PROPOSALS): EWMA of
-    // accepted draft tokens per chain verify step and the lane's current
-    // budget — the acceptance cap and live verify rows that step.
-    double proposalAcceptedAvg = kDraftProposalTokens;
-    uint32_t proposalBudget = kDraftProposalTokens;
-  };
+  using ImageKey = richengine::model::RuntimeImageKey;
+  using ImageKeyHash = richengine::model::RuntimeImageKeyHash;
+  using ImageRows = richengine::model::RuntimeImageRows;
+  using ImageState = richengine::model::RuntimeImageState;
+  using Request = richengine::model::RuntimeRequest;
   struct DecodeLaneResult final {
     Request *request = nullptr;
     uint32_t retained = 0;
@@ -273,6 +131,22 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   kv::PageStorage &kvPages;
   QwenStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
+  // Submit-ahead input banks (PrefillArena::get(tensor, bank)): one bit per
+  // bank an unconsumed prefill command wrote. At most one submit-ahead
+  // command overlaps a running one, so two banks cover the ring.
+  uint32_t prefillInputBanksInFlight_ = 0;
+  uint32_t claimPrefillInputBank() {
+    const uint32_t bank = (prefillInputBanksInFlight_ & 1) ? 1 : 0;
+    prefillInputBanksInFlight_ |= 1u << bank;
+    return bank;
+  }
+  void releasePrefillInputBank(uint32_t bank) noexcept {
+    prefillInputBanksInFlight_ &= ~(1u << bank);
+  }
+  // A bank is free while fewer than two prefills are unconsumed.
+  bool prefillSubmitAheadAvailable() const noexcept {
+    return prefillInputBanksInFlight_ != 3;
+  }
   std::unique_ptr<DecodeArena> decodeArena;
   // Every state lane's penalty words, bound whole: a batch lane reads the row
   // of its request's state lane, which need not be its own.
@@ -309,36 +183,41 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   ModelTelemetry counters;
   ops::Sampling sampling;
   QwenTarget targetModel;
-  std::variant<DFlashDraft, PlainDraft, DSparkDraft> draftModel;
-  // Tree verify (TREE_VERIFY_DESIGN): the selector emits each greedy,
+  std::variant<NullDraft, DFlashDraft, PlainDraft, DSparkDraft> draftModel;
+  // Tree verify (docs/TREE_VERIFY_DESIGN.md): the selector emits each greedy,
   // unconstrained lane's comb tree when the draft is a DFlash2. Measured a
   // net loss on the decode benchmark (identical accepted tokens at ~2x
-  // verify rows), so it is opt-in: SPLASH_VERIFY_TREE=1 enables.
-  const bool verifyTreeEnabled = envFlagOn("SPLASH_VERIFY_TREE");
-  // Adaptive proposal budgets (SPEC_DECODE_BOOST L3): a chain lane's
+  // verify rows), so it is opt-in: RICHENGINE_VERIFY_TREE=1 enables.
+  const bool verifyTreeEnabled = envFlagOn("RICHENGINE_VERIFY_TREE");
+  // Adaptive proposal budgets (docs/SPEC_DECODE_BOOST.md L3): a chain lane's
   // accepted-token cap tracks its rolling acceptance EWMA, so a lane that
   // keeps rejecting pays for fewer live verify rows — GDN scan depth and
   // the per-row vocabulary/argmax sweeps — instead of the fixed eight.
-  // Opt-in: SPLASH_ADAPTIVE_PROPOSALS=1.
-  const bool adaptiveProposals_ = envFlagOn("SPLASH_ADAPTIVE_PROPOSALS");
+  // On by default; RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
+  const bool adaptiveProposals_ =
+      ![] {
+        const char *value = std::getenv("RICHENGINE_ADAPTIVE_PROPOSALS");
+        return value && std::string_view(value) == "0";
+      }();
   // Per-step debug gates, read once: getenv scans environ linearly and these
   // ran inside the decode/finalize paths on every command.
-  const bool treeDebug_ = envFlag("SPLASH_TREE_DEBUG");
+  const bool treeDebug_ = envFlag("RICHENGINE_TREE_DEBUG");
+  const bool draftDebug_ = envFlag("RICHENGINE_DRAFT_DEBUG");
   const std::string treeSkip_ = [] {
-    const char *value = std::getenv("SPLASH_TREE_SKIP");
+    const char *value = std::getenv("RICHENGINE_TREE_SKIP");
     return value ? std::string(value) : std::string();
   }();
-  const bool aneDebug_ = envFlag("SPLASH_ANE_DEBUG");
-  const bool ngramDebug_ = envFlag("SPLASH_NGRAM_DEBUG");
-  // Opt-in ANE speculation (ANE_DRAFTING.md): SPLASH_ANE_MEDUSA names a
+  const bool aneDebug_ = envFlag("RICHENGINE_ANE_DEBUG");
+  const bool ngramDebug_ = envFlag("RICHENGINE_NGRAM_DEBUG");
+  // Opt-in ANE speculation (docs/ANE_DRAFTING.md): RICHENGINE_ANE_MEDUSA names a
   // CoreML package whose leaf alternates replace a tree batch's sibling
-  // leaves; SPLASH_ANE_PREDRAFT names one that drafts the next step's
+  // leaves; RICHENGINE_ANE_PREDRAFT names one that drafts the next step's
   // proposal chain while the target verifies. Both keep the target's own
   // acceptance authoritative, so a stale or absent result never changes the
   // output — it only wastes ANE time.
   std::unique_ptr<AnePredictor> aneMedusa_;
   std::unique_ptr<AnePredictor> anePredraft_;
-  MetalBuffer aneLeafTokens_;  // [kLaneCount][SPLASH_DRAFT_PROPOSAL_TOKENS]
+  MetalBuffer aneLeafTokens_;  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS]
   MetalBuffer aneFlag_;        // one u32: the medusa serial last published
   std::atomic<uint32_t> medusaSerial_{0};
   std::atomic<uint32_t> predraftSerial_{0};
@@ -349,20 +228,20 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::condition_variable aneCv_;
   std::array<uint32_t, kLaneCount> aneAnchors_{};
   std::array<uint64_t, kLaneCount> anePositions_{};
-  std::array<std::array<uint32_t, SPLASH_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
+  std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
       aneProposals_{};
-  const uint32_t aneWaitMs_ = envUint("SPLASH_ANE_WAIT_MS", 3);
-  // Learning-free predraft (opt-in, SPLASH_NGRAM_PREDRAFT=1): an n-gram
+  const uint32_t aneWaitMs_ = envUint("RICHENGINE_ANE_WAIT_MS", 3);
+  // Learning-free predraft (opt-in, RICHENGINE_NGRAM_PREDRAFT=1): an n-gram
   // table over each lane's prompt+generated stream feeds the same
   // ProposedTokens injection the ANE artifact uses — a wrong candidate
   // only wastes verify rows.
-  const bool ngramPredraft_ = envFlagOn("SPLASH_NGRAM_PREDRAFT");
+  const bool ngramPredraft_ = envFlagOn("RICHENGINE_NGRAM_PREDRAFT");
   // Acceptance gate (SSSD-style): a batch goes n-gram-predrafted when the
   // lanes' expected accepted-token scores total at least what the GPU draft
   // would have delivered. A lane with a weak EWMA or no match drags the
   // total down and can veto; a cold lane re-probes each kNgramProbeTokens.
-  const double ngramDraftExpect_ = envDouble("SPLASH_NGRAM_DRAFT_EXPECT", 4.0);
-  const uint32_t ngramWarmup_ = envUint("SPLASH_NGRAM_WARMUP", 8);
+  const double ngramDraftExpect_ = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
+  const uint32_t ngramWarmup_ = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   static constexpr uint32_t kNgramProbeTokens = 256;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -380,15 +259,26 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                         value.package.target)),
         draftModel(std::visit(
                        [&](const auto &weights)
-                           -> std::variant<DFlashDraft, PlainDraft, DSparkDraft> {
+                           -> std::variant<NullDraft, DFlashDraft, PlainDraft,
+                                           DSparkDraft> {
                          using W = std::decay_t<decltype(weights)>;
                          using Draft = std::conditional_t<
-                             std::is_same_v<W, DFlashDraftWeights>, DFlashDraft,
-                             std::conditional_t<std::is_same_v<W, PlainDraftWeights>,
-                                                PlainDraft, DSparkDraft>>;
-                         return std::variant<DFlashDraft, PlainDraft, DSparkDraft>(
-                             std::in_place_type<Draft>, weights,
-                             value.backend, operators);
+                             std::is_same_v<W, NullDraftWeights>, NullDraft,
+                             std::conditional_t<
+                                 std::is_same_v<W, DFlashDraftWeights>,
+                                 DFlashDraft,
+                                 std::conditional_t<
+                                     std::is_same_v<W, PlainDraftWeights>,
+                                     PlainDraft, DSparkDraft>>>;
+                         if constexpr (std::is_same_v<Draft, NullDraft>)
+                           return std::variant<NullDraft, DFlashDraft,
+                                               PlainDraft, DSparkDraft>(
+                               std::in_place_type<Draft>);
+                         else
+                           return std::variant<NullDraft, DFlashDraft,
+                                               PlainDraft, DSparkDraft>(
+                               std::in_place_type<Draft>, weights,
+                               value.backend, operators);
                        },
                        value.package.draft)) {
     if (states.layout() != package.stateLayout() ||
@@ -400,23 +290,23 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
     preparePolicyPipelines();
-    if (const char *path = std::getenv("SPLASH_ANE_MEDUSA")) {
+    if (const char *path = std::getenv("RICHENGINE_ANE_MEDUSA")) {
       std::string error;
       aneMedusa_ = AnePredictor::load(path, error);
       if (!aneMedusa_)
-        throw std::invalid_argument("SPLASH_ANE_MEDUSA: " + error);
+        throw std::invalid_argument("RICHENGINE_ANE_MEDUSA: " + error);
       aneLeafTokens_ = backend.allocateBuffer(
-          kLaneCount * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
+          kLaneCount * RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
           BufferStorage::Shared, "ane-leaf-tokens");
       aneFlag_ = backend.allocateBuffer(sizeof(uint32_t),
                                         BufferStorage::Shared, "ane-flag");
       *static_cast<uint32_t *>(aneFlag_.contents()) = 0xffffffffu;
     }
-    if (const char *path = std::getenv("SPLASH_ANE_PREDRAFT")) {
+    if (const char *path = std::getenv("RICHENGINE_ANE_PREDRAFT")) {
       std::string error;
       anePredraft_ = AnePredictor::load(path, error);
       if (!anePredraft_)
-        throw std::invalid_argument("SPLASH_ANE_PREDRAFT: " + error);
+        throw std::invalid_argument("RICHENGINE_ANE_PREDRAFT: " + error);
     }
   }
   // Warmup selects greedily, so the first sampled, penalized or constrained
@@ -478,109 +368,36 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         static_cast<uint32_t>(static_cast<int64_t>(logical) + delta);
     return {position, position, position};
   }
-  uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
-           geometry.target.hiddenSize * sizeof(uint16_t);
-  }
-  static ImageKey imageKey(const ImageSpan &span) noexcept {
-    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth};
-  }
+  uint64_t embeddingBytes(const ImageSpan &span) const;
+
+  static ImageKey imageKey(const ImageSpan &span) noexcept;
+
   // The rows of an identical image that something still holds, moved to the
   // front of the embedding cache when it is there; null otherwise.
-  std::shared_ptr<ImageRows> findRows(const ImageSpan &span) {
-    const auto found = imageRows.find(imageKey(span));
-    if (found == imageRows.end())
-      return {};
-    std::shared_ptr<ImageRows> rows = found->second.lock();
-    if (!rows) {
-      imageRows.erase(found);
-      return {};
-    }
-    if (rows->cached)
-      embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
-    return rows;
-  }
+  std::shared_ptr<ImageRows> findRows(const ImageSpan &span);
+
   // Keeps encoded rows for reuse as the most recently used, dropping the
   // least recently used while the rows kept for reuse exceed the cache's
   // bytes.
-  void retain(const std::shared_ptr<ImageRows> &rows) {
-    if (rows->cached) {
-      embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
-      return;
-    }
-    const uint64_t bytes = rows->embeddings.sizeBytes();
-    embeddingCache.push_front(rows);
-    rows->cached = embeddingCache.begin();
-    embeddingCacheBytes += bytes;
-    while (!embeddingCache.empty() &&
-           embeddingCacheBytes + heldRowsBytes(true) > kEmbeddingCacheBytes)
-      static_cast<void>(uncache(std::prev(embeddingCache.end())));
-  }
+  void retain(const std::shared_ptr<ImageRows> &rows);
+
   // The bytes of the distinct rows states in RAM hold: all of them, or only
   // those the embedding cache does not hold as well.
-  [[nodiscard]] uint64_t heldRowsBytes(bool uncachedOnly) const noexcept {
-    uint64_t bytes = 0;
-    for (auto hold = stateHolds.begin(); hold != stateHolds.end(); ++hold) {
-      const std::shared_ptr<const HeldState> held = hold->lock();
-      if (!held || (uncachedOnly && held->rows->cached))
-        continue;
-      const bool counted = std::any_of(
-          stateHolds.begin(), hold, [&](const std::weak_ptr<const HeldState> &earlier) {
-            const std::shared_ptr<const HeldState> other = earlier.lock();
-            return other && other->rows == held->rows;
-          });
-      if (!counted)
-        bytes += held->rows->embeddings.sizeBytes();
-    }
-    return bytes;
-  }
+  [[nodiscard]] uint64_t heldRowsBytes(bool uncachedOnly) const noexcept;
+
   // A state in RAM whose boundary lies inside an image, less than a page
   // before its end, holds the image's encoded rows, unless that would take
   // the rows kept for reuse past the cache's bytes: the state returned owns
   // them. Boundaries deeper inside an image keep only the embedding cache.
   std::shared_ptr<const CompositeState>
-  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state) {
-    std::erase_if(stateHolds, [](const std::weak_ptr<const HeldState> &hold) {
-      return hold.expired();
-    });
-    const uint64_t boundary = states.metadata(entry.stateLane).lengths.targetTokens;
-    for (const ImageState &image : entry.images) {
-      // The chunk that ended at the boundary encoded the image it reached.
-      if (image.span.offset >= boundary || image.span.end() <= boundary)
-        continue;
-      if (image.span.end() - boundary >= kv::kPageTokens)
-        break;
-      const bool kept =
-          image.rows->cached ||
-          std::ranges::any_of(stateHolds, [&](const std::weak_ptr<const HeldState> &hold) {
-            const std::shared_ptr<const HeldState> held = hold.lock();
-            return held && held->rows == image.rows;
-          });
-      const uint64_t added = kept ? 0 : image.rows->embeddings.sizeBytes();
-      if (embeddingCacheBytes + heldRowsBytes(true) + added > kEmbeddingCacheBytes)
-        break;
-      auto held = std::make_shared<const HeldState>(HeldState{std::move(state), image.rows});
-      stateHolds.push_back(held);
-      return {held, held->state.get()};
-    }
-    return state;
-  }
+  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state);
+
   // Drops one entry of the embedding cache and returns the bytes it held.
-  uint64_t uncache(std::list<std::shared_ptr<ImageRows>>::iterator entry) noexcept {
-    const uint64_t bytes = (*entry)->embeddings.sizeBytes();
-    (*entry)->cached.reset();
-    embeddingCache.erase(entry);
-    embeddingCacheBytes -= bytes;
-    return bytes;
-  }
+  uint64_t uncache(std::list<std::shared_ptr<ImageRows>>::iterator entry) noexcept;
+
   // A request lets go of its images; the encoded ones stay in the cache.
-  void releaseImages(Request &entry) {
-    for (const ImageState &image : entry.images) {
-      if (image.rows && image.rows->encoded)
-        retain(image.rows);
-    }
-    entry.images.clear();
-  }
+  void releaseImages(Request &entry);
+
   // Frees one cache that can be rebuilt and returns its bytes. The vision
   // arena goes first, when no image waits for its encode and nothing holds
   // it: an image whose rows are encoded never needs it, and the next start
@@ -588,18 +405,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // used embedding entry nothing else holds, one at a time, since only an
   // encode rebuilds it. An entry something else holds is skipped, since
   // dropping it frees nothing.
-  uint64_t releaseOneCache() noexcept {
-    if (vision && vision.use_count() == 1 && visionIdle()) {
-      const uint64_t bytes = vision->arenaBytes();
-      vision.reset();
-      return bytes;
-    }
-    for (auto entry = embeddingCache.end(); entry != embeddingCache.begin();) {
-      if ((--entry)->use_count() == 1)
-        return uncache(entry);
-    }
-    return 0;
-  }
+  uint64_t releaseOneCache() noexcept;
+
   // Puts back the encoder a start replaced, or drops the one it built,
   // unless the start completes: an admission granted it, but a later step of
   // the start threw.
@@ -634,90 +441,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // retry spares it; a grant hands the request's images to `images` and
   // counts the rows it shares as reuses, each once.
   StateAdmission activate(const ModelRequest &request, uint32_t stateLane,
-                          std::vector<ImageState> &images) {
-    if (request.images.empty())
-      return laneAdmission(stateLane, states.tryActivateLane(stateLane, request.id));
-    // The engine rejects image requests at submission when there is no vision.
-    if (!package.descriptor.hasVision())
-      throw std::logic_error("image request reached a model without vision");
-    std::vector<ImageState> staged;
-    staged.reserve(request.images.size());
-    std::vector<std::shared_ptr<ImageRows>> shared;
-    uint64_t bytes = 0;
-    // The patches of the largest staged image that still needs its encode.
-    uint32_t encodePatches = 0;
-    for (const ImageSpan &span : request.images) {
-      if (span.end() <= request.restoredTokens) {
-        staged.push_back({span, nullptr});
-        continue;
-      }
-      // New rows enter the registry now, so a repeated placement shares
-      // them; they have no buffers until the admission allocates them.
-      std::shared_ptr<ImageRows> rows = findRows(span);
-      if (!rows) {
-        rows = std::make_shared<ImageRows>();
-        rows->key = imageKey(span);
-        imageRows.insert_or_assign(rows->key, rows);
-        bytes += span.pixelBytes() + embeddingBytes(span);
-      } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
-        shared.push_back(rows);
-      }
-      if (!rows->encoded)
-        encodePatches = std::max(encodePatches, span.gridHeight * span.gridWidth);
-      staged.push_back({span, std::move(rows)});
-    }
-    const uint64_t encoderBytes =
-        encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
-            ? ops::Vision::scratchBytes(package.vision.tensors.layout, encodePatches)
-            : 0;
-    std::shared_ptr<ops::Vision> encoder;
-    const uint8_t *pixels = request.imagePixels.data();
-    const auto allocate = [&] {
-      if (encoderBytes) {
-        encoder = std::make_shared<ops::Vision>(
-            backend, package.vision.tensors, encodePatches);
-      }
-      for (ImageState &image : staged) {
-        const ImageSpan &span = image.span;
-        if (image.rows && !image.rows->embeddings) {
-          ImageRows &rows = *image.rows;
-          rows.pixels = backend.allocateBuffer(
-              span.pixelBytes(), BufferStorage::Shared, "image pixels");
-          std::memcpy(contents<uint8_t>(rows.pixels, "image pixels"), pixels,
-                      static_cast<size_t>(span.pixelBytes()));
-          rows.embeddings = backend.allocateBuffer(
-              embeddingBytes(span), BufferStorage::Private, "image embeddings");
-        }
-        pixels += span.pixelBytes();
-      }
-    };
-    StateAdmission admission = laneAdmission(
-        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
-    if (!admission.granted()) {
-      admission.held = std::make_shared<const Matched>(
-          Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
-      return admission;
-    }
-    if (encoder)
-      vision = std::move(encoder);
-    counters.imageEmbeddingReuses += shared.size();
-    images = std::move(staged);
-    return admission;
-  }
+                          std::vector<ImageState> &images);
+
   // No image waits for its encode, so the vision arena can go.
-  [[nodiscard]] bool visionIdle() noexcept {
-    for (auto entry = imageRows.begin(); entry != imageRows.end();) {
-      const std::shared_ptr<ImageRows> rows = entry->second.lock();
-      if (!rows) {
-        entry = imageRows.erase(entry);
-        continue;
-      }
-      if (!rows->encoded)
-        return false;
-      ++entry;
-    }
-    return true;
-  }
+  [[nodiscard]] bool visionIdle() noexcept;
+
   // Encodes every image whose rows first appear in this chunk and overwrites
   // the chunk's placeholder embedding rows with the image rows. Text-only
   // requests add no dispatches.
@@ -759,40 +487,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   }
   static void stageSamplingCycle(Request &entry) noexcept {
     entry.cycleUniforms.fill(0.0F);
-    for (uint32_t index = SPLASH_UNIFORM_PROPOSALS;
-         index < SPLASH_SAMPLING_UNIFORMS; ++index) {
+    for (uint32_t index = RICHENGINE_UNIFORM_PROPOSALS;
+         index < RICHENGINE_SAMPLING_UNIFORMS; ++index) {
       entry.cycleUniforms[index] = nextUniform(entry);
     }
   }
   [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
-                                                  const ModelBatchItem &item) {
-    if (entry.stateLane >= pageTableBindings.size())
-      throw std::out_of_range("request state lane is outside page tables");
-    if (item.pageTable.empty() ||
-        item.pageTable.size() > kMaximumPageTableEntries) {
-      throw std::invalid_argument("request page table has invalid length");
-    }
-    if (!item.pageTableRevision)
-      throw std::invalid_argument("request page table has no revision");
-    PageTableBinding &binding = pageTableBindings[entry.stateLane];
-    MetalBuffer destination =
-        decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
-    // Rewrite only what changed since the table was written: nothing at the
-    // same revision, the entries from the first changed page on at the next
-    // one, and everything after two changes or for another request.
-    const auto size = static_cast<uint32_t>(item.pageTable.size());
-    uint32_t first = 0;
-    if (binding.requestId == entry.id) {
-      if (binding.revision == item.pageTableRevision)
-        first = size;
-      else if (binding.revision + 1 == item.pageTableRevision)
-        first = std::min(item.pageTableFirstChanged, size);
-    }
-    if (first < size)
-      kvPages.writeEntries(item.pageTable, first, destination);
-    binding = {entry.id, item.pageTableRevision};
-    return destination;
-  }
+                                                  const ModelBatchItem &item);
+
   void addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
                      uint32_t targetRows, MetalBuffer draftPositions,
                      uint32_t draftRows, MetalBuffer targetCos,
@@ -897,43 +599,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     }
     return true;
   }
-  ops::SamplingBuffers samplingBuffers(uint32_t lanes) const {
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
-    };
-    return {d(DecodeTensor::Logits),
-            d(DecodeTensor::TargetPartialMasses),
-            d(DecodeTensor::TargetVocabularyRows),
-            d(DecodeTensor::SamplingUniforms),
-            d(DecodeTensor::ConstraintMasks),
-            d(DecodeTensor::OutputTokens),
-            d(DecodeTensor::ArgmaxValues),
-            d(DecodeTensor::ArgmaxIndices),
-            d(DecodeTensor::InputTokens),
-            d(DecodeTensor::Candidates),
-            d(DecodeTensor::ProposalProbs),
-            d(DecodeTensor::TargetVocabularyRanges),
-            d(DecodeTensor::TargetVocabularyArrivals)};
-  }
-  std::span<uint32_t> penaltyWords(uint32_t stateLane) const {
-    return {contents<uint32_t>(
-                decodeArena->get(stateLane, DecodeTensor::PenaltyState),
-                "penalty words"),
-            geometry.target.vocabularySize};
-  }
+  ops::SamplingBuffers samplingBuffers(uint32_t lanes) const;
+
+  std::span<uint32_t> penaltyWords(uint32_t stateLane) const;
+
   // Rebuilds a penalized request's penalty words when it takes a state lane,
   // at activation and at resume, from the history the lane's prefill
   // consumes. No command reads the lane's words yet.
   void bindPenalties(const Request &entry,
-                     std::span<const uint32_t> history) const {
-    const ops::SamplingPenalties penalties = samplingPenalties(entry);
-    if (!penalties.active())
-      return;
-    ops::Sampling::rebuildPenaltyWords(penaltyWords(entry.stateLane), history,
-                                       entry.generatedTokens,
-                                       entry.pendingToken,
-                                       penalties.repetition != 1.0F);
-  }
+                     std::span<const uint32_t> history) const;
+
   // The one place a token the target selected becomes the pending anchor:
   // tokens are one step's selections in order, the new anchor last. The
   // command that selected them has completed, and the next one that reads
@@ -970,7 +645,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // cycle.
   void uploadInitialUniform(Request &entry, uint32_t lane) const {
     entry.cycleUniforms.fill(0.0F);
-    entry.cycleUniforms[SPLASH_UNIFORM_INITIAL] = nextUniform(entry);
+    entry.cycleUniforms[RICHENGINE_UNIFORM_INITIAL] = nextUniform(entry);
     uploadSamplingUniforms(entry, lane);
   }
   // One LM head over the batch's `width` lanes, then one selection of the
@@ -1099,7 +774,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   }
   PackedPrefillBatch
   preparePackedPrefill(std::span<const ModelBatchItem> items,
-                       std::array<Request *, kLaneCount> &entries) {
+                       std::array<Request *, kLaneCount> &entries,
+                       uint32_t inputBank) {
     PackedPrefillBatch batch;
     batch.sequences.reserve(items.size());
     uint64_t queryOffset = 0;
@@ -1114,8 +790,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         throw std::invalid_argument("invalid packed Qwen prefill item");
       }
       const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
+      // A chunk submitted ahead of its predecessor's consumption still has
+      // the predecessor's rows unapplied: lengths advance only at consume.
       if (metadata.requestId != entry.id ||
-          metadata.lengths.targetTokens != item.logicalPosition) {
+          metadata.lengths.targetTokens + entry.prefillUnappliedRows !=
+              item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
       if (item.logicalPosition == 0)
@@ -1153,13 +832,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     }
 
     auto *input =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::InputTokens),
+        contents<uint32_t>(prefillArena->get(PrefillTensor::InputTokens,
+                                             inputBank),
                            "packed prefill input tokens");
     auto *targetPositions =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions),
+        contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions,
+                                             inputBank),
                            "target RoPE positions");
     auto *draftPositions =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions),
+        contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions,
+                                             inputBank),
                            "draft RoPE positions");
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       const ModelBatchItem &item = *sequence.item;
@@ -1208,7 +890,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         {p(PrefillTensor::Captured), p(PrefillTensor::ProjectionSums),
          p(PrefillTensor::ContextProjected), p(PrefillTensor::ContextHidden),
          p(PrefillTensor::ContextKv), p(PrefillTensor::DraftRopeCos),
-         p(PrefillTensor::DraftRopeSin)},
+         p(PrefillTensor::DraftRopeSin),
+         {.i8codes = p(PrefillTensor::I8Codes),
+          .i8codesLo = p(PrefillTensor::I8CodesLo),
+          .i8params = p(PrefillTensor::I8Params),
+          .i8paramsLo = p(PrefillTensor::I8ParamsLo)}},
         batch.capturedRows, std::span(spans).first(spanCount));
     }, draftModel);
   }
@@ -1216,17 +902,21 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::array<DispatchDraftCapturePlan, kLaneCount>
   encodePackedPrefillGraph(CommandGraph &graph,
                            std::span<const ModelBatchItem> items,
-                           std::array<Request *, kLaneCount> &entries) {
-    PackedPrefillBatch batch = preparePackedPrefill(items, entries);
+                           std::array<Request *, kLaneCount> &entries,
+                           uint32_t inputBank = 0) {
+    PackedPrefillBatch batch = preparePackedPrefill(items, entries, inputBank);
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
+    auto pi = [&](PrefillTensor tensor) {
+      return prefillArena->get(tensor, inputBank);
+    };
 
-    addRopeTables(graph, p(PrefillTensor::TargetPositions), batch.rows,
-                  p(PrefillTensor::DraftPositions), batch.capturedRows,
+    addRopeTables(graph, pi(PrefillTensor::TargetPositions), batch.rows,
+                  pi(PrefillTensor::DraftPositions), batch.capturedRows,
                   p(PrefillTensor::RopeCos), p(PrefillTensor::RopeSin),
                   p(PrefillTensor::DraftRopeCos),
                   p(PrefillTensor::DraftRopeSin));
 
-    targetModel.addEmbedding(graph, p(PrefillTensor::InputTokens),
+    targetModel.addEmbedding(graph, pi(PrefillTensor::InputTokens),
                              p(PrefillTensor::Hidden0), batch.rows);
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
@@ -1261,8 +951,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           std::span(recurrentIn).subspan(stateBegin, gdnLayers);
       destination.recurrentOut =
           std::span(recurrentOut).subspan(stateBegin, gdnLayers);
-      const GdnParityBuffers &in = states.current(sequence.entry->stateLane);
-      const GdnParityBuffers &out = states.next(sequence.entry->stateLane);
+      // An odd count of unconsumed chunks means the pending command's output
+      // is this chunk's input: bind the parities it will swap between.
+      const bool pendingSwap =
+          (sequence.entry->prefillUnapplied & 1) != 0;
+      const GdnParityBuffers &in = pendingSwap
+          ? states.next(sequence.entry->stateLane)
+          : states.current(sequence.entry->stateLane);
+      const GdnParityBuffers &out = pendingSwap
+          ? states.current(sequence.entry->stateLane)
+          : states.next(sequence.entry->stateLane);
       for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
         convolutionIn[stateBegin + layer] = in.convolutionLayers[layer];
         convolutionOut[stateBegin + layer] = out.convolutionLayers[layer];
@@ -1287,7 +985,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                              .sums = p(PrefillTensor::LinearExponents),
                              .partials = p(PrefillTensor::LinearPartials),
                              .counters = p(PrefillTensor::LinearCounters),
-                             .rotated = p(PrefillTensor::LinearRotated)};
+                             .rotated = p(PrefillTensor::LinearRotated),
+                             .i8codes = p(PrefillTensor::I8Codes),
+                             .i8codesLo = p(PrefillTensor::I8CodesLo),
+                             .i8params = p(PrefillTensor::I8Params),
+                             .i8paramsLo = p(PrefillTensor::I8ParamsLo)};
     buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
     buffers.normalized = p(PrefillTensor::Normalized);
     buffers.captured = p(PrefillTensor::Captured);
@@ -1365,32 +1067,19 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                          uint32_t lane);
   // Batch lanes beyond the active width replay the last active request so
   // every padded M32 lane binds valid state.
-  static Request &laneEntry(std::span<Request *const> entries, uint32_t lane) {
-    Request *entry = entries[std::min<size_t>(lane, entries.size() - 1)];
-    if (!entry)
-      throw std::invalid_argument("empty decode batch lane");
-    return *entry;
-  }
+  static Request &laneEntry(std::span<Request *const> entries, uint32_t lane);
+
   // Lane bindings for the padded physical width: the real entries in order,
   // then the last lane replayed (laneEntry's rule).
   void bindPageTables(
       std::span<Request *const> entries,
-      std::array<MetalBuffer, kLaneCount> &pageTables) const {
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
-      pageTables[lane] =
-          decodeArena->get(laneEntry(entries, lane).stateLane,
-                           DecodeTensor::PageTable);
-  }
+      std::array<MetalBuffer, kLaneCount> &pageTables) const;
+
   void bindGdnStates(
       std::span<Request *const> entries,
       std::array<MetalBuffer, kLaneCount> &current,
-      std::array<MetalBuffer, kLaneCount> &next) const {
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      Request &entry = laneEntry(entries, lane);
-      current[lane] = states.current(entry.stateLane).stateBase;
-      next[lane] = states.next(entry.stateLane).stateBase;
-    }
-  }
+      std::array<MetalBuffer, kLaneCount> &next) const;
+
   void bindDraftRings(
       std::span<Request *const> entries,
       std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
@@ -1461,7 +1150,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                       std::span<const uint32_t> liveRows = {});
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
   // lanes' strides, while the row-indexed logits and the argmax output take
-  // the tree's SPLASH_TREE_VERIFY_NODES stride.
+  // the tree's RICHENGINE_TREE_VERIFY_NODES stride.
   ops::SamplingBuffers samplingTreeBuffers(uint32_t lanes) const;
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
                                      std::span<Request *const> entries,
@@ -1541,6 +1230,18 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // token, so every retained token is checked.
       const uint32_t *targetTokens = contents<uint32_t>(
           d(DecodeTensor::OutputTokens), "target output tokens");
+      if (draftDebug_ && !tree) {
+        const uint32_t *props = contents<uint32_t>(
+            d(DecodeTensor::ProposedTokens), "proposed tokens");
+        std::string p, t;
+        for (uint32_t i = 0; i < kDraftProposalTokens; ++i)
+          p += (i ? " " : "") + std::to_string(props[i]);
+        for (uint32_t i = 0; i < laneResult.retained && i < 9; ++i)
+          t += (i ? " " : "") + std::to_string(targetTokens[i]);
+        fprintf(stderr, "draft lane=%u pos=%llu props=[%s] retained=%u accepted=%u out=[%s]\n",
+                lane, static_cast<unsigned long long>(items[lane].logicalPosition), p.c_str(),
+                laneResult.retained, laneResult.accepted, t.c_str());
+      }
       laneResult.failure = invalidSelection({targetTokens, laneResult.retained});
       if (tree && treeDebug_) {
         const uint32_t *treeTok = contents<uint32_t>(
@@ -1843,4 +1544,6 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   };
 };
 
-} // namespace splash::model
+#include "model/RuntimeBindings.hpp"
+
+} // namespace richengine::model

@@ -13,7 +13,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace splash::ops::tuning {
+namespace richengine::ops::tuning {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -193,7 +193,7 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
     for (uint32_t splits = 2;
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / 256; splits *= 2)
       append({LinearTile::Split128, 0, LinearSimdgroups::Eight, splits});
-  if (w.rows == SPLASH_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None)
+  if (w.rows == RICHENGINE_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None)
     append({LinearTile::Paired256, columns / 256, LinearSimdgroups::Four});
   return result;
 }
@@ -415,4 +415,4 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
   return result;
 }
 
-} // namespace splash::ops::tuning
+} // namespace richengine::ops::tuning

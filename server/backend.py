@@ -116,6 +116,9 @@ class Job:
     # when unknown.
     generation_prompt_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
+    # Leading prompt tokens that later requests are expected to share (the
+    # system prompt and tools); zero when unknown.
+    shared_prefix_tokens: int = 0
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
     output_clamped_to_context: bool = False
@@ -352,7 +355,7 @@ class NativeBackend:
         self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
-            name="splash-http-finalizer",
+            name="richengine-http-finalizer",
             daemon=True,
         )
         self.finalizer.start()
@@ -383,13 +386,13 @@ class NativeBackend:
                 self._stop_restarting_locked(
                     f"the inference engine failed {self.failures} times in a row, "
                     f"each within {CRASH_LOOP_WINDOW_SECONDS:.0f} s of starting "
-                    f"({error}); Splash stopped restarting it. "
+                    f"({error}); RichEngine stopped restarting it. "
                     + (
                         f"Crash trace: {trace}. "
                         if trace
-                        else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
+                        else "Set RICHENGINE_CRASH_TRACE=1 to record a crash trace. "
                     )
-                    + "Restart the Splash server after fixing the cause."
+                    + "Restart the RichEngine server after fixing the cause."
                 )
             else:
                 self.restart_due = time.monotonic() + delay
@@ -432,7 +435,7 @@ class NativeBackend:
             return
         self.recovery = threading.Thread(
             target=self._recover,
-            name="splash-engine-recovery",
+            name="richengine-engine-recovery",
             daemon=True,
         )
         try:
@@ -659,6 +662,7 @@ class NativeBackend:
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+            shared_prefix_tokens=job.shared_prefix_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner

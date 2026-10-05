@@ -13,7 +13,7 @@ INSTALL_LOCK = $(VENV).install.lock
 REQUIREMENTS := install/requirements.txt
 PYTHON_CANDIDATES ?= python3.13 python3 python3.12 python3.14
 BUILD_ID_PYTHON ?= python3
-SPLASH_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
+RICHENGINE_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
 MODEL ?=
 # MODEL with the installer's source options selects one installation
 # (DEVELOPMENT.md, Upstream model loading); every model target passes them.
@@ -33,7 +33,7 @@ MODEL_ROOT = $(if $(MODEL),$(shell $(MODEL_INSTALL) link))
 MODEL_RESULTS = build/release/$(subst :,--,$(subst /,--,$(MODEL)))
 
 BUILD := build
-TARGET := $(BUILD)/splash
+TARGET := $(BUILD)/richengine
 METAL_BUILD := $(BUILD)/metal
 # Production kernels are grouped by execution phase under
 # runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
@@ -59,7 +59,7 @@ PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
-LIB := $(BUILD)/splash.metallib
+LIB := $(BUILD)/richengine.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
 	platform-check model-selection preflight serve
@@ -68,14 +68,14 @@ all: $(TARGET)
 
 install: model-selection platform-check
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install
+		-f "$(RICHENGINE_MAKEFILE)" _install
 
 _install: model-selection _install-environment
 	$(MODEL_INSTALL) prepare
 
 model-selection:
 	@test -n "$(MODEL)" || { \
-		echo "error: set MODEL to a model ID as splash serve --model takes it (OWNER/REPO[:VARIANT])" >&2; \
+		echo "error: set MODEL to a model ID as richengine serve --model takes it (OWNER/REPO[:VARIANT])" >&2; \
 		exit 1; \
 	}
 	@case "$(LANGUAGE_ONLY)" in ""|0|1) ;; *) \
@@ -85,7 +85,7 @@ model-selection:
 
 platform-check:
 	@test "$(SYSTEM_NAME)" = Darwin && test "$(SYSTEM_ARCH)" = arm64 || { \
-		echo "error: Splash requires an Apple Silicon Mac" >&2; \
+		echo "error: RichEngine requires an Apple Silicon Mac" >&2; \
 		exit 1; \
 	}
 	@command -v "$(XCRUN)" >/dev/null 2>&1 || { \
@@ -101,7 +101,7 @@ platform-check:
 
 install-environment:
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install-environment
+		-f "$(RICHENGINE_MAKEFILE)" _install-environment
 
 # The environment is created from the interpreter under the candidate's
 # installation prefix (sys.base_prefix). A symlinked launcher, such as uv's,
@@ -160,7 +160,7 @@ _install-environment:
 
 preflight: model-selection
 	@test -x $(PYTHON) || { \
-		echo "error: Splash is not installed; run 'make install MODEL=$(MODEL)' first" >&2; \
+		echo "error: RichEngine is not installed; run 'make install MODEL=$(MODEL)' first" >&2; \
 		exit 1; \
 	}
 	@$(MODEL_INSTALL) verify
@@ -168,7 +168,7 @@ preflight: model-selection
 	@TRANSFORMERS_VERBOSITY=error $(PYTHON) -c 'import server.server'
 
 serve: preflight $(TARGET)
-	./splash serve $(MODEL_ARGS)
+	./richengine serve $(MODEL_ARGS)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -185,7 +185,7 @@ $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 ENGINE_BUILD := $(BUILD)/engine
-ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
+ENGINE_LIBRARY := $(ENGINE_BUILD)/librichengine.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
 	-framework CoreML
 ENGINE_DEPFLAGS := -MMD -MP
@@ -239,24 +239,24 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
-	runtime/engine/MemoryPlan.cpp \
+	runtime/engine/memory/MemoryPlan.cpp \
 	runtime/engine/Scheduler.cpp \
-	runtime/engine/Cache.cpp \
-	runtime/engine/WriteBehind.cpp \
+	runtime/engine/cache/Cache.cpp \
+	runtime/engine/memory/WriteBehind.cpp \
 	runtime/engine/Engine.cpp \
-	runtime/engine/MemoryGovernor.cpp \
-	runtime/engine/MemoryControl.cpp \
-	runtime/engine/KvPool.cpp \
-	runtime/engine/KvCache.cpp \
-	runtime/engine/KvPageTier.cpp \
-	runtime/engine/CacheDirectory.cpp \
-	runtime/engine/StateCache.cpp \
+	runtime/engine/memory/MemoryGovernor.cpp \
+	runtime/engine/memory/MemoryControl.cpp \
+	runtime/engine/cache/KvPool.cpp \
+	runtime/engine/cache/KvCache.cpp \
+	runtime/engine/cache/KvPageTier.cpp \
+	runtime/engine/cache/CacheDirectory.cpp \
+	runtime/engine/cache/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
-	runtime/engine/Protocol.cpp \
-	runtime/engine/NativeRuntime.cpp \
-	runtime/engine/FdTransport.cpp \
-	runtime/engine/MemoryAudit.cpp \
-	runtime/engine/Status.cpp \
+	runtime/engine/wire/Protocol.cpp \
+	runtime/engine/wire/NativeRuntime.cpp \
+	runtime/engine/wire/FdTransport.cpp \
+	runtime/engine/memory/MemoryAudit.cpp \
+	runtime/engine/wire/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/GgufFile.cpp \
 	runtime/model/GgufImage.cpp \
@@ -268,6 +268,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Dense.cpp \
+	runtime/model/Granite.cpp \
 	runtime/model/Lfm2.cpp \
 	runtime/model/Lfm2Moe.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
@@ -293,6 +294,8 @@ ENGINE_MM_SOURCES := \
 	runtime/model/RuntimeEncode.mm \
 	runtime/model/RuntimeNgram.mm \
 	runtime/model/RuntimeArenas.mm \
+	runtime/metal/MetalArena.mm \
+	runtime/metal/MetalEncode.mm \
 	runtime/ops/Vision.mm \
 	runtime/ops/PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
@@ -337,7 +340,7 @@ $(ENGINE_METAL_RUNTIME_OBJECT): runtime/metal/MetalBackend.mm
 $(ENGINE_INSTRUMENTED_METAL_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
-		-DSPLASH_BACKEND_INSTRUMENTATION=1 -c $< -o $@
+		-DRICHENGINE_BACKEND_INSTRUMENTATION=1 -c $< -o $@
 
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)

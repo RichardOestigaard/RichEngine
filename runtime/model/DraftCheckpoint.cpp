@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 using affine::copy;
@@ -189,4 +189,4 @@ WeightFile DSparkCheckpointLoader::model() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
 }
 
-} // namespace splash::model
+} // namespace richengine::model

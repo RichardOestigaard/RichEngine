@@ -103,7 +103,7 @@ class CrashTraceTest(unittest.TestCase):
                 mock.patch.object(crash_trace, "MAX_TRACE_BYTES", 12),
             ):
                 ring = crash_trace.CrashTraceRing(
-                    ("splash", "serve-native"), enabled=True
+                    ("richengine", "serve-native"), enabled=True
                 )
                 ring.start_generation(1, 50)
                 for frame in (b"one", b"two2", b"three", b"four"):
@@ -127,7 +127,7 @@ class CrashTraceTest(unittest.TestCase):
             directory = Path(temporary) / "crash"
             with mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", directory):
                 ring = crash_trace.CrashTraceRing(
-                    ("splash", "serve-native"), enabled=True
+                    ("richengine", "serve-native"), enabled=True
                 )
                 ring.start_generation(3, 1234)
                 outgoing = wire.serialize_message(wire.StatusRequestFrame(9))
@@ -172,7 +172,7 @@ class CrashTraceTest(unittest.TestCase):
                 mock.patch.object(crash_trace, "MAX_TRACE_BYTES", 64),
             ):
                 ring = crash_trace.CrashTraceRing(
-                    ("splash", "serve-native"), enabled=True
+                    ("richengine", "serve-native"), enabled=True
                 )
                 ring.start_generation(1, 50)
                 small = wire.serialize_message(wire.StatusRequestFrame(1))
@@ -203,7 +203,7 @@ class CrashTraceTest(unittest.TestCase):
             spawn.assert_not_called()
 
     def test_disabled_ring_does_not_reencode_received_frames(self):
-        ring = crash_trace.CrashTraceRing(("splash", "serve-native"))
+        ring = crash_trace.CrashTraceRing(("richengine", "serve-native"))
         frame = ready_frame()
         with mock.patch.object(crash_trace.wire, "serialize_frame") as serialize:
             ring.record_frame(1, "engine_to_client", frame)

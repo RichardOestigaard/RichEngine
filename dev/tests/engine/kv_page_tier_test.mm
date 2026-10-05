@@ -1,11 +1,11 @@
-#include "engine/KvPageTier.hpp"
+#include "engine/cache/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/ScopedTestConfig.hpp"
 #include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
-#include "engine/MemoryGovernor.hpp"
+#include "engine/memory/MemoryGovernor.hpp"
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -25,7 +25,7 @@
 #include <thread>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 using engine::KvPageTier;
 using engine::KvTransfer;
 using model::DiskBudget;
@@ -33,7 +33,7 @@ using model::SlotFile;
 
 namespace {
 
-using splash::test::require;
+using richengine::test::require;
 
 std::vector<std::byte> pattern(uint64_t bytes, uint32_t seed) {
   std::vector<std::byte> result(bytes);
@@ -323,7 +323,7 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   // 0 starts its extent, so its entry is the extent's address.
   std::byte *const base = pages.spans(0).front().data();
   const uint64_t address = test::entryOf(
-      pages, 0, test::sharedBuffer(backend, sizeof(SplashKvPage)));
+      pages, 0, test::sharedBuffer(backend, sizeof(RichKvPage)));
   const auto slabs = [&](uint32_t page, std::vector<uint64_t> &table) {
     for (const auto span : pages.spans(page)) {
       if (span.size() == data) table.push_back(address + static_cast<uint64_t>(span.data() - base));
@@ -450,7 +450,7 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
   require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
-  std::string name = (std::filesystem::temp_directory_path() / "splash-kv-tier-XXXXXX").string();
+  std::string name = (std::filesystem::temp_directory_path() / "richengine-kv-tier-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
   const SlotFile::Persistence persistence{directory / "kv.slots", directory / "kv.records", {}, 8};

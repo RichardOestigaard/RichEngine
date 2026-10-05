@@ -51,10 +51,10 @@ struct GDNDecodeBatchParams {
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
-  // Adaptive proposal budgets (SPLASH_ADAPTIVE_PROPOSALS): each lane's live
-  // verify rows bound the serial scan. Zero or SPLASH_TARGET_VERIFY_ROWS
+  // Adaptive proposal budgets (RICHENGINE_ADAPTIVE_PROPOSALS): each lane's live
+  // verify rows bound the serial scan. Zero or RICHENGINE_TARGET_VERIFY_ROWS
   // scans all eight rows; the commit replays only retained rows regardless.
-  uint32_t live_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
 static_assert(sizeof(GDNDecodeBatchParams) == 48,

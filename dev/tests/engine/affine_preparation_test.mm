@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-using namespace splash;
+using namespace richengine;
 namespace {
 
 std::vector<uint8_t> fileBytes(const std::filesystem::path &path) {

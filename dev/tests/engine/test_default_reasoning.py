@@ -169,7 +169,7 @@ class DefaultReasoningTests(unittest.TestCase):
                 with (
                     self.subTest(value=value, parse=parse.__module__),
                     mock.patch.dict(
-                        os.environ, {"SPLASH_DEFAULT_REASONING_EFFORT": value}
+                        os.environ, {"RICHENGINE_DEFAULT_REASONING_EFFORT": value}
                     ),
                     mock.patch("sys.stderr", io.StringIO()),
                 ):
@@ -192,9 +192,9 @@ class DefaultReasoningTests(unittest.TestCase):
             ("low", "xhigh", "xhigh"),
         ):
             with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("SPLASH_DEFAULT_REASONING_EFFORT", None)
+                os.environ.pop("RICHENGINE_DEFAULT_REASONING_EFFORT", None)
                 if env is not None:
-                    os.environ["SPLASH_DEFAULT_REASONING_EFFORT"] = env
+                    os.environ["RICHENGINE_DEFAULT_REASONING_EFFORT"] = env
                 options = ["--default-reasoning-effort", explicit] if explicit else []
                 self.assertEqual(
                     api.parse_args([*SERVER_ARGS, *options]).default_reasoning_effort,

@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-namespace splash::model {
+namespace richengine::model {
 
 class WeightStoreError : public std::runtime_error {
 public:
@@ -119,4 +119,4 @@ readAffineExpertProjection(WeightFile &file, uint32_t experts,
 [[nodiscard]] std::string
 weightManifestFingerprint(std::span<const WeightFileRecord> records);
 
-} // namespace splash::model
+} // namespace richengine::model

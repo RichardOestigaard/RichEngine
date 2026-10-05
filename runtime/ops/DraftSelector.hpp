@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <span>
 
-namespace splash::ops {
+namespace richengine::ops {
 
 struct DraftSelectorWorkspace final {
   uint64_t partialIdsBytes = 0;
@@ -30,7 +30,7 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer proposalProbabilities;
   // Tree-verify tables (draft_select_tree): per lane the node descriptors,
   // node tokens and node count of its verify tree
-  // (SPLASH_TREE_VERIFY_NODES stride). Unused by chain-only selection.
+  // (RICHENGINE_TREE_VERIFY_NODES stride). Unused by chain-only selection.
   metal::MetalBuffer treeNodes;
   metal::MetalBuffer treeTokens;
   metal::MetalBuffer treeCounts;
@@ -53,9 +53,9 @@ struct DraftMarkovHead final {
 
 // The DFlash draft's proposal policy (draft_select_* in
 // metal/kernels/decode/sampling.metal): each lane keeps the
-// SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
+// RICHENGINE_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or,
+// choice, and walks the RICHENGINE_DRAFT_PROPOSAL_TOKENS positions greedily or,
 // for a sampling lane, drawing at its temperature.
 class DraftSelector final {
 public:
@@ -102,4 +102,4 @@ private:
   uint32_t vocabulary_ = 0;
 };
 
-} // namespace splash::ops
+} // namespace richengine::ops

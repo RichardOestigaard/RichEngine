@@ -42,7 +42,7 @@
 
 #include "model/RuntimeImpl.hpp"
 
-namespace splash::model {
+namespace richengine::model {
 
 Runtime::Runtime(RuntimeContext context)
     : impl_(std::make_unique<Impl>(context)) {}
@@ -226,6 +226,10 @@ Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
   throw std::logic_error("unknown model work kind");
 }
 
+bool Runtime::prefillSubmitAheadAvailable() const noexcept {
+  return impl_->prefillSubmitAheadAvailable();
+}
+
 std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
@@ -237,7 +241,18 @@ Runtime::prefillAsync(const BatchPlan &plan,
 
   std::array<Impl::Request *, kLaneCount> entries{};
   CommandGraph graph;
-  const auto captures = impl_->encodePackedPrefillGraph(graph, items, entries);
+  // The submit-ahead ring admits a second in-flight prefill; its host-written
+  // input tensors come from the other bank so the running chunk's inputs are
+  // untouched. Bank 0 serves whenever nothing is in flight.
+  const uint32_t inputBank = impl_->claimPrefillInputBank();
+  std::array<DispatchDraftCapturePlan, kLaneCount> captures;
+  try {
+    captures = impl_->encodePackedPrefillGraph(graph, items, entries,
+                                               inputBank);
+  } catch (...) {
+    impl_->releasePrefillInputBank(inputBank);
+    throw;
+  }
   const bool encodesImages = std::any_of(
       entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
         return std::any_of(entry->images.begin(), entry->images.end(),
@@ -246,11 +261,23 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      graph.dispatches(), std::move(completion));
+  CommandTicket command;
+  try {
+    command = impl_->backend.submitCommandAsync(graph.dispatches(),
+                                              std::move(completion));
+  } catch (...) {
+    impl_->releasePrefillInputBank(inputBank);
+    throw;
+  }
+  for (uint32_t lane = 0; lane < items.size(); ++lane) {
+    Impl::Request &entry = *entries[lane];
+    ++entry.prefillUnapplied;
+    entry.prefillUnappliedRows += items[lane].tokenCount;
+  }
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, captures,
+  auto finish = [impl, entries, captures, inputBank,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    impl->releasePrefillInputBank(inputBank);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
@@ -277,6 +304,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
       const uint64_t nextLength = item.logicalPosition + item.tokenCount;
+      --entry.prefillUnapplied;
+      entry.prefillUnappliedRows -= item.tokenCount;
       // The anchor this chunk selects when it completes a generation prompt.
       std::optional<uint32_t> selected;
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
@@ -371,6 +400,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
+  const auto encodeStart = std::chrono::steady_clock::now();
   const bool constrained = plan.constrained;
   if (plan.decodeStage != DecodeStage::Regular) {
     if (!constrained) {
@@ -432,6 +462,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
     proposals[lane] =
         std::min(budget, laneResult.maximumRetained - 1);
     liveRows[lane] = proposals[lane] + 1;
+    // A Null draft's n-gram proposals carry no draft probabilities, so a
+    // sampled lane cannot verify them: it decodes its anchor row alone.
+    if (std::holds_alternative<NullDraft>(impl_->draftModel) &&
+        Impl::samplingEnabled(entry)) {
+      proposals[lane] = 0;
+      liveRows[lane] = 1;
+    }
 
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
@@ -443,9 +480,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // A completed ANE predraft stands in for the draft forward when its assumed
   // anchors and positions match every lane — the chain path consumes its
   // proposals; there is no tree table, so a predrafted batch stays a chain.
+  // A Null draft (Granite) has nothing to encode even for a constrained
+  // batch: the n-gram predraft writes its ProposedTokens in its place.
+  const bool nullDraft =
+      std::holds_alternative<NullDraft>(impl_->draftModel);
   const bool predrafted =
-      !constrained && (impl_->applyAnePredraft(entries, items, width) ||
-                       impl_->applyNgramPredraft(entries, width));
+      (!constrained || nullDraft) &&
+      (impl_->applyAnePredraft(entries, items, width) ||
+       impl_->applyNgramPredraft(entries, width));
   // The tree decision needs every lane's policy: a tree batch is all greedy,
   // unconstrained, unpenalized DFlash lanes, at most two wide.
   const bool tree =
@@ -506,7 +548,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->addRopeTables(
         commandGraph,
         impl_->decodeArena->packed(DecodeTensor::Positions, 2 * width),
-        width * SPLASH_TREE_VERIFY_NODES,
+        width * RICHENGINE_TREE_VERIFY_NODES,
         impl_->decodeArena->packed(DecodeTensor::DraftPositions, width), 0,
         impl_->decodeArena->packed(DecodeTensor::RopeCos, 2 * width),
         impl_->decodeArena->packed(DecodeTensor::RopeSin, 2 * width),
@@ -544,9 +586,23 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
+  static const bool decodeTiming = envFlag("RICHENGINE_DECODE_TIMING");
+  const auto encodeEnd = std::chrono::steady_clock::now();
   auto finish = [impl, lanes = std::move(lanes),
-                 items = std::move(copiedItems), tree](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing, tree);
+                 items = std::move(copiedItems), tree,
+                 encodeStart, encodeEnd](CommandTiming timing) mutable {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = impl->finalizeDecode(lanes, items, timing, tree);
+    if (decodeTiming) {
+      const auto t1 = std::chrono::steady_clock::now();
+      fprintf(stderr,
+              "decode-timing encode=%.3fms finalize=%.3fms gpu=%.3fms "
+              "wall=%.3fms\n",
+              std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count(),
+              std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              timing.gpuSeconds * 1e3, timing.wallSeconds * 1e3);
+    }
+    return result;
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.dispatches(), std::move(completion));
@@ -927,4 +983,4 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   return std::make_unique<Runtime>(std::move(context));
 }
 
-} // namespace splash::model
+} // namespace richengine::model

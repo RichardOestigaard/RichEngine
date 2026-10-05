@@ -35,6 +35,7 @@ REQUEST_FIELDS = (
     "score_count",
     "generation_prompt_tokens",
     "flags",
+    "shared_prefix_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -411,6 +412,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 len(request.score_tokens),
                 request.generation_prompt_tokens,
                 int(request.flags),
+                request.shared_prefix_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -418,7 +420,7 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         header = struct.pack(
             p._HEADER.format,
-            b"SPLH",
+            b"RICH",
             p.PROTOCOL_VERSION,
             p.FRAME_HEADER_BYTES,
             int(p.FrameType.REQUEST),
@@ -552,7 +554,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_request_header_and_binary_prompt(self):
         request = example_request()
         wire = p.serialize_message(request)
-        self.assertEqual(wire[:4], b"SPLH")
+        self.assertEqual(wire[:4], b"RICH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
             (

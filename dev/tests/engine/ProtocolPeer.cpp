@@ -7,10 +7,10 @@
 #include <string_view>
 #include <variant>
 
-namespace splash::protocol::peer {
+namespace richengine::protocol::peer {
 namespace {
 
-constexpr std::string_view kMagic = "SPLH";
+constexpr std::string_view kMagic = "RICH";
 
 class Writer {
 public:
@@ -100,6 +100,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   out.u32(request.generationPromptTokens);
   out.u32(request.flags);
+  out.u32(request.sharedPrefixTokens);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);
@@ -274,4 +275,4 @@ std::vector<EngineEvent> EventReader::feed(std::span<const uint8_t> bytes) {
   return events;
 }
 
-} // namespace splash::protocol::peer
+} // namespace richengine::protocol::peer

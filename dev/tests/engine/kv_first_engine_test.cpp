@@ -16,8 +16,8 @@
 #include <optional>
 #include <stdexcept>
 
-using namespace splash;
-using namespace splash::engine;
+using namespace richengine;
+using namespace richengine::engine;
 using benchmark::draftContextRows;
 
 namespace {
@@ -639,7 +639,7 @@ public:
   std::vector<std::pair<WorkKind, double>> cycles;
 };
 
-using splash::test::require;
+using richengine::test::require;
 
 // Every submitted request has ended and no command is in flight.
 bool idle(const engine::Engine &engine) {
@@ -1236,6 +1236,68 @@ void testSharedJunctionEndsBeforeTheGenerationPrompt() {
   require(events.starts.size() == 3 && events.starts[1] == 64 &&
               events.starts[2] == 64,
           "the shared junction was not the waiter's reusable state");
+}
+
+// A request keeps a state at the last whole page of the prefix it declares
+// shared, so the first request with another suffix already resumes there
+// instead of recomputing the prefix to plan a junction for the next one.
+void testSharedPrefixStateServesTheFirstReuse() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(2208);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest first = request(1, prompt);
+  first.sharedPrefixTokens = 2100;
+  engine.submit(std::move(first));
+  runUntilIdle(engine);
+  prompt.resize(2080);
+  prompt.resize(2208, 500);
+  EngineRequest second = request(2, prompt);
+  second.sharedPrefixTokens = 2100;
+  engine.submit(std::move(second));
+  runUntilIdle(engine);
+  require(events.starts.size() == 2 && events.starts[1] == 2080,
+          "the first reuse did not resume after the shared prefix");
+
+  // Below the minimum junction gain no state is kept: the same suffix change
+  // recomputes from the replay boundary.
+  test::TestKvStorage small(1024, 4096, 4);
+  KvPool smallPool(small, 0);
+  engine::Cache smallCache(smallPool, nullptr, nullptr);
+  Executor smallModel;
+  Events smallEvents;
+  engine::Engine smallEngine({}, smallCache, smallModel, smallEvents);
+  guardReleases(small, smallEngine);
+  std::vector<uint32_t> head(161);
+  std::iota(head.begin(), head.end(), 1);
+  EngineRequest cold = request(1, head);
+  cold.sharedPrefixTokens = 70;
+  smallEngine.submit(std::move(cold));
+  runUntilIdle(smallEngine);
+  head.resize(64);
+  head.resize(161, 500);
+  EngineRequest reuse = request(2, head);
+  reuse.sharedPrefixTokens = 70;
+  smallEngine.submit(std::move(reuse));
+  runUntilIdle(smallEngine);
+  require(smallEvents.starts.size() == 2 && smallEvents.starts[1] == 0,
+          "a sub-gain shared prefix still kept a state");
+
+  // A shared prefix beyond the prompt is refused.
+  EngineRequest beyond = request(3, std::vector<uint32_t>(33, 5));
+  beyond.sharedPrefixTokens = 34;
+  bool rejected = false;
+  try {
+    engine.submit(std::move(beyond));
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "a shared prefix beyond the prompt was admitted");
 }
 
 void testImageSpansKeyPrefixIdentity() {
@@ -9026,6 +9088,7 @@ int main() {
     testFollowUpResumesBeforeTheGenerationPrompt();
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
+    testSharedPrefixStateServesTheFirstReuse();
     testImageSpansKeyPrefixIdentity();
     testSharedPrefillBoundaryStopsAtTheFirstDifferentImage();
     testOneRequestPublishesJunctionAndLatestReplayState();

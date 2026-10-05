@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace splash::model {
+namespace richengine::model {
 namespace {
 
 using metal::MetalBuffer;
@@ -438,11 +438,22 @@ QwenStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffe
   }
   for (uint32_t cell = pooledCells; cell < cells; ++cell)
     buffers.gdn[cell] = std::move(fresh.gdn[cell]);
+  // A zero-byte layout admits without running the allocation lambda, so its
+  // cells would stay null; every lane still binds them.
+  for (uint32_t cell = 0; cell < cells; ++cell)
+    if (!buffers.gdn[cell])
+      buffers.gdn[cell] = std::shared_ptr<QwenGdnCell>(new QwenGdnCell(
+          backend_, allocations_, layout_.target,
+          std::string(label) + "-gdn-" + std::to_string(cell)));
   if (pooledRing) {
     buffers.draft = std::move(pool_->rings.back());
     pool_->rings.pop_back();
   } else {
     buffers.draft = std::move(fresh.draft);
+    if (!buffers.draft)
+      buffers.draft = std::shared_ptr<DFlashDraftRing>(new DFlashDraftRing(
+          backend_, allocations_, layout_.draft,
+          std::string(label) + "-draft"));
   }
   return {};
 }
@@ -550,4 +561,4 @@ void QwenStateStorage::requireAssigned(const Lane &current) {
   }
 }
 
-} // namespace splash::model
+} // namespace richengine::model

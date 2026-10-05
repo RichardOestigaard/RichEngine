@@ -24,11 +24,11 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::metal::CommandGraph;
-using namespace splash::ops;
+using richengine::metal::BufferStorage;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::metal::CommandGraph;
+using namespace richengine::ops;
 
 constexpr uint32_t kRows = 8;
 constexpr uint32_t kKvHeads = 8;
@@ -38,7 +38,7 @@ constexpr uint32_t kWindow = 2048;
 constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
-constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+constexpr uint32_t kSplits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
@@ -48,7 +48,7 @@ constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Function> void rejects(Function function) {
   try {

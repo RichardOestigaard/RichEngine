@@ -1,6 +1,6 @@
 #include "engine/Engine.hpp"
 #include "engine/Bootstrap.hpp"
-#include "engine/Json.hpp"
+#include "engine/wire/Json.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
 #include "PrefillWork.hpp"
@@ -26,13 +26,13 @@
 #include <unordered_map>
 #include <vector>
 
-#ifndef SPLASH_BUILD_ID
-#error "backend_benchmark requires the production SPLASH_BUILD_ID"
+#ifndef RICHENGINE_BUILD_ID
+#error "backend_benchmark requires the production RICHENGINE_BUILD_ID"
 #endif
 
-using namespace splash;
-using namespace splash::engine;
-using splash::benchmark::expectedDraftContextRows;
+using namespace richengine;
+using namespace richengine::engine;
+using richengine::benchmark::expectedDraftContextRows;
 
 namespace {
 
@@ -184,7 +184,7 @@ public:
       throw std::runtime_error("cannot open benchmark progress journal");
     output_ << std::setprecision(10)
             << "{\"event\":\"started\",\"build_id\":\""
-            << SPLASH_BUILD_ID << "\",\"samples_requested\":" << samples
+            << RICHENGINE_BUILD_ID << "\",\"samples_requested\":" << samples
             << "}\n";
     flush();
   }
@@ -361,12 +361,13 @@ private:
   std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
 };
 
-std::vector<uint32_t> prompt(uint32_t length, uint64_t salt) {
+std::vector<uint32_t> prompt(uint32_t length, uint64_t salt,
+                             uint32_t vocabulary = 200100) {
   std::vector<uint32_t> result(length);
   uint64_t state = salt ^ 0x9e3779b97f4a7c15ULL;
   for (uint32_t &token : result) {
     state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-    token = 100 + static_cast<uint32_t>((state >> 17) % 200000);
+    token = 100 + static_cast<uint32_t>((state >> 17) % (vocabulary - 100));
   }
   return result;
 }
@@ -790,9 +791,13 @@ int main(int argc, char **argv) {
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::inspectModelPackage(config.modelRoot);
-    config.buildId = SPLASH_BUILD_ID;
+    config.buildId = RICHENGINE_BUILD_ID;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    // Prompt token ids stay inside the model's vocabulary; above 200,100 the
+    // ids are exactly the historical ones.
+    const uint32_t promptVocabulary =
+        std::min<uint32_t>(capabilities.vocabularySize, 200100);
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
@@ -887,6 +892,11 @@ int main(int argc, char **argv) {
         248045, 74455, 198,   248068, 271,  248069, 271};
     constexpr std::string_view decodeThroughputPromptSha256 =
         "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
+    std::vector<uint32_t> decodePrompt(decodeThroughputPrompt.begin(),
+                                       decodeThroughputPrompt.end());
+    for (uint32_t &token : decodePrompt)
+      if (token >= promptVocabulary)
+        token = 100 + token % (promptVocabulary - 100);
     std::vector<DecodeThroughputMeasurement> decodeThroughput;
     decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
     uint64_t requestId = 1;
@@ -899,7 +909,7 @@ int main(int argc, char **argv) {
           evictAllCache(resources->cache());
           decodeThroughput.push_back(runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,
-              width, sample, decodeThroughputPrompt));
+              width, sample, decodePrompt));
         }
       }
       // A wider batch must not lose aggregate throughput. A dense model can
@@ -958,10 +968,9 @@ int main(int argc, char **argv) {
         // Every cache prompt ends with the chat-formatted decode prompt so the
         // answer request below produces a real multi-block greedy answer.
         std::vector<uint32_t> cold = prompt(
-            length - static_cast<uint32_t>(decodeThroughputPrompt.size()),
-            uint64_t{length} << 32 | sample);
-        cold.insert(cold.end(), decodeThroughputPrompt.begin(),
-                    decodeThroughputPrompt.end());
+            length - static_cast<uint32_t>(decodePrompt.size()),
+            uint64_t{length} << 32 | sample, promptVocabulary);
+        cold.insert(cold.end(), decodePrompt.begin(), decodePrompt.end());
         Measurement coldResult =
             runRequest(engine, driver, *executor, events, progress.get(),
                        requestId++, "cold", sample, cold);
@@ -1013,7 +1022,8 @@ int main(int argc, char **argv) {
                             answerResult.outputTokens.begin(),
                             answerResult.outputTokens.end());
         std::vector<uint32_t> turn =
-            prompt(64, (uint64_t{length} << 32 | sample) ^ 0x5a5a5a5aULL);
+            prompt(64, (uint64_t{length} << 32 | sample) ^ 0x5a5a5a5aULL,
+                   promptVocabulary);
         continuation.insert(continuation.end(), turn.begin(), turn.end());
         Measurement continuationResult =
             runRequest(engine, driver, *executor, events, progress.get(),
@@ -1028,7 +1038,8 @@ int main(int argc, char **argv) {
         std::vector<uint32_t> rolling = cold;
         std::vector<uint32_t> suffix =
             prompt(rollingSuffixTokens,
-                   (uint64_t{length} << 32 | sample) ^ 0xa5a5a5a5ULL);
+                   (uint64_t{length} << 32 | sample) ^ 0xa5a5a5a5ULL,
+                   promptVocabulary);
         rolling.insert(rolling.end(), suffix.begin(), suffix.end());
         Measurement rollingResult =
             runRequest(engine, driver, *executor, events, progress.get(),
@@ -1087,9 +1098,9 @@ int main(int argc, char **argv) {
     // Compare against the same prompt evaluated cold, then recreate its 10K
     // prefix so the second evaluation is a real partial state-backed hit.
     if (selected.partial) {
-      std::vector<uint32_t> partialBase = prompt(10000, 0x5041525449414cULL);
+      std::vector<uint32_t> partialBase = prompt(10000, 0x5041525449414cULL, promptVocabulary);
       std::vector<uint32_t> partialPrompt = partialBase;
-      std::vector<uint32_t> partialSuffix = prompt(4096, 0x535546464958ULL);
+      std::vector<uint32_t> partialSuffix = prompt(4096, 0x535546464958ULL, promptVocabulary);
       partialPrompt.insert(partialPrompt.end(), partialSuffix.begin(),
                            partialSuffix.end());
       for (uint32_t sample = 0; sample < samples; ++sample) {
@@ -1141,10 +1152,10 @@ int main(int argc, char **argv) {
     // diverge. State eviction deliberately leaves the Page32 graph intact.
     if (selected.context) {
       evictAllCache(resources->cache());
-      const std::vector<uint32_t> lazyShared = prompt(7168, 0x4c415a594b56ULL);
+      const std::vector<uint32_t> lazyShared = prompt(7168, 0x4c415a594b56ULL, promptVocabulary);
       const auto lazyBranch = [&](uint64_t salt) {
         std::vector<uint32_t> branch = lazyShared;
-        const std::vector<uint32_t> tail = prompt(2048, salt);
+        const std::vector<uint32_t> tail = prompt(2048, salt, promptVocabulary);
         branch.insert(branch.end(), tail.begin(), tail.end());
         return branch;
       };
@@ -1204,7 +1215,7 @@ int main(int argc, char **argv) {
       measurements.push_back(std::move(lazyReuse));
     }
 
-    std::cout << "{\"schema_version\":2,\"build_id\":\"" << SPLASH_BUILD_ID
+    std::cout << "{\"schema_version\":2,\"build_id\":\"" << RICHENGINE_BUILD_ID
               << "\",\"identity\":" << identity
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
@@ -1229,7 +1240,7 @@ int main(int argc, char **argv) {
       std::cout << decodeWarmupGpu[index];
     }
     std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
-              << decodeThroughputPrompt.size()
+              << decodePrompt.size()
               << ",\"prompt_sha256\":\"" << decodeThroughputPromptSha256
               << "\",\"output_tokens_per_lane\":64,\"samples\":[";
     for (size_t index = 0; index < decodeThroughput.size(); ++index) {

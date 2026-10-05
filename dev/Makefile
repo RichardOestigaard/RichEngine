@@ -50,7 +50,7 @@ HTTP_SMOKE_ARGS ?=
 # before install-environment rebuilds it.
 install-development: install-environment
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install-development
+		-f "$(RICHENGINE_MAKEFILE)" _install-development
 
 _install-development:
 	@set -eu; \
@@ -118,7 +118,7 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
-# BASELINE is a checkout whose build/ holds another build's splash.metallib,
+# BASELINE is a checkout whose build/ holds another build's richengine.metallib,
 # engine-tests/backend-benchmark and, for a build that loads the weights into
 # memory, engine-tests/weight-digests: this build is compared with it on this
 # machine in ABBA order, and so are their weight images

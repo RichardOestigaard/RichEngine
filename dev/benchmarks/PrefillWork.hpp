@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace splash::benchmark {
+namespace richengine::benchmark {
 
 // The draft context rows a plan captures.
 inline uint64_t draftContextRows(const DraftContextPlan &plan) {
@@ -34,4 +34,4 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
       planDraftContext(restoredTokens, promptTokens, boundaries));
 }
 
-} // namespace splash::benchmark
+} // namespace richengine::benchmark

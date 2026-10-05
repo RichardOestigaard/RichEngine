@@ -32,12 +32,12 @@
 
 namespace {
 
-using splash::metal::BufferStorage;
-using splash::metal::CommandGraph;
-using splash::metal::MetalBackend;
-using splash::metal::MetalBuffer;
-using splash::ops::ImageGrid;
-using splash::ops::Vision;
+using richengine::metal::BufferStorage;
+using richengine::metal::CommandGraph;
+using richengine::metal::MetalBackend;
+using richengine::metal::MetalBuffer;
+using richengine::ops::ImageGrid;
+using richengine::ops::Vision;
 
 std::vector<uint8_t> readFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary);
@@ -71,7 +71,7 @@ std::vector<float> encodeOnce(MetalBackend &backend,
   const auto *words = static_cast<const uint16_t *>(embeddings.contents());
   std::vector<float> result(uint64_t{grid.mergedTokens()} * hiddenSize);
   for (uint64_t index = 0; index < result.size(); ++index)
-    result[index] = splash::ops::tuning::bf16ToFloat(words[index]);
+    result[index] = richengine::ops::tuning::bf16ToFloat(words[index]);
   return result;
 }
 
@@ -157,14 +157,14 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       verifyComparison();
-      const auto descriptor = splash::model::inspectModelPackage(argv[2]);
-      if (descriptor.visionSource == splash::model::VisionSource::None)
+      const auto descriptor = richengine::model::inspectModelPackage(argv[2]);
+      if (descriptor.visionSource == richengine::model::VisionSource::None)
         throw std::runtime_error("the model has no vision role");
       MetalBackend backend(argv[1]);
-      const auto loader = splash::model::planVisionLoader(argv[2], descriptor);
-      splash::model::WeightImages images(backend);
-      const splash::model::QwenVisionWeights model =
-          splash::model::loadVisionWeights(backend, images, argv[2], descriptor, loader.get());
+      const auto loader = richengine::model::planVisionLoader(argv[2], descriptor);
+      richengine::model::WeightImages images(backend);
+      const richengine::model::QwenVisionWeights model =
+          richengine::model::loadVisionWeights(backend, images, argv[2], descriptor, loader.get());
       const std::string fixture = argv[3];
 
       ImageGrid grid;
@@ -186,7 +186,7 @@ int main(int argc, char **argv) {
 
       // A scratch arena larger than the fixture exercises padded rows and
       // tokens exactly as serving does for smaller images.
-      constexpr uint32_t maximumPatches = splash::ops::kMaximumImagePatches;
+      constexpr uint32_t maximumPatches = richengine::ops::kMaximumImagePatches;
       Vision encoder(backend, model.tensors, maximumPatches);
       MetalBuffer pixels = upload(backend, pixelBytes, "fixture pixels");
 
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
       const std::vector<float> first =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
-      const std::string digest = splash::model::weightDigest(
+      const std::string digest = richengine::model::weightDigest(
           {reinterpret_cast<const uint8_t *>(first.data()), first.size() * sizeof(float)});
       std::printf("embedding SHA-256: %s\n", digest.c_str());
       const Parity parity =

@@ -1,4 +1,6 @@
-Splash contains the third-party material below, which keeps its own license.
+RichEngine contains the third-party material below, which keeps its own license.
+RichEngine itself derives from Splash (https://github.com/incoai/splash),
+Apache-2.0; see NOTICE.
 The SemIf code in server/judgments.py carries its MIT notice in that file.
 
 llama.cpp (https://github.com/ggml-org/llama.cpp)
@@ -9,7 +11,7 @@ iq1s_grid_gpu, iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid and iq3s_grid
 (ggml/src/ggml-common.h), and the GGUF decoding in
 runtime/metal/kernels/common/quant_formats.h and the GGUF kernels built on it
 follow ggml's Metal dequantize.h and mul_mm.metal. They are compiled into
-splash.metallib. The tests' CPU reference,
+richengine.metallib. The tests' CPU reference,
 dev/tests/engine/GgufFormatReference.hpp, decodes the same blocks as ggml's
 dequantize_row_* (ggml/src/ggml-quants.c).
 

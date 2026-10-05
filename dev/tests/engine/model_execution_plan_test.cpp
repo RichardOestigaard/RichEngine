@@ -14,9 +14,9 @@
 
 namespace {
 
-using namespace splash;
+using namespace richengine;
 
-using splash::test::require;
+using richengine::test::require;
 
 template <class Weights>
 model::ModelPackage package() {
@@ -60,7 +60,8 @@ model::ModelPackage package() {
   result.descriptor = model::makeModelDescriptor(
       "operator workspace test", target.layout, draft, vision);
   result.target = std::move(target);
-  std::get<splash::model::DFlashDraftWeights>(result.draft).layout = draft;
+  result.draft = richengine::model::DFlashDraftWeights{};
+  std::get<richengine::model::DFlashDraftWeights>(result.draft).layout = draft;
   return result;
 }
 

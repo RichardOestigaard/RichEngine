@@ -1,13 +1,15 @@
 #include "engine/Engine.hpp"
+#include "Env.hpp"
 #include "TestConfig.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
-namespace splash::engine {
+namespace richengine::engine {
 namespace {
 
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
@@ -85,6 +87,9 @@ void Engine::submit(EngineRequest value) {
   if (value.prompt.size() + value.maxNewTokens > config_.maxContext) {
     throw std::invalid_argument("request exceeds the context window");
   }
+  if (value.sharedPrefixTokens > value.prompt.size()) {
+    throw std::invalid_argument("shared prefix must lie within the prompt");
+  }
   if (std::any_of(value.prompt.begin(), value.prompt.end(), outOfVocabulary)) {
     throw std::invalid_argument("prompt token is out of vocabulary");
   }
@@ -141,7 +146,9 @@ void Engine::failRequest(uint64_t id, LaneOutcome outcome, std::string message) 
 void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
   Request &active = request(id);
   const bool ownedByActiveBatch =
-      pending_ && pending_->ticket->ownsMaskWait(id);
+      std::any_of(pending_.begin(), pending_.end(), [&](const Pending &pending) {
+        return pending.ticket->ownsMaskWait(id);
+      });
   // A request that already left its mask wait (cancellation, deadline, or a
   // failure raced the frontend) treats the response as stale.
   if (active.finalized || active.pendingEnd ||
@@ -184,8 +191,8 @@ bool Engine::tick(double now) {
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
   uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
-  if (pending_) {
-    for (const BatchItem &item : pending_->plan.items) {
+  for (const Pending &pending : pending_) {
+    for (const BatchItem &item : pending.plan.items) {
       earliestWorking =
           std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
       earliestWorkingAdmission =
@@ -231,35 +238,48 @@ bool Engine::tick(double now) {
   // late mask or cancel for them is a no-op rather than a scheduler error.
   if (progressed)
     sweepTerminal();
-  if (pending_) {
+  if (!pending_.empty()) {
     auto forwardMaskRequests = [&] {
-      for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
-        events_.maskRequested(asked.requestId, asked.simulationTokens);
-        request(asked.requestId).maskRequestedMilliseconds = now;
-        progressed = true;
-      }
+      for (Pending &pending : pending_)
+        for (ModelMaskRequest &asked : pending.ticket->takeMaskRequests()) {
+          events_.maskRequested(asked.requestId, asked.simulationTokens);
+          request(asked.requestId).maskRequestedMilliseconds = now;
+          progressed = true;
+        }
     };
     forwardMaskRequests();
-    for (const BatchItem &item : pending_->plan.items) {
-      Request &active = request(item.requestId);
-      if (!active.pendingEnd && active.request.deadlineMilliseconds <= now) {
-        settle(active, deadlineEnd());
-        progressed = true;
+    for (const Pending &pending : pending_)
+      for (const BatchItem &item : pending.plan.items) {
+        Request &active = request(item.requestId);
+        if (!active.pendingEnd && active.request.deadlineMilliseconds <= now) {
+          settle(active, deadlineEnd());
+          progressed = true;
+        }
       }
-    }
     // A mask response, cancellation, or deadline can make the commit tail
     // runnable without another Metal completion wake.
     forwardMaskRequests();
-    if (!pending_->ticket->ready())
+    if (!pending_.front().ticket->ready()) {
+      // Nothing retires: a chunk may still be committed behind it.
+      if (trySubmitAhead(now))
+        return true;
       return progressed;
-    Pending command = std::move(*pending_);
-    pending_.reset();
-    std::vector<ModelStepResult> results = command.ticket->wait();
-    apply(command.plan, results, command.ticket->wallMilliseconds(),
-          now - command.startedMilliseconds,
-          command.ticket->prefillTimingIsRepresentative(), now);
+    }
+    // Commands retire strictly in submission order: the ahead command's
+    // results are consumed only after its predecessor applied.
+    while (!pending_.empty() && pending_.front().ticket->ready()) {
+      Pending command = std::move(pending_.front());
+      pending_.pop_front();
+      std::vector<ModelStepResult> results = command.ticket->wait();
+      apply(command.plan, results, command.ticket->wallMilliseconds(),
+            now - command.startedMilliseconds,
+            command.ticket->prefillTimingIsRepresentative(), now);
+      progressed = true;
+    }
     busySinceMilliseconds_ = now;
     sweepTerminal();
+    // A chunk may be committed behind the one still in flight.
+    static_cast<void>(trySubmitAhead(now));
     return true;
   }
 
@@ -283,8 +303,9 @@ bool Engine::tick(double now) {
         throw std::logic_error("model returned an empty command ticket");
       }
       scheduler_.commit(*plan, excluded);
-      pending_ = Pending{std::move(*plan), std::move(ticket),
-                         busySinceMilliseconds_.value_or(now)};
+      pending_.push_back(Pending{std::move(*plan), std::move(ticket),
+                                 busySinceMilliseconds_.value_or(now)});
+      static_cast<void>(trySubmitAhead(now));
       return true;
     }
     case Prepared::Yielded:
@@ -331,7 +352,7 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
   std::optional<double> result;
-  if (pending_)
+  if (!pending_.empty())
     result = nextHealthCheckMilliseconds_;
   const bool draining = drainingForRecovery();
   if (draining && (!result || drainEndMilliseconds_ < *result))
@@ -355,7 +376,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     const double deadline = resourceDeadline(active);
     if (!draining && deadline > 0.0 && (!result || deadline < *result))
       result = deadline;
-    if (pending_ || !admissionTries(active, tier, draining) ||
+    if (!pending_.empty() || !admissionTries(active, tier, draining) ||
         active.resourceWait.retryMilliseconds <= 0.0)
       continue;
     const double wakeup = active.resourceWait.epoch == resourceEpoch_
@@ -941,6 +962,12 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false);
+  // A prefix other requests will share is a junction they have not reached
+  // yet: keeping its state now spares the first of them recomputing it.
+  const uint32_t sharedJunction = active.request.sharedPrefixTokens /
+                                  KvCache::pageTokens * KvCache::pageTokens;
+  if (sharedJunction >= stateBoundary + kMinimumJunctionGain)
+    addStateBoundary(active, stateBoundary, sharedJunction, false);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active));
   // A resumed lane below its prompt's replay point lost that state; it
@@ -1138,7 +1165,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
 }
 
 Engine::Prepared Engine::prepare(BatchPlan &plan,
-                                 std::vector<ModelBatchItem> &items, double now) {
+                                 std::vector<ModelBatchItem> &items, double now,
+                                 bool forAhead) {
   items.reserve(plan.items.size());
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
@@ -1213,6 +1241,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       deferResourceRetry(request(entry.requestId), now, entry.denial);
     return Prepared::Waiting;
   }
+  // A submit-ahead plan yields nothing: suspending or failing a lane
+  // whose command is in flight mid-prepare is never worth the overlap.
+  if (forAhead)
+    return Prepared::Waiting;
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),
       [&](const Denied &left, const Denied &right) {
@@ -1236,6 +1268,40 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     suspendForGrowth(active, resumeTarget, victim.admission.allocationFailure,
                      now);
   return Prepared::Yielded;
+}
+
+bool Engine::trySubmitAhead(double now) {
+  // Opt-in: RICHENGINE_SUBMIT_AHEAD. A second command overlaps only when it
+  // provably cannot touch the running one's inputs: a prefill behind a
+  // prefill. Decode never qualifies — its next step consumes the running
+  // step's results — and neither does a mix, because a prefill's commit
+  // tail reads decode-arena rows the other kind's command would overwrite.
+  static const bool enabled = envFlag("RICHENGINE_SUBMIT_AHEAD");
+  if (!enabled || pending_.size() != 1 ||
+      pending_.front().plan.kind != WorkKind::Prefill ||
+      !model_.prefillSubmitAheadAvailable()) {
+    return false;
+  }
+  std::vector<uint64_t> excluded;
+  for (const auto &[id, active] : requests_) {
+    if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
+      excluded.push_back(id);
+  }
+  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
+  if (!plan || plan->kind != WorkKind::Prefill)
+    return false;
+  std::vector<ModelBatchItem> items;
+  if (prepare(*plan, items, now, /*forAhead=*/true) != Prepared::Runnable)
+    return false;
+  std::unique_ptr<ModelBatchTicket> ticket =
+      model_.submit(*plan, items, completionNotifier_);
+  if (!ticket) {
+    throw std::logic_error("model returned an empty command ticket");
+  }
+  scheduler_.commit(*plan, excluded);
+  pending_.push_back(Pending{std::move(*plan), std::move(ticket),
+                             busySinceMilliseconds_.value_or(now)});
+  return true;
 }
 
 uint64_t Engine::completedTokens(const Request &active) const {
@@ -1472,7 +1538,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
 }
 
 MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
-  if (pending_)
+  if (!pending_.empty())
     throw std::logic_error("memory reclaim requested while a command is in flight");
   if (cache_.pollTransfers())
     signalResourceProgress();
@@ -1559,6 +1625,15 @@ void Engine::apply(const BatchPlan &plan,
       throw std::logic_error("model result order changed");
     }
     Request &active = request(result.requestId);
+    // Settled while this command was in flight: the provisional result
+    // publishes nothing and emits nothing.
+    const Phase phase = scheduler_.phase(active.request.id);
+    if (phase == Phase::Completed || phase == Phase::Cancelled ||
+        phase == Phase::Failed) {
+      schedulerResults.push_back({active.request.id, 0, true,
+                                  result.nextDecodeStage});
+      continue;
+    }
     if (!result.failure.empty() && !active.pendingEnd) {
       // The model rejected this lane's own numerical result. An earlier
       // cancellation or deadline of the same lane still stands.
@@ -1685,9 +1760,13 @@ void Engine::apply(const BatchPlan &plan,
 }
 
 bool Engine::inFlight(uint64_t id) const {
-  return pending_ &&
-         std::any_of(pending_->plan.items.begin(), pending_->plan.items.end(),
-                     [id](const BatchItem &item) { return item.requestId == id; });
+  return std::any_of(
+      pending_.begin(), pending_.end(), [id](const Pending &pending) {
+        return std::any_of(pending.plan.items.begin(), pending.plan.items.end(),
+                           [id](const BatchItem &item) {
+                             return item.requestId == id;
+                           });
+      });
 }
 
 void Engine::settle(Request &active, LaneEnd end) {
@@ -1697,7 +1776,8 @@ void Engine::settle(Request &active, LaneEnd end) {
     if (!active.pendingEnd)
       active.pendingEnd = std::move(end);
     if (!active.restore)
-      pending_->ticket->abandonMask(active.request.id);
+      for (Pending &pending : pending_)
+        pending.ticket->abandonMask(active.request.id);
     else if (active.restore->ticket)
       active.restore->ticket->cancel();
     return;
@@ -1800,4 +1880,4 @@ Engine::Request &Engine::request(uint64_t id) {
   return found->second;
 }
 
-} // namespace splash::engine
+} // namespace richengine::engine
