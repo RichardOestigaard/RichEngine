@@ -60,6 +60,12 @@ private:
 // a confidence head the runtime loads but does not score).
 enum class DraftKind : uint8_t { DFlash2, Plain, DSpark };
 
+// The dynamic convolutions of every DFlash2 draft layer, as the draft
+// kernels run them (decode/draft.metal): two taps, a row and the one before
+// it, each with one dynamic weight per group of 16 channels.
+inline constexpr uint32_t kDraftConvolutionGroup = 16;
+inline constexpr uint32_t kDraftConvolutionTaps = 2;
+
 struct DFlashDraftLayout final {
   DraftKind kind = DraftKind::DFlash2;
   // Plain drafts: the bitmask of layers whose current block rows attend

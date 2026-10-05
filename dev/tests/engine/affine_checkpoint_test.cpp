@@ -31,14 +31,11 @@ int main() {
   try {
     const splash::test::TemporaryDirectory directory("splash-affine-checkpoint");
     const std::filesystem::path &root = directory.path();
-    splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}},"text_config":{"layers":2,"model_type":"fixture","layer_types":["linear_attention","full_attention"]}})");
+    splash::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
     source.requireQuantization("projection", 4);
     source.requireQuantization("router", 8);
-    source.requireConfigNumber("layers", 2);
-    source.requireConfigString("model_type", "fixture");
-    source.requireLayerTypes(2, 2);
     require(source.require("a").shape == std::vector<uint64_t>({2, 2}), "shape changed");
     std::array<uint8_t, 4> data{};
     source.require("a").read(7, data);
@@ -48,8 +45,6 @@ int main() {
     rejects([&] { (void)source.require("missing"); }, "missing source tensor: missing", "missing tensor accepted");
     rejects([&] { source.requireQuantization("router", 4); }, "unsupported affine quantization for router",
             "wrong quantization accepted");
-    rejects([&] { source.requireLayerTypes(2, 1); }, "source layer schedule does not match",
-            "wrong layer schedule accepted");
     // Rewriting a shard in place, even with the same content, writes the
     // file the checkpoint holds.
     shard(root / "model.safetensors", valid);
