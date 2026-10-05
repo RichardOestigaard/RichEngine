@@ -89,10 +89,14 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat) {
-  constexpr uint32_t H = 2048, I = 512, E = 256, kRowsMax = 2048;
+int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat, bool a1b) {
+  // The 35B shape by default; `a1b` is LFM2.5-8B-A1B's sparse block: 32
+  // experts, top 4, intermediate 1792, sigmoid-bias router, no shared expert.
+  const uint32_t H = 2048, I = a1b ? 1792 : 512, E = a1b ? 32 : 256,
+                 TOPK = a1b ? 4 : 8, kRowsMax = 2048;
   // gate and up hold most of the routed expert weights.
-  const MoeShape affineShape{H, E, 8, I}, ggufShape{H, E, 8, I, WeightLayout::Block32, uint32_t(gateUpFormat)};
+  const MoeShape affineShape{H, E, TOPK, I}, ggufShape{H, E, TOPK, I, WeightLayout::Block32,
+                                                       uint32_t(gateUpFormat), !a1b};
   std::mt19937 local(9);
   // Affine: random Q4 slabs with finite scales, the router and shared gate of the routing fixture.
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
@@ -135,15 +139,19 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     const std::vector<uint8_t> native = makeNative(f, rows, k, local, [&] { return f2h(d(local)); });
     return planeSegment(backend, f, repack(f, native, rows, k, nullptr), rows, k);
   };
-  std::vector<float> router(uint64_t{E} * H, 0.0f), sharedGate(H, 0.0f);
+  std::vector<float> router(uint64_t{E} * H, 0.0f), sharedGate(H, 0.0f), bias(E, 0.0f);
   for (uint32_t e = 0; e < E; ++e) router[uint64_t{e} * H + e] = 4.0f;
   const QuantizedSegment routerSegment = floatSegment(backend, router, E, H);
-  const QuantizedSegment sharedGateSegment = floatSegment(backend, sharedGate, 1, H);
+  const QuantizedSegment sharedGateSegment =
+      a1b ? QuantizedSegment{} : floatSegment(backend, sharedGate, 1, H);
+  const QuantizedSegment biasSegment =
+      a1b ? floatSegment(backend, bias, 1, E) : QuantizedSegment{};
   MoeWeights gguf;
   gguf = BlockMoeWeights{routerSegment, sharedGateSegment,
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
-                             {planes(downFormat, E * H, I), planes(Q80, H, I)}};
+                             {planes(downFormat, E * H, I), planes(Q80, H, I)},
+                             biasSegment};
   // Rows route to 8 of a pool of 24 experts per lane of 8 rows (decode) or of all 256 (prefill).
   const auto input = [&](uint32_t rows, uint32_t pool) {
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
@@ -155,7 +163,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
       std::vector<uint32_t> candidates(experts.begin(), experts.begin() + pool);
       std::shuffle(candidates.begin(), candidates.end(), local);
       for (uint32_t k = 0; k < H; ++k) x[uint64_t{r} * H + k] = bf16(k < E ? 0.05f * unit(local) : unit(local));
-      for (uint32_t rank = 0; rank < 8; ++rank) x[uint64_t{r} * H + candidates[rank]] = bf16(1.0f - 0.05f * rank);
+      for (uint32_t rank = 0; rank < TOPK; ++rank) x[uint64_t{r} * H + candidates[rank]] = bf16(1.0f - 0.05f * rank);
     }
     return x;
   };
@@ -186,7 +194,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   printf("  prefill %u rows: affine %.3f  gguf %.3f\n", kRowsMax, affinePrefill,
          time(gguf, plans.moePrefill(ggufShape, kRowsMax)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    b.input = bfloatBuffer(backend, input(lanes * 8, 24), "input");
+    b.input = bfloatBuffer(backend, input(lanes * 8, a1b ? E : 24), "input");
     MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
     config.ggufTile = other;
     const double a = time(affine, plans.moeDecode(affineShape, lanes));
@@ -213,7 +221,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
         std::tuple{"gguf B1", &gguf, plans.moeDecode(ggufShape, 1)},
         std::tuple{"affine B4", &affine, plans.moeDecode(affineShape, 4)},
         std::tuple{"gguf B4", &gguf, plans.moeDecode(ggufShape, 4)}}) {
-    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax ? E : 24), "input");
+    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax || a1b ? E : 24), "input");
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, *weights, plan);
@@ -232,14 +240,16 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K;
-    if (argc < 2 || argc > 5 || gateUp == FMT_COUNT || down == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format]\n";
+    const bool a1b = argc > 1 && std::string_view(argv[argc - 1]) == "a1b";
+    const int args = argc - (a1b ? 1 : 0);
+    const Fmt gateUp = args > 3 ? fmtNamed(argv[3]) : Q4K, down = args > 4 ? fmtNamed(argv[4]) : Q5K;
+    if (args < 2 || args > 5 || gateUp == FMT_COUNT || down == FMT_COUNT) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [a1b]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      return timing(backend, argc > 2 ? std::stoul(argv[2]) : 20, gateUp, down);
+      return timing(backend, args > 2 ? std::stoul(argv[2]) : 20, gateUp, down, a1b);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

@@ -28,6 +28,9 @@ struct Shape final {
   uint32_t outputSize;
   uint32_t inputSize;
   uint32_t formatId;
+  // Kernel infix overriding the format's: "mxfp4m"/"mxfp4n" name the family-10
+  // native decoders, which only exist on multiplane builds.
+  const char *kernel = nullptr;
 };
 
 // A fused projection's segments (gguf_decode_fused_m*: one grid over the
@@ -103,6 +106,16 @@ void run(const std::string &metallibPath) {
       {"lfm_qkv_kv", 1'024, 2'048, GGUF_FMT_Q4K},
       {"lfm_down", 2'048, 10'752, GGUF_FMT_Q4K},
       {"lfm_head", 128'000, 2'048, GGUF_FMT_Q6K},
+      // The 2B shapes' MXFP4 decode tiers on family 10: the staged table
+      // decode (mxfp4n) against the multiplane tile (mxfp4m).
+      {"mx_qkv_staged", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx_qkv_multi", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx_down_staged", 2'048, 10'752, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx_down_multi", 2'048, 10'752, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx_head_staged", 128'000, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx_head_multi", 128'000, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      // LFM2.5-8B-A1B's tied head: Q8_0, 128K rows of 2048.
+      {"a1b_head", 128'000, 2'048, GGUF_FMT_Q80},
       // Granite-4.2-3B (2560-wide): gate and up share one packed projection,
       // K is Q4_K while V is Q6_K, down and the head are Q6_K.
       {"g3_q", 2'560, 2'560, GGUF_FMT_Q4K},
@@ -153,7 +166,12 @@ void run(const std::string &metallibPath) {
         allocateImage(backend, shape, shape.label);
     for (const auto &tile : tiles) {
       char name[64];
-      std::snprintf(name, sizeof(name), tile.kernel, f.name);
+      std::snprintf(name, sizeof(name), tile.kernel,
+                    shape.kernel ? shape.kernel : f.name);
+      // The mxfp4m decoders exist only where the multiplane fp4 tensor does.
+      if (std::string_view(shape.kernel ? shape.kernel : "") == "mxfp4m" &&
+          capabilities.appleGpuFamily < 10)
+        continue;
       const uint32_t columnTiles = shape.outputSize / GGUF_TILE_COLUMNS;
       MetalBuffer input = backend.allocateBuffer(
           uint64_t{tile.rows} * shape.inputSize * sizeof(__bf16),

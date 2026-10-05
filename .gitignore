@@ -11,3 +11,5 @@ __pycache__/
 dist/
 install/download-token
 *.gguf
+.venv-tq/
+.pytest_cache/

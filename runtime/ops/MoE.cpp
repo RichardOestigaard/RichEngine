@@ -112,6 +112,14 @@ void validate(const MoeWeights &weights, MoeShape shape) {
   }
 }
 
+// K partitions of a packed MXFP4 expert pass at decode (moe_gguf.metal's
+// `_p` tiles). Measured on the LFM2.5-8B-A1B shape (gguf-moe-benchmark,
+// 20-core M5 Pro): splits cost — the partials write and arrive-last reduce
+// outweigh the shorter serial K loop, +13% pass time at 4 partitions and
+// +2% at 2 — because the expert passes already run near DRAM bandwidth
+// (~200 GB/s of ~5.8 MB per expert per pass). 1 keeps them unsplit.
+constexpr uint32_t kMoeExpertSplits = 1;
+
 MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
                           bool splitExperts, MoeGgufTile ggufTile,
                           bool packedPlane) {
@@ -136,12 +144,22 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint64_t exponentBytes = packedPlane ? groupedRows * (widest / 32) : 0;
   const uint64_t sumsBytes =
       std::max(table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0, exponentBytes);
+  // K-split packed expert tiles, decode plans only (kMoeExpertSplits; the
+  // prefill tiles' grid already saturates): fp32 partials per tile and
+  // split, one arrival counter per 64-column segment of a tile.
+  const uint64_t partialBytes = packedPlane && tileRows == 8 && kMoeExpertSplits > 1
+      ? uint64_t{tiles} * kMoeExpertSplits * tileRows * widest * sizeof(float)
+      : 0;
+  const uint64_t counterBytes = packedPlane
+      ? uint64_t{tiles} * (widest / GGUF_TILE_COLUMNS) * sizeof(uint32_t)
+      : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(uint32_t),
           groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t),
           std::max(tableBytes(table16 ? widest : shape.hiddenSize, groupedRows), scoreBytes),
           groupedRows * shape.expertIntermediateSize * sizeof(uint16_t),
-          groupedRows * outputWidth * sizeof(uint16_t), sumsBytes, packedBytes};
+          groupedRows * outputWidth * sizeof(uint16_t), sumsBytes, packedBytes,
+          partialBytes, counterBytes};
 }
 
 // Pipelines, column tiles and threadgroup width of a decode plan's fused
@@ -265,15 +283,29 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                      projection.routed.meta, shared.plane0,
                      shared.plane1Slot(), shared.meta, output,
                      scratch.expertOutput});
-    const std::string kernel = packed ? "moe_expert_gguf_m8"
-                                      : table16 ? "moe_expert_gguf_sg"
-                                                : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+    if (packed)
+      // Unsplit plans hold no partials; the kernel never touches either
+      // buffer then, but the signature still binds them.
+      bindings.insert(bindings.end(),
+                      {scratch.expertPartials ? scratch.expertPartials : scratch.expertCounters,
+                       scratch.expertCounters});
+    const std::string kernel = packed || !table16
+                                      ? "moe_expert_gguf_m" + std::to_string(plan.tileRows())
+                                      : "moe_expert_gguf_sg";
     const std::string suffix =
         packed ? "_p" : plan.configuration().mxfp4Native ? "_n" : "";
+    // The split needs every segment on the packed tile: a segment it does
+    // not serve runs whole-K on one partition while the rest exit early.
+    const uint32_t splits =
+        packed && plan.tileRows() == 8 &&
+                projection.routed.formatId == GGUF_FMT_MXFP4 &&
+                shared.formatId == GGUF_FMT_MXFP4
+            ? kMoeExpertSplits
+            : 1;
     graph.add(kernel + (up ? "_g" : "_a") + suffix, std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
-                                  shared.formatId},
-              {n / GGUF_TILE_COLUMNS, tiles, 1}, {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
+                                  shared.formatId, splits},
+              {n / GGUF_TILE_COLUMNS, tiles * splits, 1}, {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
@@ -324,11 +356,11 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");
-  // Decode plans that may pack their activations (the MXFP4 expert tiles)
-  // reserve the fp16 plane and exponent bytes up front; whether a dispatch
-  // actually packs is decided per weight set in add().
+  // Plans that may pack their activations (the MXFP4 expert tiles) reserve
+  // the fp16 plane and exponent bytes up front; whether a dispatch actually
+  // packs is decided per weight set in add().
   workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_, config.ggufTile,
-                            gguf && !prefill && config.mxfp4Native);
+                            gguf && config.mxfp4Native);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -423,17 +455,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
               groupParams, {1, 1, 1});
   }
-  // The packed decode (packsDecode's MoE analog): a decode plan on the
-  // `_n` kernels whose weights hold at least one MXFP4 expert segment
-  // gathers the packed fp16 plane and exponent bytes alongside the bf16
-  // rows, and its expert passes run the `_p` kernels — MXFP4 segments on
-  // the packed multiplane tile, the rest staged as before.
+  // The packed path (packsDecode's MoE analog): a plan on the `_n` kernels
+  // whose weights hold at least one MXFP4 expert segment gathers the packed
+  // fp16 plane and exponent bytes alongside the bf16 rows, and its expert
+  // passes run the `_p` kernels — MXFP4 segments on the packed multiplane
+  // tile, the rest staged as before. Decode and prefill tiles both take it.
   const auto mxfp4Expert = [](const BlockExpertProjection &p) {
     return p.routed.formatId == GGUF_FMT_MXFP4 || p.shared.formatId == GGUF_FMT_MXFP4;
   };
   const bool packed =
-      block && plan.phase() == MoePhase::Decode &&
-      plan.configuration().mxfp4Native &&
+      block && plan.configuration().mxfp4Native &&
       plan.configuration().ggufTile != MoeGgufTile::Register &&
       !packedDisabled() &&
       (mxfp4Expert(weights.blocks().gate) || mxfp4Expert(weights.blocks().up) ||

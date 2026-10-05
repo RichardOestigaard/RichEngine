@@ -136,6 +136,11 @@ struct MoeWorkspace final {
   // rows (moe_gather_packed) and of the down pass's intermediates
   // (gguf_pack_half), the packed MXFP4 expert tiles' A operand.
   uint64_t groupedPackedBytes = 0;
+  // Packed decode plans only: the fp32 split partials and per-tile arrival
+  // counters the K-split MXFP4 expert tiles publish and reduce through
+  // (kernels/common/split_reduce.h); counters self-reset, so zero init once.
+  uint64_t expertPartialsBytes = 0;
+  uint64_t expertCountersBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -162,6 +167,10 @@ struct MoeScratch final {
   // Packed decode plans: the slot-permuted fp16 activation plane the MXFP4
   // expert segments read (kernels/common/gguf_mxfp4p_tile.h's layout).
   metal::MetalBuffer groupedPacked;
+  // Packed decode plans: the K split's fp32 partial sums, tiled per expert
+  // tile, and the splits' arrival counters of split_reduce.h.
+  metal::MetalBuffer expertPartials;
+  metal::MetalBuffer expertCounters;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -169,7 +178,7 @@ struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
 };
-inline constexpr std::array<MoeScratchField, 11> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 13> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
@@ -181,6 +190,8 @@ inline constexpr std::array<MoeScratchField, 11> kMoeScratchFields{{
     {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes},
     {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes},
     {&MoeScratch::groupedPacked, &MoeWorkspace::groupedPackedBytes},
+    {&MoeScratch::expertPartials, &MoeWorkspace::expertPartialsBytes},
+    {&MoeScratch::expertCounters, &MoeWorkspace::expertCountersBytes},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),

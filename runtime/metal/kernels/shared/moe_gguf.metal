@@ -98,15 +98,17 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
                                  device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0,
                                  device uchar *sw1, device uchar *smeta, device bfloat *output, device bfloat *aux,
+                                 device float *partials, device atomic_uint *counters,
                                  constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
-                                 threadgroup half *stage, threadgroup half2 *tl) {
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+                                 threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
+  const uint tile_index = group.y / p.splits, split = group.y % p.splits;
+  if (tile_index >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[tile_index];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  device half *xp = packed + ulong(group.y) * Rows * p.input_size;
-  device uchar *xe = exponents + ulong(group.y) * Rows * (p.input_size / 32);
-  const ulong out = ulong(group.y) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile_index) * Rows * p.input_size;
+  device half *xp = packed + ulong(tile_index) * Rows * p.input_size;
+  device uchar *xe = exponents + ulong(tile_index) * Rows * (p.input_size / 32);
+  const ulong out = ulong(tile_index) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   const auto run = [&](auto rows) {
@@ -114,14 +116,21 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
 #if defined(__HAVE_TENSOR_MULTIPLANE__) && defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
     // The MXFP4 segments the host packed for: the packed plane's rows are
     // the tile's grouped rows and its exponent bytes the same (row, group)
-    // index, so the tile is the dense kernels' with per-tile offsets.
-    if (R <= 8 && s.format == GGUF_FMT_MXFP4) {
+    // index, so the tile is the dense kernels' with per-tile offsets. The
+    // K split reuses the dense store: partials stride out_stride per tile,
+    // one counter per 64-column segment of it.
+    if (s.format == GGUF_FMT_MXFP4) {
       gguf_decode_mxfp4p_tile<R, Ep>(xp, xe, s.w0, s.meta, output + out,
-                                     (device coherent(device) float *)nullptr, nullptr, aux + out, p.input_size,
-                                     1, p.output_size, origin, origin, 0, simd_lane, simd_group, nullptr);
+                                     (device coherent(device) float *)(partials + ulong(tile_index) * p.splits * Rows * p.output_size),
+                                     counters + tile_index * (p.output_size / GGUF_TILE_COLUMNS) + group.x,
+                                     aux + out, p.input_size,
+                                     p.splits, p.output_size, origin, origin, split, simd_lane, simd_group, arrival);
       return;
     }
 #endif
+    // A segment the packed tile does not serve runs its whole K on one
+    // partition; the rest exit early.
+    if (split) return;
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc);
     staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, true>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
@@ -143,18 +152,27 @@ kernel void moe_expert_gguf_packed(device bfloat *input [[buffer(0)]], device ha
                                    device uchar *w1 [[buffer(6)]], device uchar *meta [[buffer(7)]],
                                    device uchar *sw0 [[buffer(8)]], device uchar *sw1 [[buffer(9)]],
                                    device uchar *smeta [[buffer(10)]], device bfloat *output [[buffer(11)]],
-                                   device bfloat *aux [[buffer(12)]], constant MoeGgufExpertParams &p [[buffer(13)]],
+                                   device bfloat *aux [[buffer(12)]],
+                                   device float *partials [[buffer(13)]],
+                                   device atomic_uint *counters [[buffer(14)]],
+                                   constant MoeGgufExpertParams &p [[buffer(15)]],
                                    uint2 group [[threadgroup_position_in_grid]],
                                    uint simd_lane [[thread_index_in_simdgroup]],
                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
+  threadgroup uint arrival;
   moe_gguf_packed_tile<Rows, Ep>(input, packed, exponents, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta,
-                                 output, aux, p, group, simd_lane, simd_group, stage, tl);
+                                 output, aux, partials, counters, p, group, simd_lane, simd_group, stage, tl,
+                                 &arrival);
 }
 using MoeExpertGgufPackedKernel = void(device bfloat *, device half *, device uchar *,
                                        device const MoeTileDescriptor *, device const uint *, device uchar *,
                                        device uchar *, device uchar *, device uchar *, device uchar *,
                                        device uchar *, device bfloat *, device bfloat *,
+                                       device float *, device atomic_uint *,
                                        constant MoeGgufExpertParams &, uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_a_p")]] kernel MoeExpertGgufPackedKernel moe_expert_gguf_packed<8, EpNone>;
 template [[host_name("moe_expert_gguf_m8_g_p")]] kernel MoeExpertGgufPackedKernel moe_expert_gguf_packed<8, EpUpWithGate>;
+// The prefill chunks' 32-row tiles on the same packed path.
+template [[host_name("moe_expert_gguf_m32_a_p")]] kernel MoeExpertGgufPackedKernel moe_expert_gguf_packed<32, EpNone>;
+template [[host_name("moe_expert_gguf_m32_g_p")]] kernel MoeExpertGgufPackedKernel moe_expert_gguf_packed<32, EpUpWithGate>;

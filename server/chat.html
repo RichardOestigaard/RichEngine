@@ -49,9 +49,15 @@
   #new-chat svg { width: 17px; height: 17px }
   .recent-label { margin: 26px 10px 6px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
   #recents { display: grid; gap: 1px }
-  .recent { overflow: hidden; width: 100%; padding: 8px 10px; border-radius: 8px; font-size: 14px; text-align: left; text-overflow: ellipsis; white-space: nowrap }
+  .recent { display: flex; align-items: center; border-radius: 8px }
   .recent:hover { background: var(--hover) }
-  .recent.active { background: var(--hover); font-weight: 550 }
+  .recent.active { background: var(--hover) }
+  .recent.active .recent-title { font-weight: 550 }
+  .recent-title { overflow: hidden; flex: 1; min-width: 0; padding: 8px 4px 8px 10px; font-size: 14px; text-align: left; text-overflow: ellipsis; white-space: nowrap }
+  .recent-edit { flex: 1; min-width: 0; margin: 0 4px 0 10px; padding: 5px 0; border: 0; border-bottom: 1px solid var(--accent); outline: 0; background: transparent; font-size: 14px }
+  .recent-act { display: none; width: 24px; height: 24px; flex: none; place-items: center; margin-right: 2px; border-radius: 6px; color: var(--muted); font-size: 13px }
+  .recent:hover .recent-act, .recent:focus-within .recent-act { display: grid }
+  .recent-act:hover { color: var(--text); background: var(--bg) }
 
   .credentials { display: block; margin: 22px 10px; color: var(--muted); font-size: 12px }
   #api-key { width: 100%; margin-top: 6px; padding: 7px 9px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px }
@@ -151,6 +157,10 @@
     .effort > span { display: none }
     .user { max-width: 88% }
   }
+  @media (min-width: 1400px) {
+    #chat { width: min(860px, 100%) }
+    form { width: min(860px, calc(100vw - var(--sidebar) - 48px)) }
+  }
 </style>
 
 <aside id="sidebar">
@@ -174,7 +184,7 @@
   <div class="brand">RichEngine</div>
   <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="m15 4 5 5M14 10l6-6"/></svg></button>
 </header>
-<main><div id="chat"></div></main>
+<main><div id="chat" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation"></div></main>
 <button id="to-bottom" type="button" hidden>&darr; Latest</button>
 <form id="form">
   <input id="image-input" type="file" accept="image/*" multiple hidden>
@@ -486,6 +496,7 @@
       if (cached) parts.push(`${cached.toLocaleString()} cached`);
     }
     if (assistant.stopped) parts.push('stopped');
+    if (assistant.interrupted) parts.push('interrupted');
     return parts.join(' · ');
   }
 
@@ -558,6 +569,7 @@
         box.append(gallery);
       }
     }
+    box._message = message;
     chat.append(box);
     maybeScroll();
     return box;
@@ -577,14 +589,62 @@
   function renderRecents() {
     recents.replaceChildren();
     conversations.forEach(conversation => {
-      const item = document.createElement('button');
-      item.type = 'button';
+      const item = document.createElement('div');
       item.className = `recent${conversation.id === activeId ? ' active' : ''}`;
-      item.textContent = conversation.title;
-      item.disabled = Boolean(controller);
-      item.addEventListener('click', () => openChat(conversation.id));
+      const title = document.createElement('button');
+      title.type = 'button';
+      title.className = 'recent-title';
+      title.textContent = conversation.title;
+      title.title = conversation.title;
+      title.disabled = Boolean(controller);
+      title.addEventListener('click', () => openChat(conversation.id));
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.className = 'recent-act';
+      rename.textContent = '✎';
+      rename.setAttribute('aria-label', `Rename ${conversation.title}`);
+      rename.title = 'Rename';
+      rename.disabled = Boolean(controller);
+      rename.addEventListener('click', () => renameChat(conversation, item));
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'recent-act';
+      del.textContent = '×';
+      del.setAttribute('aria-label', `Delete ${conversation.title}`);
+      del.title = 'Delete';
+      del.disabled = Boolean(controller);
+      del.addEventListener('click', () => deleteChat(conversation.id));
+      item.append(title, rename, del);
       recents.append(item);
     });
+  }
+
+  function renameChat(conversation, item) {
+    const edit = document.createElement('input');
+    edit.className = 'recent-edit';
+    edit.value = conversation.title;
+    edit.setAttribute('aria-label', 'Chat title');
+    item.replaceChildren(edit);
+    edit.focus();
+    edit.select();
+    const commit = () => {
+      const title = edit.value.replace(/\s+/g, ' ').trim();
+      if (title && title !== conversation.title) {
+        conversation.title = title.length > 60 ? `${title.slice(0, 60)}…` : title;
+        save();
+      } else renderRecents();
+    };
+    edit.addEventListener('blur', commit);
+    edit.addEventListener('keydown', event => {
+      if (event.key === 'Enter') edit.blur();
+      else if (event.key === 'Escape') { edit.removeEventListener('blur', commit); renderRecents(); }
+    });
+  }
+
+  function deleteChat(id) {
+    conversations = conversations.filter(conversation => conversation.id !== id);
+    save();
+    if (activeId === id) newChat();
   }
 
   function newChat() {
@@ -830,15 +890,20 @@
       messages.push(assistant);
       persist(firstPrompt);
     } catch (error) {
-      // A stopped stream keeps whatever arrived; the stats line says so.
-      if (error.name !== 'AbortError') {
+      // Interrupted streams keep whatever arrived: a deliberate stop is marked
+      // "stopped", a dropped connection "interrupted". Nothing arrived yet is
+      // still an error the caller reports.
+      const partial = Boolean(assistant.content || assistant.reasoning_content);
+      if (error.name !== 'AbortError' && !partial) {
         box.remove();
         throw error;
       }
       box.querySelector('.waiting').hidden = true;
       paintContent(box, assistant.content);
-      assistant.stopped = true;
-      assistant.stats = statsText(assistant) || 'stopped';
+      if (error.name === 'AbortError') assistant.stopped = true;
+      else assistant.interrupted = true;
+      const label = assistant.stopped ? 'stopped' : 'interrupted';
+      assistant.stats = statsText(assistant) || label;
       paintStats(box, assistant);
       messages.push(assistant);
       persist(firstPrompt);
@@ -854,8 +919,8 @@
   // Regenerate: drop the turn from this assistant message on and resend.
   function regenerate(box) {
     if (controller) return;
-    // Error notes are .message bubbles too, but hold no entry in messages.
-    const index = [...chat.querySelectorAll('.message:not(.error)')].indexOf(box);
+    // The box carries its message entry; error notes hold none and miss here.
+    const index = messages.indexOf(box._message);
     if (index < 0 || messages[index]?.role !== 'assistant') return;
     const prompt = messages.slice(0, index).reverse().find(message => message.role === 'user');
     const {text} = userParts(prompt?.content ?? '');

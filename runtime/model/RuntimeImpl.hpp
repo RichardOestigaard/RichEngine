@@ -1322,9 +1322,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
               std::min<uint32_t>(kDraftProposalTokens,
                                  entry.proposalBudget + 1);
         } else {
-          entry.proposalBudget = std::clamp<uint32_t>(
+          // Shrink toward the EWMA target one row per step: a single-visit
+          // clamp to avg+2 oscillates the live verify width whenever the
+          // rolling rate hovers across an integer boundary.
+          const uint32_t target = std::clamp<uint32_t>(
               static_cast<uint32_t>(entry.proposalAcceptedAvg) + 2, 1,
               kDraftProposalTokens);
+          if (target < entry.proposalBudget) --entry.proposalBudget;
         }
       }
       if (entry.ngramInFlight) {

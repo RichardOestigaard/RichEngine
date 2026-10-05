@@ -146,6 +146,56 @@ std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
   return kStagedTiers;
 }
 
+// Measured staged-tile splits, the shapes the tiers under-split: each beats
+// the tier's pick by 6-45% on the cores it names (dev/benchmarks/
+// gguf_decode_sweep.mm and gguf_projection_benchmark.mm; zero cores means
+// every core count). The 2048-wide entries are MiniCPM5-2B's attention out,
+// its fused QKV's small KV segments and the LFM drafts' KV on the M5 Pro;
+// the PQ2_0 entries are Ternary-Bonsai-2-27B's gate/up, down and fused GDN
+// inputs at 8 and 16 rows on the 20-core M5 Pro, where 2.3-bit weights want
+// two to four times the splits the size-only tier picks.
+struct MeasuredSplit {
+  uint32_t output;
+  uint32_t input;
+  uint32_t tileRows;
+  uint32_t splits;
+  uint32_t cores;
+};
+constexpr MeasuredSplit kMeasuredStagedSplits[] = {
+    {2'048, 2'048, 8, 4, 0},   {2'048, 2'048, 16, 4, 0}, {2'048, 2'048, 32, 4, 0},
+    {512, 2'048, 8, 8, 0},     {512, 2'048, 16, 4, 0},   {512, 2'048, 32, 4, 0},
+    {1'024, 2'048, 8, 8, 0},   {1'024, 2'048, 16, 4, 0}, {1'024, 2'048, 32, 4, 0},
+    {17'408, 5'120, 8, 4, 20}, {17'408, 5'120, 16, 4, 20},
+    {5'120, 17'408, 8, 8, 20}, {5'120, 17'408, 16, 8, 20},
+    {14'336, 5'120, 8, 4, 20}, {14'336, 5'120, 16, 4, 20},
+    {16'640, 5'120, 8, 4, 20}, {16'640, 5'120, 16, 4, 20},
+    // Granite-4.2-3B and -8B shapes on the 20-core M5 Pro: the fused QKV and
+    // gate/up packs, the narrow KV segments at 8 rows, the 8B attention out,
+    // gate/up and 32-row KV, and the LFM2.5 16-row down.
+    {3'584, 2'560, 8, 2, 20},  {3'584, 2'560, 16, 4, 20},
+    {3'584, 2'560, 32, 2, 20}, {16'384, 2'560, 8, 2, 20},
+    {16'384, 2'560, 16, 2, 20}, {4'096, 4'096, 16, 4, 20},
+    {512, 2'560, 8, 8, 20},    {12'800, 4'096, 8, 2, 20},
+    {1'024, 4'096, 32, 4, 20}, {2'048, 10'752, 16, 8, 20},
+    {25'600, 4'096, 8, 2, 20}, {25'600, 4'096, 16, 2, 20},
+};
+// Measured splits for the native MXFP4 tiles, same fields and source, kept
+// separate because a projection's n x k does not say which format its
+// segments hold. The LFM2.5 MXFP4 head at 16 rows splits once on the 20-core
+// M5 Pro — the only tile over the 128K row grid where a second partition
+// pays (mx_head sweep: 1.175 vs 1.236 ms).
+constexpr MeasuredSplit kMeasuredMxfp4Splits[] = {
+    {128'000, 2'048, 16, 2, 20},
+};
+
+uint32_t measuredSplits(std::span<const MeasuredSplit> table, uint32_t n, uint32_t k,
+                        uint32_t tileRows, uint32_t cores) noexcept {
+  for (const auto &o : table)
+    if (n == o.output && k == o.input && tileRows == o.tileRows && (!o.cores || o.cores == cores))
+      return o.splits;
+  return 0;
+}
+
 // The decode tile configurations over an n x k matrix on `cores` cores.
 LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
   return {.tile = LinearTile::GgufRegister, .splits = decodeSplits(n, k, cores, kRegisterTiers)};
@@ -343,42 +393,12 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                          .splits = decodeSplits(n, k, gpuCores_,
                                                 native && appleGpuFamily_ >= 10 ? std::span(kMxfp4Tiers)
                                                                                 : stagedTiers(appleGpuFamily_))};
-  // Measured staged-tile splits, the shapes the tiers under-split: each
-  // beats the tier's pick by 6-45% on the cores it names (dev/benchmarks/
-  // gguf_decode_sweep.mm and gguf_projection_benchmark.mm; zero cores means
-  // every core count). The 2048-wide entries are MiniCPM5-2B's attention
-  // out, its fused QKV's small KV segments and the LFM drafts' KV on the
-  // M5 Pro; the PQ2_0 entries are Ternary-Bonsai-2-27B's gate/up, down and
-  // fused GDN inputs at 8 and 16 rows on the 20-core M5 Pro, where 2.3-bit
-  // weights want two to four times the splits the size-only tier picks.
-  if (appleGpuFamily_ >= 10 && !native) {
-    constexpr struct {
-      uint32_t output;
-      uint32_t input;
-      uint32_t tileRows;
-      uint32_t splits;
-      uint32_t cores;
-    } kMeasuredStagedSplits[] = {
-        {2'048, 2'048, 8, 4, 0},   {2'048, 2'048, 16, 4, 0}, {2'048, 2'048, 32, 4, 0},
-        {512, 2'048, 8, 8, 0},     {512, 2'048, 16, 4, 0},   {512, 2'048, 32, 4, 0},
-        {1'024, 2'048, 8, 8, 0},   {1'024, 2'048, 16, 4, 0}, {1'024, 2'048, 32, 4, 0},
-        {17'408, 5'120, 8, 4, 20}, {17'408, 5'120, 16, 4, 20},
-        {5'120, 17'408, 8, 8, 20}, {5'120, 17'408, 16, 8, 20},
-        {14'336, 5'120, 8, 4, 20}, {14'336, 5'120, 16, 4, 20},
-        {16'640, 5'120, 8, 4, 20}, {16'640, 5'120, 16, 4, 20},
-        // Granite-4.2-3B and -8B shapes on the 20-core M5 Pro: the fused
-        // QKV and gate/up packs and the 8B attention out.
-        {3'584, 2'560, 8, 8, 20},  {3'584, 2'560, 16, 2, 20},
-        {3'584, 2'560, 32, 2, 20}, {16'384, 2'560, 8, 2, 20},
-        {16'384, 2'560, 16, 2, 20}, {4'096, 4'096, 16, 4, 20},
-        {25'600, 4'096, 8, 2, 20}, {25'600, 4'096, 16, 2, 20},
-    };
+  if (appleGpuFamily_ >= 10) {
     const uint32_t tileRows = stagedTileRows(w.rows);
-    for (const auto &o : kMeasuredStagedSplits)
-      if (n == o.output && k == o.input && tileRows == o.tileRows && (!o.cores || o.cores == gpuCores_)) {
-        config.splits = o.splits;
-        break;
-      }
+    if (const uint32_t splits = measuredSplits(native ? std::span<const MeasuredSplit>(kMeasuredMxfp4Splits)
+                                                    : std::span<const MeasuredSplit>(kMeasuredStagedSplits),
+                                               n, k, tileRows, gpuCores_))
+      config.splits = splits;
   }
   return config;
 }
@@ -390,9 +410,15 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   if (appleGpuFamily_ >= 10 && w.phase == LinearPhase::Decode && w.weightLayout == WeightLayout::Block32) {
     // An MXFP4 segment decodes on the MXFP4 tiers' splits (ggufBaseline),
     // which the baseline computed without segments under-reserves: reserve
-    // the split partials and counters the MXFP4 rule may take.
+    // the split partials and counters the MXFP4 rule may take. The measured
+    // per-shape overrides can exceed either tier's pick, so the reservation
+    // takes the largest of all three (the segments are not known here).
+    uint32_t splits = decodeSplits(n, k, gpuCores_, std::span(kMxfp4Tiers));
+    const uint32_t tileRows = stagedTileRows(w.rows);
+    splits = std::max(splits, measuredSplits(kMeasuredStagedSplits, n, k, tileRows, gpuCores_));
+    splits = std::max(splits, measuredSplits(kMeasuredMxfp4Splits, n, k, tileRows, gpuCores_));
     size.include(LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged,
-                                            .splits = decodeSplits(n, k, gpuCores_, std::span(kMxfp4Tiers))})
+                                            .splits = splits})
                      .scratchSize());
   }
   // A decode plan packs its activations when a projection is MXFP4

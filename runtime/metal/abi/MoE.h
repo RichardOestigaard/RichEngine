@@ -85,10 +85,15 @@ struct MoeGgufExpertParams {
   uint32_t experts;
   uint32_t routed_format;
   uint32_t shared_format;
+  // K partitions of the packed tile (ops/MoE.cpp): grid.y is
+  // tiles * splits, partition p covering K groups [p*per, (p+1)*per) — the
+  // dense decode tile's contiguous split. 1 when unpacked or when the
+  // segments do not all take the packed path.
+  uint32_t splits;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 20,
-              "MoE GGUF expert parameters are 20 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 24,
+              "MoE GGUF expert parameters are 24 bytes on both sides");
 
 struct MoeCombineParams {
   uint32_t rows;
