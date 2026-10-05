@@ -145,7 +145,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--kv-format` | `int4` | Target KV storage: `int4`, `int8`, `bf16`, or `fp8e4m3`. See [KV cache formats](README.md#kv-cache-formats). |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
-| `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
+| `--request-timeout` | None | Time a request may take from its arrival: seconds, or with an `s`, `m` or `h` suffix, e.g. `30m`; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |

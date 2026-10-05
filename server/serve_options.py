@@ -96,35 +96,35 @@ def parse_request_size(value):
     return size
 
 
-def _positive_seconds(number, unit=1):
-    """`number` times `unit` seconds, None unless positive and finite."""
+# The units a duration takes after its number; seconds without one.
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def _duration_seconds(value):
+    """A duration in seconds, written as seconds or with an s, m or h suffix;
+    None unless positive and finite."""
+    text = value.strip().lower()
+    unit = _DURATION_UNITS.get(text[-1:])
     try:
-        seconds = float(number) * unit
+        seconds = float(text[:-1]) * unit if unit else float(text)
     except ValueError:
         return None
     return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 def parse_request_timeout(value):
-    if (seconds := _positive_seconds(value)) is None:
+    if (seconds := _duration_seconds(value)) is None:
         raise argparse.ArgumentTypeError(
-            "must be a positive number of seconds such as 3600"
+            "must be a positive duration such as 30m, 2h or 3600"
         )
     return seconds
 
 
-# The units --idle-release takes after its number; seconds without one.
-_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
-
-
 def parse_idle_release(value):
     """--idle-release in seconds, math.inf for off."""
-    text = value.strip().lower()
-    if text == "off":
+    if value.strip().lower() == "off":
         return math.inf
-    unit = _DURATION_UNITS.get(text[-1:])
-    seconds = _positive_seconds(text[:-1], unit) if unit else _positive_seconds(text)
-    if seconds is None:
+    if (seconds := _duration_seconds(value)) is None:
         raise argparse.ArgumentTypeError(
             "must be off or a positive duration such as 30m, 2h or 600"
         )
@@ -134,6 +134,7 @@ def parse_idle_release(value):
 def idle_release_text(seconds):
     """--idle-release as the server's and the engine's command lines spell it."""
     return "off" if math.isinf(seconds) else str(seconds)
+
 
 
 def parse_queue_size(value):
@@ -296,18 +297,6 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
-        "--idle-release",
-        dict(
-            type=parse_idle_release,
-            default=None,
-            metavar="DURATION",
-            help="time without a request before the engine unwires its memory and "
-            "frees the weights: seconds, or with an s, m or h suffix, e.g. 30m "
-            "(default: 10m); off keeps both",
-        ),
-        text=idle_release_text,
-    ),
-    ServeOption(
         "--max-cache-disk",
         dict(
             type=parse_max_cache_disk,
@@ -398,8 +387,9 @@ SERVE_OPTIONS = (
         dict(
             type=parse_request_timeout,
             default=None,
-            help="seconds before a queued or in-flight request expires with 504 "
-            "(default: none)",
+            metavar="DURATION",
+            help="time before a queued or in-flight request expires with 504: "
+            "seconds, or with an s, m or h suffix, e.g. 30m (default: none)",
         ),
     ),
     ServeOption(
@@ -419,15 +409,6 @@ SERVE_OPTIONS = (
         ),
         environment="SPLASH_API_KEY",
         secret=True,
-    ),
-    ServeOption(
-        "--allow-idle-sleep",
-        dict(
-            action="store_true",
-            default=False,
-            help="let the Mac sleep automatically while requests run (default: it "
-            "stays awake until they finish; the display may still sleep)",
-        ),
     ),
     ServeOption(
         "--no-webui",

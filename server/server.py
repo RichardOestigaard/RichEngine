@@ -61,7 +61,9 @@ from .output import (
 )
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
-# Match the former generation ingress envelope (32 slots × 16 MiB).
+# Request bodies held at once, from upload through preparation and, for what
+# a generation retains of them, until it ends, take at most max(this, twice
+# --max-request-size) bytes, so two of the largest requests always fit.
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
@@ -139,6 +141,9 @@ class Collected:
     result: NativeResult
     # The output ended inside its reasoning.
     reasoning_open: bool
+    # The id of the call the token limit cut, whose arguments are
+    # unfinished; None when it cut none.
+    cut_call: str | None
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -277,9 +282,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         super().end_headers()
 
-    def _send(self, status, data, content_type):
+    def _send(self, status, data, content_type, *, retry_after=False):
         self.send_response(status)
-        if status == 503:
+        if retry_after:
             self.send_header("Retry-After", "1")
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
@@ -298,7 +303,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, *, retry_after=False):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
@@ -308,9 +313,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self.route.startswith("/v1/messages"),
             )
             return
-        self._send(status, data, "application/json")
+        self._send(status, data, "application/json", retry_after=retry_after)
 
-    def _error(self, error, anthropic=False):
+    def _error(self, error, anthropic=False, *, retry_after=False):
         error_type = error.protocol_type(anthropic)
         message = error.message
         if anthropic and isinstance(error, ContextLengthError):
@@ -331,6 +336,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "code": error.code,
                 }
             },
+            retry_after=retry_after,
         )
 
     def _log_api_error(self, error):
@@ -343,7 +349,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if log:
             self._log_api_error(error)
         try:
-            self._error(error, anthropic)
+            self._error(error, anthropic, retry_after=error.retryable)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -403,9 +409,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         finally:
             self._unread_body = length - len(payload)
             self.connection.settimeout(HTTP_IO_TIMEOUT)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-        payload.clear()
-        return json_codec.loads(text)
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except (ValueError, RecursionError):
+            # Text that is not JSON, or JSON nested deeper than the parser
+            # reads.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
+        return body
 
     def do_HEAD(self):
         self.do_GET()
@@ -449,6 +463,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(
                 200 if ready else 503,
                 {"status": "ready" if ready else "unavailable"},
+                retry_after=not ready,
             )
             return
         if path == "/status":
@@ -606,7 +621,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._json(200, {"input_tokens": tokens})
                 return
             if path == "/v1/judgments":
-                job, row = self.app.prepare_judgment(body, deadline=deadline)
+                job, row = self.app.prepare_judgment(
+                    body, deadline=deadline,
+                    disconnected=self._client_disconnected
+                )
                 remaining_request_time(deadline)
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
@@ -708,18 +726,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
-        except (ValueError, RecursionError):
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone:
-                self._systemone_error(
-                    judgments.SystemOneError(
-                        [judgments.detail([], "invalid JSON request body")]
-                    )
-                )
-            else:
-                error = APIError(400, "invalid JSON request body")
-                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -750,7 +756,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _systemone(self, body, deadline):
         active_job = None
         try:
-            entries = self.app.prepare_systemone(body, deadline=deadline)
+            entries = self.app.prepare_systemone(
+                body, deadline=deadline, disconnected=self._client_disconnected
+            )
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
@@ -914,7 +922,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         publish(events)
         return Collected(
-            "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
+            "".join(reasoning),
+            content_text,
+            tool_calls,
+            result,
+            splitter.reasoning,
+            None if projector is None else projector.call_id,
         )
 
     def _complete(self, job):
@@ -953,6 +966,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         result = collected.result
         blocks = sequencer.finish(result.reason == "length", collected.reasoning_open)
+        if collected.cut_call is not None:
+            # A complete message leaves out the call the token limit cut.
+            blocks = [block for block in blocks if block.call_id != collected.cut_call]
         signature = (
             self.app.thinking_codec.encode(collected.reasoning)
             if collected.reasoning and job.thinking_display == "omitted"
@@ -1766,7 +1782,7 @@ class FrontendServer(ThreadingHTTPServer):
         address,
         app,
         bind_and_activate=True,
-        request_capacity=32,
+        request_capacity=serve_options.DEFAULT_QUEUE_SIZE,
         allowed_hosts=(),
         api_key=None,
         webui=True,

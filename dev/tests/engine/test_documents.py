@@ -121,7 +121,7 @@ class DocumentTests(unittest.TestCase):
             render_pdf(locked)
 
     def setUp(self):
-        with documents._pdf_lock:
+        with documents._cache_lock:
             documents._cache.clear()
             documents._cache_bytes = 0
 
@@ -356,19 +356,23 @@ class DocumentTests(unittest.TestCase):
                     self.assertEqual(bool(documents._cache), cached)
                     self.assertIn("ALPHA 42", render_pdf(payload)[0]["text"])
 
-    def test_waiting_for_renderer_expires_without_decoding_more_pdf_bytes(self):
-        with (
-            documents._pdf_lock,
-            mock.patch.object(documents.base64, "b64decode") as decode,
-        ):
+    def test_only_an_uncached_pdf_waits_for_the_renderer(self):
+        render_pdf()
+        with documents._render_lock, mock.patch.object(documents, "_render") as render:
+            # While another PDF renders, a cached one is answered at once.
+            self.assertIn("ALPHA 42", render_pdf()[0]["text"])
+            # Another waits for the renderer within its deadline.
             with self.assertRaises(APIError) as raised:
                 render_pdf(
-                    budget=documents.DocumentBudget(deadline=time.monotonic() + 0.01)
+                    pdf_bytes("BETA 7"),
+                    documents.DocumentBudget(deadline=time.monotonic() + 0.01),
                 )
-            self.assertEqual(raised.exception.status, 504)
-            self.assertEqual(raised.exception.code, "request_timeout")
-            decode.assert_not_called()
-        self.assertFalse(documents._pdf_lock.locked())
+            self.assertEqual(
+                (raised.exception.status, raised.exception.code),
+                (504, "request_timeout"),
+            )
+            render.assert_not_called()
+        self.assertFalse(documents._render_lock.locked())
 
     def test_expired_render_closes_native_objects_and_does_not_cache_partial_pdf(self):
         import pypdfium2 as pdfium
@@ -391,7 +395,7 @@ class DocumentTests(unittest.TestCase):
         self.assertTrue(all(handle.raw is None for handle in handles))
         self.assertFalse(documents._cache)
         self.assertEqual(documents._cache_bytes, 0)
-        self.assertFalse(documents._pdf_lock.locked())
+        self.assertFalse(documents._render_lock.locked())
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_cache_evicts_by_bytes_and_entry_count(self):

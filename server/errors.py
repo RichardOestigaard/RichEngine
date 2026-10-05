@@ -8,6 +8,13 @@ class APIError(Exception):
         self.message = message
         self.code = code
 
+    @property
+    def retryable(self):
+        """Whether the same request may succeed when retried shortly: the
+        server is overloaded, restarting its engine or shutting down. It
+        reports each with 503, whatever status an API answers it with."""
+        return self.status == 503
+
     def protocol_type(self, anthropic=False):
         if not anthropic:
             return "server_error" if self.status >= 500 else "invalid_request_error"

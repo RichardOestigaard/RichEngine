@@ -356,7 +356,13 @@ class ServerRecoveryTests(unittest.TestCase):
         harness = self.harness(runtime, queue_size=1)
         runtime.fail(harness.backend)
         with mock.patch.object(harness.app, "prepare") as prepare:
-            for path in ("/v1/messages", "/v1/chat/completions", "/v1/responses"):
+            for path, status in (
+                ("/v1/messages", 503),
+                ("/v1/chat/completions", 503),
+                ("/v1/responses", 503),
+                # TypeSafe's overload status, which invites a retry as well.
+                ("/v1/systemone", 529),
+            ):
                 with self.subTest(path=path):
                     connection = http.client.HTTPConnection(
                         *harness.server.server_address, timeout=1
@@ -367,7 +373,7 @@ class ServerRecoveryTests(unittest.TestCase):
                         connection.putheader("Content-Length", "100")
                         connection.endheaders()
                         response = connection.getresponse()
-                        self.assertEqual(response.status, 503)
+                        self.assertEqual(response.status, status)
                         self.assertEqual(response.getheader("Retry-After"), "1")
                         self.assertEqual(
                             json.loads(response.read())["error"]["type"],
@@ -432,6 +438,42 @@ class ServerRecoveryTests(unittest.TestCase):
                 plan.release.set()
             self.assertEqual(generation.result(1)[0], 200)
         self.wait_until(lambda: harness.server.requests.stats()["active"] == 0)
+
+    def test_systemone_overload_is_529_and_invites_a_retry(self):
+        plan = Plan([[4]], block=True)
+        harness = self.harness(FakeRuntime(plan), queue_size=1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            generation = pool.submit(
+                harness.request, "POST", "/v1/chat/completions", self.body()
+            )
+            try:
+                self.assertTrue(plan.started.wait(1))
+                connection = http.client.HTTPConnection(
+                    *harness.server.server_address, timeout=3
+                )
+                self.addCleanup(connection.close)
+                connection.request(
+                    "POST",
+                    "/v1/systemone",
+                    json.dumps(
+                        {
+                            "model": "test-model",
+                            "state": "evidence",
+                            "questions": {"supported": {"type": "noul"}},
+                        }
+                    ),
+                    {"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 529)
+                self.assertEqual(response.getheader("Retry-After"), "1")
+                self.assertEqual(
+                    json.loads(response.read())["error"]["code"],
+                    "frontend_overloaded",
+                )
+            finally:
+                plan.release.set()
+            self.assertEqual(generation.result(1)[0], 200)
 
     def test_token_count_has_its_own_bounded_ingress_and_releases_on_disconnect(self):
         harness = self.harness(FakeRuntime(), queue_size=1)

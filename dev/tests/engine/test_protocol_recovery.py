@@ -317,8 +317,12 @@ class ProtocolRecoveryTests(unittest.TestCase):
         with mock.patch.object(codec, "MAX_SIGNATURE_BYTES", 8):
             with self.assertRaises(api.APIError):
                 codec.decode(signature)
-            with self.assertRaises(api.APIError):
+            with self.assertRaises(api.APIError) as caught:
                 codec.encode("too long")
+            self.assertEqual(
+                (caught.exception.status, caught.exception.code),
+                (500, "thinking_too_large"),
+            )
         for _ in range(300):
             codec.encode("later response")
         self.assertEqual(codec.decode(signature), "private reasoning")

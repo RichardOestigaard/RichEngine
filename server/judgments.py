@@ -39,7 +39,7 @@ import string
 import weakref
 from dataclasses import dataclass
 
-from .chat_templates import render_chat_template, template_options
+from .chat_templates import render_chat_template
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -188,35 +188,34 @@ def slot_labels(tokenizer):
     return labels
 
 
-def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoint):
+def encode_prompt(
+    prompt_tokenizer, chat_template, messages, labels, *, admit, checkpoint
+):
     """Render messages with chat_template, without thinking as a request
     with effort none renders, and verify single-token answer slots.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
-    prompt must extend the token ids by exactly that token.
-
-    The boundary pass re-tokenizes the whole prompt once per slot, so a long
-    prompt with many options costs far more than the prompt itself. `admit`
-    receives the prepared prompt token count before that pass begins and
-    `checkpoint` runs once per slot inside it; either may raise to abandon
-    preparation.
+    prompt must extend the token ids by exactly that token. A label can only
+    change the tokens of the text after the prompt's last message boundary,
+    which encodes on its own (PromptTokenizer.split), so the boundary pass
+    encodes that end, the generation prompt, with each label: the whole
+    prompt only where the tokenizer has no such boundary. `admit` receives
+    the prepared prompt token count before that pass begins and `checkpoint`
+    runs once per slot inside it; either may raise to abandon preparation.
     """
+    tokenizer = prompt_tokenizer.tokenizer
     prompt = render_chat_template(
         tokenizer,
         messages,
-        {
-            "chat_template": chat_template,
-            "tokenize": False,
-            **template_options(
-                reasoning_effort="none",
-                preserve_thinking=None,
-                tools=None,
-                add_generation_prompt=True,
-            ),
-        },
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
-    ids = list(tokenizer.encode(prompt, add_special_tokens=False))
+    head, tail = prompt_tokenizer.split(prompt)
+    tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))
+    ids = head + tail_ids
     if not ids:
         raise ScoringUnsupported("the tokenizer produced an empty prompt")
     slots = []
@@ -232,7 +231,8 @@ def encode_prompt(tokenizer, chat_template, messages, labels, *, admit, checkpoi
     admit(len(ids))
     for label, token in zip(labels, slots):
         checkpoint()
-        if tokenizer.encode(prompt + label, add_special_tokens=False) != ids + [token]:
+        encoded = tokenizer.encode(tail + label, add_special_tokens=False)
+        if encoded != tail_ids + [token]:
             raise ScoringUnsupported(
                 f"answer boundary changes tokenization for slot {label!r}"
             )

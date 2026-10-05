@@ -16,7 +16,7 @@ from server.errors import APIError
 
 class DocumentWorkerTests(unittest.TestCase):
     def setUp(self):
-        with documents._pdf_lock:
+        with documents._cache_lock:
             documents._cache.clear()
             documents._cache_bytes = 0
 
@@ -38,7 +38,7 @@ class DocumentWorkerTests(unittest.TestCase):
         self.assertIsNotNone(children[0].poll())
         self.assertFalse(document_worker._workers)
         self.assertFalse(documents._cache)
-        self.assertFalse(documents._pdf_lock.locked())
+        self.assertFalse(documents._render_lock.locked())
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_deadline_stops_worker_and_next_document_succeeds(self):
@@ -91,6 +91,22 @@ class DocumentWorkerTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "document_unavailable")
         self.assert_released(children)
+
+    def test_unreadable_result_is_a_server_error(self):
+        start = subprocess.Popen
+
+        def spawn(command, **kwargs):
+            return start([sys.executable, "-c", "print('not JSON')"], **kwargs)
+
+        with mock.patch.object(document_worker.subprocess, "Popen", spawn):
+            with self.assertRaises(APIError) as caught:
+                render_pdf()
+        self.assertEqual(
+            (caught.exception.status, caught.exception.code),
+            (500, "document_worker_failed"),
+        )
+        self.assertFalse(document_worker._workers)
+        self.assertFalse(documents._cache)
 
     def test_spawn_failure_is_transient_and_leaves_no_worker(self):
         with mock.patch.object(

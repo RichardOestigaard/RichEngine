@@ -300,7 +300,10 @@ class LauncherTests(unittest.TestCase):
                             ),
                             1,
                         )
-                self.assertIn("installation is busy", error.getvalue())
+                self.assertIn(
+                    "Splash is being upgraded; wait for the upgrade to finish",
+                    error.getvalue(),
+                )
                 self.assertNotIn("stale/model", error.getvalue())
                 install.assert_not_called()
                 execute.assert_not_called()

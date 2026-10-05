@@ -87,6 +87,18 @@ TOP_K_DEFAULT = 20
 assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
 
 
+def _preparation_checkpoint(deadline, disconnected):
+    """A check that a request's preparation may go on: its deadline has not
+    passed, and its client has not left, where `disconnected` can tell."""
+
+    def checkpoint():
+        remaining_request_time(deadline)
+        if disconnected is not None and disconnected():
+            raise ConnectionResetError("client disconnected during preparation")
+
+    return checkpoint
+
+
 def _drop_nulls(body, extras):
     """The body without the null values of the sampling options and of the
     endpoint's other nullable fields, which then take their defaults."""
@@ -612,26 +624,27 @@ class Frontend:
             prompt_sha256=prompt_sha256,
         )
 
-    def _encode_score_prompt(self, messages, labels, admit, deadline, what):
+    def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
         """The tokens, answer-slot token ids and text of a scoring prompt. The
         request's input drives the render, so a failure is its error."""
         try:
             return judgments.encode_prompt(
-                self.tokenizer,
+                self.prompt_tokenizer,
                 self.chat_templates.select(None).source,
                 messages,
                 labels,
                 admit=admit,
-                checkpoint=lambda: remaining_request_time(deadline),
+                checkpoint=checkpoint,
             )
         except judgments.ScoringUnsupported as error:
             raise APIError(500, str(error), "scoring_unsupported") from error
-        except (APIError, judgments.SystemOneError):
+        except (APIError, judgments.SystemOneError, ConnectionResetError):
+            # The request's own limits, deadline and client end preparation.
             raise
         except Exception as error:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
-    def prepare_judgment(self, body, *, deadline):
+    def prepare_judgment(self, body, *, deadline, disconnected=None):
         unknown = sorted(
             set(body)
             - {"id", "state", "question", "options", "model", "timeout", "priority"}
@@ -645,10 +658,11 @@ class Frontend:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         priority = self._priority(body)
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
         with self._preparation(deadline):
 
             def admit(prompt_tokens):
-                remaining_request_time(deadline)
+                checkpoint()
                 if prompt_tokens > self.max_context:
                     raise ContextLengthError(prompt_tokens, self.max_context)
 
@@ -656,16 +670,16 @@ class Frontend:
                 judgments.judgment_messages(body),
                 judgments.LETTERS[: len(body["options"])],
                 admit,
-                deadline,
+                checkpoint,
                 "judgment",
             )
-            remaining_request_time(deadline)
+            checkpoint()
             job = self._score_job(
                 tokens, slots, deadline, priority, judgments.digest(prompt)
             )
         return job, body
 
-    def prepare_systemone(self, body, *, deadline):
+    def prepare_systemone(self, body, *, deadline, disconnected=None):
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
@@ -686,6 +700,7 @@ class Frontend:
             raise judgments.SystemOneError(details)
         jobs = []
         total_tokens = 0
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
         with self._preparation(deadline):
             for qid, spec in specs:
                 if spec.deterministic:
@@ -706,7 +721,7 @@ class Frontend:
                 labels = slots[: len(spec.labels)]
 
                 def admit(prompt_tokens, qid=qid, prepared=total_tokens):
-                    remaining_request_time(deadline)
+                    checkpoint()
                     if prompt_tokens > self.max_context:
                         raise ContextLengthError(prompt_tokens, self.max_context)
                     if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
@@ -724,10 +739,10 @@ class Frontend:
                     judgments.systemone_messages(state, spec, labels),
                     labels,
                     admit,
-                    deadline,
+                    checkpoint,
                     "question",
                 )
-                remaining_request_time(deadline)
+                checkpoint()
                 total_tokens += len(tokens)
                 jobs.append(
                     (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))

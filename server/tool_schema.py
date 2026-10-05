@@ -13,7 +13,12 @@ from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
 from .errors import APIError
-from .schema_validation import build_validator, json_objects, subschemas
+from .schema_validation import (
+    build_validator,
+    check_schema,
+    json_objects,
+    subschemas,
+)
 
 # The chat template's tool-call tags, as it lays a call out: grammars write
 # calls that way, and the projector reads them that way (output.py). A call
@@ -386,6 +391,11 @@ def detect_tool_dialect(rendered):
     return None
 
 
+# Schemas are read recursively, by jsonschema and by this module, several
+# stack frames a level, and arrays nested twice this deep would exhaust the
+# interpreter's stack: a schema nests objects and arrays at most this deep.
+MAX_SCHEMA_DEPTH = 64
+
 # Framing projects each tool's fields through schema composition and copies
 # the root schema into every field that refers to it. Pathological schemas
 # make that quadratic or exponential in their size, so framing all tools of
@@ -468,6 +478,21 @@ def json_value(value):
         return parsed
     except (ValueError, RecursionError):
         return value
+
+
+def _check_depth(schema, invalid):
+    """Refuse `schema`, as `invalid` names it, if it nests deeper than
+    MAX_SCHEMA_DEPTH. Read without recursion, before anything recurses."""
+    pending = [(schema, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, (dict, list)):
+            if depth > MAX_SCHEMA_DEPTH:
+                raise APIError(
+                    400, f"{invalid}: nested more than {MAX_SCHEMA_DEPTH} levels deep"
+                )
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((child, depth + 1) for child in children)
 
 
 def _remote_ref(schema):
@@ -1157,14 +1182,26 @@ def _lark_regex(pattern):
 _RAW_VALUE = "/(?s:.*)/"
 
 
+def _regex_class(characters):
+    """`characters` as a regex character-class body: control characters are
+    escaped, since a literal one inside the class would break the lark
+    pattern."""
+    return "".join(
+        {ord(c): f"\\{c}" for c in "\\-^]"}.get(
+            ord(c), {"\n": r"\n", "\r": r"\r", "\t": r"\t"}.get(c, c)
+        )
+        for c in dict.fromkeys(characters)
+    )
+
+
 def _name_regex(dialect):
     """The lexer pattern of a name the dialect's grammars write: one that
     neither starts nor ends with the space reading strips, no longer than
     reading takes, and free of the dialect's markup characters. A name is a
     lexeme of its own: one spanning "<parameter=url>" would win over another
     name that starts like it, and lexing cannot back off."""
-    forbidden = dialect.param_name_forbidden
-    edge = forbidden + " \t"
+    forbidden = _regex_class(dialect.param_name_forbidden)
+    edge = _regex_class(dialect.param_name_forbidden + " \t")
     return _lark_regex(
         rf"[^{edge}]([^{forbidden}]{{0,{MAX_NAME_LENGTH - 2}}}[^{edge}])?"
     )
@@ -1312,6 +1349,7 @@ def normalize_response_format(value):
             raise APIError(400, "response_format.json_schema.schema is required")
     else:
         raise APIError(400, "unsupported response_format")
+    _check_depth(schema, "invalid response schema")
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote schema reference is not allowed: {ref}")
     try:
@@ -1356,6 +1394,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
         strict = function.get("strict")
         if strict is not None and not isinstance(strict, bool):
             raise APIError(400, f"strict must be a boolean for tool {name}")
+        _check_depth(schema, f"invalid tool schema for {name}")
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:

@@ -15,6 +15,7 @@ from tokenizers import (
 )
 from transformers import PreTrainedTokenizerFast
 
+from server import judgments
 from server.tokenization import PromptTokenizer
 
 
@@ -79,6 +80,107 @@ class PromptTokenizationTests(unittest.TestCase):
                     prompt.replace("Release notes.", "Other notes.", 1)
                 )
         self.assertGreater(self.cache.stats()["reused_tokens"], 10000)
+
+    def test_text_after_the_split_encodes_on_its_own_with_any_label(self):
+        # Encoding text and a label equals the split's tokens followed by the
+        # encoded end and label, so a label extends the whole text's tokens
+        # by its token exactly when it so extends the end's: a slot check
+        # need encode only the end (judgments.encode_prompt).
+        randomizer = random.Random(1234)
+        fragments = [
+            "e\u0301",
+            "中文",
+            " 👨‍👩‍👧‍👦",
+            "\n\r\t ",
+            "<|im_end|>",
+            "<|im_end",
+            "<|im_start|>",
+            "'s",
+            "12345",
+            "Hello",
+            " world!",
+            "AB",
+            " ",
+        ]
+        labels = ("", "A", "Q", "Z", "AB", "ZZ")
+        split = 0
+        for _ in range(300):
+            text = "".join(randomizer.choices(fragments, k=randomizer.randint(0, 12)))
+            head, tail = self.cache.split(text)
+            if head:
+                split += 1
+                self.assertNotIn("<|im_end|>", tail)
+                self.assertEqual(head[-1], self.cache.marker_id)
+            else:
+                self.assertEqual(tail, text)
+            for label in labels:
+                self.assertEqual(
+                    head
+                    + self.tokenizer(tail + label, add_special_tokens=False)[
+                        "input_ids"
+                    ],
+                    self.tokenizer(text + label, add_special_tokens=False)["input_ids"],
+                )
+        self.assertGreater(split, 50)
+        self.assertEqual(self.cache.stats()["entries"], 0)
+
+    def test_text_is_not_split_where_the_tokenizer_may_not_split_it(self):
+        consumed = tokenizer()
+        consumed.backend_tokenizer.add_special_tokens(
+            [AddedToken("hello<|im_end", normalized=False)]
+        )
+        stripping = tokenizer()
+        stripping.backend_tokenizer.add_special_tokens(
+            [AddedToken("<|im_end|>", normalized=False, rstrip=True)]
+        )
+        for name, t, text in (
+            ("no marker", self.tokenizer, "Hello world!"),
+            ("consumed marker", consumed, "hello<|im_end|>suffix"),
+            ("stripping marker", stripping, "Hello<|im_end|> suffix"),
+        ):
+            with self.subTest(name):
+                self.assertEqual(PromptTokenizer(t).split(text), ([], text))
+
+    def test_slot_checks_encode_only_the_prompt_end(self):
+        template = (
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n"
+            "{{ message.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        )
+        messages = [
+            {"role": "system", "content": "Choose one."},
+            {"role": "user", "content": "Release notes 中文 e\u0301. " * 2000},
+        ]
+        labels = judgments.slot_labels(self.tokenizer)[:26]
+        encode = self.tokenizer.encode
+        encoded = []
+
+        def counted(text, **options):
+            encoded.append(text)
+            return encode(text, **options)
+
+        with mock.patch.object(self.tokenizer, "encode", counted):
+            ids, slots, prompt = judgments.encode_prompt(
+                self.cache,
+                template,
+                messages,
+                labels,
+                admit=lambda tokens: None,
+                checkpoint=lambda: None,
+            )
+        self.assertEqual(
+            ids, self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        )
+        self.assertEqual(
+            slots, [encode(label, add_special_tokens=False)[0] for label in labels]
+        )
+        end = "\n<|im_start|>assistant\n"
+        self.assertTrue(prompt.endswith("<|im_end|>" + end))
+        # The end, each label, and each label after the end.
+        self.assertEqual(
+            sorted(encoded),
+            sorted([end, *labels, *(end + label for label in labels)]),
+        )
 
     def test_concurrent_requests_eviction_and_oversized_prefix(self):
         self.enterContext(mock.patch.object(PromptTokenizer, "CAPACITY", 2))

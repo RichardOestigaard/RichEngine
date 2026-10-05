@@ -6,6 +6,7 @@ from unittest import mock
 from jsonschema import SchemaError
 
 from server import schema_validation as validation
+from server import tool_schema
 from server.errors import APIError
 
 
@@ -152,3 +153,81 @@ class ValidatorCacheTests(unittest.TestCase):
             validation._validator_cache_bytes,
             sum(len(key) for key in validation._validator_cache),
         )
+
+
+class SchemaCheckCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.clear()
+        self.addCleanup(self.clear)
+
+    @staticmethod
+    def clear():
+        with validation._checked_schemas_lock:
+            validation._checked_schemas.clear()
+            validation._checked_schemas_bytes = 0
+        with validation._validator_cache_lock:
+            validation._validator_cache.clear()
+            validation._validator_cache_bytes = 0
+
+    @staticmethod
+    def tools(*schemas):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": f"t{index}", "parameters": schema},
+            }
+            for index, schema in enumerate(schemas)
+        ]
+        return tool_schema.normalize_tools(tools, "auto", True)
+
+    def test_tool_schemas_are_checked_once_without_validators(self):
+        schemas = [{"type": "object", "properties": {"x": {"type": "integer"}}}] * 2
+        self.tools(*schemas)
+        self.assertEqual(len(validation._checked_schemas), 1)
+        # Response formats keep the validators' slots to themselves.
+        self.assertFalse(validation._validator_cache)
+        # The next turn's tools are not checked again.
+        with mock.patch.object(validation.validators, "validator_for") as check:
+            self.tools(*schemas)
+        check.assert_not_called()
+
+    def test_invalid_tool_schema_is_refused_every_time(self):
+        for _ in range(2):
+            with self.assertRaises(APIError) as caught:
+                self.tools({"type": "invalid"})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertTrue(
+                caught.exception.message.startswith("invalid tool schema for t0: ")
+            )
+        self.assertFalse(validation._checked_schemas)
+
+    def test_eviction_obeys_both_count_and_source_byte_limits(self):
+        for count, budget in ((2, 10000), (1024, 180)):
+            with (
+                self.subTest(count=count, budget=budget),
+                mock.patch.object(validation, "_CHECKED_SCHEMAS_SIZE", count),
+                mock.patch.object(validation, "_CHECKED_SCHEMAS_SOURCE_BYTES", budget),
+            ):
+                self.clear()
+                for i in range(20):
+                    validation.check_schema(
+                        {"type": "string", "description": str(i) + "x" * 30}
+                    )
+                    checked = validation._checked_schemas
+                    self.assertLessEqual(len(checked), count)
+                    self.assertLessEqual(validation._checked_schemas_bytes, budget)
+                    self.assertEqual(
+                        validation._checked_schemas_bytes,
+                        sum(len(key) for key in checked),
+                    )
+
+    def test_tools_take_schemas_only_a_validator_could_not_evaluate(self):
+        # Calls are not validated, so a tool's schema need only be valid; a
+        # response format is, and refuses what jsonschema would evaluate
+        # without bounds.
+        schema = {"patternProperties": {"^a": {}}, "unevaluatedProperties": False}
+        self.tools(schema)
+        with self.assertRaises(APIError):
+            tool_schema.normalize_response_format(
+                {"type": "json_schema", "json_schema": {"schema": schema}}
+            )
