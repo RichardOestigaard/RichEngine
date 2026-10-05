@@ -3825,6 +3825,7 @@ class ServerTest(unittest.TestCase):
             request_logger=diagnostics.print_request,
             think_end_id=validate.return_value.think_end_id,
             visible_token_ids=mock.ANY,
+            tool_call_open_id=validate.return_value.tool_call_open_id,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.

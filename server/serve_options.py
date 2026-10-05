@@ -297,6 +297,18 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--idle-release",
+        dict(
+            type=parse_idle_release,
+            default=None,
+            metavar="DURATION",
+            help="time without a request before the engine unwires its memory and "
+            "frees the weights: seconds, or with an s, m or h suffix, e.g. 30m "
+            "(default: 10m); off keeps both",
+        ),
+        text=idle_release_text,
+    ),
+    ServeOption(
         "--max-cache-disk",
         dict(
             type=parse_max_cache_disk,
@@ -409,6 +421,15 @@ SERVE_OPTIONS = (
         ),
         environment="SPLASH_API_KEY",
         secret=True,
+    ),
+    ServeOption(
+        "--allow-idle-sleep",
+        dict(
+            action="store_true",
+            default=False,
+            help="let the Mac sleep automatically while requests run (default: it "
+            "stays awake until they finish; the display may still sleep)",
+        ),
     ),
     ServeOption(
         "--no-webui",

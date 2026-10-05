@@ -580,7 +580,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         try:
             with self.app.latencies.measure("upload"):
-                body = self._read_json_body(started_at + self.app.request_timeout)
+                try:
+                    body = self._read_json_body(
+                        started_at + self.app.request_timeout
+                    )
+                except (ValueError, RecursionError):
+                    # Text that is not JSON, or JSON nested deeper than the
+                    # parser reads.
+                    if systemone:
+                        raise judgments.SystemOneError(
+                            [judgments.detail([], "invalid JSON request body")]
+                        ) from None
+                    raise APIError(400, "invalid JSON request body") from None
             if not isinstance(body, dict):
                 if systemone:
                     raise judgments.SystemOneError(
@@ -718,18 +729,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
-        except (ValueError, RecursionError):
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone:
-                self._systemone_error(
-                    judgments.SystemOneError(
-                        [judgments.detail([], "invalid JSON request body")]
-                    )
-                )
-            else:
-                error = APIError(400, "invalid JSON request body")
-                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
