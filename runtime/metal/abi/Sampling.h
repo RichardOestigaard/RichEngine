@@ -51,10 +51,15 @@ struct TargetSamplingParams {
   uint32_t exclude_stop_mask;
   uint32_t stop_token_0;
   uint32_t stop_token_1;
+  // Adaptive proposal budgets (SPLASH_ADAPTIVE_PROPOSALS): the lane's live
+  // selected rows. A row s with s % rows >= live_rows[lane] is dead — the
+  // selection kernels skip it. Unadapted dispatches fill every lane with
+  // rows.
+  uint32_t live_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 112,
-              "Target sampling parameters are 112 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 128,
+              "Target sampling parameters are 128 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -156,10 +161,14 @@ struct AcceptBatchParams {
   uint32_t stop_token_0;
   uint32_t stop_token_1;
   uint32_t sampling_mask;
+  // Adaptive proposal budgets: the most draft tokens the lane may accept
+  // this step (SPLASH_DRAFT_PROPOSAL_TOKENS when unadapted). A lane's
+  // retained count stays within proposals + 1 live rows.
+  uint32_t proposals[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(AcceptBatchParams) == 28,
-              "Batched acceptance parameters are 28 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 44,
+              "Batched acceptance parameters are 44 bytes on both sides");
 
 // verify_input_tree_tokens parameters: one thread per (lane, node) fills the
 // node's verify input token, its (t, h, w) rope position (the lane's base

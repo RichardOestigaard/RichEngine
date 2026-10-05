@@ -151,10 +151,15 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
   graph.add("dspark_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+  graph.add("dspark_select_edges",
+            {buffers.partialIds, buffers.partialValues, buffers.candidates,
+             buffers.unary, markov.embedding, markov.projection},
+            params, {uint64_t{lanes} * kPositions, 1, 1},
+            {kEdgeThreads, 1, 1});
   graph.add("draft_select_dspark",
-            {buffers.partialIds, buffers.partialValues, buffers.uniforms,
-             buffers.candidates, buffers.proposalProbabilities,
-             buffers.proposedTokens, markov.embedding, markov.projection},
+            {buffers.candidates, buffers.unary, buffers.partialValues,
+             buffers.uniforms, buffers.proposalProbabilities,
+             buffers.proposedTokens},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 

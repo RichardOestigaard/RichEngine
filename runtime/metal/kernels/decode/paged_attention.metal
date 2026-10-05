@@ -342,6 +342,63 @@ PAGED_VERIFY_REDUCE_HD(verify_attention_reduce_hd128, 2, 8, 128)
 PAGED_VERIFY_REDUCE_HD(verify_attention_reduce_hd64, 8, 4, 64)
 #undef PAGED_VERIFY_REDUCE_HD
 
+// The reduce/gather fusion of the no-gate targets (dense hd128, LFM2 hd64):
+// the reduce/gate kernel's structure minus the gate multiply — the same
+// per-row split reduce as verify_attention_reduce_hd*, writing the bf16
+// value straight into the out-projection's [row][query head][dimension]
+// hidden layout. One dispatch replaces reduce plus verify_attention_gather.
+// The reduced bits equal the reduce kernel's, and the gather's bf16 -> float
+// -> bf16 copy is exact, so the hidden rows are bit-identical. The attention
+// staging rows are not written: with no gate nothing reads them afterward.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
+inline void splash_verify_attention_reduce_gather_phase(
+    device const float *partials, device const float *statistics,
+    device bfloat *hidden,
+    constant SplashVerifyAttentionParams *params, uint3 group,
+    uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
+  constexpr uint QHeads = KVHeads * QueryHeadsPerKVHead;
+  constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * QueryHeadsPerKVHead;
+  const uint kv_head = group.x;
+  const uint fused_row = group.y;
+  const uint batch = group.z;
+  constant SplashVerifyAttentionParams &lane_params = params[batch];
+  if (!splash_verify_attention_contract_valid(lane_params) ||
+      kv_head >= KVHeads || fused_row >= M || thread_index >= HeadDim)
+    return;
+  const bfloat value =
+      splash_attention_reduce_value<QueryHeadsPerKVHead,
+                                    SPLASH_TARGET_VERIFY_ROWS, HeadDim>(
+          partials, statistics, lane_params.committed_tokens,
+          SPLASH_TARGET_VERIFY_ROWS, lane_params.split_count,
+          (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits,
+          fused_row, thread_index, weights, group_values);
+  const uint row = fused_row / QueryHeadsPerKVHead;
+  const uint query_head =
+      kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
+  hidden[((ulong(batch) * SPLASH_TARGET_VERIFY_ROWS + row) * QHeads +
+          query_head) *
+             HeadDim +
+         thread_index] = value;
+}
+
+#define PAGED_VERIFY_REDUCE_GATHER(Name, Heads, Group, HeadDim)            \
+  kernel void Name(                                                        \
+      device const float *partials [[buffer(0)]],                          \
+      device const float *statistics [[buffer(1)]],                        \
+      device bfloat *hidden [[buffer(2)]],                                 \
+      constant SplashVerifyAttentionParams *params [[buffer(3)]],          \
+      uint3 group [[threadgroup_position_in_grid]],                        \
+      uint thread_index [[thread_index_in_threadgroup]]) {                 \
+    threadgroup float weights[SplashVerifyMaximumSplits];                  \
+    threadgroup float group_values[8];                                     \
+    splash_verify_attention_reduce_gather_phase<Heads, Group, HeadDim>(    \
+        partials, statistics, hidden, params, group, thread_index,         \
+        weights, group_values);                                            \
+  }
+PAGED_VERIFY_REDUCE_GATHER(verify_attention_reduce_gather_hd128, 2, 8, 128)
+PAGED_VERIFY_REDUCE_GATHER(verify_attention_reduce_gather_hd64, 8, 4, 64)
+#undef PAGED_VERIFY_REDUCE_GATHER
+
 // The tree reduces: a SPLASH_TREE_VERIFY_NODES-row tile per lane, with the
 // runtime active row count deciding which rows carry splits. Rows past a
 // lane's emitted nodes reduce to zeros, exactly as inactive chain rows do.

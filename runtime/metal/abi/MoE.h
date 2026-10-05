@@ -44,6 +44,16 @@ struct MoeGroupParams {
 static_assert(sizeof(MoeGroupParams) == 20,
               "MoE grouping parameters are 20 bytes on both sides");
 
+// The fused select-and-group dispatch (moe_route_group_sigmoid) takes the
+// routing and grouping parameters together.
+struct MoeRouteGroupParams {
+  MoeRouteParams route;
+  MoeGroupParams group;
+};
+
+static_assert(sizeof(MoeRouteGroupParams) == 36,
+              "MoE route-group parameters are 36 bytes on both sides");
+
 struct MoeGatherParams {
   uint32_t tile_rows;
   uint32_t input_size;

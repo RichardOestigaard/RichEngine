@@ -295,7 +295,9 @@ public:
   // `gateHidden` are bound (a Plain-input out-projection), the reduce
   // dispatch also applies the query gate addVerifyGate would, from the lane's
   // packed QKV rows into `gateHidden` — one fewer dispatch and no
-  // attention-row round trip, bitwise identical.
+  // attention-row round trip, bitwise identical. With `gateHidden` bound and
+  // `gatePacked` empty the no-gate fusion runs instead: the reduce writes
+  // `gateHidden` directly (verify_attention_reduce_gather_*, chain plans).
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,

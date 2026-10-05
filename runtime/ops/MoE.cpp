@@ -1,5 +1,6 @@
 #include "ops/MoE.hpp"
 
+#include "Env.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
@@ -13,6 +14,13 @@ namespace splash::ops {
 namespace {
 
 static_assert(offsetof(MoeExpertParams, expert_stride_bytes_0) == 16);
+
+// A kill switch for the packed expert paths, read once (the decode plan
+// calls this per step).
+bool packedDisabled() {
+  static const bool off = envFlag("SPLASH_MOE_PACKED_OFF");
+  return off;
+}
 
 bool matches(const Q8Projection &projection, uint32_t output,
              uint32_t input) noexcept {
@@ -347,6 +355,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (bakeable) graph.beginBakedSpan();
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
+  const MoeGroupParams groupParams{rows, shape.expertsPerToken, tileRows,
+                                   shape.experts, shape.sharedExpert};
+  // A sigmoid-gated block (no shared expert) at a single lane's rows folds
+  // the select into the grouping dispatch: one threadgroup selects a row
+  // per simdgroup, then sorts the routes by expert. Wider batches keep the
+  // separate select: its row-per-group grid parallelizes where the fused
+  // kernel's row loop serializes.
+  const bool fusedRoute = !shape.sharedExpert && rows <= 8;
+  metal::MetalBuffer expertBias;
   const bool block = weights.layout() == WeightLayout::Block32;
   if (block) {
     // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
@@ -358,6 +375,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                  weights.blocks().sharedScalarGate.plane0, scratch.selectedExperts,
                  scratch.routingWeights},
                 routeParams, {rows, 1, 1});
+    } else if (fusedRoute) {
+      expertBias = weights.blocks().expertBias.plane0;
     } else {
       // Sigmoid gating with the per-expert selection bias; no shared expert.
       graph.add("moe_route_select_sigmoid",
@@ -382,6 +401,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                  affine.sharedScalarGate.planes.biases, scratch.selectedExperts,
                  scratch.routingWeights},
                 routeParams, {rows, 1, 1});
+    } else if (fusedRoute) {
+      expertBias = affine.expertBias;
     } else {
       graph.add("moe_route_select_sigmoid",
                 {scratch.groupedInput, affine.expertBias,
@@ -389,12 +410,19 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                 routeParams, {rows, 1, 1});
     }
   }
-  graph.add("moe_group_routes",
-            {scratch.selectedExperts, scratch.tileDescriptors,
-             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            MoeGroupParams{rows, shape.expertsPerToken, tileRows,
-                           shape.experts, shape.sharedExpert},
-            {1, 1, 1});
+  if (fusedRoute) {
+    // The scores kernel's output feeds the fused select-and-group.
+    graph.add("moe_route_group_sigmoid",
+              {scratch.groupedInput, expertBias, scratch.selectedExperts,
+               scratch.routingWeights, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
+              MoeRouteGroupParams{routeParams, groupParams}, {1, 1, 1});
+  } else {
+    graph.add("moe_group_routes",
+              {scratch.selectedExperts, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
+              groupParams, {1, 1, 1});
+  }
   // The packed decode (packsDecode's MoE analog): a decode plan on the
   // `_n` kernels whose weights hold at least one MXFP4 expert segment
   // gathers the packed fp16 plane and exponent bytes alongside the bf16
@@ -407,7 +435,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       block && plan.phase() == MoePhase::Decode &&
       plan.configuration().mxfp4Native &&
       plan.configuration().ggufTile != MoeGgufTile::Register &&
-      !std::getenv("SPLASH_MOE_PACKED_OFF") &&
+      !packedDisabled() &&
       (mxfp4Expert(weights.blocks().gate) || mxfp4Expert(weights.blocks().up) ||
        mxfp4Expert(weights.blocks().down));
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};

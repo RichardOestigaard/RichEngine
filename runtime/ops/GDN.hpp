@@ -63,6 +63,9 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentRows;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
+  // WY/UT scratch for the chunkwise-parallel scan (SPLASH_GDN_CHUNKED); an
+  // empty buffer keeps the serial prefill_gdn_scan.
+  metal::MetalBuffer chunkScratch;
 };
 
 struct GdnDecodeBuffers final {
@@ -95,17 +98,24 @@ public:
   // `sums`, when present, is written by the gate's *_sums kernel: the
   // out-projection's input sums beside the gated rows, so the mixer output
   // needs no sums pass of its own.
+  // Floats of WY/UT scratch the chunked scan needs for `tokens` rows
+  // (`factor` is the SPLASH_GDN_CHUNKED chunk size; 0 disables it).
+  static uint64_t chunkScratchFloats(const GdnShape &shape, uint32_t tokens,
+                                     uint32_t factor);
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                          GdnShape shape, uint32_t tokens,
                          GdnHeadOrder order, metal::MetalBuffer sums = {});
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.
+  // liveRows bounds each lane's serial verify scan (adaptive proposal
+  // budgets); empty scans all SPLASH_TARGET_VERIFY_ROWS rows.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
-                                 LinearInput input);
+                                 LinearInput input,
+                                 std::span<const uint32_t> liveRows = {});
   // The tree-verify variants: SPLASH_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.

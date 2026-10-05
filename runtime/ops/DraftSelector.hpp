@@ -84,11 +84,14 @@ public:
                 std::span<const uint32_t> anchors,
                 std::span<const SamplingPolicy> policies) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
-  // draft_select_dspark): like the plain path, but position p reads logits
-  // row p (the anchor row already predicts a token) and each position's
-  // candidates are rescored with the Markov bias of the previously sampled
-  // token, so the positions are chosen serially. The codebookless buffers'
-  // selectorHidden and unary are unused; there is no tree path.
+  // dspark_select_edges + draft_select_dspark): like the plain path, but
+  // position p reads logits row p (the anchor row already predicts a token)
+  // and each position's candidates are rescored with the Markov bias of the
+  // previously sampled token. A parallel pass scores every
+  // predecessor/candidate edge in advance — the predecessor set is the
+  // previous position's unbiased top-16, not the walk's pick — and the walk
+  // chooses the positions serially. selectorHidden is unused; unary holds
+  // the merged top-16 logits. There is no tree path.
   void addDSpark(metal::CommandGraph &graph,
                  const DraftSelectorBuffers &buffers,
                  const DraftMarkovHead &markov,

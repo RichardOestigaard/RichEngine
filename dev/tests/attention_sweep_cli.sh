@@ -28,7 +28,7 @@ for value in -1 262144 4294967296 10x '' '0,'; do
     reject '--histories requires integers' --histories "$value"
 done
 for value in typo '' '27b,' '27b,typo' ',35b'; do
-    reject '--shapes takes 27b or 35b' --shapes "$value"
+    reject '--shapes takes 27b, 35b, minicpm5 or lfm2' --shapes "$value"
 done
 for value in 0 16384 -1 1x ''; do
     reject '--extent-pages requires integers' --extent-pages "$value"

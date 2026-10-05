@@ -19,9 +19,10 @@ struct SplashLfmConvParams {
   uint32_t taps;            // kernel taps (3)
   uint32_t taps_major;      // weights are [tap][channel] when set
   uint64_t state_layer_bytes; // one layer's conv state bytes per lane
-  uint32_t layer;           // the recurrent layer's state slot
+  uint32_t layer;           // the first recurrent layer's state slot
   uint32_t lanes;           // verify lanes in the dispatch
-  uint32_t reserved;
+  uint32_t layers;          // conv layers batched in one commit dispatch
+  uint64_t mixed_layer_stride; // bytes between layers' `mixed` blocks
 };
 
 typedef struct SplashLfmConvParams SplashLfmConvParams;

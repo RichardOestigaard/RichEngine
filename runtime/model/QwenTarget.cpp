@@ -1,4 +1,5 @@
 #include "model/QwenTarget.hpp"
+#include "Env.hpp"
 
 #include "metal/abi/GDN.h"
 #include "model/Dense.hpp"
@@ -348,6 +349,7 @@ struct QwenTarget::VerifyStep {
   bool tree = false;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
+  std::span<const uint32_t> liveRows{};
 };
 
 metal::MetalBuffer QwenTarget::addPrefill(
@@ -437,7 +439,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
          u16(b.gdnKeys, geometry_.gdnKeyWidth()), u16(b.gdnValues, geometry_.attentionWidth), mixer.decay,
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
-         mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
+         mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth), b.gdnChunkScratch},
         geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder,
         prefillSums(backend_, b.projectionSums, sequence.rowBegin, sequence.rows, geometry_.attentionWidth));
   }
@@ -591,8 +593,9 @@ void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
     std::span<const SplashKvLayer> kvLayers,
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
-    bool tree) const {
+    bool tree, std::span<const uint32_t> liveRows) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
+      (!liveRows.empty() && liveRows.size() != lanes) ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
       buffers.gdnMixed.size() != geometry_.stateLayout.layers ||
@@ -625,6 +628,7 @@ void QwenTarget::addVerify(
   step.planLanes = planLanes;
   step.rowCapacity = rowCapacity;
   step.tree = tree;
+  step.liveRows = liveRows;
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes);
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
@@ -697,7 +701,7 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
                  geometry_.stateLayout.convolutionBytes()},
-                mixer.outputHeadOrder, outputPlan.input());
+                mixer.outputHeadOrder, outputPlan.input(), step.liveRows);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
               .prepared = hidden},
@@ -764,18 +768,28 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttent
                                            step.rowCapacity);
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual);
-  // A Plain-input out-projection folds the query gate into the attention
-  // reduce dispatch; a table or packed one keeps the gate kernel that writes
-  // its operand.
   ops::PreparedInput hidden;
-  static const bool noFusedGate = std::getenv("SPLASH_NO_FUSED_GATE") != nullptr;
-  if (geometry_.attentionQueryGate && !noFusedGate &&
-      outputPlan.input() == ops::LinearInput::Plain) {
+  static const bool noFusedGate = envFlag("SPLASH_NO_FUSED_GATE");
+  // A Plain-input out-projection folds its operand pass into the attention
+  // reduce: the query gate of the gated targets, the hidden-row gather of
+  // the no-gate ones (chain verifies only — tree plans keep the two-pass
+  // path, the fused gather kernels are chain-shaped).
+  const bool fusedReduce =
+      !noFusedGate && outputPlan.input() == ops::LinearInput::Plain &&
+      (geometry_.attentionQueryGate ||
+       // verify_attention_reduce_gather_* exists for hd128 and hd64 only.
+       (!step.tree && (geometry_.attentionHeadDimension == 128 ||
+                       geometry_.attentionHeadDimension == 64)));
+  if (fusedReduce) {
     ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                    {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries,
                                     b.attentionPartials, b.attentionStatistics, b.fullAttention,
                                     b.pageTables, b.treeMasks},
-                                   step.chunks, step.attention, b.fullPacked, b.attentionHidden);
+                                   step.chunks, step.attention,
+                                   geometry_.attentionQueryGate
+                                       ? b.fullPacked
+                                       : metal::MetalBuffer{},
+                                   b.attentionHidden);
   } else {
     ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                    {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
@@ -924,15 +938,15 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph,
                                 geometry_.convolutionDimension * 2;
     const uint64_t layerBytes =
         uint64_t{ExecutionLimits::maximumBatchWidth} * laneStride;
-    for (uint32_t layer = 0; layer < geometry_.convLayers; ++layer)
-      ops::LfmConv::addCommit(
-          graph,
-          {backend_.view(buffers.mixed, uint64_t{layer} * layerBytes,
-                         layerBytes),
-           buffers.retainedCounts, buffers.currentStates, buffers.nextStates},
-          geometry_.convShape(), lanes, ExecutionLimits::targetVerifyRows,
-          layer, geometry_.stateLayout.convolutionLayerBytes(),
-          /*tapsMajor*/ false);
+    // One dispatch rolls every conv layer's lanes: the kernel derives each
+    // layer's state slot and its `mixed` block from the layer's grid slice.
+    ops::LfmConv::addCommit(
+        graph,
+        {buffers.mixed, buffers.retainedCounts, buffers.currentStates,
+         buffers.nextStates},
+        geometry_.convShape(), lanes, ExecutionLimits::targetVerifyRows,
+        /*layer*/ 0, geometry_.stateLayout.convolutionLayerBytes(),
+        geometry_.convLayers, layerBytes, /*tapsMajor*/ false);
     return;
   }
   ops::GDN::addCommit(

@@ -101,6 +101,19 @@ struct Worst final {
   }
 };
 
+// The WY/UT scratch of a chunked prefill (SPLASH_GDN_CHUNKED 32/64/128);
+// empty for the serial scan.
+MetalBuffer chunkScratch(MetalBackend &backend, const GdnShape &shape,
+                         uint32_t tokens) {
+  const char *value = std::getenv("SPLASH_GDN_CHUNKED");
+  const uint32_t factor = value ? uint32_t(std::atoi(value)) : 0;
+  if (factor != 32 && factor != 64 && factor != 128)
+    return {};
+  return shared(backend,
+                GDN::chunkScratchFloats(shape, tokens, factor) * 4,
+                "chunk scratch");
+}
+
 // Per-token outputs of a prefill over `tokens` rows; the caller supplies the
 // packed rows, the convolution carry and the recurrent state it starts from.
 GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
@@ -130,7 +143,8 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
           shared(backend, stateBytes, "state out"),
           shared(backend, uint64_t{tokens} * valueWidth * 2, "recurrent rows"),
           std::move(mixerNorm),
-          shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden")};
+          shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden"),
+          chunkScratch(backend, shape, tokens)};
 }
 
 // The mixer norm is bf16, or F32 as a GGUF stores it.

@@ -127,6 +127,9 @@ enum class PrefillTensor : uint32_t {
   // (ops::LinearScratch::input and ::sums, kernels/shared/gguf_mxfp4p.metal).
   LinearPacked,
   LinearExponents,
+  // WY/UT scratch of the chunked GDN scan (SPLASH_GDN_CHUNKED); zero-sized
+  // unless the flag selects a chunk factor.
+  GdnChunkScratch,
   Count,
 };
 

@@ -1,4 +1,5 @@
 #include "Linear.hpp"
+#include "Env.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -486,6 +487,72 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits};
   }
   if (appleGpuFamily_ >= 10) {
+    // Measured overrides (tune-kernels, 20-core M5 Pro, 2026-10-05): these
+    // decode shapes beat their policy defaults — mostly deeper split-K than
+    // the wave-fit rule reaches, +5% to +24% GPU. Exact {matrix, rows,
+    // epilogue} rows so no unmeasured workload changes policy.
+    struct DecodeOverride final {
+      LinearMatrix matrix;
+      uint32_t rows;
+      LinearEpilogue epilogue;
+      LinearTile tile;
+      uint32_t groups;
+      LinearSimdgroups simdgroups;
+      uint32_t splits;
+    };
+    static constexpr DecodeOverride kMeasuredOverrides[] = {
+        // Qwen3.8-27B shapes.
+        {{1280, 5120}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +18.7%
+        {{6144, 5120}, 24, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +7.5%
+        {{6144, 5120}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},    // +10.4%
+        {{14336, 5120}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +14.0%
+        {{16640, 5120}, 16, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},    // +6.3%
+        {{16640, 5120}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},    // +12.8%
+        {{5120, 17408}, 24, LinearEpilogue::Residual,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +5.1%
+        {{5120, 17408}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +5.5%
+        {{5120, 25600}, 24, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +6.1%
+        {{5120, 25600}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +6.1%
+        {{17408, 5120}, 32, LinearEpilogue::GateUp,
+         LinearTile::N256, 68, LinearSimdgroups::Eight, 1},       // +6.9%
+        // Ornith-1.5-9B shapes.
+        {{4096, 12288}, 24, LinearEpilogue::Residual,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +13.5%
+        {{4096, 12288}, 32, LinearEpilogue::Residual,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +15.7%
+        {{4096, 32768}, 24, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 8},    // +23.6%
+        {{4096, 32768}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 8},    // +24.0%
+        {{6144, 4096}, 32, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},    // +10.1%
+        {{10240, 4096}, 8, LinearEpilogue::None,
+         LinearTile::N128, 80, LinearSimdgroups::Eight, 1},       // +14.2%
+        {{10240, 4096}, 32, LinearEpilogue::None,
+         LinearTile::N128, 80, LinearSimdgroups::Eight, 1},       // +12.5%
+        {{12288, 4096}, 8, LinearEpilogue::GateUp,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +11.4%
+        {{12288, 4096}, 16, LinearEpilogue::GateUp,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 4},    // +7.5%
+        {{12544, 4096}, 8, LinearEpilogue::None,
+         LinearTile::Paired256, 49, LinearSimdgroups::Four, 1},   // +8.9%
+        {{12544, 4096}, 16, LinearEpilogue::None,
+         LinearTile::Split128, 0, LinearSimdgroups::Eight, 2},    // +6.7%
+    };
+    for (const DecodeOverride &o : kMeasuredOverrides) {
+      if (w.matrix == o.matrix && w.rows == o.rows &&
+          w.epilogue == o.epilogue)
+        return {o.tile, o.groups, o.simdgroups, o.splits};
+    }
     if (const uint32_t splits = apple10Splits(w.matrix, gpuCores_); splits > 1)
       return {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
     if (lanes == 1)
@@ -537,12 +604,12 @@ namespace {
 // elements: 1 of 32768 at 32 rows, observed at ~4e-5 magnitudes where the
 // pack's exponent path engages). Equal within fp64, not bitwise.
 bool packedPrefillEnabled() {
-  static const bool on = std::getenv("SPLASH_GGUF_PACKED_ON") != nullptr;
+  static const bool on = envFlag("SPLASH_GGUF_PACKED_ON");
   return on;
 }
 // A kill switch for the packed paths, for benchmarks and triage.
 bool packedTilesDisabled() {
-  static const bool off = std::getenv("SPLASH_GGUF_PACKED_OFF") != nullptr;
+  static const bool off = envFlag("SPLASH_GGUF_PACKED_OFF");
   return off;
 }
 // A GGUF prefill plan may dispatch gguf_pack_half and the pre-packed MXFP4

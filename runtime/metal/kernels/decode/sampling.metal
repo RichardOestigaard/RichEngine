@@ -46,6 +46,12 @@ inline uint selected_lane(constant TargetSamplingParams &params, uint s) {
 inline bool lane_samples(constant TargetSamplingParams &params, uint s) {
   return (params.sampling_mask & (1u << selected_lane(params, s))) != 0;
 }
+// A selected row past its lane's live verify rows (adaptive proposal
+// budgets): the selection kernels skip it and acceptance never reaches it.
+inline bool row_dead(constant TargetSamplingParams &params, uint s) {
+  const uint live = params.live_rows[selected_lane(params, s)];
+  return live && s % params.rows >= live;
+}
 
 // Selected row s of a dispatch (TargetSamplingParams). The per-lane stride of
 // the logits and mask buffers is the larger of the chain's eight rows and
@@ -139,7 +145,7 @@ kernel void decode_sample_mass_sharded(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup TargetShardMass group_masses[8];
   const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  if (!lane_samples(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s))
     return;
   shard_mass(selected_row(logits, token_mask, params, s),
              group % SPLASH_TARGET_SAMPLING_SHARDS, partial_masses[group],
@@ -861,7 +867,7 @@ kernel void decode_sample_vocabulary_search(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup VocabularyScratch scratch;
-  if (!lane_samples(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s))
     return;
   const uint batch = selected_lane(params, s);
   search_row(selected_row(logits, token_mask, params, s),
@@ -892,15 +898,20 @@ kernel void decode_sample_vocabulary_draw(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
   const uint s = group / kVocabularyGroups;
-  if (!lane_samples(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s))
     return;
   const uint batch = selected_lane(params, s);
   const uint index = s % params.rows;
   device TargetVocabularyRow &record = vocabulary_rows[s];
   TargetRow row = selected_row(logits, token_mask, params, s);
   row.maximum = record.maximum;
-  // A drafted row follows its draft token, the next verify input row.
-  const bool drafted = index < params.drafted_rows;
+  // A drafted row follows its draft token, the next verify input row. The
+  // lane's last live row is never drafted: its draw is the bonus a full
+  // acceptance takes, sampled from the target, not the residual. A zero
+  // live_rows is an unadapted dispatch — every row is live.
+  const uint live = params.live_rows[batch];
+  const bool drafted =
+      index < params.drafted_rows && (!live || index + 1 < live);
   const ulong position =
       ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
   uint token;
@@ -1558,53 +1569,117 @@ kernel void draft_select_plain(
     tokens[batch * Positions + position] = chosen;
 }
 
-// One simdgroup per lane walks a DSpark draft's proposal positions in order:
-// each position's top-16 candidates (dspark_select_top16_sharded) are
-// rescored with the Markov bias W2 . W1[prev] of the previously sampled
-// token — the anchor for position zero — before the greedy or drawn pick
-// that feeds the next position. The bias reaches only the candidates the
+// One group per DSpark proposal row. Simdgroup 0 merges the row's top-16
+// candidates and unary scores; simdgroup 1 merges the preceding row's
+// (position zero's only predecessor is the anchor). Every remaining thread
+// then accumulates one predecessor/candidate edge's Markov bias
+// W2[candidate] . W1[predecessor] over the rank in order, so each entry
+// rounds exactly as the serial walk's per-lane dot did. The table follows
+// the shard partials in partial-values scratch, laid out as
+// draft_select_edges lays it out. The bias reaches only the candidates the
 // unbiased top-16 kept, the same candidate restriction the DFlash2
 // selector's codebook edges apply.
-kernel void draft_select_dspark(
+kernel void dspark_select_edges(
     device const uint *partial_ids [[buffer(0)]],
-    device const float *partial_values [[buffer(1)]],
-    device const float *uniforms [[buffer(2)]],
-    device uint *candidates [[buffer(3)]],
+    device float *partial_values [[buffer(1)]],
+    device uint *candidates [[buffer(2)]],
+    device float *unary [[buffer(3)]],
+    device const bfloat *markov_w1 [[buffer(4)]],
+    device const bfloat *markov_w2 [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
+  const uint batch = row / Positions;
+  const uint position = row % Positions;
+  threadgroup uint successors[Candidates];
+  threadgroup uint predecessors[Candidates];
+  if (simd_group == 0) {
+    float value;
+    uint token;
+    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+    if (lane < Candidates) {
+      candidates[row * Candidates + lane] = token;
+      unary[row * Candidates + lane] = value;
+      successors[lane] = token;
+    }
+  } else if (simd_group == 1) {
+    uint token = params.anchor[batch];
+    if (position > 0) {
+      float value;
+      top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
+                         token);
+    }
+    if (lane < Candidates)
+      predecessors[lane] = token;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // One thread per edge: the bias sums the rank's products in order in one
+  // lane, so the table's entries are bitwise the serial walk's dots.
+  const uint predecessor = thread_index / Candidates;
+  const uint candidate = thread_index % Candidates;
+  if (predecessor >= (position ? Candidates : 1u))
+    return;
+  device float *table =
+      partial_values +
+      ulong(params.lanes) * Positions * Shards * Candidates +
+      ulong(row) * Candidates * Candidates;
+  // Ids are produced by the top-k selection and are always in range; the
+  // clamp only keeps a corrupted id inside the Markov tables.
+  const uint safe_predecessor =
+      min(predecessors[predecessor], params.vocabulary - 1u);
+  const uint safe_candidate =
+      min(successors[candidate], params.vocabulary - 1u);
+  device const bfloat *feature_row =
+      markov_w1 + ulong(safe_predecessor) * Rank;
+  device const bfloat *bias_row = markov_w2 + ulong(safe_candidate) * Rank;
+  float bias = 0.0f;
+  for (uint dim = 0; dim < Rank; ++dim)
+    bias += float(bias_row[dim]) * float(feature_row[dim]);
+  table[predecessor * Candidates + candidate] = bias;
+}
+
+// One simdgroup per lane walks a DSpark draft's proposal positions in order:
+// each position's score is its candidate's unary score plus the edge the
+// parallel dspark_select_edges pass scored for the previously chosen
+// candidate — the anchor's row for position zero — then the greedy or drawn
+// pick feeds the next position, exactly as the serial Markov walk did.
+kernel void draft_select_dspark(
+    device const uint *candidates [[buffer(0)]],
+    device const float *unary [[buffer(1)]],
+    device const float *partial_values [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
     device float *probabilities [[buffer(4)]],
     device uint *tokens [[buffer(5)]],
-    device const bfloat *markov_w1 [[buffer(6)]],
-    device const bfloat *markov_w2 [[buffer(7)]],
-    constant SelectorBatchParams &params [[buffer(8)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
-  threadgroup float feature[Rank];
-  threadgroup uint chosen[Positions];
+  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  device const float *tables =
+      partial_values +
+      ulong(params.lanes) * Positions * Shards * Candidates +
+      ulong(batch) * Positions * Candidates * Candidates;
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
     const uint row = batch * Positions + position;
-    const uint previous =
-        position ? chosen[position - 1] : params.anchor[batch];
-    for (uint dim = lane; dim < Rank; dim += 32)
-      feature[dim] = float(markov_w1[ulong(previous) * Rank + dim]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float value;
-    uint token;
-    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
-    float biased = -INFINITY;
-    if (lane < Candidates && token < params.vocabulary) {
-      device const bfloat *bias_row = markov_w2 + ulong(token) * Rank;
-      float bias = 0.0f;
-      for (uint dim = 0; dim < Rank; ++dim)
-        bias += float(bias_row[dim]) * feature[dim];
-      biased = value + bias;
-    }
-    if (lane < Candidates)
-      candidates[row * Candidates + lane] = token;
+    const uint token =
+        lane < Candidates ? candidates[row * Candidates + lane] : 0xffffffffu;
+    const float value =
+        lane < Candidates ? unary[row * Candidates + lane] : -INFINITY;
+    const float edge =
+        tables[(position * Candidates + predecessor_index) * Candidates +
+               min(lane, uint(Candidates - 1))];
+    const float biased = lane < Candidates ? value + edge : -INFINITY;
 
     const float scaled = lane < Candidates ? biased / temperature : -INFINITY;
     const float maximum = simd_max(scaled);
@@ -1629,11 +1704,11 @@ kernel void draft_select_dspark(
       if (selected == 0xffffffffu)
         selected = 0;
     }
-    chosen[position] = simd_broadcast(token, selected);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint chosen = simd_broadcast(token, selected);
+    if (lane == 0)
+      tokens[row] = chosen;
+    predecessor_index = selected;
   }
-  for (uint position = lane; position < Positions; position += 32)
-    tokens[batch * Positions + position] = chosen[position];
 }
 
 inline float sparse_lookup(device const uint *ids,
@@ -1651,6 +1726,8 @@ struct AcceptParams {
   uint remaining;
   uint stop_token_0;
   uint stop_token_1;
+  // The lane's proposal budget: the most draft tokens it may accept.
+  uint limit;
 };
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
@@ -1684,7 +1761,7 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &accepted_count,
                                 AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < params.limit) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
                             draft_probs + accepted * kDraftCandidates,
@@ -1752,7 +1829,7 @@ kernel void decode_sample_argmax_sharded(
   threadgroup float group_values[8];
   threadgroup uint group_indices[8];
   const uint s = group / SPLASH_TARGET_SAMPLING_SHARDS;
-  if (lane_samples(params, s))
+  if (lane_samples(params, s) || row_dead(params, s))
     return;
   argmax_shard(selected_row(logits, token_mask, params, s),
                group % SPLASH_TARGET_SAMPLING_SHARDS, partial_values[group],
@@ -1781,7 +1858,7 @@ kernel void decode_sample_argmax_reduce(
     constant TargetSamplingParams &params [[buffer(3)]],
     uint s [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  if (lane_samples(params, s))
+  if (lane_samples(params, s) || row_dead(params, s))
     return;
   const uint token = argmax_reduce(partial_values, partial_indices, s, lane);
   if (lane == 0)
@@ -1794,7 +1871,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &accepted_count,
                                AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < params.limit &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -1815,7 +1892,11 @@ kernel void decode_accept_dflash(
     uint batch [[threadgroup_position_in_grid]]) {
   uint remaining = params.remaining[batch];
   AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+                           params.stop_token_1,
+                           params.proposals[batch]
+                               ? min(uint(SPLASH_DRAFT_PROPOSAL_TOKENS),
+                                     params.proposals[batch])
+                               : uint(SPLASH_DRAFT_PROPOSAL_TOKENS)};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =
@@ -1897,7 +1978,8 @@ kernel void decode_accept_tree(
   if (count <= remaining)
     output_tokens[count - 1] = target_tokens[cursor];
   AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+                           params.stop_token_1,
+                           SPLASH_DRAFT_PROPOSAL_TOKENS};
   finish_acceptance(output_tokens, count - 1, lane_params, retained[batch],
                     accepted_count[batch]);
   for (uint i = 0; i < retained[batch]; ++i)

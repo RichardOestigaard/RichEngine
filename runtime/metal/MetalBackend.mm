@@ -1,5 +1,6 @@
 #import "MetalBackend.hpp"
 #include "CommandWatchdog.hpp"
+#include "Env.hpp"
 #include "Residency.hpp"
 #include "TestConfig.hpp"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
@@ -838,14 +839,14 @@ struct MetalBackend::Impl {
 
     // The escape hatch: baked indirect dispatch is off entirely.
     [[nodiscard]] static bool icbDisabled() noexcept {
-        static const bool disabled = std::getenv("SPLASH_ICB_OFF") != nullptr;
+        static const bool disabled = envFlag("SPLASH_ICB_OFF");
         return disabled;
     }
 
     // The Metal 4 encoder is opt-in (SPLASH_MTL4=1) while it is benchmarked
     // against the Metal 3 path it mirrors.
     [[nodiscard]] static bool mtl4Enabled() noexcept {
-        static const bool enabled = std::getenv("SPLASH_MTL4") != nullptr;
+        static const bool enabled = envFlag("SPLASH_MTL4");
         return enabled;
     }
 
@@ -1336,8 +1337,7 @@ struct MetalBackend::Impl {
 
     // The escape hatch for the prepared-command cache only.
     [[nodiscard]] static bool preparedCacheDisabled() noexcept {
-        static const bool disabled =
-            std::getenv("SPLASH_PREPARED_CACHE_OFF") != nullptr;
+        static const bool disabled = envFlag("SPLASH_PREPARED_CACHE_OFF");
         return disabled;
     }
 

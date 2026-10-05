@@ -141,9 +141,10 @@ void Sampling::addInitial(metal::CommandGraph &graph,
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, uint32_t stopToken0,
-                         uint32_t stopToken1,
-                         const PenaltyTable &penalties) const {
-  if (policies.empty() || policies.size() > kMaximumLanes)
+                         uint32_t stopToken1, const PenaltyTable &penalties,
+                         std::span<const uint32_t> liveRows) const {
+  if (policies.empty() || policies.size() > kMaximumLanes ||
+      (!liveRows.empty() && liveRows.size() != policies.size()))
     throw std::invalid_argument("invalid sampling batch width");
   addPenalties(graph, policies, buffers, penalties, 0, true);
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
@@ -152,7 +153,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   addSelection(graph, policies, buffers,
                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION,
                 SPLASH_DRAFT_PROPOSAL_TOKENS},
-               stopToken0, stopToken1);
+               stopToken0, stopToken1, liveRows);
 }
 
 void Sampling::addVerifyTree(metal::CommandGraph &graph,
@@ -174,7 +175,8 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                             std::span<const SamplingPolicy> policies,
                             const SamplingBuffers &buffers,
                             const TargetRows &rows, uint32_t stopToken0,
-                            uint32_t stopToken1) const {
+                            uint32_t stopToken1,
+                            std::span<const uint32_t> liveRows) const {
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
@@ -201,6 +203,10 @@ void Sampling::addSelection(metal::CommandGraph &graph,
       params.constrained_mask |= uint32_t{1} << lane;
     if (policy.excludesStopTokens)
       params.exclude_stop_mask |= uint32_t{1} << lane;
+    params.live_rows[lane] =
+        lane < liveRows.size()
+            ? std::clamp(liveRows[lane], uint32_t{1}, rows.rows)
+            : rows.rows;
   }
   // Greedy and sampled lanes run their own kernels, each over the selected
   // rows of every lane; the groups of the other kind's lanes return at once.
@@ -238,9 +244,10 @@ void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
     std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-    uint32_t stopToken1) const {
+    uint32_t stopToken1, std::span<const uint32_t> proposals) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
-      maximumRetained.size() > kMaximumLanes)
+      maximumRetained.size() > kMaximumLanes ||
+      (!proposals.empty() && proposals.size() != policies.size()))
     throw std::invalid_argument("invalid DFlash acceptance batch");
   const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
   AcceptBatchParams params{};
@@ -251,6 +258,11 @@ void Sampling::addAcceptance(
         maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
+    params.proposals[lane] =
+        lane < proposals.size()
+            ? std::min(proposals[lane],
+                       uint32_t{SPLASH_DRAFT_PROPOSAL_TOKENS})
+            : SPLASH_DRAFT_PROPOSAL_TOKENS;
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }

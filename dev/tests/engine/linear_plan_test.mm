@@ -123,6 +123,47 @@ std::optional<LinearConfig> expectedOneLane(uint32_t cores,
   return std::nullopt;
 }
 
+// The measured per-shape overrides Linear.cpp's decode baseline applies
+// first, restated for the rule checks: matrix, rows (decode rows), epilogue
+// -> tile/groups/simdgroups/splits. Tile 255 = no override.
+LinearConfig measuredOverride(LinearMatrix matrix, uint32_t rows,
+                              LinearEpilogue epilogue) {
+  struct Override {
+    LinearMatrix matrix;
+    uint32_t rows;
+    LinearEpilogue epilogue;
+    LinearConfig config;
+  };
+  static constexpr Override overrides[] = {
+        {{1280, 5120}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{6144, 5120}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{6144, 5120}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{14336, 5120}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{16640, 5120}, 16, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{16640, 5120}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{5120, 17408}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 17408}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 25600}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 25600}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{17408, 5120}, 32, LinearEpilogue::GateUp, {LinearTile::N256, 68, LinearSimdgroups::Eight, 1}},
+        {{4096, 12288}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{4096, 12288}, 32, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{4096, 32768}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
+        {{4096, 32768}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
+        {{6144, 4096}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{10240, 4096}, 8, LinearEpilogue::None, {LinearTile::N128, 80, LinearSimdgroups::Eight, 1}},
+        {{10240, 4096}, 32, LinearEpilogue::None, {LinearTile::N128, 80, LinearSimdgroups::Eight, 1}},
+        {{12288, 4096}, 8, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{12288, 4096}, 16, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{12544, 4096}, 8, LinearEpilogue::None, {LinearTile::Paired256, 49, LinearSimdgroups::Four, 1}},
+        {{12544, 4096}, 16, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+  };
+  for (const Override &o : overrides)
+    if (matrix == o.matrix && rows == o.rows && epilogue == o.epilogue)
+      return o.config;
+  return {LinearTile(255), 0, LinearSimdgroups(255), 0};
+}
+
 LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix,
                             uint32_t lanes, LinearEpilogue epilogue) {
   if (family == 9 && !(lanes >= 3 && epilogue == LinearEpilogue::None &&
@@ -137,9 +178,13 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
     }
     return {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, selected};
   }
-  if (family >= 10)
+  if (family >= 10) {
+    if (const LinearConfig config = measuredOverride(matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, epilogue);
+        config.tile != LinearTile(255))
+      return config;
     if (const uint32_t splits = expectedApple10Splits(cores, matrix); splits > 1)
       return {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
+  }
   constexpr GroupRule n128{4, 4, 12}, m16{5, 4, 12}, n256{3, 3, 8}, gateUp{3, 3, 8},
       fourSimdgroups{8, 8, 24};
   const uint32_t tiles128 = matrix.outputSize / 128;
@@ -432,22 +477,24 @@ void baselinePlans() {
               configured(10, 20, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 60} &&
               configured(10, 16, {{12544, 2048}, 8}) ==
                   LinearConfig{LinearTile::Paired256, 49, LinearSimdgroups::Four} &&
-              configured(10, 20, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 75} &&
-              configured(10, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 64} &&
+              // The measured overrides: 16- and 32-row {16640, 5120} decode
+              // takes four- and two-split Split128 tiles on Apple10.
+              configured(10, 20, {{16640, 5120}, 16}) == LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 2} &&
+              configured(10, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 2} &&
               configured(10, 20, {{12544, 2048}, 16}) == LinearConfig{LinearTile::N128, 98} &&
               configured(10, 16, {{16640, 5120}, 24}) ==
                   LinearConfig{LinearTile::N128, 96, LinearSimdgroups::Four} &&
               configured(10, 20, {{16640, 5120}, 24}) ==
                   LinearConfig{LinearTile::N128, 130, LinearSimdgroups::Four} &&
-              configured(10, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 45} &&
+              configured(10, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 2} &&
               configured(10, 20, {{248320, 5120}, 16}) == LinearConfig{LinearTile::N128, 1940} &&
               configured(9, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 2} &&
               configured(10, 0, {{16640, 5120}, 8}) == configured(10, 32, {{16640, 5120}, 8}),
           "persistent decode groups changed for the measured shapes");
   require(configured(10, 16, {{14336, 5120}, 24}) ==
               LinearConfig{LinearTile::N128, 112, LinearSimdgroups::Four} &&
-          configured(10, 16, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N256, 40} &&
-          configured(10, 40, {{14336, 5120}, 32}) == LinearConfig{LinearTile::N128, 112} &&
+          configured(10, 16, {{14336, 5120}, 32}) == LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 4} &&
+          configured(10, 40, {{14336, 5120}, 32}) == LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 4} &&
           configured(9, 40, {{14336, 5120}, 24}) ==
               LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 4} &&
           configured(9, 40, {{248320, 5120}, 24}) ==
@@ -922,7 +969,10 @@ void ggufPlans() {
   // The arena bound is the single-tensor plan of the 32-row tile, which fused
   // and gate/up plans share.
   const ProjectionShape downShape{5120, 17408, WeightLayout::Block32};
-  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
+  // The arena bound also covers the MXFP4 tiers' splits a segment may take,
+  // so it is at least the single plan's; equality holds when the plan's own
+  // splits are the MXFP4 rule's.
+  require(linear.decodeScratchSize(downShape).partials >= three.scratchSize().partials,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from three of its
   // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
@@ -1179,9 +1229,17 @@ void apple10AffineCoreLaws() {
             const LinearPlan one = plan(linear, n, 8);
             const LinearConfig c = one.configuration();
             const bool split = c.tile == LinearTile::Split128;
+            // The measured overrides are keyed on the row count; a shape one
+            // of them names is exempt from batch-width independence.
+            bool overridden = false;
+            for (const uint32_t w : {n, 2 * n})
+              for (const uint32_t rows : {8U, 16U, 24U, 32U})
+                overridden |=
+                    measuredOverride({w, k}, rows, epilogue).tile != LinearTile(255);
             for (const uint32_t rows : {16U, 24U, 32U}) {
               const LinearConfig wider = plan(linear, n, rows).configuration();
-              require((wider.tile == LinearTile::Split128) == split && (!split || wider == c),
+              require(overridden ||
+                          ((wider.tile == LinearTile::Split128) == split && (!split || wider == c)),
                       "Apple10 split plan depends on the batch width");
             }
             const uint32_t s = c.splits;
@@ -1189,7 +1247,7 @@ void apple10AffineCoreLaws() {
                         (!split || (c.groups == 0 && c.simdgroups == LinearSimdgroups::Eight)),
                     "Apple10 split plan tile or split count");
             require(k / 256 >= s, "Apple10 split partition below one 256-input block");
-            if (cores) {
+            if (cores && !overridden) {
               require(plan(twice, 2 * n, 8).configuration().splits == s,
                       "Apple10 split count depends on more than the grid per core");
               require(plan(more, n, 8).configuration().splits >= s, "Apple10 split count falls with more cores");

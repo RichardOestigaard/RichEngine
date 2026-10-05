@@ -289,6 +289,9 @@ ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
+	runtime/model/RuntimeAne.mm \
+	runtime/model/RuntimeEncode.mm \
+	runtime/model/RuntimeNgram.mm \
 	runtime/model/RuntimeArenas.mm \
 	runtime/ops/Vision.mm \
 	runtime/ops/PageStorage.mm \

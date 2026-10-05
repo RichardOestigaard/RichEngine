@@ -1,6 +1,8 @@
 #pragma once
 
 // Parameter layouts shared by host dispatch code and Metal kernels.
+#include "metal/abi/ExecutionGeometry.h"
+
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else
@@ -19,6 +21,19 @@ struct GDNPrefillParams {
 static_assert(sizeof(GDNPrefillParams) == 4,
               "GDN prefill parameters are 4 bytes on both sides");
 
+// The chunkwise-parallel (WY/UT) scan kernels in prefill/gdn_chunked.metal,
+// dispatched when a GdnPrefillBuffers.chunkScratch is bound. The chunk
+// factor C is compiled into the kernel name (gdn_chunked_*_cC).
+struct GDNChunkedParams {
+  uint32_t tokens;
+  uint32_t key_heads;
+  uint32_t value_heads;
+  uint32_t chunks; // ceil(tokens / C)
+};
+
+static_assert(sizeof(GDNChunkedParams) == 16,
+              "GDN chunked parameters are 16 bytes on both sides");
+
 // tiled_heads (0 or 1) selects the value-head order of the GDN output, the
 // out_proj input columns: 0 keeps a key head's value heads adjacent (head h
 // at h); 1 is llama.cpp's tiled GGUF order, head h at
@@ -36,10 +51,14 @@ struct GDNDecodeBatchParams {
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
+  // Adaptive proposal budgets (SPLASH_ADAPTIVE_PROPOSALS): each lane's live
+  // verify rows bound the serial scan. Zero or SPLASH_TARGET_VERIFY_ROWS
+  // scans all eight rows; the commit replays only retained rows regardless.
+  uint32_t live_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 32,
-              "GDN decode parameters are 32 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 48,
+              "GDN decode parameters are 48 bytes on both sides");
 
 struct GDNBatchCommitParams {
   uint64_t conv_layer_bytes;

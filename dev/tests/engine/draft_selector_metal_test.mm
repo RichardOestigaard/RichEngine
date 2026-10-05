@@ -334,6 +334,151 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 }
 
+// The DSpark selector against the same references: position p reads logits
+// row p (the anchor row already predicts), the Markov bias W2[candidate] .
+// W1[predecessor] replaces the codebook edge, and the parallel edge pass
+// must agree with the serial walk the reference models.
+void runDSparkCase(MetalBackend &backend, const Case &c) {
+  Random random(0xd5a9ec + uint64_t{c.vocabulary} * 8 + c.lanes * 2 +
+                c.sampling);
+  const uint32_t rows = c.lanes * kRows;
+  const uint32_t positions = c.lanes * kPositions;
+  const auto workspace = DraftSelector::workspace(positions);
+  const DraftSelector selector(c.vocabulary);
+
+  MetalBuffer logits =
+      allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
+  auto *logitRows = static_cast<float *>(logits.contents());
+  const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
+                            Pattern::Sparse};
+  for (uint32_t row = 0; row < rows; ++row)
+    fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
+            patterns[(row / kRows + row % kRows) % patterns.size()], random);
+  const DraftMarkovHead markov{
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  DraftSelectorBuffers buffers{
+      logits,
+      allocate(backend, workspace.partialIdsBytes),
+      allocate(backend, workspace.partialValuesBytes),
+      allocate(backend, workspace.candidatesBytes),
+      allocate(backend, workspace.unaryBytes),
+      allocate(backend, uint64_t{rows} * kRank * sizeof(uint16_t)),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
+      allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
+  auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
+  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
+    uniforms[index] = (random.unit() + 1.0F) * 0.5F;
+  std::vector<uint32_t> anchors(c.lanes);
+  std::vector<SamplingPolicy> policies(c.lanes);
+  for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    anchors[lane] = random.next() % c.vocabulary;
+    policies[lane] = SamplingPolicy{16, c.sampling ? 0.8F : 0.0F, 1.0F, false};
+  }
+
+  CommandGraph graph;
+  selector.addDSpark(graph, buffers, markov, anchors, policies);
+  require(graph.dispatches().size() == 3,
+          "dspark selector dispatch count changed");
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+
+  const auto *candidates =
+      static_cast<const uint32_t *>(buffers.candidates.contents());
+  const auto *unary = static_cast<const float *>(buffers.unary.contents());
+  const auto *tokens =
+      static_cast<const uint32_t *>(buffers.proposedTokens.contents());
+  const auto *probabilities =
+      static_cast<const float *>(buffers.proposalProbabilities.contents());
+  const auto *w1 = static_cast<const uint16_t *>(markov.embedding.contents());
+  const auto *w2 =
+      static_cast<const uint16_t *>(markov.projection.contents());
+
+  for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    uint32_t predecessor = anchors[lane];
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t global = lane * kPositions + position;
+      const float *row =
+          logitRows + (uint64_t{lane} * kRows + position) * c.vocabulary;
+      const auto expected = referenceTop16(row, c.vocabulary);
+      for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+        const uint32_t id = candidates[global * kCandidates + rank];
+        const float value = unary[global * kCandidates + rank];
+        if (rank < expected.size()) {
+          require(id == expected[rank] && value == row[expected[rank]],
+                  "dspark top-16 candidates differ from the exact sorted order");
+        } else {
+          require(id == 0xFFFFFFFFU && value == -INFINITY,
+                  "dspark top-16 padding lost the empty sentinel");
+        }
+      }
+
+      std::array<double, kCandidates> scores{};
+      for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+        const uint32_t candidate =
+            std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
+        double bias = 0.0;
+        for (uint32_t dim = 0; dim < kRank; ++dim)
+          bias += double(tuning::bf16ToFloat(
+                      w2[uint64_t{candidate} * kRank + dim])) *
+                  tuning::bf16ToFloat(
+                      w1[uint64_t{predecessor} * kRank + dim]);
+        scores[rank] = double(unary[global * kCandidates + rank]) + bias;
+      }
+      const uint32_t token = tokens[global];
+      uint32_t selected = kCandidates;
+      for (uint32_t rank = 0; rank < kCandidates; ++rank)
+        if (candidates[global * kCandidates + rank] == token)
+          selected = selected == kCandidates ? rank : selected;
+      require(selected < kCandidates,
+              "dspark selector proposed a token outside its candidates");
+      if (c.sampling) {
+        const double maximum = *std::max_element(scores.begin(), scores.end());
+        double sum = 0.0;
+        std::array<double, kCandidates> reference{};
+        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+          reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
+          sum += reference[rank];
+        }
+        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
+                                       SPLASH_UNIFORM_PROPOSALS + position];
+        std::array<double, kCandidates> cumulative{};
+        uint32_t expectedSelection = kCandidates - 1;
+        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+          const float probability = probabilities[global * kCandidates + rank];
+          require(std::fabs(probability - reference[rank] / sum) < 1e-4,
+                  "dspark selector probabilities diverged from the softmax");
+          cumulative[rank] =
+              (rank ? cumulative[rank - 1] : 0.0) + reference[rank] / sum;
+          if (expectedSelection == kCandidates - 1 &&
+              cumulative[rank] > uniform)
+            expectedSelection = rank;
+        }
+        const double boundary = std::fabs(
+            cumulative[std::min(selected, expectedSelection)] - uniform);
+        require(selected == expectedSelection || boundary < 1e-5,
+                "dspark selector drew a different candidate than the reference");
+      } else {
+        uint32_t expectedSelection = 0;
+        for (uint32_t rank = 1; rank < kCandidates; ++rank)
+          if (scores[rank] > scores[expectedSelection])
+            expectedSelection = rank;
+        require(selected == expectedSelection ||
+                    std::fabs(scores[selected] - scores[expectedSelection]) <
+                        1e-5,
+                "dspark selector picked a different greedy candidate");
+      }
+      predecessor = token;
+    }
+  }
+}
+
 void invalidRequests(MetalBackend &backend) {
   rejects([] { DraftSelector(0); });
   const DraftSelector selector(1024);
@@ -372,6 +517,8 @@ int main(int argc, char **argv) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         runCase(backend, {vocabulary, lanes, false});
         runCase(backend, {vocabulary, lanes, true});
+        runDSparkCase(backend, {vocabulary, lanes, false});
+        runDSparkCase(backend, {vocabulary, lanes, true});
       }
     }
     std::cout << "draft_selector_metal_test: PASS\n";

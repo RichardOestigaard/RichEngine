@@ -1,5 +1,6 @@
 #include "model/RuntimeArenas.hpp"
 
+#include "Env.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
@@ -40,6 +41,16 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::GdnBeta,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.gdnValueHeads));
+  {
+    // SPLASH_GDN_CHUNKED (32/64/128) sizes the WY/UT scratch at this
+    // geometry's GDN shape; the serial scan binds nothing here.
+    const uint32_t factor = envUint("SPLASH_GDN_CHUNKED", 0);
+    if (factor == 32 || factor == 64 || factor == 128) {
+      put(PrefillTensor::GdnChunkScratch,
+          bytesFor<float>(ops::GDN::chunkScratchFloats(
+              geometry.target.gdnShape(), kPrefillRows, factor)));
+    }
+  }
   put(PrefillTensor::Recurrent,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));

@@ -116,7 +116,9 @@ struct AttentionFixturePlan final {
     plan.pages = pagesOf(lanes, rows, histories);
     plan.poolPages = poolPagesFor(plan.pages);
     const kv::Layout pool = plan.poolLayout();
-    if (shape.headDimension != kHeadDimension || !pool.valid() ||
+    if ((shape.headDimension != kHeadDimension && shape.headDimension != 128 &&
+         shape.headDimension != 64) ||
+        !pool.valid() ||
         geometry.layer >= geometry.poolLayers || !geometry.extentPages ||
         geometry.extentPages % pool.extentAlignmentPages() ||
         geometry.extentPages > SPLASH_KV_PAGE_INDEX_MASK)
@@ -128,9 +130,9 @@ struct AttentionFixturePlan final {
     plan.poolBytes =
         uint64_t{plan.extents} * HostKvExtents::extentStride(pool, geometry.extentPages);
     const uint64_t chunks =
-        uint64_t{lanes} * shape.kvHeads * plan.stride * kHeadDimension * sizeof(uint16_t);
+        uint64_t{lanes} * shape.kvHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     const uint64_t queries =
-        uint64_t{lanes} * shape.queryHeads * plan.stride * kHeadDimension * sizeof(uint16_t);
+        uint64_t{lanes} * shape.queryHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     plan.size(Tensor::ChunkKeys, chunks);
     plan.size(Tensor::ChunkValues, chunks);
     plan.size(Tensor::Queries, queries);
@@ -167,7 +169,7 @@ struct AttentionFixturePlan final {
                                     uint32_t dimension) const noexcept {
     const uint32_t group = shape.queryHeads / shape.kvHeads;
     return (((uint64_t{lane} * shape.kvHeads + head / group) * stride + row) * group +
-            head % group) * kHeadDimension + dimension;
+            head % group) * shape.headDimension + dimension;
   }
 
 private:
@@ -218,7 +220,7 @@ public:
     auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
     auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
-    constexpr uint32_t dimensions = AttentionFixturePlan::kHeadDimension;
+    const uint32_t dimensions = plan_.shape.headDimension;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       pages_.writeTable(pageIds_[lane], tables_[lane].contents());
       for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
@@ -311,12 +313,14 @@ public:
   template <typename T>
   [[nodiscard]] T *keyRow(uint32_t lane, uint32_t head, uint32_t token) const {
     return slab<T>(lane, SPLASH_KV_KEYS, token) +
-           splash_kv_key_element(head, token % kv::kPageTokens, 0);
+           splash_kv_key_element_dim(head, token % kv::kPageTokens, 0,
+                                     plan_.shape.headDimension);
   }
   template <typename T>
   [[nodiscard]] T *valueColumn(uint32_t lane, uint32_t head, uint32_t token) const {
     return slab<T>(lane, SPLASH_KV_VALUES, token) +
-           splash_kv_value_element(head, token % kv::kPageTokens, 0);
+           splash_kv_value_element_dim(head, token % kv::kPageTokens, 0,
+                                       plan_.shape.headDimension);
   }
   [[nodiscard]] float *scale(uint32_t lane, uint32_t tensor, uint32_t head,
                              uint32_t token) const {

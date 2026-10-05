@@ -149,10 +149,14 @@ public:
                   SamplingBuffers buffers, uint32_t rowOffset,
                   uint32_t stopToken0, uint32_t stopToken1,
                   const PenaltyTable &penalties) const;
+  // liveRows, when nonempty, gives each lane's live verify row count
+  // (proposal budget + 1): selection skips rows at or past it. Empty means
+  // every lane keeps all SPLASH_TARGET_VERIFY_ROWS rows.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
-                 uint32_t stopToken1, const PenaltyTable &penalties) const;
+                 uint32_t stopToken1, const PenaltyTable &penalties,
+                 std::span<const uint32_t> liveRows = {}) const;
   // The tree batch's selection: SPLASH_TREE_VERIFY_NODES argmax rows per
   // lane. Tree mode is greedy-only — a sampled, constrained or penalized
   // lane throws (the runtime falls back to the chain batch).
@@ -160,11 +164,13 @@ public:
                      std::span<const SamplingPolicy> policies,
                      SamplingBuffers buffers, uint32_t stopToken0,
                      uint32_t stopToken1) const;
+  // proposals, when nonempty, caps each lane's accepted draft tokens at its
+  // adaptive budget; empty means SPLASH_DRAFT_PROPOSAL_TOKENS for all.
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
+      uint32_t stopToken1, std::span<const uint32_t> proposals = {}) const;
   // Greedy acceptance over the lanes' verify trees: the walk emits the
   // retained path's tokens and its emitted-row indices for the KV, GDN and
   // captured-hidden commits.
@@ -209,11 +215,13 @@ private:
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
-  // Selects the rows that rows names of every lane.
+  // Selects the rows that rows names of every lane. liveRows bounds each
+  // lane's selected rows; empty leaves every lane's full row count.
   void addSelection(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const TargetRows &rows,
-                    uint32_t stopToken0, uint32_t stopToken1) const;
+                    uint32_t stopToken0, uint32_t stopToken1,
+                    std::span<const uint32_t> liveRows = {}) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;

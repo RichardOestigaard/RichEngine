@@ -58,12 +58,15 @@ public:
                         const LfmConvShape &shape, uint32_t lanes,
                         uint32_t rows, uint32_t layer,
                         uint64_t stateLayerBytes, bool tapsMajor);
-  // One layer's states committed from the step's retained rows.
+  // `layers` layers' states committed from the step's retained rows in one
+  // dispatch: layer l's state slot is layer+l and its `mixed` block sits
+  // l*mixedLayerStride bytes into the buffer.
   static void addCommit(metal::CommandGraph &graph,
                         const LfmConvCommitBuffers &buffers,
                         const LfmConvShape &shape, uint32_t lanes,
                         uint32_t rows, uint32_t layer,
-                        uint64_t stateLayerBytes, bool tapsMajor);
+                        uint64_t stateLayerBytes, uint32_t layers,
+                        uint64_t mixedLayerStride, bool tapsMajor);
 };
 
 } // namespace splash::ops

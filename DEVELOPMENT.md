@@ -1,10 +1,9 @@
 # Development
 
-Use Apple Silicon with macOS 26.4+, Xcode 26 or newer, Python 3.12–3.14,
-and a Metal 4 compiler with `uint4b_format` tensor support.
-The macOS 26.2 SDK can compile the host code, but Xcode 26.2's default Metal
-component cannot compile the kernels; select a newer Metal toolchain when
-using that SDK. Packaged users need none of these development tools.
+Use Apple Silicon with macOS 27+, Xcode 27 or newer, Python 3.12–3.14, and a
+Metal 4.1 compiler (`uint4b_format` tensors and the packed FP4-E2M1 unpack the
+`n` kernels decode MXFP4 with). Packaged users need none of these development
+tools.
 
 ## Build and run
 
@@ -136,7 +135,7 @@ loopback, so use a listener that includes loopback when launching agents locally
 | `--max-cache-disk` | `0` (off) | Session-local SSD cache, e.g. `16G`. See [disk cache](#disk-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files. |
-| `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. |
+| `--kv-format` | `int4` | Target KV storage: `int4`, `int8`, `bf16`, or `fp8e4m3`. See [KV cache formats](README.md#kv-cache-formats). |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Seconds a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -192,9 +191,12 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 
 BF16 avoids target KV quantization, uses approximately twice the target KV
 memory, and can be slower at long contexts. Model weights are unchanged.
-Restart to switch formats. Omit `--kv-format` or use `--kv-format int8` for the
-default. The [SSD cache](#disk-cache) supports both formats, preserving their
-stored bytes without further quantization; it does not survive a restart.
+Restart to switch formats. Omit `--kv-format` or use `--kv-format int4` for the
+default. INT4 halves KV bytes but perturbs verify logits enough to cut draft
+acceptance — `int8` measures faster in typical decode; see
+[KV cache formats](README.md#kv-cache-formats). The [SSD cache](#disk-cache)
+supports all formats, preserving their stored bytes without further
+quantization; it does not survive a restart.
 
 ## API model aliases
 

@@ -140,8 +140,8 @@ template <uint HeadDim, uint RowsInFlight>
 inline void gdn_decode_scan(device const float *state_in,
                             device float *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
-                            uint value_head, uint lane, uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+                            uint value_head, uint lane, uint simd_group,
+                            uint tokens) {
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -156,7 +156,7 @@ inline void gdn_decode_scan(device const float *state_in,
     uint value_dim[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
       value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
-    for (uint token = 0; token < Tokens; ++token) {
+    for (uint token = 0; token < tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
       threadgroup const bfloat *key = shared.keys + token * HeadDim + lane * 4;
@@ -593,8 +593,14 @@ inline void gdn_decode_batch_phase(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
       dt_bias, decay, beta, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Adaptive proposal budgets bound the serial scan; a zero or full count
+  // runs all eight rows. Rows past the count keep stale hidden values and
+  // are never committed or selected.
+  const uint live = params.live_rows[batch];
+  const uint tokens =
+      live && live < Rows ? live : Rows;
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
-                                         lane, simd_group);
+                                         lane, simd_group, tokens);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(

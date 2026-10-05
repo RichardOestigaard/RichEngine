@@ -426,24 +426,22 @@ kernel void moe_route_select_f32(
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
-kernel void moe_group_routes(
-    device const uint *selected [[buffer(0)]],
-    device MoeTileDescriptor *tiles [[buffer(1)]],
-    device uint *tile_count [[buffer(2)]],
-    device uint *grouped_routes [[buffer(3)]],
-    device uint *route_rows [[buffer(4)]],
-    constant MoeGroupParams &params [[buffer(5)]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+inline void moe_group_routes_run(
+    device const uint *selected,
+    device MoeTileDescriptor *tiles,
+    device uint *tile_count,
+    device uint *grouped_routes,
+    device uint *route_rows,
+    constant MoeGroupParams &params,
+    threadgroup atomic_uint *counts,
+    threadgroup atomic_uint *cursors,
+    threadgroup uint *tile_offsets,
+    threadgroup uint *simd_totals,
+    threadgroup uint &routed_tiles,
+    uint thread_index, uint simd_lane, uint simd_group) {
   constexpr uint Experts = 256;
   const uint routes_per_row = params.top_k + params.shared;
   const uint routes = params.rows * routes_per_row;
-  threadgroup atomic_uint counts[Experts];
-  threadgroup atomic_uint cursors[Experts];
-  threadgroup uint tile_offsets[Experts];
-  threadgroup uint simd_totals[8];
-  threadgroup uint routed_tiles;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -520,6 +518,27 @@ kernel void moe_group_routes(
     *tile_count = routed_tiles + shared_tiles;
 }
 
+kernel void moe_group_routes(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device uint *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    constant MoeGroupParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Experts = 256;
+  threadgroup atomic_uint counts[Experts];
+  threadgroup atomic_uint cursors[Experts];
+  threadgroup uint tile_offsets[Experts];
+  threadgroup uint simd_totals[8];
+  threadgroup uint routed_tiles;
+  moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
+                       params, counts, cursors, tile_offsets, simd_totals,
+                       routed_tiles, thread_index, simd_lane, simd_group);
+}
+
 // The sigmoid-gated MoE router (GGUF expert_gating_func 2, LFM2-MoE): expert
 // e's selection key is sigmoid(score_e) + bias_e, and the top_k winners'
 // routing weights are their sigmoid scores normalized over the winners —
@@ -589,6 +608,105 @@ kernel void moe_route_select_sigmoid(
       denominator += ordered[other];
     routing_weights[row_routes + rank] = ordered[rank] / denominator;
   }
+}
+
+// One row's sigmoid-gated select on a single simdgroup: lane l holds
+// experts l, l + 32, ... as selection probabilities in lane_probs and keys
+// (prob + bias) in lane_keys, and each rank takes the highest remaining key
+// and the lowest expert id among ties, exactly as moe_route_select_sigmoid
+// orders them. Lane 0 records the winners' probabilities in row_ordered
+// (top_k entries) for the norm_topk_prob weights.
+inline void moe_sigmoid_select_row(device uint *selected,
+                                   device float *routing_weights,
+                                   constant MoeRouteParams &params, uint row,
+                                   threadgroup float *row_ordered,
+                                   thread float *lane_probs,
+                                   thread float *lane_keys, uint simd_lane) {
+  constexpr uint ExpertsPerLane = 256 / 32;
+  const ulong row_routes = ulong(row) * params.top_k;
+  for (uint rank = 0; rank < params.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity();
+    uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+      if (lane_keys[slot] > best) {
+        best = lane_keys[slot];
+        best_slot = slot;
+      }
+    }
+    const float row_best = simd_max(best);
+    const uint candidate =
+        best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner)
+      lane_keys[best_slot] = -numeric_limits<float>::infinity();
+    // The winning lane holds the winner's selection prob at best_slot.
+    const float prob = simd_broadcast(lane_probs[best_slot], winner & 31);
+    if (simd_lane == 0) {
+      row_ordered[rank] = prob;
+      selected[row_routes + rank] = winner;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  // norm_topk_prob: the winners' sigmoid scores over their sum.
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
+    float denominator = 0.0f;
+    for (uint other = 0; other < params.top_k; ++other)
+      denominator += row_ordered[other];
+    routing_weights[row_routes + rank] = row_ordered[rank] / denominator;
+  }
+}
+
+// The sigmoid-gated select fused with route grouping, for the small row
+// counts of a decode step: the threadgroup's eight simdgroups each select
+// one row at a time — lane l holds experts l, l + 32, ... — then the
+// threadgroup sorts the routes by expert as moe_group_routes does. One
+// dispatch covers both passes, so the selected experts never leave the
+// threadgroup's view between them.
+kernel void moe_route_group_sigmoid(
+    device const float *scores [[buffer(0)]],
+    device const float *expert_bias [[buffer(1)]],
+    device uint *selected [[buffer(2)]],
+    device float *routing_weights [[buffer(3)]],
+    device MoeTileDescriptor *tiles [[buffer(4)]],
+    device uint *tile_count [[buffer(5)]],
+    device uint *grouped_routes [[buffer(6)]],
+    device uint *route_rows [[buffer(7)]],
+    constant MoeRouteGroupParams &params [[buffer(8)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  constexpr uint ExpertsPerLane = StorageN / 32;
+  constexpr uint Simdgroups = 8;
+  threadgroup float ordered[Simdgroups * StorageN];
+  for (uint row = simd_group; row < params.route.rows; row += Simdgroups) {
+    float lane_keys[ExpertsPerLane];
+    float lane_probs[ExpertsPerLane];
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+      const uint expert = simd_lane + 32 * slot;
+      const bool live = expert < params.route.experts;
+      const float prob =
+          live ? splash_sigmoid(scores[ulong(row) * StorageN + expert])
+               : 0.0f;
+      lane_probs[slot] = prob;
+      lane_keys[slot] = live ? prob + expert_bias[expert]
+                             : -numeric_limits<float>::infinity();
+    }
+    moe_sigmoid_select_row(selected, routing_weights, params.route, row,
+                           ordered + simd_group * StorageN, lane_probs,
+                           lane_keys, simd_lane);
+  }
+  // The routes this threadgroup just wrote are read back below.
+  threadgroup_barrier(mem_flags::mem_device);
+  constexpr uint Experts = 256;
+  threadgroup atomic_uint counts[Experts];
+  threadgroup atomic_uint cursors[Experts];
+  threadgroup uint tile_offsets[Experts];
+  threadgroup uint simd_totals[8];
+  threadgroup uint routed_tiles;
+  moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
+                       params.group, counts, cursors, tile_offsets, simd_totals,
+                       routed_tiles, thread_index, simd_lane, simd_group);
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,

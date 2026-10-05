@@ -1,6 +1,7 @@
 // GGUF projections: plan policy and dispatch (kernels/shared/gguf_linear.metal,
 // kernels/decode/linear_gguf_sgmatrix.metal).
 #include "Linear.hpp"
+#include "Env.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -63,7 +64,7 @@ const char *packedFormat(uint32_t formatId) noexcept {
   }
 }
 bool packedDecodeEnabled() {
-  static const bool on = std::getenv("SPLASH_GGUF_PACKED_ON") != nullptr;
+  static const bool on = envFlag("SPLASH_GGUF_PACKED_ON");
   return on;
 }
 const char *decodeFormat(uint32_t appleGpuFamily, const QuantizedSegment &s, uint32_t rows) {
@@ -348,6 +349,14 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (appleGpuFamily_ >= 10 && w.phase == LinearPhase::Decode && w.weightLayout == WeightLayout::Block32) {
+    // An MXFP4 segment decodes on the MXFP4 tiers' splits (ggufBaseline),
+    // which the baseline computed without segments under-reserves: reserve
+    // the split partials and counters the MXFP4 rule may take.
+    size.include(LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged,
+                                            .splits = decodeSplits(n, k, gpuCores_, std::span(kMxfp4Tiers))})
+                     .scratchSize());
+  }
   // A decode plan packs its activations when a projection is MXFP4
   // (packsDecode): reserve the slot-permuted fp16 plane and the per-(row,
   // group) exponent bytes unconditionally, the segments being unknown here.

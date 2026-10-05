@@ -501,18 +501,28 @@ void PagedAttention::addVerify(
   // reads Plain input; a table or packed consumer keeps the separate gate
   // dispatch that writes its operand (addVerifyGate).
   if (gateHidden) {
-    if (!gatePacked)
-      throw std::invalid_argument("a fused verify gate takes its packed QKV rows");
-    const std::string gate =
-        std::string(tree ? "verify_tree_attention_reduce_gate"
-                         : "verify_attention_reduce_gate") +
-        std::string(plan.reducePipeline.substr(
-            tree ? std::string_view("verify_tree_attention_reduce").size()
-                 : std::string_view("verify_attention_reduce").size()));
-    graph.addPatchable(gate,
-              {buffers.partials, buffers.statistics, buffers.output,
-               std::move(gatePacked), std::move(gateHidden)},
-              attention, plan.reduceGroups);
+    const std::string_view reduceStem =
+        tree ? "verify_tree_attention_reduce" : "verify_attention_reduce";
+    const std::string suffix = std::string(
+        plan.reducePipeline.substr(reduceStem.size()));
+    if (gatePacked) {
+      const std::string gate =
+          std::string(tree ? "verify_tree_attention_reduce_gate"
+                           : "verify_attention_reduce_gate") +
+          suffix;
+      graph.addPatchable(gate,
+                {buffers.partials, buffers.statistics, buffers.output,
+                 std::move(gatePacked), std::move(gateHidden)},
+                attention, plan.reduceGroups);
+    } else {
+      // The no-gate targets' reduce/gather fusion: the hidden layout alone
+      // is written, so the reduce threads bound is the head dimension.
+      if (tree)
+        throw std::invalid_argument("tree verify has no fused gather");
+      graph.addPatchable("verify_attention_reduce_gather" + suffix,
+                {buffers.partials, buffers.statistics, std::move(gateHidden)},
+                attention, plan.reduceGroups, plan.reduceThreads_);
+    }
   } else {
     graph.addPatchable(plan.reducePipeline,
               {buffers.partials, buffers.statistics, buffers.output},

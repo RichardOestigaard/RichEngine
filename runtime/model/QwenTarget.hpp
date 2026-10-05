@@ -262,6 +262,8 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
+  // WY/UT scratch for the chunked GDN scan; empty keeps the serial scan.
+  metal::MetalBuffer gdnChunkScratch;
   ops::MoeScratch moe;
 };
 
@@ -345,11 +347,14 @@ public:
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
       std::span<const SplashKvLayer> kvLayers) const;
+  // liveRows, when nonempty, gives each chain lane's live verify row count
+  // for the GDN scan (adaptive proposal budgets); ignored for tree batches.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes, bool tree = false) const;
+      uint32_t lanes, bool tree = false,
+      std::span<const uint32_t> liveRows = {}) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,

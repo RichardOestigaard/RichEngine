@@ -57,11 +57,26 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 // The swept attention layer is the second of the extents' two.
 constexpr uint32_t kLayer = 1;
 // The memory plan's extents of the full models: 16 and 10 attention layers.
-constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10;
+constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10,
+                   kModelLayersMinicpm5 = 42, kModelLayersLfm2 = 8;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
+  if (shape == "minicpm5") return AttentionShape{16, 2, 128, format};
+  if (shape == "lfm2") return AttentionShape{32, 8, 64, format};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
                         : AttentionShape{16, 2, 256, format};
+}
+
+uint32_t shapeLayers(const std::string &shape) {
+  if (shape == "minicpm5") return kModelLayersMinicpm5;
+  if (shape == "lfm2") return kModelLayersLfm2;
+  return shape == "27b" ? kModelLayers27b : kModelLayers35b;
+}
+
+std::string shapeName(const std::string &shape) {
+  if (shape == "minicpm5") return "minicpm5-2b";
+  if (shape == "lfm2") return "lfm2.5-2.6b";
+  return shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
 }
 
 // The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
@@ -278,8 +293,9 @@ int main(int argc, const char *argv[]) {
           const size_t comma = text.find(',', start);
           const std::string shape =
               text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b")
-            throw std::invalid_argument("--shapes takes 27b or 35b");
+          if (shape != "27b" && shape != "35b" && shape != "minicpm5" &&
+              shape != "lfm2")
+            throw std::invalid_argument("--shapes takes 27b, 35b, minicpm5 or lfm2");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;
@@ -308,10 +324,10 @@ int main(int argc, const char *argv[]) {
     bool firstCase = true;
     for (const std::string &shape : shapes) {
       const AttentionShape geometry = shapeOf(shape, format);
-      const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
+      const std::string name = shapeName(shape);
       const uint32_t shapeExtentPages =
           extentPages ? extentPages
-                      : kv::Layout{shape == "27b" ? kModelLayers27b : kModelLayers35b,
+                      : kv::Layout{shapeLayers(shape),
                                    geometry.kvHeads, geometry.headDimension, format}
                             .maximumExtentPages();
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
