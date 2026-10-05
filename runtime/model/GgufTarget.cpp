@@ -1,7 +1,80 @@
 #include "model/GgufTarget.hpp"
+#include "model/Dense.hpp"
 #include "model/GgufPreparation.hpp"
+#include "model/Lfm2.hpp"
+#include "model/Lfm2Moe.hpp"
 
 namespace splash::model {
+
+gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.arch = "llama";
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.intermediateSize = layout.intermediateSize;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.rotaryPairs = layout.rotaryPairs;
+  geometry.rotaryTheta = layout.rotaryTheta;
+  geometry.fullAttentionPeriod = 1; // every layer attends
+  geometry.attentionQueryGate = false;
+  geometry.attentionQkNorm = false;
+  return geometry;
+}
+
+gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.arch = "lfm2";
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.intermediateSize = layout.intermediateSize;
+  geometry.attentionMask = Lfm2Layout::attentionMask;
+  geometry.convolutionDimension = layout.convolutionDimension;
+  geometry.convolutionTaps = Lfm2Layout::convolutionTaps;
+  geometry.rmsEpsilon = layout.rmsEpsilon;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.rotaryPairs = layout.rotaryPairs;
+  geometry.rotaryTheta = layout.rotaryTheta;
+  geometry.attentionQueryGate = false;
+  geometry.attentionQkNorm = true;
+  geometry.tiedOutput = true;
+  return geometry;
+}
+
+// The LFM2-MoE target ("lfm2moe"): LFM2's mixers and tied head, a dense FFN
+// on the leading denseLayers and the shared-expert-free sigmoid MoE block
+// on every later layer, conv or attention.
+gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.arch = "lfm2moe";
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.intermediateSize = layout.intermediateSize;
+  geometry.attentionMask = Lfm2MoeLayout::attentionMask;
+  geometry.convolutionDimension = layout.convolutionDimension;
+  geometry.convolutionTaps = Lfm2MoeLayout::convolutionTaps;
+  geometry.rmsEpsilon = layout.rmsEpsilon;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.rotaryPairs = layout.rotaryPairs;
+  geometry.rotaryTheta = layout.rotaryTheta;
+  geometry.attentionQueryGate = false;
+  geometry.attentionQkNorm = true;
+  geometry.tiedOutput = true;
+  geometry.experts = layout.experts;
+  geometry.expertsPerToken = layout.expertsPerToken;
+  geometry.expertIntermediateSize = layout.expertIntermediateSize;
+  geometry.leadingDenseLayers = Lfm2MoeLayout::denseLayers;
+  geometry.sharedExpert = false;
+  return geometry;
+}
 std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
   std::filesystem::path found;
   std::error_code error;

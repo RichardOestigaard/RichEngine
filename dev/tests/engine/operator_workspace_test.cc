@@ -51,8 +51,10 @@ void attention() {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace =
           ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
+      // The bound covers a tree lane's SPLASH_TREE_VERIFY_NODES row slots.
       const uint64_t values =
-          uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * queryHeads;
+          uint64_t{lanes} * SPLASH_TREE_VERIFY_NODES *
+          kv::kVerifyMaximumSplits * queryHeads;
       require(workspace.partialsBytes == values * 256 * 4,
               "verify partial workspace is not sized for the maximum split count");
       require(workspace.statisticsBytes == values * 2 * 4,

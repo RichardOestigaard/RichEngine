@@ -13,16 +13,19 @@ namespace splash::kv {
 
 // Selected once for a runtime and its entire page pool. Weight storage is
 // independent of the KV format; requests never change it while serving.
-enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
+enum class Format : uint32_t { Int8 = 1, BFloat16 = 2, Int4 = 3, Float8E4M3 = 4 };
 
 [[nodiscard]] constexpr bool validFormat(Format format) noexcept {
-  return format == Format::Int8 || format == Format::BFloat16;
+  return format == Format::Int8 || format == Format::BFloat16 ||
+         format == Format::Int4 || format == Format::Float8E4M3;
 }
 
 [[nodiscard]] constexpr std::string_view formatName(Format format) noexcept {
   switch (format) {
   case Format::Int8: return "int8";
   case Format::BFloat16: return "bf16";
+  case Format::Int4: return "int4";
+  case Format::Float8E4M3: return "fp8e4m3";
   }
   return "invalid";
 }
@@ -33,6 +36,10 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
     return "q8s8_f32_scale_per_token_head_k_token_major_v_dimension_major";
   case Format::BFloat16:
     return "bf16_k_token_major_v_dimension_major";
+  case Format::Int4:
+    return "q4s8_f32_scale_per_token_head_k_token_major_v_dimension_major";
+  case Format::Float8E4M3:
+    return "fp8e4m3_f32_scale_per_token_head_k_token_major_v_dimension_major";
   }
   return "invalid";
 }
@@ -112,8 +119,9 @@ namespace detail {
 
 } // namespace detail
 
-// Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric INT8.
-// Layer and head counts vary by target.
+// Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric
+// quantization (INT8 bytes, FP8 E4M3 bytes or INT4 nibbles, two elements per
+// byte). Layer and head counts vary by target.
 struct Layout final {
   uint32_t attentionLayers = 0;
   uint32_t kvHeads = 0;
@@ -123,18 +131,27 @@ struct Layout final {
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format);
   }
+  [[nodiscard]] constexpr bool quantized() const noexcept {
+    return format != Format::BFloat16;
+  }
   [[nodiscard]] constexpr uint32_t elementsPerScale() const noexcept {
-    return format == Format::Int8 ? headDimension : 0;
+    return quantized() ? headDimension : 0;
   }
   [[nodiscard]] constexpr uint64_t elementsPerLayerPage() const noexcept {
     return uint64_t{kPageTokens} * kvHeads * headDimension;
   }
   [[nodiscard]] constexpr uint64_t scalesPerTensorLayerPage() const noexcept {
-    return format == Format::Int8 ? uint64_t{kPageTokens} * kvHeads : 0;
+    return quantized() ? uint64_t{kPageTokens} * kvHeads : 0;
   }
   // Keys and values share one data and one scale geometry per layer page.
   [[nodiscard]] constexpr uint64_t dataBytesPerLayerPage() const noexcept {
-    return elementsPerLayerPage() * (format == Format::Int8 ? 1 : 2);
+    const uint64_t elements = elementsPerLayerPage();
+    if (format == Format::BFloat16)
+      return elements * 2;
+    if (format == Format::Int4)
+      return elements / 2;
+    // INT8 and FP8 E4M3 store one byte per element.
+    return elements;
   }
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
     return scalesPerTensorLayerPage() * sizeof(float);

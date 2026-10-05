@@ -47,17 +47,19 @@ inline bool lane_samples(constant TargetSamplingParams &params, uint s) {
   return (params.sampling_mask & (1u << selected_lane(params, s))) != 0;
 }
 
-// Selected row s of a dispatch (TargetSamplingParams).
+// Selected row s of a dispatch (TargetSamplingParams). The per-lane stride of
+// the logits and mask buffers is the larger of the chain's eight rows and
+// the dispatch's rows, which a tree batch widens to
+// SPLASH_TREE_VERIFY_NODES.
 inline TargetRow selected_row(device const float *logits,
                               device const uint *token_mask,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
-  return {logits + (ulong(lane) * SPLASH_TARGET_VERIFY_ROWS +
-                    params.logits_row + index) *
+  const uint stride = max(params.rows, SPLASH_TARGET_VERIFY_ROWS);
+  return {logits + (ulong(lane) * stride + params.logits_row + index) *
                        params.vocabulary,
-          token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-                        params.mask_row + index) *
+          token_mask + (ulong(lane) * (stride + 1) + params.mask_row + index) *
                            params.mask_words,
           (params.constrained_mask & (1u << lane)) != 0,
           (params.exclude_stop_mask & (1u << lane)) != 0,
@@ -1037,15 +1039,16 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // only runs for the few survivors. The group then pops its best sixteen in
 // rank order. The (value desc, id asc) order is total, so the partial is the
 // same set in the same order whatever the thread partition.
-kernel void draft_select_top16_sharded(
-    device const float *logits [[buffer(0)]],
-    device uint *partial_ids [[buffer(1)]],
-    device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+// The sharded top-16 of one (lane, position)'s logits row. row_offset is the
+// logits row of proposal position zero: 1 for DFlash drafts (the anchor row
+// reproduces the anchor), 0 for DSpark drafts, whose anchor row already
+// predicts the next token.
+inline void draft_top16_sharded_phase(
+    device const float *logits, device uint *partial_ids,
+    device float *partial_values, uint vocabulary, uint row_offset,
+    threadgroup float *maxima, threadgroup float *thresholds,
+    threadgroup float *round_values, threadgroup uint *round_ids, uint group,
+    uint thread_index, uint lane, uint simd_group) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
@@ -1055,7 +1058,7 @@ kernel void draft_select_top16_sharded(
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
   uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;
+  ulong row_start = (ulong(batch) * Rows + position + row_offset) * vocabulary;
   uint shard_tokens = (vocabulary + Shards - 1) / Shards;
   uint begin = min(shard * shard_tokens, vocabulary);
   uint end = min(begin + shard_tokens, vocabulary);
@@ -1090,8 +1093,6 @@ kernel void draft_select_top16_sharded(
       top16_insert(values, ids, value, token);
   }
 
-  threadgroup float maxima[256];
-  threadgroup float thresholds[8];
   for (uint chunk = 0; chunk < vectors; chunk += 256 * ChunkVectors) {
     float4 loaded[ChunkVectors];
     float best = -INFINITY;
@@ -1135,8 +1136,6 @@ kernel void draft_select_top16_sharded(
 
   // Sixteen rounds pop the group-wide best head; the simdgroup bests
   // alternate between two slots so one barrier per round suffices.
-  threadgroup float round_values[2][8];
-  threadgroup uint round_ids[2][8];
   for (uint rank = 0; rank < K; ++rank) {
     float head_value = values[0];
     uint head_id = ids[0];
@@ -1145,15 +1144,15 @@ kernel void draft_select_top16_sharded(
     simd_best_head(head_value, head_id, simd_value, simd_id);
     uint slot = rank & 1;
     if (lane == 0) {
-      round_values[slot][simd_group] = simd_value;
-      round_ids[slot][simd_group] = simd_id;
+      round_values[slot * 8 + simd_group] = simd_value;
+      round_ids[slot * 8 + simd_group] = simd_id;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float best = round_values[slot][0];
-    uint best_id = round_ids[slot][0];
+    float best = round_values[slot * 8];
+    uint best_id = round_ids[slot * 8];
     for (uint other = 1; other < 8; ++other) {
-      float value = round_values[slot][other];
-      uint token = round_ids[slot][other];
+      float value = round_values[slot * 8 + other];
+      uint token = round_ids[slot * 8 + other];
       if (top_beats(value, token, best, best_id)) {
         best = value;
         best_id = token;
@@ -1166,6 +1165,46 @@ kernel void draft_select_top16_sharded(
     if (head_value == best && head_id == best_id)
       top_pop<K>(values, ids);
   }
+}
+
+kernel void draft_select_top16_sharded(
+    device const float *logits [[buffer(0)]],
+    device uint *partial_ids [[buffer(1)]],
+    device float *partial_values [[buffer(2)]],
+    constant uint &vocabulary [[buffer(3)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float maxima[256];
+  threadgroup float thresholds[8];
+  threadgroup float round_values[2][8];
+  threadgroup uint round_ids[2][8];
+  draft_top16_sharded_phase(logits, partial_ids, partial_values, vocabulary, 1,
+                            maxima, thresholds, &round_values[0][0],
+                            &round_ids[0][0], group, thread_index, lane,
+                            simd_group);
+}
+
+// The DSpark draft's anchor row already predicts the next token: position p
+// reads logits row p, not p + 1.
+kernel void dspark_select_top16_sharded(
+    device const float *logits [[buffer(0)]],
+    device uint *partial_ids [[buffer(1)]],
+    device float *partial_values [[buffer(2)]],
+    constant uint &vocabulary [[buffer(3)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float maxima[256];
+  threadgroup float thresholds[8];
+  threadgroup float round_values[2][8];
+  threadgroup uint round_ids[2][8];
+  draft_top16_sharded_phase(logits, partial_ids, partial_values, vocabulary, 0,
+                            maxima, thresholds, &round_values[0][0],
+                            &round_ids[0][0], group, thread_index, lane,
+                            simd_group);
 }
 
 // Merges the eight shard partials of one row into the simdgroup's lanes: each
@@ -1354,6 +1393,247 @@ kernel void draft_select_dflash(
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
   }
+}
+
+// draft_select_dflash plus tree emission: the same chain fills
+// tree_tokens/nodes rows 1..7, and lanes in tree_mask additionally record
+// each position's runner-up candidate under the chain's chosen predecessor
+// as a sibling leaf at the fixed row 8 + position (parent = the
+// predecessor's chain row). tokens[] still receives the chain so every
+// chain-mode consumer is unchanged; tree_counts is 8 for a chain lane
+// (anchor + 7 proposals) and SPLASH_TREE_VERIFY_NODES - 1 for a tree lane,
+// whose row 15 stays a dead SPLASH_TREE_NODE_NONE descriptor.
+kernel void draft_select_tree(
+    device const uint *candidates [[buffer(0)]],
+    device const float *unary [[buffer(1)]],
+    device const float *partial_values [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
+    device uint *tree_tokens [[buffer(6)]],
+    device uint *tree_nodes [[buffer(7)]],
+    device uint *tree_counts [[buffer(8)]],
+    constant SelectorBatchParams &params [[buffer(9)]],
+    uint batch [[thread_position_in_grid]]) {
+  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  candidates += batch * Positions * Candidates;
+  unary += batch * Positions * Candidates;
+  device const float *tables = partial_values +
+                               params.lanes * Positions * Shards * Candidates +
+                               batch * Positions * Candidates * Candidates;
+  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
+  tokens += batch * Positions;
+  q_probs += batch * Positions * Candidates;
+  tree_tokens += batch * SPLASH_TREE_VERIFY_NODES;
+  tree_nodes += batch * SPLASH_TREE_VERIFY_NODES;
+
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
+  tree_tokens[0] = params.anchor[batch];
+  tree_nodes[0] = SPLASH_TREE_NODE_NONE |
+                  (SPLASH_TREE_NODE_NONE << 16);
+  uint leaves [[maybe_unused]] = 0;
+  uint predecessor_index = 0;
+  for (uint position = 0; position < Positions; ++position) {
+    device const float *edges =
+        tables + (position * Candidates + predecessor_index) * Candidates;
+    float scores[Candidates];
+    for (uint i = 0; i < Candidates; ++i)
+      scores[i] = unary[position * Candidates + i] + edges[i];
+    uint selected = 0;
+    uint runner = Candidates;
+    if (sampling) {
+      float maximum = scores[0];
+      for (uint i = 1; i < Candidates; ++i)
+        maximum = max(maximum, scores[i]);
+      float sum = 0.0f;
+      for (uint i = 0; i < Candidates; ++i) {
+        float probability =
+            exp((scores[i] - maximum) / params.temperature[batch]);
+        q_probs[position * Candidates + i] = probability;
+        sum += probability;
+      }
+      float cumulative = 0.0f;
+      selected = Candidates - 1;
+      for (uint i = 0; i < Candidates; ++i) {
+        float probability = q_probs[position * Candidates + i] / sum;
+        q_probs[position * Candidates + i] = probability;
+        cumulative += probability;
+        if (selected == Candidates - 1 &&
+            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
+          selected = i;
+        }
+      }
+    } else {
+      for (uint i = 1; i < Candidates; ++i) {
+        if (scores[i] > scores[selected])
+          selected = i;
+      }
+      // The runner-up under the chain's predecessor becomes the leaf at this
+      // position's fixed row (8 + position); it can only matter when the
+      // chain pick is rejected.
+      for (uint i = 0; i < Candidates; ++i) {
+        if (i != selected &&
+            (runner == Candidates || scores[i] > scores[runner]))
+          runner = i;
+      }
+    }
+    const uint chain_row = position + 1;
+    tree_tokens[chain_row] = candidates[position * Candidates + selected];
+    tree_nodes[chain_row] = (chain_row - 1) | (chain_row << 8) |
+                            (position << 16);
+    predecessor_index = selected;
+    tokens[position] = candidates[position * Candidates + selected];
+    const uint leaf_row = SPLASH_TARGET_VERIFY_ROWS + position;
+    if (tree && runner != Candidates) {
+      tree_tokens[leaf_row] = candidates[position * Candidates + runner];
+      // The leaf's parent is the chain node that was this position's
+      // predecessor (row 0 for position 0, row p for position p).
+      tree_nodes[leaf_row] = position | (chain_row << 8) | (position << 16);
+      ++leaves;
+    } else {
+      tree_tokens[leaf_row] = 0;
+      tree_nodes[leaf_row] = SPLASH_TREE_NODE_NONE |
+                             (SPLASH_TREE_NODE_NONE << 8) |
+                             (SPLASH_TREE_NODE_NONE << 16);
+    }
+  }
+  tree_tokens[SPLASH_TREE_VERIFY_NODES - 1] = 0;
+  tree_nodes[SPLASH_TREE_VERIFY_NODES - 1] =
+      SPLASH_TREE_NODE_NONE | (SPLASH_TREE_NODE_NONE << 8) |
+      (SPLASH_TREE_NODE_NONE << 16);
+  tree_counts[batch] =
+      tree ? SPLASH_TREE_VERIFY_NODES - 1 : 1 + Positions;
+}
+
+// The plain DFlash draft's per-position policy, the DFlash2 walk without the
+// codebook edges: one simdgroup per proposal row merges the top-16 partials
+// into the candidate list, and its greedy lane takes the best while a
+// sampled lane draws over the candidates' softmax weights, which acceptance
+// reads as the draft probabilities.
+kernel void draft_select_plain(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device uint *candidates [[buffer(3)]],
+    device float *probabilities [[buffer(4)]],
+    device uint *tokens [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  const uint batch = row / Positions;
+  const uint position = row % Positions;
+  float value;
+  uint token;
+  top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+  if (lane < Candidates)
+    candidates[row * Candidates + lane] = token;
+
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  const float scaled = lane < Candidates ? value / temperature : -INFINITY;
+  const float maximum = simd_max(scaled);
+  const float weight =
+      lane < Candidates ? fast::exp(scaled - maximum) : 0.0f;
+  const float probability = weight / simd_sum(weight);
+  if (lane < Candidates)
+    probabilities[row * Candidates + lane] = probability;
+
+  uint selected = 0;
+  if (sampling) {
+    const float uniform = uniforms[batch * SPLASH_SAMPLING_UNIFORMS +
+                                   SPLASH_UNIFORM_PROPOSALS + position];
+    const float prefix = simd_prefix_inclusive_sum(probability);
+    const bool hit =
+        lane < Candidates && prefix - probability <= uniform && prefix > uniform;
+    selected = simd_min(hit ? lane : 0xffffffffu);
+    if (selected == 0xffffffffu)
+      selected = Candidates - 1;
+  }
+  const uint chosen = simd_broadcast(token, selected);
+  if (lane == 0)
+    tokens[batch * Positions + position] = chosen;
+}
+
+// One simdgroup per lane walks a DSpark draft's proposal positions in order:
+// each position's top-16 candidates (dspark_select_top16_sharded) are
+// rescored with the Markov bias W2 . W1[prev] of the previously sampled
+// token — the anchor for position zero — before the greedy or drawn pick
+// that feeds the next position. The bias reaches only the candidates the
+// unbiased top-16 kept, the same candidate restriction the DFlash2
+// selector's codebook edges apply.
+kernel void draft_select_dspark(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device uint *candidates [[buffer(3)]],
+    device float *probabilities [[buffer(4)]],
+    device uint *tokens [[buffer(5)]],
+    device const bfloat *markov_w1 [[buffer(6)]],
+    device const bfloat *markov_w2 [[buffer(7)]],
+    constant SelectorBatchParams &params [[buffer(8)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
+  threadgroup float feature[Rank];
+  threadgroup uint chosen[Positions];
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  for (uint position = 0; position < Positions; ++position) {
+    const uint row = batch * Positions + position;
+    const uint previous =
+        position ? chosen[position - 1] : params.anchor[batch];
+    for (uint dim = lane; dim < Rank; dim += 32)
+      feature[dim] = float(markov_w1[ulong(previous) * Rank + dim]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float value;
+    uint token;
+    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+    float biased = -INFINITY;
+    if (lane < Candidates && token < params.vocabulary) {
+      device const bfloat *bias_row = markov_w2 + ulong(token) * Rank;
+      float bias = 0.0f;
+      for (uint dim = 0; dim < Rank; ++dim)
+        bias += float(bias_row[dim]) * feature[dim];
+      biased = value + bias;
+    }
+    if (lane < Candidates)
+      candidates[row * Candidates + lane] = token;
+
+    const float scaled = lane < Candidates ? biased / temperature : -INFINITY;
+    const float maximum = simd_max(scaled);
+    const float weight =
+        lane < Candidates ? fast::exp(scaled - maximum) : 0.0f;
+    const float probability = weight / simd_sum(weight);
+    if (lane < Candidates)
+      probabilities[row * Candidates + lane] = probability;
+
+    uint selected;
+    if (sampling) {
+      const float uniform = uniforms[batch * SPLASH_SAMPLING_UNIFORMS +
+                                     SPLASH_UNIFORM_PROPOSALS + position];
+      const float prefix = simd_prefix_inclusive_sum(probability);
+      const bool hit = lane < Candidates &&
+                       prefix - probability <= uniform && prefix > uniform;
+      selected = simd_min(hit ? lane : 0xffffffffu);
+      if (selected == 0xffffffffu)
+        selected = Candidates - 1;
+    } else {
+      selected = simd_min(biased == maximum ? lane : 0xffffffffu);
+      if (selected == 0xffffffffu)
+        selected = 0;
+    }
+    chosen[position] = simd_broadcast(token, selected);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint position = lane; position < Positions; position += 32)
+    tokens[batch * Positions + position] = chosen[position];
 }
 
 inline float sparse_lookup(device const uint *ids,
@@ -1552,4 +1832,104 @@ kernel void decode_accept_dflash(
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
                        accepted_count[batch], lane_params);
   }
+}
+
+// Greedy acceptance over one lane's verify tree. From the anchor the walk
+// descends into the child whose token equals the node's argmax — the chain
+// successor or the position's sibling leaf — and emits the walk's tokens in
+// path order: the accepted nodes' tokens, then the last node's argmax as the
+// correction or bonus, capped at remaining and cut after a stop token.
+// retained_path records the committed path's DFS rows for the KV, GDN and
+// captured-hidden commits.
+kernel void decode_accept_tree(
+    device const uint *tree_tokens [[buffer(0)]],
+    device const uint *tree_nodes [[buffer(1)]],
+    device const uint *tree_counts [[buffer(2)]],
+    device const uint *target_tokens [[buffer(3)]],
+    device uint *output_tokens [[buffer(4)]],
+    device uint *retained [[buffer(5)]],
+    device uint *accepted_count [[buffer(6)]],
+    device uint *retained_path [[buffer(7)]],
+    constant TreeAcceptBatchParams &params [[buffer(8)]],
+    uint batch [[threadgroup_position_in_grid]]) {
+  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
+  constexpr uint Emitted = SPLASH_TARGET_VERIFY_ROWS;
+  tree_tokens += batch * Nodes;
+  tree_nodes += batch * Nodes;
+  target_tokens += batch * Nodes;
+  output_tokens += batch * Emitted;
+  retained_path += batch * Emitted;
+  const uint node_count = tree_counts[batch];
+  const uint remaining = params.remaining[batch];
+
+  uint path[Emitted];
+  path[0] = 0;
+  uint count = 1;
+  uint cursor = 0;
+  // Only the chain rows 0..SPLASH_DRAFT_PROPOSAL_TOKENS - 1 have children:
+  // the chain successor at cursor + 1 and the sibling leaf at row Emitted +
+  // cursor. The last chain row and every leaf are the comb's teeth — a
+  // leaf's walk ends, and row 7's only would-be child row is the first leaf
+  // row, which is not its descendant. The path also stops at Emitted rows,
+  // the committed block's capacity.
+  while (count < Emitted && count <= remaining &&
+         cursor < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+    const uint selected = target_tokens[cursor];
+    uint next = Nodes;
+    if (tree_tokens[cursor + 1] == selected) {
+      next = cursor + 1;
+    } else {
+      const uint leaf = Emitted + cursor;
+      if (leaf < node_count &&
+          SPLASH_TREE_NODE_PARENT(tree_nodes[leaf]) !=
+              SPLASH_TREE_NODE_NONE &&
+          tree_tokens[leaf] == selected) {
+        next = leaf;
+      }
+    }
+    if (next == Nodes)
+      break;
+    path[count] = next;
+    output_tokens[count - 1] = tree_tokens[next];
+    ++count;
+    cursor = next;
+  }
+  if (count <= remaining)
+    output_tokens[count - 1] = target_tokens[cursor];
+  AcceptParams lane_params{remaining, params.stop_token_0,
+                           params.stop_token_1};
+  finish_acceptance(output_tokens, count - 1, lane_params, retained[batch],
+                    accepted_count[batch]);
+  for (uint i = 0; i < retained[batch]; ++i)
+    retained_path[i] = path[i];
+}
+
+// Splices ANE-produced alternates into the comb's sibling-leaf rows (8..14),
+// one per proposal slot, when the predictor job finished before this dispatch
+// executes. The flag carries the job serial the encode snapshot named
+// `expected`; the job writes the token block, then the serial with release
+// order, so an acquired match also publishes the tokens. A NONE token keeps
+// the draft's own second-best leaf, and rows past the tree's node count are
+// not nodes at all.
+kernel void tree_leaf_patch(
+    device uint *tree_tokens [[buffer(0)]],
+    device const uint *medusa_tokens [[buffer(1)]],
+    device atomic_uint *medusa_flag [[buffer(2)]],
+    device const uint *tree_counts [[buffer(3)]],
+    constant TreeLeafPatchParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+  if (atomic_load_explicit(medusa_flag, memory_order_acquire,
+                           mem_flags::mem_device) != params.expected)
+    return;
+  constexpr uint Leaves = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  const uint lane = index / Leaves;
+  const uint slot = index % Leaves;
+  if (lane >= params.lanes)
+    return;
+  const uint row = SPLASH_TARGET_VERIFY_ROWS + slot;
+  if (row >= tree_counts[lane])
+    return;
+  const uint token = medusa_tokens[index];
+  if (token != 0xffffffffu)
+    tree_tokens[lane * SPLASH_TREE_VERIFY_NODES + row] = token;
 }

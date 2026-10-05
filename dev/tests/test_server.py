@@ -236,7 +236,7 @@ class BlockingTokenizer(FakeTokenizer):
 
 
 class PassthroughStreamer:
-    def __init__(self, tokenizer, callback, *args):
+    def __init__(self, tokenizer, callback, *args, **_kwargs):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequence = None
@@ -255,7 +255,7 @@ class PassthroughStreamer:
 
 
 class SeededRandomChunkStreamer(PassthroughStreamer):
-    def __init__(self, tokenizer, callback, *args):
+    def __init__(self, tokenizer, callback, *args, **kwargs):
         super().__init__(tokenizer, callback)
         self.random = random.Random(20260821)
 
@@ -537,7 +537,7 @@ def main_args(**overrides):
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
             "binary": "splash",
-            "kv_format": "int8",
+            "kv_format": "int4",
             **overrides,
         }
     )
@@ -740,10 +740,10 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value="executor"),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, executor: (matcher, executor),
+                side_effect=lambda matcher, executor, _contract: (matcher, executor),
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object())
+            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -790,10 +790,10 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _, _contract: matcher,
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object())
+            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(factory.create, ["shared"] * 4))
 
@@ -831,10 +831,10 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _, _contract: matcher,
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object())
+            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
             for _ in range(2):
                 with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
                     factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))
@@ -3545,10 +3545,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             api._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
         )
-        self.assertEqual(args.kv_format, "int8")
+        self.assertEqual(args.kv_format, "int4")
         self.assertNotIn("--kv-format", api._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
         self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        fp8_args = api.parse_args([*required, "--kv-format", "fp8e4m3"])
+        self.assertEqual(api._native_command(fp8_args)[-2:], ["--kv-format", "fp8e4m3"])
         disk_bf16_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--kv-format", "bf16"]
         )
@@ -3682,7 +3684,7 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
-            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "validate_tokenizer") as validate,
             mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
@@ -3719,7 +3721,10 @@ class ServerTest(unittest.TestCase):
             eager_start=False,
         )
         backend_type.assert_called_once_with(
-            runtime, tokenizer, request_logger=diagnostics.print_request
+            runtime,
+            tokenizer,
+            request_logger=diagnostics.print_request,
+            think_end_id=validate.return_value.think_end_id,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.

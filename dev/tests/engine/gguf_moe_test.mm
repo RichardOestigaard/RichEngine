@@ -591,9 +591,12 @@ int moe(MetalBackend &backend) {
       Stats stats;
       std::vector<uint16_t> widest;
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
-        const MoePlan plan = MoE::decodePlan(
-            shape, lanes,
-            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
+        // Production decode plans set mxfp4Native on Apple GPU family 10,
+        // which packs the gathered rows and runs the `_p` expert kernels on
+        // the models' MXFP4 segments.
+        MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile};
+        config.mxfp4Native = backend.capabilities().appleGpuFamily >= 10;
+        const MoePlan plan = MoE::decodePlan(shape, lanes, config);
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                   std::to_string(lanes);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
@@ -607,9 +610,9 @@ int moe(MetalBackend &backend) {
       }
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
-        const MoePlan plan = MoE::prefillPlan(
-            shape, chunk,
-            MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile});
+        MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile};
+        config.mxfp4Native = backend.capabilities().appleGpuFamily >= 10;
+        const MoePlan plan = MoE::prefillPlan(shape, chunk, config);
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
                                   std::to_string(chunk);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
@@ -634,6 +637,7 @@ int moe(MetalBackend &backend) {
       std::vector<uint16_t> widest;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
         MoeConfig config{MoeExpertTile::M32};
+        config.mxfp4Native = backend.capabilities().appleGpuFamily >= 10;
         config.ggufRouterTile = router;
         const MoePlan plan = MoE::prefillPlan(shape, rows, config);
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +

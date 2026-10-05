@@ -101,7 +101,14 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
+    std::span<const ops::SamplingPolicy> policies, uint32_t treeMask) const {
+  if (treeMask) {
+    selector_.addTree(graph, buffers,
+                      {weights_.predecessorCodebook,
+                       weights_.successorCodebook},
+                      anchors, policies, treeMask);
+    return;
+  }
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
                 anchors, policies);
@@ -167,6 +174,11 @@ void DFlashDraft::addDecode(
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
+  // Every draft decode dispatch is static per batch width except the
+  // attention split/reduce, whose parameters carry each lane's cache length;
+  // the pair's payloads are patchable, so the layers and head replay as one
+  // baked indirect command buffer span.
+  graph.beginBakedSpan();
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
@@ -248,6 +260,7 @@ void DFlashDraft::addDecode(
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
              weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
+  graph.endBakedSpan();
 }
 
 void DFlashDraft::addContextCommit(

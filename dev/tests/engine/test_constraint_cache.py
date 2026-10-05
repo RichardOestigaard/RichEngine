@@ -23,9 +23,7 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(side_effect=lambda matcher, executor: matcher)
-        constraint.VOCABULARY = constraints.TokenConstraint.VOCABULARY
-        constraint.EOS_TOKENS = constraints.TokenConstraint.EOS_TOKENS
+        constraint = mock.Mock(side_effect=lambda matcher, executor, contract: matcher)
         for target, replacement in (
             ("guidance_tokenizer", lambda *args, **kwargs: None),
             ("LLMatcher", Matcher),
@@ -38,7 +36,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
             )
         )
-        return constraints.ConstraintFactory(object())
+        return constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -170,7 +168,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=StructuredToolGrammarTest.guidance,
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
         # More grammar symbols than the compiler can index make it panic.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
@@ -198,7 +196,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=StructuredToolGrammarTest.guidance,
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
         barrier = threading.Barrier(8)
 
         def generate(index):

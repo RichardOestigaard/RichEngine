@@ -5,9 +5,18 @@
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
+// Nodes of one lane's verify tree in tree-verify mode (TREE_VERIFY_DESIGN):
+// the anchor plus the seven-node chain plus the seven second-best sibling
+// leaves emitted by draft_select_tree (rows 8..14, one per proposal
+// position; row 15 is spare). Verify-row tensors stay strided by
+// SPLASH_TARGET_VERIFY_ROWS in chain mode; the tree layout occupies rows
+// 0..tree_counts[lane] of a lane's SPLASH_TREE_VERIFY_NODES-stride region.
+#define SPLASH_TREE_VERIFY_NODES 16u
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 262144u
-#define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
-  (SPLASH_TARGET_VERIFY_ROWS - 1u)
+// Verify rows are stored to page slots ahead of acceptance; a tree lane
+// occupies fifteen slots before its path is compacted, so the scratch
+// covers the larger of the chain (8) and tree (15) footprints.
+#define SPLASH_SPECULATIVE_SCRATCH_TOKENS (SPLASH_TREE_VERIFY_NODES - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u

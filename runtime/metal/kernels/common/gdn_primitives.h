@@ -35,6 +35,52 @@ inline bfloat gdn_conv_carry(device const bfloat *packed,
                     : packed[(source - 3) * packed_width + channel];
 }
 
+// The row `hops` parents above `row` in one lane's node table (tree verify):
+// the convolution and carry of a branch row read their predecessors along
+// the node's path, not the adjacent DFS rows.
+inline uint gdn_tree_ancestor(device const uint *nodes, uint row, uint hops) {
+  for (uint i = 0; i < hops; ++i)
+    row = SPLASH_TREE_NODE_PARENT(nodes[row]);
+  return row;
+}
+
+// The tree counterpart of gdn_conv_silu: the node's four taps cover path
+// positions depth-3..depth, taken from the carried state below zero and
+// from the ancestor row above it.
+inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
+                                 device const bfloat *conv_state_in,
+                                 device const bfloat *conv_weights,
+                                 uint packed_width, uint conv_dim, uint row,
+                                 uint channel, device const uint *nodes) {
+  const uint depth = SPLASH_TREE_NODE_DEPTH(nodes[row]);
+  float value = 0.0f;
+  for (uint tap = 0; tap < 4; ++tap) {
+    const int position = int(depth) + int(tap);
+    const bfloat input =
+        position < 3
+            ? conv_state_in[uint(position) * conv_dim + channel]
+            : packed[ulong(gdn_tree_ancestor(nodes, row, 3 - tap)) *
+                         packed_width +
+                     channel];
+    value += float(input) * float(conv_weights[channel * 4 + tap]);
+  }
+  value = float(bfloat(value));
+  return bfloat(splash_silu(value));
+}
+
+// The tree counterpart of gdn_conv_carry: the consumed prefix is the
+// retained path's DFS rows, so path[p] names the row at path position p.
+inline bfloat gdn_conv_carry_tree(device const bfloat *packed,
+                                  device const bfloat *conv_state_in,
+                                  uint packed_width, uint conv_dim,
+                                  device const uint *path, uint consumed,
+                                  uint row, uint channel) {
+  const uint source = consumed + row;
+  return source < 3
+             ? conv_state_in[source * conv_dim + channel]
+             : packed[ulong(path[source - 3]) * packed_width + channel];
+}
+
 // The gates of one (token, value head): beta = sigmoid(b) and
 // decay = exp(a_scale * softplus(bf16(a + dt_bias))), the softplus rounded to
 // bf16 as the reference does.

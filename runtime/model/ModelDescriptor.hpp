@@ -1,7 +1,11 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "Dense.hpp"
+#include "Lfm2.hpp"
+#include "Lfm2Moe.hpp"
 #include "Model.hpp"
+#include "Ornith9B.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "ops/Vision.hpp"
@@ -13,7 +17,9 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+using TargetLayout =
+    std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout, DenseLayout,
+                 Lfm2Layout, Lfm2MoeLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX or GGUF checkpoint prepared into images when it loads. The vision

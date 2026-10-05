@@ -11,8 +11,10 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace splash::kv {
 
@@ -47,10 +49,12 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // pages its history and verify rows fill, never fewer than kVerifySplits
 // and never more than the maximum the partial workspace is sized for. It
 // depends only on the lane's own history, so batching never changes a
-// lane's arithmetic.
+// lane's arithmetic. `rows` is the lane's live row count: kVerifyRows for
+// a chain, SPLASH_TREE_VERIFY_NODES - 1 for a tree lane.
 [[nodiscard]] constexpr uint32_t
-verifyAttentionSplits(uint32_t committedTokens) noexcept {
-  const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
+verifyAttentionSplits(uint32_t committedTokens,
+                      uint32_t rows = kVerifyRows) noexcept {
+  const uint64_t visible = uint64_t{committedTokens} + rows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
       (pages + kVerifyPagesPerSplit - 1) / kVerifyPagesPerSplit;
@@ -107,21 +111,25 @@ struct PrefillAttentionPlan final {
   const uint32_t rows;
   const uint32_t splits;
   const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
+  const std::string splitPipeline;
+  const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // The reduce threadgroup: one thread per head-dimension element.
+  const metal::DispatchSize reduceThreads;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
-                       std::string_view splitPipeline, std::string_view reducePipeline,
+                       std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       kv::Format format)
+                       metal::DispatchSize reduceThreads, kv::Format format)
       : format(format), rows(rows),
         splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups) {}
+        splitPipeline(std::move(splitPipeline)),
+        reducePipeline(std::move(reducePipeline)),
+        splitGroups(splitGroups), reduceGroups(reduceGroups),
+        reduceThreads(reduceThreads) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -133,28 +141,38 @@ struct VerifyAttentionPlan final {
   const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits;
   const uint32_t splits;
   const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
+  const std::string splitPipeline;
+  const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // The tile's row capacity per lane: SPLASH_TARGET_VERIFY_ROWS for the
+  // chain plan, SPLASH_TREE_VERIFY_NODES for a tree plan.
+  const uint32_t rowCapacity;
 
 private:
   friend class PagedAttention;
-  const std::string_view storePipeline_;
+  const std::string storePipeline_;
   const metal::DispatchSize storeGroups_;
   const metal::DispatchSize storeThreads_;
+  // The reduce threadgroup: one thread per head-dimension element.
+  const metal::DispatchSize reduceThreads_;
   VerifyAttentionPlan(uint32_t lanes,
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
-                      std::string_view splitPipeline, std::string_view reducePipeline,
+                      std::string splitPipeline, std::string reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Format format)
+                      std::string storePipeline, metal::DispatchSize storeGroups,
+                      metal::DispatchSize storeThreads,
+                      metal::DispatchSize reduceThreads, kv::Format format,
+                      uint32_t rowCapacity)
       : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
+        splitPipeline(std::move(splitPipeline)),
+        reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
-        storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+        rowCapacity(rowCapacity),
+        storePipeline_(std::move(storePipeline)), storeGroups_(storeGroups),
+        storeThreads_(storeThreads), reduceThreads_(reduceThreads) {}
 };
 
 struct PagedVerifyBuffers final {
@@ -165,6 +183,9 @@ struct PagedVerifyBuffers final {
   metal::MetalBuffer statistics;
   metal::MetalBuffer output;
   std::span<const metal::MetalBuffer> pageTables;
+  // The lanes' ancestor bitmasks (verify_input_tree_tokens), bound by the
+  // tree split kernels only.
+  metal::MetalBuffer treeMasks;
 };
 
 // Target attention over paged INT8 or BF16 history. Prefill and verify both
@@ -177,10 +198,11 @@ public:
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
   // historyTokens holds each lane's committed tokens before its verify rows,
-  // one entry per lane.
+  // one entry per lane. A tree plan selects the SPLASH_TREE_VERIFY_NODES-row
+  // kernels and workspaces; fp8 KV has none and throws.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens);
+             std::span<const uint32_t> historyTokens, bool tree = false);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -199,19 +221,33 @@ public:
                        metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                        metal::MetalBuffer chunkValues, uint32_t tokens,
                        uint32_t stride, uint32_t queryHeads, kv::Layout layout);
+  // `queryGate` selects the sigmoid gate of the Qwen rows or the plain
+  // gather of the no-gate targets (dense, LFM2).
   static void addPrefillGate(metal::CommandGraph &graph,
                              metal::MetalBuffer packed,
                              metal::MetalBuffer attention,
                              metal::MetalBuffer hidden, uint32_t tokens,
                              uint32_t stride, uint32_t queryHeads,
-                             kv::Layout layout);
+                             kv::Layout layout, bool queryGate = true);
+  // The *_sums variant for the gated layouts: the gate also writes the
+  // out-projection's input sums beside the gated rows.
+  static void addPrefillGateSums(metal::CommandGraph &graph,
+                                 metal::MetalBuffer packed,
+                                 metal::MetalBuffer attention,
+                                 metal::MetalBuffer hidden,
+                                 metal::MetalBuffer sums, uint32_t tokens,
+                                 uint32_t stride, uint32_t queryHeads,
+                                 kv::Layout layout);
+  // `rows` is the lanes' row count of this verify step:
+  // SPLASH_TARGET_VERIFY_ROWS chain, SPLASH_TREE_VERIFY_NODES tree.
   static void
   addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
                       const NormWeights &queryNorm, const NormWeights &keyNorm,
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t queryHeads,
-                      kv::Layout layout, uint32_t lanes);
+                      kv::Layout layout, uint32_t lanes,
+                      uint32_t rows = kv::kVerifyRows);
   // Also writes the out-projection's `input` table into `scratch` when it is
   // not Plain, and throws when `scratch` cannot hold it.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
@@ -220,7 +256,8 @@ public:
                                      metal::MetalBuffer hidden,
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch,
-                                     LinearInput input);
+                                     LinearInput input, bool queryGate = true,
+                                     uint32_t rows = kv::kVerifyRows);
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.
@@ -231,6 +268,9 @@ public:
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams
   verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  // A tree lane's chunk: its emitted nodes' DFS rows.
+  [[nodiscard]] static kv::ChunkedPrefillParams
+  verifyTreeParams(uint64_t logicalPosition, uint32_t pageTableEntries);
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,
@@ -251,11 +291,29 @@ public:
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan);
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
-  // its verify rows with the plan's split counts.
+  // its verify rows with the plan's split counts. When `gatePacked` and
+  // `gateHidden` are bound (a Plain-input out-projection), the reduce
+  // dispatch also applies the query gate addVerifyGate would, from the lane's
+  // packed QKV rows into `gateHidden` — one fewer dispatch and no
+  // attention-row round trip, bitwise identical.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
-                        const VerifyAttentionPlan &plan);
+                        const VerifyAttentionPlan &plan,
+                        metal::MetalBuffer gatePacked = {},
+                        metal::MetalBuffer gateHidden = {});
+  // The tree-verify tail after acceptance: the store wrote every node's K/V
+  // at committed + emitted row, while the committed tokens are the retained
+  // path — this dispatch copies each path row's slab to its path slot
+  // committed + i, skipping slots already correct. Encode after
+  // decode_accept_tree wrote retained/retainedPath.
+  static void
+  addVerifyTreeCompact(metal::CommandGraph &graph, SplashKvLayer layer,
+                       std::span<const metal::MetalBuffer> pageTables,
+                       metal::MetalBuffer retainedPath,
+                       metal::MetalBuffer retained,
+                       std::span<const kv::ChunkedPrefillParams> chunks,
+                       uint32_t lanes, kv::Layout layout);
 };
 
 } // namespace splash::ops

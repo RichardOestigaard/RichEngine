@@ -10,7 +10,11 @@
 namespace splash::model {
 
 struct Qwen3_8Layout;
+struct Ornith9BLayout;
 struct Qwen3_6MoeLayout;
+struct DenseLayout;
+struct Lfm2Layout;
+struct Lfm2MoeLayout;
 
 namespace affine {
 struct PlannedCheckpoint;
@@ -23,7 +27,11 @@ struct PlannedCheckpoint;
 class AffineTargetLoader final {
 public:
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_8Layout &layout);
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Ornith9BLayout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_6MoeLayout &layout);
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const DenseLayout &layout);
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2Layout &layout);
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2MoeLayout &layout);
   ~AffineTargetLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
@@ -36,6 +44,10 @@ private:
 // Every planned image of a layout, its sections at their offsets: the layers,
 // the head, the embedding.
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_8Layout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const Ornith9BLayout &layout);
 [[nodiscard]] std::vector<affine::Image> affineTargetImages(const Qwen3_6MoeLayout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const DenseLayout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const Lfm2Layout &layout);
+[[nodiscard]] std::vector<affine::Image> affineTargetImages(const Lfm2MoeLayout &layout);
 
 } // namespace splash::model

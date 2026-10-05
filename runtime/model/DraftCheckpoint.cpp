@@ -1,6 +1,8 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/AffinePlan.hpp"
 #include "model/DFlashDraft.hpp"
+#include "model/DSparkDraft.hpp"
+#include "model/PlainDraft.hpp"
 
 #include <string>
 #include <utility>
@@ -71,6 +73,50 @@ Image modelImage(const DFlashDraftLayout &layout) {
   return result;
 }
 
+// The plain transformer draft's files, in the order PlainDraft.cpp reads
+// them: the same fused QKV tile split as DFlash2, minus its convolutions.
+Image plainLayerImage(const DFlashDraftLayout &layout, uint32_t layer) {
+  Image result = affine::image("layer-" + std::to_string(layer) + ".bin", kPlainDraftMagic, layer, 0);
+  const std::string prefix = "layers." + std::to_string(layer) + ".";
+  const std::string attention = prefix + "self_attn.";
+  const uint32_t hidden = layout.hiddenSize;
+  const uint32_t kv = layout.kvHeads * layout.attentionHeadDimension;
+  copy(result, prefix + "input_layernorm.weight", {hidden});
+  quantized(result, {{attention + "q_proj", layout.attentionSize}, {attention + "k_proj", kv}, {attention + "v_proj", kv}},
+            layout.qkvSize, hidden);
+  copy(result, attention + "q_norm.weight", {layout.attentionHeadDimension});
+  copy(result, attention + "k_norm.weight", {layout.attentionHeadDimension});
+  quantized(result, {{attention + "o_proj", hidden}}, hidden, layout.attentionSize);
+  copy(result, prefix + "post_attention_layernorm.weight", {hidden});
+  quantized(result, {{prefix + "mlp.gate_proj", layout.intermediateSize}}, layout.intermediateSize, hidden);
+  quantized(result, {{prefix + "mlp.up_proj", layout.intermediateSize}}, layout.intermediateSize, hidden);
+  quantized(result, {{prefix + "mlp.down_proj", hidden}}, hidden, layout.intermediateSize);
+  return result;
+}
+
+Image plainModelImage(const DFlashDraftLayout &layout) {
+  Image result = affine::image("model.bin", kPlainDraftMagic, layout.layers, 1);
+  quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
+  copy(result, "hidden_norm.weight", {layout.hiddenSize});
+  copy(result, "norm.weight", {layout.hiddenSize});
+  return result;
+}
+
+// The DSpark draft's files: the layers are the plain draft's (both carry a
+// fused QKV tile, per-head norms and a gated MLP); model.bin adds the Markov
+// head's tables and the confidence head.
+Image dsparkModelImage(const DFlashDraftLayout &layout) {
+  Image result = affine::image("model.bin", kDSparkDraftMagic, layout.layers, 1);
+  quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
+  copy(result, "hidden_norm.weight", {layout.hiddenSize});
+  copy(result, "norm.weight", {layout.hiddenSize});
+  copy(result, "markov_head.markov_w1.weight", {layout.vocabularySize, layout.markovRank});
+  copy(result, "markov_head.markov_w2.weight", {layout.vocabularySize, layout.markovRank});
+  copy(result, "confidence_head.proj.weight", {1, layout.hiddenSize + layout.markovRank});
+  copy(result, "confidence_head.proj.bias", {1});
+  return result;
+}
+
 } // namespace
 
 std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -92,6 +138,54 @@ WeightFile DraftCheckpointLoader::layer(uint32_t index) {
   return images_.load(affine::imagePlan(planned_, index, "draft"));
 }
 WeightFile DraftCheckpointLoader::model() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+}
+
+std::vector<Image> plainDraftCheckpointImages(const DFlashDraftLayout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(plainLayerImage(layout, layer));
+  result.push_back(plainModelImage(layout));
+  return result;
+}
+
+PlainDraftCheckpointLoader::PlainDraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                                                     const DFlashDraftLayout &layout)
+    : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
+  planned_->images = plainDraftCheckpointImages(layout);
+  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+}
+PlainDraftCheckpointLoader::~PlainDraftCheckpointLoader() = default;
+WeightFile PlainDraftCheckpointLoader::layer(uint32_t index) {
+  if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
+  return images_.load(affine::imagePlan(planned_, index, "draft"));
+}
+WeightFile PlainDraftCheckpointLoader::model() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+}
+
+std::vector<Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    Image layerImage = plainLayerImage(layout, layer);
+    layerImage.magic = std::string(kDSparkDraftMagic);
+    result.push_back(std::move(layerImage));
+  }
+  result.push_back(dsparkModelImage(layout));
+  return result;
+}
+
+DSparkCheckpointLoader::DSparkCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                                               const DFlashDraftLayout &layout)
+    : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
+  planned_->images = dsparkDraftCheckpointImages(layout);
+  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+}
+DSparkCheckpointLoader::~DSparkCheckpointLoader() = default;
+WeightFile DSparkCheckpointLoader::layer(uint32_t index) {
+  if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
+  return images_.load(affine::imagePlan(planned_, index, "draft"));
+}
+WeightFile DSparkCheckpointLoader::model() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
 }
 

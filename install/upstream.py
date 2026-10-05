@@ -6,7 +6,8 @@ selects its components and decides when to follow the Hub, and the native
 source adapters own tensor validation and preparation. A target is
 identified by its own metadata (a GGUF header or an MLX config), read before
 any weight download, and paired with the draft trained for its family
-(families.py); repository names play no part. Every start follows the
+(families.py); names decide only what an incomplete config leaves open.
+Every start follows the
 target's revision, then its draft's, with one Hub request each, and
 publishes a new commit's assembly atomically; the installed assembly starts
 when the Hub cannot answer or the new commit cannot be installed.
@@ -152,8 +153,14 @@ def _gguf_target(repo, variant, language_only):
         )
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
-    # The family bounds the layers whose tensors the screening lists.
-    families.family_for(gguf.model_config(header))
+    # The family bounds the layers whose tensors the screening lists; one the
+    # runtime serves text-only is installed so whatever the selection asked.
+    # The names hint the fields a GGUF omits (router_aux_loss_coef).
+    family = families.family_for(
+        gguf.model_config(header),
+        name=f"{repo.name} {name} {header.values.get('general.name', '')}",
+    )
+    language_only = language_only or not family.vision
     gguf.require_loadable(header)
     files = {"target/" + name: name}
     vision_header = None
@@ -167,20 +174,31 @@ def _gguf_target(repo, variant, language_only):
 
 def _mlx_target(repo, language_only):
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-    if not language_only:
-        required.add("preprocessor_config.json")
     if missing := required - repo.files:
-        # --language-only drops the processor requirement and no other.
-        hint = (
-            "; use --language-only to serve text only"
-            if missing == {"preprocessor_config.json"}
-            else ""
-        )
         raise models.ModelError(
             f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
             "Configuration, tokenizer and processor must come from the target "
-            f"repository{hint}."
+            "repository."
         )
+    if not language_only and "preprocessor_config.json" not in repo.files:
+        # A family the runtime serves text-only asks no processor; deciding
+        # reads the config by range request, so a refusal downloads nothing.
+        # Anything unreadable asks for the processor as any repository does.
+        try:
+            with repo.open("config.json") as stream:
+                text_only = not families.family_for(
+                    json.load(stream), name=repo.name
+                ).vision
+        except (models.ModelError, ValueError, OSError):
+            text_only = False
+        if not text_only:
+            # --language-only drops the processor requirement and no other.
+            raise models.ModelError(
+                f"target repository {repo.name} is missing: preprocessor_config.json. "
+                "Configuration, tokenizer and processor must come from the target "
+                "repository; use --language-only to serve text only."
+            )
+        language_only = True
     config = models.read_json(repo.file("config.json"))
     # MLX states its quantization under "quantization"; a transformers
     # quantization_config alone describes another method (GPTQ, AWQ, ...).
@@ -194,6 +212,11 @@ def _mlx_target(repo, language_only):
         raise models.ModelError(
             "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
         )
+    # A family the runtime serves text-only takes no tower, whether or not
+    # the repository describes one; _install resolves the family again.
+    language_only = language_only or not families.family_for(
+        config, name=repo.name
+    ).vision
     files = {
         path: "config.json"
         for path in ("config.json", "target/config.json", "tokenizer/config.json")
@@ -422,14 +445,14 @@ def _install(selection, repo, installed, draft=None):
     # Every Hub request (header reads, downloads) happens here.
     with hub.as_model_errors(f"cannot install {selection.model}"):
         target = inspect_target(repo, selection.variant, selection.language_only)
-        family = families.family_for(target.config)
+        family = families.family_for(target.config, name=repo.name)
         if draft is None:
             draft = _resolve_draft(family, selection, installed, repo)
         draft, files = _draft(family, installed, draft)
         print(
             f"Installing {selection.model} as {family.name} ({target.format}); "
             f"draft {draft.name}; "
-            f"vision {'disabled' if selection.language_only else 'enabled'}.",
+            f"vision {'disabled' if target.vision_format == 'none' else 'enabled'}.",
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))

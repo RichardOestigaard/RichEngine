@@ -78,7 +78,7 @@ struct PersistentCacheFiles final {
 void requireLoadedModel(const model::ModelPackage &package);
 
 struct RuntimeResourcesConfig {
-  kv::Format kvFormat = kv::Format::Int8;
+  kv::Format kvFormat = kv::Format::Int4;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;

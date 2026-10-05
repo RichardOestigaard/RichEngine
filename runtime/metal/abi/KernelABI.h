@@ -7,6 +7,7 @@
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "metal/abi/LfmConv.h"
 #include "metal/abi/Linear.h"
 #include "metal/abi/MoE.h"
 #include "metal/abi/PagedAttention.h"

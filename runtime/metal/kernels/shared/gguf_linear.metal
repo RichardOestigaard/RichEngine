@@ -7,25 +7,8 @@
 // before the includes, so it also holds for the shared format and reduction code compiled here.
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_staged_tile.h"
+#include "metal/kernels/common/gguf_mxfp4_tile.h"
 #include "metal/kernels/common/split_reduce.h"
-
-// A tile's sums over every K partition, handed to store(row, column, sum). One partition stores its own; more publish
-// fp32 partials [split][Rows][destination column] (kernels/common/split_reduce.h) and the last arriving partition adds
-// them in split order. `column0` is the simdgroup's first destination column, `counter` its threadgroup's (one per 64
-// destination columns: the segments of a projection never share one).
-template <ushort Rows, class Acc, class Store>
-inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coherent(device) float *partials,
-                            device atomic_uint *counter, uint stride, uint column0, uint thread_index,
-                            threadgroup uint *arrival, Store store) {
-  if (splits == 1) { gguf_elements(acc, store); return; }
-  const auto at = [&](uint s, uint row, uint column) { return (ulong(s) * Rows + row) * stride + column0 + column; };
-  gguf_elements(acc, [&](uint row, uint column, float v) { partials[at(split, row, column)] = v; });
-  if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
-  gguf_elements(acc, [&](uint row, uint column, float v) {
-    store(row, column, split_sum(v, split, splits, [&](uint s) { return partials[at(s, row, column)]; }));
-  });
-  split_release(counter, thread_index);
-}
 
 // ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
@@ -94,7 +77,7 @@ kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[b
                         device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
                         uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
+  threadgroup half2 tl[F::Kind == QuantCodebook && !F::Native ? kQuantPairTableEntries : 1];
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS);
   threadgroup half stage[kStagedStages];
   threadgroup uint arrival;
@@ -113,17 +96,98 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
   GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
+// The native MXFP4 decoders, dispatched on Apple GPU family 10 and up only.
+GGUF_DECODE_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_DECODE_FORMAT
 #undef GGUF_DECODE_ROWS
 #undef GGUF_DECODE
+
+#if defined(__HAVE_TENSOR_MULTIPLANE__) && defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
+// MXFP4 on the Metal 4.1 multiplane tensor (ops::Linear's `mxfp4m` decode
+// kernels, Apple GPU family 10 and up): the packed-FP4 decode tile of
+// kernels/common/gguf_mxfp4_tile.h over one tensor's planes.
+template <ushort Rows, GgufEpilogue Ep, class Out>
+kernel void gguf_decode_mxfp4(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                              device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                              device Out *output [[buffer(4)]],
+                              device coherent(device) float *partials [[buffer(5)]],
+                              device atomic_uint *counters [[buffer(6)]],
+                              device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
+                              uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                              uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[2 * Rows * 32];
+  threadgroup uchar scales_plane[2 * Rows + 4];
+  threadgroup uint arrival;
+  static_cast<void>(w1);   // MXFP4 has no second plane; the slot keeps the shared GgufDecodeKernel signature
+  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  gguf_decode_mxfp4_tile<Rows, Ep>(input, w0, meta, output, partials,
+                                   counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, aux, p.input_size, p.splits,
+                                   p.out_stride, origin, p.out_offset + origin, group.y, simd_lane, simd_group,
+                                   stage, scales_plane, &arrival);
+}
+#define GGUF_DECODE_MXFP4(R, ep, Ep, Out) \
+  template [[host_name("gguf_decode_mxfp4m_m" #R "_" #ep)]] kernel GgufDecodeKernel<Out> gguf_decode_mxfp4<R, Ep, Out>;
+#define GGUF_DECODE_MXFP4_ROWS(ep, Ep, Out) \
+  GGUF_DECODE_MXFP4(8, ep, Ep, Out) GGUF_DECODE_MXFP4(16, ep, Ep, Out) GGUF_DECODE_MXFP4(32, ep, Ep, Out)
+GGUF_DECODE_MXFP4_ROWS(a, EpNone, bfloat) GGUF_DECODE_MXFP4_ROWS(a_f32, EpNone, float)
+GGUF_DECODE_MXFP4_ROWS(r, EpResidual, bfloat) GGUF_DECODE_MXFP4_ROWS(g, EpUpWithGate, bfloat)
+#undef GGUF_DECODE_MXFP4_ROWS
+#undef GGUF_DECODE_MXFP4
+#endif
+
+#if defined(__HAVE_INT4B_FORMAT_TYPE__) && defined(__HAVE_INT2B_FORMAT_TYPE__)
+// The packed-operand decoders of the formats whose codes matmul2d reads
+// directly (ops::Linear's `<f>m` decode kernels, Apple GPU family 10 and
+// up): the packed-B tile of kernels/common/gguf_mxfp4_tile.h over plane0,
+// the group's (s, m - s * Zero) coefficient applied in the epilogue.
+template <class F, class BT, ushort Rows, GgufEpilogue Ep, class Out>
+kernel void gguf_decode_packed(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                               device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                               device Out *output [[buffer(4)]],
+                               device coherent(device) float *partials [[buffer(5)]],
+                               device atomic_uint *counters [[buffer(6)]],
+                               device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
+                               uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                               uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup bfloat stage[2 * Rows * 32];
+  threadgroup float2 coefs[2 * 64];
+  threadgroup float sums[2 * Rows];
+  threadgroup uint arrival;
+  static_cast<void>(w1);   // the packed formats decode from plane0 alone
+  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  gguf_decode_packed_tile<F, BT, Rows, Ep>(input, w0, meta, output, partials,
+                                          counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, aux, p.input_size,
+                                          p.splits, p.out_stride, origin, p.out_offset + origin, group.y, simd_lane,
+                                          simd_group, stage, coefs, sums, &arrival);
+}
+#define GGUF_DECODE_PACKED(F, f, BT, R, ep, Ep, Out) \
+  template [[host_name("gguf_decode_" #f "m_m" #R "_" #ep)]] \
+  kernel GgufDecodeKernel<Out> gguf_decode_packed<F, BT, R, Ep, Out>;
+#define GGUF_DECODE_PACKED_ROWS(F, f, BT, ep, Ep, Out) \
+  GGUF_DECODE_PACKED(F, f, BT, 8, ep, Ep, Out) GGUF_DECODE_PACKED(F, f, BT, 16, ep, Ep, Out) \
+  GGUF_DECODE_PACKED(F, f, BT, 32, ep, Ep, Out)
+#define GGUF_DECODE_PACKED_FORMAT(F, f, BT)                                              \
+  GGUF_DECODE_PACKED_ROWS(F, f, BT, a, EpNone, bfloat)                                   \
+  GGUF_DECODE_PACKED_ROWS(F, f, BT, a_f32, EpNone, float)                                \
+  GGUF_DECODE_PACKED_ROWS(F, f, BT, r, EpResidual, bfloat)                               \
+  GGUF_DECODE_PACKED_ROWS(F, f, BT, g, EpUpWithGate, bfloat)
+GGUF_DECODE_PACKED_FORMAT(FmtQ40, q40, uint4b_format)
+GGUF_DECODE_PACKED_FORMAT(FmtQ41, q41, uint4b_format)
+GGUF_DECODE_PACKED_FORMAT(FmtQ4K, q4k, uint4b_format)
+GGUF_DECODE_PACKED_FORMAT(FmtQ80, q80, int8_t)
+GGUF_DECODE_PACKED_FORMAT(FmtPQ20, pq20, uint2b_format)
+#undef GGUF_DECODE_PACKED_FORMAT
+#undef GGUF_DECODE_PACKED_ROWS
+#undef GGUF_DECODE_PACKED
+#endif
 
 // Fused projections (qkv|z|ab, q|k|v): up to three column segments of any formats in one dispatch, so the small
 // segments do not run as dispatches of their own. The threadgroup's tile picks its segment, and the segment's format
 // picks the decode; every segment takes the same K splits. The fused and prefill kernels stay plain kernels: as
 // template instantiations (weak_odr) the compiler infers fewer parameter attributes and inlines differently.
 #define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
-#define GGUF_DECODE_FUSED(R)                                                                                       \
-  kernel void gguf_decode_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),          \
+#define GGUF_DECODE_FUSED(R, SUFFIX, NATIVE)                                                                       \
+  kernel void gguf_decode_fused_m##R##SUFFIX(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),          \
                                      GGUF_SEGMENT(4, w0b, w1b, mb), GGUF_SEGMENT(7, w0c, w1c, mc),                \
                                      device bfloat *output [[buffer(10)]],                                        \
                                      device coherent(device) float *partials [[buffer(11)]],                      \
@@ -133,6 +197,7 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
                                      uint simd_lane [[thread_index_in_simdgroup]],                                \
                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {                        \
     threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries]; threadgroup uint arrival; \
+    threadgroup float2 packed_coefs[128]; threadgroup float packed_sums[2 * R];                                 \
     const uint t0 = p.cols[0] / GGUF_TILE_COLUMNS, t1 = t0 + p.cols[1] / GGUF_TILE_COLUMNS;                        \
     const uint s = group.x < t0 ? 0 : group.x < t1 ? 1 : 2;                                                       \
     device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;                                                         \
@@ -140,16 +205,29 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
     device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;                                                          \
     const uint local = group.x - (s == 0 ? 0 : s == 1 ? t0 : t1), per = p.input_size / GGUF_STAGED_STEP / p.splits; \
     const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin; \
+    if (NATIVE && gguf_decode_fused_mxfp4<R>(p.fmt[s], input, w0, meta, output, partials,                       \
+                      counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.input_size, p.splits, p.out_stride, \
+                      origin, column0, group.y, simd_lane, simd_group, stage, (threadgroup uchar *)tl,        \
+                      &arrival))                                                                            \
+      return;                                                                                               \
+    if (NATIVE && gguf_decode_fused_packed<R>(p.fmt[s], input, w0, meta, output, partials,                    \
+                      counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.input_size, p.splits, p.out_stride, \
+                      origin, column0, group.y, simd_lane, simd_group, (threadgroup bfloat *)stage,           \
+                      packed_coefs, packed_sums, &arrival))                                                   \
+      return;                                                                                               \
     threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;                                            \
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);                                         \
     gguf_zero(acc);                                                                                               \
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NATIVE>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
                                             simd_group * 32 + simd_lane, simd_lane, group.y * per, (group.y + 1) * per, acc); \
     gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
+GGUF_DECODE_FUSED(8, , false) GGUF_DECODE_FUSED(16, , false) GGUF_DECODE_FUSED(32, , false)
+// The `_n` fused kernels an Apple GPU family 10 host dispatches, whose MXFP4
+// segments decode on the native FP4 path.
+GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED(32, _n, true)
 #undef GGUF_DECODE_FUSED
 #undef GGUF_SEGMENT
 
@@ -162,7 +240,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
   uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],                      \
       uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GGUF_PREFILL_TABLES(F)                                                                                     \
-  threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];                                     \
+  threadgroup half2 tl[F::Kind == QuantCodebook && !F::Native ? kQuantPairTableEntries : 1];                                     \
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS);                                      \
   threadgroup half stage[kPrefillStages]
 #define GGUF_PREFILL(F, f)                                                                                         \
@@ -188,6 +266,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
 #define GGUF_PREFILL_FORMAT(F, f) \
   GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
+GGUF_PREFILL_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_PREFILL_FORMAT
 #undef GGUF_PREFILL_EPILOGUE
 #undef GGUF_PREFILL

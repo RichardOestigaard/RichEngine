@@ -35,12 +35,16 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 } // namespace
 
 void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                     GdnShape shape, uint32_t tokens, GdnHeadOrder order) {
+                     GdnShape shape, uint32_t tokens, GdnHeadOrder order,
+                     metal::MetalBuffer sums) {
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
-  const std::string gate = normKernel(kernelName(kernel, "prefill_gdn_gate", "prefill_gdn_gate_vh32"),
-                                      buffers.mixerNorm, shape.headDimension);
+  const std::string gate =
+      normKernel(kernelName(kernel,
+                            sums ? "prefill_gdn_gate_sums" : "prefill_gdn_gate",
+                            sums ? "prefill_gdn_gate_sums_vh32" : "prefill_gdn_gate_vh32"),
+                 buffers.mixerNorm, shape.headDimension);
   const GDNPrefillParams params{tokens};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
@@ -60,9 +64,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                  SPLASH_GDN_SCAN_STATE_ROWS,
              1, 1},
             {SPLASH_GDN_SCAN_THREADS, 1, 1});
-  graph.add(gate,
-            {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer,
-             buffers.hidden},
+  std::vector<metal::MetalBuffer> gateBindings{buffers.recurrentRows, buffers.packed,
+                                                buffers.mixerNorm.buffer, buffers.hidden};
+  if (sums) gateBindings.push_back(sums);
+  graph.add(gate, gateBindings,
             GDNGatePrefillParams{order == GdnHeadOrder::Tiled},
             {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
@@ -99,6 +104,43 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   return {buffers.hidden, input};
 }
 
+PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
+                                 GdnDecodeBuffers buffers,
+                                 metal::MetalBuffer treeNodes,
+                                 metal::MetalBuffer treeCounts, GdnShape shape,
+                                 uint32_t lanes, uint32_t layer,
+                                 GdnStateStrides state, GdnHeadOrder order,
+                                 LinearInput input) {
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+      !treeNodes || !treeCounts)
+    throw std::invalid_argument("invalid GDN tree decode geometry");
+  const KernelLayout kernel = kernelShape(shape);
+  std::vector<metal::MetalBuffer> bindings{buffers.packed,
+                                           buffers.convolutionWeights};
+  const bool prepare = input != LinearInput::Plain;
+  if (prepare)
+    requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
+                        lanes * SPLASH_TREE_VERIFY_NODES);
+  bindings.reserve(prepare ? 21 : 19);
+  appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  bindings.insert(bindings.end(),
+                  {buffers.mixed, buffers.decayWeights, buffers.timeBias,
+                   buffers.decay, buffers.beta, buffers.mixerNorm.buffer,
+                   buffers.hidden, treeNodes, treeCounts});
+  if (prepare)
+    bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
+  const GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
+                                    layer,
+                                    state.convolutionLayerBytes,
+                                    state.recurrentLayerBytes,
+                                    state.convolutionStateBytes};
+  const std::string name = std::string("verify_tree_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
+  graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
+            {shape.valueHeads, lanes, 1});
+  if (!prepare) return {};
+  return {buffers.hidden, input};
+}
+
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                     GdnShape shape, uint32_t layers, uint32_t lanes,
                     GdnStateStrides state) {
@@ -114,10 +156,38 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   const GDNBatchCommitParams params{state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
+  // Static parameters and arena/state buffers: replayable. The current/next
+  // state swap alternates between the span cache's two slots.
+  graph.beginBakedSpan();
   graph.add(kernelName(kernel, "verify_gdn_commit",
                        "verify_gdn_commit_vh32"),
             std::move(bindings), params,
             {shape.valueHeads, layers, lanes});
+  graph.endBakedSpan();
+}
+
+void GDN::addCommitTree(metal::CommandGraph &graph, GdnCommitBuffers buffers,
+                        metal::MetalBuffer retainedPath, GdnShape shape,
+                        uint32_t layers, uint32_t lanes,
+                        GdnStateStrides state) {
+  if (!layers || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      !state.valid() || !retainedPath)
+    throw std::invalid_argument("invalid GDN tree commit geometry");
+  const KernelLayout kernel = kernelShape(shape);
+  std::vector<metal::MetalBuffer> bindings{
+      buffers.packed, buffers.mixed, buffers.decay, buffers.beta};
+  bindings.reserve(14);
+  appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  bindings.insert(bindings.end(), {buffers.retainedCounts, retainedPath});
+  const GDNBatchCommitParams params{state.convolutionLayerBytes,
+                                    state.recurrentLayerBytes,
+                                    state.convolutionStateBytes};
+  graph.beginBakedSpan();
+  graph.add(kernelName(kernel, "verify_gdn_commit_tree",
+                       "verify_gdn_commit_tree_vh32"),
+            std::move(bindings), params,
+            {shape.valueHeads, layers, lanes});
+  graph.endBakedSpan();
 }
 
 } // namespace splash::ops

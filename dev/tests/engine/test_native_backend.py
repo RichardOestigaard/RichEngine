@@ -8,12 +8,13 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_runtime import FakeFactory
 from dev.tests.test_server import FOREVER, _byte_backend, make_frontend
 from server import backend as backend_api
 from server import constraints as generation_constraints
+
+CONTRACT = generation_constraints.TokenizerContract(32, (), '', 0)
 from server import errors as api_errors
 from server import images, runtime
 from server import protocol as wire
@@ -281,7 +282,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
+            generation_constraints.TokenConstraint(None, None, CONTRACT).masks(tuple(range(9)))
 
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
@@ -623,7 +624,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None)
+        constraint = generation_constraints.TokenConstraint(matcher, None, CONTRACT)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])

@@ -14,12 +14,14 @@
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every embedding format's native rows is checked here too.
 #include "GgufFormatReference.hpp"
+#include "NormReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Normalization.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #include <dispatch/dispatch.h>
@@ -572,8 +574,21 @@ void prefill(MetalBackend &backend, const Linear &linear) {
         const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, plan.storageRows()),
                                 chunkAux, kPoisonNaN, covered, name);
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
-        if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
+        if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns)) {
+          float worst = 0;
+          uint64_t differing = 0, at = 0;
+          for (uint64_t i = 0; i < uint64_t{rows} * columns; ++i)
+            if (out.output[i] != tileOutput[i]) {
+              const float d = std::fabs(bf16ToFloat(out.output[i]) - bf16ToFloat(tileOutput[i]));
+              if (d > worst) { worst = d; at = i; }
+              ++differing;
+            }
+          std::cerr << "    diff " << name << ": " << differing << " of " << uint64_t{rows} * columns
+                    << " elements differ, max |d| " << worst << " at row " << at / columns
+                    << " column " << at % columns << " (got " << bf16ToFloat(out.output[at])
+                    << " want " << bf16ToFloat(tileOutput[at]) << ")\n";
           fail(name + ": differs from the 128-row tiles");
+        }
       }
   };
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
@@ -701,6 +716,121 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   }
 }
 
+// ---------------------------------------------------------------- packed input
+// A decode plan whose single-tensor projections hold an MXFP4 segment asks
+// its input's producer for LinearInput::Packed: the norm emits the
+// slot-permuted fp16 plane and exponent bytes of the mxfp4p operand beside
+// its bf16 rows and the projection dispatches no gguf_pack_half. The fused
+// graph's output is the consumer-packed run's bit for bit.
+void packedInput(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 2048, columns = N + kPadding;
+  if (backend.capabilities().appleGpuFamily < 10) {
+    section("packed input: skipped (the mxfp4p decode needs Apple GPU family 10)");
+    return;
+  }
+  const Tensor w = tensor(backend, MXFP4, N, K), g = tensor(backend, Q4K, N, K);
+  const Projection up = projection({&w}, columns), gate = projection({&g}, columns);
+  // Unit weights: the norm's bf16 output is its input row scaled by the
+  // inverse RMS — the values a packed consumer multiplies.
+  const NormWeights ones = test::makeNormWeights(backend, K, true, [](uint32_t) { return 1.0f; });
+  const std::vector<float> raw = activations(Inputs::Sparse, kMaximumRows, K);
+  const std::vector<float> residual = residuals(kMaximumRows, columns);
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+    for (const uint32_t lanes : {1u, 3u}) {
+      const std::string what = std::string(epilogueName(epilogue)) + " L=" + std::to_string(lanes);
+      const Projection *gatep = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
+      const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
+      const LinearPlan plan = linear.decodePlan(up, lanes, epilogue, gatep);
+      if (plan.input() != LinearInput::Packed) {
+        fail(what + ": an MXFP4 decode plan does not ask for a packed input");
+        continue;
+      }
+      const uint32_t rows = wl.rows, storage = plan.storageRows();
+      const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
+      const Scratch scratch(backend, plan.scratchSize());
+      const Guarded source = bfloats(backend, storageRows(raw, K, rows, storage));
+      const Guarded normalized(backend, uint64_t{storage} * K * 2, 0);
+      // The fused graph: norm_rms_packed_decode writes the bf16 rows and the
+      // packed operand, and the projection runs the mxfp4p kernels straight
+      // off them — no gguf_pack_half.
+      CommandGraph fused;
+      Guarded fusedOut(backend, uint64_t{storage} * columns * 2, 0xFF), fusedGate(backend, plan.gateScratchBytes(), 0xFF);
+      const PreparedInput prepared = Normalization::addRms(fused, source.view, ones, normalized.view, K, rows,
+                                                         scratch.bindings(), LinearInput::Packed);
+      const Guarded auxBuffer = bfloats(backend, aux);
+      static_cast<void>(linear.add(
+          fused,
+          {.input = normalized.view, .output = fusedOut.view,
+           .residual = epilogue == LinearEpilogue::Residual ? auxBuffer.view : MetalBuffer{},
+           .gateScratch = fusedGate.view, .scratch = scratch.bindings(), .prepared = prepared},
+          up, plan, gatep));
+      uint32_t packs = 0;
+      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == "gguf_pack_half";
+      if (packs) fail(what + ": the projection still dispatches gguf_pack_half");
+      static_cast<void>(backend.submitCommand(fused.dispatches()));
+      // The same projection on the same rows with the consumer's pack: every
+      // output and the gate scratch must match bit for bit.
+      const Outcome want =
+          run(backend, linear, plan, up, gatep,
+              std::vector<uint16_t>(static_cast<const uint16_t *>(normalized.view.contents()),
+                                    static_cast<const uint16_t *>(normalized.view.contents()) + storage * K),
+              aux, kPoisonNaN, N, what + " packed by the consumer");
+      const std::vector<uint16_t> gotOut = fusedOut.halves(), gotGate = fusedGate.halves();
+      if (!std::equal(gotOut.begin(), gotOut.begin() + uint64_t{rows} * columns, want.output.begin()))
+        fail(what + ": the producer-packed projection differs from the consumer-packed one");
+      if (epilogue == LinearEpilogue::GateUp &&
+          !std::equal(gotGate.begin(), gotGate.begin() + uint64_t{rows} * columns, want.gate.begin()))
+        fail(what + ": the packed-input gate pass differs");
+      if (!fusedOut.intact() || !fusedGate.intact()) fail(what + ": a write past a buffer");
+    }
+  // A prefill chunk plan of up to a decode batch's rows runs the same mxfp4p
+  // decode tiles, so its producer can emit the packed operand the same way.
+  // The tiles stay behind SPLASH_GGUF_PACKED_ON: the fp4 multiplane matmul
+  // is not bitwise equal to the staged mxfp4n prefill tile's outputs.
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual})
+    for (const uint32_t rows : {8u, 32u}) {
+      if (!std::getenv("SPLASH_GGUF_PACKED_ON")) break;
+      const std::string what =
+          "prefill " + std::string(epilogueName(epilogue)) + " rows=" + std::to_string(rows);
+      const LinearPlan plan = linear.prefillPlan(up, rows, epilogue);
+      if (plan.input() != LinearInput::Packed) {
+        fail(what + ": an MXFP4 prefill chunk plan does not ask for a packed input");
+        continue;
+      }
+      const uint32_t storage = plan.storageRows();
+      const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
+      const Scratch scratch(backend, plan.scratchSize());
+      const Guarded source = bfloats(backend, storageRows(raw, K, rows, storage));
+      const Guarded normalized(backend, uint64_t{storage} * K * 2, 0);
+      CommandGraph fused;
+      Guarded fusedOut(backend, uint64_t{storage} * columns * 2, 0xFF);
+      const PreparedInput prepared = Normalization::addRms(fused, source.view, ones, normalized.view, K, rows,
+                                                         scratch.bindings(), LinearInput::Packed);
+      const Guarded auxBuffer = bfloats(backend, aux);
+      static_cast<void>(linear.add(
+          fused,
+          {.input = normalized.view, .output = fusedOut.view,
+           .residual = epilogue == LinearEpilogue::Residual ? auxBuffer.view : MetalBuffer{},
+           .scratch = scratch.bindings(), .prepared = prepared},
+          up, plan, nullptr));
+      uint32_t packs = 0;
+      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == "gguf_pack_half";
+      if (packs) fail(what + ": the projection still dispatches gguf_pack_half");
+      static_cast<void>(backend.submitCommand(fused.dispatches()));
+      const Outcome want =
+          run(backend, linear, plan, up, nullptr,
+              std::vector<uint16_t>(static_cast<const uint16_t *>(normalized.view.contents()),
+                                    static_cast<const uint16_t *>(normalized.view.contents()) + storage * K),
+              aux, kPoisonNaN, N, what + " packed by the consumer");
+      const std::vector<uint16_t> gotOut = fusedOut.halves();
+      if (!std::equal(gotOut.begin(), gotOut.begin() + uint64_t{rows} * columns, want.output.begin()))
+        fail(what + ": the producer-packed prefill chunk differs from the consumer-packed one");
+      if (!fusedOut.intact()) fail(what + ": a write past a buffer");
+    }
+  section("packed input: norm-emitted mxfp4p operand, plain/residual/gate-up at 1 and 3 lanes and prefill "
+          "chunks of 8 and 32 rows, no pack dispatch, bitwise equal to the consumer-packed projection");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- token gather
@@ -761,6 +891,7 @@ int main(int argc, char **argv) {
         }
       section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
               "independent of poisoned partials and within fp64");
+      packedInput(backend, linear);
       tokenGather(backend);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';

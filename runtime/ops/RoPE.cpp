@@ -14,12 +14,14 @@ void RoPE::addTables(
     metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
     metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
     RopeTableParams rows, uint32_t maximumRows) {
-  if (!rows.target_rows || rows.target_rows > maximumRows ||
-      rows.draft_rows > maximumRows) {
+  // Either side may be empty: a tree batch builds the draft's tables before
+  // its forward and the target's after the tree input pass wrote them.
+  if ((!rows.target_rows && !rows.draft_rows) ||
+      rows.target_rows > maximumRows || rows.draft_rows > maximumRows) {
     throw std::invalid_argument("invalid RoPE table row count");
   }
   const uint64_t elements =
-      std::max<uint64_t>(uint64_t{rows.target_rows} * 32,
+      std::max<uint64_t>(uint64_t{rows.target_rows} * rows.target_dims,
                          uint64_t{rows.draft_rows} * 64);
   graph.add("rope_build_tables",
             {std::move(targetPositions), std::move(draftPositions),

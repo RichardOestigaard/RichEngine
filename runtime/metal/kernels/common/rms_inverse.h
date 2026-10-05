@@ -13,7 +13,8 @@ constant constexpr float kRmsEpsilon = 1e-6f;
 // includes them.
 template <ushort Simdgroups = 8>
 inline float rms_inverse_of_sums(float sum, uint width, threadgroup float *reductions,
-                                 uint thread_index, uint lane, uint simd_group) {
+                                 uint thread_index, uint lane, uint simd_group,
+                                 float eps = kRmsEpsilon) {
 #pragma clang fp reassociate(off)
   sum = simd_sum(sum);
   if (lane == 0)
@@ -23,7 +24,7 @@ inline float rms_inverse_of_sums(float sum, uint width, threadgroup float *reduc
     float total = 0.0f;
     for (uint i = 0; i < Simdgroups; ++i)
       total += reductions[i];
-    reductions[0] = rsqrt(total / width + kRmsEpsilon);
+    reductions[0] = rsqrt(total / width + eps);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return reductions[0];
@@ -46,7 +47,7 @@ inline float row_squares(Row row, uint width, uint thread_index) {
 // every thread.
 inline float rms_inverse(device const bfloat *row_input, uint width,
                          threadgroup float *reductions, uint thread_index,
-                         uint lane, uint simd_group) {
+                         uint lane, uint simd_group, float eps = kRmsEpsilon) {
   return rms_inverse_of_sums(row_squares(row_input, width, thread_index), width, reductions,
-                             thread_index, lane, simd_group);
+                             thread_index, lane, simd_group, eps);
 }

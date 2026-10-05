@@ -126,17 +126,30 @@ static_assert(sizeof(SamplingPenaltyParams) == 112,
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
-// are zero and unread.
+// are zero and unread. tree_mask marks the lanes whose draft_select_tree
+// emits sibling leaves beyond the chain (greedy, unconstrained lanes of a
+// tree-capable draft); sampled lanes always get a linear node table.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  uint32_t tree_mask;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 48,
+              "Draft selector parameters are 48 bytes on both sides");
+
+// One node of a lane's verify tree (draft_select_tree): the DFS row of its
+// parent (0xFF for the anchor), its depth from the anchor, and its proposal
+// position (0xFF for the anchor). Row 0 is the anchor, rows 1..7 the chain,
+// rows 8.. the sibling leaves. A node's row also indexes its verify input
+// token (TreeTokens), its logits row and its attention/GDN row.
+#define SPLASH_TREE_NODE_PARENT(node) ((node)&0xffu)
+#define SPLASH_TREE_NODE_DEPTH(node) (((node) >> 8) & 0xffu)
+#define SPLASH_TREE_NODE_POSITION(node) (((node) >> 16) & 0xffu)
+#define SPLASH_TREE_NODE_NONE 0xffu
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -147,3 +160,38 @@ struct AcceptBatchParams {
 
 static_assert(sizeof(AcceptBatchParams) == 28,
               "Batched acceptance parameters are 28 bytes on both sides");
+
+// verify_input_tree_tokens parameters: one thread per (lane, node) fills the
+// node's verify input token, its (t, h, w) rope position (the lane's base
+// triple plus the node's depth) and its ancestor bitmask.
+struct VerifyTreeInputParams {
+  uint32_t vocabulary;
+  uint32_t mask_token;
+  uint32_t base[SPLASH_MAXIMUM_BATCH_WIDTH][3];
+};
+
+static_assert(sizeof(VerifyTreeInputParams) == 56,
+              "Verify tree input parameters are 56 bytes on both sides");
+
+// decode_accept_tree walks one lane's tree: it shares the remaining/limits
+// fields of AcceptBatchParams and adds nothing else.
+struct TreeAcceptBatchParams {
+  uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t stop_token_0;
+  uint32_t stop_token_1;
+  uint32_t lanes;
+};
+
+static_assert(sizeof(TreeAcceptBatchParams) == 28,
+              "Batched tree acceptance parameters are 28 bytes on both sides");
+
+// tree_leaf_patch splices ANE-produced leaf alternates into a lane's comb
+// rows: the kernel runs while a predictor job may still be in flight, so it
+// applies only when the flag's serial matches the one the encode snapshotted.
+struct TreeLeafPatchParams {
+  uint32_t expected;
+  uint32_t lanes;
+};
+
+static_assert(sizeof(TreeLeafPatchParams) == 8,
+              "Tree leaf patch parameters are 8 bytes on both sides");

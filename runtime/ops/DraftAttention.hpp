@@ -16,6 +16,9 @@ struct DraftAttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  // Nonzero selects the interleaved (GPT-J) rotary pairing over the default
+  // half-split one (a DSpark draft's rope_is_neox_style = false).
+  uint32_t ropeInterleaved = 0;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };
@@ -89,10 +92,20 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
+  // `causal` masks the eight current rows to the block rows up to each
+  // query's position (a plain DFlash draft's sliding layers); the DFlash2
+  // blocks attend bidirectionally.
   static void addDecode(metal::CommandGraph &graph,
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
-                        const DraftAttentionPlan &plan);
+                        const DraftAttentionPlan &plan, bool causal = false);
+  // output = input + residual over the plan's rows: the plain draft's
+  // residual adds, which the DFlash2 convolutions fold in.
+  static void addResidual(metal::CommandGraph &graph,
+                          metal::MetalBuffer input,
+                          metal::MetalBuffer residual,
+                          metal::MetalBuffer output,
+                          const DraftAttentionPlan &plan);
   static void addReorder(metal::CommandGraph &graph,
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer packed,

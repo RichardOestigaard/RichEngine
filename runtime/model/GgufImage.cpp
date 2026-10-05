@@ -116,6 +116,16 @@ public:
            Conversion::NarrowToBfloat16);
   }
 
+  // LFM2's conv kernel F32, as the exact bf16 values the conv kernel
+  // reads, in the stored channel-major [channels, taps] order.
+  void convTaps(const std::string &name) {
+    const uint32_t channels = geometry_.convolutionDimension;
+    const uint64_t taps = geometry_.convolutionTaps ? geometry_.convolutionTaps : kGdnConvolutionTaps;
+    if (const GgufTensor *tensor = floatVector(name, channels * taps))
+      copy(tensorRows(*tensor, taps, tensor->bytes / taps),
+           Conversion::NarrowToBfloat16);
+  }
+
   // A per value head F32 vector in grouped head order: as stored, or as the
   // exact bf16 values the kernels read.
   void headVector(const std::string &name, Conversion conversion) {
@@ -244,6 +254,87 @@ private:
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
 
+// The dense ("llama" arch) and LFM2 GGUFs' metadata: their fields differ
+// from the qwen35 family (no ssm/full_attention_interval keys; LFM2's
+// head_count_kv is a per-layer array). Optional keys are checked only when
+// the file declares them.
+void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geometry,
+                              const std::string &arch) {
+  std::string mismatched;
+  const auto expect = [&](const char *key, uint64_t value) {
+    const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
+    if (found != value)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
+                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
+  };
+  const auto expectOptional = [&](const char *key, uint64_t value) {
+    if (const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
+        found && *found != value)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
+                    std::to_string(*found) + " (expected " + std::to_string(value) + ")";
+  };
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = file.floatValue(arch + "." + key);
+    if (found && std::abs(*found - value) <= value * 1e-6) return;
+    std::ostringstream text;
+    text << (mismatched.empty() ? "" : ", ") << key << ' ';
+    if (found) text << *found;
+    else text << "missing";
+    text << " (expected " << value << ')';
+    mismatched += text.str();
+  };
+  expect("block_count", geometry.layers);
+  expect("embedding_length", geometry.hiddenSize);
+  expect("feed_forward_length", geometry.intermediateSize);
+  // LFM2 writes per-layer head arrays; a scalar means the whole model.
+  if (const std::optional<std::span<const double>> heads =
+          file.numericArray(arch + ".attention.head_count")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= heads->size()) break;
+      const uint64_t expected =
+          geometry.isFullAttentionLayer(layer)
+              ? geometry.attentionWidth / geometry.attentionHeadDimension
+              : 0;
+      if (uint64_t((*heads)[layer]) != expected)
+        mismatched += (mismatched.empty() ? "" : ", ") +
+                      std::string("attention.head_count[") + std::to_string(layer) + "]";
+    }
+  } else {
+    expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
+  }
+  if (const std::optional<std::span<const double>> kvs =
+          file.numericArray(arch + ".attention.head_count_kv")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= kvs->size()) break;
+      const uint64_t expected =
+          geometry.isFullAttentionLayer(layer) ? geometry.attentionKvHeads : 0;
+      if (uint64_t((*kvs)[layer]) != expected)
+        mismatched += (mismatched.empty() ? "" : ", ") +
+                      std::string("attention.head_count_kv[") + std::to_string(layer) + "]";
+    }
+  } else {
+    expect("attention.head_count_kv", geometry.attentionKvHeads);
+  }
+  expectOptional("attention.key_length", geometry.attentionHeadDimension);
+  expectOptional("attention.value_length", geometry.attentionHeadDimension);
+  expectOptional("rope.dimension_count", 2ull * geometry.rotaryPairs);
+  expectFloat("rope.freq_base", geometry.rotaryTheta);
+  expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
+  if (arch == "lfm2" || arch == "lfm2moe")
+    expect("shortconv.l_cache", geometry.convolutionTaps ? geometry.convolutionTaps : 3);
+  if (arch == "lfm2moe") {
+    // The sigmoid-gated MoE without a shared expert.
+    expect("expert_count", geometry.experts);
+    expect("expert_used_count", geometry.expertsPerToken);
+    expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+    expect("leading_dense_block_count", geometry.leadingDenseLayers);
+    expect("expert_gating_func", 2); // sigmoid
+  }
+  if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+}
+
 // The target geometry the metadata declares, with the rotary embedding and
 // norms the kernels compute: the RoPE base and rotated dimensions, the RMS
 // epsilon and no RoPE scaling. One error names every mismatch.
@@ -251,6 +342,10 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   const std::string arch = geometry.architecture();
   if (file.architecture() != arch)
     throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
+  if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe") {
+    requireNewTargetMetadata(file, geometry, arch);
+    return;
+  }
   std::string mismatched;
   const auto expect = [&](const char *key, uint64_t value) {
     const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
@@ -301,17 +396,34 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
                  uint32_t index) {
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
+  const std::string arch = g.architecture();
   Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
   b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
   if (full) {
-    b.quantized(p + "attn_q.weight", 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension),
-                g.hiddenSize);
+    // A "llama" GGUF stores each rotated head's q and k rows interleaved in
+    // rope pairs; the image deinterleaves them into splash's head-major
+    // order (gguf::RowOrder::rotaryInterleaved).
+    const RowOrder rope = arch == "llama"
+        ? RowOrder{0, g.attentionHeadDimension, 0, 0, true}
+        : RowOrder{};
+    b.quantized(p + "attn_q.weight",
+                (g.attentionQueryGate ? 2ull : 1ull) * g.attentionHeadDimension *
+                    (g.attentionWidth / g.attentionHeadDimension),
+                g.hiddenSize, rope);
     const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
-    b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize);
+    b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize, rope);
     b.quantized(p + "attn_v.weight", kvRows, g.hiddenSize);
-    b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
-    b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+    if (g.attentionQkNorm) {
+      b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+      b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+    }
     b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
+  } else if (arch == "lfm2" || arch == "lfm2moe") {
+    // The double-gated short convolution: in_proj's [B|C|x] rows, the
+    // channel-major kernel and out_proj.
+    b.quantized(p + "shortconv.in_proj.weight", 3ull * g.convolutionDimension, g.hiddenSize);
+    b.convTaps(p + "shortconv.conv.weight");
+    b.quantized(p + "shortconv.out_proj.weight", g.hiddenSize, g.convolutionDimension);
   } else {
     const uint32_t valueRows = g.gdnValueHeads * g.gdnHeadDimension;
     const uint32_t keyRows = g.convolutionDimension - valueRows; // q and k
@@ -324,17 +436,25 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }
-  b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
-  if (g.sparseMoe()) {
+  b.floatNorm(p + (arch == "qwen35" || arch == "qwen35moe"
+                       ? "post_attention_norm.weight"
+                       : "ffn_norm.weight"),
+              g.hiddenSize);
+  if (g.sparseMoe() && index >= g.leadingDenseLayers) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
+    if (!g.sharedExpert)
+      // The sigmoid gate's per-expert selection bias (exp_probs_b).
+      b.floatTensor(p + "exp_probs_b.bias", 1, routed);
     b.quantized(p + "ffn_gate_exps.weight", routed * width, g.hiddenSize);
     b.quantized(p + "ffn_up_exps.weight", routed * width, g.hiddenSize);
     b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);
-    b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
-    b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
-    b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
-    b.floatTensor(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize);
+    if (g.sharedExpert) {
+      b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
+      b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
+      b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
+      b.floatTensor(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize);
+    }
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
@@ -373,8 +493,13 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
     images.push_back(layerImage(file, geometry, problems, layer));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
-  head.floatNorm("output_norm.weight", geometry.hiddenSize);
-  head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);
+  // The LFM2 targets name their final norm token_embd_norm and tie their
+  // output head to the token embedding.
+  head.floatNorm(geometry.tiedOutput ? "token_embd_norm.weight"
+                                     : "output_norm.weight",
+                 geometry.hiddenSize);
+  head.quantized(geometry.tiedOutput ? "token_embd.weight" : "output.weight",
+                 geometry.vocabularySize, geometry.hiddenSize);
   images.push_back(head.finish());
   Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   embedding.embeddingRows("token_embd.weight");

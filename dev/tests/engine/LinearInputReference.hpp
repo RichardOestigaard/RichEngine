@@ -7,6 +7,7 @@
 // write the table themselves to, byte for byte.
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/Gguf.h"
 #include "ops/Linear.hpp"
 
 #include <cstdint>
@@ -25,6 +26,13 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
                                     uint32_t lanes) {
   if (layout == ops::LinearInput::Plain)
     throw std::invalid_argument("a plain input has no table to prepare");
+  if (layout == ops::LinearInput::Packed) {
+    // The pack dispatch the mxfp4p consumers run when no producer wrote the
+    // operand (ops/LinearGguf.cpp's single-tensor branch).
+    graph.add("gguf_pack_half", {input, table, sums, input, input, input, input, input},
+              GgufDecodeParams{width, 1, 0, 0}, {uint64_t{lanes} * 8 * width / 32, 1, 1}, {32, 1, 1});
+    return;
+  }
   graph.add(layout == ops::LinearInput::Table16 ? "decode_linear_gguf_prepare"
                                                 : "decode_linear_q4_prepare",
             {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});

@@ -160,6 +160,7 @@ def check() -> list[str]:
     }
     concrete_model_headers = (
         "model/DFlashDraft.hpp",
+        "model/DSparkDraft.hpp",
         "model/ModelFactory.hpp",
         "model/Qwen3_6Moe.hpp",
         "model/Qwen3_8.hpp",

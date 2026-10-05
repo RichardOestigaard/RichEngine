@@ -14,13 +14,17 @@
 namespace splash::model {
 
 void requireCompatibleModelPackage(const ModelPackage &package) {
+  const DFlashDraftLayout &draftLayout =
+      std::visit([](const auto &weights) -> const DFlashDraftLayout & {
+        return weights.layout;
+      }, package.draft);
   if (!package.descriptor.valid() ||
-      package.descriptor.draft != package.draft.layout ||
+      package.descriptor.draft != draftLayout ||
       !std::visit(
           [&](const auto &target) {
             return package.descriptor.target == TargetLayout{target.layout} &&
                    target.layout.vocabularySize ==
-                       package.draft.layout.vocabularySize;
+                       draftLayout.vocabularySize;
           },
           package.target)) {
     throw std::invalid_argument(
@@ -35,9 +39,29 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layo
   return loadQwen3_8Weights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const Ornith9BLayout &layout,
+                         const QwenTargetFiles<Ornith9BLayout> &files) {
+  return loadOrnith9BWeights(backend, layout, files);
+}
+
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
                          const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
   return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const DenseLayout &layout,
+                         const QwenTargetFiles<DenseLayout> &files) {
+  return loadDenseWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2Layout &layout,
+                         const QwenTargetFiles<Lfm2Layout> &files) {
+  return loadLfm2Weights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2MoeLayout &layout,
+                         const QwenTargetFiles<Lfm2MoeLayout> &files) {
+  return loadLfm2MoeWeights(backend, layout, files);
 }
 
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
@@ -60,9 +84,19 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
+  const bool plainDraft = result.descriptor.draft.kind == DraftKind::Plain;
+  const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draftFromCheckpoint())
-    draft.emplace(images, root / "draft", result.descriptor.draft);
+  std::optional<PlainDraftCheckpointLoader> plainDraftLoader;
+  std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
+  if (result.descriptor.draftFromCheckpoint()) {
+    if (plainDraft)
+      plainDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
+    else if (dsparkDraft)
+      dsparkDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
+    else
+      draft.emplace(images, root / "draft", result.descriptor.draft);
+  }
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
@@ -82,17 +116,35 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(
-      backend,
-      draft ? DraftFiles(std::ref(*draft))
-            : DraftFiles(PackedDraftFiles{images, root / "draft", result.descriptor.draft}),
-      result.descriptor.draft);
+  if (plainDraft) {
+    result.draft = loadPlainDraftWeights(
+        backend,
+        plainDraftLoader
+            ? PlainDraftFiles(std::ref(*plainDraftLoader))
+            : PlainDraftFiles(PackedPlainDraftFiles{images, root / "draft", result.descriptor.draft}),
+        result.descriptor.draft);
+  } else if (dsparkDraft) {
+    result.draft = loadDSparkDraftWeights(
+        backend,
+        dsparkDraftLoader
+            ? DSparkDraftFiles(std::ref(*dsparkDraftLoader))
+            : DSparkDraftFiles(PackedDSparkDraftFiles{images, root / "draft", result.descriptor.draft}),
+        result.descriptor.draft);
+  } else {
+    result.draft = loadDFlashDraftWeights(
+        backend,
+        draft ? DraftFiles(std::ref(*draft))
+              : DraftFiles(PackedDraftFiles{images, root / "draft", result.descriptor.draft}),
+        result.descriptor.draft);
+  }
   result.vision = loadVisionWeights(backend, images, root, result.descriptor, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
-  records.insert(records.end(), result.draft.files.begin(),
-                 result.draft.files.end());
+  const std::span<const WeightFileRecord> draftFiles = std::visit(
+      [](const auto &weights) { return std::span<const WeightFileRecord>(weights.files); },
+      result.draft);
+  records.insert(records.end(), draftFiles.begin(), draftFiles.end());
   records.insert(records.end(), result.vision.files.begin(),
                  result.vision.files.end());
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
@@ -127,7 +179,11 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);
   }
   if (descriptor.draftFromCheckpoint())
-    bytes += imageBytes(draftCheckpointImages(descriptor.draft));
+    bytes += descriptor.draft.kind == DraftKind::Plain
+                 ? imageBytes(plainDraftCheckpointImages(descriptor.draft))
+                 : descriptor.draft.kind == DraftKind::DSpark
+                       ? imageBytes(dsparkDraftCheckpointImages(descriptor.draft))
+                       : imageBytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += visionImageBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {

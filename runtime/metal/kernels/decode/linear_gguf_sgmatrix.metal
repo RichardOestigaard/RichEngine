@@ -62,6 +62,14 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
   typedef Shape<F> S;
   if constexpr (F::Kind == QuantLinear) {
     return as_type<bfloat2>(F::codes(ch)[f] + S::Operand * 0x00010001u);   // Operand in both halves
+  } else if constexpr (F::Native) {
+#if defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
+    // Pair f is nibbles 2f, 2f + 1 of the chunk; doubled, as kFP4Values is
+    // twice E2M1 (one unpack decodes all four pairs — the calls share it).
+    const vec<bfloat, 8> v =
+        unpack<bfloat>(packed_metal_fp4_e2m1<8>(as_type<packed_uchar4>(F::indices(ch))));
+    return bfloat2(2 * v[2 * f], 2 * v[2 * f + 1]);
+#endif
   } else if constexpr (F::Kind == QuantCodebook) {
     return lut[(F::indices(ch) >> (8 * f)) & 0xFFu];
   } else if constexpr (F::Kind == QuantInt8) {
@@ -303,7 +311,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
                    constant GgufDecodeParams &p [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],    \
                    uint lane [[thread_index_in_simdgroup]]) {                                               \
-    threadgroup bfloat2 lut[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];                         \
+    threadgroup bfloat2 lut[F::Kind == QuantCodebook && !F::Native ? kQuantPairTableEntries : 1];                         \
     threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F>];                                                 \
     threadgroup uint arrival;                                                                               \
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);                                                                              \
@@ -319,6 +327,8 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
 QUANT_FORMATS(GGUF_SG_FORMAT)
+// The native MXFP4 decoders, dispatched on Apple GPU family 10 and up only.
+GGUF_SG_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_SG_FORMAT
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
@@ -329,7 +339,7 @@ QUANT_FORMATS(GGUF_SG_FORMAT)
 // format picks the decode; every segment takes the same K splits.
 #define GGUF_SG_SEGMENT(i, w0, w1, m) \
   device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
-template <uint L>
+template <uint L, bool NativeMxfp4>
 inline void gguf_sg_fused(device const bfloat *table, device const float *sums, device uchar *w0a, device uchar *w1a,
                           device uchar *ma, device uchar *w0b, device uchar *w1b, device uchar *mb, device uchar *w0c,
                           device uchar *w1c, device uchar *mc, device bfloat *out, device coherent(device) float *partials,
@@ -342,7 +352,11 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
   const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
-  quant_format_switch(p.fmt[s], [&](auto format) {
+  const auto pick = [&](auto body) {
+    if constexpr (NativeMxfp4) quant_format_switch_native(p.fmt[s], body);
+    else quant_format_switch(p.fmt[s], body);
+  };
+  pick([&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
@@ -350,8 +364,8 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
                                               reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs), &arrival);
   });
 }
-#define GGUF_SG_FUSED(L)                                                                                          \
-  kernel void gguf_decode_sg_fused_l##L(                                                                   \
+#define GGUF_SG_FUSED(L, SUFFIX, NATIVE)                                                                          \
+  kernel void gguf_decode_sg_fused_l##L##SUFFIX(                                                                   \
       device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],                          \
       GGUF_SG_SEGMENT(2, w0a, w1a, ma), GGUF_SG_SEGMENT(5, w0b, w1b, mb), GGUF_SG_SEGMENT(8, w0c, w1c, mc),       \
       device bfloat *out [[buffer(11)]], device coherent(device) float *partials [[buffer(12)]],                  \
@@ -361,13 +375,19 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                              \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                              \
     threadgroup uint arrival;                                                                                     \
-    gguf_sg_fused<L>(table, sums, w0a, w1a, ma, w0b, w1b, mb, w0c, w1c, mc, out, partials, counters, p, tg, tid, sg, \
+    gguf_sg_fused<L, NATIVE>(table, sums, w0a, w1a, ma, w0b, w1b, mb, w0c, w1c, mc, out, partials, counters, p, tg, tid, sg, \
                      lane, lut, coefs, arrival);                                                                  \
   }
-GGUF_SG_FUSED(1)
-GGUF_SG_FUSED(2)
-GGUF_SG_FUSED(3)
-GGUF_SG_FUSED(4)
+GGUF_SG_FUSED(1, , false)
+GGUF_SG_FUSED(2, , false)
+GGUF_SG_FUSED(3, , false)
+GGUF_SG_FUSED(4, , false)
+// The `_n` fused kernels an Apple GPU family 10 host dispatches, whose MXFP4
+// segments decode on the native FP4 path.
+GGUF_SG_FUSED(1, _n, true)
+GGUF_SG_FUSED(2, _n, true)
+GGUF_SG_FUSED(3, _n, true)
+GGUF_SG_FUSED(4, _n, true)
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_SEGMENT
 
@@ -376,7 +396,7 @@ GGUF_SG_FUSED(4)
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
 // (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
 // aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
-template <GgufEpilogue Ep>
+template <GgufEpilogue Ep, bool NativeMxfp4>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
@@ -387,7 +407,11 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0};
-  quant_format_switch(s.format, [&](auto format) {
+  const auto pick = [&](auto body) {
+    if constexpr (NativeMxfp4) quant_format_switch_native(s.format, body);
+    else quant_format_switch(s.format, body);
+  };
+  pick([&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, 1, Ep>(
@@ -396,7 +420,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
         arrival);
   });
 }
-#define GGUF_SG_EXPERT(Name, EP)                                                                                    \
+#define GGUF_SG_EXPERT(Name, EP, NATIVE)                                                                            \
   kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
                    device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
                    device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
@@ -408,9 +432,11 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
+    gguf_sg_expert<EP, NATIVE>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
                        lut, coefs, &arrival);                                                                       \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, false)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, false)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a_n, EpNone, true)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g_n, EpUpWithGate, true)
 #undef GGUF_SG_EXPERT

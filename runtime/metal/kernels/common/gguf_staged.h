@@ -26,6 +26,19 @@ inline void dequant32(typename F::Payload w, typename F::Meta meta, ushort j, th
       const uint4 p = F::codes(q);
       lo = half4(staged_linear<F>(p.x, k.s.x, k.m.x), staged_linear<F>(p.y, k.s.x, k.m.x));
       hi = half4(staged_linear<F>(p.z, k.s.y, k.m.y), staged_linear<F>(p.w, k.s.y, k.m.y));
+    } else if constexpr (F::Native) {
+#if defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
+      // The chunk's eight E2M1 nibbles, unpacked in element order; kFP4Values
+      // are twice E2M1, so the doubled coefficient keeps one rounding. Index
+      // 8 unpacks as -0.0 where the table's 0 is positive, so each product's
+      // sign bit is cleared where the value is zero.
+      const vec<float, 8> v =
+          unpack<float>(packed_metal_fp4_e2m1<8>(as_type<packed_uchar4>(F::indices(q))));
+      const float4 a = float4(v[0], v[1], v[2], v[3]) * (2 * k.s.x);
+      const float4 b = float4(v[4], v[5], v[6], v[7]) * (2 * k.s.y);
+      lo = half4(as_type<float4>(as_type<uint4>(a) & select(uint4(~0u), uint4(0x7FFFFFFFu), a == 0.0f)));
+      hi = half4(as_type<float4>(as_type<uint4>(b) & select(uint4(~0u), uint4(0x7FFFFFFFu), b == 0.0f)));
+#endif
     } else if constexpr (F::Kind == QuantCodebook) {   // value * s in Scale: one rounding to half either way
       typedef typename F::Scale S;
       const uchar4 b = as_type<uchar4>(F::indices(q));

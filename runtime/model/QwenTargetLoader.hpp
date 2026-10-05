@@ -81,6 +81,16 @@ template <class Format>
                                              const QwenMixerGeometry &geometry,
                                              bool fullAttention);
 
+// The family's mixer reader; the default reads a Qwen GDN/full-attention
+// mixer, Dense.hpp and Lfm2.hpp overload it for their mixers.
+template <class Layout, class Format>
+[[nodiscard]] QwenMixerWeights readTargetMixer(const Layout &, WeightFile &file,
+                                               const Format &format,
+                                               const QwenMixerGeometry &geometry,
+                                               bool fullAttention) {
+  return readQwenMixer(file, format, geometry, fullAttention);
+}
+
 // Loads the packed files of a target directory: one per hybrid layer,
 // head.bin and embedding.bin.
 template <class Layout> struct PackedTargetFiles final {
@@ -119,7 +129,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-    layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
+    layer.mixer = readTargetMixer(layout, file, format, layout.mixerGeometry(), fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
     readFfn(file, layer, format);
     file.finish();
@@ -178,7 +188,8 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       // The GDN value rows are sized with attentionWidth throughout.
       layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
       layout.packedFullWidth !=
-          2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
+          Layout::attentionQueryStride * layout.attentionWidth +
+              2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
       std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");

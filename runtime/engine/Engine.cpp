@@ -1161,7 +1161,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     const uint64_t workEnd =
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
-            : position + model::ExecutionLimits::targetVerifyRows;
+            : position + model::ExecutionLimits::speculativeScratchTokens;
     // A scheduled lane is resident: it grows as a request in service. The
     // lane that yields first if growth fails takes nothing in use, since its
     // own suspension, not another conversation's replay point, pays for it.

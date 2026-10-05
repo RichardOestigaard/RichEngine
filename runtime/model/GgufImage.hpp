@@ -1,7 +1,8 @@
 #pragma once
 
 // Plans the images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
-// or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF, from
+// or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF,
+// or a dense (llama), LFM2 (lfm2) or LFM2-MoE (lfm2moe) one, from
 // its metadata alone: section offsets, the header and descriptor bytes, and
 // the source rows each tensor section is written from
 // (model/GgufPreparation.hpp). A 3-D expert tensor is one quantized tensor of
@@ -31,18 +32,42 @@ struct TargetGeometry {
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
   uint32_t fullAttentionPeriod = 0;
-  // A sparse MoE FFN (qwen35moe) when experts is set; the shared expert has
-  // the routed experts' intermediate width.
+  // A sparse MoE FFN (qwen35moe, lfm2moe) when experts is set; the shared
+  // expert has the routed experts' intermediate width when present.
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // A MoE target's leading dense-FFN layers (lfm2moe's
+  // leading_dense_block_count; 0 means every layer is MoE).
+  uint32_t leadingDenseLayers = 0;
+  // Whether the MoE blocks carry a shared expert (the qwen35moe shexp
+  // tensors); lfm2moe has none — it routes sigmoid probabilities with a
+  // per-expert selection bias (exp_probs_b) instead.
+  bool sharedExpert = true;
+  // A mask-typed attention schedule (LFM2) when set: bit `layer` is a
+  // full-attention layer. Zero keeps the fullAttentionPeriod schedule.
+  uint64_t attentionMask = 0;
+  // The conv kernel's taps (the GDN's 4 when zero; LFM2's conv_L_cache 3).
+  uint32_t convolutionTaps = 0;
+  // The RMS norms' epsilon (1e-6, or LFM2's norm_eps 1e-5).
+  float rmsEpsilon = 1e-6F;
+  // Whether the packed query rows interleave a gate row each (Qwen) and
+  // whether the q/k heads carry RMS norms (absent in the dense target).
+  bool attentionQueryGate = true;
+  bool attentionQkNorm = true;
+  // Whether the LM head shares the token embedding (LFM2 ties them).
+  bool tiedOutput = false;
+  // The general.architecture a GGUF of this target declares; empty keeps
+  // the Qwen families' names.
+  std::string arch;
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
+    if (attentionMask) return layer < 64 && (attentionMask >> layer) & 1;
     return (layer + 1) % fullAttentionPeriod == 0;
   }
   [[nodiscard]] bool sparseMoe() const noexcept { return experts != 0; }
   // The general.architecture of a GGUF of this target.
-  [[nodiscard]] const char *architecture() const noexcept {
-    return sparseMoe() ? "qwen35moe" : "qwen35";
+  [[nodiscard]] std::string architecture() const {
+    return arch.empty() ? (sparseMoe() ? "qwen35moe" : "qwen35") : arch;
   }
 };
 
@@ -50,11 +75,17 @@ struct TargetGeometry {
 // order; from there on, blocks of headRows rows are value heads, which
 // llama.cpp stores tiled (value head of its key head * keyHeads + key head)
 // and splash groups by key head (key head * valueHeadsPerKey + value head).
+// A rotaryInterleaved row order instead deinterleaves each headRows block:
+// a "llama" GGUF stores a rotated head's rows as rope pairs (HF dimension j
+// in stored row 2j, j + headRows/2 in 2j + 1); the image keeps HF order, so
+// image row headRows*h + j reads stored row headRows*h + 2*(j % half) +
+// (j >= half).
 struct RowOrder {
   uint64_t from = UINT64_MAX; // UINT64_MAX: rows as stored
   uint32_t headRows = 0;
   uint32_t keyHeads = 0;
   uint32_t valueHeadsPerKey = 0;
+  bool rotaryInterleaved = false;
 };
 
 // Rows [0, rows) of one source tensor in image order.

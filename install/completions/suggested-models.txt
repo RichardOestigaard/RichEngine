@@ -1,2 +1,7 @@
 mlx-community/Qwen3.6-35B-A3B-4bit
 mlx-community/Qwen3.8-27B-4bit
+ornith-ai/Ornith-1.5-9B-MLX-4bit
+ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit
+openbmb/MiniCPM5-2B-MLX
+openbmb/MiniCPM5-2B-GGUF:Q4_K_M
+LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M

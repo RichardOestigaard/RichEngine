@@ -601,7 +601,8 @@ std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, Li
          std::to_string(lanes) +
          (layout == LinearInput::Plain     ? " plain"
           : layout == LinearInput::Table64 ? " Table64"
-                                           : " Table16");
+          : layout == LinearInput::Table16 ? " Table16"
+                                           : " Packed");
 }
 
 void fusedPreparation(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
@@ -744,12 +745,12 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
-    // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
-    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+    // Table64 feeds the affine models, whose norms are bf16; Table16 and Packed a GGUF's, whose norms are F32.
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16, LinearInput::Packed})
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
-          fusedPreparation(backend, shape, lanes, layout, layout == LinearInput::Table16);
-          tiledHeadOrder(backend, shape, lanes, layout, layout == LinearInput::Table16);
+          fusedPreparation(backend, shape, lanes, layout, layout != LinearInput::Table64);
+          tiledHeadOrder(backend, shape, lanes, layout, layout != LinearInput::Table64);
         }
     // A GGUF's out-projection on the staged tile reads the tiled rows plain.
     for (const GdnShape &shape : kShapes)

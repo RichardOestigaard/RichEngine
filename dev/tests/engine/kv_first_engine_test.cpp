@@ -2952,7 +2952,9 @@ void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
 }
 
 void testRequiredWorkDoesNotReserveAnExtraPage() {
-  for (uint32_t promptTokens : {1U, 24U}) {
+  // The decode reservation is a tree lane's 15 emitted rows: a 17-token
+  // prompt plus its verify fills one page exactly, as 24 did for 8 rows.
+  for (uint32_t promptTokens : {1U, 17U}) {
     test::TestKvStorage storage(2, 4096, 1);
     storage.budgetPages = 1;
     KvPool pool(storage, 0);
@@ -4026,8 +4028,10 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
   Events events;
   engine::Engine engine({}, resources, executor, events);
   guardReleases(storage, engine);
+  // 17 prompts plus a tree verify's 15 emitted rows fill one page; the
+  // second page each lane then needs preempts one of them.
   for (uint64_t id : {250, 251}) {
-    auto value = request(id, std::vector<uint32_t>(24, id));
+    auto value = request(id, std::vector<uint32_t>(17, id));
     value.maxNewTokens = 4;
     value.returnProgress = true;
     engine.submit(std::move(value));
@@ -4060,10 +4064,10 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
               events.completedCount == 3 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0,
           "decode preemption did not finish all original/new requests");
-  require(events.progress.at(250) == std::vector<uint32_t>({0, 24}) &&
-              events.progress.at(251) == std::vector<uint32_t>({0, 24}),
+  require(events.progress.at(250) == std::vector<uint32_t>({0, 17}) &&
+              events.progress.at(251) == std::vector<uint32_t>({0, 17}),
           "decode recovery reported generated history as prompt progress");
-  std::vector<uint32_t> committedHistory(24, preempted);
+  std::vector<uint32_t> committedHistory(17, preempted);
   committedHistory.push_back(42);
   // The newly admitted request also yields once because the recovering
   // continuation has reserved both pages. Neither replays generated output.
@@ -4073,8 +4077,8 @@ void testDecodePreemptionReplaysCommittedHistoryWithoutRepeatingOutput() {
           "replay omitted or duplicated committed generated history");
   require(events.outputs.at(250) == std::vector<uint32_t>(4, 42) &&
               events.outputs.at(251) == std::vector<uint32_t>(4, 42) &&
-              events.usage.at(250) == std::pair<uint32_t, uint32_t>{24, 4} &&
-              events.usage.at(251) == std::pair<uint32_t, uint32_t>{24, 4} &&
+              events.usage.at(250) == std::pair<uint32_t, uint32_t>{17, 4} &&
+              events.usage.at(251) == std::pair<uint32_t, uint32_t>{17, 4} &&
               events.startIds.size() == 3 &&
               events.maskRequests.empty() &&
               engine.snapshot().cacheHits == 0 && engine.snapshot().coldMisses == 3,
@@ -4451,8 +4455,8 @@ void testPreemptedDecodeRestoresItsResidentCompositeState() {
   require(idle(engine) && executor.suspensions == 1 &&
               executor.resumptions == 1 && executor.restored == 64 &&
               executor.resumedPrompts.size() == 1 &&
-              executor.resumedPrompts.front().size() == 89 &&
-              engine.snapshot().resourceReplayTokens == 25,
+              executor.resumedPrompts.front().size() == 82 &&
+              engine.snapshot().resourceReplayTokens == 18,
           "preempted decode did not use its cached state plus exact suffix");
   require(events.completedCount == 2 && events.failedCount == 0 &&
               events.capacityExhaustedCount == 0 && events.startIds.size() == 2 &&
@@ -4489,13 +4493,13 @@ void testPreemptedDecodeReplayBoundaryIgnoresTheGenerationPrompt() {
     static_cast<void>(engine.tick(now));
   require(idle(engine) && executor.suspensions == 1 &&
               executor.resumedPrompts.size() == 1 &&
-              executor.resumedPrompts.front().size() == 89 &&
+              executor.resumedPrompts.front().size() == 82 &&
               events.completedCount == 2,
           "the decode was not preempted after 24 generated tokens");
   // Prompt tokens are the request id.
   const DraftContextPlan &plan =
       executor.plans.at(executor.resumedPrompts.front().front());
-  require(executor.restored == 32 && plan.replayEnd == 89 &&
+  require(executor.restored == 32 && plan.replayEnd == 82 &&
               plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64,
           "the resumed decode's replay boundary applied its generation prompt");
 }
@@ -8558,7 +8562,9 @@ void testRestoredHistoryCheckpointStaysDisposable() {
   hostPressure(false);
   tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not finish");
   const std::vector<uint32_t> history = executor.resumedPrompts.back();
-  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 89 &&
+  // The decode reservation covers a tree lane's 15 emitted rows, seven more
+  // than the chain batch's eight: pressure suspends it seven tokens earlier.
+  require(executor.resumptions == 2 && executor.restored == 32 + 64 && history.size() == 82 &&
               events.completedCount == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 1,
           "the lane did not resume from its history's checkpoint, or made it ordinary");

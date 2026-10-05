@@ -25,6 +25,7 @@ struct QwenMixerGeometry final {
   uint32_t gdnHeadDimension = 0;
   uint32_t attentionWidth = 0;
   uint32_t attentionHeadDimension = 0;
+  uint32_t convolutionTaps = 0;
 };
 
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
@@ -33,6 +34,10 @@ struct QwenMixerGeometry final {
 // reads. A family sets every value and adds its FFN sizes, its file magics
 // and its ffnKind.
 template <size_t CaptureLayers> struct QwenHybridLayout {
+  // The packed QKV rows interleave a gate row per query head ([q|gate]).
+  static constexpr uint32_t attentionQueryStride = 2;
+  // The per-head RMS norms on the queries and keys.
+  static constexpr bool attentionQkNorm = true;
   uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -76,7 +81,7 @@ template <size_t CaptureLayers> struct QwenHybridLayout {
   [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
-            attentionWidth, attentionHeadDimension};
+            attentionWidth, attentionHeadDimension, kGdnConvolutionTaps};
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * hiddenCaptureLayers.size();

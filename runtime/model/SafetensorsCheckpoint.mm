@@ -214,6 +214,20 @@ void SafetensorsCheckpoint::requireLayerTypes(uint32_t layers, uint32_t fullAtte
     }
   }
 }
+void SafetensorsCheckpoint::requireLayerTypeMask(uint32_t layers, uint64_t attentionMask,
+                                                 std::string_view attention, std::string_view other) const {
+  @autoreleasepool {
+    id types = impl_->textConfig[@"layer_types"];
+    if (![types isKindOfClass:[NSArray class]] || [types count] != layers)
+      throw WeightStoreError("source layer schedule does not match");
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      NSString *expected =
+          [NSString stringWithUTF8String:std::string(
+                                             (attentionMask >> layer) & 1 ? attention : other).c_str()];
+      if (![types[layer] isEqual:expected]) throw WeightStoreError("source layer schedule does not match");
+    }
+  }
+}
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
 
 } // namespace splash::model

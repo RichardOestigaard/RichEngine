@@ -296,7 +296,7 @@ public:
     PagedAttention::addVerify(
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
-         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
+         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_, {}},
         std::span(chunks).first(attention.lanes), attention);
   }
 

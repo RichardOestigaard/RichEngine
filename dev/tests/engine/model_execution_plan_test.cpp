@@ -60,7 +60,7 @@ model::ModelPackage package() {
   result.descriptor = model::makeModelDescriptor(
       "operator workspace test", target.layout, draft, vision);
   result.target = std::move(target);
-  result.draft.layout = draft;
+  std::get<splash::model::DFlashDraftWeights>(result.draft).layout = draft;
   return result;
 }
 

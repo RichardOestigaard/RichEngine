@@ -28,6 +28,16 @@ public:
   // (kernels/shared/residency.metal).
   static constexpr std::string_view kKickPipeline = "residency_kick";
 
+#if __has_include(<Metal/MTL4CommandQueue.h>)
+  // Attaches the set to the Metal 4 queue: its command buffers see every
+  // member, including the indirect command buffers and pipeline states the
+  // Metal 3 path declares per-encoder instead.
+  void attach(id<MTL4CommandQueue> commands) {
+    commands4_ = commands;
+    [commands addResidencySet:set_];
+  }
+#endif
+
   Residency(id<MTLDevice> device, id<MTLCommandQueue> commands,
             id<MTLComputePipelineState> kick, double keepAliveSeconds)
       : commands_(commands), kick_(kick), keepAlive_(keepAliveSeconds) {
@@ -55,6 +65,9 @@ public:
     // the set at exit.
     dispatch_sync(queue_, ^{
       [commands_ removeResidencySet:set_];
+#if __has_include(<Metal/MTL4CommandQueue.h>)
+      if (commands4_) [commands4_ removeResidencySet:set_];
+#endif
       std::lock_guard lock(mutex_);
       if (held_) [set_ endResidency];
     });
@@ -63,20 +76,22 @@ public:
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Adds the buffer to the set and restarts the keep-alive: a held set wires
-  // it at the commit, and a lapsed one is requested again off the caller's
-  // thread (use()).
-  void add(id<MTLBuffer> buffer) {
+  // Adds the allocation to the set and restarts the keep-alive: a held set
+  // wires it at the commit, and a lapsed one is requested again off the
+  // caller's thread (use()). Anything conforming to MTLAllocation may join:
+  // the Metal 4 path also registers indirect command buffers and the
+  // pipeline states inside them.
+  void add(id<MTLAllocation> allocation) {
     dispatch_sync(queue_, ^{
-      [set_ addAllocation:buffer];
+      [set_ addAllocation:allocation];
       [set_ commit];
     });
     use();
   }
 
-  void remove(id<MTLBuffer> buffer) {
+  void remove(id<MTLAllocation> allocation) {
     dispatch_sync(queue_, ^{
-      [set_ removeAllocation:buffer];
+      [set_ removeAllocation:allocation];
       [set_ commit];
     });
   }
@@ -128,6 +143,10 @@ private:
   }
 
   __strong id<MTLCommandQueue> commands_ = nil;
+#if __has_include(<Metal/MTL4CommandQueue.h>)
+  // The Metal 4 queue the set is also attached to, when one exists.
+  __weak id<MTL4CommandQueue> commands4_ = nil;
+#endif
   __strong id<MTLComputePipelineState> kick_ = nil;
   __strong id<MTLResidencySet> set_ = nil;
   __strong id<MTLCommandQueue> kickQueue_ = nil;

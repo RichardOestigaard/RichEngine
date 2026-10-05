@@ -30,11 +30,14 @@ static_assert(sizeof(DraftConvBatchParams) == 4,
 struct DraftAttentionBatchParams {
   uint32_t value_stride;
   uint32_t lanes;
+  // Nonzero masks the eight current rows causally (a plain DFlash draft's
+  // sliding layers); zero keeps the DFlash2 block-bidirectional pattern.
+  uint32_t causal;
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 24,
-              "Draft attention parameters are 24 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 28,
+              "Draft attention parameters are 28 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

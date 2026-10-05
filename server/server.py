@@ -1908,7 +1908,7 @@ def _native_command(args):
         command.extend(
             ("--cache-dir", str(args.cache_dir or serve_options.DEFAULT_CACHE_DIR))
         )
-    if args.kv_format != "int8":
+    if args.kv_format != "int4":
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
@@ -1963,7 +1963,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer, local_files_only=True, trust_remote_code=False
         )
-        validate_tokenizer(tokenizer)
+        contract = validate_tokenizer(tokenizer, args.tokenizer)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1976,6 +1976,7 @@ def main():
             runtime,
             tokenizer,
             request_logger=print_request,
+            think_end_id=contract.think_end_id,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
@@ -1992,7 +1993,7 @@ def main():
                 "native runtime reported an invalid context window"
             )
         effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer)
+        constraint_factory = ConstraintFactory(tokenizer, contract)
         app = Frontend(
             tokenizer,
             backend,
@@ -2010,6 +2011,7 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
+            contract=contract,
         )
         server.app = app
         server.server_activate()

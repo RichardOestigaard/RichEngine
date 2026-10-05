@@ -49,12 +49,12 @@ PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h))
-# macOS 26.4 is the tested floor: the engine refuses older systems at
+# macOS 27 is the tested floor: the engine refuses older systems at
 # startup, and every binary and metallib records it. The MPP kernels need
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
-MACOS_MIN_VERSION := 26.4
+MACOS_MIN_VERSION := 27
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
@@ -186,7 +186,8 @@ $(LIB): $(PRODUCTION_AIRS)
 
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
-ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit
+ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
+	-framework CoreML
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
@@ -211,7 +212,7 @@ PRODUCTION_ENGINE_INPUTS := $(sort $(shell find runtime -type f \
 		-o -name '*.hpp' -o -name '*.m' -o -name '*.mm' \) \
 	-print))
 BUILD_ID_CONSTANT_ARGS = \
-	--constant 'runtime=qwen-hybrid-dflash8' \
+	--constant 'runtime=qwen-hybrid-dflash9' \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
@@ -228,6 +229,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/LfmConv.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
@@ -265,18 +267,25 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/WeightSource.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
+	runtime/model/Dense.cpp \
+	runtime/model/Lfm2.cpp \
+	runtime/model/Lfm2Moe.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/Ornith9B.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
+	runtime/model/DSparkDraft.cpp \
+	runtime/model/PlainDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
+	runtime/model/AnePredictor.mm \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
@@ -363,8 +372,8 @@ KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_S
 PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
-TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
-	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
+TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
+	$(TEST_Q8_ATTENTION_LIB) $(TEST_FP8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
 PRODUCTION_CONFIG_TARGETS := $(filter-out $(PRODUCTION_AIRS) $(LIB),$(PRODUCTION_CONFIG_TARGETS))
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))
 

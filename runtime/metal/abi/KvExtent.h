@@ -40,18 +40,33 @@ inline uint32_t splash_kv_page_bytes(uint32_t data_bytes, uint32_t scale_bytes,
 // elements, for `token` of the page's SPLASH_TARGET_KV_BLOCK_TOKENS: keys
 // token-major, values dimension-major, and one scale per (head, token) for
 // either of them.
+// The same element functions for a page of head dimension `head_dim` other
+// than SPLASH_KV_HEAD_DIMENSION (the dense 128 and LFM2 64 head variants).
+inline uint64_t splash_kv_key_element_dim(uint32_t head, uint32_t token,
+                                          uint32_t dimension,
+                                          uint32_t head_dim) {
+  return (uint64_t(head) * SPLASH_TARGET_KV_BLOCK_TOKENS + token) * head_dim +
+         dimension;
+}
+
+inline uint64_t splash_kv_value_element_dim(uint32_t head, uint32_t token,
+                                            uint32_t dimension,
+                                            uint32_t head_dim) {
+  return (uint64_t(head) * head_dim + dimension) *
+             SPLASH_TARGET_KV_BLOCK_TOKENS +
+         token;
+}
+
 inline uint64_t splash_kv_key_element(uint32_t head, uint32_t token,
                                       uint32_t dimension) {
-  return (uint64_t(head) * SPLASH_TARGET_KV_BLOCK_TOKENS + token) *
-             SPLASH_KV_HEAD_DIMENSION +
-         dimension;
+  return splash_kv_key_element_dim(head, token, dimension,
+                                   SPLASH_KV_HEAD_DIMENSION);
 }
 
 inline uint64_t splash_kv_value_element(uint32_t head, uint32_t token,
                                         uint32_t dimension) {
-  return (uint64_t(head) * SPLASH_KV_HEAD_DIMENSION + dimension) *
-             SPLASH_TARGET_KV_BLOCK_TOKENS +
-         token;
+  return splash_kv_value_element_dim(head, token, dimension,
+                                     SPLASH_KV_HEAD_DIMENSION);
 }
 
 inline uint64_t splash_kv_scale_element(uint32_t head, uint32_t token) {

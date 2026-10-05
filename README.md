@@ -14,7 +14,7 @@ It reuses cached prefixes and batches concurrent requests automatically.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
+Apple M3 or newer, macOS 27 or later, and [Homebrew](https://brew.sh).
 The 4-bit examples need at least 36 GB of unified memory (48 GB recommended);
 24 GB Macs can use [smaller GGUF variants](#models).
 
@@ -88,7 +88,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
-| `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
+| `--kv-format int8` | KV cache format: `int4` (default), `int8`, `bf16`, `fp8e4m3`. |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
@@ -99,6 +99,39 @@ access, authentication, browser apps on other origins, and other options, see
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
 [SSD cache](DEVELOPMENT.md#disk-cache)
+
+### KV cache formats
+
+The target KV cache stores keys and values per 32-token page, with one fp32
+scale per token and KV head under quantization. Four formats:
+
+| Format | Bytes per element | Notes |
+| --- | ---: | --- |
+| `int4` (default) | 0.5 | Symmetric 4-bit, native packed INT4 matrix ops. Halves KV traffic. |
+| `int8` | 1 | Symmetric 8-bit. The original format. |
+| `bf16` | 2 | Unquantized. Reference quality, twice the memory. |
+| `fp8e4m3` | 1 | E4M3 with fp16 query staging. Experimental; lowest precision tier. |
+
+For the 27B (16 attention layers, 4 KV heads, 256 dimensions) that is ~33 KB
+per token under `int8`/`fp8e4m3`, ~17 KB under `int4`, ~66 KB under `bf16` —
+so INT4 reads roughly half the KV bytes per decode step and doubles the KV
+capacity the memory budget admits.
+
+The catch is speculative decode. Verify computes target logits over the
+quantized KV; quantization noise flips near-tie argmaxes and rejects draft
+tokens that would otherwise be accepted. Measured on an M5 Pro (20-core GPU,
+temperature 0, ~67K context):
+
+| Format | Decode | Draft acceptance |
+| --- | ---: | ---: |
+| `int8` | 62 tok/s | 63% |
+| `int4` | 56 tok/s | 55% |
+
+The bandwidth saving (~6% at 67K) does not cover the acceptance loss, and
+below ~30K the saving is negligible while the acceptance tax remains. INT4
+pays off only where KV traffic dominates — extreme histories toward the
+context limit — or where the extra capacity matters. For interactive and
+agentic coding workloads `int8` is measurably faster today.
 
 ## Performance
 

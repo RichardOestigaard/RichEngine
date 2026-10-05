@@ -155,6 +155,21 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                stopToken0, stopToken1);
 }
 
+void Sampling::addVerifyTree(metal::CommandGraph &graph,
+                             std::span<const SamplingPolicy> policies,
+                             SamplingBuffers buffers, uint32_t stopToken0,
+                             uint32_t stopToken1) const {
+  if (policies.empty() || policies.size() > kMaximumLanes)
+    throw std::invalid_argument("invalid sampling batch width");
+  for (const SamplingPolicy &policy : policies)
+    if (policy.samples() || policy.constrained || policy.penalties.active())
+      throw std::invalid_argument("tree verify requires greedy lanes");
+  addSelection(graph, policies, buffers,
+               {SPLASH_TREE_VERIFY_NODES, 0, 1, SPLASH_UNIFORM_CORRECTION,
+                SPLASH_DRAFT_PROPOSAL_TOKENS},
+               stopToken0, stopToken1);
+}
+
 void Sampling::addSelection(metal::CommandGraph &graph,
                             std::span<const SamplingPolicy> policies,
                             const SamplingBuffers &buffers,
@@ -245,6 +260,51 @@ void Sampling::addAcceptance(
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
              buffers.acceptedCounts},
             params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void Sampling::addTreeAcceptance(
+    metal::CommandGraph &graph, metal::MetalBuffer treeTokens,
+    metal::MetalBuffer treeNodes, metal::MetalBuffer treeCounts,
+    metal::MetalBuffer targetTokens, metal::MetalBuffer outputTokens,
+    metal::MetalBuffer retainedCounts, metal::MetalBuffer acceptedCounts,
+    metal::MetalBuffer retainedPath,
+    std::span<const uint32_t> maximumRetained, uint32_t stopToken0,
+    uint32_t stopToken1) const {
+  if (maximumRetained.empty() || maximumRetained.size() > kMaximumLanes)
+    throw std::invalid_argument("invalid tree acceptance batch");
+  const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
+  TreeAcceptBatchParams params{};
+  params.stop_token_0 = stopToken0;
+  params.stop_token_1 = stopToken1;
+  params.lanes = lanes;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (!maximumRetained[lane] ||
+        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+      throw std::invalid_argument("invalid tree retention limit");
+    params.remaining[lane] = maximumRetained[lane];
+  }
+  graph.add("decode_accept_tree",
+            {std::move(treeTokens), std::move(treeNodes),
+             std::move(treeCounts), std::move(targetTokens),
+             std::move(outputTokens), std::move(retainedCounts),
+             std::move(acceptedCounts), std::move(retainedPath)},
+            params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void Sampling::addTreeLeafPatch(metal::CommandGraph &graph,
+                                metal::MetalBuffer treeTokens,
+                                metal::MetalBuffer medusaTokens,
+                                metal::MetalBuffer medusaFlag,
+                                metal::MetalBuffer treeCounts,
+                                uint32_t expected, uint32_t lanes) const {
+  TreeLeafPatchParams params{};
+  params.expected = expected;
+  params.lanes = lanes;
+  graph.add("tree_leaf_patch",
+            {std::move(treeTokens), std::move(medusaTokens),
+             std::move(medusaFlag), std::move(treeCounts)},
+            params,
+            {lanes * SPLASH_DRAFT_PROPOSAL_TOKENS, 1, 1}, {32, 1, 1});
 }
 
 } // namespace splash::ops

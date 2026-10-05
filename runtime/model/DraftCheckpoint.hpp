@@ -37,4 +37,43 @@ private:
 // then model.bin.
 [[nodiscard]] std::vector<affine::Image> draftCheckpointImages(const DFlashDraftLayout &layout);
 
+// A plain transformer DFlash checkpoint ("DFlashDraftModel"), config.json
+// and BF16 safetensors -> the packed files PlainDraft.cpp reads: every
+// projection quantized to affine Q4, norms copied as stored. No
+// convolutions, selector projection or codebooks exist to write.
+class PlainDraftCheckpointLoader final {
+public:
+  PlainDraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                             const DFlashDraftLayout &layout);
+  ~PlainDraftCheckpointLoader();
+  [[nodiscard]] WeightFile layer(uint32_t index);
+  [[nodiscard]] WeightFile model();
+
+private:
+  WeightImages &images_;
+  std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, then model.bin
+};
+
+[[nodiscard]] std::vector<affine::Image> plainDraftCheckpointImages(const DFlashDraftLayout &layout);
+
+// A DSpark checkpoint ("Qwen3DSparkModel"/"Lfm2DSparkDraftModel"),
+// config.json and BF16 safetensors -> the packed files DSparkDraft.cpp
+// reads: the plain draft's quantized layer sections, then model.bin with the
+// fc projection, the norms, the Markov head's two vocabulary tables copied
+// as stored, and the confidence head (loaded, unscored).
+class DSparkCheckpointLoader final {
+public:
+  DSparkCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                         const DFlashDraftLayout &layout);
+  ~DSparkCheckpointLoader();
+  [[nodiscard]] WeightFile layer(uint32_t index);
+  [[nodiscard]] WeightFile model();
+
+private:
+  WeightImages &images_;
+  std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, then model.bin
+};
+
+[[nodiscard]] std::vector<affine::Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout);
+
 } // namespace splash::model

@@ -1,6 +1,10 @@
 #include "model/AffineTarget.hpp"
 #include "Checked.hpp"
 #include "model/AffinePlan.hpp"
+#include "model/Dense.hpp"
+#include "model/Lfm2.hpp"
+#include "model/Lfm2Moe.hpp"
+#include "model/Ornith9B.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
@@ -162,6 +166,229 @@ std::vector<Image> images(const Layout &layout) {
   return result;
 }
 
+// The MiniCPM5-2B source (MLX layout, "llama" model_type): flat `model.`
+// tensors and a separate lm_head.
+void validateConfiguration(const SafetensorsCheckpoint &source, const DenseLayout &layout) {
+  const std::pair<const char *, double> fields[] = {
+      {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
+      {"vocab_size", layout.vocabularySize}, {"head_dim", layout.attentionHeadDimension},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"intermediate_size", layout.intermediateSize}, {"rms_norm_eps", 1e-6},
+      {"rope_theta", layout.rotaryTheta}, {"attention_bias", 0},
+      {"tie_word_embeddings", 0},
+      {"max_position_embeddings", layout.maximumContextTokens}};
+  for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  source.requireConfigString("model_type", "llama");
+  source.requireConfigString("hidden_act", "silu");
+}
+
+// The LFM2 source (MLX layout, "lfm2" model_type): `language_model.model.`
+// tensors, conv and full_attention layer types and tied embeddings.
+void validateConfiguration(const SafetensorsCheckpoint &source, const Lfm2Layout &layout) {
+  const std::pair<const char *, double> fields[] = {
+      {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"intermediate_size", layout.intermediateSize},
+      {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2Layout::convolutionTaps},
+      {"norm_eps", layout.rmsEpsilon}, {"tie_word_embeddings", 1},
+      {"rope_parameters.rope_theta", layout.rotaryTheta},
+      {"max_position_embeddings", layout.maximumContextTokens}};
+  for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  source.requireConfigString("model_type", "lfm2");
+  source.requireLayerTypeMask(layout.layers, Lfm2Layout::attentionMask, "full_attention", "conv");
+}
+
+// The dense target's layer image (model.layers.N.): q/k/v fused, no norms.
+Image layerImage(const DenseLayout &layout, uint32_t layer) {
+  Image result = image("layer-" + std::to_string(layer) + ".bin", DenseLayout::layerMagic, layer, 1u);
+  const std::string prefix = "model.layers." + std::to_string(layer) + ".";
+  copy(result, prefix + "input_layernorm.weight", {layout.hiddenSize});
+  const std::string attention = prefix + "self_attn.";
+  const uint64_t kvRows = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
+  projection(result, {{attention + "q_proj", layout.attentionWidth},
+                      {attention + "k_proj", kvRows},
+                      {attention + "v_proj", kvRows}},
+             layout.packedFullWidth, layout.hiddenSize);
+  projection(result, {{attention + "o_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+  copy(result, prefix + "post_attention_layernorm.weight", {layout.hiddenSize});
+  const std::string mlp = prefix + "mlp.";
+  projection(result, {{mlp + "gate_proj", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+  projection(result, {{mlp + "up_proj", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+  projection(result, {{mlp + "down_proj", layout.hiddenSize}}, layout.hiddenSize, layout.intermediateSize);
+  return result;
+}
+
+Image headImage(const DenseLayout &layout) {
+  Image result = image("head.bin", DenseLayout::headMagic, layout.layers, 2);
+  copy(result, "model.norm.weight", {layout.hiddenSize});
+  projection(result, {{"lm_head", layout.vocabularySize}}, layout.vocabularySize, layout.hiddenSize);
+  return result;
+}
+
+Image embeddingImage(const DenseLayout &layout) {
+  Image result = image("embedding.bin", kEmbeddingMagic, layout.vocabularySize, layout.hiddenSize);
+  const std::string prefix = "model.embed_tokens";
+  result.quantized.emplace_back(prefix, 4);
+  copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
+  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  return result;
+}
+
+// LFM2's layer image (language_model.model.layers.N.): the conv layers'
+// [B|C|x] in_proj, [channels,1,taps] kernel and out_proj, or the attention
+// layers' fused QKV with per-head norms.
+Image layerImage(const Lfm2Layout &layout, uint32_t layer) {
+  const bool full = layout.isFullAttentionLayer(layer);
+  Image result = image("layer-" + std::to_string(layer) + ".bin", Lfm2Layout::layerMagic, layer, full ? 1u : 0u);
+  const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
+  copy(result, prefix + "operator_norm.weight", {layout.hiddenSize});
+  if (full) {
+    const std::string attention = prefix + "self_attn.";
+    const uint64_t kvRows = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
+    projection(result, {{attention + "q_proj", layout.attentionWidth},
+                        {attention + "k_proj", kvRows},
+                        {attention + "v_proj", kvRows}},
+               layout.packedFullWidth, layout.hiddenSize);
+    copy(result, attention + "q_layernorm.weight", {layout.attentionHeadDimension});
+    copy(result, attention + "k_layernorm.weight", {layout.attentionHeadDimension});
+    projection(result, {{attention + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+  } else {
+    const std::string conv = prefix + "conv.";
+    projection(result, {{conv + "in_proj", layout.packedGdnWidth}}, layout.packedGdnWidth, layout.hiddenSize);
+    copy(result, conv + "conv.weight", {layout.convolutionDimension, 1, Lfm2Layout::convolutionTaps});
+    projection(result, {{conv + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.convolutionDimension);
+  }
+  copy(result, prefix + "ffn_norm.weight", {layout.hiddenSize});
+  const std::string ffn = prefix + "feed_forward.";
+  projection(result, {{ffn + "w1", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+  projection(result, {{ffn + "w3", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+  projection(result, {{ffn + "w2", layout.hiddenSize}}, layout.hiddenSize, layout.intermediateSize);
+  return result;
+}
+
+// The LFM2.5-8B-A1B source (MLX layout, "lfm2_moe" model_type): LFM2's
+// mixers, a dense FFN on the leading num_dense_layers and the MoE block —
+// router, per-expert selection bias and expert slabs — after them.
+void validateConfiguration(const SafetensorsCheckpoint &source, const Lfm2MoeLayout &layout) {
+  const std::pair<const char *, double> fields[] = {
+      {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"intermediate_size", layout.intermediateSize},
+      {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2MoeLayout::convolutionTaps},
+      {"norm_eps", layout.rmsEpsilon}, {"tie_word_embeddings", 1},
+      {"rope_parameters.rope_theta", layout.rotaryTheta},
+      {"max_position_embeddings", layout.maximumContextTokens},
+      {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
+      {"moe_intermediate_size", layout.expertIntermediateSize},
+      {"num_dense_layers", Lfm2MoeLayout::denseLayers}};
+  for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  source.requireConfigString("model_type", "lfm2_moe");
+  source.requireLayerTypeMask(layout.layers, Lfm2MoeLayout::attentionMask, "full_attention", "conv");
+}
+
+// LFM2-MoE's layer image: LFM2's mixers, then the dense FFN below
+// denseLayers or the router, bias and expert slabs of its MoE block.
+Image layerImage(const Lfm2MoeLayout &layout, uint32_t layer) {
+  const bool full = layout.isFullAttentionLayer(layer);
+  Image result = image("layer-" + std::to_string(layer) + ".bin", Lfm2MoeLayout::layerMagic, layer, full ? 1u : 0u);
+  const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
+  copy(result, prefix + "operator_norm.weight", {layout.hiddenSize});
+  if (full) {
+    const std::string attention = prefix + "self_attn.";
+    const uint64_t kvRows = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
+    projection(result, {{attention + "q_proj", layout.attentionWidth},
+                        {attention + "k_proj", kvRows},
+                        {attention + "v_proj", kvRows}},
+               layout.packedFullWidth, layout.hiddenSize);
+    copy(result, attention + "q_layernorm.weight", {layout.attentionHeadDimension});
+    copy(result, attention + "k_layernorm.weight", {layout.attentionHeadDimension});
+    projection(result, {{attention + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+  } else {
+    const std::string conv = prefix + "conv.";
+    projection(result, {{conv + "in_proj", layout.packedGdnWidth}}, layout.packedGdnWidth, layout.hiddenSize);
+    copy(result, conv + "conv.weight", {layout.convolutionDimension, 1, Lfm2MoeLayout::convolutionTaps});
+    projection(result, {{conv + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.convolutionDimension);
+  }
+  copy(result, prefix + "ffn_norm.weight", {layout.hiddenSize});
+  const std::string ffn = prefix + "feed_forward.";
+  if (!layout.isMoeLayer(layer)) {
+    projection(result, {{ffn + "w1", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+    projection(result, {{ffn + "w3", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize);
+    projection(result, {{ffn + "w2", layout.hiddenSize}}, layout.hiddenSize, layout.intermediateSize);
+  } else {
+    // The router's Q8 rows pad to whole 256-row tiles, as the reader expects.
+    projection(result, {{ffn + "gate", layout.experts}}, kQ4StorageN, layout.hiddenSize, 8);
+    // The sigmoid gate's per-expert selection bias, F32 (exp_probs_b).
+    Section bias;
+    bias.input = {ffn + "expert_bias", {"F32"}, {layout.experts}};
+    bias.bytes = uint64_t{layout.experts} * sizeof(float);
+    append(result, std::move(bias));
+    const uint32_t width = layout.expertIntermediateSize;
+    projection(result, {{ffn + "experts.w1", width}}, width, layout.hiddenSize, 4, layout.experts);
+    projection(result, {{ffn + "experts.w3", width}}, width, layout.hiddenSize, 4, layout.experts);
+    projection(result, {{ffn + "experts.w2", layout.hiddenSize}}, layout.hiddenSize, width, 4, layout.experts);
+  }
+  return result;
+}
+
+// The tied LM head shares the token embedding's quantized rows.
+Image headImage(const Lfm2MoeLayout &layout) {
+  Image result = image("head.bin", Lfm2MoeLayout::headMagic, layout.layers, 2);
+  copy(result, "language_model.model.embedding_norm.weight", {layout.hiddenSize});
+  projection(result, {{"language_model.model.embed_tokens", layout.vocabularySize}},
+             layout.vocabularySize, layout.hiddenSize);
+  return result;
+}
+
+Image embeddingImage(const Lfm2MoeLayout &layout) {
+  Image result = image("embedding.bin", kEmbeddingMagic, layout.vocabularySize, layout.hiddenSize);
+  const std::string prefix = "language_model.model.embed_tokens";
+  result.quantized.emplace_back(prefix, 4);
+  copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
+  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  return result;
+}
+
+// The tied LM head shares the token embedding's quantized rows.
+Image headImage(const Lfm2Layout &layout) {
+  Image result = image("head.bin", Lfm2Layout::headMagic, layout.layers, 2);
+  copy(result, "language_model.model.embedding_norm.weight", {layout.hiddenSize});
+  projection(result, {{"language_model.model.embed_tokens", layout.vocabularySize}},
+             layout.vocabularySize, layout.hiddenSize);
+  return result;
+}
+
+Image embeddingImage(const Lfm2Layout &layout) {
+  Image result = image("embedding.bin", kEmbeddingMagic, layout.vocabularySize, layout.hiddenSize);
+  const std::string prefix = "language_model.model.embed_tokens";
+  result.quantized.emplace_back(prefix, 4);
+  copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
+  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  return result;
+}
+
+template<class Layout>
+std::shared_ptr<affine::PlannedCheckpoint> planImages(const std::filesystem::path &directory,
+                                                    const Layout &layout) {
+  auto planned = std::make_shared<affine::PlannedCheckpoint>(directory);
+  validateConfiguration(planned->source, layout);
+  std::vector<Image> list;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) list.push_back(layerImage(layout, layer));
+  list.push_back(headImage(layout));
+  list.push_back(embeddingImage(layout));
+  planned->images = std::move(list);
+  for (Image &image : planned->images) affine::bind(image, planned->source);
+  return planned;
+}
+
 // The checkpoint at directory with every image of layout bound to it.
 template<class Layout>
 std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &directory, const Layout &layout) {
@@ -175,14 +402,48 @@ std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &dir
 } // namespace
 
 std::vector<Image> affineTargetImages(const Qwen3_8Layout &layout) { return images(layout); }
+std::vector<Image> affineTargetImages(const Ornith9BLayout &layout) { return images(layout); }
 std::vector<Image> affineTargetImages(const Qwen3_6MoeLayout &layout) { return images(layout); }
+std::vector<Image> affineTargetImages(const DenseLayout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
+  result.push_back(headImage(layout));
+  result.push_back(embeddingImage(layout));
+  return result;
+}
+std::vector<Image> affineTargetImages(const Lfm2Layout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
+  result.push_back(headImage(layout));
+  result.push_back(embeddingImage(layout));
+  return result;
+}
+std::vector<Image> affineTargetImages(const Lfm2MoeLayout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
+  result.push_back(headImage(layout));
+  result.push_back(embeddingImage(layout));
+  return result;
+}
 
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
                                        const Qwen3_8Layout &layout)
     : images_(images), planned_(plan(directory, layout)) {}
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const Ornith9BLayout &layout)
+    : images_(images), planned_(plan(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
                                        const Qwen3_6MoeLayout &layout)
     : images_(images), planned_(plan(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const DenseLayout &layout)
+    : images_(images), planned_(planImages(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const Lfm2Layout &layout)
+    : images_(images), planned_(planImages(directory, layout)) {}
+AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
+                                       const Lfm2MoeLayout &layout)
+    : images_(images), planned_(planImages(directory, layout)) {}
 AffineTargetLoader::~AffineTargetLoader() = default;
 WeightFile AffineTargetLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 2) throw WeightStoreError("target layer is out of range");

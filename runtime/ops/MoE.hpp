@@ -13,6 +13,9 @@ namespace splash::ops {
 
 // The shared expert is an expert every row visits, so it has the routed
 // experts' intermediate width and runs through the same grouped tiles.
+// A shape without one (sharedExpert false) is LFM2-MoE's: sigmoid gating
+// with a per-expert selection bias (GGUF expert_gating_func 2), routing
+// weights normalized over the top_k winners, and no shared-expert route.
 struct MoeShape final {
   uint32_t hiddenSize = 0;
   uint32_t experts = 0;
@@ -24,6 +27,9 @@ struct MoeShape final {
   // A GGUF's format of most routed expert weights, which picks the expert
   // tile on Apple9 (moeGgufTile); GGUF_FMT_COUNT for affine weights.
   uint32_t expertFormat = GGUF_FMT_COUNT;
+  // Whether every row carries a shared-expert route (id `experts`) weighted
+  // by the sigmoid of its scalar gate, as the Qwen MoE does.
+  bool sharedExpert = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
@@ -31,9 +37,9 @@ struct MoeShape final {
            expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 256 == 0;
   }
-  // Routed experts followed by the shared expert.
+  // Routed experts followed by the shared expert, if there is one.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
-    return expertsPerToken + 1;
+    return expertsPerToken + (sharedExpert ? 1 : 0);
   }
   bool operator==(const MoeShape &) const = default;
 };
@@ -49,17 +55,22 @@ struct BlockExpertProjection final {
 
 // The sparse MoE block of a GGUF target. The router and the shared expert's
 // scalar gate are float tensors llama.cpp keeps unquantized, and they run in
-// fp32.
+// fp32. A target without a shared expert (sharedExpert false) leaves the
+// shared segments empty and carries the F32 per-expert selection bias
+// (exp_probs_b) instead.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
+  QuantizedSegment expertBias{};     // [1][experts] F32, sigmoid-gated MoE only
 };
 
 // The affine weights of a sparse MoE block: Q8 router and shared-expert
 // scalar gate, and Q4 expert slabs. The shared expert is a one-expert slab.
+// Without one, the shared fields stay empty and expertBias holds the F32
+// per-expert selection bias.
 struct AffineMoeWeights final {
   Q8Projection router;
   ExpertProjection expertGate;
@@ -69,6 +80,7 @@ struct AffineMoeWeights final {
   ExpertProjection sharedUp;
   ExpertProjection sharedDown;
   Q8Projection sharedScalarGate;
+  metal::MetalBuffer expertBias{}; // experts F32 values, sigmoid-gated MoE only
 };
 
 // All weights for one sparse MoE block. The model package owns the buffers;
@@ -103,7 +115,7 @@ moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
   return std::min(routed / tileRows + shape.experts, routed) +
-         (rows + tileRows - 1) / tileRows;
+         (shape.sharedExpert ? (rows + tileRows - 1) / tileRows : 0);
 }
 
 struct MoeWorkspace final {
@@ -117,7 +129,13 @@ struct MoeWorkspace final {
   uint64_t expertIntermediateBytes = 0;
   uint64_t expertOutputBytes = 0;
   // The row sums of the Table16 tiles the GGUF register expert tile reads.
+  // Packed decode plans (the MXFP4 expert tiles) hold the gathered rows'
+  // per-(row, group) exponent bytes there instead.
   uint64_t groupedSumsBytes = 0;
+  // Packed decode plans only: the slot-permuted fp16 image of the grouped
+  // rows (moe_gather_packed) and of the down pass's intermediates
+  // (gguf_pack_half), the packed MXFP4 expert tiles' A operand.
+  uint64_t groupedPackedBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -138,7 +156,12 @@ struct MoeScratch final {
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
   // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
+  // Packed decode plans: the gathered rows' and packed intermediates'
+  // exponent bytes.
   metal::MetalBuffer groupedSums;
+  // Packed decode plans: the slot-permuted fp16 activation plane the MXFP4
+  // expert segments read (kernels/common/gguf_mxfp4p_tile.h's layout).
+  metal::MetalBuffer groupedPacked;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -146,7 +169,7 @@ struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
 };
-inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 11> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
@@ -157,6 +180,7 @@ inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
     {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes},
     {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes},
     {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes},
+    {&MoeScratch::groupedPacked, &MoeWorkspace::groupedPackedBytes},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -259,6 +283,9 @@ struct MoeConfig final {
   // The tile of a GGUF plan's F32 router; the execution plans derive it from
   // the device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // GGUF plans only: the `_n` expert kernels, whose MXFP4 segments decode on
+  // the Metal 4.1 packed FP4-E2M1 path. Set on Apple GPU family 10 and up.
+  bool mxfp4Native = false;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -271,6 +298,7 @@ public:
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
   }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
   [[nodiscard]] bool splitExperts() const noexcept { return splitExperts_; }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
@@ -284,6 +312,7 @@ private:
   MoeShape shape_;
   uint32_t rows_;
   MoeConfig config_;
+  MoePhase phase_;
   bool splitExperts_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;

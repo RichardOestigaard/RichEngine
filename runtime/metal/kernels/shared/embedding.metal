@@ -42,6 +42,7 @@ inline void q4_embedding_impl(device const uint *tokens,
   }
 
 Q4_EMBEDDING_ENTRY(embedding_q4_h5120, 5120)
+Q4_EMBEDDING_ENTRY(embedding_q4_h4096, 4096)
 Q4_EMBEDDING_ENTRY(embedding_q4_h2048, 2048)
 #undef Q4_EMBEDDING_ENTRY
 
@@ -237,4 +238,64 @@ kernel void verify_input_tokens(
                    : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);
+}
+
+// A tree-verify step's inputs, SPLASH_TREE_VERIFY_NODES per lane: each live
+// node's token from draft_select_tree's tables, its rope position (the
+// lane's base triple plus the node's depth) and the ancestor bitmask the
+// attention tiles test for its visible rows. Dead rows take the mask token,
+// the base position and a zero mask.
+kernel void verify_input_tree_tokens(
+    device const uint *tree_tokens [[buffer(0)]],
+    device const uint *tree_nodes [[buffer(1)]],
+    device const uint *tree_counts [[buffer(2)]],
+    device uint *verify_input [[buffer(3)]],
+    device uint *positions [[buffer(4)]],
+    device uint *masks [[buffer(5)]],
+    constant VerifyTreeInputParams &params [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
+  const uint batch = index / Nodes;
+  const uint row = index % Nodes;
+  device const uint *nodes = tree_nodes + batch * Nodes;
+  const uint descriptor = nodes[row];
+  const uint depth = SPLASH_TREE_NODE_DEPTH(descriptor);
+  const bool live =
+      row < tree_counts[batch] &&
+      (row == 0 ||
+       SPLASH_TREE_NODE_PARENT(descriptor) != SPLASH_TREE_NODE_NONE);
+  const uint token = live ? tree_tokens[index] : params.mask_token;
+  verify_input[index] = min(token, params.vocabulary - 1u);
+  for (uint a = 0; a < 3; ++a)
+    positions[index * 3 + a] = params.base[batch][a] + (live ? depth : 0u);
+  uint mask = 0u;
+  if (live) {
+    mask = 1u << row;
+    uint parent = SPLASH_TREE_NODE_PARENT(descriptor);
+    while (parent != SPLASH_TREE_NODE_NONE) {
+      mask |= 1u << parent;
+      parent = SPLASH_TREE_NODE_PARENT(nodes[parent]);
+    }
+  }
+  masks[index] = mask;
+}
+
+// The retained path's captured hidden rows, gathered from the tree's DFS row
+// order into path order, which the draft context commit consumes.
+kernel void tree_capture_gather(
+    device const bfloat *source [[buffer(0)]],
+    device const uint *retained_path [[buffer(1)]],
+    device const uint *retained [[buffer(2)]],
+    device bfloat *destination [[buffer(3)]],
+    constant uint &width [[buffer(4)]],
+    uint element [[thread_position_in_grid]]) {
+  constexpr uint Nodes = SPLASH_TREE_VERIFY_NODES;
+  constexpr uint Emitted = SPLASH_TARGET_VERIFY_ROWS;
+  const uint lane = element / (Emitted * width);
+  const uint row = (element / width) % Emitted;
+  const uint dim = element % width;
+  const uint source_row =
+      row < retained[lane] ? retained_path[lane * Emitted + row] : 0u;
+  destination[element] =
+      source[(ulong(lane) * Nodes + source_row) * width + dim];
 }

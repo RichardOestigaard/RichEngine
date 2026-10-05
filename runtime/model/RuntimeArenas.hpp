@@ -46,7 +46,8 @@ struct RuntimeGeometry final {
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
-    result.draft = package.draft.layout;
+    result.draft = std::visit(
+        [](const auto &weights) { return weights.layout; }, package.draft);
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -122,6 +123,10 @@ enum class PrefillTensor : uint32_t {
   LinearCounters,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
+  // The pack planes of a GGUF prefill chunk's MXFP4 segments
+  // (ops::LinearScratch::input and ::sums, kernels/shared/gguf_mxfp4p.metal).
+  LinearPacked,
+  LinearExponents,
   Count,
 };
 
@@ -254,6 +259,18 @@ enum class DecodeTensor : uint32_t {
   TopPartialValues,
   ProposalProbs,
   ProposedTokens,
+  // Verify-tree tables (draft_select_tree): packed node descriptors, node
+  // tokens and node counts, SPLASH_TREE_VERIFY_NODES-stride per lane.
+  TreeNodes,
+  TreeTokens,
+  TreeCounts,
+  // Tree-verify operands (verify_input_tree_tokens/decode_accept_tree): one
+  // ancestor bitmask per node, the retained path's DFS row indices, the
+  // per-node argmax selections and the path-gathered captured hidden rows.
+  TreeMasks,
+  RetainedPath,
+  TreeSelected,
+  CapturedPath,
   PageTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
@@ -422,6 +439,9 @@ public:
     if (!isGdnLayerTensor(base))
       throw std::invalid_argument("tensor is not GDN replay scratch");
     const uint32_t index = static_cast<uint32_t>(base);
+    // A target without the tensor's field (an LFM2 target's decay/beta) has
+    // a zero-sized entry; the unused binding is an empty buffer.
+    if (!sizes_[index]) return {};
     return backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
   }
 
@@ -445,6 +465,7 @@ private:
   [[nodiscard]] metal::MetalBuffer layerBatchSlice(DecodeTensor base, uint32_t layers,
                                                    uint32_t layer, uint32_t lanes) const {
     const uint32_t index = static_cast<uint32_t>(base);
+    if (!sizes_[index]) return {};
     const uint64_t stride = sizes_[index] / layers;
     return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
                          uint64_t{lanes} * stride);

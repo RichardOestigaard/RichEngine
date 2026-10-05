@@ -23,9 +23,22 @@ struct GdnStateLayout final {
   uint32_t recurrentRows = 0;
   uint32_t recurrentColumns = 0;
 
+  // A pure dense target carries no recurrent layers (layers == 0); LFM2's
+  // convolutions keep the FIFO but no recurrent matrix (zero rows and
+  // columns). GDN layers keep both.
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && convolutionHistory && convolutionChannels &&
-           recurrentGroups && recurrentRows && recurrentColumns;
+    if (!layers)
+      return !convolutionHistory && !convolutionChannels && !recurrentGroups &&
+             !recurrentRows && !recurrentColumns;
+    if (!convolutionHistory || !convolutionChannels)
+      return false;
+    const bool recurrent = recurrentGroups && recurrentRows && recurrentColumns;
+    const bool empty = !recurrentGroups && !recurrentRows && !recurrentColumns;
+    return recurrent || empty;
+  }
+  // The layers keep a convolution FIFO only (LFM2), not the GDN matrix.
+  [[nodiscard]] constexpr bool convolutionOnly() const noexcept {
+    return layers && !recurrentGroups;
   }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
     return alignUp(uint64_t{convolutionHistory} * convolutionChannels *

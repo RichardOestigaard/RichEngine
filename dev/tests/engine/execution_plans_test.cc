@@ -179,9 +179,15 @@ void ggufMoePlans() {
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
                   plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
               "GGUF MoE decode plan left its device tile");
-      // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
+      // Register plans sum the widest input (hidden, 3 K / 4 fp32) per
+      // 8-row tile; staged Apple10+ plans reserve the MXFP4 exponent bytes
+      // of the packed decode plane in the same slot.
       require(plan.workspace().groupedSumsBytes ==
-                  (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
+                  (expected == MoeGgufTile::Register
+                       ? uint64_t{plan.maximumTiles()} * 2048 * 3
+                       : plan.configuration().mxfp4Native
+                             ? uint64_t{plan.maximumTiles()} * 8 * (2048 / 32)
+                             : 0),
               "GGUF register plan sums its Table16 tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
       require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
@@ -197,7 +203,11 @@ void ggufMoePlans() {
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
-      require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
+      require(plan.configuration().ggufTile == MoeGgufTile::Staged &&
+                  plan.workspace().groupedSumsBytes ==
+                      (plan.configuration().mxfp4Native
+                           ? uint64_t{plan.maximumTiles()} * 8 * (2048 / 32)
+                           : 0),
               "GGUF MoE plan of staged experts took the register tile");
       covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
@@ -272,9 +282,11 @@ void workspaceBounds() {
           "verify policy did not resolve one history per lane");
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
-                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
+                  uint64_t{SPLASH_TREE_VERIFY_NODES} *
+                      kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
-                  uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
+                  uint64_t{SPLASH_TREE_VERIFY_NODES} *
+                      kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);

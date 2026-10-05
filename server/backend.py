@@ -120,8 +120,13 @@ class Job:
 
 
 class CallbackStreamer:
-    def __init__(self, tokenizer, callback, stop_sequences=(), on_stop=None):
+    def __init__(
+        self, tokenizer, callback, stop_sequences=(), on_stop=None, think_end_id=None
+    ):
         self.tokenizer = tokenizer
+        self.think_end_id = (
+            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
+        )
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
         self.on_stop = on_stop
@@ -211,7 +216,7 @@ class CallbackStreamer:
         if not enabled:
             return 0
         try:
-            return self.token_ids.index(THINK_END_TOKEN_ID)
+            return self.token_ids.index(self.think_end_id)
         except ValueError:
             return len(self.token_ids)
 
@@ -245,9 +250,10 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger):
+    def __init__(self, runtime, tokenizer, request_logger, think_end_id=None):
         self.runtime = runtime
         self.tokenizer = tokenizer
+        self.think_end_id = think_end_id
         self.request_logger = request_logger
         self.active = {}
         self.closing = False
@@ -599,7 +605,11 @@ class NativeBackend:
             job.events.put(("text", text))
 
         streamer = CallbackStreamer(
-            self.tokenizer, emit, job.stop_sequences, stop_matched
+            self.tokenizer,
+            emit,
+            job.stop_sequences,
+            stop_matched,
+            think_end_id=self.think_end_id,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)

@@ -19,14 +19,16 @@ struct FullPrefillParams {
 static_assert(sizeof(FullPrefillParams) == 8,
               "Full attention prefill parameters are 8 bytes on both sides");
 
-// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows in a chunk staging of
-// SPLASH_VERIFY_CHUNK_STRIDE rows.
+// Each lane holds `rows` of its verify rows in a chunk staging of
+// SPLASH_VERIFY_CHUNK_STRIDE rows: SPLASH_TARGET_VERIFY_ROWS in chain mode,
+// SPLASH_TREE_VERIFY_NODES in tree mode.
 struct FullDecodeBatchParams {
   uint32_t lanes;
+  uint32_t rows;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 4,
-              "Full attention verify parameters are 4 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 8,
+              "Full attention verify parameters are 8 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final page slot before attention. Prefill and verify both read
@@ -59,8 +61,12 @@ struct SplashPrefillAttentionParams {
 static_assert(sizeof(SplashPrefillAttentionParams) == 28,
               "Prefill attention parameters are 28 bytes on both sides");
 
-// A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
-// queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
+// A verify lane attends all its `active_rows` live rows
+// (SPLASH_TARGET_VERIFY_ROWS chain, up to SPLASH_TREE_VERIFY_NODES - 1
+// tree), which its queries and output hold in a chunk staging of
+// SPLASH_VERIFY_CHUNK_STRIDE rows per KV head. row_capacity is the tile's
+// compile-time row count (8 or SPLASH_TREE_VERIFY_NODES) and strides its
+// partial slots.
 struct SplashVerifyAttentionParams {
   uint32_t committed_tokens;
   uint32_t page_table_entries;
@@ -69,7 +75,9 @@ struct SplashVerifyAttentionParams {
   // plan-wide slot stride that every lane's partials use.
   uint32_t split_count;
   uint32_t slot_splits;
+  uint32_t active_rows;
+  uint32_t row_capacity;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 24,
-              "Verify attention parameters are 24 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 32,
+              "Verify attention parameters are 32 bytes on both sides");

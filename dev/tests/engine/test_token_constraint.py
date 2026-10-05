@@ -20,18 +20,23 @@ class TokenConstraintTest(unittest.TestCase):
         tokenizer = structured.StructuredToolGrammarTest.tokenizer
         guidance = structured.StructuredToolGrammarTest.guidance
 
-        class Constraint(constraints.TokenConstraint):
-            VOCABULARY = guidance.vocab_size
-            EOS_TOKENS = (tokenizer.token_to_id("<eos>"),)
+        contract = constraints.TokenizerContract(
+            guidance.vocab_size, (tokenizer.token_to_id("<eos>"),), "<eos>", 0
+        )
 
+        class Constraint(constraints.TokenConstraint):
+            def __init__(self, matcher, executor):
+                super().__init__(matcher, executor, contract)
+
+        cls.contract = contract
         cls.Constraint = Constraint
-        cls.width = (Constraint.VOCABULARY + 31) // 32
+        cls.width = (contract.vocabulary + 31) // 32
         cls.matcher = LLMatcher(
             guidance, '%llguidance {}\nstart: "ab" | "ac"\n', log_level=0
         )
         cls.executor = LLExecutor()
         cls.a, cls.b, cls.c, cls.z = map(tokenizer.token_to_id, "abcz")
-        cls.eos = Constraint.EOS_TOKENS[0]
+        cls.eos = contract.eos_tokens[0]
 
     def constraint(self):
         return self.Constraint(self.matcher.deep_copy(), self.executor)
@@ -54,7 +59,7 @@ class TokenConstraintTest(unittest.TestCase):
         constraint = self.constraint()
         self.assertEqual(self.rows(constraint.masks(())), [[a]])
         self.assertEqual(self.rows(constraint.masks((a, b))), [[a], [b, c], [eos]])
-        for draft in ((a, z, b), (a, self.Constraint.VOCABULARY, b), (a, -1, b)):
+        for draft in ((a, z, b), (a, self.contract.vocabulary, b), (a, -1, b)):
             with self.subTest(draft=draft):
                 self.assertEqual(
                     self.rows(constraint.masks(draft)), [[a], [b, c], [b, c], [b, c]]
@@ -115,7 +120,7 @@ class TokenConstraintTest(unittest.TestCase):
         constraint.commit([eos])
         constraint.finish()
         self.assertFalse(constraint.matcher.is_error())
-        for tokens in ([self.z], [self.Constraint.VOCABULARY], [-1]):
+        for tokens in ([self.z], [self.contract.vocabulary], [-1]):
             with (
                 self.subTest(tokens=tokens),
                 self.assertRaises(ConstraintError) as caught,

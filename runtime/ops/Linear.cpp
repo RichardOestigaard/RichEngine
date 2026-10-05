@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -106,7 +107,8 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
   return layout == LinearInput::Table16
              ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
-       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16 : 0;
+       : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16
+       : layout == LinearInput::Packed ? rows * (width / 32) : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
@@ -117,7 +119,9 @@ void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint3
 }
 
 const char *tableSuffix(LinearInput layout) noexcept {
-  return layout == LinearInput::Table16 ? "_table16" : layout == LinearInput::Table64 ? "_table64" : "";
+  return layout == LinearInput::Table16 ? "_table16"
+       : layout == LinearInput::Table64 ? "_table64"
+       : layout == LinearInput::Packed  ? "_packed" : "";
 }
 
 void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
@@ -169,6 +173,7 @@ uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
 bool LinearPlan::usesSimdgroup() const noexcept { return config_.tile == LinearTile::Simdgroup; }
 LinearInput LinearPlan::input() const noexcept {
   if (rotated_) return LinearInput::Plain;
+  if (packedInput_) return LinearInput::Packed;
   if (config_.tile == LinearTile::GgufRegister) return LinearInput::Table16;
   return usesSimdgroup() ? LinearInput::Table64 : LinearInput::Plain;
 }
@@ -517,17 +522,87 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
           groups(tiles128, lanes == 2 ? kN128M16Groups : kN128Groups)};
 }
 
+namespace {
+
+// The pre-packed MXFP4 prefill tiles (gguf_prefill_mxfp4p_* /
+// gguf_decode_mxfp4p_*, LinearGguf.cpp) measured behind the staged tiles on
+// the compute-bound prefill GEMM (mxfp4 5120 x 8192, 20-core M5 Pro, ms
+// at rows 128/512/2048: 0.52/2.05/7.88 packed vs 0.51/1.86/6.96 staged), so
+// they stay for benchmarks: SPLASH_GGUF_PACKED_ON selects them, the same
+// opt-in the packed-operand decode kernels take (LinearGguf.cpp). The flag
+// covers every chunk size — and must: the gguf_projection test compares
+// every chunk's output bitwise against the 128-row tile's, and the fp4
+// multiplane matmul of the packed chunk tiles is NOT bitwise equal to the
+// staged mxfp4n prefill tile (a deterministic one-ulp divergence on rare
+// elements: 1 of 32768 at 32 rows, observed at ~4e-5 magnitudes where the
+// pack's exponent path engages). Equal within fp64, not bitwise.
+bool packedPrefillEnabled() {
+  static const bool on = std::getenv("SPLASH_GGUF_PACKED_ON") != nullptr;
+  return on;
+}
+// A kill switch for the packed paths, for benchmarks and triage.
+bool packedTilesDisabled() {
+  static const bool off = std::getenv("SPLASH_GGUF_PACKED_OFF") != nullptr;
+  return off;
+}
+// A GGUF prefill plan may dispatch gguf_pack_half and the pre-packed MXFP4
+// tiles (LinearGguf.cpp), which read LinearScratch::input and ::sums. The
+// flag is set conservatively wherever the segments are unknown (the
+// projection-free plan and the explicit-config plan): a non-MXFP4 plan then
+// reserves the pack scratch without using it.
+bool packsPrefill(uint32_t appleGpuFamily, LinearWorkload w) noexcept {
+  return packedPrefillEnabled() && !packedTilesDisabled() &&
+         appleGpuFamily >= 10 && w.phase == LinearPhase::Prefill &&
+         w.weightLayout == WeightLayout::Block32;
+}
+bool hasMxfp4(const Projection *p) noexcept {
+  return p && std::any_of(p->blocks().segments.begin(), p->blocks().segments.end(),
+                          [](const QuantizedSegment &s) { return s.formatId == GGUF_FMT_MXFP4; });
+}
+
+// A GGUF decode plan packs its activations the same way when any of its
+// projections is MXFP4: the pre-packed tile (gguf_decode_mxfp4p_*) wins at
+// every tile height, so decode dispatch selects it unconditionally, unlike
+// the env-gated prefill variant (LinearGguf.cpp's addGgufStaged).
+bool packsDecode(uint32_t appleGpuFamily, LinearWorkload w, const Projection *p,
+                 const Projection *gate) noexcept {
+  return appleGpuFamily >= 10 && !packedTilesDisabled() &&
+         w.phase == LinearPhase::Decode &&
+         w.weightLayout == WeightLayout::Block32 && (hasMxfp4(p) || hasMxfp4(gate));
+}
+
+} // namespace
+
 LinearPlan Linear::plan(LinearWorkload workload) const {
-  return LinearPlan(workload, baseline(workload));
+  LinearPlan plan(workload, baseline(workload));
+  plan.packs_ = packsPrefill(appleGpuFamily_, workload);
+  return plan;
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
-  return LinearPlan(workload, config, destination);
+  LinearPlan plan(workload, config, destination);
+  plan.packs_ = packsPrefill(/* any family, so forced plans size scratch */ 10, workload);
+  return plan;
 }
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   w.weightLayout = p.layout();
   const std::array<const Projection *, 2> projections{&p, gate};
   LinearPlan plan(w, baseline(w, projections), p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
+  plan.packs_ = (packsPrefill(appleGpuFamily_, w) && (hasMxfp4(&p) || hasMxfp4(gate))) ||
+                packsDecode(appleGpuFamily_, w, &p, gate);
+  // A fused projection stages its input inside the decode kernel; only the
+  // single-tensor path (a gate/up pair is two single-tensor dispatches on one
+  // input, and a prefill chunk one dispatch per segment) dispatches or reads
+  // a packed operand, so only it can take a packed input. A prefill chunk of
+  // up to a decode batch's rows runs the same mxfp4p decode tiles as decode,
+  // so its producer can emit the packed operand the same way; the 128-row
+  // prefill tile still packs its own input.
+  const auto singleTensor = [](const Projection *q) {
+    return !q || q->blocks().segments.size() == 1;
+  };
+  plan.packedInput_ = plan.packs_ &&
+                      (w.phase == LinearPhase::Decode || w.rows <= kMaximumDecodeTileRows) &&
+                      singleTensor(&p) && singleTensor(gate);
   return plan;
 }
 
@@ -560,6 +635,11 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout})
                         .scratchSize());
+  // A full chunk's plan, whose GGUF prefill tile packs the activations its
+  // MXFP4 segments multiply (the scratch LinearScratch::input and ::sums).
+  bound.include(plan({{shape.outputSize, shape.inputSize}, SPLASH_PREFILL_TOKEN_BUDGET,
+                      LinearPhase::Prefill, LinearEpilogue::None, shape.layout})
+                    .scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
@@ -589,7 +669,13 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireBytes(b.scratch.counters, scratch.counters, "counters");
   if (p.layout() == WeightLayout::Block32) {
     if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
+    // The GGUF decode kernels produce no output when they replay from an
+    // indirect command buffer on this driver (the gguf MoE expert and
+    // embedding kernels fail the same way): a suspension keeps them out of
+    // every enclosing baked span.
+    graph.suspendBakedSpan();
     addGguf(graph, b, p, selected, gate);
+    graph.resumeBakedSpan();
     // A rotated projection's plan prepares its table, if any, from the
     // rotated rows, which no other plan reads.
     if (p.rotation) return {};

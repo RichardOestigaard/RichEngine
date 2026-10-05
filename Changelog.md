@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — working tree
+
+- New families: Ornith-1.5-9B, Ornith-1.5-35B-A3B, MiniCPM5-2B, LFM2.5-2.6B, LFM2.5-8B-A1B (`install/families.py`, `install/completions/suggested-models.txt`)
+- New target/draft loaders: `Ornith9B`, `Dense`, `Lfm2`, `Lfm2Moe`, `PlainDraft`, `DSparkDraft` (Markov + confidence heads), `AnePredictor` (CoreML); `ModelFactory` dispatches draft layout via `std::visit`
+- LFM2 conv support: `runtime/ops/LfmConv.*`, `runtime/metal/abi/LfmConv.h`, `shared/lfm_conv.metal`
+- `--kv-format` gains `int4` (now default), `fp8`, `fp8e4m3`; new FP8 attention/store kernels (decode + prefill), `paged_attention_fp8_tile.h`, `Fp8PageFormatReference` tests
+- MXFP4 GGUF kernels: `gguf_mxfp4_tile.h`, `gguf_mxfp4p_tile.h`, `shared/gguf_mxfp4p.metal`
+- Tree-verify attention splits (`verifyAttentionSplits` rows param), `gdn_chunked.metal` prefill kernel, `mpp_simdgroup_attention` prototype
+- Toolchain floor raised to macOS 27, `-std=metal4.1`, CoreML link, `mtl4_benchmark` target
+- Server: `TokenizerContract` propagated to backend/frontend/constraints (`think_end_id`)
+- New design docs: `ANE_DRAFTING.md`, `SPEC_DECODE_BOOST.md`, `TREE_VERIFY_DESIGN.md`, `TurboQuant_ANLYSIS.md`, `PREFILL_OPTIMIZATION_PLAN.md`
+
 ## Unreleased — Apple M5 Pro performance pass
 
 Measured on Apple M5 Pro (GPU family 10, 20 cores), model Qwen3.8-27B-Splash,

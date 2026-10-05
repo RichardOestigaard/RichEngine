@@ -14,23 +14,24 @@ constant uint SplashKvPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 constant uint SplashKvHeadDimension = SPLASH_KV_HEAD_DIMENSION;
 
 // An element's index in a layer's region of one tensor: its page's slab,
-// then its place in the slab (abi/KvExtent.h).
-template <uint KVHeads>
+// then its place in the slab (abi/KvExtent.h). HeadDim is the slab's head
+// dimension; the default keeps every page a 256-dimension one.
+template <uint KVHeads, uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
 inline ulong splash_kv_key_index(uint page, uint head, uint token,
                                    uint dimension) {
   constexpr ulong ElementsPerPage =
-      ulong(KVHeads) * SplashKvPageTokens * SplashKvHeadDimension;
+      ulong(KVHeads) * SplashKvPageTokens * HeadDim;
   return ulong(page) * ElementsPerPage +
-         splash_kv_key_element(head, token, dimension);
+         splash_kv_key_element_dim(head, token, dimension, HeadDim);
 }
 
-template <uint KVHeads>
+template <uint KVHeads, uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
 inline ulong splash_kv_value_index(uint page, uint head, uint token,
                                      uint dimension) {
   constexpr ulong ElementsPerPage =
-      ulong(KVHeads) * SplashKvPageTokens * SplashKvHeadDimension;
+      ulong(KVHeads) * SplashKvPageTokens * HeadDim;
   return ulong(page) * ElementsPerPage +
-         splash_kv_value_element(head, token, dimension);
+         splash_kv_value_element_dim(head, token, dimension, HeadDim);
 }
 
 template <uint KVHeads>

@@ -147,6 +147,26 @@ QWEN35_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
     r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+# The minicpm5 profile splits digit runs of at most three out before the
+# GPT-2 pattern, as MiniCPM5's published tokenizer does, and normalizes
+# nothing.
+MINICPM5_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+# The lfm2 profile llama.cpp declares for Liquid's LFM2.5 tokenizer.
+LFM2_PATTERNS = (
+    r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+",
+)
+# Each tokenizer.ggml.pre profile Splash can rebuild: its Split patterns in
+# application order and whether the input is NFC-normalized first.
+TOKENIZER_PROFILES = {
+    "qwen35": ((QWEN35_PATTERN,), True),
+    "minicpm5": (MINICPM5_PATTERNS, False),
+    "lfm2": (LFM2_PATTERNS, False),
+}
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
 # that are not special, and unused ones fill the vocabulary to its size.
@@ -176,11 +196,16 @@ def tokenizer_files(metadata):
     )
     from tokenizers import models as token_models
 
-    if (
-        metadata.require("tokenizer.ggml.model", str) != "gpt2"
-        or metadata.require("tokenizer.ggml.pre", str) != "qwen35"
-    ):
-        raise ModelError("unsupported GGUF tokenizer profile; expected gpt2/qwen35")
+    if metadata.require("tokenizer.ggml.model", str) != "gpt2":
+        raise ModelError("unsupported GGUF tokenizer model; expected gpt2")
+    pre = metadata.require("tokenizer.ggml.pre", str)
+    if pre not in TOKENIZER_PROFILES:
+        raise ModelError(
+            "unsupported GGUF tokenizer profile: "
+            + pre
+            + f" (supported: {', '.join(sorted(TOKENIZER_PROFILES))})"
+        )
+    patterns, normalize = TOKENIZER_PROFILES[pre]
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
@@ -212,10 +237,14 @@ def tokenizer_files(metadata):
         )
     except Exception as error:
         raise ModelError("invalid GGUF BPE vocabulary or merges") from error
-    backend.normalizer = normalizers.NFC()
+    if normalize:
+        backend.normalizer = normalizers.NFC()
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
-            pre_tokenizers.Split(Regex(QWEN35_PATTERN), behavior="isolated"),
+            *(
+                pre_tokenizers.Split(Regex(pattern), behavior="isolated")
+                for pattern in patterns
+            ),
             pre_tokenizers.ByteLevel(
                 add_prefix_space=False, use_regex=False, trim_offsets=False
             ),
@@ -280,7 +309,13 @@ def tokenizer_files(metadata):
 
 # The GGUF text architectures Splash serves, and the model type of each one's
 # text configuration.
-TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
+TEXT_MODEL_TYPES = {
+    "qwen35": "qwen3_5_text",
+    "qwen35moe": "qwen3_5_moe_text",
+    "llama": "llama",
+    "lfm2": "lfm2",
+    "lfm2moe": "lfm2_moe",
+}
 
 
 def text_architecture(metadata):
@@ -299,17 +334,77 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
-    text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
+    text = {}
+    for name, key in fields.items():
+        value = metadata.values.get(arch + "." + key)
+        if isinstance(value, list):
+            # lfm2 states head_count_kv per layer, 0 on its conv layers.
+            if (
+                key != "attention.head_count_kv"
+                or not all(type(item) is int and item >= 0 for item in value)
+                or not value
+            ):
+                raise ModelError(
+                    "invalid GGUF metadata array: " + arch + "." + key
+                )
+            # Every attention layer shares one KV head count.
+            value = max(value)
+        elif value is None and name == "head_dim" and arch in ("lfm2", "lfm2moe"):
+            # lfm2 states no key_length; its head width divides the hidden
+            # size evenly across the attention heads.
+            continue
+        if type(value) is not int or value <= 0:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + "." + key
+            )
+        text[name] = value
+    if "head_dim" not in text:
+        if text["hidden_size"] % text["num_attention_heads"]:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".attention.key_length"
+            )
+        text["head_dim"] = text["hidden_size"] // text["num_attention_heads"]
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
         model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
+    if arch in ("llama", "lfm2", "lfm2moe"):
+        text["intermediate_size"] = metadata.positive(
+            arch + ".feed_forward_length"
+        )
+    if arch == "lfm2moe":
+        text["num_experts"] = metadata.positive(arch + ".expert_count")
+        text["num_experts_per_tok"] = metadata.positive(
+            arch + ".expert_used_count"
+        )
+        text["moe_intermediate_size"] = metadata.positive(
+            arch + ".expert_feed_forward_length"
+        )
+        text["num_dense_layers"] = metadata.positive(
+            arch + ".leading_dense_block_count"
+        )
+    if arch in ("lfm2", "lfm2moe"):
+        # The per-layer KV head count names the conv (0) and full-attention
+        # layers, as the config's layer_types does.
+        kv = metadata.values.get(arch + ".attention.head_count_kv")
+        if isinstance(kv, list):
+            text["layer_types"] = [
+                "conv" if count == 0 else "full_attention" for count in kv
+            ]
+        text["conv_dim"] = text["hidden_size"]
+        text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
     if arch == "qwen35moe":
         text.update(
             num_experts=metadata.positive(arch + ".expert_count"),
             num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
         )
+    for name in ("eos", "bos", "padding"):
+        value = metadata.values.get(f"tokenizer.ggml.{name}_token_id")
+        if value is not None and (type(value) is not int or value < 0):
+            raise ModelError(f"invalid GGUF metadata: tokenizer.ggml.{name}_token_id")
+        if type(value) is int:
+            text[name + "_token_id"] = value
     config = {
         "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
         "text_config": text,
@@ -489,15 +584,91 @@ MOE_TENSORS = {
 }
 
 
+# The names llama.cpp writes for a plain llama model (MiniCPM5): FFN norms
+# rather than the qwen35 post_attention_norm, and no QK norm.
+LLAMA_LAYER_TENSORS = {"attn_norm.weight": F32, "ffn_norm.weight": F32}
+LLAMA_ATTENTION_TENSORS = {
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_output.weight": QUANTIZED_TYPES,
+}
+# The hybrid lfm2 target: its attention layers add QK norms, its conv layers
+# run the shortconv triple, and tied embeddings leave token_embd_norm where
+# an untied model's output head stands.
+LFM2_ATTENTION_TENSORS = {
+    **LLAMA_ATTENTION_TENSORS,
+    "attn_q_norm.weight": F32,
+    "attn_k_norm.weight": F32,
+}
+LFM2_CONV_TENSORS = {
+    "shortconv.conv.weight": F32,
+    "shortconv.in_proj.weight": QUANTIZED_TYPES | F32,
+    "shortconv.out_proj.weight": QUANTIZED_TYPES | F32,
+}
+LFM2_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "token_embd_norm.weight": F32,
+}
+# The lfm2moe MoE blocks: sigmoid router with an expert bias, no shared
+# experts, dense FFNs only on the leading dense layers.
+LFM2MOE_TENSORS = {
+    "ffn_gate_inp.weight": F32,
+    "exp_probs_b.bias": F32,
+    "ffn_gate_exps.weight": QUANTIZED_TYPES,
+    "ffn_up_exps.weight": QUANTIZED_TYPES,
+    "ffn_down_exps.weight": QUANTIZED_TYPES,
+}
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
-    full_attention_interval-th layer is full attention, the others GDN."""
+    full_attention_interval-th qwen35 layer is full attention, the others
+    GDN; a llama is all attention, and an lfm2's per-layer KV head count
+    names its conv (0) and attention layers."""
     arch = text_architecture(metadata)
+    layers = loaded_layers(metadata, arch)
+    if arch == "llama":
+        tensors = dict(MODEL_TENSORS)
+        for layer in range(layers):
+            for name, types in (
+                LLAMA_LAYER_TENSORS | LLAMA_ATTENTION_TENSORS | DENSE_TENSORS
+            ).items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
+    if arch in ("lfm2", "lfm2moe"):
+        kv = metadata.values.get(arch + ".attention.head_count_kv")
+        if (
+            not isinstance(kv, list)
+            or len(kv) < layers
+            or not all(type(count) is int and count >= 0 for count in kv[:layers])
+        ):
+            raise ModelError(
+                "missing or invalid GGUF metadata: "
+                + arch
+                + ".attention.head_count_kv"
+            )
+        tensors = dict(LFM2_MODEL_TENSORS)
+        dense_layers = (
+            metadata.positive(arch + ".leading_dense_block_count")
+            if arch == "lfm2moe"
+            else layers
+        )
+        for layer in range(layers):
+            mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
+            ffn = (
+                DENSE_TENSORS
+                if layer < dense_layers
+                else LFM2MOE_TENSORS
+            )
+            for name, types in (LLAMA_LAYER_TENSORS | mixer | ffn).items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
     period = metadata.positive(arch + ".full_attention_interval")
     ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
-    for layer in range(loaded_layers(metadata, arch)):
+    for layer in range(layers):
         mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types

@@ -6,6 +6,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
+#include "metal/abi/GDN.h"
 #include "tuning/LinearNumerics.hpp"
 
 #include "NormReference.hpp"
@@ -380,6 +381,48 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
       double(hiddenInexact) / (uint64_t{tokens} * valueWidth);
   require(inexact <= 0.01, label + "gated output differs from the reference in " +
                                std::to_string(inexact * 100) + "% of values");
+
+  // The *_sums gate stores the same rows byte for byte and adds the
+  // out-projection's flat [row][64-group] input sums beside them, so the
+  // model runs no separate sums pass on the mixer output.
+  {
+    const uint32_t quantGroups = valueWidth / 64;
+    MetalBuffer gated =
+        shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden sums out");
+    MetalBuffer sums =
+        shared(backend, uint64_t{tokens} * quantGroups * 4, "gate sums");
+    splash::metal::ComputeDispatch gate;
+    gate.pipelineName = std::string("prefill_gdn_gate_sums") +
+                        (valueHeads == 32 ? "_vh32" : "") +
+                        (float32 ? "_f32" : "");
+    gate.buffers = {{0, buffers.recurrentRows},
+                    {1, buffers.packed},
+                    {2, buffers.mixerNorm.buffer},
+                    {3, gated},
+                    {4, sums}};
+    const GDNGatePrefillParams gateParams{0};
+    gate.bytes = {{5, &gateParams, sizeof(gateParams)}};
+    gate.threadgroups = {uint64_t{tokens} * valueHeads, 1, 1};
+    gate.threadsPerThreadgroup = {128, 1, 1};
+    (void)backend.submit(gate);
+    require(std::memcmp(gated.contents(), buffers.hidden.contents(),
+                        uint64_t{tokens} * valueWidth * 2) == 0,
+            label + "sums gate stored different rows");
+    const auto *gotSums = data<float>(sums);
+    const auto *gatedRows = data<uint16_t>(gated);
+    for (uint32_t token = 0; token < tokens; ++token) {
+      for (uint32_t group = 0; group < quantGroups; ++group) {
+        double expected = 0.0;
+        for (uint32_t k = 0; k < 64; ++k)
+          expected += fromBf16(
+              gatedRows[uint64_t{token} * valueWidth + group * 64 + k]);
+        const float got = gotSums[uint64_t{token} * quantGroups + group];
+        require(std::fabs(got - expected) <=
+                    1e-5 * std::max(1.0, std::fabs(expected)),
+                label + "gate sums differ from the rows' group sums");
+      }
+    }
+  }
 
   std::cout << label << "prepare " << prepareUlps << " ulps (max|err| "
             << worstPrepare.error << "), beta max|err| " << worstBeta.error

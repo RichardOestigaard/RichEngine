@@ -167,7 +167,7 @@ end
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
+    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 27")
     parser.add_argument(
         "--url", help="published tarball URL; defaults to GitHub Releases"
     )

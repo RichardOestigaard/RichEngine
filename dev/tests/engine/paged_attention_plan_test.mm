@@ -80,11 +80,25 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
           "prefill slot orientation cases omitted unequal axes, partial tiles or splits");
 }
 
+// The production GQA geometries as (query heads, KV heads) pairs. kv4 carries
+// two group sizes, each its own kernel family.
+constexpr std::array<std::array<uint32_t, 2>, 3> kGeometries{
+    {{24, 4}, {16, 4}, {16, 2}}};
+
+std::string geometrySuffix(uint32_t queryHeads, kv::Layout layout) {
+  return layout.kvHeads == 2    ? "_kv2_g8"
+         : queryHeads == 16     ? "_kv4_g4"
+                                : "";
+}
+
 void checkPlans(uint32_t queryHeads, kv::Layout layout) {
-  const std::string geometrySuffix = layout.kvHeads == 4 ? "" : "_kv2_g8";
+  const std::string geometrySuffix = ::geometrySuffix(queryHeads, layout);
   const std::array<uint32_t, 1> zeroHistory{};
-  const std::string prefillSplit = std::string(layout.format == kv::Format::Int8
-      ? "prefill_attention_q8_split" : "prefill_attention_bf16_split") + geometrySuffix;
+  const std::string prefillSplit = std::string(
+      layout.format == kv::Format::Int8      ? "prefill_attention_q8_split"
+      : layout.format == kv::Format::Int4    ? "prefill_attention_int4_split"
+                                             : "prefill_attention_bf16_split") +
+      geometrySuffix;
   const std::string prefillReduce = "prefill_attention_reduce" + geometrySuffix;
   checkPrefillSlotOrientation(queryHeads, layout);
   for (uint32_t rows = 1; rows <= 2048; ++rows) {
@@ -109,8 +123,11 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 bound.statisticsBytes >= plan.workspace.statisticsBytes,
             "prefill arena omitted a valid shorter plan");
   }
-  const std::string verifySplit = std::string(layout.format == kv::Format::Int8
-      ? "verify_attention_q8_split" : "verify_attention_bf16_split") + geometrySuffix;
+  const std::string verifySplit = std::string(
+      layout.format == kv::Format::Int8      ? "verify_attention_q8_split"
+      : layout.format == kv::Format::Int4    ? "verify_attention_int4_split"
+                                             : "verify_attention_bf16_split") +
+      geometrySuffix;
   const std::string verifyReduce = "verify_attention_reduce" + geometrySuffix;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
@@ -191,6 +208,55 @@ struct Case final {
 
   uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / 32]; }
 
+  static float packed4Code(uint8_t byte, uint32_t nibble) {
+    const int code = int(byte >> (nibble * 4)) & 0xF;
+    return float(code - (code & 0x8 ? 16 : 0));
+  }
+
+  // Raw stored codes and their fp32 scales, matching the GPU's fold order:
+  // dot of raw codes, then one multiply by the token scale.
+  float keyScale(uint32_t lane, uint32_t head, uint32_t token) const {
+    if (layout.format == kv::Format::BFloat16) return 1.0f;
+    const uint32_t id = page(lane, token);
+    return pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[
+        splash_kv_scale_element(head, token % 32)];
+  }
+
+  float valueScale(uint32_t lane, uint32_t head, uint32_t token) const {
+    if (layout.format == kv::Format::BFloat16) return 1.0f;
+    const uint32_t id = page(lane, token);
+    return pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[
+        splash_kv_scale_element(head, token % 32)];
+  }
+
+  float keyCode(uint32_t lane, uint32_t head, uint32_t token,
+                uint32_t dimension) const {
+    const uint32_t id = page(lane, token);
+    const uint64_t index = splash_kv_key_element(head, token % 32, dimension);
+    if (layout.format == kv::Format::BFloat16)
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+    if (layout.format == kv::Format::Int4)
+      return packed4Code(
+          pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[index / 2],
+          uint32_t(index & 1));
+    return float(pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+  }
+
+  float valueCode(uint32_t lane, uint32_t head, uint32_t token,
+                  uint32_t dimension) const {
+    const uint32_t id = page(lane, token);
+    const uint64_t index = splash_kv_value_element(head, token % 32, dimension);
+    if (layout.format == kv::Format::BFloat16)
+      return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+    if (layout.format == kv::Format::Int4) {
+      const uint64_t byte =
+          splash_kv_key_element(head, token % 32, dimension) / 2;
+      return packed4Code(
+          pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[byte], dimension & 1);
+    }
+    return float(pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+  }
+
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
     const uint32_t id = page(lane, token);
@@ -198,6 +264,10 @@ struct Case final {
     const uint64_t scale = splash_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[index]);
+    if (layout.format == kv::Format::Int4)
+      return packed4Code(pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[index / 2],
+                         uint32_t(index & 1)) *
+             pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[scale];
     return pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[index] *
            pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[scale];
   }
@@ -209,6 +279,15 @@ struct Case final {
     const uint64_t scale = splash_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[index]);
+    if (layout.format == kv::Format::Int4) {
+      // Values pack dim pairs at one token, token-major like the keys:
+      // byte [head][token][dim/2].
+      const uint64_t byte =
+          splash_kv_key_element(head, token % 32, dimension) / 2;
+      return packed4Code(pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[byte],
+                         dimension & 1) *
+             pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[scale];
+    }
     return pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[index] *
            pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[scale];
   }
@@ -267,25 +346,57 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
       const uint32_t id = data.page(lane, token);
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
         const uint64_t slot = splash_kv_scale_element(head, token % 32);
-        if (layout.format == kv::Format::Int8) {
+        if (layout.format == kv::Format::Int4) {
+          // INT4 codes are 16x smaller than INT8's; a realistic scale keeps
+          // decoded magnitudes comparable so output rounding noise is too.
+          data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.096f;
+          data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.112f;
+        } else if (layout.format == kv::Format::Int8) {
           data.pool.slab<float>(kLayer, SPLASH_KV_KEY_SCALES, id)[slot] = 0.006f;
           data.pool.slab<float>(kLayer, SPLASH_KV_VALUE_SCALES, id)[slot] = 0.007f;
         }
-        for (uint32_t dimension = 0; dimension < 256; ++dimension) {
-          const int key = int((token * 37 + head * 101 + dimension * 17 +
-                               token * dimension * 3 + lane * 7) % 255) - 127;
-          const int value = int((token * 53 + head * 79 + dimension * 29 +
-                                 token * dimension * 5 + lane * 19) % 255) - 127;
-          const uint64_t keyIndex = splash_kv_key_element(head, token % 32, dimension);
-          const uint64_t valueIndex = splash_kv_value_element(head, token % 32, dimension);
-          if (layout.format == kv::Format::Int8) {
-            data.pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = key;
-            data.pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = value;
-          } else {
-            data.pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] =
-                floatToBf16(key * 0.006f);
-            data.pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] =
-                floatToBf16(value * 0.007f);
+        for (uint32_t dimension = 0; dimension < 256; dimension += 2) {
+          const auto keyCode = [&](uint32_t d) {
+            return layout.format == kv::Format::Int4
+                       ? int((token * 37 + head * 101 + d * 17 + token * d * 3 +
+                              lane * 7) % 15) - 7
+                       : int((token * 37 + head * 101 + d * 17 + token * d * 3 +
+                              lane * 7) % 255) - 127;
+          };
+          const auto valueCode = [&](uint32_t d) {
+            return layout.format == kv::Format::Int4
+                       ? int((token * 53 + head * 79 + d * 29 + token * d * 5 +
+                              lane * 19) % 15) - 7
+                       : int((token * 53 + head * 79 + d * 29 + token * d * 5 +
+                              lane * 19) % 255) - 127;
+          };
+          if (layout.format == kv::Format::Int4) {
+            const uint64_t keyByte =
+                splash_kv_key_element(head, token % 32, dimension) / 2;
+            const uint64_t valueByte =
+                splash_kv_key_element(head, token % 32, dimension) / 2;
+            data.pool.slab<uint8_t>(kLayer, SPLASH_KV_KEYS, id)[keyByte] =
+                uint8_t((keyCode(dimension) & 0xF) |
+                        (keyCode(dimension + 1) & 0xF) << 4);
+            data.pool.slab<uint8_t>(kLayer, SPLASH_KV_VALUES, id)[valueByte] =
+                uint8_t((valueCode(dimension) & 0xF) |
+                        (valueCode(dimension + 1) & 0xF) << 4);
+            continue;
+          }
+          for (const uint32_t d : {dimension, dimension + 1}) {
+            const int key = keyCode(d);
+            const int value = valueCode(d);
+            const uint64_t keyIndex = splash_kv_key_element(head, token % 32, d);
+            const uint64_t valueIndex = splash_kv_value_element(head, token % 32, d);
+            if (layout.format == kv::Format::Int8) {
+              data.pool.slab<int8_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] = key;
+              data.pool.slab<int8_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] = value;
+            } else {
+              data.pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[keyIndex] =
+                  floatToBf16(key * 0.006f);
+              data.pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[valueIndex] =
+                  floatToBf16(value * 0.007f);
+            }
           }
         }
       }
@@ -321,6 +432,9 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
 void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
   double dot = 0, actualSquared = 0, expectedSquared = 0;
   float maximumError = 0;
+  double signedError = 0;
+  uint64_t count = 0;
+  uint32_t worstRow = 0, worstHead = 0, worstDim = 0;
   std::vector<uint32_t> selectedRows{0, std::min(7U, data.rows - 1),
                                      data.rows / 2, data.rows - 1};
   std::sort(selectedRows.begin(), selectedRows.end());
@@ -337,8 +451,8 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
           for (uint32_t dimension = 0; dimension < 256; ++dimension)
             score += bf16ToFloat(static_cast<const uint16_t *>(data.queries.contents())[
                               data.queryIndex(lane, head, row, dimension)]) *
-                     data.key(lane, kvHead, token, dimension);
-          scores[token] = score * 0.0625f;
+                     data.keyCode(lane, kvHead, token, dimension);
+          scores[token] = score * data.keyScale(lane, kvHead, token) * 0.0625f;
           maximum = std::max(maximum, scores[token]);
         }
         float denominator = 0;
@@ -349,11 +463,17 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
         for (uint32_t dimension = 0; dimension < 256; ++dimension) {
           float expected = 0;
           for (uint32_t token = 0; token < tokens; ++token)
-            expected += scores[token] * data.value(lane, kvHead, token, dimension);
+            expected += scores[token] * data.valueScale(lane, kvHead, token) *
+                        data.valueCode(lane, kvHead, token, dimension);
           expected /= denominator;
           const float value = bf16ToFloat(actual[data.queryIndex(lane, head, row, dimension)]);
           require(std::isfinite(value), "attention output is nonfinite");
-          maximumError = std::max(maximumError, std::abs(value - expected));
+          const float error = std::abs(value - expected);
+          if (error > maximumError)
+            worstRow = row, worstHead = head, worstDim = dimension;
+          maximumError = std::max(maximumError, error);
+          signedError += value - expected;
+          ++count;
           dot += value * expected;
           actualSquared += value * value;
           expectedSquared += expected * expected;
@@ -362,12 +482,22 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
     }
   }
   const double cosine = dot / std::sqrt(actualSquared * expectedSquared);
-  if (!(maximumError < 0.02f && cosine > 0.9995))
+  // INT4's prob-times-scale fold lands bf16 steps 16x coarser than INT8's at
+  // the same decoded magnitudes, so its oracle cosine is inherently lower;
+  // errors stay unbiased and near zero (meanSigned ~0).
+  const double bound = data.layout.format == kv::Format::Int4 ? 0.998 : 0.9995;
+  if (!(maximumError < 0.02f && cosine > bound)) {
+    std::cerr << "oracle debug: history=" << data.stores[0].committed_tokens
+              << " rows=" << data.rows << " maxErr=" << maximumError
+              << " cosine=" << cosine << " meanSigned=" << signedError / count
+              << " worst: row=" << worstRow << " head=" << worstHead
+              << " dim=" << worstDim << '\n';
     throw std::runtime_error(
         "attention candidate failed scalar KV oracle: history=" +
         std::to_string(data.stores[0].committed_tokens) + " rows=" +
         std::to_string(data.rows) + " maximum_absolute_error=" +
         std::to_string(maximumError) + " cosine=" + std::to_string(cosine));
+  }
 }
 
 void checkEquivalent(const Case &data, const std::vector<uint16_t> &baseline,
@@ -438,9 +568,119 @@ void checkBf16Store(const Case &data, const std::vector<std::vector<std::byte>> 
   }
 }
 
+// The packed-INT4 store computed independently: each stored row's symmetric
+// [-7, 7] codes, fp32 scale and nibble placement, over the current extents.
+std::vector<std::vector<std::byte>> expectedInt4Store(const Case &data) {
+  std::vector<std::vector<std::byte>> result;
+  for (uint32_t extent = 0; extent < data.pool.extentCount(); ++extent) {
+    const auto bytes = data.pool.bytes(extent);
+    result.emplace_back(bytes.begin(), bytes.end());
+  }
+  for (unsigned tensor = 0; tensor < 2; ++tensor) {
+    const auto *source = static_cast<const uint16_t *>(
+        (tensor ? data.values : data.keys).contents());
+    for (uint32_t lane = 0; lane < data.lanes; ++lane) {
+      for (uint32_t row = 0; row < data.stores[lane].chunk_tokens; ++row) {
+        const uint32_t token = data.stores[lane].committed_tokens + row;
+        const uint32_t id = data.page(lane, token);
+        const uint32_t extent = id / data.pool.extentPages();
+        for (uint32_t head = 0; head < data.layout.kvHeads; ++head) {
+          const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) *
+                                data.stride * 256;
+          const auto element = [&](uint32_t d) {
+            return bf16ToFloat(
+                source[base + (tensor ? d * data.stride + row : row * 256 + d)]);
+          };
+          float maximum = 0;
+          for (uint32_t d = 0; d < 256; ++d)
+            maximum = std::max(maximum, std::abs(element(d)));
+          const float scale = maximum == 0.0f ? 0.0f : maximum / 7.0f;
+          const auto code = [&](uint32_t d) {
+            return maximum == 0.0f
+                       ? 0
+                       : std::clamp(int(std::rint(element(d) * 7.0f / maximum)),
+                                    -7, 7);
+          };
+          const uint64_t scaleIndex = splash_kv_scale_element(head, token % 32);
+          const auto *scalePage = data.pool.slab<float>(
+              kLayer, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, id);
+          const auto scaleOffset =
+              reinterpret_cast<const std::byte *>(scalePage + scaleIndex) -
+              data.pool.bytes(extent).data();
+          std::memcpy(result[extent].data() + scaleOffset, &scale, sizeof(float));
+          for (uint32_t d = 0; d < 256; d += 2) {
+            const uint64_t element =
+                splash_kv_key_element(head, token % 32, d) / 2;
+            const auto *page = data.pool.slab<uint8_t>(
+                kLayer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, id);
+            const auto offset =
+                reinterpret_cast<const std::byte *>(page + element) -
+                data.pool.bytes(extent).data();
+            result[extent][offset] = std::byte(
+                uint8_t((code(d) & 0xF) | (code(d + 1) & 0xF) << 4));
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+void checkInt4Store(const Case &data,
+                    const std::vector<std::vector<std::byte>> &expected) {
+  // Byte-exact except inside stored slots: the GPU may evaluate the
+  // quantization arithmetic one ulp differently, so a stored code may sit
+  // one nibble step away and a stored scale one ulp away. Zero-expected
+  // bytes are outside every stored slot and must stay zero.
+  uint64_t near = 0;
+  const uint64_t db = data.layout.dataBytesPerLayerPage();
+  const uint64_t sb = data.layout.scaleBytesPerLayerPage();
+  const uint64_t ep = data.pool.extentPages();
+  const uint64_t layerRegion = ep * 2 * (db + sb);
+  const auto isScale = [&](size_t i) {
+    const uint64_t local = i % layerRegion;
+    return (local >= ep * db && local < ep * (db + sb)) ||
+           local >= ep * (2 * db + sb);
+  };
+  for (uint32_t extent = 0; extent < data.pool.extentCount(); ++extent) {
+    const auto bytes = data.pool.bytes(extent);
+    const auto &want = expected[extent];
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      if (bytes[i] == want[i])
+        continue;
+      if (isScale(i)) {
+        const size_t base = i & ~size_t{3};
+        float actualScale, expectedScale;
+        std::memcpy(&actualScale, bytes.data() + base, sizeof(float));
+        std::memcpy(&expectedScale, want.data() + base, sizeof(float));
+        require(std::abs(actualScale - expectedScale) <=
+                    std::nextafterf(expectedScale, INFINITY) - expectedScale,
+                "INT4 store scale differs by more than an ulp");
+        continue;
+      }
+      const auto nibble = [](uint8_t byte, uint shift) {
+        const int code = int(byte >> shift) & 0xF;
+        return code - (code & 0x8 ? 16 : 0);
+      };
+      const uint8_t actual = uint8_t(bytes[i]), target = uint8_t(want[i]);
+      if (!(std::abs(nibble(actual, 0) - nibble(target, 0)) <= 1 &&
+            std::abs(nibble(actual, 4) - nibble(target, 4)) <= 1)) {
+        std::cerr << "INT4 store code mismatch: extent=" << extent << " byte=" << i
+                  << " actual=0x" << std::hex << int(actual) << " expected=0x"
+                  << int(target) << std::dec << '\n';
+        require(false,
+                "INT4 store code differs by more than one quantization step");
+      }
+      ++near;
+    }
+  }
+  require(near <= data.lanes * data.rows * data.layout.kvHeads,
+          "INT4 store quantization differs everywhere");
+}
+
 void checkBf16StoreEdges(metal::MetalBackend &backend) {
-  for (uint32_t heads : {16U, 24U}) {
-    auto data = makeCase(backend, heads, {1, heads == 24 ? 4U : 2U, 256,
+  for (const auto &[heads, kvHeads] : kGeometries) {
+    auto data = makeCase(backend, heads, {1, kvHeads, 256,
                                          kv::Format::BFloat16}, 1, 33, 31, false);
     // Signed zero, subnormals, large finite values, infinities and NaN payloads.
     constexpr std::array<uint16_t, 12> bits{0, 0x8000, 1, 0x8001, 0x007f, 0x0080,
@@ -493,7 +733,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
                                       data.stores[0], plan);
     } else {
       ops::PagedVerifyBuffers buffers{data.keys, data.values, data.queries,
-                                      partialBuffer, statisticsBuffer, output, data.tables};
+                                      partialBuffer, statisticsBuffer, output, data.tables, {}};
       ops::PagedAttention::addVerify(graph, data.layer, buffers,
                                      std::span(data.stores).first(plan.lanes), plan);
     }
@@ -557,11 +797,13 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
   }
-  const auto expected = data.layout.format == kv::Format::BFloat16
-                            ? expectedBf16Store(data)
-                            : std::vector<std::vector<std::byte>>{};
+  const auto expected =
+      data.layout.format == kv::Format::BFloat16 ? expectedBf16Store(data)
+      : data.layout.format == kv::Format::Int4   ? expectedInt4Store(data)
+                                                 : std::vector<std::vector<std::byte>>{};
   (void)backend.submitCommand(graph.dispatches());
   if (data.layout.format == kv::Format::BFloat16) checkBf16Store(data, expected);
+  if (data.layout.format == kv::Format::Int4) checkInt4Store(data, expected);
   for (size_t i = 0; i < sizes.size(); ++i) {
     const auto *bytes = static_cast<const uint8_t *>(backing[i].contents());
     for (uint64_t byte = 0; byte < guardBytes; ++byte)
@@ -739,9 +981,9 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
 int main(int argc, char **argv) {
   try {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
-    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-      for (uint32_t heads : {24U, 16U})
-        checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
+    for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
+      for (const auto &[heads, kvHeads] : kGeometries)
+        checkPlans(heads, {1, kvHeads, 256, format});
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
@@ -749,16 +991,16 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkBf16StoreEdges(backend);
     // The prepare kernels do not depend on the KV format.
-    for (uint32_t heads : {24U, 16U})
+    for (const auto &[heads, kvHeads] : kGeometries)
       for (bool float32 : {false, true})
         for (bool verify : {false, true})
-          checkProjection(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8}, float32,
+          checkProjection(backend, heads, {1, kvHeads, 256, kv::Format::Int8}, float32,
                           verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
-      for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-        for (uint32_t heads : {24U, 16U})
+      for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
+        for (const auto &[heads, kvHeads] : kGeometries)
           for (uint32_t history : {131072U, 260096U}) {
-            const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
+            const kv::Layout layout{1, kvHeads, 256, format};
             auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
             checkReference(prefill, run<Phase::Prefill>(backend, prefill, true));
             auto verify = makeCase(backend, heads, layout, 4, 8, history, true);
@@ -770,9 +1012,9 @@ int main(int argc, char **argv) {
       return 0;
     }
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
-    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-    for (uint32_t heads : {24U, 16U}) {
-      const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
+    for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
+    for (const auto &[heads, kvHeads] : kGeometries) {
+      const kv::Layout layout{1, kvHeads, 256, format};
       for (const auto [history, rows] :
            std::array<std::array<uint32_t, 2>, 10>{{{0, 1}, {33, 7}, {255, 17},
                                                   {1023, 8}, {0, 2048},

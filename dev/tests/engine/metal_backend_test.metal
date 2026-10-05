@@ -20,6 +20,19 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
+struct TestFillParams {
+    uint value;
+    uint count;
+};
+
+kernel void test_fill_u32(device uint *destination [[buffer(0)]],
+                          constant TestFillParams &params [[buffer(1)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid < params.count) {
+        destination[gid] = params.value;
+    }
+}
+
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],

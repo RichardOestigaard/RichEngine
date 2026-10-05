@@ -85,10 +85,13 @@ void requireReachesModelLoader(RuntimeResourcesConfig config,
 // state and the KV runway.
 uint64_t minimumBytes(const RuntimeResourcesConfig &config,
                       const TemporaryModelRoot &root) {
+  // The engine sizes the runway at the config's format, not the package's.
+  kv::Layout kvLayout = config.model.targetKvLayout;
+  kvLayout.format = config.kvFormat;
   return minimumRequiredBytes(root.packageBytes + model::kPipelineReserveBytes +
                                   model::kRuntimeOverheadReserveBytes,
                               config.model.stateLayout.laneBytes(),
-                              config.model.targetKvLayout)
+                              kvLayout)
       .value();
 }
 
@@ -294,7 +297,8 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   target.actualAllocatedBytes = 1;
   target.manifestFingerprintSha256 = "target";
   package.target = std::move(target);
-  package.draft.actualAllocatedBytes = 1;
+  std::visit([](auto &draft) { draft.actualAllocatedBytes = 1; },
+             package.draft);
   package.manifestFingerprintSha256 = "package";
   bool rejected = false;
   try {

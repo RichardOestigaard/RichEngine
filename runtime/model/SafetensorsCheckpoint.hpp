@@ -23,6 +23,10 @@ public:
   void requireConfigString(std::string_view key, std::string_view expected,
                            std::string_view legacyKey = {}) const;
   void requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const;
+  // The layer_types array of a mask-typed hybrid (LFM2): `attention` at the
+  // mask's bits, `other` at the rest.
+  void requireLayerTypeMask(uint32_t layers, uint64_t attentionMask,
+                          std::string_view attention, std::string_view other) const;
   void checkUnchanged() const;
 private:
   struct Impl;

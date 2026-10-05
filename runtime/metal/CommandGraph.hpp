@@ -4,9 +4,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -47,6 +49,49 @@ public:
                               payloads_.back().data(), sizeof(Params)});
   }
 
+  // Like add(), but marks the dispatch's parameter payload as changing
+  // between submissions: a baked span containing it replays with the
+  // payload rewritten in place rather than re-baking (see
+  // ComputeDispatch::patchableBytes). SPLASH_PATCHABLE_OFF makes the
+  // dispatch non-bakeable instead — the pre-patchable behavior of a
+  // suspension — for A/B measurement.
+  template <class Params>
+  void addPatchable(std::string pipeline, std::vector<MetalBuffer> buffers,
+                    const Params &params, DispatchSize groups,
+                    DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    static const bool disabled =
+        std::getenv("SPLASH_PATCHABLE_OFF") != nullptr;
+    if (disabled) {
+      dispatches_.back().bakeable = false;
+    } else {
+      dispatches_.back().patchableBytes = true;
+    }
+  }
+
+  // Marks the dispatches added between the calls as one replayable span.
+  // Every buffer binding, parameter payload and geometry of the span must be
+  // identical on each submission that reuses it; the backend revalidates and
+  // falls back to direct encoding when it is not. The exception is a
+  // dispatch added through addPatchable(): its payload may change and is
+  // rewritten into the span's staged parameters on every replay. Spans nest
+  // (an inner begin/end pair leaves the outer span open).
+  void beginBakedSpan() { ++bakedSpanDepth_; }
+  void endBakedSpan() {
+    if (!bakedSpanDepth_)
+      throw std::logic_error("CommandGraph baked span was not open");
+    --bakedSpanDepth_;
+  }
+  // Excludes dispatches from any enclosing span — spans nest, so ending an
+  // inner span cannot remove dispatches from an outer one; a suspension
+  // leaves them out of every span. Nests like the spans.
+  void suspendBakedSpan() { ++bakedSpanSuspend_; }
+  void resumeBakedSpan() {
+    if (!bakedSpanSuspend_)
+      throw std::logic_error("CommandGraph baked span was not suspended");
+    --bakedSpanSuspend_;
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
     return dispatches_;
@@ -59,6 +104,7 @@ private:
     dispatch.pipelineName = std::move(pipeline);
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
+    dispatch.bakeable = bakedSpanDepth_ > 0 && !bakedSpanSuspend_;
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
@@ -67,6 +113,8 @@ private:
     return dispatches_.back();
   }
 
+  uint32_t bakedSpanDepth_ = 0;
+  uint32_t bakedSpanSuspend_ = 0;
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
 };

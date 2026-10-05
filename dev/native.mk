@@ -94,6 +94,8 @@ TEST_Q8_METAL_TEST := $(ENGINE_TEST_BUILD)/q8-paged-kv-metal
 TEST_Q8_STORAGE_TEST := $(ENGINE_TEST_BUILD)/q8-page-storage
 TEST_Q8_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/q8-flash-attention
 TEST_Q8_PREFILL_TEST := $(ENGINE_TEST_BUILD)/q8-chunked-prefill
+TEST_FP8_METAL_TEST := $(ENGINE_TEST_BUILD)/fp8-paged-kv-metal
+TEST_FP8_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/fp8-flash-attention
 TEST_Q4_SGMATRIX_TEST := $(ENGINE_TEST_BUILD)/q4-sgmatrix
 TEST_Q4_BATCH_TEST := $(ENGINE_TEST_BUILD)/q4-batched-projection
 TEST_Q4_PREFILL_TEST := $(ENGINE_TEST_BUILD)/q4-prefill-projection
@@ -121,19 +123,37 @@ TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
+TEST_MTL4_BENCHMARK := $(ENGINE_TEST_BUILD)/mtl4-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_AFFINE_SOURCE_ORACLE := $(ENGINE_TEST_BUILD)/affine-source-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
+# Prototype only: the per-simdgroup cooperative-tensor attention tile has its
+# own library and test so the production path never links it.
+TEST_MPP_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention
+TEST_MPP_ATTENTION_AIR := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention.air
+TEST_MPP_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
 TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/prefill/paged_attention.metal \
 	runtime/metal/kernels/decode/paged_attention.metal \
 	runtime/metal/kernels/prefill/paged_attention_store.metal \
-	runtime/metal/kernels/decode/paged_attention_store.metal
+	runtime/metal/kernels/decode/paged_attention_store.metal \
+	runtime/metal/kernels/decode/attention_qkv.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
+TEST_FP8_AIR := $(ENGINE_TEST_BUILD)/fp8-paged-kv.air
+TEST_FP8_LIB := $(ENGINE_TEST_BUILD)/fp8-paged-kv.metallib
+# The fp8 tier's split and store kernels; the fp8 attention test also links
+# the shared reduce and q8 splits for its read-path comparison.
+TEST_FP8_KERNEL_SOURCES := \
+	runtime/metal/kernels/decode/fp8_attention.metal \
+	runtime/metal/kernels/prefill/fp8_attention.metal \
+	runtime/metal/kernels/decode/fp8_attention_store.metal \
+	runtime/metal/kernels/prefill/fp8_attention_store.metal
+TEST_FP8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_FP8_KERNEL_SOURCES))
+TEST_FP8_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/fp8-attention.metallib
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.
 TEST_RESIDENCY_AIR := $(ENGINE_TEST_BUILD)/kernels/shared/residency.air
@@ -192,6 +212,8 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_Q8_STORAGE_TEST) \
 	$(TEST_Q8_ATTENTION_TEST) \
 	$(TEST_Q8_PREFILL_TEST) \
+	$(TEST_FP8_METAL_TEST) \
+	$(TEST_FP8_ATTENTION_TEST) \
 	$(TEST_Q4_BATCH_TEST) \
 	$(TEST_Q4_PREFILL_TEST) \
 	$(TEST_MOE_METAL_TEST) \
@@ -203,6 +225,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
+	$(TEST_FP8_LIB) $(TEST_FP8_ATTENTION_LIB) \
 	$(TEST_GGUF_DEQUANT_LIB)
 
 # Keep every output that uses a flag set together, including standalone
@@ -211,8 +234,10 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
-	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR)
+	$(TEST_MTL4_BENCHMARK) \
+	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
+	$(TEST_GGUF_DEQUANT_AIR) \
+	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS) $(WEIGHT_DIGESTS)
@@ -390,8 +415,53 @@ $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_MPP_ATTENTION_AIR): dev/tests/engine/mpp_simdgroup_attention_test.metal \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
+
+$(TEST_MPP_ATTENTION_LIB): $(TEST_MPP_ATTENTION_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_MPP_ATTENTION_TEST): dev/tests/engine/mpp_simdgroup_attention_test.mm \
+		$(TEST_MPP_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+# The prototype check runs on demand only; it is not part of test-engine-metal.
+.PHONY: test-mpp-attention
+test-mpp-attention: $(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_LIB) $(MPP_ATTENTION_ARGS)
+
+.PHONY: test-q8-attention
+test-q8-attention: $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
+
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_FP8_AIR): dev/tests/engine/fp8_page_format_oracle.metal \
+		runtime/metal/abi/ExecutionGeometry.h | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
+
+$(TEST_FP8_LIB): $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+# The fp8 kernels plus the two attention translation units that carry the
+# shared reduce and the q8 splits the fp8 benchmark compares against.
+$(TEST_FP8_ATTENTION_LIB): $(TEST_FP8_KERNEL_AIRS) \
+		$(ENGINE_TEST_BUILD)/kernels/decode/paged_attention.air \
+		$(ENGINE_TEST_BUILD)/kernels/prefill/paged_attention.air \
+		$(TEST_RESIDENCY_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_FP8_METAL_TEST): dev/tests/engine/fp8_paged_kv_metal_test.mm | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_FP8_ATTENTION_TEST): dev/tests/engine/fp8_flash_attention_metal_test.mm \
+		$(ENGINE_LIBRARY) $(TEST_FP8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -592,6 +662,12 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_MTL4_BENCHMARK): dev/benchmarks/mtl4_benchmark.mm \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 .PHONY: verify-build-identity
 verify-build-identity: $(TARGET) $(BUILD_ID_HEADER) $(BUILD_ID_STAMP)
 	$(BUILD_ID_PYTHON) $(BUILD_ID_SCRIPT) check --root . \
@@ -665,6 +741,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_Q8_STORAGE_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q8_PREFILL_TEST) $(TEST_Q8_ATTENTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_FP8_METAL_TEST) $(TEST_FP8_LIB)
+	$(METAL_TEST_ENV) $(TEST_FP8_ATTENTION_TEST) $(TEST_FP8_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q4_BATCH_TEST) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_Q4_PREFILL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_Q4_SGMATRIX_TEST) $(TEST_PRODUCTION_LIB)
@@ -733,6 +811,14 @@ benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"
+
+# Metal 3 against Metal 4 submission encode cost on a decode-shaped graph of
+# small dispatches; MTL4_BENCHMARK_ARGS passes [dispatches] [rounds].
+.PHONY: benchmark-mtl4
+benchmark-mtl4: $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB)
+	$(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB) $(MTL4_BENCHMARK_ARGS)
+	SPLASH_MTL4=1 $(TEST_MTL4_BENCHMARK) $(TEST_METAL_BACKEND_LIB) \
+		$(MTL4_BENCHMARK_ARGS)
 
 # CPU tests that also run under the sanitizers: each is built three times
 # from the same sources.

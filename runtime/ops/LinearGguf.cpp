@@ -6,6 +6,7 @@
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,59 @@ std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
 std::string prefillKernel(const char *format, char epilogue) {
   return std::string("gguf_prefill_") + format + "_" + epilogue;
 }
+
+// The kernel token of a segment's format, and whether the runtime-format
+// kernels take their `_n` variant. On Apple GPU family 10 and up MXFP4
+// decodes on the Metal 4.1 packed FP4-E2M1 path (the `n` kernels; earlier
+// families never create their pipelines, whose AIR would not lower there).
+const char *kernelFormat(uint32_t appleGpuFamily, const QuantizedSegment &s) {
+  return appleGpuFamily >= 10 && s.formatId == GGUF_FMT_MXFP4 ? "mxfp4n" : s.name();
+}
+// Decode tiles on Apple GPU family 10 and up feed MXFP4 to the Metal 4.1
+// multiplane matmul (gguf_decode_mxfp4m_* in shared/gguf_linear.metal)
+// instead of dequantizing it. The tile restages the shared activations per
+// group, a cost per lane linear in the tile's rows, so it wins the 8- and
+// 16-row tiles and loses the 32-row one to the staged decode at every split
+// (mxfp4 5120 x 8192 on a 20-core M5 Pro, best split, ms: 8 rows 0.19 vs
+// 0.25 staged; 16 rows 0.23 vs 0.32; 32 rows 0.41 vs 0.34 — kMxfp4Tiers
+// picks the splits it wins by).
+// The formats with a packed-operand decode kernel (`<f>m`, the
+// gguf_decode_packed instantiations of shared/gguf_linear.metal) on Apple
+// GPU family 10 and up. Measured 2.5-4x slower than the staged decode at
+// every row count and split (see the tile's comment in
+// kernels/common/gguf_mxfp4_tile.h), so decodeFormat keeps them for
+// benchmarks only: SPLASH_GGUF_PACKED_ON selects them.
+const char *packedFormat(uint32_t formatId) noexcept {
+  switch (formatId) {
+  case GGUF_FMT_Q40: return "q40m";
+  case GGUF_FMT_Q41: return "q41m";
+  case GGUF_FMT_Q4K: return "q4km";
+  case GGUF_FMT_Q80: return "q80m";
+  case GGUF_FMT_PQ20: return "pq20m";
+  default: return nullptr;
+  }
+}
+bool packedDecodeEnabled() {
+  static const bool on = std::getenv("SPLASH_GGUF_PACKED_ON") != nullptr;
+  return on;
+}
+const char *decodeFormat(uint32_t appleGpuFamily, const QuantizedSegment &s, uint32_t rows) {
+  if (appleGpuFamily < 10) return kernelFormat(appleGpuFamily, s);
+  if (s.formatId == GGUF_FMT_MXFP4 && rows <= 16) return "mxfp4m";
+  // Unlike MXFP4 a packed format decodes on its tile at every tile height: a
+  // lane's rows must equal the one-lane projection bitwise, which only holds
+  // within one decode path.
+  if (packedDecodeEnabled())
+    if (const char *packed = packedFormat(s.formatId)) return packed;
+  return kernelFormat(appleGpuFamily, s);
+}
+// Whether a format has a native-operand decode tile in dispatch
+// (decodeFormat), whose split demand is the MXFP4 tile's rather than the
+// staged tile's.
+bool nativeDecodeFormat(uint32_t formatId) noexcept {
+  return formatId == GGUF_FMT_MXFP4 || (packedDecodeEnabled() && packedFormat(formatId));
+}
+const char *nativeSuffix(uint32_t appleGpuFamily) { return appleGpuFamily >= 10 ? "_n" : ""; }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
@@ -73,6 +127,12 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 // 15-us shape (the register tiers in threads per core: 6.6%; the previous 32
 // per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
+
+// The MXFP4 multiplane tile wants more partitions than the staged tile: at
+// the staged tiers' two splits it ties or loses; from four to eight it pulls
+// ahead (see decodeFormat). Applied to any decode projection that holds an
+// MXFP4 segment.
+constexpr SplitTier kMxfp4Tiers[] = {{24, 256}};
 
 // The staged tile's tiers on a family. Apple9 cores take as many of its
 // threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
@@ -237,10 +297,21 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows
   // and one counter per 64-column tile (a tile covers every row of the
   // dispatch). The prefill tile never splits.
-  return config_.splits > 1
-      ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
-                          uint64_t{n / tileColumns()} * sizeof(uint32_t)}
-      : LinearScratchSize{};
+  LinearScratchSize size =
+      config_.splits > 1
+          ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
+                              uint64_t{n / tileColumns()} * sizeof(uint32_t)}
+          : LinearScratchSize{};
+  // A prefill plan that may pack its activations (packsActivations): the
+  // slot-permuted fp16 plane goes in scratch.input and its per-(row, group)
+  // exponent bytes in scratch.sums (kernels/common/gguf_mxfp4p_tile.h's
+  // layout). Chunk rows never exceed the tile's storage rows.
+  if (packs_) {
+    const uint64_t rows = storageRows();
+    size.input = rows * k * sizeof(uint16_t);
+    size.sums = rows * (k / 32);
+  }
+  return size;
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
@@ -262,13 +333,32 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  bool native = false;
+  for (const Projection *p : projections) {
+    if (!p) continue;
+    for (const QuantizedSegment &s : p->blocks().segments) native |= nativeDecodeFormat(s.formatId);
+  }
+  return {.tile = LinearTile::GgufStaged,
+          .splits = decodeSplits(n, k, gpuCores_,
+                                 native && appleGpuFamily_ >= 10 ? std::span(kMxfp4Tiers)
+                                                                 : stagedTiers(appleGpuFamily_))};
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  // A decode plan packs its activations when a projection is MXFP4
+  // (packsDecode): reserve the slot-permuted fp16 plane and the per-(row,
+  // group) exponent bytes unconditionally, the segments being unknown here.
+  if (appleGpuFamily_ >= 10 && w.phase == LinearPhase::Decode &&
+      w.weightLayout == WeightLayout::Block32) {
+    const uint64_t rows = stagedTileRows(w.rows);
+    LinearScratchSize packed{};
+    packed.input = rows * k * sizeof(uint16_t);
+    packed.sums = rows * (k / 32);
+    size.include(packed);
+  }
   return size;
 }
 
@@ -344,19 +434,78 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   // One partition never touches the partials and counters: the output stands in.
   const metal::MetalBuffer partials = splits > 1 ? b.scratch.partials : b.output;
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
+  // Any MXFP4 segment lets the plan pack activations (packsDecode, or the
+  // env-gated packsPrefill): the pre-packed multiplane tiles then take the
+  // single-tensor decode of every MXFP4 segment (0.11-0.14 ms vs the staged
+  // multiplane's 0.19-0.40 and staged's 0.28-0.35 at 5120 x 8192, any tile
+  // height). Fused segments keep mxfp4m: their kernel binds the raw bf16
+  // input and stages inside.
+  const bool packs =
+      plan.packsActivations() && appleGpuFamily_ >= 10 &&
+      std::any_of(segments.begin(), segments.end(),
+                  [](const QuantizedSegment &s) { return s.formatId == GGUF_FMT_MXFP4; });
+  // Decode tiles take the multiplane path; prefill chunks' other segments
+  // keep the staged decode, and the test compares their outputs against the
+  // 128-row prefill tile's.
+  const auto format = [&](const QuantizedSegment &s) {
+    if (w.phase == LinearPhase::Decode) {
+      if (packs && s.formatId == GGUF_FMT_MXFP4) return "mxfp4p";
+      return decodeFormat(appleGpuFamily_, s, rows);
+    }
+    return kernelFormat(appleGpuFamily_, s);
+  };
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
-              {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
+    const bool packed = std::strcmp(format(s), "mxfp4p") == 0;
+    graph.add(kernelInstance(decodeKernel(format(s), rows, epilogue), plan.destination()),
+              {packed ? b.scratch.input : b.input, s.plane0,
+               packed ? b.scratch.sums : s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
-    for (const QuantizedSegment &s : segments)
-      tensor(s, epilogueSuffix(w.epilogue), b.output, epilogueInput(b, w.epilogue));
+    // A chunk's MXFP4 segments run the pre-packed multiplane decode tiles
+    // (gguf_decode_mxfp4p_*, shared/gguf_mxfp4p.metal): gguf_pack_half packs
+    // the chunk's rows once into the scratch fp16 plane and exponent bytes,
+    // which every MXFP4 segment's dispatch then reads. Equal to the prefill
+    // tile's outputs because both compute the same packed path.
+    const char epilogue = epilogueSuffix(w.epilogue);
+    const metal::MetalBuffer &aux = epilogueInput(b, w.epilogue);
+    // A producer that emitted the packed operand already (plan.input() ==
+    // LinearInput::Packed: the norm, the GDN and attention-gate variants)
+    // leaves the planes in the same scratch slots, so no dispatch is needed.
+    const bool prePacked =
+        b.prepared.layout == LinearInput::Packed && b.prepared.source.sameView(b.input);
+    if (packs && !prePacked)
+      graph.add("gguf_pack_half",
+                {b.input, b.scratch.input, b.scratch.sums,
+                 b.input, b.input, b.input, b.input, b.input},
+                GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
+    for (const QuantizedSegment &s : segments) {
+      if (packs && s.formatId == GGUF_FMT_MXFP4) {
+        graph.add(decodeKernel("mxfp4p", rows, epilogue),
+                  {b.scratch.input, s.plane0, b.scratch.sums, s.meta, b.output, partials, counters, aux},
+                  GgufDecodeParams{k, splits, n, s.columnOffset},
+                  {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+      } else {
+        tensor(s, epilogue, b.output, aux);
+      }
+    }
     return;
   }
   if (segments.size() == 1) {
+    // One pack covers every MXFP4 tensor of the projection (and its gate:
+    // both read the same packed input — see the prefill branch). A producer
+    // that emitted the packed operand already (plan.input() ==
+    // LinearInput::Packed: the norm, GDN and attention-gate variants) leaves
+    // the planes in the same scratch slots, so no dispatch is needed.
+    const bool prePacked =
+        b.prepared.layout == LinearInput::Packed && b.prepared.source.sameView(b.input);
+    if (packs && !prePacked)
+      graph.add("gguf_pack_half",
+                {b.input, b.scratch.input, b.scratch.sums,
+                 b.input, b.input, b.input, b.input, b.input},
+                GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
     addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
@@ -374,7 +523,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   std::vector<metal::MetalBuffer> bindings{b.input};
   const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
   bindings.insert(bindings.end(), {b.output, partials, counters});
-  graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
+  graph.add("gguf_decode_fused_m" + std::to_string(rows) + nativeSuffix(appleGpuFamily_), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 
@@ -387,10 +536,41 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
-  for (const QuantizedSegment &s : p.blocks().segments) {
-    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  // MXFP4 segments run the pre-packed multiplane prefill tile
+  // (gguf_prefill_mxfp4p_*, shared/gguf_mxfp4p.metal): one gguf_pack_half
+  // dispatch packs the chunk's rows, rounded up to a simdgroup's
+  // GGUF_PREFILL_SIMDGROUP_ROWS so a partial simdgroup's padding rows are
+  // packed too, into the scratch fp16 plane and exponent bytes.
+  const bool packs =
+      plan.packsActivations() && appleGpuFamily_ >= 10 &&
+      std::any_of(segments.begin(), segments.end(),
+                  [](const QuantizedSegment &s) { return s.formatId == GGUF_FMT_MXFP4; });
+  if (packs) {
+    const uint32_t rows =
+        (w.rows + GGUF_PREFILL_SIMDGROUP_ROWS - 1) / GGUF_PREFILL_SIMDGROUP_ROWS *
+        GGUF_PREFILL_SIMDGROUP_ROWS;
+    graph.add("gguf_pack_half",
+              {b.input, b.scratch.input, b.scratch.sums,
+               b.input, b.input, b.input, b.input, b.input},
+              GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
+  }
+  for (const QuantizedSegment &s : segments) {
+    std::vector<metal::MetalBuffer> bindings;
+    if (packs && s.formatId == GGUF_FMT_MXFP4) {
+      bindings = {b.scratch.input, s.plane0, b.scratch.sums, s.meta, b.output};
+      // The mxfp4p prefill kernels always take the aux slot: the plain
+      // epilogue binds the output there, its params staying at index 6.
+      bindings.push_back(w.epilogue != LinearEpilogue::None ? epilogueInput(b, w.epilogue) : b.output);
+      graph.add(prefillKernel("mxfp4p", epilogue), std::move(bindings),
+                GgufPrefillParams{k, w.rows, n, s.columnOffset},
+                {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
+                {GGUF_PREFILL_THREADS, 1, 1});
+      continue;
+    }
+    bindings = {b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-    graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
+    graph.add(prefillKernel(kernelFormat(appleGpuFamily_, s), epilogue), std::move(bindings),
               GgufPrefillParams{k, w.rows, n, s.columnOffset},
               {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
               {GGUF_PREFILL_THREADS, 1, 1});
@@ -418,12 +598,14 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
-    graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    graph.add("gguf_decode_sg_fused" + suffix + nativeSuffix(appleGpuFamily_), std::move(bindings), params, grid,
+              {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
+    graph.add(kernelInstance(std::string("gguf_decode_sg_") + kernelFormat(appleGpuFamily_, s) + suffix + "_" + epilogue,
+                             plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {GGUF_REGISTER_THREADS, 1, 1});

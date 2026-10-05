@@ -461,13 +461,13 @@ class GgufMetadataTests(unittest.TestCase):
 
     def test_every_derivation_names_an_unsupported_architecture(self):
         values = fixture()
-        values["general.architecture"] = "llama"
+        values["general.architecture"] = "qwen2"
         metadata = self.metadata(values)
         for derive in (gguf.require_loadable, gguf.model_config, gguf.tokenizer_files):
             with (
                 self.subTest(derive=derive.__name__),
                 self.assertRaisesRegex(
-                    models.ModelError, "unsupported GGUF model architecture: llama"
+                    models.ModelError, "unsupported GGUF model architecture: qwen2"
                 ),
             ):
                 derive(metadata)

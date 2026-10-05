@@ -66,4 +66,96 @@ void DraftSelector::add(metal::CommandGraph &graph,
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 
+void DraftSelector::addTree(metal::CommandGraph &graph,
+                            const DraftSelectorBuffers &buffers,
+                            const DraftCodebooks &codebooks,
+                            std::span<const uint32_t> anchors,
+                            std::span<const SamplingPolicy> policies,
+                            uint32_t treeMask) const {
+  if (anchors.empty() || anchors.size() != policies.size() ||
+      anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft selector batch");
+  const uint32_t lanes = static_cast<uint32_t>(anchors.size());
+  SelectorBatchParams params{};
+  params.lanes = lanes;
+  params.vocabulary = vocabulary_;
+  params.tree_mask = treeMask;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.anchor[lane] = anchors[lane];
+    params.temperature[lane] = policies[lane].temperature;
+    if (policies[lane].samples())
+      params.sampling_mask |= uint32_t{1} << lane;
+  }
+  graph.add("draft_select_top16_sharded",
+            {buffers.logits, buffers.partialIds, buffers.partialValues},
+            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+  graph.add("draft_select_edges",
+            {buffers.partialIds, buffers.partialValues, buffers.candidates,
+             buffers.unary, buffers.selectorHidden, codebooks.predecessor,
+             codebooks.successor},
+            params, {uint64_t{lanes} * kPositions, 1, 1},
+            {kEdgeThreads, 1, 1});
+  graph.add("draft_select_tree",
+            {buffers.candidates, buffers.unary, buffers.partialValues,
+             buffers.uniforms, buffers.proposedTokens,
+             buffers.proposalProbabilities, buffers.treeTokens,
+             buffers.treeNodes, buffers.treeCounts},
+            params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void DraftSelector::addPlain(metal::CommandGraph &graph,
+                             const DraftSelectorBuffers &buffers,
+                             std::span<const uint32_t> anchors,
+                             std::span<const SamplingPolicy> policies) const {
+  if (anchors.empty() || anchors.size() != policies.size() ||
+      anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft selector batch");
+  const uint32_t lanes = static_cast<uint32_t>(anchors.size());
+  SelectorBatchParams params{};
+  params.lanes = lanes;
+  params.vocabulary = vocabulary_;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.anchor[lane] = anchors[lane];
+    params.temperature[lane] = policies[lane].temperature;
+    if (policies[lane].samples())
+      params.sampling_mask |= uint32_t{1} << lane;
+  }
+  graph.add("draft_select_top16_sharded",
+            {buffers.logits, buffers.partialIds, buffers.partialValues},
+            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+  graph.add("draft_select_plain",
+            {buffers.partialIds, buffers.partialValues, buffers.uniforms,
+             buffers.candidates, buffers.proposalProbabilities,
+             buffers.proposedTokens},
+            params, {uint64_t{lanes} * kPositions, 1, 1}, {32, 1, 1});
+}
+
+void DraftSelector::addDSpark(metal::CommandGraph &graph,
+                              const DraftSelectorBuffers &buffers,
+                              const DraftMarkovHead &markov,
+                              std::span<const uint32_t> anchors,
+                              std::span<const SamplingPolicy> policies) const {
+  if (anchors.empty() || anchors.size() != policies.size() ||
+      anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft selector batch");
+  const uint32_t lanes = static_cast<uint32_t>(anchors.size());
+  SelectorBatchParams params{};
+  params.lanes = lanes;
+  params.vocabulary = vocabulary_;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.anchor[lane] = anchors[lane];
+    params.temperature[lane] = policies[lane].temperature;
+    if (policies[lane].samples())
+      params.sampling_mask |= uint32_t{1} << lane;
+  }
+  graph.add("dspark_select_top16_sharded",
+            {buffers.logits, buffers.partialIds, buffers.partialValues},
+            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+  graph.add("draft_select_dspark",
+            {buffers.partialIds, buffers.partialValues, buffers.uniforms,
+             buffers.candidates, buffers.proposalProbabilities,
+             buffers.proposedTokens, markov.embedding, markov.projection},
+            params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
+}
+
 } // namespace splash::ops

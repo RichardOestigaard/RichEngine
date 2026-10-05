@@ -1,4 +1,5 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
+#include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "ScopedTestConfig.hpp"
 #include "TestBuffers.hpp"
@@ -1370,6 +1371,154 @@ void run(const std::string &metallibPath) {
     privateBuffer = MetalBuffer{};
     require(backend.memoryStats().allocatedBytes == 0,
             "private allocation release was not tracked");
+
+    {
+        // A CommandGraph baked span replays its dispatches from an indirect
+        // command buffer. Two submissions bake then replay; a span whose
+        // bindings drifted re-bakes instead of replaying stale commands. The
+        // second copy inside the span reads the first copy's output, so the
+        // replay must keep the run's ordering.
+        const uint64_t submissionsBefore =
+            BackendInstrumentation::submittedCommands(backend);
+        MetalBuffer sourceA = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-source-a");
+        MetalBuffer sourceB = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-source-b");
+        MetalBuffer copied = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-copy-a");
+        MetalBuffer copiedAgain = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-copy-b");
+        auto *wordsA = static_cast<uint32_t *>(sourceA.contents());
+        auto *wordsB = static_cast<uint32_t *>(sourceB.contents());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            wordsA[i] = 1000 + i;
+            wordsB[i] = 2000 + i;
+        }
+        splash::metal::CommandGraph graph;
+        // Outside the span, feeding its first dispatch: the replay must
+        // still order after this write.
+        graph.add("test_copy_u32", {sourceA, copied}, kElementCount,
+                  {1, 1, 1}, {kElementCount, 1, 1});
+        graph.beginBakedSpan();
+        graph.add("test_copy_u32", {copied, copiedAgain}, kElementCount,
+                  {1, 1, 1}, {kElementCount, 1, 1});
+        graph.add("test_copy_u32", {copiedAgain, copied}, kElementCount,
+                  {1, 1, 1}, {kElementCount, 1, 1});
+        graph.endBakedSpan();
+        graph.add("test_copy_u32", {copied, copiedAgain}, kElementCount,
+                  {1, 1, 1}, {kElementCount, 1, 1});
+        (void)backend.submitCommand(graph.dispatches());
+        (void)backend.submitCommand(graph.dispatches());
+        auto *chain = static_cast<uint32_t *>(copiedAgain.contents());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(chain[i] == 1000 + i,
+                    "baked span replay produced an incorrect result");
+        }
+        // Same span shape and position, a different bound buffer: the
+        // snapshot mismatches and the span re-bakes rather than replaying.
+        splash::metal::CommandGraph drifted;
+        drifted.add("test_copy_u32", {sourceB, copied}, kElementCount,
+                    {1, 1, 1}, {kElementCount, 1, 1});
+        drifted.beginBakedSpan();
+        drifted.add("test_copy_u32", {sourceB, copiedAgain}, kElementCount,
+                    {1, 1, 1}, {kElementCount, 1, 1});
+        drifted.add("test_copy_u32", {copiedAgain, copied}, kElementCount,
+                    {1, 1, 1}, {kElementCount, 1, 1});
+        drifted.endBakedSpan();
+        (void)backend.submitCommand(drifted.dispatches());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(chain[i] == 2000 + i,
+                    "re-baked span dispatch produced an incorrect result");
+        }
+        require(BackendInstrumentation::submittedCommands(backend) ==
+                    submissionsBefore + 3,
+                "baked span submissions were not counted");
+    }
+
+    {
+        // A patchable payload may change between submissions: the span
+        // still replays, with the payload rewritten into its staged
+        // parameters each time. Two structurally identical graphs fill the
+        // same buffer with different values; the second submission must
+        // land the new value through the replayed commands.
+        MetalBuffer filled = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "patchable-fill");
+        struct FillParams {
+            uint32_t value;
+            uint32_t count;
+        };
+        const auto fillGraph = [&](uint32_t value, bool patchable) {
+            splash::metal::CommandGraph graph;
+            graph.beginBakedSpan();
+            if (patchable) {
+                graph.addPatchable("test_fill_u32", {filled},
+                                   FillParams{value, kElementCount},
+                                   {1, 1, 1}, {kElementCount, 1, 1});
+            } else {
+                graph.add("test_fill_u32", {filled},
+                          FillParams{value, kElementCount},
+                          {1, 1, 1}, {kElementCount, 1, 1});
+            }
+            graph.endBakedSpan();
+            return graph;
+        };
+        (void)backend.submitCommand(fillGraph(42, true).dispatches());
+        auto *filledWords = static_cast<uint32_t *>(filled.contents());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(filledWords[i] == 42,
+                    "patchable span bake produced an incorrect result");
+        }
+        (void)backend.submitCommand(fillGraph(77, true).dispatches());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(filledWords[i] == 77,
+                    "patchable span replay used a stale payload");
+        }
+        // Same shape without the mark: the changed payload mismatches the
+        // snapshot, the span re-bakes, and the new value still lands.
+        (void)backend.submitCommand(fillGraph(99, false).dispatches());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(filledWords[i] == 99,
+                    "non-patchable span payload change did not re-bake");
+        }
+        // And a patchable graph again: the mark participates in matching,
+        // so it resolves its own alternate and patches afresh.
+        (void)backend.submitCommand(fillGraph(55, true).dispatches());
+        for (uint32_t i = 0; i < kElementCount; ++i) {
+            require(filledWords[i] == 55,
+                    "patchable span alternate replayed a stale payload");
+        }
+    }
+
+    {
+        // Encode-cost probe: a decode-step-shaped command of 40 baked spans
+        // among 320 dispatches, timed over the submit calls alone. Run the
+        // test with and without SPLASH_ICB_OFF for the replay delta.
+        MetalBuffer words = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-timing");
+        MetalBuffer wordsOut = backend.allocateBuffer(
+            kAllocationBytes, BufferStorage::Shared, "baked-timing-out");
+        splash::metal::CommandGraph graph;
+        for (uint32_t span = 0; span < 40; ++span) {
+            graph.beginBakedSpan();
+            for (uint32_t dispatch = 0; dispatch < 7; ++dispatch)
+                graph.add("test_copy_u32", {words, wordsOut},
+                          kElementCount, {1, 1, 1},
+                          {kElementCount, 1, 1});
+            graph.endBakedSpan();
+        }
+        constexpr uint32_t kRounds = 50;
+        double seconds = 0.0;
+        for (uint32_t round = 0; round < kRounds; ++round) {
+            const auto began = std::chrono::steady_clock::now();
+            auto ticket = backend.submitCommandAsync(graph.dispatches());
+            seconds += std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - began)
+                           .count();
+            static_cast<void>(ticket.wait());
+        }
+        std::printf("baked-span encode: %.1f us per submit of %zu dispatches\n",
+                    seconds / kRounds * 1e6, graph.dispatches().size());
+    }
 
     bindingRunsKeepOffsets(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,

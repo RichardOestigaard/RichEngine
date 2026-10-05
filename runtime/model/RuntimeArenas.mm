@@ -122,6 +122,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
     put(PrefillTensor::LinearRotated, linear.rotated);
+    put(PrefillTensor::LinearPacked, linear.input);
+    put(PrefillTensor::LinearExponents, linear.sums);
   }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
@@ -170,7 +172,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   std::array<uint64_t, decodeTensorCount> result{};
   const auto draftWorkspace =
       operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
-  const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
+  // The sampling workspaces cover a tree lane's node count so the same
+  // tensors serve chain (8-row) and tree (16-row) verify batches.
+  const auto samplingWorkspace =
+      ops::Sampling::workspace(SPLASH_TREE_VERIFY_NODES);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
@@ -279,6 +284,20 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
+  put(DecodeTensor::TreeNodes,
+      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+  put(DecodeTensor::TreeTokens,
+      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+  put(DecodeTensor::TreeCounts, bytesFor<uint32_t>(1));
+  put(DecodeTensor::TreeMasks,
+      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+  put(DecodeTensor::RetainedPath,
+      bytesFor<uint32_t>(SPLASH_TARGET_VERIFY_ROWS));
+  put(DecodeTensor::TreeSelected,
+      bytesFor<uint32_t>(SPLASH_TREE_VERIFY_NODES));
+  put(DecodeTensor::CapturedPath,
+      bytesFor<uint16_t>(uint64_t{SPLASH_TREE_VERIFY_NODES} *
+                         geometry.draft.targetHiddenSize));
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
@@ -332,8 +351,11 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
+       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}}) {
+    // A plain draft's dynamic and selector projections are absent (size 0).
+    if (!shape.outputSize || !shape.inputSize) continue;
     result.include(operators.linear().decodeScratchSize(shape));
+  }
   return result;
 }
 

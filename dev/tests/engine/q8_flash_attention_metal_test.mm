@@ -29,7 +29,7 @@ constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The two production GQA geometries. The group size selects the kernel
+// The three production GQA geometries. The group size selects the kernel
 // specialization; the suffix names its pipelines.
 struct Shape {
   uint32_t kvHeads;
@@ -39,7 +39,8 @@ struct Shape {
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   Layout layout() const { return {1, kvHeads, kHeadDimension}; }
 };
-constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
+constexpr std::array<Shape, 3> kShapes{
+    {{4, 6, ""}, {4, 4, "_kv4_g4"}, {2, 8, "_kv2_g8"}}};
 
 using splash::test::require;
 
@@ -53,9 +54,11 @@ void testContract() {
               verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
               verifyAttentionSplits(131072) == kVerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
-  ++finalCycle.committed_tokens;
+  // The scratch runway is a tree verify's SPLASH_TREE_VERIFY_NODES - 1
+  // emitted rows, not a chain's seven.
+  finalCycle.committed_tokens = splash::kv::kMaximumPhysicalTokens - kRows + 1;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its speculative row allowance");
 }
 
 id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
@@ -400,7 +403,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits});
+               data.params.kv, splits, splits, 8, 8});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -725,9 +728,60 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits};
+    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, 8, 8};
     verify = reduce("verify_attention_reduce", params);
     check(verify);
+    // The fused reduce/gate of a Plain-input out-projection: its attention
+    // output is the plain reduce's bitwise, and its hidden rows are the
+    // separate gate kernel's on that output, bitwise.
+    const uint32_t qHeads = shape.queryHeads();
+    const uint64_t packedStride = 2 * uint64_t{qHeads} * d + 2 * shape.kvHeads * d;
+    id<MTLBuffer> packed = makeBuffer(device, kRows * packedStride * sizeof(BFloat16Bits));
+    auto *packedValues = static_cast<BFloat16Bits *>(packed.contents);
+    for (uint64_t i = 0; i < kRows * packedStride; ++i)
+      packedValues[i] =
+          floatToBFloat16(float(int((i * 31 + 11) % 211) - 105) * 0.015625f);
+    id<MTLBuffer> fusedOutput =
+        makeBuffer(device, uint64_t{shape.kvHeads} * kStride * shape.queryHeadsPerKvHead * d * 2);
+    std::memset(fusedOutput.contents, 0xa5, fusedOutput.length);
+    id<MTLBuffer> fusedHidden = makeBuffer(device, uint64_t{kRows} * qHeads * d * 2);
+    std::memset(fusedHidden.contents, 0xa5, fusedHidden.length);
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:makePipeline(
+                 device, library, "verify_attention_reduce_gate" + std::string(shape.suffix))];
+    [encoder setBuffer:partials offset:0 atIndex:0];
+    [encoder setBuffer:stats offset:0 atIndex:1];
+    [encoder setBuffer:fusedOutput offset:0 atIndex:2];
+    [encoder setBuffer:packed offset:0 atIndex:3];
+    [encoder setBuffer:fusedHidden offset:0 atIndex:4];
+    [encoder setBytes:&params length:sizeof(params) atIndex:5];
+    [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, 1)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    finish(command);
+    require(!std::memcmp(fusedOutput.contents, verify.contents, verify.length),
+            "fused reduce/gate changed the attention output");
+    // The unfused gate over the same attention output gives the hidden bits.
+    id<MTLBuffer> referenceHidden = makeBuffer(device, fusedHidden.length);
+    std::memset(referenceHidden.contents, 0xa5, referenceHidden.length);
+    const uint32_t elements = kRows * qHeads * d;
+    FullDecodeBatchParams gateParams{1, 8};
+    command = [queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:makePipeline(
+                 device, library, "verify_attention_gate" + std::string(shape.suffix))];
+    [encoder setBuffer:packed offset:0 atIndex:0];
+    [encoder setBuffer:verify offset:0 atIndex:1];
+    [encoder setBuffer:referenceHidden offset:0 atIndex:2];
+    [encoder setBytes:&gateParams length:sizeof(gateParams) atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(elements, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    finish(command);
+    require(!std::memcmp(fusedHidden.contents, referenceHidden.contents,
+                         referenceHidden.length),
+            "fused reduce/gate differs from reduce plus verify_attention_gate");
   }
   if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits};

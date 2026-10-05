@@ -887,9 +887,12 @@ void testContract() {
       {}};
   require(chunkedPrefillValidationError(finalCycle).empty(),
           "the final cycle's verification rows exceeded physical KV scratch");
-  ++finalCycle.committed_tokens;
+  // The scratch runway is a tree verify's SPLASH_TREE_VERIFY_NODES - 1
+  // emitted rows, not a chain's seven.
+  finalCycle.committed_tokens =
+      splash::kv::kMaximumPhysicalTokens - splash::kv::kVerifyRows + 1;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
-          "physical KV scratch exceeded its fixed seven-row allowance");
+          "physical KV scratch exceeded its speculative row allowance");
 }
 
 void run(const char *libraryPath) {

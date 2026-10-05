@@ -130,7 +130,7 @@ std::set<LinearWorkload> expectedLinear(
   const auto target = std::visit([](const auto &weights) {
     return qwenTargetGeometry(weights);
   }, package.target);
-  const auto &draft = package.draft.layout;
+  const auto &draft = std::get<splash::model::DFlashDraftWeights>(package.draft).layout;
   std::set<LinearWorkload> result;
   auto add = [&](LinearMatrix matrix, LinearPhase phase, LinearEpilogue epilogue) {
     for (uint32_t size : phase == LinearPhase::Prefill ? prefill : decode)
@@ -193,7 +193,7 @@ void checkPair(ModelPackage package) {
   std::visit([](auto &target) {
     target.layers.push_back(target.layers.front());
   }, package.target);
-  package.draft.layers.push_back(package.draft.layers.front());
+  std::get<splash::model::DFlashDraftWeights>(package.draft).layers.push_back(std::get<splash::model::DFlashDraftWeights>(package.draft).layers.front());
   const auto renamed = collectTuningWorkloads(package, prefill, decode);
   require(linearKeys(renamed) == keys,
           "dedup depends on layer count or model/weight names");
@@ -206,7 +206,7 @@ void checkPair(ModelPackage package) {
   rejects([&] { (void)collectTuningWorkloads(package, std::array{2049U}, decode); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{0U}); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{5U}); });
-  package.draft.contextProjection.inputSize = 0;
+  std::get<splash::model::DFlashDraftWeights>(package.draft).contextProjection.inputSize = 0;
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
@@ -295,7 +295,7 @@ void run() {
   sparse.draft = draftWeights(smallerDraft);
   checkPair(sparse);
 
-  dense.draft.layers.clear();
+  std::get<splash::model::DFlashDraftWeights>(dense.draft).layers.clear();
   rejects([&] { (void)collectTuningWorkloads(dense, std::array{32U}, std::array{1U}); });
   std::get<Qwen3_6MoeWeights>(sparse.target).layers.clear();
   rejects([&] { (void)collectTuningWorkloads(sparse, std::array{32U}, std::array{1U}); });
@@ -341,7 +341,7 @@ void metadataViews(const char *metallib) {
     }
     // Target and draft execute the same GateUp shape in this pair. They also
     // share a representative here, so this must not add another measurement.
-    for (auto &layer : package.draft.layers) {
+    for (auto &layer : std::get<splash::model::DFlashDraftWeights>(package.draft).layers) {
       layer.upProjection = target.layers.front().upProjection;
       layer.gateProjection = target.layers.front().gateProjection;
     }

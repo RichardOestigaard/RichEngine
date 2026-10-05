@@ -25,7 +25,9 @@ FUNCTION_OPEN = "\n<function="
 FUNCTION_CLOSE = "</function>\n</tool_call>"
 PARAMETER_OPEN = "<parameter="
 PARAMETER_CLOSE = "\n</parameter>\n"
-THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
+# The chat template's think-close token id where no tokenizer contract
+# supplies one (tests); the server always passes its validated contract's.
+THINK_END_TOKEN_ID = 248069
 
 
 def function_opening(name):
@@ -697,14 +699,17 @@ def _argument_grammar(schema):
     )
 
 
-def json_grammar(schema, thinking):
+def json_grammar(schema, thinking, *, think_end_id=None):
     start = "start: " + ("think " if thinking else "") + "WS %json "
     grammar = [
         "%llguidance {}",
         start + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
     if thinking:
-        grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
+        think_end = (
+            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
+        )
+        grammar.append(f"think: TEXT <[{think_end}]>")
         grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
@@ -813,7 +818,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
 THINK_END = "</think>"
 
 
-def tool_grammar(policy, thinking, response_schema=None):
+def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
     try:
         arguments = [
             _argument_grammar(schema) for schema in policy.argument_schemas.values()
@@ -866,7 +871,10 @@ def tool_grammar(policy, thinking, response_schema=None):
     if separator == "WS":
         main.append(WHITESPACE_RULE)
     if thinking:
-        main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
+        think_end = (
+            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
+        )
+        main.append(f"think: TEXT <[{think_end}]>")
     main.extend(
         [
             "tail: TEXT",

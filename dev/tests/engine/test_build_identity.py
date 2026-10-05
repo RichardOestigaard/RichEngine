@@ -20,7 +20,7 @@ class BuildIdentityTests(unittest.TestCase):
             destination.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / relative, destination)
             constants = {
-                "metal_flags": "-std=metal4.0 -O3",
+                "metal_flags": "-std=metal4.1 -O3",
                 "engine_cxxflags": "-std=c++20 -O3",
             }
             first = build_identity.build_id(root, [relative.as_posix()], constants)
@@ -332,6 +332,8 @@ class CompileConfigurationTests(unittest.TestCase):
                 for phase in ("prefill", "decode")
                 for name in ("paged_attention.metal", "paged_attention_store.metal")
             ]
+            # q8-attention.metallib also links the decode QKV-prepare kernel.
+            paged_sources.append(kernel_root / "decode" / "attention_qkv.metal")
             # Every test library a MetalBackend loads links the kernel that
             # ends residency; q8-attention.metallib is loaded by raw MTLDevice
             # tests.

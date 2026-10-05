@@ -21,4 +21,6 @@ kernel void gguf_test_dequant_##name(device uchar *w0 [[buffer(0)]], \
 }
 
 QUANT_FORMATS(DEQUANT_TEST)
+// The native FP4-E2M1 unpack decode of the MXFP4 image (Apple GPU family 10).
+DEQUANT_TEST(FmtMXFP4N, mxfp4n)
 #undef DEQUANT_TEST

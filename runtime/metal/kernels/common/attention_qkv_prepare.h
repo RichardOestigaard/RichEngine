@@ -4,8 +4,13 @@
 #include "metal/kernels/common/rms_inverse.h"
 
 // q_norm and k_norm are read in their stored type W: bfloat in the packed
-// formats, float for a GGUF's F32 norms.
-template <uint QHeads, uint KHeads, class W>
+// formats, float for a GGUF's F32 norms. HeadDim is the per-head dimension,
+// RotaryPairs the rotated dimension pairs of each head (headDim/2 for the
+// full-rotary variants), QueryGate whether every query head is stored as
+// [query | gate] pairs (Qwen) or plain rows, Norms whether the per-head RMS
+// norms run at all (the dense target has none), eps their epsilon.
+template <uint QHeads, uint KHeads, uint HeadDim = 256, uint RotaryPairs = 32,
+          bool QueryGate = true, bool Norms = true, class W = bfloat>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -13,11 +18,13 @@ inline void full_qkv_storage_phase(
     device bfloat *chunk_keys, device bfloat *chunk_values,
     FullPrefillParams params, threadgroup float *reductions,
     threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
-    uint simd_group) {
+    uint simd_group, float eps = kRmsEpsilon) {
   static_assert(QHeads % KHeads == 0);
-  constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
+  static_assert(RotaryPairs * 2 <= HeadDim);
+  constexpr uint QStride = QueryGate ? 2 * HeadDim : HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
+  constexpr uint Simdgroups = HeadDim / 32;
   uint query_tasks = params.tokens * QHeads;
   bool query = task < query_tasks;
   uint local_task = query ? task : task - query_tasks;
@@ -43,11 +50,18 @@ inline void full_qkv_storage_phase(
   }
 
   float element = float(source[thread_index]);
-  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
+  float inverse = 1.0f, scale = 1.0f;
+  if constexpr (Norms) {
+    inverse = rms_inverse_of_sums<Simdgroups>(element * element, HeadDim,
                                             reductions, thread_index, lane,
-                                            simd_group);
-  normalized[thread_index] =
-      bfloat(element * inverse * float(weight[thread_index]));
+                                            simd_group, eps);
+    scale = float(weight[thread_index]);
+  } else {
+    // Keep the callers' barrier count identical either way: no reduction
+    // runs without norms, so no barrier is needed before the rope read.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  normalized[thread_index] = bfloat(element * inverse * scale);
   if (!query) {
     ulong value_offset =
         (ulong(head_index) * HeadDim + thread_index) * params.stride +
@@ -55,13 +69,14 @@ inline void full_qkv_storage_phase(
     chunk_values[value_offset] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < 32) {
+  if (thread_index < RotaryPairs) {
     float first = float(normalized[thread_index]);
-    float second = float(normalized[thread_index + 32]);
+    float second = float(normalized[thread_index + RotaryPairs]);
     float cosine = rope_cos[ulong(row) * RotaryPairs + thread_index];
     float sine = rope_sin[ulong(row) * RotaryPairs + thread_index];
     destination[thread_index] = bfloat(first * cosine - second * sine);
-    destination[thread_index + 32] = bfloat(second * cosine + first * sine);
+    destination[thread_index + RotaryPairs] =
+        bfloat(second * cosine + first * sine);
   } else if (thread_index >= 2 * RotaryPairs) {
     destination[thread_index] = normalized[thread_index];
   }

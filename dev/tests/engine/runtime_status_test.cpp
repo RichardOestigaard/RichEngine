@@ -26,8 +26,8 @@ EngineMemoryPlan plan() {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
-  device.macosMajor = 26;
-  device.macosMinor = 4;
+  device.macosMajor = 27;
+  device.macosMinor = 0;
   device.physicalMemoryBytes = 32 * kGiB;
   device.recommendedMaxWorkingSetBytes = 24 * kGiB;
   device.maxBufferLengthBytes = 16 * kGiB;

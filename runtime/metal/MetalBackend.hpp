@@ -115,6 +115,18 @@ struct ComputeDispatch {
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // True while a CommandGraph baked span is open: a maximal run of these is
+  // eligible for replay through a cached indirect command buffer (see
+  // CommandGraph::beginBakedSpan). Submission revalidates every field of the
+  // run against the baked snapshot and falls back to normal encoding on any
+  // drift, so the flag only ever names a candidate.
+  bool bakeable = false;
+  // Set by CommandGraph::addPatchable: every bytes payload of this dispatch
+  // may change between submissions while its index and size stay the same.
+  // Inside a baked span the payload is still staged and bound in the span's
+  // parameter arena — the submission just rewrites the staged bytes instead
+  // of re-baking, so the binding itself never drifts.
+  bool patchableBytes = false;
 };
 
 struct CommandTiming {

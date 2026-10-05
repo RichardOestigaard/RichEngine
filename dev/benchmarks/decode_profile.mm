@@ -108,6 +108,25 @@ std::vector<uint32_t> chatPrompt(uint32_t tokens) {
   return prompt;
 }
 
+// Raw little-endian u32 tokens, as written by a tokenizer script — used to
+// profile decode on a workload the built-in prompt cannot express, like an
+// echo request whose output repeats the prompt.
+std::vector<uint32_t> filePrompt(const char *path) {
+  FILE *file = std::fopen(path, "rb");
+  if (!file)
+    throw std::invalid_argument(std::string("cannot open prompt file: ") + path);
+  std::fseek(file, 0, SEEK_END);
+  const long size = std::ftell(file);
+  std::fseek(file, 0, SEEK_SET);
+  if (size <= 0 || size % 4)
+    throw std::invalid_argument("prompt file is not u32 tokens");
+  std::vector<uint32_t> result(static_cast<size_t>(size) / 4);
+  if (std::fread(result.data(), 4, result.size(), file) != result.size())
+    throw std::invalid_argument("prompt file is truncated");
+  std::fclose(file);
+  return result;
+}
+
 uint32_t parseCount(std::string_view text, std::string_view label) {
   uint32_t value = 0;
   auto result = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -194,7 +213,6 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(), tokens,
-          backend.submissionCount() - submissionsBefore};
           BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
 }
 
@@ -205,11 +223,13 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]\n";
+                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
+                     "[--prompt-file PATH]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      const char *promptFile = nullptr;
       kv::Format format = kv::Format::Int8;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
@@ -217,6 +237,8 @@ int main(int argc, char **argv) {
           throw std::invalid_argument(std::string(option) + " requires a value");
         if (option == "--prompt-tokens")
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
+        else if (option == "--prompt-file")
+          promptFile = argv[index + 1];
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--kv-format") {
@@ -234,9 +256,12 @@ int main(int argc, char **argv) {
           model::loadModelPackage(backend, root, model::inspectModelPackage(root));
       ops::ExecutionPlans operators(backend.capabilities());
 
+      const std::vector<uint32_t> prompt =
+          promptFile ? filePrompt(promptFile) : chatPrompt(promptTokens);
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (static_cast<uint32_t>(prompt.size()) + 256 +
+           model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -269,8 +294,6 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
-
       // Warm prefill and B1 decode with real work before measuring.
       prefill(executor, lanes[0], prompt);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
@@ -313,7 +336,7 @@ int main(int argc, char **argv) {
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands),
                     tokens / gpuTotal, tokens / wallTotal);
-        BackendInstrumentation::setDispatchProfiling(true);
+        BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
         BackendInstrumentation::setDispatchProfiling(backend, false);

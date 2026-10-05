@@ -10,7 +10,10 @@ namespace splash::ops {
 std::string normKernel(std::string_view name, const NormWeights &weights, uint32_t width) {
   if (!weights.buffer || weights.buffer.sizeBytes() < weights.bytes(width))
     throw std::invalid_argument("norm weights are below the width");
-  return std::string(name) + (weights.float32 ? "_f32" : "");
+  std::string result(name);
+  if (weights.rmsEpsilon != 1e-6F) result += "_e5";
+  if (weights.float32) result += "_f32";
+  return result;
 }
 
 PreparedInput Normalization::addRms(metal::CommandGraph &graph,
@@ -21,6 +24,8 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     LinearInput layout) {
   if (layout != LinearInput::Plain) {
     requireTableScratch(scratch, layout, width, rows);
+    // Packed takes the same two scratch slots as a table: the fp16 plane and
+    // the per-(row, 32) exponent bytes the mxfp4p decode kernels read.
     graph.add(normKernel(std::string("norm_rms") + tableSuffix(layout) + "_decode", weight, width),
               {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
     return {std::move(output), layout};

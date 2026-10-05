@@ -54,7 +54,7 @@ struct NativeArguments final {
   // --cache-dir: where the cache tier keeps its files for the next process;
   // empty for temporary ones.
   std::filesystem::path persistentCacheRoot;
-  kv::Format kvFormat = kv::Format::Int8;
+  kv::Format kvFormat = kv::Format::Int4;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
 };
@@ -128,7 +128,7 @@ void printUsage(std::string_view executable) {
       "usage: " + std::string(executable) +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--decode-share SHARE]"
+      " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]");
 }
 
@@ -210,9 +210,13 @@ NativeArguments parseArguments(int argc, char **argv) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
     if (option == "--kv-format") {
-      if (value != "int8" && value != "bf16")
-        throw UsageError("--kv-format requires int8 or bf16");
-      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      if (value != "int8" && value != "int4" && value != "bf16" &&
+          value != "fp8" && value != "fp8e4m3")
+        throw UsageError("--kv-format requires int8, int4, bf16 or fp8e4m3");
+      result.kvFormat = value == "int8"                          ? kv::Format::Int8
+                        : value == "int4"                        ? kv::Format::Int4
+                        : value == "fp8" || value == "fp8e4m3"   ? kv::Format::Float8E4M3
+                                                                 : kv::Format::BFloat16;
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {

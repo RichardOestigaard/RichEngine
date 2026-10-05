@@ -16,6 +16,9 @@ namespace splash::ops {
 struct NormWeights final {
   metal::MetalBuffer buffer;
   bool float32 = false;
+  // The norm's epsilon: the shared kRmsEpsilon 1e-6 unless a family (LFM2)
+  // declares another, which selects the `_e5` kernel variants (normKernel).
+  float rmsEpsilon = 1e-6F;
 
   [[nodiscard]] constexpr uint64_t bytes(uint32_t width) const noexcept {
     return uint64_t{width} * (float32 ? 4 : 2);

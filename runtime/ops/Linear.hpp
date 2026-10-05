@@ -136,6 +136,11 @@ enum class LinearInput : uint8_t {
   Plain,    // bf16 [rows][K]
   Table64,  // affine simdgroup table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
   Table16,  // GGUF simdgroup table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  // The mxfp4p A-operand (kernels/common/gguf_mxfp4p_tile.h): the
+  // slot-permuted fp16 plane in LinearScratch::input and the per-(row, 32)
+  // exponent bytes in ::sums, which a producer can emit beside its bf16 rows
+  // instead of a gguf_pack_half dispatch.
+  Packed,
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -171,8 +176,15 @@ public:
   [[nodiscard]] bool usesSimdgroup() const noexcept;
   // The layout the producer of this plan's input writes. A rotated
   // projection prepares its table from the rotated rows itself
-  // (LinearGguf.cpp), so its producer writes plain rows.
+  // (LinearGguf.cpp), so its producer writes plain rows. Packed only asks
+  // producers that know it (norms, the GDN and attention gates); a producer
+  // that stays Plain leaves the pack dispatch to the consumer.
   [[nodiscard]] LinearInput input() const noexcept;
+  // A GGUF prefill plan whose MXFP4 segments run the pre-packed multiplane
+  // tiles: one gguf_pack_half dispatch per chunk packs the bf16 rows into
+  // LinearScratch::input (the slot-permuted fp16 plane) and ::sums (the
+  // exponent bytes), which those kernels then read (LinearGguf.cpp).
+  [[nodiscard]] bool packsActivations() const noexcept { return packs_; }
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
@@ -195,6 +207,13 @@ private:
   FloatOutput destination_;
   // The plan's projection multiplies the rotated input (InputRotation).
   bool rotated_ = false;
+  // packsActivations(): set by Linear's plan methods.
+  bool packs_ = false;
+  // A decode plan — or a prefill chunk plan of up to a decode batch's rows —
+  // whose single-tensor projections dispatch the pre-packed mxfp4p kernels:
+  // input() then asks the producer for the packed operand
+  // (LinearInput::Packed), which addGgufStaged takes instead of packing.
+  bool packedInput_ = false;
   std::string_view pipeline_;
   std::string_view secondPipeline_;
 };

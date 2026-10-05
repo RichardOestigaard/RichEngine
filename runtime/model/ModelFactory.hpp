@@ -2,7 +2,13 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "DSparkDraft.hpp"
+#include "PlainDraft.hpp"
 #include "ModelDescriptor.hpp"
+#include "Dense.hpp"
+#include "Lfm2.hpp"
+#include "Lfm2Moe.hpp"
+#include "Ornith9B.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
@@ -19,14 +25,18 @@ namespace splash::model {
 
 class QwenStateStorage;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
+                 DenseWeights, Lfm2Weights, Lfm2MoeWeights>;
+using DraftWeights =
+    std::variant<DFlashDraftWeights, PlainDraftWeights, DSparkDraftWeights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
-  DFlashDraftWeights draft;
+  DraftWeights draft;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
 
@@ -48,6 +58,11 @@ struct ModelPackage final {
     return std::visit([](const auto &weights) {
       return weights.actualAllocatedBytes;
     }, target);
+  }
+  [[nodiscard]] uint64_t draftActualAllocatedBytes() const noexcept {
+    return std::visit([](const auto &weights) {
+      return weights.actualAllocatedBytes;
+    }, draft);
   }
   [[nodiscard]] const std::string &targetManifestFingerprint() const noexcept {
     return std::visit([](const auto &weights) -> const std::string & {

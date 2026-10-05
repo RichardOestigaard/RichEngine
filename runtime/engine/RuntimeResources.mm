@@ -152,7 +152,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
-      !package.draft.actualAllocatedBytes ||
+      !package.draftActualAllocatedBytes() ||
       (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
@@ -408,7 +408,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   ModelMemoryFootprint footprint{
       package.targetActualAllocatedBytes(),
-      package.draft.actualAllocatedBytes,
+      package.draftActualAllocatedBytes(),
       package.vision.actualAllocatedBytes,
       modelMemoryPlan,
       stateStagingBytes,
@@ -640,7 +640,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     const model::ModelMemoryActual &modelMemory) const {
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
-  report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
+  report.draftWeightsBytes = model_.draftActualAllocatedBytes();
   report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;

@@ -28,6 +28,12 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer proposalProbabilities;
+  // Tree-verify tables (draft_select_tree): per lane the node descriptors,
+  // node tokens and node count of its verify tree
+  // (SPLASH_TREE_VERIFY_NODES stride). Unused by chain-only selection.
+  metal::MetalBuffer treeNodes;
+  metal::MetalBuffer treeTokens;
+  metal::MetalBuffer treeCounts;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -35,6 +41,14 @@ struct DraftSelectorBuffers final {
 struct DraftCodebooks final {
   metal::MetalBuffer predecessor;
   metal::MetalBuffer successor;
+};
+
+// A DSpark draft's Markov head: the previous-token feature table
+// (markov_w1, [vocabulary][rank]) and the bias projection (markov_w2,
+// [vocabulary][rank]), both bf16 row-major.
+struct DraftMarkovHead final {
+  metal::MetalBuffer embedding;
+  metal::MetalBuffer projection;
 };
 
 // The DFlash draft's proposal policy (draft_select_* in
@@ -53,6 +67,33 @@ public:
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
            std::span<const SamplingPolicy> policies) const;
+  // The same pipeline plus draft_select_tree, which emits each lane's verify
+  // tree tables. treeMask marks the lanes whose comb leaves are emitted
+  // (greedy lanes of a tree-capable draft); other lanes get a linear table.
+  void addTree(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+               const DraftCodebooks &codebooks,
+               std::span<const uint32_t> anchors,
+               std::span<const SamplingPolicy> policies,
+               uint32_t treeMask) const;
+  // The plain DFlash draft's selection (draft_select_top16_sharded +
+  // draft_select_plain): per position the best or a drawn candidate of the
+  // draft logits, with no predecessor/successor codebooks. The codebookless
+  // buffers' selectorHidden and unary are unused.
+  void addPlain(metal::CommandGraph &graph,
+                const DraftSelectorBuffers &buffers,
+                std::span<const uint32_t> anchors,
+                std::span<const SamplingPolicy> policies) const;
+  // The DSpark draft's selection (dspark_select_top16_sharded +
+  // draft_select_dspark): like the plain path, but position p reads logits
+  // row p (the anchor row already predicts a token) and each position's
+  // candidates are rescored with the Markov bias of the previously sampled
+  // token, so the positions are chosen serially. The codebookless buffers'
+  // selectorHidden and unary are unused; there is no tree path.
+  void addDSpark(metal::CommandGraph &graph,
+                 const DraftSelectorBuffers &buffers,
+                 const DraftMarkovHead &markov,
+                 std::span<const uint32_t> anchors,
+                 std::span<const SamplingPolicy> policies) const;
 
 private:
   uint32_t vocabulary_ = 0;

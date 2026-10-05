@@ -19,8 +19,8 @@ DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
   DeviceCapabilities result;
   result.deviceName = "test";
   result.appleGpuFamily = 9;
-  result.macosMajor = 26;
-  result.macosMinor = 4;
+  result.macosMajor = 27;
+  result.macosMinor = 0;
   result.physicalMemoryBytes = 16 * kGiB;
   result.recommendedMaxWorkingSetBytes = workingSet;
   result.maxBufferLengthBytes = 8 * kGiB;
@@ -303,23 +303,23 @@ void testDeviceValidationNamesTheMacosFloor() {
   require(!device().validationError(),
           "the reference device reported a validation error");
   DeviceCapabilities older = device();
+  older.macosMajor = 26;
   older.macosMinor = 3;
-  require(older.validationError().value_or("") == "macos_26_4_required",
+  require(older.validationError().value_or("") == "macos_27_required",
           "macOS 26.3 was not refused with the macOS reason");
   // The operating system is checked before the device.
   older.appleGpuFamily = 8;
-  require(older.validationError().value_or("") == "macos_26_4_required",
+  require(older.validationError().value_or("") == "macos_27_required",
           "an older macOS did not take precedence over the device's reason");
   require(older.macosVersion() == "26.3.0",
           "the macOS version string is not major.minor.patch");
   DeviceCapabilities unknown = device();
   unknown.macosMajor = 0;
   unknown.macosMinor = 0;
-  require(unknown.validationError().value_or("") == "macos_26_4_required",
+  require(unknown.validationError().value_or("") == "macos_27_required",
           "an unknown macOS version was accepted");
   DeviceCapabilities newer = device();
-  newer.macosMajor = 27;
-  newer.macosMinor = 0;
+  newer.macosMajor = 28;
   require(!newer.validationError(), "a newer macOS major was refused");
 }
 
@@ -327,21 +327,22 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
   require(!device().validationMessage(),
           "the reference device has a validation message");
   const std::string needs =
-      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
+      "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 27.0 "
       "or newer; this Mac has ";
   DeviceCapabilities m2 = device();
   m2.deviceName = "Apple M2 Max";
   m2.appleGpuFamily = 8;
   m2.macosPatch = 1;
   require(m2.validationMessage().value_or("") ==
-              needs + "Apple M2 Max (Apple GPU family 8) on macOS 26.4.1 "
+              needs + "Apple M2 Max (Apple GPU family 8) on macOS 27.0.1 "
                       "(apple_gpu_family_9_required)",
           "a family-8 GPU was not named against the family required");
   DeviceCapabilities older = device();
+  older.macosMajor = 26;
   older.macosMinor = 3;
   require(older.validationMessage().value_or("") ==
               needs + "test (Apple GPU family 9) on macOS 26.3.0 "
-                      "(macos_26_4_required)",
+                      "(macos_27_required)",
           "an older macOS was not named against the macOS required");
 }
 

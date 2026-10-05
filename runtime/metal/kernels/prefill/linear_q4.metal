@@ -2,6 +2,11 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
+// Row-major sums of each 64-input group: sums[row * (input_size / 64) +
+// group]. Every producer (this pass, prefill_norm_rms_sums32, the q4 prefill
+// output-sums epilogues and the mixer gates) and consumer writes and reads
+// this flat layout, which is also what lets a producer emit a row range
+// starting at an unaligned row (the packed prefill sequences' rowBegin).
 kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
                               device float *sums [[buffer(1)]],
                               constant uint &input_size [[buffer(2)]],
@@ -18,7 +23,7 @@ kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
       uint origin = row * input_size + quant_group * 64 + simd_lane;
       float sum = simd_sum(float(input[origin]) + float(input[origin + 32]));
       if (simd_lane == 0) {
-        sums[quant_group * TileM + row] = sum;
+        sums[row * quant_groups + quant_group] = sum;
       }
     }
   }
@@ -74,7 +79,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
          index += Simdgroups * 32) {
       uint quant_group = start + index / TileM;
       uint row = index % TileM;
-      input_sums[index] = precomputed_sums[quant_group * TileM + row];
+      input_sums[index] = precomputed_sums[row * quant_groups + quant_group];
     }
   };
   if constexpr (StagedSums) {
@@ -103,7 +108,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
           tile_column + index[0];
       float sum = StagedSums
           ? input_sums[(quant_group % PrefillSumBatch) * TileM + row]
-          : precomputed_sums[quant_group * TileM + row];
+          : precomputed_sums[row * quant_groups + quant_group];
       accumulated[i] += partial[i] * float(scales[parameter]) +
                         sum * float(biases[parameter]);
     }
@@ -154,7 +159,7 @@ inline void q4_prefill_write_output_sums(device const bfloat *output,
     float sum = simd_sum(float(output[origin]) + float(output[origin + 32]));
     if (simd_lane == 0) {
       uint quant_group = output_origin / 64 + local_group;
-      output_sums[quant_group * TileM + row] = sum;
+      output_sums[row * (output_size / 64) + quant_group] = sum;
     }
   }
 }

@@ -110,12 +110,13 @@ uint32_t expectedApple10Splits(uint32_t cores, LinearMatrix matrix) {
   return selected;
 }
 
-// Apple10 one-lane MPP rule: paired N256 from eight tiles per core.
+// Apple10 one-lane MPP rule: paired N256 from three tiles per core, the
+// measured crossover on the 20-core M5 Pro (kPaired256TilesPerCore).
 std::optional<LinearConfig> expectedOneLane(uint32_t cores,
                                             LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
   const uint32_t tiles256 = n / 256;
-  if (epilogue == LinearEpilogue::None && tiles256 >= 8 * cores)
+  if (epilogue == LinearEpilogue::None && tiles256 >= 3 * cores)
     return LinearConfig{LinearTile::Paired256,
                         std::min(tiles256, 4 * cores),
                         LinearSimdgroups::Four};
@@ -150,7 +151,13 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
   };
   if (family >= 10 && lanes == 1)
     if (const auto oneLane = expectedOneLane(cores, matrix, epilogue)) return *oneLane;
-  if (epilogue == LinearEpilogue::GateUp) return {LinearTile::N256, groups(tiles256, gateUp)};
+  if (epilogue == LinearEpilogue::GateUp) {
+    // The resident gate/up rule: the whole N256 grid while it fits four
+    // tiles per core at one or two lanes (kGateUpGroups in Linear.cpp).
+    if (family >= 10 && lanes <= 2 && tiles256 <= 4 * cores)
+      return {LinearTile::N256, tiles256};
+    return {LinearTile::N256, groups(tiles256, gateUp)};
+  }
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, n128)};
   if (lanes == 3)
     return {LinearTile::N128, groups(tiles128, fourSimdgroups), LinearSimdgroups::Four};
@@ -336,7 +343,8 @@ void baselinePlans() {
   };
   const LinearWorkload gateUp{{17408, 5120}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   require(configured(10, 16, gateUp) == LinearConfig{LinearTile::N256, 36} &&
-              configured(10, 20, gateUp) == LinearConfig{LinearTile::N256, 48} &&
+              // 68 tiles fit four per core at 20 cores: one resident wave.
+              configured(10, 20, gateUp) == LinearConfig{LinearTile::N256, 68} &&
               configured(9, 40, gateUp) == LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 2} &&
               // Unknown counts use the same intermediate estimate on both families.
               configured(10, 0, gateUp) == configured(10, 32, gateUp) &&
@@ -395,7 +403,9 @@ void baselinePlans() {
                   LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 1} &&
               configured(10, 20, {{40960, 5120}, 8}) ==
                   LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four} &&
-              configured(10, 20, {{40704, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 318},
+              // 159 N256 tiles clear the three-per-core crossover.
+              configured(10, 20, {{40704, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 80, LinearSimdgroups::Four},
           "one-lane paired N256 anchors changed");
   // K % 1024 != 0 is legal for matrix tiles, and Split128 partitions differ by
   // at most one 256-input block (17 into 8 and 9, 3 into 1 and 2).
@@ -414,10 +424,14 @@ void baselinePlans() {
   // Balanced two-tile groups above one wave: 130 paired tiles keep three
   // groups per core on 20 cores and one full wave of longer chains on 16; 98
   // tiles land on 60 and 50 groups; the M16 grid holds to five per core.
-  require(configured(10, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 70} &&
-              configured(10, 16, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 64} &&
+  require(configured(10, 20, {{16640, 5120}, 8}) ==
+                  // 65 N256 tiles clear the three-per-core crossover.
+                  LinearConfig{LinearTile::Paired256, 65, LinearSimdgroups::Four} &&
+              configured(10, 16, {{16640, 5120}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 64, LinearSimdgroups::Four} &&
               configured(10, 20, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 60} &&
-              configured(10, 16, {{12544, 2048}, 8}) == LinearConfig{LinearTile::Paired128, 50} &&
+              configured(10, 16, {{12544, 2048}, 8}) ==
+                  LinearConfig{LinearTile::Paired256, 49, LinearSimdgroups::Four} &&
               configured(10, 20, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 75} &&
               configured(10, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 64} &&
               configured(10, 20, {{12544, 2048}, 16}) == LinearConfig{LinearTile::N128, 98} &&
@@ -1438,7 +1452,7 @@ void checkReference(const Projection &p, const Projection &gate,
         double expected = 0;
         for (uint32_t k = 0; k < 64; ++k)
           expected += tuning::bf16ToFloat(output[uint64_t{row} * p.outputSize + group * 64 + k]);
-        const uint64_t index = uint64_t{row / 32} * 32 * quantGroups + group * 32 + row % 32;
+        const uint64_t index = uint64_t{row} * quantGroups + group;
         require(std::abs(sums[index] - expected) <= 1e-6 * std::max(1.0, std::abs(expected)),
                 "fused prefill output sums have wrong layout/value");
       }

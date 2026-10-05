@@ -573,8 +573,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
         schedulerAfter.decodeBatchesByWidth[candidate - 1] -
         schedulerBefore.decodeBatchesByWidth[candidate - 1];
     if ((candidate == width && !delta) || (candidate != width && delta)) {
-      throw std::runtime_error(
-          "decode throughput request used a different physical batch width");
+      throw std::runtime_error("physical width accounting mismatch");
     }
   }
 

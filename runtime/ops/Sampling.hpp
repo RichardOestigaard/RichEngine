@@ -153,11 +153,42 @@ public:
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties) const;
+  // The tree batch's selection: SPLASH_TREE_VERIFY_NODES argmax rows per
+  // lane. Tree mode is greedy-only — a sampled, constrained or penalized
+  // lane throws (the runtime falls back to the chain batch).
+  void addVerifyTree(metal::CommandGraph &graph,
+                     std::span<const SamplingPolicy> policies,
+                     SamplingBuffers buffers, uint32_t stopToken0,
+                     uint32_t stopToken1) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
+  // Greedy acceptance over the lanes' verify trees: the walk emits the
+  // retained path's tokens and its emitted-row indices for the KV, GDN and
+  // captured-hidden commits.
+  void addTreeAcceptance(metal::CommandGraph &graph,
+                         metal::MetalBuffer treeTokens,
+                         metal::MetalBuffer treeNodes,
+                         metal::MetalBuffer treeCounts,
+                         metal::MetalBuffer targetTokens,
+                         metal::MetalBuffer outputTokens,
+                         metal::MetalBuffer retainedCounts,
+                         metal::MetalBuffer acceptedCounts,
+                         metal::MetalBuffer retainedPath,
+                         std::span<const uint32_t> maximumRetained,
+                         uint32_t stopToken0, uint32_t stopToken1) const;
+  // Splices ANE-produced alternates into every lane's sibling-leaf rows when
+  // the predictor job whose serial `expected` holds has published its tokens
+  // (metal/abi/Sampling.h TreeLeafPatchParams); a late or absent result keeps
+  // the draft's own leaves.
+  void addTreeLeafPatch(metal::CommandGraph &graph,
+                        metal::MetalBuffer treeTokens,
+                        metal::MetalBuffer medusaTokens,
+                        metal::MetalBuffer medusaFlag,
+                        metal::MetalBuffer treeCounts, uint32_t expected,
+                        uint32_t lanes) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h

@@ -36,10 +36,13 @@ struct MoeGroupParams {
   uint32_t top_k;
   uint32_t tile_rows;
   uint32_t experts;
+  // Whether every row's routes end in the shared expert (id `experts`),
+  // whose tiles follow the routed ones. LFM2-MoE has none.
+  uint32_t shared;
 };
 
-static_assert(sizeof(MoeGroupParams) == 16,
-              "MoE grouping parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 20,
+              "MoE grouping parameters are 20 bytes on both sides");
 
 struct MoeGatherParams {
   uint32_t tile_rows;

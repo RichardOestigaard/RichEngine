@@ -10,9 +10,9 @@ namespace splash {
 struct DeviceCapabilities {
     std::string deviceName = "unknown";
     // The tested floor (MACOS_MIN_VERSION in the Makefile); the MPP kernels
-    // need macOS 26.2 or newer.
-    static constexpr uint32_t kMinimumMacosMajor = 26;
-    static constexpr uint32_t kMinimumMacosMinor = 4;
+    // need macOS 26.2 or newer and the Metal 4.1 metallib macOS 27.
+    static constexpr uint32_t kMinimumMacosMajor = 27;
+    static constexpr uint32_t kMinimumMacosMinor = 0;
     uint32_t macosMajor = 0;
     uint32_t macosMinor = 0;
     uint32_t macosPatch = 0;

@@ -50,4 +50,42 @@ struct Table16 {
   }
 };
 
+// The mxfp4p A-operand (LinearInput::Packed): a producer drops in Packed for
+// Table wherever the caller's lane holds elements 2 * lane, 2 * lane + 1 of a
+// 64-column span — lanes 0-15 cover one of the span's two 32-element groups,
+// lanes 16-31 the other, so an xor-shuffle reduce over four bits is each
+// group's max. `packed` and `exponents` take the table and sums slots,
+// indexed by absolute row as the caller's pointer arithmetic provides (a
+// tile's first row plus `row`): packed is [rows][width] halves, slot s of
+// group g at packed[r * width + g * 32 + s] holding element
+// 16 * ((s >> 2) & 1) + 4 * (s >> 3) + (s & 3) of the group scaled by 2^-e,
+// exactly as gguf_pack_half writes it (kernels/shared/gguf_mxfp4p.metal);
+// exponents is [rows][width / 32] bytes of 127 + e.
+struct Packed {
+  static ulong sums_per_tile(uint width) { return width / 4; }  // 8 rows * width / 32 bytes
+  static void write(device half *packed, device uchar *exponents, uint width, uint span, uint row,
+                    uint lane, bfloat a, bfloat b) {
+    const float x = float(a), y = float(b);
+    float m = fmax(fabs(x), fabs(y));
+    // The 16 lanes of this half-simdgroup hold one whole 32-element group.
+    m = fmax(m, simd_shuffle_xor(m, 1u));
+    m = fmax(m, simd_shuffle_xor(m, 2u));
+    m = fmax(m, simd_shuffle_xor(m, 4u));
+    m = fmax(m, simd_shuffle_xor(m, 8u));
+    const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
+                      ? clamp(int(floor(log2(m))) - 14, -100, 100)
+                      : 0;
+    const float scale = as_type<float>(uint(127 - e) << 23);
+    const uint group = span * 2 + (lane >> 4);
+    device half *dst = packed + ulong(row) * width + group * 32;
+    // Element j of the group lands in slot (j & 3) | ((j >> 2 & 3) << 3) |
+    // ((j >> 4 & 1) << 2) — the inverse of the image's chunk-slot order.
+    const uint j = 2 * (lane & 15);
+    dst[(j & 3) | ((j & 16) >> 2) | ((j & 12) << 1)] = half(x * scale);
+    const uint j1 = j | 1;
+    dst[(j1 & 3) | ((j1 & 16) >> 2) | ((j1 & 12) << 1)] = half(y * scale);
+    if ((lane & 15) == 0) exponents[ulong(row) * (width / 32) + group] = uchar(127 + e);
+  }
+};
+
 } // namespace gguf_sg

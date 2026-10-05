@@ -28,21 +28,24 @@ splash_chunk_contract_valid(constant SplashChunkedPrefillParams &params) {
          params.kv.extent_pages > 0;
 }
 
+template <uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
 inline ulong splash_current_key_index(uint stride, uint head, uint token,
                                         uint dimension) {
-  return (ulong(head) * stride + token) * SplashKvHeadDimension + dimension;
+  return (ulong(head) * stride + token) * HeadDim + dimension;
 }
 
+template <uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
 inline ulong splash_current_value_index(uint stride, uint head, uint token,
                                           uint dimension) {
-  return (ulong(head) * SplashKvHeadDimension + dimension) * stride + token;
+  return (ulong(head) * HeadDim + dimension) * stride + token;
 }
 
 // One lane per dimension stores a current row in its final page slot.
 // INT8 derives a per-row scale; BF16 copies the original bits. Slots are
 // addressed inside the head's slab of the page: the page index functions at
 // page zero and head zero.
-template <uint KVHeads, typename CacheElement>
+template <uint KVHeads, typename CacheElement,
+          uint HeadDim = SPLASH_KV_HEAD_DIMENSION>
 __attribute__((always_inline)) inline void splash_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const SplashKvPage *page_table,
@@ -52,30 +55,71 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
   uint logical_token = params.committed_tokens + chunk_token;
   const SplashKvPage page = page_table[logical_token / SplashKvPageTokens];
   const SplashKvPageTensors<CacheElement> slab =
-      SplashKvAddressing<KVHeads, CacheElement>(params.kv, head).page(page);
+      SplashKvAddressing<KVHeads, CacheElement, HeadDim>(params.kv, head).page(page);
   uint page_token = logical_token % SplashKvPageTokens;
   ulong source_index =
-      value_tensor ? splash_current_value_index(params.chunk_stride, head,
+      value_tensor ? splash_current_value_index<HeadDim>(params.chunk_stride, head,
                                                   chunk_token, dimension)
-                   : splash_current_key_index(params.chunk_stride, head,
+                   : splash_current_key_index<HeadDim>(params.chunk_stride, head,
                                                 chunk_token, dimension);
   bfloat source = value_tensor ? chunk_values[source_index] : chunk_keys[source_index];
 
   if constexpr (is_same<CacheElement, bfloat>::value) {
     if (value_tensor)
-      slab.values[splash_kv_value_index<KVHeads>(0, 0, page_token, dimension)] = source;
+      slab.values[splash_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
     else
-      slab.keys[splash_kv_key_index<KVHeads>(0, 0, page_token, dimension)] = source;
+      slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
     return;
-  } else {
-
+  } else if constexpr (is_same<CacheElement, SplashKvPacked4>::value) {
+    constexpr uint Groups = HeadDim / 32;
     float value = float(source);
     float local_maximum = simd_max(abs(value));
     if (simd_lane == 0)
       maxima[simd_group] = local_maximum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
-      for (uint offset = 4; offset != 0; offset >>= 1) {
+      for (uint offset = Groups / 2; offset != 0; offset >>= 1) {
+        if (simd_lane < offset)
+          maxima[simd_lane] = max(maxima[simd_lane], maxima[simd_lane + offset]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maximum = maxima[0];
+    float scale = maximum == 0.0f ? 0.0f : maximum / 7.0f;
+    int quantized = maximum == 0.0f
+                        ? 0
+                        : clamp(int(rint(value * 7.0f / maximum)), -7, 7);
+    uint nibble = uint(quantized) & 0xFu;
+
+    // Packed bytes hold a dim pair at one token for both tensors, so the
+    // even lane writes a whole byte after taking the odd lane's code by
+    // shuffle. Keys and values are both token-major [token][dim pair], the
+    // element order of the attention tile's int4b matmul2d operands.
+    const uint partner = simd_shuffle_xor(nibble, 1);
+    if (value_tensor) {
+      if ((dimension & 1) == 0)
+        slab.values[(page_token * HeadDim + dimension) / 2] =
+            uchar(nibble | (partner << 4));
+      if (dimension == 0)
+        slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+    } else {
+      if ((dimension & 1) == 0)
+        slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension) / 2] =
+            uchar(nibble | (partner << 4));
+      if (dimension == 0)
+        slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
+    }
+  } else {
+
+    constexpr uint Groups = HeadDim / 32;
+    float value = float(source);
+    float local_maximum = simd_max(abs(value));
+    if (simd_lane == 0)
+      maxima[simd_group] = local_maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+      for (uint offset = Groups / 2; offset != 0; offset >>= 1) {
         if (simd_lane < offset)
           maxima[simd_lane] = max(maxima[simd_lane], maxima[simd_lane + offset]);
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -89,12 +133,12 @@ __attribute__((always_inline)) inline void splash_store_kv_row(
                         : clamp(int(rint(value * 127.0f / maximum)), -127, 127);
 
     if (value_tensor) {
-      slab.values[splash_kv_value_index<KVHeads>(0, 0, page_token, dimension)] =
+      slab.values[splash_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
           char(quantized);
       if (dimension == 0)
         slab.value_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;
     } else {
-      slab.keys[splash_kv_key_index<KVHeads>(0, 0, page_token, dimension)] =
+      slab.keys[splash_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
           char(quantized);
       if (dimension == 0)
         slab.key_scales[splash_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;

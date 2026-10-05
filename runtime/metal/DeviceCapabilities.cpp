@@ -11,7 +11,7 @@ std::string DeviceCapabilities::macosVersion() const {
 
 std::optional<std::string> DeviceCapabilities::validationError() const {
     // As at startup, the operating system is checked before the device.
-    if (!meetsMinimumMacos()) return "macos_26_4_required";
+    if (!meetsMinimumMacos()) return "macos_27_required";
     if (!physicalMemoryBytes) return "physical_memory_unavailable";
     if (!recommendedMaxWorkingSetBytes) {
         return "recommended_working_set_unavailable";

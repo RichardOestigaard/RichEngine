@@ -8,16 +8,18 @@ from collections import OrderedDict
 
 
 class PromptTokenizer:
-    MARKER = "<|im_end|>"
-    MIN_PREFIX_CHARS = 4096
-    BUDGET_BYTES = 8 * 1024 * 1024
-    CAPACITY = 4
-
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, marker=None):
         self.tokenizer = tokenizer
-        self.enabled = self._supports_boundaries(tokenizer)
+        # The token that ends a chat turn; the tokenizer's EOS by default, the
+        # validated contract's turn-end token where one is supplied.
+        self.marker = (
+            getattr(tokenizer, "eos_token", None) if marker is None else marker
+        )
+        self.enabled = isinstance(self.marker, str) and self._supports_boundaries(
+            tokenizer
+        )
         self.marker_id = (
-            tokenizer.backend_tokenizer.token_to_id(self.MARKER)
+            tokenizer.backend_tokenizer.token_to_id(self.marker)
             if self.enabled
             else None
         )
@@ -25,8 +27,11 @@ class PromptTokenizer:
         self.bytes = self.hits = self.reused_tokens = 0
         self.lock = threading.Lock()
 
-    @classmethod
-    def _supports_boundaries(cls, tokenizer):
+    MIN_PREFIX_CHARS = 4096
+    BUDGET_BYTES = 8 * 1024 * 1024
+    CAPACITY = 4
+
+    def _supports_boundaries(self, tokenizer):
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if not getattr(tokenizer, "is_fast", False) or backend is None:
             return False
@@ -56,9 +61,9 @@ class PromptTokenizer:
                 return False
         markers = []
         for token in backend.get_added_tokens_decoder().values():
-            if cls.MARKER not in token.content:
+            if self.marker not in token.content:
                 continue
-            if token.content != cls.MARKER:
+            if token.content != self.marker:
                 return False
             markers.append(token)
         return len(markers) == 1 and not any(
@@ -74,10 +79,12 @@ class PromptTokenizer:
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
     def encode(self, text):
-        boundary = text.rfind(self.MARKER)
-        if not self.enabled or boundary < 0:
+        if not self.enabled:
             return self._encode(text)
-        boundary += len(self.MARKER)
+        boundary = text.rfind(self.marker)
+        if boundary < 0:
+            return self._encode(text)
+        boundary += len(self.marker)
         if boundary < self.MIN_PREFIX_CHARS:
             return self._encode(text)
         prefix = text[:boundary]

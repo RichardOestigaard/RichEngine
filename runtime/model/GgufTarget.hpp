@@ -48,6 +48,16 @@ private:
   std::optional<GgufRotation> rotation_;
 };
 
+struct DenseLayout;
+struct Lfm2Layout;
+struct Lfm2MoeLayout;
+
+// The GGUF geometry of the dense ("llama"), LFM2 ("lfm2") and LFM2-MoE
+// ("lfm2moe") targets.
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout);
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout);
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout);
+
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE
 // FFN.
 template <class Layout>

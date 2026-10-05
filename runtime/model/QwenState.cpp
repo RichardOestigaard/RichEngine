@@ -21,6 +21,8 @@ void *writableContents(const MetalBuffer &buffer, const char *name) {
 
 void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
                const char *name) {
+  if (!destination.sizeBytes() && !source.sizeBytes())
+    return;
   if (destination.sizeBytes() != source.sizeBytes()) {
     throw std::logic_error(std::string(name) + " shape mismatch");
   }
@@ -29,6 +31,8 @@ void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
 }
 
 void clear(const MetalBuffer &buffer, const char *name) {
+  if (!buffer.sizeBytes())
+    return;
   std::memset(writableContents(buffer, name), 0, buffer.sizeBytes());
 }
 
@@ -36,8 +40,9 @@ std::vector<std::span<std::byte>> stateSpans(
     const GdnParityBuffers &gdn, const std::vector<DFlashDraftRingLayer> &draft) {
   std::vector<std::span<std::byte>> spans;
   const auto append = [&](const MetalBuffer &buffer) {
-    spans.emplace_back(static_cast<std::byte *>(writableContents(buffer, "state IO")),
-                       buffer.sizeBytes());
+    if (buffer.sizeBytes())
+      spans.emplace_back(static_cast<std::byte *>(writableContents(buffer, "state IO")),
+                         buffer.sizeBytes());
   };
   append(gdn.stateBase);
   for (const auto &layer : draft) {
@@ -104,8 +109,11 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
   if (!layout.valid())
     throw std::invalid_argument("Qwen GDN state layout is invalid");
   const uint64_t before = backend.memoryStats().allocatedBytes;
-  buffers_.stateBase = backend.allocateBuffer(
-      layout.cellBytes(), metal::BufferStorage::Shared, label);
+  // A stateless target's cell is empty: no layers, no allocation.
+  buffers_.stateBase =
+      layout.cellBytes()
+          ? backend.allocateBuffer(layout.cellBytes(), metal::BufferStorage::Shared, label)
+          : metal::MetalBuffer{};
   // The cell holds every layer's convolution state, then every layer's
   // recurrent state.
   buffers_.convolutionLayers.resize(layout.layers);
@@ -115,11 +123,12 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
         backend.view(buffers_.stateBase,
                      uint64_t{layer} * layout.convolutionLayerBytes(),
                      layout.convolutionLayerBytes());
-    buffers_.recurrentLayers[layer] = backend.view(
-        buffers_.stateBase,
-        layout.convolutionBytes() +
-            uint64_t{layer} * layout.recurrentLayerBytes(),
-        layout.recurrentLayerBytes());
+    if (layout.recurrentLayerBytes())
+      buffers_.recurrentLayers[layer] = backend.view(
+          buffers_.stateBase,
+          layout.convolutionBytes() +
+              uint64_t{layer} * layout.recurrentLayerBytes(),
+          layout.recurrentLayerBytes());
   }
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);

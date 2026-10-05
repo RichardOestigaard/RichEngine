@@ -13,12 +13,13 @@ kernel void rope_build_tables(
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
   // Target rows carry (t, h, w) positions; Qwen3.5's interleaved M-RoPE
-  // assigns frequency i to axis i % 3. Text rows repeat one position.
-  const uint target_elements = params.target_rows * 32;
+  // assigns frequency i to axis i % 3. Text rows repeat one position. The
+  // dense and LFM2 targets run one position axis and their own pair counts.
+  const uint target_elements = params.target_rows * params.target_dims;
   for (uint element = index; element < target_elements; element += grid_size) {
-    const uint row = element / 32;
-    const uint dim = element % 32;
-    const float angle = float(target_positions[row * 3 + dim % 3]) *
+    const uint row = element / params.target_dims;
+    const uint dim = element % params.target_dims;
+    const float angle = float(target_positions[row * 3 + dim % params.target_axes]) *
                         target_inverse_frequencies[dim];
     target_cosine[element] = cos(angle);
     target_sine[element] = sin(angle);

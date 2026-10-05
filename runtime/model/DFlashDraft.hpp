@@ -50,7 +50,21 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
+// Which draft architecture a layout describes: DFlash2 (dynamic convolutions,
+// candidate-selector codebooks, block-bidirectional attention), a plain
+// transformer DFlash draft (no convolutions or selector; its sliding
+// attention layers mask the block rows causally, its full layer does not) or
+// DSpark (no convolutions or selector codebooks; block-bidirectional layers
+// like DFlash2, plus a sequential Markov head that corrects each proposal
+// position's logits with a low-rank bias of the previously sampled token and
+// a confidence head the runtime loads but does not score).
+enum class DraftKind : uint8_t { DFlash2, Plain, DSpark };
+
 struct DFlashDraftLayout final {
+  DraftKind kind = DraftKind::DFlash2;
+  // Plain drafts: the bitmask of layers whose current block rows attend
+  // causally (sliding_attention layers; bit i is layer i). Zero for DFlash2.
+  uint32_t causalLayers = 0;
   uint32_t layers = 5;
   uint32_t hiddenSize = 5120;
   uint32_t vocabularySize = 248320;
@@ -63,6 +77,17 @@ struct DFlashDraftLayout final {
   uint32_t targetHiddenSize = 25600;
   uint32_t selectorRank = 256;
   uint32_t kvHeads = 8;
+  // DSpark only: the Markov head's inner rank (markov_w1/markov_w2 rows of
+  // vocabularySize x markovRank), the config's declared block_size (the
+  // runtime always dispatches ExecutionLimits::draftQueryRows query rows,
+  // padding or truncating the trained block) and whether the rotary is the
+  // interleaved (GPT-J) pairing rather than the half-split NeoX one.
+  uint32_t markovRank = 0;
+  uint32_t blockSize = 0;
+  uint32_t ropeInterleaved = 0;
+  // The norms' epsilon: 1e-6 unless the family declares another (LFM2's
+  // 1e-5, which also selects the _e5 draft kernels).
+  float rmsEpsilon = 1e-6F;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension};
@@ -70,7 +95,7 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+            attentionHeadDimension, ropeInterleaved};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -203,10 +228,13 @@ public:
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths) const;
+  // treeMask marks greedy, unconstrained lanes whose selector emits sibling
+  // leaves for tree verification; 0 selects the chain-only pipeline.
   void addSelection(metal::CommandGraph &graph,
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies) const;
+                    std::span<const ops::SamplingPolicy> policies,
+                    uint32_t treeMask) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions) const;

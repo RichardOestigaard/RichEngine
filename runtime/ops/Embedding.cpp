@@ -3,6 +3,7 @@
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Sampling.h"
 
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,9 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
       if (native.formatId != GGUF_FMT_PQ20 || table.inputSize % GGUF_ROTATION_BLOCK ||
           table.rotation.signs.sizeBytes() < table.inputSize)
         throw std::invalid_argument("a rotated token table takes PQ2_0 rows of whole rotation blocks and their signs");
+      // The GGUF decode kernels produce no output when they replay from an
+      // indirect command buffer on this driver (the gguf expert kernels fail
+      // the same way): never mark them.
       graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
                 params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
       return;
@@ -46,6 +50,8 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   const Q4EmbeddingParams params{rows, table.outputSize};
   const AffineWeights &affine = table.affine();
   // One kernel per compiled hidden size (kernels/shared/embedding.metal).
+  // Unmarked: the prefill path shares this op, and a one-dispatch span's
+  // cached ICB and params arena cost more than its encode saves.
   graph.add("embedding_q4_h" + std::to_string(table.inputSize),
             {std::move(tokens), affine.weights, affine.scales, affine.biases, std::move(output)},
             params, {hiddenGroups, 1, 1});
@@ -59,10 +65,49 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify input batch");
   const VerifyInputBatchParams params{vocabulary};
+  // One static-parameter dispatch over stable arena buffers: replayable.
+  graph.beginBakedSpan();
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},
             params, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, 1, 1},
+            {1, 1, 1});
+  graph.endBakedSpan();
+}
+
+void Embedding::addVerifyTreeInput(
+    metal::CommandGraph &graph, metal::MetalBuffer treeTokens,
+    metal::MetalBuffer treeNodes, metal::MetalBuffer treeCounts,
+    metal::MetalBuffer verifyInputTokens, metal::MetalBuffer positions,
+    metal::MetalBuffer masks, const uint32_t base[][3], uint32_t vocabulary,
+    uint32_t maskToken, uint32_t lanes) {
+  if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !base)
+    throw std::invalid_argument("invalid verify tree input batch");
+  VerifyTreeInputParams params{};
+  params.vocabulary = vocabulary;
+  params.mask_token = maskToken;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t axis = 0; axis < 3; ++axis)
+      params.base[lane][axis] = base[lane][axis];
+  graph.add("verify_input_tree_tokens",
+            {std::move(treeTokens), std::move(treeNodes),
+             std::move(treeCounts), std::move(verifyInputTokens),
+             std::move(positions), std::move(masks)},
+            params,
+            {uint64_t{lanes} * SPLASH_TREE_VERIFY_NODES, 1, 1}, {1, 1, 1});
+}
+
+void Embedding::addTreeCaptureGather(
+    metal::CommandGraph &graph, metal::MetalBuffer source,
+    metal::MetalBuffer retainedPath, metal::MetalBuffer retained,
+    metal::MetalBuffer destination, uint32_t width, uint32_t lanes) {
+  if (!width || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid tree capture gather");
+  graph.add("tree_capture_gather",
+            {std::move(source), std::move(retainedPath), std::move(retained),
+             std::move(destination)},
+            width,
+            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * width, 1, 1},
             {1, 1, 1});
 }
 

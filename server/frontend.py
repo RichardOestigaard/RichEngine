@@ -256,6 +256,7 @@ class Frontend:
         served_model_names=(),
         announce_served_name=False,
         default_reasoning_effort=None,
+        contract=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -267,7 +268,14 @@ class Frontend:
         # Probed at startup; requests choose among these, never the
         # tokenizer's own.
         self.chat_templates = chat_templates
-        self.prompt_tokenizer = PromptTokenizer(tokenizer)
+        # The validated tokenizer contract's ids; the module defaults stand
+        # in only where no contract was validated (the test harness).
+        self.think_end_id = (
+            THINK_END_TOKEN_ID if contract is None else contract.think_end_id
+        )
+        self.prompt_tokenizer = PromptTokenizer(
+            tokenizer, None if contract is None else contract.marker
+        )
         self.backend = backend
         # The package id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
@@ -954,13 +962,20 @@ class Frontend:
             with self.latencies.measure("grammar"):
                 if tools:
                     constraint = self.constraint_factory.create(
-                        tool_grammar(tool_policy, thinking, response_schema),
+                        tool_grammar(
+                            tool_policy,
+                            thinking,
+                            response_schema,
+                            think_end_id=self.think_end_id,
+                        ),
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
                 elif response_schema is not None:
                     constraint = self.constraint_factory.create(
-                        json_grammar(response_schema, thinking),
+                        json_grammar(
+                            response_schema, thinking, think_end_id=self.think_end_id
+                        ),
                         timeout=remaining_request_time(deadline),
                     )
         remaining_request_time(deadline)
@@ -1010,7 +1025,7 @@ class Frontend:
         """The tokens that begin each callable tool's call. Its parameter
         names are all possible next, so a tool with more of them than the
         parser admits fails there."""
-        reasoning = [THINK_END_TOKEN_ID] if thinking else []
+        reasoning = [self.think_end_id] if thinking else []
         return [
             (
                 reasoning

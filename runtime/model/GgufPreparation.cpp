@@ -25,6 +25,17 @@ static_assert(kGgufRepackStagingBytes <= std::numeric_limits<uint32_t>::max());
 uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
   const gguf::RowOrder &order = rows.order;
   if (row < order.from) return row;
+  if (order.rotaryInterleaved) {
+    if (!order.headRows || order.headRows % 2)
+      throw GgufError("invalid weight row permutation");
+    const uint64_t head = (row - order.from) / order.headRows;
+    const uint64_t dim = (row - order.from) % order.headRows;
+    const uint64_t half = order.headRows / 2;
+    const uint64_t source = order.from + head * order.headRows +
+                            2 * (dim % half) + (dim >= half ? 1 : 0);
+    if (source >= rows.rows) throw GgufError("weight row permutation is out of bounds");
+    return source;
+  }
   if (!order.headRows || !order.keyHeads || !order.valueHeadsPerKey)
     throw GgufError("invalid weight row permutation");
   const uint64_t head = (row - order.from) / order.headRows;

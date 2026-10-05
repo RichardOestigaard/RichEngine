@@ -113,13 +113,15 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
 }
 
 // runtime dequantizer selection (uniform per threadgroup): the format's pair table, which every thread of the
-// threadgroup fills, then its tile loop
-template <ushort Rows, ushort Cols, ushort KS, class Acc>
+// threadgroup fills, then its tile loop. NativeMxfp4 selects the `n` kernels' switch (quant_format_switch_native).
+template <ushort Rows, ushort Cols, ushort KS, bool NativeMxfp4, class Acc>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se, thread Acc &acc) {
-  quant_format_switch(fmt, [&](auto format) {
+  const auto body = [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
     staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, acc);
-  });
+  };
+  if constexpr (NativeMxfp4) quant_format_switch_native(fmt, body);
+  else quant_format_switch(fmt, body);
 }

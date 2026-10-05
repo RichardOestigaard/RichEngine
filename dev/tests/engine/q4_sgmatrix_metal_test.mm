@@ -396,7 +396,7 @@ int main(int argc,char **argv) {
   try {
     require(argc==2,"usage: q4-sgmatrix <production.metallib>");
     metal::MetalBackend backend(argv[1]);
-    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16})
+    for (LinearInput layout : {LinearInput::Table64, LinearInput::Table16, LinearInput::Packed})
       for (uint32_t lanes : {1U,2U,3U,4U}) {
         fusedAttentionGate(backend, 24, 4, lanes, layout);
         fusedAttentionGate(backend, 16, 2, lanes, layout);
@@ -412,7 +412,8 @@ int main(int argc,char **argv) {
     // The production pairs of table and norm weights (kernels/shared/normalization.metal): bf16 norms feed both
     // tables, F32 norms only Table16.
     for (auto [layout, float32] : {std::pair{LinearInput::Table64, false}, std::pair{LinearInput::Table16, false},
-                                   std::pair{LinearInput::Table16, true}})
+                                   std::pair{LinearInput::Table16, true}, std::pair{LinearInput::Packed, false},
+                                   std::pair{LinearInput::Packed, true}})
       for (uint32_t width : {64U, 320U, 1984U, 2048U, 2112U, 5120U, 17408U})
         for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows, layout, float32);
     for (uint32_t width : {64U, 2048U, 5120U, 17408U})

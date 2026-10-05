@@ -6,6 +6,9 @@
 // One KV head of one context row: a row of context_kv holds the row's keys,
 // then its values (KWidth each). The keys are normalized and rotated into
 // the ring slot of the row's position; the values are copied there.
+// Interleaved selects the GPT-J rotary pairing (adjacent pairs) over the
+// half-split NeoX one (a DSpark draft's rope_is_neox_style = false).
+template <uint KVHeads, uint HeadDim, bool Interleaved, bool E5 = false>
 inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -13,7 +16,7 @@ inline void draft_context_kv_phase(
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint KVHeads = 8, HeadDim = 128, Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)
@@ -27,16 +30,25 @@ inline void draft_context_kv_phase(
   device bfloat *value = values + ulong(head_index) * HeadDim * Window + slot;
 
   float element = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
-  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
-                                            reductions, thread_index, lane,
-                                            simd_group);
+  const float inverse =
+      rms_inverse_of_sums(element * element, HeadDim, reductions, thread_index,
+                          lane, simd_group, E5 ? 1e-5f : kRmsEpsilon);
   if (thread_index < HeadDim) {
     normalized[thread_index] =
         bfloat(element * inverse * float(k_norm[thread_index]));
     value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (thread_index < HeadDim / 2) {
+  if constexpr (Interleaved) {
+    if (thread_index < HeadDim / 2) {
+      float first = float(normalized[2 * thread_index]);
+      float second = float(normalized[2 * thread_index + 1]);
+      float cosine = rope_cos[ulong(row) * (HeadDim / 2) + thread_index];
+      float sine = rope_sin[ulong(row) * (HeadDim / 2) + thread_index];
+      key[2 * thread_index] = bfloat(first * cosine - second * sine);
+      key[2 * thread_index + 1] = bfloat(second * cosine + first * sine);
+    }
+  } else if (thread_index < HeadDim / 2) {
     float first = float(normalized[thread_index]);
     float second = float(normalized[thread_index + HeadDim / 2]);
     float cosine = rope_cos[ulong(row) * (HeadDim / 2) + thread_index];

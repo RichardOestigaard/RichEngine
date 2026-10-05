@@ -42,12 +42,14 @@ struct QuantCoef {
 
 // The id, sizes and traits of format F of kind K with code offset Z, whose
 // coefficients cover G elements and, with InChunk, whose scales are in every
-// chunk of a group.
+// chunk of a group. Native marks a format whose chunks decode by the Metal
+// 4.1 packed-numeric unpack instead of a pair table (FmtMXFP4N).
 #define QUANT_FORMAT(F, K, Z, G, InChunk)                                                                        \
   enum : uint { Id = F, P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
   enum : ushort { MetaGroups = kQuantFormats[F].meta_groups, Zero = Z, Group = G };                              \
   static constexpr constant QuantKind Kind = K;                                                                  \
-  static constexpr constant bool ScaleInChunk = InChunk
+  static constexpr constant bool ScaleInChunk = InChunk;                                                         \
+  static constexpr constant bool Native = false
 
 // Entries of a codebook format's pair table: one per index byte.
 constant constexpr uint kQuantPairTableEntries = 256;
@@ -56,7 +58,7 @@ constant constexpr uint kQuantPairTableEntries = 256;
 // threads of the threadgroup.
 template <class F, class T>
 inline void quant_pair_table(threadgroup T *table, uint thread_index, uint threads) {
-  if constexpr (F::Kind == QuantCodebook) {
+  if constexpr (F::Kind == QuantCodebook && !F::Native) {
     for (uint i = thread_index; i < kQuantPairTableEntries; i += threads) table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -426,6 +428,33 @@ struct FmtMXFP4 {
   static uint indices(Chunk q) { return q; }
   static QuantCoef coef(Meta e, ushort) { return {float2(as_type<float>(e < 2 ? 0x00200000u << e : uint(e - 1) << 23))}; }
 };
+// MXFP4 on Apple GPU family 10 (the host's `n` kernels; ops/LinearGguf.cpp, ops/MoE.cpp): FmtMXFP4's image and
+// E8M0 coefficient, the chunk's eight elements unpacked by the Metal 4.1 packed FP4-E2M1 hardware path
+// (metal_packed_numeric's unpack) instead of the pair table. The table's entries are twice the E2M1 values, so
+// the decoders double their operands. Where the toolchain lacks the format type, Native stays false and the
+// kernels degenerate to FmtMXFP4's table decode.
+struct FmtMXFP4N {
+  enum : uint { Id = FmtMXFP4::Id, P0 = FmtMXFP4::P0, P1 = FmtMXFP4::P1, MetaBytes = FmtMXFP4::MetaBytes };
+  enum : ushort { MetaGroups = FmtMXFP4::MetaGroups, Zero = FmtMXFP4::Zero, Group = FmtMXFP4::Group };
+  static constexpr constant QuantKind Kind = FmtMXFP4::Kind;
+  static constexpr constant bool ScaleInChunk = FmtMXFP4::ScaleInChunk;
+#if defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
+  static constexpr constant bool Native = true;
+#else
+  static constexpr constant bool Native = false;
+#endif
+  using Payload = FmtMXFP4::Payload;
+  typedef FmtMXFP4::Chunk Chunk;
+  typedef FmtMXFP4::Meta Meta;
+  typedef FmtMXFP4::Scale Scale;
+  static half value(uint i) { return FmtMXFP4::value(i); }
+  static Payload load(device uchar *p0, device uchar *p1) { return FmtMXFP4::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return FmtMXFP4::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) { return FmtMXFP4::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return FmtMXFP4::loadChunk(p0, p1, c); }
+  static uint indices(Chunk q) { return FmtMXFP4::indices(q); }
+  static QuantCoef coef(Meta e, ushort g) { return FmtMXFP4::coef(e, g); }
+};
 // PQ2_0 (Prism ML's GGUFs, ggml type 142): plane0 2-bit codes as Q2_K's; meta the half d of the 128-element native
 // block, four groups. value = d * (q - 1).
 struct FmtPQ20 {
@@ -459,6 +488,17 @@ inline void quant_format_switch(uint format, Body body) {
     QUANT_FORMATS(QUANT_FORMAT_CASE)
   }
 #undef QUANT_FORMAT_CASE
+}
+
+// As quant_format_switch, but GGUF_FMT_MXFP4 decodes on the native FP4 path
+// (FmtMXFP4N): only the kernels built for Apple GPU family 10 call it.
+template <class Body>
+inline void quant_format_switch_native(uint format, Body body) {
+  if (format == GGUF_FMT_MXFP4) {
+    body(FmtMXFP4N());
+    return;
+  }
+  quant_format_switch(format, body);
 }
 
 // QUANT_FORMATS lists every format, by its kQuantFormats name, and so does the switch above.

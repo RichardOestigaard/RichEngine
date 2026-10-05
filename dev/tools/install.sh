@@ -37,8 +37,8 @@ minor=${os#"$major"}
 minor=${minor#.}
 minor=${minor%%.*}
 [ -n "$minor" ] || minor=0
-[ "$major" -gt 26 ] 2>/dev/null || { [ "$major" -eq 26 ] && [ "$minor" -ge 4 ]; } \
-    || fail "Splash requires macOS 26.4 or newer; this Mac runs $os."
+[ "$major" -ge 27 ] 2>/dev/null \
+    || fail "Splash requires macOS 27 or newer; this Mac runs $os."
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 [ -n "$TOKEN" ] || fail "set SPLASH_TOKEN to the access token from your invitation."
 

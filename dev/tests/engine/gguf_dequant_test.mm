@@ -59,6 +59,22 @@ int main(int argc, char **argv) {
         std::cout << fmtName(f) << ": " << differ << " of " << values.size()
                   << " weights differ from FP16(GGML fp32 dequantization) " << (differ ? "FAIL" : "ok") << '\n';
         failures += differ != 0;
+        if (f == MXFP4 && backend.capabilities().appleGpuFamily >= 10) {
+          // The Metal 4.1 packed FP4-E2M1 decode of the same image and
+          // coefficient (FmtMXFP4N; the production `n` kernels' dequantizer).
+          const MetalBuffer nativeOutput = sharedBuffer(backend, uint64_t{N} * K * 2);
+          CommandGraph nativeGraph;
+          nativeGraph.add("gguf_test_dequant_mxfp4n", {w0, w1, meta, nativeOutput},
+                          GgufDecodeParams{K, 1, N, 0}, {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
+          static_cast<void>(backend.submitCommand(nativeGraph.dispatches()));
+          const auto *native = static_cast<const uint16_t *>(nativeOutput.contents());
+          size_t nativeDiffer = 0;
+          for (size_t i = 0; i < values.size(); ++i) nativeDiffer += native[i] != f2h(values[i]);
+          std::cout << "mxfp4n: " << nativeDiffer << " of " << values.size()
+                    << " weights differ from FP16(GGML fp32 dequantization) " << (nativeDiffer ? "FAIL" : "ok")
+                    << '\n';
+          failures += nativeDiffer != 0;
+        }
       }
     } catch (const std::exception &e) {
       std::cerr << "gguf-dequant: FAIL: " << e.what() << '\n';

@@ -92,9 +92,12 @@ struct GdnCommitBuffers final {
 
 class GDN final {
 public:
+  // `sums`, when present, is written by the gate's *_sums kernel: the
+  // out-projection's input sums beside the gated rows, so the mixer output
+  // needs no sums pass of its own.
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                          GdnShape shape, uint32_t tokens,
-                         GdnHeadOrder order);
+                         GdnHeadOrder order, metal::MetalBuffer sums = {});
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.
@@ -103,9 +106,24 @@ public:
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input);
+  // The tree-verify variants: SPLASH_TREE_VERIFY_NODES rows per lane, the
+  // node descriptors and emitted counts steering the conv taps and the
+  // leaf-on-copy scan. addCommitTree replays the retained path.
+  static PreparedInput addDecodeTree(metal::CommandGraph &graph,
+                                     GdnDecodeBuffers buffers,
+                                     metal::MetalBuffer treeNodes,
+                                     metal::MetalBuffer treeCounts,
+                                     GdnShape shape, uint32_t lanes,
+                                     uint32_t layer, GdnStateStrides state,
+                                     GdnHeadOrder order, LinearInput input);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state);
+  static void addCommitTree(metal::CommandGraph &graph,
+                            GdnCommitBuffers buffers,
+                            metal::MetalBuffer retainedPath,
+                            GdnShape shape, uint32_t layers, uint32_t lanes,
+                            GdnStateStrides state);
 };
 
 } // namespace splash::ops

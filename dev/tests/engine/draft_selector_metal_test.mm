@@ -165,7 +165,12 @@ void runCase(MetalBackend &backend, const Case &c) {
       allocate(backend,
                uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes)};
+      allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend,
+               uint64_t{c.lanes} * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
   for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
@@ -177,7 +182,8 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 
   CommandGraph graph;
-  selector.add(graph, buffers, codebooks, anchors, policies);
+  const uint32_t treeMask = c.sampling ? 0 : ((1U << c.lanes) - 1);
+  selector.addTree(graph, buffers, codebooks, anchors, policies, treeMask);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -195,8 +201,17 @@ void runCase(MetalBackend &backend, const Case &c) {
       static_cast<const uint16_t *>(codebooks.predecessor.contents());
   const auto *successors =
       static_cast<const uint16_t *>(codebooks.successor.contents());
+  const auto *treeTokens =
+      static_cast<const uint32_t *>(buffers.treeTokens.contents());
+  const auto *treeNodes =
+      static_cast<const uint32_t *>(buffers.treeNodes.contents());
+  const auto *treeCounts =
+      static_cast<const uint32_t *>(buffers.treeCounts.contents());
 
   for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    // The comb a greedy tree lane gets: one runner-up leaf per position.
+    std::vector<uint32_t> expectedLeaves;
+    std::vector<uint32_t> expectedLeafParents;
     uint32_t predecessor = anchors[lane];
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t global = lane * kPositions + position;
@@ -262,16 +277,59 @@ void runCase(MetalBackend &backend, const Case &c) {
                 "draft selector drew a different candidate than the reference");
       } else {
         uint32_t expectedSelection = 0;
+        uint32_t expectedRunner = kCandidates;
         for (uint32_t rank = 1; rank < kCandidates; ++rank)
           if (scores[rank] > scores[expectedSelection])
             expectedSelection = rank;
+        for (uint32_t rank = 0; rank < kCandidates; ++rank)
+          if (rank != expectedSelection &&
+              (expectedRunner == kCandidates ||
+               scores[rank] > scores[expectedRunner]))
+            expectedRunner = rank;
         // fp32 accumulation over 256 products of magnitude 1e-3 stays far
         // below this margin; only an exact tie could legitimately differ.
         require(selected == expectedSelection ||
                     std::fabs(scores[selected] - scores[expectedSelection]) < 1e-5,
                 "draft selector picked a different greedy candidate");
+        if (expectedRunner < kCandidates &&
+            candidates[global * kCandidates + expectedRunner] != token) {
+          expectedLeaves.push_back(
+              candidates[global * kCandidates + expectedRunner]);
+          expectedLeafParents.push_back(position);
+        }
       }
       predecessor = token;
+    }
+
+    const uint32_t laneBase = lane * SPLASH_TREE_VERIFY_NODES;
+    const bool treeLane = !c.sampling && (treeMask & (1U << lane));
+    require(treeTokens[laneBase] == anchors[lane] &&
+                SPLASH_TREE_NODE_PARENT(treeNodes[laneBase]) ==
+                    SPLASH_TREE_NODE_NONE &&
+                SPLASH_TREE_NODE_DEPTH(treeNodes[laneBase]) == 0,
+            "verify tree anchor node is malformed");
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t row = laneBase + position + 1;
+      require(treeTokens[row] == tokens[lane * kPositions + position] &&
+                  SPLASH_TREE_NODE_PARENT(treeNodes[row]) == position &&
+                  SPLASH_TREE_NODE_DEPTH(treeNodes[row]) == position + 1 &&
+                  SPLASH_TREE_NODE_POSITION(treeNodes[row]) == position,
+              "verify tree chain node is malformed");
+    }
+    const uint32_t expectedCount =
+        kPositions + 1 + (treeLane ? expectedLeaves.size() : 0);
+    require(treeCounts[lane] == expectedCount,
+            "verify tree node count is wrong");
+    for (uint32_t leaf = 0; leaf < expectedLeaves.size(); ++leaf) {
+      const uint32_t row = laneBase + kPositions + 1 + leaf;
+      require(treeTokens[row] == expectedLeaves[leaf] &&
+                  SPLASH_TREE_NODE_PARENT(treeNodes[row]) ==
+                      expectedLeafParents[leaf] &&
+                  SPLASH_TREE_NODE_DEPTH(treeNodes[row]) ==
+                      expectedLeafParents[leaf] + 1 &&
+                  SPLASH_TREE_NODE_POSITION(treeNodes[row]) ==
+                      expectedLeafParents[leaf],
+              "verify tree leaf node is malformed");
     }
   }
 }
@@ -289,7 +347,10 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, uint64_t{kRows} * kRank * 2),
       allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
-      allocate(backend, workspace.proposalProbabilitiesBytes)};
+      allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, kLanes * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, kLanes * SPLASH_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, kLanes * sizeof(uint32_t))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{1024} * kRank * 2),
                                  allocate(backend, uint64_t{1024} * kRank * 2)};
   const std::array<uint32_t, 2> anchors{1, 2};

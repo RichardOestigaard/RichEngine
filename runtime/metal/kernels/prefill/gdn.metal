@@ -323,3 +323,51 @@ GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, 16640, float)
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
                        float)
 #undef GDN_GATE_PREFILL_ENTRY
+
+// The *_sums variants also write the Affine64 out-projection's input sums of
+// the gated rows — the flat [row][64-group] layout and pairing of
+// prefill_linear_q4_sums32, computed post-store like
+// q4_prefill_write_output_sums — so no separate sums pass runs on the mixer
+// output. The threadgroup's HeadDim store lands at a 64-aligned offset of
+// one row, so its flat group index is the stored offset / 64.
+#define GDN_GATE_PREFILL_SUMS_ENTRY(Name, KeyHeads, ValueHeads, HeadDim,     \
+                                    ConvDim, PackedWidth, W)                 \
+  kernel void Name(                                                          \
+      device const bfloat *recurrent [[buffer(0)]],                          \
+      device const bfloat *packed [[buffer(1)]],                             \
+      device const W *norm_weight [[buffer(2)]],                             \
+      device bfloat *hidden [[buffer(3)]],                                   \
+      device float *sums [[buffer(4)]],                                      \
+      constant GDNGatePrefillParams &params [[buffer(5)]],                   \
+      uint task [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]],                     \
+      uint lane [[thread_index_in_simdgroup]],                               \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
+    threadgroup float reductions[4];                                         \
+    const bool tiled = params.tiled_heads != 0;                              \
+    gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(     \
+        recurrent, packed, norm_weight, hidden, task, tiled, reductions,     \
+        thread_index, lane, simd_group);                                     \
+    const ulong base =                                                       \
+        (ulong(task / ValueHeads) * ValueHeads +                             \
+         gdn_output_head<KeyHeads, ValueHeads>(task % ValueHeads, tiled)) *  \
+        HeadDim;                                                             \
+    threadgroup_barrier(mem_flags::mem_device);                              \
+    for (uint group = simd_group; group < HeadDim / 64; group += 4) {        \
+      const ulong origin = base + group * 64 + lane;                         \
+      const float sum =                                                      \
+          simd_sum(float(hidden[origin]) + float(hidden[origin + 32]));      \
+      if (lane == 0)                                                         \
+        sums[base / 64 + group] = sum;                                       \
+    }                                                                        \
+  }
+
+GDN_GATE_PREFILL_SUMS_ENTRY(prefill_gdn_gate_sums, 16, 48, 128, 10240, 16640,
+                            bfloat)
+GDN_GATE_PREFILL_SUMS_ENTRY(prefill_gdn_gate_sums_vh32, 16, 32, 128, 8192,
+                            12544, bfloat)
+GDN_GATE_PREFILL_SUMS_ENTRY(prefill_gdn_gate_sums_f32, 16, 48, 128, 10240,
+                            16640, float)
+GDN_GATE_PREFILL_SUMS_ENTRY(prefill_gdn_gate_sums_vh32_f32, 16, 32, 128, 8192,
+                            12544, float)
+#undef GDN_GATE_PREFILL_SUMS_ENTRY

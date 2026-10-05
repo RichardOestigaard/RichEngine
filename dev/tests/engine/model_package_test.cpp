@@ -569,7 +569,7 @@ void testSyntheticPackage(MetalBackend &backend,
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
-        require(package.draft.layers.size() == draft.layers,
+        require(std::get<splash::model::DFlashDraftWeights>(package.draft).layers.size() == draft.layers,
                 "draft layer vector is incomplete");
         require(std::holds_alternative<QwenGdnWeights>(
                     loadedTarget.layers[0].mixer),
@@ -579,18 +579,18 @@ void testSyntheticPackage(MetalBackend &backend,
                 "target full-attention layer has the wrong typed layout");
         require(loadedTarget.files.size() == target.layers + 2,
                 "target file records are incomplete");
-        require(package.draft.files.size() == draft.layers + 1,
+        require(std::get<splash::model::DFlashDraftWeights>(package.draft).files.size() == draft.layers + 1,
                 "draft file records are incomplete");
         require(declaredBytes(loadedTarget.files) == expected.targetBytes,
                 "target declared byte accounting is wrong");
-        require(declaredBytes(package.draft.files) == expected.draftBytes,
+        require(declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files) == expected.draftBytes,
                 "draft declared byte accounting is wrong");
         require(package.vision.tensors.blocks.size() == vision.depth &&
                     package.vision.files.size() == 1 &&
                     declaredBytes(package.vision.files) == expected.visionBytes,
                 "vision role records are incomplete");
         require(loadedTarget.actualAllocatedBytes +
-                    package.draft.actualAllocatedBytes +
+                    std::get<splash::model::DFlashDraftWeights>(package.draft).actualAllocatedBytes +
                     package.vision.actualAllocatedBytes ==
                     backend.memoryStats().allocatedBytes - baseline,
                 "actual package allocation accounting is wrong");
@@ -598,8 +598,8 @@ void testSyntheticPackage(MetalBackend &backend,
                 "manifest SHA-256 has the wrong length");
 
         std::vector<WeightFileRecord> records = loadedTarget.files;
-        records.insert(records.end(), package.draft.files.begin(),
-                       package.draft.files.end());
+        records.insert(records.end(), std::get<splash::model::DFlashDraftWeights>(package.draft).files.begin(),
+                       std::get<splash::model::DFlashDraftWeights>(package.draft).files.end());
         records.insert(records.end(), package.vision.files.begin(),
                        package.vision.files.end());
         require(weightManifestFingerprint(records) ==
@@ -624,9 +624,9 @@ void testSyntheticPackage(MetalBackend &backend,
                     package.manifestFingerprintSha256,
                 "manifest fingerprint ignores the sources' identity");
 
-        require(package.draft.layers[0].attentionDynamic.outputSize ==
+        require(std::get<splash::model::DFlashDraftWeights>(package.draft).layers[0].attentionDynamic.outputSize ==
                         draft.dynamicSize &&
-                    package.draft.layers[0].downProjection.outputSize ==
+                    std::get<splash::model::DFlashDraftWeights>(package.draft).layers[0].downProjection.outputSize ==
                         draft.hiddenSize,
                 "draft projections lost their logical dimensions");
         actualTrackedBytes =
@@ -643,7 +643,7 @@ void testSyntheticPackage(MetalBackend &backend,
         package.images->release();
         require(backend.memoryStats().allocatedBytes - baseline ==
                     actualTrackedBytes - declaredBytes(loadedTarget.files) -
-                        declaredBytes(package.draft.files) - declaredBytes(package.vision.files),
+                        declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files) - declaredBytes(package.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
         require(!package.images->restore() && !package.images->contents()[0].bytes.empty() &&
@@ -681,14 +681,14 @@ void validateRealPackage(MetalBackend &backend,
     {
         auto package = loadModelPackage(backend, root, splash::model::inspectModelPackage(root));
         targetBytes = declaredBytes(package.targetFiles());
-        draftBytes = declaredBytes(package.draft.files);
+        draftBytes = declaredBytes(std::get<splash::model::DFlashDraftWeights>(package.draft).files);
         visionBytes = declaredBytes(package.vision.files);
         const uint32_t targetLayers = std::visit(
             [](const auto &weights) { return weights.layout.layers; },
             package.target);
         require(package.targetFiles().size() == targetLayers + 2,
                 "real target file set is incomplete");
-        require(package.draft.files.size() == package.draft.layout.layers + 1,
+        require(std::get<splash::model::DFlashDraftWeights>(package.draft).files.size() == std::get<splash::model::DFlashDraftWeights>(package.draft).layout.layers + 1,
                 "real draft file set is incomplete");
         require(package.vision.files.size() == 1,
                 "real vision file set is incomplete");
@@ -761,6 +761,144 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     }
 }
 
+void writeJson(const std::filesystem::path &path, std::string_view text) {
+    std::ofstream output(path);
+    require(bool(output), "unable to write " + path.string());
+    output << text;
+}
+
+// A synthetic source package's draft config check: the two DSpark dialects
+// (MiniCPM5's flat fields, LFM2.5's dflash_config nesting) must parse to
+// their expected layouts.
+void testDSparkDescriptors(const std::filesystem::path &root) {
+    using splash::model::DraftKind;
+    {
+        const std::filesystem::path package = root / "minicpm5";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"MiniCPM5-2B","target_format":"mlx-affine","vision_format":"none"})");
+        writeJson(package / "config.json",
+                  R"({"model_type":"llama","hidden_size":2048,"num_hidden_layers":42,"vocab_size":130560,"max_position_embeddings":131072,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144})");
+        writeJson(package / "draft" / "config.json",
+                  R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144,"vocab_size":130560,"hidden_act":"silu","rms_norm_eps":1e-06,"attention_bias":false,"tie_word_embeddings":false,"rope_parameters":{"rope_theta":5000000,"rope_type":"default"},"block_size":7,"mask_token_id":75982,"target_layer_ids":[1,10,20,30,39],"num_target_layers":42,"projector_type":"dspark","markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"confidence_head_alpha":1.0,"attention_mode":"gqa","layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"]})");
+        const auto descriptor = splash::model::inspectModelPackage(package);
+        require(std::holds_alternative<splash::model::DenseLayout>(descriptor.target),
+                "MiniCPM5 target is not the dense layout");
+        require(descriptor.draft.kind == DraftKind::DSpark,
+                "MiniCPM5 draft is not a DSpark layout");
+        const auto &d = descriptor.draft;
+        require(d.layers == 5 && d.hiddenSize == 2048 &&
+                    d.vocabularySize == 130560 && d.intermediateSize == 6144 &&
+                    d.attentionSize == 2048 && d.qkvSize == 2560 &&
+                    d.kvHeads == 2 && d.attentionHeadDimension == 128 &&
+                    d.markovRank == 256 && d.blockSize == 7 &&
+                    d.targetHiddenSize == 10240 && !d.ropeInterleaved &&
+                    !d.causalLayers && d.rmsEpsilon == 1e-6F &&
+                    d.rotaryTheta == 5'000'000.0F && !d.selectorRank &&
+                    !d.dynamicSize,
+                "MiniCPM5 DSpark layout differs from the config");
+        require(descriptor.stateLayout.draft ==
+                    splash::model::DraftStateLayout{5, 2, 128},
+                "MiniCPM5 draft state layout mismatch");
+        require(descriptor.valid(), "MiniCPM5 descriptor is invalid");
+    }
+    {
+        const std::filesystem::path package = root / "lfm25";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"LFM2.5-2.6B","target_format":"gguf","vision_format":"none"})");
+        std::string layers = "[";
+        for (uint32_t layer = 0; layer < 30; ++layer) {
+            const bool attention =
+                layer == 2 || layer == 5 || layer == 9 || layer == 13 ||
+                layer == 17 || layer == 21 || layer == 24 || layer == 27;
+            layers += layer ? "," : "";
+            layers += attention ? "\"full_attention\"" : "\"conv\"";
+        }
+        layers += "]";
+        writeJson(package / "config.json",
+                  std::string("{\"model_type\":\"lfm2\",\"hidden_size\":2048,"
+                              "\"num_hidden_layers\":30,\"vocab_size\":128000,"
+                              "\"max_position_embeddings\":131072,"
+                              "\"num_attention_heads\":32,"
+                              "\"num_key_value_heads\":8,\"conv_dim\":2048,"
+                              "\"conv_L_cache\":3,\"intermediate_size\":10752,"
+                              "\"layer_types\":") +
+                      layers + "}");
+        writeJson(package / "draft" / "config.json",
+                  R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":10000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,9,17,21,27],"num_target_layers":30},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
+        const auto descriptor = splash::model::inspectModelPackage(package);
+        require(std::holds_alternative<splash::model::Lfm2Layout>(descriptor.target),
+                "LFM2.5 target is not the LFM2 layout");
+        const auto &d = descriptor.draft;
+        require(d.kind == DraftKind::DSpark && d.layers == 5 &&
+                    d.vocabularySize == 128000 && d.attentionSize == 2048 &&
+                    d.qkvSize == 3072 && d.kvHeads == 8 &&
+                    d.attentionHeadDimension == 64 && d.markovRank == 256 &&
+                    d.blockSize == 9 && d.targetHiddenSize == 10240 &&
+                    d.ropeInterleaved && d.rmsEpsilon == 1e-5F &&
+                    d.rotaryTheta == 10'000'000.0F,
+                "LFM2.5 DSpark layout differs from the config");
+        require(descriptor.stateLayout.draft ==
+                    splash::model::DraftStateLayout{5, 8, 64},
+                "LFM2.5 draft state layout mismatch");
+        require(descriptor.valid(), "LFM2.5 descriptor is invalid");
+    }
+    {
+        // LFM2.5-8B-A1B ("lfm2_moe"): 24 layers, attention at
+        // {2,6,10,14,18,21}, two leading dense-FFN layers then the
+        // sigmoid-gated MoE block, and its 8B-A1B DSpark draft.
+        const std::filesystem::path package = root / "lfm25moe";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"LFM2.5-8B-A1B","target_format":"gguf","vision_format":"none"})");
+        std::string layers = "[";
+        for (uint32_t layer = 0; layer < 24; ++layer) {
+            const bool attention =
+                layer == 2 || layer == 6 || layer == 10 || layer == 14 ||
+                layer == 18 || layer == 21;
+            layers += layer ? "," : "";
+            layers += attention ? "\"full_attention\"" : "\"conv\"";
+        }
+        layers += "]";
+        writeJson(package / "config.json",
+                  std::string("{\"model_type\":\"lfm2_moe\",\"hidden_size\":2048,"
+                              "\"num_hidden_layers\":24,\"vocab_size\":128000,"
+                              "\"max_position_embeddings\":128000,"
+                              "\"num_attention_heads\":32,"
+                              "\"num_key_value_heads\":8,\"conv_dim\":2048,"
+                              "\"conv_L_cache\":3,\"intermediate_size\":7168,"
+                              "\"num_experts\":32,\"num_experts_per_tok\":4,"
+                              "\"moe_intermediate_size\":1792,"
+                              "\"num_dense_layers\":2,"
+                              "\"layer_types\":") +
+                      layers + "}");
+        writeJson(package / "draft" / "config.json",
+                  R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":5000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,6,10,14,18],"num_target_layers":24},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
+        const auto descriptor = splash::model::inspectModelPackage(package);
+        require(std::holds_alternative<splash::model::Lfm2MoeLayout>(descriptor.target),
+                "LFM2.5-8B target is not the LFM2-MoE layout");
+        const auto &target =
+            std::get<splash::model::Lfm2MoeLayout>(descriptor.target);
+        require(target.layers == 24 && target.experts == 32 &&
+                    target.expertsPerToken == 4 &&
+                    target.expertIntermediateSize == 1792 &&
+                    target.intermediateSize == 7168 &&
+                    target.attentionLayerCount() == 6 &&
+                    target.gdnStateLayout().layers == 18,
+                "LFM2.5-8B target layout differs from the config");
+        const auto &d = descriptor.draft;
+        require(d.kind == DraftKind::DSpark && d.layers == 5 &&
+                    d.vocabularySize == 128000 && d.qkvSize == 3072 &&
+                    d.kvHeads == 8 && d.attentionHeadDimension == 64 &&
+                    d.blockSize == 9 && d.targetHiddenSize == 10240 &&
+                    d.ropeInterleaved && d.rmsEpsilon == 1e-5F &&
+                    d.rotaryTheta == 5'000'000.0F,
+                "LFM2.5-8B DSpark layout differs from the config");
+        require(descriptor.valid(), "LFM2.5-8B descriptor is invalid");
+    }
+}
+
 }  // namespace
 
 int main(int argc, const char *argv[]) {
@@ -774,6 +912,7 @@ int main(int argc, const char *argv[]) {
         TempDirectory temporary;
         testWeightImages(backend, temporary.path());
         testGgufImageLayout(backend, temporary.path());
+        testDSparkDescriptors(temporary.path() / "sources");
         testSyntheticPackage(backend, temporary.path() / "package");
         if (argc == 3) {
             testRealPackageMetadata(argv[2]);

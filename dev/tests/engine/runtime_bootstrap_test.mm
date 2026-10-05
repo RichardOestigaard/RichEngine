@@ -6,6 +6,8 @@
 #include "TestStatus.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
+#include "model/ModelDescriptor.hpp"
+#include "model/Ornith9B.hpp"
 #include "TestModel.hpp"
 
 #import <Foundation/Foundation.h>
@@ -35,7 +37,7 @@ using splash::test::require;
 
 class TemporaryModelRoot final {
 public:
-  TemporaryModelRoot() {
+  explicit TemporaryModelRoot(uint32_t hiddenSize = 5120) {
     path_ = std::filesystem::temp_directory_path() /
             ("splash-geometry-" +
              std::string([NSUUID UUID].UUIDString.UTF8String));
@@ -43,7 +45,8 @@ public:
       throw std::runtime_error("unable to create temporary model root");
     std::filesystem::create_directories(path_ / "tokenizer");
     std::ofstream config(path_ / "tokenizer" / "config.json");
-    config << R"({"text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,"hidden_size":5120,"vocab_size":248320}})";
+    config << R"({"text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,"hidden_size":)"
+           << hiddenSize << R"(,"vocab_size":248320}})";
     if (!config)
       throw std::runtime_error("unable to write tokenizer config");
   }
@@ -62,9 +65,11 @@ private:
 };
 
 std::string executionManifest(uint32_t draftRows = 8,
-                              std::string_view extraGeometry = {}) {
+                              std::string_view extraGeometry = {},
+                              std::string_view model = "Qwen3.8-27B-DFlash2") {
   std::ostringstream out;
-  out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
+  out << R"({"schema_version":3,"model":")" << model
+      << R"(","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
       << R"("draft_proposal_tokens":7,)"
       << "\"draft_query_rows\":" << draftRows << ','
       << R"("draft_sliding_window":2048,)"
@@ -148,6 +153,79 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 }
 
+// Both dense qwen3_5_text families share the packed format; the tokenizer
+// config's hidden size selects Ornith 9B's layout and its text-only draft.
+void testDenseManifestSelectsTargetByHiddenSize() {
+  TemporaryModelRoot root(4096);
+  root.write(executionManifest(8, {}, "Ornith-1.5-9B-DFlash2"));
+  const model::ModelDescriptor descriptor =
+      model::inspectModelPackage(root.path());
+  const auto *target = std::get_if<model::Ornith9BLayout>(&descriptor.target);
+  require(target && descriptor.valid(), "Ornith manifest built an invalid descriptor");
+  require(target->hiddenSize == 4096 && target->layers == 32 &&
+              target->hiddenCaptureLayers.size() == 8,
+          "Ornith packed manifest selected the wrong target layout");
+  require(descriptor.draft.layers == 6 && descriptor.draft.hiddenSize == 4096 &&
+              descriptor.draft.targetHiddenSize == 32768,
+          "Ornith packed manifest selected the wrong draft layout");
+  require(descriptor.visionSource == model::VisionSource::None,
+          "Ornith packed manifest kept a vision source");
+}
+
+// An upstream assembly's text_config layer count selects the dense family;
+// Ornith's own draft signature is then required.
+void testSourceModelSelectsDenseFamilyByLayers() {
+  class SourceRoot final {
+  public:
+    SourceRoot() {
+      path_ = std::filesystem::temp_directory_path() /
+              ("splash-source-" +
+               std::string([NSUUID UUID].UUIDString.UTF8String));
+      if (!std::filesystem::create_directories(path_ / "draft"))
+        throw std::runtime_error("unable to create source model root");
+    }
+    ~SourceRoot() { std::filesystem::remove_all(path_); }
+    void write(const std::filesystem::path &file,
+               std::string_view document) const {
+      std::ofstream output(path_ / file);
+      output << document;
+      if (!output) throw std::runtime_error("unable to write " + file.string());
+    }
+    const std::filesystem::path &path() const noexcept { return path_; }
+  private:
+    std::filesystem::path path_;
+  } root;
+  root.write("model.json",
+             R"({"version":1,"model":"Ornith-1.5-9B","target_format":"mlx-affine","vision_format":"none"})");
+  root.write("config.json",
+             R"({"text_config":{"model_type":"qwen3_5_text","hidden_size":4096,"num_hidden_layers":32,"vocab_size":248320,"max_position_embeddings":262144,"num_attention_heads":16,"num_key_value_heads":4,"head_dim":256}})");
+  root.write("draft/config.json",
+             R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":6,"hidden_size":4096,"vocab_size":248320,"intermediate_size":12288,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,"attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"hidden_act":"silu","rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"mask_token_id":248077,"target_layer_ids":[1,5,9,13,17,21,25,29]}})");
+  const model::ModelDescriptor descriptor =
+      model::inspectModelPackage(root.path());
+  require(std::holds_alternative<model::Ornith9BLayout>(descriptor.target) &&
+              descriptor.valid() &&
+              descriptor.targetSource == model::TargetSource::Mlx &&
+              descriptor.visionSource == model::VisionSource::None,
+          "an Ornith source assembly did not select the Ornith layout");
+  // A mismatched capture list is rejected.
+  root.write("draft/config.json",
+             R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":6,"hidden_size":4096,"vocab_size":248320,"intermediate_size":12288,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,"attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"hidden_act":"silu","rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"mask_token_id":248077,"target_layer_ids":[1,5,9,13,17,21,25,30]}})");
+  try {
+    static_cast<void>(model::inspectModelPackage(root.path()));
+    throw std::runtime_error("a wrong capture layer was accepted");
+  } catch (const std::invalid_argument &) {
+  }
+  // The 27B's own layer count still selects its layout.
+  root.write("config.json",
+             R"({"text_config":{"model_type":"qwen3_5_text","hidden_size":5120,"num_hidden_layers":64,"vocab_size":248320,"max_position_embeddings":262144,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256}})");
+  root.write("draft/config.json",
+             R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":5,"hidden_size":5120,"vocab_size":248320,"intermediate_size":17408,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,"attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"hidden_act":"silu","rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"mask_token_id":248070,"target_layer_ids":[5,19,33,47,61]}})");
+  require(std::holds_alternative<model::Qwen3_8Layout>(
+              model::inspectModelPackage(root.path()).target),
+          "a 27B source assembly did not select the 27B layout");
+}
+
 // The identity reports the loaded model's digests in lowercase hex and the
 // KV layout as loaded; a malformed digest or a missing build id fails before
 // anything is served.
@@ -186,8 +264,8 @@ DeviceCapabilities device() {
   DeviceCapabilities result;
   result.deviceName = "bootstrap-test";
   result.appleGpuFamily = 9;
-  result.macosMajor = 26;
-  result.macosMinor = 4;
+  result.macosMajor = 27;
+  result.macosMinor = 0;
   result.physicalMemoryBytes = 32 * kGiB;
   result.recommendedMaxWorkingSetBytes = 24 * kGiB;
   result.maxBufferLengthBytes = 16 * kGiB;
@@ -697,6 +775,8 @@ void testProtocolLimitsFollowTheModel() {
 int main() {
   try {
     testInstalledManifestBindsExecutionGeometry();
+    testDenseManifestSelectsTargetByHiddenSize();
+    testSourceModelSelectsDenseFamilyByLayers();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();

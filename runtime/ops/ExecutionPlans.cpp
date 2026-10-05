@@ -35,8 +35,9 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
+    std::span<const uint32_t> historyTokens, bool tree) const {
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens,
+                                    tree);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -57,6 +58,7 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     config.ggufTile = tile;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
+    config.mxfp4Native = appleGpuFamily_ >= 10;
   }
   return config;
 }

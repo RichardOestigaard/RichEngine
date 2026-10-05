@@ -114,8 +114,8 @@ DeviceCapabilities mac(uint64_t physicalGiB, uint64_t numerator,
   DeviceCapabilities device;
   device.deviceName = "governor-test";
   device.appleGpuFamily = 9;
-  device.macosMajor = 26;
-  device.macosMinor = 4;
+  device.macosMajor = 27;
+  device.macosMinor = 0;
   device.physicalMemoryBytes = physicalGiB * kGiB;
   device.recommendedMaxWorkingSetBytes =
       device.physicalMemoryBytes / denominator * numerator;
@@ -154,9 +154,9 @@ void testAdvertisedContextIsGrantable() {
     uint32_t advertisedTokens;
   };
   for (const Machine &machine :
-       {Machine{"32 GB INT8", 32, 2, 3, kv::Format::Int8, 69'625},
-        Machine{"36 GB INT8", 36, 3, 4, kv::Format::Int8, 253'945},
-        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'049}}) {
+       {Machine{"32 GB INT8", 32, 2, 3, kv::Format::Int8, 69'617},
+        Machine{"36 GB INT8", 36, 3, 4, kv::Format::Int8, 253'937},
+        Machine{"36 GB BF16", 36, 3, 4, kv::Format::BFloat16, 129'041}}) {
     // The 27B with its draft and vision tower: 16.2 GiB of weights.
     ModelMemoryProfile model =
         test::modelMemoryProfile(15 * kGiB, kGiB / 2, 7 * kGiB / 10);

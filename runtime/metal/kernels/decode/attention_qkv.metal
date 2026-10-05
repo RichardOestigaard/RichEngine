@@ -9,19 +9,20 @@ inline void full_qkv_decode_phase(
     device const W *k_norm, device const float *rope_cos,
     device const float *rope_sin, device bfloat *queries,
     device bfloat *keys, device bfloat *values, threadgroup float *reductions,
-    threadgroup bfloat *normalized, uint2 group, uint thread_index, uint lane,
+    threadgroup bfloat *normalized, constant FullDecodeBatchParams &params,
+    uint2 group, uint thread_index, uint lane,
     uint simd_group) {
   constexpr uint HeadDim = 256, RotaryPairs = 32, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
+  const uint rows = params.rows;
   uint batch = group.y;
-  constexpr ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
-  FullPrefillParams lane_params{Rows, Stride};
+  const ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
+  FullPrefillParams lane_params{rows, Stride};
   full_qkv_storage_phase<QHeads, KHeads>(
-      qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
-      rope_cos + ulong(batch) * Rows * RotaryPairs,
-      rope_sin + ulong(batch) * Rows * RotaryPairs,
+      qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
+      rope_cos + ulong(batch) * rows * RotaryPairs,
+      rope_sin + ulong(batch) * rows * RotaryPairs,
       queries + ulong(batch) * QHeads * Stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,
@@ -38,6 +39,7 @@ inline void full_qkv_decode_phase(
       device const float *rope_sin [[buffer(4)]],                             \
       device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]], \
       device bfloat *values [[buffer(7)]],                                    \
+      constant FullDecodeBatchParams &params [[buffer(8)]],                   \
       uint2 group [[threadgroup_position_in_grid]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
@@ -46,32 +48,95 @@ inline void full_qkv_decode_phase(
     threadgroup bfloat normalized[256];                                       \
     full_qkv_decode_phase<QHeads, KHeads>(                                    \
         qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,       \
-        reductions, normalized, group, thread_index, lane, simd_group);       \
+        reductions, normalized, params, group, thread_index, lane,            \
+        simd_group);                                                          \
   }
 VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, bfloat)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4, 16, 4, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, float)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4_f32, 16, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, float)
 #undef VERIFY_ATTENTION_QKV
 
-template <uint QHeads, uint KHeads>
+// The head-dimension variants' decode phase: no query gate, a full rotary of
+// HeadDim/2 pairs and per-head norms of epsilon `Eps` (LFM2's 1e-5; the
+// dense target runs none).
+template <uint QHeads, uint KHeads, uint HeadDim, bool Norms, class W>
+inline void full_qkv_decode_phase_hd(
+    device const bfloat *qkv, device const W *q_norm,
+    device const W *k_norm, device const float *rope_cos,
+    device const float *rope_sin, device bfloat *queries,
+    device bfloat *keys, device bfloat *values, threadgroup float *reductions,
+    threadgroup bfloat *normalized, constant FullDecodeBatchParams &params,
+    uint2 group, uint thread_index, uint lane,
+    uint simd_group, float eps) {
+  constexpr uint RotaryPairs = HeadDim / 2;
+  constexpr uint PackedStride = QHeads * HeadDim + 2 * KHeads * HeadDim;
+  constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
+  const uint rows = params.rows;
+  uint batch = group.y;
+  const ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
+  FullPrefillParams lane_params{rows, Stride};
+  full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, false, Norms>(
+      qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
+      rope_cos + ulong(batch) * rows * RotaryPairs,
+      rope_sin + ulong(batch) * rows * RotaryPairs,
+      queries + ulong(batch) * QHeads * Stride * HeadDim,
+      keys + ulong(batch) * kv_lane_stride,
+      values + ulong(batch) * kv_lane_stride, lane_params, reductions,
+      normalized, group.x, thread_index, lane, simd_group, eps);
+}
+
+// The dense target's KV2/Group8 of 128 (no norms) and LFM2's KV8/Group4 of
+// 64 (norms of epsilon 1e-5, in their stored type).
+#define VERIFY_ATTENTION_QKV_HD(Name, QHeads, KHeads, HeadDim, Norms, W, Eps) \
+  kernel void Name(                                                           \
+      device const bfloat *qkv [[buffer(0)]],                                 \
+      device const W *q_norm [[buffer(1)]],                                   \
+      device const W *k_norm [[buffer(2)]],                                   \
+      device const float *rope_cos [[buffer(3)]],                             \
+      device const float *rope_sin [[buffer(4)]],                             \
+      device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]], \
+      device bfloat *values [[buffer(7)]],                                    \
+      constant FullDecodeBatchParams &params [[buffer(8)]],                   \
+      uint2 group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint lane [[thread_index_in_simdgroup]],                                \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float reductions[HeadDim / 32];                               \
+    threadgroup bfloat normalized[HeadDim];                                   \
+    full_qkv_decode_phase_hd<QHeads, KHeads, HeadDim, Norms, W>(              \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,       \
+        reductions, normalized, params, group, thread_index, lane,            \
+        simd_group, Eps);                                                     \
+  }
+VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd128, 16, 2, 128, false, bfloat, 1e-6f)
+VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd64, 32, 8, 64, true, bfloat, 1e-5f)
+VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd64_f32, 32, 8, 64, true, float, 1e-5f)
+#undef VERIFY_ATTENTION_QKV_HD
+
+template <uint QHeads, uint KHeads, uint HeadDim = 256, bool Gate = true>
 inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
                                         device const bfloat *attention,
-                                        uint element) {
-  constexpr uint HeadDim = 256, QStride = 2 * HeadDim;
+                                        uint element, uint rows) {
+  constexpr uint QStride = Gate ? 2 * HeadDim : HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint HeadsPerKV = QHeads / KHeads, Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint per_lane = Rows * QHeads * HeadDim;
+  constexpr uint HeadsPerKV = QHeads / KHeads;
+  const uint per_lane = rows * QHeads * HeadDim;
   uint batch = element / per_lane;
   uint lane_element = element % per_lane;
   uint row = lane_element / (QHeads * HeadDim);
   uint remainder = lane_element % (QHeads * HeadDim);
   uint query_head = remainder / HeadDim;
   uint dim = remainder % HeadDim;
-  float gate = float(
-      packed_qkv[(ulong(batch) * Rows + row) * PackedStride +
-                 query_head * QStride + HeadDim + dim]);
-  float gate_scale = splash_sigmoid(gate);
+  float gate_scale = 1.0f;
+  if constexpr (Gate) {
+    float gate = float(
+        packed_qkv[(ulong(batch) * rows + row) * PackedStride +
+                   query_head * QStride + HeadDim + dim]);
+    gate_scale = splash_sigmoid(gate);
+  }
   uint kv_head = query_head / HeadsPerKV;
   uint local_head = query_head % HeadsPerKV;
   ulong attention_index =
@@ -83,15 +148,16 @@ inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
   return bfloat(float(attention[attention_index]) * gate_scale);
 }
 
-template <uint QHeads, uint KHeads>
+template <uint QHeads, uint KHeads, uint HeadDim = 256, bool Gate = true>
 inline void full_attention_gate_decode_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
     device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
     uint grid_size) {
-  const uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS * QHeads * 256;
+  const uint count =
+      params.lanes * params.rows * QHeads * HeadDim;
   for (uint element = index; element < count; element += grid_size)
     hidden[element] =
-        full_attention_gate_value<QHeads, KHeads>(packed_qkv, attention, element);
+        full_attention_gate_value<QHeads, KHeads, HeadDim, Gate>(packed_qkv, attention, element, params.rows);
 }
 
 kernel void verify_attention_gate(
@@ -102,6 +168,17 @@ kernel void verify_attention_gate(
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
   full_attention_gate_decode_phase<24, 4>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
+kernel void verify_attention_gate_kv4_g4(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullDecodeBatchParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_decode_phase<16, 4>(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
@@ -116,25 +193,80 @@ kernel void verify_attention_gate_kv2_g8(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
-#define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout) \
+#define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout, HeadDim, Gate) \
   kernel void Name( \
       device const bfloat *packed [[buffer(0)]], \
       device const bfloat *attention [[buffer(1)]], \
       device bfloat *hidden [[buffer(2)]], \
       device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      constant FullDecodeBatchParams &params [[buffer(5)]], \
       uint index [[thread_position_in_grid]], \
       uint lane [[thread_index_in_simdgroup]]) { \
-    constexpr uint width = QHeads * 256; \
+    constexpr uint width = QHeads * HeadDim; \
     const uint element = 2 * index; \
-    const bfloat a = full_attention_gate_value<QHeads, KHeads>(packed, attention, element); \
-    const bfloat b = full_attention_gate_value<QHeads, KHeads>(packed, attention, element + 1); \
+    const bfloat a = full_attention_gate_value<QHeads, KHeads, HeadDim, Gate>(packed, attention, element, params.rows); \
+    const bfloat b = full_attention_gate_value<QHeads, KHeads, HeadDim, Gate>(packed, attention, element + 1, params.rows); \
     hidden[element] = a; hidden[element + 1] = b; \
     const uint row = element / width; \
     Layout::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * Layout::sums_per_tile(width), \
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
-ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64)
-ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64)
-ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16)
-ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv4_g4, 16, 4, q4sg::Table64, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv4_g4, 16, 4, gguf_sg::Table16, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16, 256, true)
+// The no-gate gather variants of the dense and LFM2 targets, head
+// dimensions 128 and 64.
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_hd128, 16, 2, q4sg::Table64, 128, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_hd128, 16, 2, gguf_sg::Table16, 128, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_hd64, 32, 8, q4sg::Table64, 64, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_hd64, 32, 8, gguf_sg::Table16, 64, false)
 #undef ATTENTION_GATE_TABLE
+
+// The mxfp4p-operand variant (LinearInput::Packed): the same two elements per
+// thread through gguf_sg::Packed, which takes the table and sums slots as the
+// fp16 plane and exponent bytes — the table grid already covers every element.
+#define ATTENTION_GATE_PACKED(Name, QHeads, KHeads, HeadDim, Gate) \
+  kernel void Name( \
+      device const bfloat *packed [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      device half *plane [[buffer(3)]], device uchar *exponents [[buffer(4)]], \
+      constant FullDecodeBatchParams &params [[buffer(5)]], \
+      uint index [[thread_position_in_grid]], \
+      uint lane [[thread_index_in_simdgroup]]) { \
+    constexpr uint width = QHeads * HeadDim; \
+    const uint element = 2 * index; \
+    const bfloat a = full_attention_gate_value<QHeads, KHeads, HeadDim, Gate>(packed, attention, element, params.rows); \
+    const bfloat b = full_attention_gate_value<QHeads, KHeads, HeadDim, Gate>(packed, attention, element + 1, params.rows); \
+    hidden[element] = a; hidden[element + 1] = b; \
+    const uint row = element / width; \
+    gguf_sg::Packed::write(plane + ulong(row / 8) * width * 8, \
+                           exponents + ulong(row / 8) * gguf_sg::Packed::sums_per_tile(width), \
+                           width, (element % width) / 64, row % 8, lane, a, b); \
+  }
+ATTENTION_GATE_PACKED(verify_attention_gate_packed, 24, 4, 256, true)
+ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv4_g4, 16, 4, 256, true)
+ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv2_g8, 16, 2, 256, true)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd128, 16, 2, 128, false)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd64, 32, 8, 64, false)
+#undef ATTENTION_GATE_PACKED
+
+// The no-gate gather of a Plain-input out-projection: attention rows as
+// hidden, no packed gate or sigmoid.
+#define VERIFY_ATTENTION_GATHER(Name, QHeads, KHeads, HeadDim) \
+  kernel void Name( \
+      device const bfloat *packed_qkv [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      constant FullDecodeBatchParams &params [[buffer(3)]], \
+      uint index [[thread_position_in_grid]], \
+      uint grid_size [[threads_per_grid]]) { \
+    full_attention_gate_decode_phase<QHeads, KHeads, HeadDim, false>( \
+        packed_qkv, attention, hidden, params, index, grid_size); \
+  }
+VERIFY_ATTENTION_GATHER(verify_attention_gather_hd128, 16, 2, 128)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_hd64, 32, 8, 64)
+#undef VERIFY_ATTENTION_GATHER
