@@ -111,6 +111,28 @@ class ToolDialect:
             return _python_argument_grammar(schema)
         return _argument_grammar(schema, self)
 
+    def spelling(self, text):
+        """`text` as lark atoms: a structural marker is a special token,
+        spelled by its name so generation emits that token rather than the
+        characters; other text is a JSON string."""
+        atoms = []
+        special = [
+            marker
+            for marker in self.structural
+            if marker and re.fullmatch(r"<[^<>]*>", marker)
+        ]
+        while text:
+            marker = next((m for m in special if text.startswith(m)), None)
+            if marker is not None:
+                atoms.append(marker)
+                text = text[len(marker) :]
+                continue
+            ends = [text.find(m) for m in special]
+            end = min((index for index in ends if index >= 0), default=len(text))
+            atoms.append(json.dumps(text[:end]))
+            text = text[end:]
+        return " ".join(atoms)
+
     def call_rule(self, index, name, arguments):
         """The lark rule ``call_<index>`` spelling one call of tool `name`,
         its arguments coming from the side grammar `arguments`."""
@@ -123,9 +145,8 @@ class ToolDialect:
             f"{json.dumps(self.call_separator)}? " if self.call_separator else ""
         )
         return (
-            f"call_{index}: {separator}{json.dumps(self.call_open)} "
-            f"{json.dumps(self.name_prefix + name + self.name_close)} "
-            f"@{arguments} {json.dumps(self.call_close)}"
+            f"call_{index}: {separator}{self.spelling(self.call_opening(name))} "
+            f"@{arguments} {self.spelling(self.call_close)}"
         )
 
     def call_expression(self, count, parallel):
@@ -136,9 +157,7 @@ class ToolDialect:
         if self.kind != "python":
             return choice
         inner = choice + (f' ({json.dumps(", ")} {choice})*' if parallel else "")
-        return (
-            f"({json.dumps(self.call_open)} {inner} {json.dumps(self.call_close)})"
-        )
+        return f"({self.spelling(self.call_open)} {inner} {self.spelling(self.call_close)})"
 
     def free_arguments(self):
         """The lark grammar of an unconstrained call's arguments: any
@@ -312,7 +331,9 @@ _PYTHON_FREE_ARGUMENTS = (
 
 # The framing each supported chat template writes its calls in, detected at
 # startup from a rendered canary call.
-QWEN3_XML = ToolDialect(name="qwen3-xml")
+QWEN3_XML = ToolDialect(
+    name="qwen3-xml", structural=("<tool_call>", "</tool_call>")
+)
 
 MINICPM5_XML = ToolDialect(
     name="minicpm5-xml",
