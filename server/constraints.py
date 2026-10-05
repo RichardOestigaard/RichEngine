@@ -39,6 +39,9 @@ class TokenizerContract:
 
 
 class TokenConstraint:
+    # A mask request simulates at most the engine's target verify rows
+    # (ExecutionLimits::targetVerifyRows, 8: the pending anchor and seven
+    # draft proposals) and takes a mask before and after each.
     MAX_ROWS = 9
 
     def __init__(self, matcher, executor, contract):

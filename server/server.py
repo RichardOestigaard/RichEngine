@@ -62,7 +62,9 @@ from .output import (
 )
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
-# Match the former generation ingress envelope (32 slots × 16 MiB).
+# Request bodies held at once, from upload through preparation and, for what
+# a generation retains of them, until it ends, take at most max(this, twice
+# --max-request-size) bytes, so two of the largest requests always fit.
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
@@ -1786,7 +1788,7 @@ class FrontendServer(ThreadingHTTPServer):
         address,
         app,
         bind_and_activate=True,
-        request_capacity=32,
+        request_capacity=serve_options.DEFAULT_QUEUE_SIZE,
         allowed_hosts=(),
         api_key=None,
         webui=True,
