@@ -33,6 +33,7 @@ PARAMETER_OPEN = "<parameter="
 PARAMETER_CLOSE = "\n</parameter>\n"
 CALL_OPEN = f"{TOOL_CALL_OPEN}\n{FUNCTION_START}"
 THINK_END = "</think>"
+THINK_OPEN = "<think>"
 # The same framing in a ToolDialect's field terms: a call is call_open +
 # name_prefix + name + name_close, and ends with call_close.
 FUNCTION_OPEN = f"\n{FUNCTION_START}"

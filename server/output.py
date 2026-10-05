@@ -17,6 +17,7 @@ from .tool_schema import (
     NAME_SPACE,
     QWEN3_XML,
     THINK_END,
+    THINK_OPEN,
     json_value,
 )
 
@@ -55,6 +56,11 @@ class ReasoningSplitter:
         if not self.reasoning:
             return self._content(text)
         self.pending += text
+        # A template that leaves reasoning open ends the prompt at the role
+        # tag, so the model writes <think> itself; it marks the reasoning
+        # rather than being part of it.
+        if self.pending.startswith(THINK_OPEN):
+            self.pending = self.pending[len(THINK_OPEN) :]
         ends = [
             (index, marker)
             for marker in self.ends
@@ -71,7 +77,7 @@ class ReasoningSplitter:
             self.separator = marker == THINK_END
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
-        ready, self.pending = hold_partial(self.pending, *self.ends)
+        ready, self.pending = hold_partial(self.pending, *self.ends, THINK_OPEN)
         return [("reasoning_content", ready)] if ready else []
 
     def _content(self, text):
