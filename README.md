@@ -168,10 +168,20 @@ partial-prefix request.
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
 | --- | ---: | ---: |
-| Decode · short prompt | 260 tok/s | 103 tok/s |
-| Prefill · 14K prompt | 2,876 tok/s | 466 tok/s |
-| Time to first token · 14K prompt, 10K cached | 1.6 s | 9.4 s |
-| Aggregate decode · 4 concurrent short prompts | 703 tok/s | 246 tok/s |
+| Decode · short prompt | 259 tok/s | 103 tok/s |
+| Prefill · 14K prompt | 2,937 tok/s | 600 tok/s |
+| Time to first token · 14K prompt, 10K cached | 1.7 s | 7.4 s |
+| Aggregate decode · 4 concurrent short prompts | 714 tok/s | 246 tok/s |
+
+Decode numbers run `--kv-format int8`; the benchmark's synthetic prompt
+reads 69% draft acceptance on the 35B and 43% on the 27B — the 27B's drop
+from an earlier 87% is under investigation (see
+[BENCHMARKING.md](BENCHMARKING.md)).
+
+A dense model's prefill also runs its FFN on the Apple Neural Engine when
+calibration finds that faster — on this Mac the 27B's split at share 0.41
+cuts a cold 14K prefill from 28.4 s to 22.5 s (1.26×), decode unchanged.
+`--disable-ane` keeps prefill on the GPU alone.
 
 The same benchmark on the 2B-class GGUF installs on this Mac:
 
@@ -182,15 +192,18 @@ The same benchmark on the 2B-class GGUF installs on this Mac:
 | Time to first token · 14K prompt, 10K cached | 1.1 s | 1.6 s |
 | Aggregate decode · 4 concurrent short prompts | 319 tok/s | 390 tok/s |
 
-The Granite 4.2 GGUF installs, measured the same way with a ~2K-token prompt.
-Granite ships no draft model, so decode verifies n-gram proposals instead of a
-neural draft's — acceptance is high on repetitive output (over 400 tok/s) and
-near zero on free text:
+The Granite 4.2 GGUF installs, measured the same way. Granite ships no
+draft model, so decode verifies n-gram proposals instead of a neural
+draft's; acceptance on this prompt is 39% on the 3B and 27% on the 8B.
+Neither hidden size fits the Neural Engine split, so their prefills run on
+the GPU alone:
 
 | Metric | Granite-4.2-3B | Granite-4.2-8B |
 | --- | ---: | ---: |
-| Decode | 79 tok/s | 40 tok/s |
-| Prefill | 3,469 tok/s | 1,553 tok/s |
+| Decode · short prompt | 303 tok/s | 116 tok/s |
+| Prefill · 14K prompt | 2,117 tok/s | 1,226 tok/s |
+| Time to first token · 14K prompt, 10K cached | 2.6 s | 4.1 s |
+| Aggregate decode · 4 concurrent short prompts | 883 tok/s | 363 tok/s |
 
 Agent-style follow-ups that share a chat template's leading system prompt and
 tools resume from a shared-prefix junction: 2.5 s to first token against

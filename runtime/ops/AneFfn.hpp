@@ -147,9 +147,10 @@ private:
   friend class ane_ffn::Measurement;
 
   // The split's channels: hidden and intermediate, the layers', the GPU's and
-  // the ANE's, and the segments of down's inputs the ANE takes.
+  // the ANE's, the segment of the hidden inputs gate and up multiply, and the
+  // segments of down's inputs the ANE takes.
   struct Shape final {
-    uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
+    uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0, inputSegment = 0;
     std::vector<uint32_t> downSegments;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each

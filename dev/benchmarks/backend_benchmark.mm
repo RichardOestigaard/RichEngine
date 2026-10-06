@@ -725,6 +725,14 @@ double parseAneFfnShare(std::string_view value) {
   return share;
 }
 
+// --kv-format: the KV cache's format, as serve's --kv-format.
+kv::Format parseKvFormat(std::string_view value) {
+  for (const kv::Format format : {kv::Format::Int4, kv::Format::Int8, kv::Format::BFloat16,
+                                  kv::Format::Float8E4M3})
+    if (kv::formatName(format) == value) return format;
+  throw std::invalid_argument("--kv-format takes int4, int8, bf16 or fp8e4m3");
+}
+
 double median(std::vector<double> values) {
   if (values.empty())
     throw std::invalid_argument("cannot take the median of no samples");
@@ -794,7 +802,8 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS]\n"
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--kv-format FORMAT]\n"
                    "  NAME: decode, partial, short, context or exact "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
@@ -802,7 +811,9 @@ int main(int argc, char **argv) {
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
-                   "--max-context (default: what memory holds)\n";
+                   "--max-context (default: what memory holds)\n"
+                   "  FORMAT: the KV cache's format, as serve's --kv-format "
+                   "(default: int8, the format the published numbers run)\n";
       return 2;
     }
     uint32_t samples = 1;
@@ -811,6 +822,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    kv::Format kvFormat = kv::Format::Int8;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
@@ -827,6 +839,8 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--kv-format") {
+        kvFormat = parseKvFormat(argv[index + 1]);
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -841,6 +855,7 @@ int main(int argc, char **argv) {
     config.model = model::inspectModelPackage(config.modelRoot);
     config.buildId = RICHENGINE_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.kvFormat = kvFormat;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -1211,7 +1226,7 @@ int main(int argc, char **argv) {
           evictAllCache(resources->cache());
           Measurement result = runRequest(
               engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
-              prompt(rows + 1, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
+              prompt(rows + 1, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL, promptVocabulary));
           if (result.cacheStatus != "miss")
             throw std::runtime_error("short prompt of a " + std::to_string(rows) +
                                      "-row chunk was not a cold miss: " + result.cacheStatus);

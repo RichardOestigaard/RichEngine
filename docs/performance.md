@@ -21,12 +21,19 @@ other kernels; [GGUF against llama.cpp](#gguf-against-llamacpp) compares them.
 | Decode · short prompt (B1) | 260 tok/s | 103 tok/s |
 | Decode · aggregate, 2 lanes (B2) | 458 tok/s | 177 tok/s |
 | Decode · aggregate, 3 lanes (B3) | 594 tok/s | 191 tok/s |
-| Decode · aggregate, 4 lanes (B4) | 703 tok/s | 246 tok/s |
-| Prefill · 14,096-token prompt, cold | 2,876 tok/s | 466 tok/s |
-| Time to first token · 14K prompt, 10K cached | 1.6 s | 9.4 s |
+| Decode · aggregate, 4 lanes (B4) | 714 tok/s | 246 tok/s |
+| Prefill · 14,096-token prompt, cold | 2,937 tok/s | 600 tok/s |
+| Time to first token · 14K prompt, 10K cached | 1.6 s | 7.4 s |
 
-Draft acceptance on the short-prompt decode: 69% on the 35B, 87% on the
-27B.
+Draft acceptance on the short-prompt decode: 69% on the 35B, 43% on the
+27B. Decode benchmarks run `--kv-format int8` (INT4 measurably lowers
+acceptance). The 27B's prefill rows run its calibrated Neural Engine split
+(share 0.41); with `--disable-ane` it prefills at 495 tok/s and reaches the
+first token in 8.7 s.
+
+The 27B's draft acceptance is down from 87% in earlier measurements of the
+same benchmark — the KV format does not explain it (INT4 reads 51% here),
+so the drop looks like a draft-path regression under investigation.
 
 The Neural Engine prefill split (`--disable-ane` keeps the FFN on the GPU)
 runs part of each dense layer's FFN on the Apple Neural Engine during
@@ -65,6 +72,25 @@ tok/s) — the model saturates by width 2, so the benchmark's monotonicity
 gate reports a performance failure even though every check's numbers are
 valid. The `Q4_K_M` LFM2.5 install does not complete the batched decode
 scenario on this build.
+
+### Granite 4.2
+
+The same benchmark on the `Q4_K_M` GGUF installs. Granite ships no draft
+model, so decode verifies n-gram proposals instead of a neural draft's;
+acceptance on this prompt is 39% on the 3B and 27% on the 8B.
+
+| Metric | Granite-4.2-3B | Granite-4.2-8B |
+| --- | ---: | ---: |
+| Decode · short prompt (B1) | 303 tok/s | 116 tok/s |
+| Decode · aggregate, 2 lanes (B2) | 565 tok/s | 230 tok/s |
+| Decode · aggregate, 3 lanes (B3) | 662 tok/s | 274 tok/s |
+| Decode · aggregate, 4 lanes (B4) | 883 tok/s | 363 tok/s |
+| Prefill · 14,096-token prompt, cold | 2,117 tok/s | 1,226 tok/s |
+| Time to first token · 14K prompt, 10K cached | 2.6 s | 4.1 s |
+
+The Neural Engine split does not apply to either Granite: the 3B's hidden
+size overflows the rotation's block count and the 8B's is no whole
+2,560-channel segment, so both prefill on the GPU alone.
 
 For repeatable measurements on your Mac, see [local benchmarks](../DEVELOPMENT.md#local-benchmarks).
 

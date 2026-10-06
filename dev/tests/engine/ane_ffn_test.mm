@@ -458,11 +458,19 @@ void takes(MetalBackend &backend, const Model &affine, const Model &gguf) {
   if (AneFfn::unsupported(affine.layers) || AneFfn::unsupported(gguf.layers))
     fail("the split does not take the models");
   if (!AneFfn::unsupported({})) fail("the split takes no layers");
-  // A hidden size the programs' segments do not take, and layers of two shapes.
-  const Projection gate = test::deterministicQ4Projection(backend, {kIntermediate, 4096}, 1);
-  const Projection down = test::deterministicQ4Projection(backend, {4096, kIntermediate}, 2);
-  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, mixed{affine.layers[0], narrow[0]};
-  if (!AneFfn::unsupported(narrow)) fail("the split takes a hidden size of 4096");
+  // A hidden size the programs' segments do not take, one ane_ffn_rotate does
+  // not, and layers of two shapes.
+  const Projection gate = test::deterministicQ4Projection(backend, {kIntermediate, 4352}, 1);
+  const Projection down = test::deterministicQ4Projection(backend, {4352, kIntermediate}, 2);
+  const Projection rotateGate = test::deterministicQ4Projection(backend, {kIntermediate, 1536}, 3);
+  const Projection rotateDown = test::deterministicQ4Projection(backend, {1536, kIntermediate}, 4);
+  const Projection ornithGate = test::deterministicQ4Projection(backend, {kIntermediate, 4096}, 5);
+  const Projection ornithDown = test::deterministicQ4Projection(backend, {4096, kIntermediate}, 6);
+  const std::vector<SwiGluProjections> narrow{{&gate, &gate, &down}}, rotate{{&rotateGate, &rotateGate, &rotateDown}},
+      ornith{{&ornithGate, &ornithGate, &ornithDown}}, mixed{affine.layers[0], narrow[0]};
+  if (AneFfn::unsupported(ornith)) fail("the split does not take a hidden size of 4096");
+  if (!AneFfn::unsupported(narrow)) fail("the split takes a hidden size of 4352");
+  if (!AneFfn::unsupported(rotate)) fail("the split takes a hidden size of 1536");
   if (!AneFfn::unsupported(mixed)) fail("the split takes layers of two shapes");
   if (AneFfn::units(affine.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
