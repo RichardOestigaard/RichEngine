@@ -424,7 +424,6 @@ SERVE_OPTIONS = (
     ),
     ServeOption(
         "--disable-ane",
-        "requests",
         dict(
             action="store_true",
             default=False,
