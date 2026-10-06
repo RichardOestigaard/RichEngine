@@ -198,6 +198,29 @@ void testDiskTierStateStagingIsBudgeted() {
           "a plan without the disk tier reported state staging");
 }
 
+// The prefill FFN's Neural Engine split is fixed runtime memory of its own
+// category, which the KV cache gives up, so the context it leaves is the
+// plan's to state; the status and description report it.
+void testNeuralEngineSplitIsBudgeted() {
+  const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
+  ModelMemoryProfile split = model();
+  // Qwen3.8-27B's split at the M6's share (DEVELOPMENT.md, Neural Engine prefill).
+  const uint64_t surfaces = 508 * kMiB;
+  split.footprint.aneFfnBytes = surfaces;
+  const EngineMemoryPlan with = test::requireMemoryPlan(device(), split);
+  const auto &budget = with.breakdown();
+  require(budget.aneFfnBytes == surfaces &&
+              budget.fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + surfaces &&
+              with.maximumContextTokens() < without.maximumContextTokens(),
+          "the split was not planned as fixed runtime memory out of the KV cache");
+  require(with.toStatusJson().find("\"ane_ffn_bytes\":" + std::to_string(surfaces) +
+                                   ",\"state_staging_bytes\"") != std::string::npos &&
+              budget.describe().find("Neural Engine split: " + std::to_string(surfaces)) !=
+                  std::string::npos &&
+              without.toStatusJson().find("\"ane_ffn_bytes\":0,") != std::string::npos,
+          "the split is missing from the memory plan status");
+}
+
 // The pipeline and runtime reserves are the model constants rather than part
 // of a model's plan, and a model's plan without one of its arenas is refused.
 void testReservesAreTheModelConstants() {
@@ -354,6 +377,7 @@ int main() {
     testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
+    testNeuralEngineSplitIsBudgeted();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
     testContextTokensWithin();

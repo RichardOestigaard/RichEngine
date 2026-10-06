@@ -1,5 +1,7 @@
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
+#include "ane/ProgramInstrumentation.hpp"
+#include "engine/RuntimeResources.hpp"
 #include "engine/memory/MemoryGovernor.hpp"
 #include "engine/memory/MemoryPlan.hpp"
 #include "engine/wire/Types.hpp"
@@ -1413,7 +1415,13 @@ int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
     kv::Format format = kv::Format::Int8;
-    if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
+    std::optional<double> givenAneFfnShare;
+    // The evaluation of the split's program that fails, counted from 1 as
+    // ane::ProgramInstrumentation counts them; 0 for none.
+    uint64_t aneFfnFault = 0;
+    if (argc < 3)
+      fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--ane-ffn-share SHARE] "
+           "[--ane-ffn-fault EVALUATION]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -1422,6 +1430,17 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      } else if (option == "--ane-ffn-share" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        givenAneFfnShare = std::strtod(value, &end);
+        if (end == value || *end || !(*givenAneFfnShare >= 0.0 && *givenAneFfnShare < 1.0))
+          fail("--ane-ffn-share takes a share in [0, 1)");
+      } else if (option == "--ane-ffn-fault" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        aneFfnFault = std::strtoull(value, &end, 10);
+        if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -1450,16 +1469,19 @@ int main(int argc, char **argv) {
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
-    ModelMemoryFootprint footprint{
-        model.targetActualAllocatedBytes(),
-        model.draft.actualAllocatedBytes,
-        model.vision.actualAllocatedBytes,
-        executorPlan, 0};
-    ModelMemoryProfile profile{
-        model.name(), model.maximumContextTokens(),
-        model.targetKvLayout(format), footprint};
-    EngineMemoryPlan memoryPlan =
-        test::requireMemoryPlan(backend.capabilities(), profile);
+    // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
+    // Neural Engine split.
+    const auto planMemory = [&](uint64_t aneFfnBytes) {
+      ModelMemoryFootprint footprint{
+          model.targetActualAllocatedBytes(),
+          model.draft.actualAllocatedBytes,
+          model.vision.actualAllocatedBytes,
+          executorPlan, 0, 0, aneFfnBytes};
+      ModelMemoryProfile profile{
+          model.name(), model.maximumContextTokens(),
+          model.targetKvLayout(format), footprint};
+      return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
+    };
 
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.
@@ -1467,7 +1489,51 @@ int main(int argc, char **argv) {
     const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
+    // A dense target's prefill FFN splits with the Neural Engine as a start
+    // splits it (engine::startAneFfn), calibrated by the build's first run and
+    // remembered for the runs after it unless a share is given,
+    // within a plan that holds the oracle's pages. The split is allocated
+    // beside the weights, outside the governor's admissions, and its own
+    // category of the plan bounds it, as the memory audit requires. A split
+    // that fails fails the oracle; given share 0 runs the GPU alone. A fault
+    // is armed for the first program constructed, the split's with a share
+    // given, whose evaluations count from verify's.
+    const engine::AneFfnSetting aneFfnSetting = engine::AneFfnSetting::fromGiven(givenAneFfnShare, std::nullopt);
+    if (aneFfnFault) {
+      require(aneFfnSetting.given.has_value(), "--ane-ffn-fault takes a share given by --ane-ffn-share");
+      ane::ProgramInstrumentation::arm({.failingEvaluation = aneFfnFault});
+    }
+    const engine::AneFfnModel aneFfnModel =
+        engine::aneFfnModel(backend, model, operators, format, "model-runtime-oracle " RICHENGINE_BUILD_ID, {});
+    engine::AneFfnStart aneFfnStart =
+        engine::startAneFfn(aneFfnModel, aneFfnSetting, pageCount * kv::kPageTokens, planMemory, {});
+    std::cout << "ane_ffn_outcome=" << engine::aneFfnOutcomeName(aneFfnStart.outcome.kind) << ' '
+              << aneFfnStart.outcome.reason << '\n';
+    require(aneFfnStart.outcome.kind != engine::AneFfnOutcome::Kind::Unavailable,
+            "the Neural Engine split is unavailable: " + aneFfnStart.outcome.reason);
+    // The automatic context is what the plan holds with the split the start
+    // runs, as this Mac's calibration of the model remembers it, and without
+    // the split otherwise.
+    const auto contextOf = [&](uint64_t aneFfnBytes) {
+      const EngineMemoryPlanResult result = planMemory(aneFfnBytes);
+      return result.plan ? result.plan->maximumContextTokens() : 0u;
+    };
+    const uint32_t automaticContext =
+        aneFfnStart.split ? contextOf(aneFfnModel.plannedBytes(static_cast<uint32_t>(
+                                std::lround(aneFfnStart.split->share() * aneFfnModel.units))))
+                          : contextOf(0);
+    std::cout << "ane_ffn_context=" << aneFfnStart.outcome.context
+              << " no_ane_context=" << aneFfnStart.outcome.contextWithout << '\n';
+    require(aneFfnStart.outcome.context == automaticContext && aneFfnStart.outcome.contextWithout == contextOf(0),
+            "the automatic context is not the plan's with the split the start runs");
+    std::unique_ptr<ops::AneFfn> aneFfn = std::move(aneFfnStart.split);
+    EngineMemoryPlanResult planned = aneFfnStart.plan ? EngineMemoryPlanResult{std::move(aneFfnStart.plan), {}}
+                                                      : planMemory(0);
+    require(planned.plan.has_value(), "the oracle model has no memory plan: " + planned.status.describe());
+    EngineMemoryPlan memoryPlan = std::move(*planned.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
+    require(!aneFfn || aneFfn->allocatedBytes() <= budget.aneFfnBytes,
+            "the Neural Engine split allocated more than its plan");
     require(budget.pipelineReserveBytes <= budget.hardBudgetBytes &&
                 budget.runtimeOverheadReserveBytes <
                     budget.hardBudgetBytes - budget.pipelineReserveBytes,
@@ -1476,6 +1542,8 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             queryHostAvailableMemory, 0);
+    std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
+              << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
         [admit = governor.allocationAdmission(), &governor](
             uint64_t bytes, const std::function<void()> &allocate) {
@@ -1518,7 +1586,7 @@ int main(int argc, char **argv) {
     model::QwenStateStorage states(backend,
                                     admission,
                                     model.stateLayout(), nullptr);
-    model::RuntimeContext context{backend, model, pages, states, operators};
+    model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     require(executorPlan.sharedDecodePlannedAllocatedBytes <=
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,
@@ -2436,11 +2504,13 @@ int main(int argc, char **argv) {
     }
     const uint64_t beforeRaggedPrefill =
         BackendInstrumentation::submittedCommands(backend);
+    const uint64_t rerunsBeforeRaggedPrefill = executor.telemetry().aneFfnReruns;
     auto raggedPrefill =
         executor.prefill(raggedPrefillPlan, raggedPrefillItems);
+    // The GPU runs a chunk again alone where the Neural Engine split stops.
     require(raggedPrefill.size() == raggedIds.size() &&
                 BackendInstrumentation::submittedCommands(backend) ==
-                    beforeRaggedPrefill + 1,
+                    beforeRaggedPrefill + 1 + executor.telemetry().aneFfnReruns - rerunsBeforeRaggedPrefill,
             "ragged 2048-row prefill was not one Metal command");
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       require(raggedPrefill[lane].consumedPromptTokens == raggedRows[lane] &&
@@ -3425,6 +3495,12 @@ int main(int argc, char **argv) {
               << historicalTelemetry.lastPrefillWallSeconds
               << " cache_restore_b1_cycle_wall_seconds="
               << historicalTelemetry.lastDecodeWallSeconds << '\n';
+    // An armed fault stops the split once, in the chunk whose evaluation
+    // fails, which the GPU runs again alone, as every chunk after it.
+    std::cout << "ane_ffn_reruns=" << historicalTelemetry.aneFfnReruns
+              << (aneFfn && aneFfn->retired() ? " ane_ffn_stopped=" + aneFfn->reason() : std::string()) << '\n';
+    require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
+            "an armed fault did not stop the split once");
     std::cout << "model_runtime_oracle_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

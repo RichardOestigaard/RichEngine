@@ -65,7 +65,9 @@ namespace detail {
 // RuntimeNgram.mm.
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
-  using Completion = std::function<std::vector<ModelStepResult>(metal::CommandTiming)>;
+  // Runs once the command has completed, and may add work of its own to its
+  // timing, as a rerun of the command does.
+  using Completion = std::function<std::vector<ModelStepResult>(metal::CommandTiming &)>;
 
   DeferredMetalTicket(metal::CommandTicket ticket, Completion completion,
                       bool representativePrefillTiming = true)
@@ -79,9 +81,15 @@ public:
       throw std::logic_error("Metal ticket was already consumed");
     }
     metal::CommandTiming timing = ticket_.wait();
-    wallMilliseconds_ = timing.wallSeconds * 1000.0;
+    const double commandSeconds = timing.wallSeconds;
     Completion completion = std::move(completion_);
-    return completion(timing);
+    std::vector<ModelStepResult> results = completion(timing);
+    wallMilliseconds_ = timing.wallSeconds * 1000.0;
+    // Work the completion added takes wall time, but is no sample of the
+    // command's rows.
+    if (timing.wallSeconds != commandSeconds)
+      representativePrefillTiming_ = false;
+    return results;
   }
 
   double wallMilliseconds() const noexcept override {
@@ -97,6 +105,53 @@ private:
   double wallMilliseconds_ = 0.0;
   bool representativePrefillTiming_;
 };
+
+// A prefill arena's tensors as the target's prefill reads them.
+inline QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
+  auto p = [&](PrefillTensor tensor) { return arena.get(tensor); };
+  QwenTargetPrefillBuffers buffers;
+  // Prefill plans read plain bf16 rows; the input and sums slots hold a
+  // GGUF chunk's packed plane and exponent bytes (ops::LinearGguf.cpp).
+  buffers.linearScratch = {.input = p(PrefillTensor::LinearPacked),
+                           .sums = p(PrefillTensor::LinearExponents),
+                           .partials = p(PrefillTensor::LinearPartials),
+                           .counters = p(PrefillTensor::LinearCounters),
+                           .rotated = p(PrefillTensor::LinearRotated),
+                           .i8codes = p(PrefillTensor::I8Codes),
+                           .i8codesLo = p(PrefillTensor::I8CodesLo),
+                           .i8params = p(PrefillTensor::I8Params),
+                           .i8paramsLo = p(PrefillTensor::I8ParamsLo)};
+  buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
+  buffers.normalized = p(PrefillTensor::Normalized);
+  buffers.captured = p(PrefillTensor::Captured);
+  buffers.gdnPacked = p(PrefillTensor::GdnPacked);
+  buffers.gdnQueries = p(PrefillTensor::GdnQueries);
+  buffers.gdnKeys = p(PrefillTensor::GdnKeys);
+  buffers.gdnValues = p(PrefillTensor::GdnValues);
+  buffers.gdnDecay = p(PrefillTensor::GdnDecay);
+  buffers.gdnBeta = p(PrefillTensor::GdnBeta);
+  buffers.recurrent = p(PrefillTensor::Recurrent);
+  buffers.gdnHidden = p(PrefillTensor::GdnHidden);
+  buffers.gdnOutput = p(PrefillTensor::GdnOutput);
+  buffers.denseGateScratch = p(PrefillTensor::GateIntermediate);
+  buffers.denseIntermediate = p(PrefillTensor::Intermediate);
+  buffers.fullPacked = p(PrefillTensor::FullPacked);
+  buffers.fullQueries = p(PrefillTensor::FullQueries);
+  buffers.fullAttention = p(PrefillTensor::FullAttention);
+  buffers.attentionPartials = p(PrefillTensor::AttentionPartials);
+  buffers.attentionStatistics = p(PrefillTensor::AttentionStatistics);
+  buffers.attentionHidden = p(PrefillTensor::AttentionHidden);
+  buffers.attentionOutput = p(PrefillTensor::AttentionOutput);
+  buffers.projectionSums = p(PrefillTensor::ProjectionSums);
+  buffers.downProjectionSums = p(PrefillTensor::DownProjectionSums);
+  buffers.ropeCos = p(PrefillTensor::RopeCos);
+  buffers.ropeSin = p(PrefillTensor::RopeSin);
+  buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
+  buffers.chunkValues = p(PrefillTensor::ChunkValues);
+  buffers.gdnChunkScratch = p(PrefillTensor::GdnChunkScratch);
+  buffers.moe = arena.moeScratch();
+  return buffers;
+}
 
 } // namespace detail
 
@@ -184,6 +239,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   ops::Sampling sampling;
   QwenTarget targetModel;
   std::variant<NullDraft, DFlashDraft, PlainDraft, DSparkDraft> draftModel;
+  ops::AneFfn *aneFfn;
   // Tree verify (docs/TREE_VERIFY_DESIGN.md): the selector emits each greedy,
   // unconstrained lane's comb tree when the draft is a DFlash2. Measured a
   // net loss on the decode benchmark (identical accepted tokens at ~2x
@@ -280,7 +336,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                std::in_place_type<Draft>, weights,
                                value.backend, operators);
                        },
-                       value.package.draft)) {
+                       value.package.draft)),
+        aneFfn(value.aneFfn) {
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -978,51 +1035,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             capture.absoluteEnd - capture.absoluteBegin};
       }
     }
-    QwenTargetPrefillBuffers buffers;
-    // Prefill plans read plain bf16 rows; the input and sums slots hold a
-    // GGUF chunk's packed plane and exponent bytes (ops::LinearGguf.cpp).
-    buffers.linearScratch = {.input = p(PrefillTensor::LinearPacked),
-                             .sums = p(PrefillTensor::LinearExponents),
-                             .partials = p(PrefillTensor::LinearPartials),
-                             .counters = p(PrefillTensor::LinearCounters),
-                             .rotated = p(PrefillTensor::LinearRotated),
-                             .i8codes = p(PrefillTensor::I8Codes),
-                             .i8codesLo = p(PrefillTensor::I8CodesLo),
-                             .i8params = p(PrefillTensor::I8Params),
-                             .i8paramsLo = p(PrefillTensor::I8ParamsLo)};
-    buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
-    buffers.normalized = p(PrefillTensor::Normalized);
-    buffers.captured = p(PrefillTensor::Captured);
-    buffers.gdnPacked = p(PrefillTensor::GdnPacked);
-    buffers.gdnQueries = p(PrefillTensor::GdnQueries);
-    buffers.gdnKeys = p(PrefillTensor::GdnKeys);
-    buffers.gdnValues = p(PrefillTensor::GdnValues);
-    buffers.gdnDecay = p(PrefillTensor::GdnDecay);
-    buffers.gdnBeta = p(PrefillTensor::GdnBeta);
-    buffers.recurrent = p(PrefillTensor::Recurrent);
-    buffers.gdnHidden = p(PrefillTensor::GdnHidden);
-    buffers.gdnOutput = p(PrefillTensor::GdnOutput);
-    buffers.denseGateScratch = p(PrefillTensor::GateIntermediate);
-    buffers.denseIntermediate = p(PrefillTensor::Intermediate);
-    buffers.fullPacked = p(PrefillTensor::FullPacked);
-    buffers.fullQueries = p(PrefillTensor::FullQueries);
-    buffers.fullAttention = p(PrefillTensor::FullAttention);
-    buffers.attentionPartials = p(PrefillTensor::AttentionPartials);
-    buffers.attentionStatistics = p(PrefillTensor::AttentionStatistics);
-    buffers.attentionHidden = p(PrefillTensor::AttentionHidden);
-    buffers.attentionOutput = p(PrefillTensor::AttentionOutput);
-    buffers.projectionSums = p(PrefillTensor::ProjectionSums);
-    buffers.downProjectionSums = p(PrefillTensor::DownProjectionSums);
-    buffers.ropeCos = p(PrefillTensor::RopeCos);
-    buffers.ropeSin = p(PrefillTensor::RopeSin);
-    buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
-    buffers.chunkValues = p(PrefillTensor::ChunkValues);
-    buffers.gdnChunkScratch = p(PrefillTensor::GdnChunkScratch);
-    buffers.moe = prefillArena->moeScratch();
+    QwenTargetPrefillBuffers buffers = detail::prefillBuffers(*prefillArena);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvPages.layers());
+        kvPages.layers(), aneFfn);
     addPackedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0

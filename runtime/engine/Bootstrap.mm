@@ -19,6 +19,7 @@ RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
 RuntimeBootstrapReport
 reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
+  report.resourceStage = error.stage();
   report.resourceFailure = error.failure();
   report.message = error.message();
   report.memoryPlanJson = error.statusJson();
@@ -82,9 +83,10 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
   if (failure.resourceFailure != RuntimeResourceFailure::HostCapacity &&
       failure.resourceFailure != RuntimeResourceFailure::DriverAllocation)
     return std::nullopt;
-  if (!deadline_ || failure.stage > stage_) {
+  const std::pair reached{failure.stage, failure.resourceStage};
+  if (!deadline_ || reached > reached_) {
     deadline_ = now + length_;
-    stage_ = failure.stage;
+    reached_ = reached;
   }
   if (now >= *deadline_)
     return std::nullopt;
@@ -140,7 +142,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
-      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot());
+      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
+      resources_->aneFfnSnapshot());
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
@@ -253,30 +256,32 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     NativeRuntime::StatusProvider statusProvider) {
   std::unique_ptr<RuntimeResources> resources;
   try {
-    resources = RuntimeResources::create(config.resources);
+    resources = RuntimeResources::create(config.resources, config.nativeLoop.engine.maxContext);
   } catch (const RuntimeResourcesError &error) {
     throw RuntimeBootstrapError(error);
   }
 
   RuntimeBootstrapReport base = reportForPlan(resources->memoryPlan());
-  const uint32_t automaticContext =
+  const uint32_t planContext =
       resources->memoryPlan().maximumContextTokens();
-  if (!automaticContext) {
+  if (!planContext) {
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "memory plan cannot hold one model token");
   }
   if (!config.nativeLoop.engine.maxContext) {
-    config.nativeLoop.engine.maxContext = automaticContext;
-  } else if (config.nativeLoop.engine.maxContext > automaticContext) {
+    // The automatic context, which the plan holds and every start of the
+    // model on this Mac serves alike (AneFfnOutcome::context).
+    config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
+  } else if (config.nativeLoop.engine.maxContext > planContext) {
     // --max-memory sets the budget only below this Mac's own.
     const auto &budget = resources->memoryPlan().breakdown();
     const bool memoryCapped = budget.configuredMemoryLimitBytes &&
                               budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
-             " exceeds the " + std::to_string(automaticContext) + " tokens the model and " +
+             " exceeds the " + std::to_string(planContext) + " tokens the model and " +
              (memoryCapped ? "--max-memory" : "this Mac's memory") +
-             " allow; omit it or pass at most " + std::to_string(automaticContext));
+             " allow; omit it or pass at most " + std::to_string(planContext));
   }
   // Without the disk tier a request that runs out of memory cannot publish
   // its progress checkpoints and replays its prompt.
@@ -338,7 +343,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
-    config.nativeLoop.weights = &resources->weightImages();
+    config.nativeLoop.weights = &resources->releasableMemory();
     config.nativeLoop.idleReleaseSeconds = config.resources.idleReleaseSeconds;
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.

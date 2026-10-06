@@ -423,6 +423,16 @@ SERVE_OPTIONS = (
         secret=True,
     ),
     ServeOption(
+        "--disable-ane",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="prefill on the GPU alone (default: a dense model's long "
+            "prompts also use the Neural Engine when that is faster)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         dict(
             action="store_true",

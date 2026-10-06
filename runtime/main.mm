@@ -67,6 +67,10 @@ struct NativeArguments final {
   // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
   // automatically while it holds a request.
   bool preventIdleSleep = true;
+  // --ane on|off: whether a dense target's prefill FFN may split with the
+  // Neural Engine when that is faster (richengine serve --disable-ane turns
+  // it off).
+  bool neuralEngine = true;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -182,7 +186,7 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
-      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow]");
+      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
 }
 
 template <typename T>
@@ -295,6 +299,10 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--ane") {
+      if (value != "on" && value != "off")
+        throw UsageError("--ane requires on or off");
+      result.neuralEngine = value == "on";
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -340,6 +348,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
+  config.resources.aneFfn.enabled = arguments.neuralEngine;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

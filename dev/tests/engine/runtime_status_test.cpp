@@ -177,10 +177,25 @@ void testCleanRuntimeStatus() {
   executorTelemetry.embeddingCacheBytes = 6;
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
-  const std::string json =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true, {},
-                        {}, {}, {});
+  executorTelemetry.aneFfnReruns = 1;
+  const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
+                              "an evaluation did not complete within 2 s",
+                              0.235,
+                              1037,
+                              12,
+                              768,
+                              10752.5};
+  const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                                  .restoring = 1, .suspended = 1,
+                                  .oldestWaitMilliseconds = 1250.0, .draining = true};
+  const std::string json = runtimeStatusJson(
+      memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
+      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, 2}, aneFfn);
+  require(json.find("\"ane_ffn\":{\"state\":\"stopped\",\"share\":0.235,"
+                    "\"minimum_rows\":1037,\"reason\":\"an evaluation did not "
+                    "complete within 2 s\",\"split_commands\":12,\"reruns\":1,"
+                    "\"ane_ms\":10752.5,\"evaluations\":768}") != std::string::npos,
+          "the Neural Engine split's status is missing or inaccurate");
   require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
               json.find("\"kv_restores\":3") != std::string::npos,
           "disk token accounting must include transfers completed before admission retries");
@@ -213,7 +228,7 @@ void testCleanRuntimeStatus() {
   bf16Identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, bf16Identity, governor, true,
-                        {}, {}, {}, {});
+                        {}, {}, {}, {}, {});
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
@@ -241,7 +256,7 @@ void testCleanRuntimeStatus() {
 
   const std::string unmeasured =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, {}, identity, governor, true, {}, {}, {}, {});
+                        metrics, {}, identity, governor, true, {}, {}, {}, {}, {});
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0},"
@@ -341,7 +356,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, memory, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {});
+                             {}, {}, {}, governor, true, {}, {}, {}, {}, {});
   };
   const std::string healthy = status();
   require(healthy.find("\"ready\":true") != std::string::npos &&
@@ -392,7 +407,7 @@ void testWarmupStepsReportMeasurementTruth() {
   governor.hostReserveBytes = 2 * kGiB;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {});
+                             {}, {}, {}, governor, true, {}, {}, {}, {}, {});
   };
   require(status().find("\"memory_limited_steps\":[]") != std::string::npos,
           "fully measured warmup listed a memory-limited step");
@@ -448,7 +463,7 @@ void testMemoryPressureTelemetry() {
   governor.hostGrowthAllowed = false;
   auto status = [&] {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true, {},
-                             {}, {}, {});
+                             {}, {}, {}, {});
   };
   const std::string hostLimited = status();
   require(hostLimited.find("\"memory_pressure\":\"critical\"") !=
@@ -477,7 +492,7 @@ void testResourceWaitDiagnostics() {
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
   const std::string json = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {});
+      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
@@ -486,7 +501,7 @@ void testResourceWaitDiagnostics() {
           "resource wait summary is missing or inaccurate");
   const std::string ticked = runtimeStatusJson(
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
-      NativeLoopTiming{1843.25}, {});
+      NativeLoopTiming{1843.25}, {}, {});
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
               ticked.find("\"schema_version\":6") != std::string::npos,
           "the loop's longest tick is missing, or changed the status schema");
@@ -498,7 +513,7 @@ void testWeightsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](WeightsSnapshot weights) {
     return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
-                             weights);
+                             weights, {});
   };
   require(status({600.0, true, 2})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
@@ -511,6 +526,45 @@ void testWeightsStatus() {
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
                         "\"restores\":0}") != std::string::npos,
           "an idle release that is off is not null");
+}
+
+// The prefill FFN's Neural Engine split: off with the start's reason and no
+// share, serving with the start's, stopped with why, and what it ran beside
+// the chunks the GPU ran again.
+void testAneFfnStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const AneFfnSnapshot &split, uint64_t reruns) {
+    model::ModelTelemetry telemetry;
+    telemetry.aneFfnReruns = reruns;
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, telemetry, {}, {}, true, {}, {}, {},
+                             {}, split);
+  };
+  require(status({.reason = "as given"}, 0)
+                  .find("\"ane_ffn\":{\"state\":\"off\",\"share\":0,\"minimum_rows\":0,"
+                        "\"reason\":\"as given\",\"split_commands\":0,\"reruns\":0,\"ane_ms\":0,"
+                        "\"evaluations\":0},\"kv\":") != std::string::npos,
+          "a split the start left off is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
+                  192, 1234.5},
+                 0)
+                  .find("\"ane_ffn\":{\"state\":\"split\",\"share\":0.41,\"minimum_rows\":640,"
+                        "\"reason\":\"at share 0.41 for chunks of 640 rows or more\",\"split_commands\":3,"
+                        "\"reruns\":0,\"ane_ms\":1234.5,\"evaluations\":192}") != std::string::npos,
+          "a split that serves is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Stopped,
+                  "losing to the GPU alone (19.4 ms on the Neural Engine per 2048-row layer against 19.0 ms "
+                  "on the GPU alone)",
+                  0.26, 1037, 8, 512, 9932.8},
+                 0)
+                  .find("\"state\":\"stopped\",\"share\":0.26,\"minimum_rows\":1037,\"reason\":\"losing "
+                        "to the GPU alone (19.4 ms on the Neural Engine per 2048-row layer against 19.0 ms on the "
+                        "GPU alone)\",\"split_commands\":8,\"reruns\":0,\"ane_ms\":9932.8,"
+                        "\"evaluations\":512}") != std::string::npos,
+          "a split the breaker stopped is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Stopped, "an evaluation failed", 0.26, 1037, 2, 128, 100.0}, 1)
+                  .find("\"reason\":\"an evaluation failed\",\"split_commands\":2,\"reruns\":1,") !=
+              std::string::npos,
+          "a split that failed lost its rerun");
 }
 
 // The server and the runtime share stderr, as `serve > log 2>&1` does: a
@@ -554,6 +608,7 @@ int main() {
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
     testWeightsStatus();
+    testAneFfnStatus();
     testStderrLinesStayWhole();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;

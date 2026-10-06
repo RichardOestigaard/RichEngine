@@ -46,6 +46,9 @@ struct ModelMemoryFootprint final {
   // when the tier's state file opened (a quota that holds one state); zero
   // otherwise.
   uint64_t stateStagingBytes = 0;
+  // The prefill FFN's Neural Engine split (ops::AneFfn::plannedBytes); zero
+  // without one.
+  uint64_t aneFfnBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -123,6 +126,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint64_t aneFfnBytes = 0;
   uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 

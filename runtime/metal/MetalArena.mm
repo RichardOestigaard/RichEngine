@@ -39,6 +39,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include <unistd.h>
+
 #include "metal/MetalBackendImpl.hpp"
 
 namespace richengine::metal {
@@ -90,8 +92,47 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     return MetalBuffer(std::move(result));
 }
 
+MetalBuffer MetalBackend::wrapSharedMemory(void *address, uint64_t bytes,
+                                           std::shared_ptr<void> owner,
+                                           std::string_view label) {
+    checkOperation();
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    if (!address || !bytes || !owner ||
+        reinterpret_cast<uintptr_t>(address) % page || bytes % page) {
+        throw MetalBackendError(
+            "wrapped memory needs an owner and whole pages");
+    }
+    if (bytes > impl_->capabilities.maxBufferLengthBytes) {
+        throw MetalBackendError("Metal buffer exceeds maxBufferLength");
+    }
+    auto allocation = std::make_shared<MetalAllocation>();
+    allocation->accounting = impl_->accounting;
+    allocation->length = bytes;
+    allocation->owner = owner;
+    if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
+    allocation->residency = impl_->residency;
+    // Metal may keep the buffer past our last view, so its deallocator holds
+    // the owner too.
+    id<MTLBuffer> buffer = [impl_->device
+        newBufferWithBytesNoCopy:address
+                          length:bytes
+                         options:MTLResourceStorageModeShared
+                     deallocator:^(void *, NSUInteger) { (void)owner; }];
+    if (!buffer)
+        throw MetalAllocationError("zero-copy Metal buffer creation failed");
+    if (allocation->label) buffer.label = allocation->label;
+    allocation->attach(buffer);
+    impl_->sampleDeviceMemory();
+    auto result = std::make_shared<MetalBuffer::Impl>();
+    result->lengthBytes = bytes;
+    result->allocation = std::move(allocation);
+    return MetalBuffer(std::move(result));
+}
+
 void MetalBackend::releaseMemory(const MetalBuffer &buffer) {
     MetalAllocation &allocation = impl_->baseAllocation(buffer);
+    if (allocation.owner)
+        throw MetalBackendError("wrapped memory is its owner's to release");
     if (!allocation.buffer)
         throw MetalBackendError("Metal buffer memory is already released");
     if (commandInFlight())
@@ -134,6 +175,17 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     result->offsetBytes = base.impl_->offsetBytes + offsetBytes;
     result->lengthBytes = lengthBytes;
     return MetalBuffer(std::move(result));
+}
+
+SharedEvent MetalBackend::newSharedEvent() {
+    checkOperation();
+    auto result = std::make_shared<SharedEvent::Impl>();
+    result->event = [impl_->device newSharedEvent];
+    if (!result->event) {
+        throw MetalBackendError("unable to create Metal shared event");
+    }
+    result->listener = impl_->eventListener;
+    return SharedEvent(std::move(result));
 }
 
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {

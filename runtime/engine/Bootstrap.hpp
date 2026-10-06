@@ -34,6 +34,8 @@ enum class RuntimeBootstrapStage {
 // A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
+    // The step of resource assembly that failed; empty past resource assembly.
+    std::optional<RuntimeResourceStage> resourceStage;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;
     WarmupReport warmup;
@@ -79,7 +81,8 @@ public:
 private:
     Clock::duration length_;
     std::optional<Clock::time_point> deadline_;
-    RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
+    std::pair<RuntimeBootstrapStage, std::optional<RuntimeResourceStage>>
+        reached_ = {RuntimeBootstrapStage::ResourceAssembly, std::nullopt};
 };
 
 // Whether memory may not hold a request of contextTokens: the plan within

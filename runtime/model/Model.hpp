@@ -459,6 +459,9 @@ struct ModelTelemetry final {
   uint32_t lastDecodeWidth = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
+  // Prefill chunks the GPU ran again alone once the Neural Engine split's
+  // work for them failed (Runtime::prefillAsync).
+  uint64_t aneFfnReruns = 0;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;

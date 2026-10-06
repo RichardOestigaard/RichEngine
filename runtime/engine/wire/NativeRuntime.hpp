@@ -19,10 +19,10 @@ namespace richengine::engine {
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
-  // The model's weights: released once the engine has held no request for
-  // idleReleaseSeconds, and written back, an image per tick, before the
-  // engine runs the next request. Null where they stay, as in tests of other
-  // behavior.
+  // What the engine gives back while idle (ReleasableMemory): released once
+  // the engine has held no request for idleReleaseSeconds, and taken back, a
+  // part per tick, before the engine runs the next request. Null where they
+  // stay, as in tests of other behavior.
   model::WeightMemory *weights = nullptr;
   // Positive; infinite never releases them. Bootstrap binds it to
   // RuntimeResourcesConfig::idleReleaseSeconds.
@@ -55,8 +55,8 @@ public:
   bool receive(std::span<const uint8_t> bytes);
   bool finishInput();
 
-  // Executes at most one explicit GPU BatchPlan, or writes back one image of
-  // released weights.
+  // Executes at most one explicit GPU BatchPlan, or takes back one part of
+  // the released weights (model::WeightMemory::restore).
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);

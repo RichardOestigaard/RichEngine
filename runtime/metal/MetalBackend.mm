@@ -46,6 +46,33 @@
 namespace richengine::metal {
 
 
+
+SharedEvent::SharedEvent() = default;
+SharedEvent::~SharedEvent() = default;
+SharedEvent::SharedEvent(const SharedEvent &) = default;
+SharedEvent &SharedEvent::operator=(const SharedEvent &) = default;
+SharedEvent::SharedEvent(SharedEvent &&) noexcept = default;
+SharedEvent &SharedEvent::operator=(SharedEvent &&) noexcept = default;
+SharedEvent::SharedEvent(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+SharedEvent::operator bool() const noexcept { return impl_ && impl_->event; }
+
+void *SharedEvent::nativeHandle() const noexcept {
+    return impl_ ? (__bridge void *)impl_->event : nullptr;
+}
+
+// Metal ignores a value below the event's, so the write alone raises it.
+void SharedEvent::signal(uint64_t value) const noexcept {
+    if (*this) impl_->event.signaledValue = value;
+}
+
+void SharedEvent::notify(uint64_t value, std::function<void()> callback) const {
+    if (!*this) throw MetalBackendError("an empty shared event cannot notify");
+    [impl_->event notifyListener:impl_->listener
+                         atValue:value
+                           block:^(id<MTLSharedEvent>, uint64_t) { callback(); }];
+}
+
 MetalBuffer::MetalBuffer() = default;
 MetalBuffer::~MetalBuffer() = default;
 MetalBuffer::MetalBuffer(const MetalBuffer &) = default;
@@ -62,6 +89,10 @@ MetalBuffer::operator bool() const noexcept {
 
 uint64_t MetalBuffer::sizeBytes() const noexcept {
     return impl_ ? impl_->lengthBytes : 0;
+}
+
+uint64_t MetalBuffer::allocatedBytes() const noexcept {
+    return impl_ ? impl_->allocation->bytes : 0;
 }
 
 bool MetalBuffer::sameView(const MetalBuffer &other) const noexcept {
@@ -159,10 +190,22 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
             throw MetalBackendError("Metal device unavailable");
         }
         impl_->asyncState->device = impl_->device;
-        impl_->queue = [impl_->device newCommandQueue];
+        // A command takes one Metal command buffer per event signal
+        // (EventStep) and one more, all created before the first is
+        // committed, and creating one waits while the queue's limit of them
+        // is outstanding: at the default of 64, a 64-layer prefill with a
+        // Neural Engine step each would wait forever.
+        impl_->queue = [impl_->device
+            newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
+        impl_->eventListener = [[MTLSharedEventListener alloc]
+            initWithDispatchQueue:dispatch_queue_create(
+                "richengine.metal.events",
+                dispatch_queue_attr_make_with_autorelease_frequency(
+                    DISPATCH_QUEUE_SERIAL,
+                    DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM))];
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
         NSError *error = nil;

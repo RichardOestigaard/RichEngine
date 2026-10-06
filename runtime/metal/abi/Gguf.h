@@ -53,6 +53,15 @@ struct GgufPrefillParams {
   uint32_t out_offset;  // first destination column of this segment
 };
 static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
+// The residual prefill kernels over a view of the leading inputs of wider weight rows
+// (gguf_prefill_<format>_r_leading_inputs): each row of the planes holds plane_input_size inputs, of which the
+// projection reads the first prefill.input_size.
+struct GgufPrefillLeadingParams {
+  GgufPrefillParams prefill;
+  uint32_t plane_input_size;
+};
+static_assert(sizeof(GgufPrefillLeadingParams) == 20,
+              "GGUF leading-input prefill parameters are 20 bytes on both sides");
 
 // Decode tiles of both families (the register tile on Apple9, the staged
 // tile elsewhere and for prefill chunks of up to 32 rows): one tensor per

@@ -123,8 +123,12 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 # memory, engine-tests/weight-digests: this build is compared with it on this
 # machine in ABBA order, and so are their weight images
 # (dev/benchmarks/backend_regression.py). Without it, the release scenarios
-# characterize this build alone.
+# characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the prefill
+# FFN's Neural Engine share every benchmark that takes --ane-ffn-share runs
+# instead of calibrating one (0: the GPU alone).
 BASELINE ?=
+ANE_FFN_SHARE ?=
+ANE_FFN_SHARE_ARGS = $(if $(ANE_FFN_SHARE),--ane-ffn-share "$(ANE_FFN_SHARE)",)
 test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
 		$(if $(BASELINE),$(WEIGHT_DIGESTS))
 	@mkdir -p "$(MODEL_RESULTS)"
@@ -133,10 +137,11 @@ test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
 		$(BUILD_ID_CONSTANT_ARGS) --binary $(TEST_BACKEND_BENCHMARK)
 ifneq ($(BASELINE),)
 	$(PYTHON) -m dev.benchmarks.backend_regression --baseline "$(BASELINE)" \
-		--package "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)"
+		--package "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)" \
+		$(ANE_FFN_SHARE_ARGS)
 else
 	@$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
-		--scenario decode,partial --samples 3 \
+		--scenario decode,partial,short --samples 3 $(ANE_FFN_SHARE_ARGS) \
 		--progress "$(MODEL_RESULTS)/backend-benchmark-progress.jsonl" \
 		> "$(MODEL_RESULTS)/backend-benchmark.json" \
 		&& $(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null

@@ -28,6 +28,22 @@ other kernels; [GGUF against llama.cpp](#gguf-against-llamacpp) compares them.
 Draft acceptance on the short-prompt decode: 69% on the 35B, 87% on the
 27B.
 
+The Neural Engine prefill split (`--disable-ane` keeps the FFN on the GPU)
+runs part of each dense layer's FFN on the Apple Neural Engine during
+prefill while the GPU runs the rest, calibrated once per Mac and model. On
+the same M5 Pro with the Qwen3.8-27B package (split at share 0.41 of 34
+units, chunks of 512 rows or more, 27.5 ms per 2048-row FFN layer against
+40.0 ms on the GPU alone):
+
+| Metric | GPU alone | With the split |
+| --- | ---: | ---: |
+| Prefill · 14,096-token prompt, cold | 28.4 s | 22.5 s (1.26×) |
+| Prefill · 10,000-token prompt, cold | 19.7 s | 15.5 s (1.27×) |
+| Time to first token · 14K prompt, 10K cached | 8.7 s | 7.0 s (1.24×) |
+
+Decode is unchanged: its kernels do not run on the Neural Engine, and the
+split does not engage while other requests decode.
+
 ### 2B-class models
 
 The same benchmark on the same Mac, on the GGUF installs
@@ -69,9 +85,9 @@ The positions where they differ are near-ties: there, llama.cpp's two best
 tokens are a median 0.03–0.10 nats apart, against 2.6–2.7 nats over all
 positions. RichEngine's perplexity is 0.1–0.4% (27B) and 0.1–0.9% (35B) above
 llama.cpp's; llama.cpp's CPU backend is 1.7–1.8% above its Metal on the 27B.
-RichEngine's figures cover an M5 Pro and an M3 Max with `--kv-format bf16`; the
-INT8 cache gives 99.23–99.25% and 97.92–97.94% on the M5 Pro (the default is
-INT4).
+RichEngine's figures cover an M5 Pro and an M3 Max with `--kv-format bf16` and
+`--disable-ane`; the INT8 cache gives 99.23–99.25% and 97.92–97.94% on the
+M5 Pro (the default is INT4).
 
 Speed uses the selected SPEED-Bench coding prompts described above, with
 greedy sampling. llama-server runs with its default settings, which do not

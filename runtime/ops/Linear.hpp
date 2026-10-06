@@ -20,6 +20,12 @@ namespace richengine::ops {
 [[nodiscard]] inline std::string kernelInstance(std::string_view name, FloatOutput destination) {
   return std::string(name) + (destination == FloatOutput::Float32 ? "_f32" : "");
 }
+// The instance of prefill residual kernel `name` that reads a view of the
+// leading inputs of wider weight rows (Projection::leadingInputs):
+// "<name>_leading_inputs".
+[[nodiscard]] inline std::string leadingInputsInstance(std::string_view name) {
+  return std::string(name) + "_leading_inputs";
+}
 // The tile of a float projection (kernels/shared/gguf_float.metal): fp32
 // simdgroup MMA on the weights as stored, or the neural accelerator's bf16
 // matmul on each weight's three bf16 parts, which sum to it exactly. Both
@@ -38,8 +44,15 @@ struct LinearMatrix final {
 };
 
 // Throws unless `projection` is an affine projection of `matrix` whose planes
-// hold all of its Q4 weights, scales and biases.
+// hold all of its Q4 weights, scales and biases, in rows of its
+// planeInputSize() inputs.
 void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
+// Throws unless the planes of the quantized `segment` hold every tile of its
+// outputSize x inputSize weights (metal/abi/QuantFormat.h), naming them
+// "<what> plane0", "<what> plane1" and "<what> meta": in rows of
+// `planeInputs` inputs, of which it is a view of the leading ones
+// (Projection::leadingInputs), or of its inputSize when that is 0.
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
@@ -122,6 +135,20 @@ struct LinearScratch final {
   metal::MetalBuffer i8codesLo{};
   metal::MetalBuffer i8params{};
   metal::MetalBuffer i8paramsLo{};
+};
+// One layer's SwiGLU projections, affine Q4 or quantized GGUF tensors:
+// down(silu(gate x) * up x).
+struct SwiGluProjections final {
+  const Projection *gate = nullptr;
+  const Projection *up = nullptr;
+  const Projection *down = nullptr;
+};
+// A prefill chunk's buffers of its dense FFN: the normalized rows and their
+// Q4 sums, gate's output, the intermediate rows and their Q4 sums, and the
+// linear scratch.
+struct PrefillFfnBuffers final {
+  metal::MetalBuffer normalized, sums, gateScratch, intermediate, downSums;
+  LinearScratch scratch;
 };
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
@@ -316,6 +343,10 @@ public:
                                    const Projection &projection, metal::MetalBuffer residual,
                                    metal::MetalBuffer output, metal::MetalBuffer sums,
                                    uint32_t rows, LinearScratch scratch, PreparedInput prepared = {}) const;
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows,
+  // whose Q4 sums the norm wrote.
+  void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
+                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) const;
 
   // The fused greedy head of a block projection (gguf_decode_*_m*_amax in
   // shared/gguf_linear.metal): the vocabulary projection's staged decode,

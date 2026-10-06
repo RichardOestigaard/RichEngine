@@ -374,6 +374,30 @@ GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 GGUF_PREFILL_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_PREFILL_FORMAT
+
+// The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down
+// projection, one per format. Each runs the tile of its residual kernel on the planes advanced past the groups and
+// meta units the view leaves unread in the rows of the plane tiles before its column tile, which the tile then
+// addresses as rows of input_size inputs.
+#define GGUF_PREFILL_LEADING_INPUTS(F, f)                                                                          \
+  kernel void gguf_prefill_##f##_r_leading_inputs(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],          \
+                                                  constant GgufPrefillLeadingParams &leading [[buffer(6)]],        \
+                                                  GGUF_PREFILL_THREAD) {                                           \
+    GGUF_PREFILL_TABLES(F);                                                                                        \
+    constant GgufPrefillParams &p = leading.prefill;                                                               \
+    const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
+    const ulong before = ulong(group.y * GGUF_TILE_COLUMNS / QUANT_TILE_ROWS) * QUANT_TILE_ROWS;                   \
+    const uint groups = p.input_size / 32, plane_groups = leading.plane_input_size / 32;                           \
+    const ulong unread = before * (plane_groups - groups),                                                         \
+                unread_units = before * (plane_groups / F::MetaGroups - groups / F::MetaGroups);                   \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, \
+                      EpResidual>(input + ulong(first) * p.input_size, w0 + unread * F::P0, w1 + unread * F::P1,   \
+                                  meta + unread_units * F::MetaBytes, output + ulong(first) * p.out_stride,        \
+                                  p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane,           \
+                                  simd_group, p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);      \
+  }
+QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
+#undef GGUF_PREFILL_LEADING_INPUTS
 #undef GGUF_PREFILL_EPILOGUE
 #undef GGUF_PREFILL
 #undef GGUF_PREFILL_TABLES

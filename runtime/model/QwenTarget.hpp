@@ -22,6 +22,10 @@
 #include <variant>
 #include <vector>
 
+namespace richengine::ops {
+class AneFfn;
+} // namespace richengine::ops
+
 namespace richengine::model {
 
 struct Qwen3_8Layout;
@@ -267,6 +271,11 @@ struct QwenTargetPrefillBuffers final {
   // WY/UT scratch for the chunked GDN scan; empty keeps the serial scan.
   metal::MetalBuffer gdnChunkScratch;
   ops::MoeScratch moe;
+
+  // The dense FFN's buffers among these.
+  [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
+    return {normalized, projectionSums, denseGateScratch, denseIntermediate, downProjectionSums, linearScratch};
+  }
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -351,11 +360,13 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows.
+  // Returns the hidden buffer that holds the last layer's output rows. The
+  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
+  // Neural Engine on `aneFfn`, when given.
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const RichKvLayer> kvLayers) const;
+      std::span<const RichKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
   // liveRows, when nonempty, gives each chain lane's live verify row count
   // for the GDN scan (adaptive proposal budgets); ignored for tree batches.
   void addVerify(
@@ -421,18 +432,13 @@ private:
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const LfmConvWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
-  // The dense gated FFN of three projections; the LFM2-MoE target's leading
-  // layers run the same one.
-  void addPrefillDenseFfn(PrefillStep &step, const ops::NormWeights &norm,
-                          const ops::Projection &gate, const ops::Projection &up,
-                          const ops::Projection &down, metal::MetalBuffer residual,
-                          metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
-                     metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                     metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, const Lfm2MoeLayerWeights &layer, metal::MetalBuffer residual,
-                     metal::MetalBuffer output) const;
+  // The FFN of layer `index`; the dense FFN runs on `step.aneFfn` when set.
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
+                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_6MoeLayerWeights &layer,
+                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Lfm2MoeLayerWeights &layer,
+                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,

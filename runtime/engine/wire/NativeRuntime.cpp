@@ -86,8 +86,8 @@ bool NativeRuntime::tick() {
   if (closeConnection_ || !engineHealthy_)
     return false;
   try {
-    // The engine runs no request until its weights are back, written an
-    // image per tick so that frames are answered between them.
+    // The engine runs no request until its weights are back, taken back a
+    // part per tick so that frames are answered between them.
     if (restoreStarted_) {
       restoreWeights();
       return true;

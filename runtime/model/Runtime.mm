@@ -7,6 +7,7 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
@@ -240,7 +241,14 @@ Runtime::prefillAsync(const BatchPlan &plan,
   }
 
   std::array<Impl::Request *, kLaneCount> entries{};
+  // Each request's draws before the chunk, which a rerun of it restores.
+  std::array<uint64_t, kLaneCount> draws{};
   CommandGraph graph;
+  if (impl_->aneFfn) {
+    for (uint32_t lane = 0; lane < items.size(); ++lane)
+      draws[lane] = impl_->request(items[lane].requestId).rngCounter;
+    impl_->aneFfn->begin();
+  }
   // The submit-ahead ring admits a second in-flight prefill; its host-written
   // input tensors come from the other bank so the running chunk's inputs are
   // untouched. Bank 0 serves whenever nothing is in flight.
@@ -263,8 +271,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   CommandTicket command;
   try {
-    command = impl_->backend.submitCommandAsync(graph.dispatches(),
-                                              std::move(completion));
+    command = impl_->aneFfn
+                  ? impl_->aneFfn->commit(graph, std::move(completion))
+                  : impl_->backend.submitCommandAsync(graph.command(),
+                                                      std::move(completion));
   } catch (...) {
     impl_->releasePrefillInputBank(inputBank);
     throw;
@@ -275,8 +285,33 @@ Runtime::prefillAsync(const BatchPlan &plan,
     entry.prefillUnappliedRows += items[lane].tokenCount;
   }
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, captures, inputBank,
-                 items = std::move(copiedItems)](CommandTiming timing) mutable {
+  auto finish = [impl, entries, captures, draws, inputBank,
+                 items = std::move(copiedItems)](CommandTiming &timing) mutable {
+    // A chunk whose Neural Engine work failed holds no usable outputs, and
+    // the split has stopped: the GPU runs the chunk again alone, which
+    // computes what it would have the first time. Nothing of the chunk is
+    // committed before the code below: state parity, lengths, the selected
+    // token and the image rows' state. The rerun writes the same KV and draft
+    // rows into the same input bank; clearForColdStart clears the current
+    // state again, which neither command writes; synchronizedPageTable writes
+    // nothing at the same revision; image rows the first command encoded are
+    // still `encoding` and are copied, not encoded again; and the requests'
+    // draws restored, a sampled first token draws the same uniform. The
+    // first ticket was released before this completion runs
+    // (DeferredMetalTicket::wait), so the backend takes the rerun's command,
+    // whose time counts in the chunk's.
+    if (impl->aneFfn && !impl->aneFfn->finish()) {
+      for (uint32_t lane = 0; lane < items.size(); ++lane)
+        entries[lane]->rngCounter = draws[lane];
+      CommandGraph again;
+      static_cast<void>(impl->encodePackedPrefillGraph(again, items, entries,
+                                                      inputBank));
+      const CommandTiming rerun =
+          impl->backend.submitCommandAsync(again.command()).wait();
+      timing.gpuSeconds += rerun.gpuSeconds;
+      timing.wallSeconds += rerun.wallSeconds;
+      ++impl->counters.aneFfnReruns;
+    }
     impl->releasePrefillInputBank(inputBank);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
@@ -963,6 +998,32 @@ ModelTelemetry Runtime::telemetry() const noexcept {
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
   }
   return result;
+}
+
+std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &model) {
+  std::vector<ops::SwiGluProjections> layers;
+  std::visit(
+      [&](const auto &weights) {
+        using Layer =
+            typename std::decay_t<decltype(weights.layers)>::value_type;
+        // Every dense target's layers carry the SwiGLU projections the
+        // split can take; a MoE target's routed blocks do not.
+        if constexpr (std::is_same_v<Layer, Qwen3_8LayerWeights>) {
+          for (const Qwen3_8LayerWeights &layer : weights.layers)
+            layers.push_back({&layer.gateProjection, &layer.upProjection,
+                              &layer.downProjection});
+        }
+      },
+      model.target);
+  return layers;
+}
+
+void withPrefillArena(
+    MetalBackend &backend, const ModelPackage &model, const ops::ExecutionPlans &operators, kv::Format format,
+    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
+  const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
+  const QwenTargetPrefillBuffers buffers = detail::prefillBuffers(arena);
+  use(buffers.ffn(), buffers.hidden);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,

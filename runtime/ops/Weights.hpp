@@ -157,6 +157,23 @@ public:
     return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
   }
 
+  // Views of a projection of affine Q4 weights or of one unrotated quantized
+  // GGUF tensor (Linear.cpp): over the leading `rows` rows of its planes,
+  // whole QUANT_TILE_ROWS tiles; or over the leading `inputs` inputs of each
+  // of its rows, whole quant groups and meta units, which reads its planes as
+  // they are (planeInputs()).
+  [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
+  [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
+  // Whether those views take it: its own planes, not a view, of affine Q4
+  // weights or of one unrotated quantized GGUF tensor.
+  [[nodiscard]] bool takesPlaneViews() const noexcept;
+  // The inputs each row of the weight planes holds when the projection reads
+  // only their first inputSize, a view of leadingInputs(); zero for
+  // inputSize. Only the prefill residual tiles of quantized weights take such
+  // a view, on kernel instances of their own (Linear::add).
+  [[nodiscard]] uint32_t planeInputs() const noexcept { return planeInputs_; }
+  [[nodiscard]] uint32_t planeInputSize() const noexcept { return planeInputs_ ? planeInputs_ : inputSize; }
+
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
@@ -164,6 +181,9 @@ public:
   FloatOutput destination = FloatOutput::BFloat16;
   // Block projections only.
   InputRotation rotation;
+
+private:
+  uint32_t planeInputs_ = 0;
 };
 
 // A token table's rows as the GGUF stores them, in a gguf_embedding_format

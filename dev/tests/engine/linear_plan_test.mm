@@ -7,6 +7,7 @@
 #include "ops/PagedAttention.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Linear.h"
 #include "metal/abi/QuantFormat.h"
 #include "tuning/LinearNumerics.hpp"
 #include "tuning/LinearTuning.hpp"
@@ -38,6 +39,8 @@ using namespace richengine::ops;
 using test::mix;
 
 using richengine::test::require;
+using richengine::test::requireExtent;
+using richengine::test::rejects;
 
 template <class Function> void rejects(Function function) {
   try {
@@ -904,6 +907,12 @@ uint32_t ggufMeasuredSplits(uint32_t n, uint32_t k, uint32_t tileRows, uint32_t 
       {5'120, 17'408, 8, 8, 20}, {5'120, 17'408, 16, 8, 20},
       {14'336, 5'120, 8, 4, 20}, {14'336, 5'120, 16, 4, 20},
       {16'640, 5'120, 8, 4, 20}, {16'640, 5'120, 16, 4, 20},
+      {3'584, 2'560, 8, 2, 20},  {3'584, 2'560, 16, 4, 20},
+      {3'584, 2'560, 32, 2, 20}, {16'384, 2'560, 8, 2, 20},
+      {16'384, 2'560, 16, 2, 20}, {4'096, 4'096, 16, 4, 20},
+      {512, 2'560, 8, 8, 20},    {12'800, 4'096, 8, 2, 20},
+      {1'024, 4'096, 32, 4, 20}, {2'048, 10'752, 16, 8, 20},
+      {25'600, 4'096, 8, 2, 20}, {25'600, 4'096, 16, 2, 20},
   };
   for (const auto &e : kEntries)
     if (n == e.output && k == e.input && tileRows == e.tileRows && (!e.cores || e.cores == cores))
@@ -1363,15 +1372,27 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
   return buffer;
 }
 
+// An n x k segment in `format` at column `offset`, whose planes hold whole
+// tiles of its rows, unwritten: encoding reads only their sizes.
+QuantizedSegment segmentPlanes(metal::MetalBackend &backend, uint32_t format, uint32_t n, uint32_t k,
+                               uint32_t offset = 0) {
+  const QuantFormat &f = kQuantFormats[format];
+  const uint64_t units = uint64_t{(n + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS} * (k / 32);
+  QuantizedSegment s =
+      QuantizedSegment::planes(format, n, k, allocate(backend, units * f.plane0_bytes),
+                               allocate(backend, units * f.plane1_bytes),
+                               allocate(backend, units / f.meta_groups * f.meta_bytes));
+  s.columnOffset = offset;
+  return s;
+}
+
 // A block projection dispatches only as the plan's matrix, and each segment
 // fills whole 64-column tiles, with every buffer the plan needs: the matching
 // projection encodes its dispatch, so only the projection can reject.
 void ggufProjectionMatrix(metal::MetalBackend &backend) {
   const Linear linear = gpu(10, 16);
-  const auto segment = [](uint32_t n, uint32_t offset) {
-    QuantizedSegment s = QuantizedSegment::planes(GGUF_FMT_Q4K, n, 17408, {}, {}, {});
-    s.columnOffset = offset;
-    return s;
+  const auto segment = [&](uint32_t n, uint32_t offset) {
+    return segmentPlanes(backend, GGUF_FMT_Q4K, n, 17408, offset);
   };
   const Projection matching(5120, 17408, BlockWeights{{segment(5120, 0)}});
   const LinearPlan plan = linear.plan({{5120, 17408}, 8}, matching);
@@ -1485,6 +1506,267 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   }
 }
 
+// Each buffer only a block projection's dispatches reach, at its extent and
+// one element short: a rotated projection's int8 sign of every input and its
+// rotated rows of the plan's storage; a float projection's fp32 weights, its
+// input rows and its output rows of 512 columns up to its last column, 192;
+// and the planes of a quantized segment.
+void blockExtents(metal::MetalBackend &backend) {
+  const Linear linear = gpu(10, 16);
+  constexpr uint32_t n = 256, k = 2048;
+  Projection rotated(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_PQ20, n, k)}});
+  rotated.rotation.signs = allocate(backend, k);
+  const LinearPlan plan = linear.decodePlan(rotated, 1);
+  const uint64_t rows = plan.storageRows();
+  const LinearScratchSize scratch = plan.scratchSize();
+  const LinearBuffers buffers{.input = allocate(backend, rows * k * 2),
+                              .output = allocate(backend, rows * n * 2),
+                              .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                          allocate(backend, scratch.partials), allocate(backend, scratch.counters),
+                                          allocate(backend, rows * k * 2)}};
+  requireExtent(backend, rotated.rotation.signs, k, 1, "rotation sign",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  Projection changed = rotated;
+                  changed.rotation.signs = view;
+                  (void)linear.add(graph, buffers, changed, plan);
+                });
+  requireExtent(backend, buffers.scratch.rotated, rows * k * 2, 2, "projection rotated input",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  LinearBuffers changed = buffers;
+                  changed.scratch.rotated = view;
+                  (void)linear.add(graph, changed, rotated, plan);
+                });
+
+  constexpr uint32_t floatRows = 37, floatColumns = 64, outStride = 512, outOffset = 128;
+  const QuantizedSegment weights =
+      QuantizedSegment::floats(floatColumns, k, allocate(backend, uint64_t{floatColumns} * k * 4));
+  const metal::MetalBuffer input = allocate(backend, uint64_t{floatRows} * k * 2),
+                           output = allocate(backend, uint64_t{floatRows} * outStride * 4);
+  const auto project = [&](metal::CommandGraph &graph, const metal::MetalBuffer &rowsIn,
+                           const QuantizedSegment &segment, const metal::MetalBuffer &rowsOut) {
+    addGgufFloat(graph, rowsIn, segment, rowsOut, floatRows, outStride, outOffset, FloatOutput::Float32,
+                 FloatTile::Simdgroup);
+  };
+  requireExtent(backend, weights.plane0, uint64_t{floatColumns} * k * 4, 4, "float projection weight",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  project(graph, input, QuantizedSegment::floats(floatColumns, k, view), output);
+                });
+  requireExtent(backend, input, uint64_t{floatRows} * k * 2, 2, "float projection input",
+                [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  project(graph, view, weights, output);
+                });
+  requireExtent(backend, output, (uint64_t{floatRows - 1} * outStride + outOffset + floatColumns) * 4, 4,
+                "float projection output", [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                  project(graph, input, weights, view);
+                });
+
+  // A fused projection of a 320-row Q5_K segment and a 192-row Q4_K one.
+  // Each plane is tiles of 256 rows by groups of 32 inputs, or meta units,
+  // and ends at the last row's unit of the last group: row 63 of the Q5_K
+  // segment's second tile, row 191 of the Q4_K segment's first.
+  const std::array segments{segmentPlanes(backend, GGUF_FMT_Q5K, 320, k),
+                            segmentPlanes(backend, GGUF_FMT_Q4K, 192, k, 320)};
+  const Projection fused(512, k, BlockWeights{{segments[0], segments[1]}});
+  const LinearPlan fusedPlan = linear.decodePlan(fused, 1);
+  const LinearScratchSize fusedScratch = fusedPlan.scratchSize();
+  const LinearBuffers fusedBuffers{.input = allocate(backend, fusedPlan.storageRows() * k * 2),
+                                   .output = allocate(backend, fusedPlan.storageRows() * 512 * 2),
+                                   .scratch = {allocate(backend, fusedScratch.input),
+                                               allocate(backend, fusedScratch.sums),
+                                               allocate(backend, fusedScratch.partials),
+                                               allocate(backend, fusedScratch.counters)}};
+  for (size_t index = 0; index < segments.size(); ++index) {
+    const QuantFormat &format = kQuantFormats[segments[index].formatId];
+    const uint64_t groups = k / 32, units = groups / format.meta_groups;
+    const auto lastUnit = [&](uint64_t blocks) {
+      return index == 0 ? (2 * blocks - 1) * 256 + 64 : (blocks - 1) * 256 + 192;
+    };
+    for (const auto &[member, bytes, element, name] :
+         std::initializer_list<std::tuple<metal::MetalBuffer QuantizedSegment::*, uint64_t, uint64_t, const char *>>{
+             {&QuantizedSegment::plane0, lastUnit(groups) * format.plane0_bytes, format.plane0_bytes,
+              "projection plane0"},
+             {&QuantizedSegment::plane1, lastUnit(groups) * format.plane1_bytes, format.plane1_bytes,
+              "projection plane1"},
+             {&QuantizedSegment::meta, lastUnit(units) * format.meta_bytes, format.meta_bytes, "projection meta"}}) {
+      if (!bytes) continue;
+      requireExtent(backend, segments[index].*member, bytes, element, name,
+                    [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                      std::array changed = segments;
+                      changed[index].*member = view;
+                      (void)linear.add(graph, fusedBuffers, Projection(512, k, BlockWeights{{changed[0], changed[1]}}),
+                                       fusedPlan);
+                    });
+    }
+  }
+}
+
+// A view of the leading 512 inputs of rows of 1024 (Projection::leadingInputs)
+// over 512 outputs, two tiles of 256 rows: each prefill residual tile
+// encodes its leading-input instance with the view's parameters, and each
+// plane is read up to the last group the view reads of the second tile, after
+// every group of the first. A plane at that extent encodes, one element
+// shorter or holding only a matrix of the view's own inputs is refused. Every
+// other plan, a rotated view and a gate/up plan's gate are refused before
+// anything is encoded. The views' factories refuse inputs beyond the
+// projection's or of part of a quant group or meta unit, rows of part of a
+// tile, and float or rotated weights or a view; a view of leading rows holds
+// its planes' first tiles.
+void leadingInputViews(metal::MetalBackend &backend) {
+  const Linear linear = gpu(10, 16);
+  constexpr uint32_t n = 512, k = 512, wide = 1024, rows = 168;
+  const auto buffersOf = [&](const LinearPlan &plan) {
+    const uint64_t storage = plan.storageRows();
+    const LinearScratchSize scratch = plan.scratchSize();
+    return LinearBuffers{.input = allocate(backend, storage * k * 2),
+                         .output = allocate(backend, storage * n * 2),
+                         .sums = allocate(backend, plan.sumsBytes()),
+                         .residual = allocate(backend, storage * n * 2),
+                         .gateScratch = allocate(backend, plan.gateScratchBytes()),
+                         .downSums = allocate(backend, plan.downSumsBytes()),
+                         .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                     allocate(backend, scratch.partials), allocate(backend, scratch.counters)}};
+  };
+  const auto residualPrefill = [&](WeightLayout layout, LinearConfig config, LinearEpilogue epilogue) {
+    return Linear::plan({{n, k}, rows, LinearPhase::Prefill, epilogue, layout}, config, FloatOutput::BFloat16);
+  };
+  const auto encodes = [&](const Projection &view, const LinearPlan &plan, const auto &params) {
+    metal::CommandGraph graph;
+    (void)linear.add(graph, buffersOf(plan), view, plan);
+    const std::string kernel =
+        leadingInputsInstance(view.layout() == WeightLayout::Affine64 ? std::string(plan.pipeline())
+                                                                       : "gguf_prefill_q5k_r");
+    require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
+    const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
+    require(dispatch.pipelineName == kernel && dispatch.bytes.size() == 1 &&
+                dispatch.bytes[0].sizeBytes == sizeof(params) &&
+                std::memcmp(dispatch.bytes[0].data, &params, sizeof(params)) == 0,
+            "a view of leading inputs did not encode " + kernel + " with its parameters");
+  };
+  // The extent of a plane the view reads, in units of `unitBytes`: the first
+  // tile, `rowGroups` groups (or meta units) of each of its 256 rows, then
+  // the first `readGroups` of the second tile.
+  const auto reach = [](uint64_t rowGroups, uint64_t readGroups, uint64_t unitBytes) {
+    return (rowGroups + readGroups) * 256 * unitBytes;
+  };
+
+  const AffineWeights wideAffine{allocate(backend, uint64_t{n} * wide / 2),
+                                 allocate(backend, uint64_t{n} * (wide / 64) * 2),
+                                 allocate(backend, uint64_t{n} * (wide / 64) * 2)};
+  const auto affineView = [&](const AffineWeights &planes) { return Projection(n, wide, planes).leadingInputs(k); };
+  const Projection affine = affineView(wideAffine);
+  for (const LinearConfig config : {LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
+                                    LinearConfig{LinearTile::N128}, LinearConfig{LinearTile::N256}})
+    encodes(affine, residualPrefill(WeightLayout::Affine64, config, LinearEpilogue::Residual),
+            Q4PrefillLeadingParams{{n, k}, wide});
+  const LinearPlan affinePlan = residualPrefill(WeightLayout::Affine64, {LinearTile::N128, 0, LinearSimdgroups::Four},
+                                                LinearEpilogue::Residual);
+  const LinearBuffers affineBuffers = buffersOf(affinePlan);
+  for (const auto &[member, unitBytes, element, name] :
+       std::initializer_list<std::tuple<metal::MetalBuffer AffineWeights::*, uint64_t, uint64_t, const char *>>{
+           {&AffineWeights::weights, 32, 1, "projection weight"},
+           {&AffineWeights::scales, 2, 2, "projection scale"},
+           {&AffineWeights::biases, 2, 2, "projection bias"}}) {
+    const auto add = [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+      AffineWeights planes = wideAffine;
+      planes.*member = view;
+      (void)linear.add(graph, affineBuffers, affineView(planes), affinePlan);
+    };
+    requireExtent(backend, wideAffine.*member, reach(wide / 64, k / 64, unitBytes), element, name, add);
+    metal::CommandGraph graph;
+    rejects([&] { add(graph, backend.view(wideAffine.*member, 0, uint64_t{n} * (k / 64) * unitBytes)); },
+            std::string(name) + " buffer holds", "a view of leading inputs over planes of its own inputs was accepted");
+    require(graph.empty(), "a view of leading inputs over planes of its own inputs encoded a dispatch");
+  }
+
+  const QuantFormat &q5k = kQuantFormats[GGUF_FMT_Q5K];
+  const QuantizedSegment wideSegment = segmentPlanes(backend, GGUF_FMT_Q5K, n, wide);
+  const auto ggufView = [&](const QuantizedSegment &planes) {
+    return Projection(n, wide, BlockWeights{{planes}}).leadingInputs(k);
+  };
+  const Projection gguf = ggufView(wideSegment);
+  const LinearPlan ggufPlan =
+      residualPrefill(WeightLayout::Block32, {.tile = LinearTile::GgufPrefill}, LinearEpilogue::Residual);
+  encodes(gguf, ggufPlan, GgufPrefillLeadingParams{{k, rows, n, 0}, wide});
+  const LinearBuffers ggufBuffers = buffersOf(ggufPlan);
+  const QuantizedSegment narrow = segmentPlanes(backend, GGUF_FMT_Q5K, n, k);
+  for (const auto &[member, rowGroups, readGroups, unitBytes, name] :
+       std::initializer_list<
+           std::tuple<metal::MetalBuffer QuantizedSegment::*, uint64_t, uint64_t, uint64_t, const char *>>{
+           {&QuantizedSegment::plane0, wide / 32, k / 32, q5k.plane0_bytes, "projection plane0"},
+           {&QuantizedSegment::plane1, wide / 32, k / 32, q5k.plane1_bytes, "projection plane1"},
+           {&QuantizedSegment::meta, wide / 32 / q5k.meta_groups, k / 32 / q5k.meta_groups, q5k.meta_bytes,
+            "projection meta"}}) {
+    const auto add = [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+      QuantizedSegment planes = wideSegment;
+      planes.*member = view;
+      (void)linear.add(graph, ggufBuffers, ggufView(planes), ggufPlan);
+    };
+    requireExtent(backend, wideSegment.*member, reach(rowGroups, readGroups, unitBytes), unitBytes, name, add);
+    metal::CommandGraph graph;
+    rejects([&] { add(graph, narrow.*member); }, std::string(name) + " buffer holds",
+            "a view of leading inputs over planes of its own inputs was accepted");
+    require(graph.empty(), "a view of leading inputs over planes of its own inputs encoded a dispatch");
+  }
+
+  Projection rotated = gguf;
+  rotated.rotation.signs = allocate(backend, k);
+  const Projection plain(n, k, wideAffine);
+  const LinearPlan gateUp = linear.decodePlan(plain, 1, LinearEpilogue::GateUp, &affine);
+  const auto refuses = [&](const Projection &view, const LinearPlan &plan, std::string_view refusal,
+                           const Projection *gate = nullptr) {
+    metal::CommandGraph graph;
+    rejects([&] { (void)linear.add(graph, buffersOf(plan), view, plan, gate); }, refusal,
+            "a view of leading inputs ran on a plan without its instance");
+    require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
+  };
+  constexpr std::string_view kOtherPlan = "a view of leading inputs runs only the quantized prefill residual tiles";
+  refuses(affine, linear.decodePlan(affine, 1, LinearEpilogue::Residual), kOtherPlan);
+  for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate}) {
+    refuses(affine, residualPrefill(WeightLayout::Affine64, {LinearTile::N128, 0, LinearSimdgroups::Four}, epilogue),
+            kOtherPlan);
+    refuses(gguf, residualPrefill(WeightLayout::Block32, {.tile = LinearTile::GgufPrefill}, epilogue), kOtherPlan);
+  }
+  refuses(gguf,
+          Linear::plan({{n, k}, 32, LinearPhase::Prefill, LinearEpilogue::Residual, WeightLayout::Block32},
+                       {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16),
+          kOtherPlan);
+  refuses(rotated, ggufPlan, kOtherPlan);
+  refuses(plain, gateUp, kOtherPlan, &affine);
+
+  // The views' factories: inputs beyond the projection's or of part of a quant group or meta unit, and a projection
+  // of float or rotated weights or of a view, are refused.
+  const Projection wideProjection(n, wide, wideAffine), wideGguf(n, wide, BlockWeights{{wideSegment}});
+  constexpr std::string_view kInputs = "a view of leading inputs takes whole quant groups and meta units";
+  constexpr std::string_view kSource = "views of a projection's planes take affine Q4 weights or one unrotated";
+  rejects([&] { (void)wideProjection.leadingInputs(wide + 64); }, kInputs, "a view of more inputs than rows hold");
+  rejects([&] { (void)wideProjection.leadingInputs(k + 32); }, kInputs, "a view of part of a quant group");
+  rejects([&] { (void)wideGguf.leadingInputs(k + 64); }, kInputs, "a view of part of a Q5_K meta unit");
+  const Projection floats(n, wide, BlockWeights{{QuantizedSegment::floats(n, wide, allocate(backend, n * wide * 4))}});
+  Projection rotatedSource = wideGguf;
+  rotatedSource.rotation.signs = allocate(backend, wide);
+  rejects([&] { (void)floats.leadingInputs(k); }, kSource, "a view of float weights");
+  rejects([&] { (void)rotatedSource.leadingInputs(k); }, kSource, "a view of rotated weights");
+  rejects([&] { (void)affine.leadingInputs(k / 2); }, kSource, "a view of a view");
+  rejects([&] { (void)floats.leadingRows(backend, 256); }, kSource, "a view of the rows of float weights");
+
+  // A view of leading rows, whole 256-row tiles, takes each plane's first tiles.
+  const Projection affineRows = wideProjection.leadingRows(backend, 256), ggufRows = wideGguf.leadingRows(backend, 256);
+  require(affineRows.outputSize == 256 && affineRows.inputSize == wide && !affineRows.planeInputs() &&
+              affineRows.affine().weights.sizeBytes() == uint64_t{256} * wide / 2 &&
+              affineRows.affine().scales.sizeBytes() == uint64_t{256} * (wide / 64) * 2 &&
+              affineRows.affine().biases.sizeBytes() == uint64_t{256} * (wide / 64) * 2,
+          "a view of 256 affine rows does not hold their tile");
+  const QuantizedSegment &segment = ggufRows.blocks().segments.front();
+  require(ggufRows.outputSize == 256 && segment.outputSize == 256 && segment.inputSize == wide &&
+              segment.plane0.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane0_bytes &&
+              segment.plane1.sizeBytes() == uint64_t{256} * (wide / 32) * q5k.plane1_bytes &&
+              segment.meta.sizeBytes() == uint64_t{256} * (wide / 32 / q5k.meta_groups) * q5k.meta_bytes,
+          "a view of 256 Q5_K rows does not hold their tile");
+  for (const uint32_t count : {0u, 128u, n + 256})
+    rejects([&] { (void)wideProjection.leadingRows(backend, count); }, "whole plane tiles",
+            "a view of " + std::to_string(count) + " leading rows");
+}
+
 std::array<uint64_t, 3> projectionFingerprint(const Projection &projection) {
   std::array<uint64_t, 3> result{};
   const std::array buffers{projection.affine().weights, projection.affine().scales, projection.affine().biases};
@@ -1580,77 +1862,156 @@ void checkReference(const Projection &p, const Projection &gate,
   }
 }
 
+// requireExtent for each scratch field of the `scratch` bytes a plan uses,
+// add(graph, buffers) encoding the plan with that field cut.
+template <class Add>
+void scratchExtents(metal::MetalBackend &backend, const LinearBuffers &buffers, LinearScratchSize scratch,
+                    const Add &add) {
+  for (const auto &[member, bytes, element, name] :
+       std::initializer_list<std::tuple<metal::MetalBuffer LinearScratch::*, uint64_t, uint64_t, const char *>>{
+           {&LinearScratch::input, scratch.input, 2, "projection scratch table"},
+           {&LinearScratch::sums, scratch.sums, 4, "projection scratch sums"},
+           {&LinearScratch::partials, scratch.partials, 4, "projection partials"},
+           {&LinearScratch::counters, scratch.counters, 4, "projection counters"}}) {
+    if (!bytes) continue;
+    requireExtent(backend, buffers.scratch.*member, bytes, element, name,
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                    LinearBuffers changed = buffers;
+                    changed.scratch.*member = view;
+                    add(graph, changed);
+                  });
+  }
+}
+
+// Each buffer and weight plane a plan's dispatches reach, at its extent and
+// one element short: the input, output and residual rows of the plan's
+// storage, the sums, gate scratch and down sums its epilogue reads or writes,
+// every scratch field its tile uses, and the Q4 weights of the projection and
+// of a gate/up plan's gate, with a scale and a bias per 64 values.
 void bufferContracts(metal::MetalBackend &backend, Linear &linear,
                         LinearBuffers buffers, const Projection &p,
                         const Projection &gate, const LinearPlan &plan) {
   const bool gateUp = plan.workload().epilogue == LinearEpilogue::GateUp;
+  const auto [n, k] = plan.workload().matrix;
+  const uint64_t rows = plan.storageRows(), outputElement = elementBytes(plan.destination());
   const auto add = [&](metal::CommandGraph &graph, LinearBuffers b,
                         const Projection &projection, const Projection *g) {
     linear.add(graph, b, projection, plan, g);
   };
-  const std::array members{&LinearBuffers::input, &LinearBuffers::output,
-                           &LinearBuffers::sums, &LinearBuffers::residual,
-                           &LinearBuffers::gateScratch, &LinearBuffers::downSums};
-  for (auto member : members) {
-    if (!(buffers.*member)) continue;
-    auto shortBuffers = buffers;
-    shortBuffers.*member = backend.view(buffers.*member, 0, (buffers.*member).sizeBytes() - 1);
-    metal::CommandGraph graph;
-    rejects([&] { add(graph, shortBuffers, p, gateUp ? &gate : nullptr); });
-    require(graph.empty(), "invalid Linear buffers partially encoded a graph");
-  }
-  // Every scratch field the plan uses (the simdgroup tile's table, sums,
-  // partials and counters; the Split128 partials and counters).
   const LinearScratchSize scratch = plan.scratchSize();
-  for (const auto [member, bytes] : {std::pair{&LinearScratch::input, scratch.input},
-                                     std::pair{&LinearScratch::sums, scratch.sums},
-                                     std::pair{&LinearScratch::partials, scratch.partials},
-                                     std::pair{&LinearScratch::counters, scratch.counters}}) {
+  for (const auto &[member, bytes, element, name] :
+       std::initializer_list<std::tuple<metal::MetalBuffer LinearBuffers::*, uint64_t, uint64_t, const char *>>{
+           {&LinearBuffers::input, rows * k * 2, 2, "projection input"},
+           {&LinearBuffers::output, rows * n * outputElement, outputElement, "projection output"},
+           {&LinearBuffers::residual,
+            plan.workload().epilogue == LinearEpilogue::Residual ? rows * n * 2 : 0, 2, "projection residual"},
+           {&LinearBuffers::sums, plan.sumsBytes(), 4, "projection sums"},
+           {&LinearBuffers::gateScratch, plan.gateScratchBytes(), 2, "projection gate scratch"},
+           {&LinearBuffers::downSums, plan.downSumsBytes(), 4, "projection down sums"}}) {
     if (!bytes) continue;
-    auto shortBuffers = buffers;
-    shortBuffers.scratch.*member = backend.view(buffers.scratch.*member, 0,
-                                                (buffers.scratch.*member).sizeBytes() - 1);
-    metal::CommandGraph graph;
-    rejects([&] { add(graph, shortBuffers, p, gateUp ? &gate : nullptr); });
-    require(graph.empty(), "invalid split workspace partially encoded a graph");
+    requireExtent(backend, buffers.*member, bytes, element, name,
+                  [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                    LinearBuffers changed = buffers;
+                    changed.*member = view;
+                    add(graph, changed, p, gateUp ? &gate : nullptr);
+                  });
   }
-  for (auto member : {&AffineWeights::weights, &AffineWeights::scales, &AffineWeights::biases}) {
-    AffineWeights planes = p.affine();
-    planes.*member = backend.view(p.affine().*member, 0, (p.affine().*member).sizeBytes() - 1);
-    const Projection shortProjection(p.outputSize, p.inputSize, planes);
-    metal::CommandGraph graph;
-    rejects([&] { add(graph, buffers, shortProjection, gateUp ? &gate : nullptr); });
-    require(graph.empty(), "invalid projection partially encoded a graph");
+  // Every scratch field the plan uses (the Q4 register tile's table, sums,
+  // partials and counters; the Split128 partials and counters).
+  scratchExtents(backend, buffers, scratch, [&](metal::CommandGraph &graph, const LinearBuffers &changed) {
+    add(graph, changed, p, gateUp ? &gate : nullptr);
+  });
+  const uint64_t parameters = uint64_t{n} * (k / 64) * 2;
+  for (const bool ofGate : {false, true}) {
+    if (ofGate && !gateUp) continue;
+    const Projection &weights = ofGate ? gate : p;
+    for (const auto &[member, bytes, element, name] :
+         std::initializer_list<std::tuple<metal::MetalBuffer AffineWeights::*, uint64_t, uint64_t, const char *>>{
+             {&AffineWeights::weights, uint64_t{n} * k / 2, 1, "projection weight"},
+             {&AffineWeights::scales, parameters, 2, "projection scale"},
+             {&AffineWeights::biases, parameters, 2, "projection bias"}})
+      requireExtent(backend, weights.affine().*member, bytes, element, name,
+                    [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
+                      AffineWeights planes = weights.affine();
+                      planes.*member = view;
+                      const Projection changed(weights.outputSize, weights.inputSize, planes);
+                      add(graph, buffers, ofGate ? p : changed, gateUp ? (ofGate ? &changed : &gate) : nullptr);
+                    });
   }
   auto mismatch = p;
   mismatch.inputSize += 256;
   metal::CommandGraph graph;
-  rejects([&] { add(graph, buffers, mismatch, gateUp ? &gate : nullptr); });
-  rejects([&] { add(graph, buffers, p, gateUp ? nullptr : &gate); });
+  rejects([&] { add(graph, buffers, mismatch, gateUp ? &gate : nullptr); },
+          "affine projection does not match plan", "a projection of another matrix was accepted");
+  rejects([&] { add(graph, buffers, p, gateUp ? nullptr : &gate); },
+          "a gate/up plan takes a gate projection and no other plan does",
+          "a gate projection was given to the wrong plan or withheld from gate/up");
   require(graph.empty(), "invalid Linear gate/projection partially encoded graph");
   if (plan.workload().phase == LinearPhase::Prefill) {
     const auto workload = plan.workload();
-    rejects([&] {
-      linear.addPrefillSums(graph,
-          backend.view(buffers.input, 0, buffers.input.sizeBytes() - 1), buffers.sums,
-          p, workload.rows);
-    });
-    rejects([&] {
-      linear.addPrefillSums(graph, buffers.input,
-          backend.view(buffers.sums, 0, buffers.sums.sizeBytes() - 1),
-          p, workload.rows);
-    });
+    // The input sums of the plan's 32-row tiles.
+    requireExtent(backend, buffers.input, rows * k * 2, 2, "projection input",
+                  [&](metal::CommandGraph &sums, const metal::MetalBuffer &view) {
+                    linear.addPrefillSums(sums, view, buffers.sums, p, workload.rows);
+                  });
+    requireExtent(backend, buffers.sums, rows * (k / 64) * 4, 4, "projection sums",
+                  [&](metal::CommandGraph &sums, const metal::MetalBuffer &view) {
+                    linear.addPrefillSums(sums, buffers.input, view, p, workload.rows);
+                  });
     for (const LinearMatrix matrix : {LinearMatrix{0, workload.matrix.inputSize},
            LinearMatrix{128, workload.matrix.inputSize},
            LinearMatrix{workload.matrix.outputSize, 0},
            LinearMatrix{workload.matrix.outputSize, 63}})
       rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums,
                                          Projection(matrix.outputSize, matrix.inputSize, p.affine()),
-                                         workload.rows); });
+                                         workload.rows); },
+              "invalid linear matrix", "prefill sums of a matrix of no or partial tiles or quant groups were accepted");
     for (uint32_t rows : {0U, RICHENGINE_PREFILL_TOKEN_BUDGET + 1U})
-      rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums, p, rows); });
+      rejects([&] { linear.addPrefillSums(graph, buffers.input, buffers.sums, p, rows); },
+              "invalid linear prefill workload", "prefill sums of no rows or past the budget were accepted");
     require(graph.empty(), "invalid prefill sums input partially encoded graph");
   }
+}
+
+// Every buffer of the Q4 register tile's plans of each epilogue and the scratch
+// of a GGUF register plan, at their extents and one element short: the
+// Apple9 decode tiles that read an activation table, on plans of a 40-core
+// Apple9 GPU that split K. requireExtent only encodes, so this runs on any
+// device.
+void registerTileExtents(metal::MetalBackend &backend) {
+  Linear m3 = gpu(9, 40);
+  constexpr uint32_t n = 512, k = 2048, lanes = 2;
+  constexpr uint64_t rows = lanes * 8;
+  const auto tableAndSplits = [](const LinearScratchSize &s) {
+    return s.input && s.sums && s.partials && s.counters;
+  };
+  const Projection p = test::deterministicQ4Projection(backend, {n, k}, 31),
+                   gate = test::deterministicQ4Projection(backend, {n, k}, 157);
+  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+    const LinearPlan plan = m3.plan({{n, k}, rows, LinearPhase::Decode, epilogue});
+    const LinearScratchSize scratch = plan.scratchSize();
+    require(tableAndSplits(scratch), "the affine Apple9 plan reads no table or does not split K");
+    bufferContracts(backend, m3,
+                    {.input = allocate(backend, rows * k * 2),
+                     .output = allocate(backend, rows * n * 2),
+                     .residual = allocate(backend, epilogue == LinearEpilogue::Residual ? rows * n * 2 : 0),
+                     .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                 allocate(backend, scratch.partials), allocate(backend, scratch.counters)}},
+                    p, gate, plan);
+  }
+  const Projection block(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, n, k)}});
+  const LinearPlan plan = m3.decodePlan(block, lanes);
+  const LinearScratchSize scratch = plan.scratchSize();
+  require(plan.configuration().tile == LinearTile::GgufRegister && tableAndSplits(scratch),
+          "the GGUF Apple9 plan is not a register plan that splits K");
+  scratchExtents(backend,
+                 {.input = allocate(backend, rows * k * 2),
+                  .output = allocate(backend, rows * n * 2),
+                  .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                              allocate(backend, scratch.partials), allocate(backend, scratch.counters)}},
+                 scratch, [&](metal::CommandGraph &graph, const LinearBuffers &buffers) {
+                   (void)m3.add(graph, buffers, block, plan);
+                 });
 }
 
 // Every tuning candidate of the workload against the CPU reference and the
@@ -1982,6 +2343,9 @@ int main(int argc, char **argv) {
     ggufProjectionMatrix(backend);
     producerTableContract(backend);
     rotatedRegisterInput(backend);
+    blockExtents(backend);
+    leadingInputViews(backend);
+    registerTileExtents(backend);
     Linear linear(backend.capabilities());
     for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
                                       LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},

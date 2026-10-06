@@ -5,6 +5,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BufferExtent.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -237,9 +238,11 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
 void requireSegments(const Projection &p, LinearMatrix matrix) {
   if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
     throw std::invalid_argument("block projection does not match plan");
-  for (const QuantizedSegment &s : p.blocks().segments)
+  for (const QuantizedSegment &s : p.blocks().segments) {
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
+    if (!s.isFloat()) requireSegmentPlanes(s, "projection", p.planeInputs());
+  }
 }
 
 // Columns of the segments, which the fused kernels' grids cover.
@@ -464,8 +467,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     // rotated once. Rows past the workload's are padding the tiles discard.
     if (gate && !gate->rotation.signs.sameView(p.rotation.signs))
       throw std::invalid_argument("a rotated gate/up pair takes one rotation");
-    if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
-      throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
+    if (k % GGUF_ROTATION_BLOCK)
+      throw std::invalid_argument("a rotated projection takes whole rotation blocks");
+    requireBytes(p.rotation.signs, k, "rotation sign");
     // A rotated projection leaves the rotated rows in the scratch (its add
     // returns LinearInput::Rotated): a second projection of the same input
     // and signs — the up pass of a prefill gate/up pair — skips the pass.
@@ -684,10 +688,15 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     bindings = {b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-    graph.add(prefillKernel(kernelFormat(appleGpuFamily_, s), epilogue), std::move(bindings),
-              GgufPrefillParams{k, w.rows, n, s.columnOffset},
-              {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
-              {GGUF_PREFILL_THREADS, 1, 1});
+    const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
+    const metal::DispatchSize groups{plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1};
+    if (p.planeInputs())
+      graph.add(leadingInputsInstance(prefillKernel(kernelFormat(appleGpuFamily_, s), epilogue)),
+                std::move(bindings), GgufPrefillLeadingParams{params, p.planeInputs()}, groups,
+                {GGUF_PREFILL_THREADS, 1, 1});
+    else
+      graph.add(prefillKernel(kernelFormat(appleGpuFamily_, s), epilogue), std::move(bindings), params, groups,
+                {GGUF_PREFILL_THREADS, 1, 1});
   }
 }
 
@@ -766,16 +775,35 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
   const uint64_t element = elementBytes(type);
   const bool accelerator = tile == FloatTile::NeuralAccelerator;
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
-      input.sizeBytes() < uint64_t{rows} * k * 2 ||
-      output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
+      (accelerator && (rows < 16 || k % 32)))
     throw std::invalid_argument("invalid float projection");
+  requireBytes(weights.plane0, uint64_t{n} * k * sizeof(float), "float projection weight");
+  requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
+  requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, element), "float projection output");
   const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
                              (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
+}
+
+void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {
+  // Each plane ends at its unit of the last row's last group the segment
+  // reads, or meta unit: tile row (rows - 1) % T of that group of its tile,
+  // whose rows hold the groups of planeInputs inputs.
+  const QuantFormat &format = segment.format();
+  const uint32_t groups = segment.inputSize / 32, units = groups / format.meta_groups;
+  const uint32_t rowGroups = (planeInputs ? planeInputs : segment.inputSize) / 32,
+                 rowUnits = rowGroups / format.meta_groups;
+  const auto planeBytes = [&](uint32_t blocks, uint32_t rowBlocks, uint32_t unitBytes) {
+    return (quant_tile_index(segment.outputSize - 1, blocks - 1, rowBlocks) + 1) * unitBytes;
+  };
+  const std::string name(what);
+  requireBytes(segment.plane0, planeBytes(groups, rowGroups, format.plane0_bytes), name + " plane0");
+  if (format.plane1_bytes)
+    requireBytes(segment.plane1, planeBytes(groups, rowGroups, format.plane1_bytes), name + " plane1");
+  requireBytes(segment.meta, planeBytes(units, rowUnits, format.meta_bytes), name + " meta");
 }
 
 bool apple9StagesFormat(uint32_t format) noexcept {

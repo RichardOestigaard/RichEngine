@@ -95,6 +95,7 @@ window. To set your own limits or cache options, add these to `richengine serve`
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format int8` | KV cache format: `int4` (default), `int8`, `bf16`, `fp8e4m3`. |
+| `--disable-ane` | Prefill on the GPU alone. Default: a dense model's long prompts also use the Neural Engine when that is faster. |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
@@ -224,7 +225,7 @@ That is **2.5–3.2×** as fast on the 35B and **4.5–5.3×** on the 27B
 | llama.cpp: single-token vs. batched | 99.65–99.75% | 97.95% |
 | **RichEngine vs. llama.cpp** | **99.30–99.45%** | **97.83–98.14%** |
 
-RichEngine uses BF16 KV in this comparison.
+RichEngine uses BF16 KV and `--disable-ane` in this comparison.
 [Benchmark details](docs/performance.md#gguf-against-llamacpp)
 
 ## Design

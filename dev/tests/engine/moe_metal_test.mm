@@ -606,32 +606,34 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   const auto dispatches = graph.dispatches();
   const bool split = plan.splitExperts();
   const size_t expertPasses = split ? 3 : 2;
-  // Two router dispatches, grouping, gather, the expert passes and combine.
-  require(dispatches.size() == 5 + expertPasses,
+  // Two router dispatches, grouping, the expert passes and combine; prefill
+  // plans' gate and up passes read the rows' inputs through grouped_routes,
+  // while decode plans still gather first.
+  require(dispatches.size() == (split ? 4 : 5) + expertPasses,
           "MoE plan must encode the entire operator");
   const auto route =
       richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
                                              : "moe_route_scores_q8_m32";
-  const size_t experts = 4;
+  const size_t experts = split ? 3 : 4;
   const size_t combine = experts + expertPasses;
   require(dispatches[0].pipelineName == scores &&
               dispatches[1].pipelineName == "moe_route_select_q8" &&
               dispatches[2].pipelineName == "moe_group_routes" &&
-              dispatches[3].pipelineName == "moe_gather_rows" &&
+              (split || dispatches[3].pipelineName == "moe_gather_rows") &&
               dispatches[combine].pipelineName == "moe_combine",
           "MoE plan chose inconsistent pipelines");
   if (split) {
     require(dispatches[experts].pipelineName ==
-                    "prefill_moe_expert_q4_n256_m32" &&
+                    "prefill_moe_expert_q4_n256_indirect_m32" &&
                 dispatches[experts + 1].pipelineName ==
-                    "prefill_moe_expert_q4_n256_up_silu_m32" &&
+                    "prefill_moe_expert_q4_n256_up_silu_indirect_m32" &&
                 dispatches[experts + 2].pipelineName ==
                     "prefill_moe_expert_q4_n256_m32",
             "split MoE plan chose inconsistent expert pipelines");
     // The gate parks in expertOutput and the up pass reads it back.
-    const auto &gate = dispatches[experts].buffers[5].buffer;
-    require(gate.sameView(dispatches[experts + 1].buffers[5].buffer) &&
+    const auto &gate = dispatches[experts].buffers[6].buffer;
+    require(gate.sameView(dispatches[experts + 1].buffers[6].buffer) &&
                 gate.sameView(dispatches[experts + 2].buffers[5].buffer) &&
                 dispatches[experts].threadgroups.x == kIntermediate / 256 &&
                 dispatches[experts + 1].threadgroups.x == kIntermediate / 256 &&
@@ -660,16 +662,20 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
     tileGrids &= dispatches[pass].threadgroups.y == plan.maximumTiles();
   for (size_t pass = 0; pass <= combine; ++pass) {
     const bool expertPass = pass >= experts && pass < combine;
-    require((expertPass || dispatches[pass].threadsPerThreadgroup.x == 256) &&
+    require((expertPass ||
+             dispatches[pass].threadsPerThreadgroup.x ==
+                 (dispatches[pass].pipelineName == "moe_group_routes" ? 1024 : 256)) &&
                 dispatches[pass].threadsPerThreadgroup.y == 1 &&
                 dispatches[pass].threadsPerThreadgroup.z == 1,
             "MoE plan changed a non-expert threadgroup width");
   }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
-              dispatches[0].threadgroups.y == kStorageColumns / route.experts &&
+              dispatches[0].threadgroups.y ==
+                  (kExperts + route.experts - 1) / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
-              dispatches[3].threadgroups.x == plan.maximumTiles() && tileGrids &&
+              (split || dispatches[3].threadgroups.x == plan.maximumTiles()) &&
+              tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
           "MoE plan chose inconsistent dispatch bounds");
 }

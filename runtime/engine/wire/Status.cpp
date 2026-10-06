@@ -26,6 +26,17 @@ void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
       << ",\"restores\":" << weights.restores << '}';
 }
 
+// reruns: the chunks the GPU ran again alone once the split's work for them
+// failed (model::ModelTelemetry::aneFfnReruns).
+void appendAneFfn(std::ostringstream &out, const AneFfnSnapshot &split, uint64_t reruns) {
+  constexpr std::string_view kStates[] = {"off", "split", "stopped"};
+  out << "{\"state\":" << json::quote(kStates[static_cast<size_t>(split.state)])
+      << ",\"share\":" << split.share << ",\"minimum_rows\":" << split.minimumRows
+      << ",\"reason\":" << json::quote(split.reason) << ",\"split_commands\":" << split.commands
+      << ",\"reruns\":" << reruns << ",\"ane_ms\":" << split.aneMilliseconds
+      << ",\"evaluations\":" << split.evaluations << '}';
+}
+
 void appendBatch(std::ostringstream &out,
                  const RuntimeBatchMetricsSnapshot &batch) {
   out << '{' << "\"valid\":" << boolean(batch.valid)
@@ -48,7 +59,8 @@ std::string runtimeStatusJson(
     const engine::RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
-    const NativeLoopTiming &loop, const WeightsSnapshot &weights) {
+    const NativeLoopTiming &loop, const WeightsSnapshot &weights,
+    const AneFfnSnapshot &aneFfn) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -125,6 +137,8 @@ std::string runtimeStatusJson(
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);
+  out << ",\"ane_ffn\":";
+  appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
       << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive

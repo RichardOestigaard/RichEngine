@@ -669,17 +669,21 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         return command;
     }
 
-// Encodes and commits prepared dispatches; the ticket retains
-    // `retained` until it is consumed.
+// Encodes and commits prepared dispatches and the event steps between
+    // them; the ticket retains `retained` until it is consumed.
     CommandTicket MetalBackend::Impl::commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
         // A second command may be committed while this one is still in
         // flight (the submit-ahead ring). Baked spans stay exclusive to the
         // GPU-idle case: patchSpanParams rewrites the shared parameter arena
         // an in-flight replay still reads, so a pipelined submission encodes
-        // every dispatch directly instead.
-        const bool replaySpans = !asyncState->hasActiveSubmission();
+        // every dispatch directly instead. A command with event steps also
+        // encodes directly: a replayed span would hide the dispatches its
+        // steps order against the other agent (EventStep).
+        const bool replaySpans =
+            events.empty() && !asyncState->hasActiveSubmission();
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
@@ -705,16 +709,56 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 failBeforeCommit("unable to create Metal command buffer");
             }
             ticketState->wallStart = wallStart;
-            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-            if (!encoder) {
-                failBeforeCommit("unable to create Metal compute encoder");
-            }
+            // The buffers before `command`, each ended by an event signal.
+            std::vector<id<MTLCommandBuffer>> leading;
+            id<MTLComputeCommandEncoder> encoder = nil;
+            // Encodes the event steps that follow the first `encoded`
+            // dispatches.
+            auto step = events.begin();
+            const auto encodeSteps = [&](size_t encoded) {
+                for (; step != events.end() && step->before == encoded; ++step) {
+                    if (encoder) {
+                        [encoder endEncoding];
+                        encoder = nil;
+                    }
+                    id<MTLSharedEvent> event =
+                        (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
+                    if (step->kind == EventStep::Kind::Wait) {
+                        [command encodeWaitForEvent:event value:step->value];
+                        continue;
+                    }
+                    [command encodeSignalEvent:event value:step->value];
+                    // A buffer that fails may end without its signal; the
+                    // work after it, waiting on an agent that waits on the
+                    // signal, would then stall until a timeout ends it. The
+                    // CPU delivers the signal instead, so the command ends
+                    // with the failure at once.
+                    const SharedEvent signaled = step->event;
+                    const uint64_t value = step->value;
+                    [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+                        if (ended.status == MTLCommandBufferStatusError)
+                            signaled.signal(value);
+                    }];
+                    leading.push_back(command);
+                    command = [queue commandBuffer];
+                    if (!command) {
+                        failBeforeCommit("unable to create Metal command buffer");
+                    }
+                }
+            };
             // Indexed by argument table entry. The ticket and the dispatches
             // keep the buffers alive.
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
             for (size_t index = 0; index < dispatches.size(); ++index) {
+                encodeSteps(index);
                 const PreparedDispatch &item = dispatches[index];
+                if (!encoder) {
+                    encoder = [command computeCommandEncoder];
+                    if (!encoder) {
+                        failBeforeCommit("unable to create Metal compute encoder");
+                    }
+                }
                 // A baked span replays its whole run from the indirect
                 // command buffer; the run's own dispatches are skipped.
                 if (item.span && replaySpans &&
@@ -763,7 +807,9 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 [encoder dispatchThreadgroups:item.groups
                          threadsPerThreadgroup:item.threads];
             }
-            [encoder endEncoding];
+            encodeSteps(dispatches.size());
+            if (encoder) [encoder endEncoding];
+            ticketState->leadingCommands = leading;
 
             // Driver callbacks only complete the ticket. Device-wide memory
             // telemetry is sampled on the host when consuming the result. The
@@ -774,7 +820,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 ticketState->finishCommand(completed);
             }];
             residency->use();
-            asyncState->commitSubmission(ticketState->sequence, command,
+            asyncState->commitSubmission(ticketState->sequence, leading, command,
                 [weakTicket = std::weak_ptr(ticketState)](
                     id<MTLCommandBuffer> completed) {
                     if (auto ticket = weakTicket.lock())
@@ -1024,7 +1070,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         CommandTiming total;
         for (const PreparedDispatch &item : command.dispatches) {
             const CommandTiming timing =
-                commit({&item, 1}, command.retainedAllocations, {}).wait();
+                commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
             dispatchProfile.push_back(
                 {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
@@ -1057,21 +1103,33 @@ CommandTicket MetalBackend::submitAsync(const ComputeDispatch &dispatch) {
 CommandTicket MetalBackend::submitCommandAsync(
     std::span<const ComputeDispatch> dispatches,
     CommandCompletion completion) {
+    return submitCommandAsync(Command{dispatches, {}}, std::move(completion));
+}
+
+CommandTicket MetalBackend::submitCommandAsync(const Command &command,
+                                               CommandCompletion completion) {
     checkOperation();
     // Always present, whatever this translation unit's instrumentation flag:
     // submitProfiled is only reachable in objects that carry it.
-    if (impl_->dispatchProfiling)
-        return impl_->submitProfiled(dispatches, std::move(completion));
-    Impl::PreparedCommand command = impl_->prepared(dispatches);
+    if (impl_->dispatchProfiling) {
+        if (!command.events.empty())
+            throw MetalBackendError(
+                "dispatch profiling does not replay event steps");
+        return impl_->submitProfiled(command.dispatches, std::move(completion));
+    }
+    checkEvents(command.events, command.dispatches.size());
+    Impl::PreparedCommand prepared = impl_->prepared(command.dispatches);
 #if RICHENGINE_MTL4_AVAILABLE
-    if (impl_->useMtl4()) {
-        return impl_->commit4(command.dispatches,
-                              std::move(command.retainedAllocations),
+    // The Metal 4 path has no shared-event encoding: a command with event
+    // steps takes the Metal 3 encoder.
+    if (command.events.empty() && impl_->useMtl4()) {
+        return impl_->commit4(prepared.dispatches,
+                              std::move(prepared.retainedAllocations),
                               std::move(completion));
     }
 #endif
-    return impl_->commit(command.dispatches,
-                         std::move(command.retainedAllocations),
+    return impl_->commit(prepared.dispatches, command.events,
+                         std::move(prepared.retainedAllocations),
                          std::move(completion));
 }
 

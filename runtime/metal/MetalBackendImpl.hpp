@@ -155,6 +155,31 @@ static_assert(sizeof(NSUInteger) == sizeof(uint64_t),
 constexpr uint32_t kBufferArgumentEntries = 31;
 // How long a ticket waits for its command before it asks the watchdog.
 constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
+// The queue's outstanding command buffers; a command takes one per event
+// signal and one more.
+constexpr NSUInteger kMaximumCommandBuffers = 512;
+
+// Refuses the event steps of a command of `dispatches` dispatches that its
+// submission cannot encode.
+[[maybe_unused]] void checkEvents(std::span<const EventStep> events, size_t dispatches) {
+    size_t before = 0;
+    NSUInteger signals = 0;
+    for (const EventStep &step : events) {
+        if (!step.event || !step.value)
+            throw MetalBackendError(
+                "event step needs an event and a nonzero value");
+        if (step.before < before)
+            throw MetalBackendError("event steps are out of dispatch order");
+        if (step.before > dispatches)
+            throw MetalBackendError(
+                "event step follows more dispatches than its command has");
+        before = step.before;
+        if (step.kind == EventStep::Kind::Signal) ++signals;
+    }
+    if (signals >= kMaximumCommandBuffers)
+        throw MetalBackendError("Metal command signals more events than its "
+                                "queue holds command buffers");
+}
 [[maybe_unused]] double awakeSeconds() noexcept {
     return std::chrono::duration<double>(AwakeClock::now().time_since_epoch()).count();
 }
@@ -214,6 +239,9 @@ struct MetalAllocation {
     uint64_t length = 0;
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
+    // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
+    // never released: our views keep it as well as Metal's deallocator.
+    std::shared_ptr<void> owner;
     // The residency set the buffer belongs to, held weakly as allocations
     // may outlive the backend. The set retains the buffer, and with it its
     // memory, so the last view takes it out.
@@ -247,11 +275,18 @@ struct MetalAllocation {
 };
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
-// released: only allocateBuffer and view create one.
+// released: only allocateBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
     uint64_t lengthBytes = 0;
+};
+
+struct SharedEvent::Impl {
+    __strong id<MTLSharedEvent> event = nil;
+    // The listener of the backend that created the event, which runs its
+    // notify() callbacks; the backend and each of its events hold it.
+    __strong MTLSharedEventListener *listener = nil;
 };
 
 struct BackendAsyncState {
@@ -337,12 +372,15 @@ struct BackendAsyncState {
         return sequence;
     }
 
-    void commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
+    void commitSubmission(uint64_t sequence,
+                          const std::vector<id<MTLCommandBuffer>> &leading,
+                          id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
         std::lock_guard lock(gateMutex);
         InFlight &entry = inFlightEntry(sequence);
         entry.command = command;
         entry.completion = std::move(completion);
+        for (id<MTLCommandBuffer> earlier : leading) [earlier commit];
         [command commit];
     }
 
@@ -456,6 +494,8 @@ struct CommandTicket::State {
     uint64_t sequence = 0;
     CommandTiming timing;
     AwakeClock::time_point wallStart;
+    // Command buffers committed before the last one, split at event signals.
+    std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::string error;
     bool completed = false;
     bool released = false;
@@ -463,8 +503,9 @@ struct CommandTicket::State {
     void finishCommand(id<MTLCommandBuffer> command) {
         auto wallEnd = AwakeClock::now();
         CommandTiming timing;
-        timing.gpuSeconds =
-            command.GPUEndTime - command.GPUStartTime;
+        const double gpuStart = leadingCommands.empty()
+            ? command.GPUStartTime : leadingCommands.front().GPUStartTime;
+        timing.gpuSeconds = command.GPUEndTime - gpuStart;
         if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
             timing.gpuSeconds = 0.0;
         }
@@ -472,11 +513,21 @@ struct CommandTicket::State {
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
         std::string error;
-        if (command.status != MTLCommandBufferStatusCompleted) {
+        // The first buffer that failed names the error: the buffers after a
+        // failed one still run, as its signal is delivered (EventStep).
+        id<MTLCommandBuffer> failed =
+            command.status != MTLCommandBufferStatusCompleted ? command : nil;
+        for (id<MTLCommandBuffer> earlier : leadingCommands) {
+            if (earlier.status == MTLCommandBufferStatusError) {
+                failed = earlier;
+                break;
+            }
+        }
+        if (failed) {
             std::ostringstream message;
             message << "Metal command " << sequence << " failed";
-            if (command.error) {
-                message << ": " << errorDescription(command.error);
+            if (failed.error) {
+                message << ": " << errorDescription(failed.error);
             }
             error = message.str();
         }
@@ -720,6 +771,9 @@ struct MetalBackend::Impl {
     std::vector<DispatchTiming> dispatchProfile;
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
+    // Runs the notify() callbacks of the backend's shared events, on a
+    // serial dispatch queue.
+    __strong MTLSharedEventListener *eventListener = nil;
 #if RICHENGINE_MTL4_AVAILABLE
     // The Metal 4 submission path, used only while mtl4Enabled() opted in.
     // The submit-ahead ring keeps two commands in flight, so the allocator
@@ -892,9 +946,10 @@ struct MetalBackend::Impl {
     PreparedCommand prepared(std::span<const ComputeDispatch> dispatches);
 
 
-    // Encodes and commits prepared dispatches; the ticket retains
-    // `retained` until it is consumed.
+    // Encodes and commits prepared dispatches and the event steps between
+    // them; the ticket retains `retained` until it is consumed.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion);
 

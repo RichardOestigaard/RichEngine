@@ -241,6 +241,45 @@ PREFILL_Q4(prefill_linear_q4_n256_up_silu_sums, 256, 8, UpSiluSums)
 PREFILL_Q4(prefill_linear_q4_n128_sg4, 128, 4, Plain)
 PREFILL_Q4(prefill_linear_q4_n128_residual_sg4, 128, 4, Residual)
 PREFILL_Q4(prefill_linear_q4_n128_up_silu_sums_sg4, 128, 4, UpSiluSums)
+
+// The parameters (a scale, a bias and 64 weights per column and group) that
+// a view of the leading input_size inputs of rows of plane_input_size leaves
+// unread in the 256-column tiles before the one holding `column`.
+inline ulong q4_unread_parameters(constant Q4PrefillLeadingParams &params,
+                                  uint column) {
+  return ulong(column / kQ4StorageColumns) *
+         (params.plane_input_size / 64 - params.matrix.input_size / 64) *
+         kQ4StorageColumns;
+}
+
+// The residual kernels over a view of the leading inputs of wider weight rows,
+// for the Neural Engine FFN split's down projection. Each runs the tile of its
+// residual kernel on the planes advanced past the parameters the view leaves
+// unread before its column tile, which the tile then addresses as rows of
+// input_size inputs.
+#define PREFILL_Q4_LEADING(Name, TileN, Simdgroups)                            \
+  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+                   device uchar *weights [[buffer(1)]],                        \
+                   device bfloat *scales [[buffer(2)]],                        \
+                   device bfloat *biases [[buffer(3)]],                        \
+                   device bfloat *residual [[buffer(4)]],                      \
+                   device bfloat *output [[buffer(5)]],                        \
+                   device const float *sums [[buffer(6)]],                     \
+                   constant Q4PrefillLeadingParams &params [[buffer(7)]],      \
+                   uint2 group [[threadgroup_position_in_grid]],               \
+                   uint simd_lane [[thread_index_in_simdgroup]],               \
+                   uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
+    PREFILL_Q4_INPUT_SUMS_##Simdgroups;                                        \
+    const ulong unread = q4_unread_parameters(params, group.y * TileN);        \
+    q4_prefill<TileN, Simdgroups, PrefillQ4Epilogue::Residual>(                \
+        input, weights + unread * 64 / 2, scales + unread, biases + unread,    \
+        residual, output, sums, nullptr, params.matrix, group, simd_lane,      \
+        simd_group, input_sums);                                               \
+  }
+PREFILL_Q4_LEADING(prefill_linear_q4_n128_residual_leading_inputs, 128, 8)
+PREFILL_Q4_LEADING(prefill_linear_q4_n256_residual_leading_inputs, 256, 8)
+PREFILL_Q4_LEADING(prefill_linear_q4_n128_residual_sg4_leading_inputs, 128, 4)
+#undef PREFILL_Q4_LEADING
 #undef PREFILL_Q4
 #undef PREFILL_Q4_INPUT_SUMS_4
 #undef PREFILL_Q4_INPUT_SUMS_8

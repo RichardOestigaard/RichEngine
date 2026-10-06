@@ -49,6 +49,7 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"pipeline_reserve_bytes\":" << model::kPipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":"
       << model::kRuntimeOverheadReserveBytes << ','
+      << "\"ane_ffn_bytes\":" << model.footprint.aneFfnBytes << ','
       << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
   return out.str();
 }
@@ -140,7 +141,7 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
            footprint.runtime.sharedPrefillPlannedAllocatedBytes,
            footprint.runtime.sharedDecodePlannedAllocatedBytes,
            model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
-           footprint.stateStagingBytes}) {
+           footprint.stateStagingBytes, footprint.aneFfnBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -165,7 +166,8 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":" << runtimeOverheadReserveBytes
-      << ',' << "\"state_staging_bytes\":" << stateStagingBytes << ','
+      << ',' << "\"ane_ffn_bytes\":" << aneFfnBytes << ','
+      << "\"state_staging_bytes\":" << stateStagingBytes << ','
       << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
       << "\"kv_page_tokens\":" << kvPageTokens << ','
@@ -203,6 +205,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "pipeline reserve: " << bytesAndMiB(pipelineReserveBytes) << '\n'
       << "allocator/runtime reserve: "
       << bytesAndMiB(runtimeOverheadReserveBytes) << '\n'
+      << "Neural Engine split: " << bytesAndMiB(aneFfnBytes) << '\n'
       << "disk tier state staging: " << bytesAndMiB(stateStagingBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
       << "elastic state/KV budget: " << bytesAndMiB(dynamicBudgetBytes) << '\n'
@@ -296,6 +299,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
+  breakdown.aneFfnBytes = model.footprint.aneFfnBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
   if (auto error = device.validationError()) {

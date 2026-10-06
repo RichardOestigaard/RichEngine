@@ -255,6 +255,22 @@ struct WeightsSnapshot {
   uint64_t restores = 0;
 };
 
+// The prefill FFN's Neural Engine split (RuntimeResources::aneFfnSnapshot).
+struct AneFfnSnapshot {
+  // Off: the start left the GPU alone; Split: the split serves; Stopped: it
+  // stopped while serving, and the GPU runs alone until the engine restarts.
+  enum class State : uint8_t { Off, Split, Stopped };
+  State state = State::Off;
+  // The start's outcome (AneFfnOutcome), or why the split stopped.
+  std::string reason;
+  // The split's share and least chunk rows; 0 when off.
+  double share = 0.0;
+  uint32_t minimumRows = 0;
+  // What it ran (ops::AneFfn::Served).
+  uint64_t commands = 0, evaluations = 0;
+  double aneMilliseconds = 0.0;
+};
+
 // Single source for /status and native protocol status events.
 [[nodiscard]] std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const EngineSnapshot &core,
@@ -264,6 +280,7 @@ struct WeightsSnapshot {
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
-    const NativeLoopTiming &loop, const WeightsSnapshot &weights);
+    const NativeLoopTiming &loop, const WeightsSnapshot &weights,
+    const AneFfnSnapshot &aneFfn);
 
 } // namespace richengine::engine

@@ -53,6 +53,7 @@ OPTIONS = {
         ("", "turbo", "XHIGH"),
     ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
+    "--disable-ane": ([(["--disable-ane"], True)], []),
     "--max-memory": values(
         "--max-memory",
         {

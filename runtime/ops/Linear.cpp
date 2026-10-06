@@ -102,7 +102,82 @@ bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
                         w.epilogue == LinearEpilogue::Residual));
 }
 
+// Throws if `p` is a view of the leading inputs of wider weight rows
+// (Projection::leadingInputs) that `plan` has no kernel instance for: only the
+// prefill residual tiles of affine Q4 weights (N128, N256) and of quantized
+// GGUF segments (GgufPrefill), unrotated, read one (leadingInputsInstance).
+void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
+  if (!p.planeInputs()) return;
+  const LinearWorkload w = plan.workload();
+  const LinearTile tile = plan.configuration().tile;
+  if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
+      (tile != LinearTile::N128 && tile != LinearTile::N256 && tile != LinearTile::GgufPrefill) || p.rotation)
+    throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
+}
+
+// Throws unless views of `p`'s planes can stand for it (takesPlaneViews).
+void requirePlaneViews(const Projection &p) {
+  if (p.takesPlaneViews()) return;
+  throw std::invalid_argument(
+      "views of a projection's planes take affine Q4 weights or one unrotated quantized GGUF tensor, not a view");
+}
+
 } // namespace
+
+// Every plane of either layout holds its rows in tiles of QUANT_TILE_ROWS
+// rows, each tile's units in order, so the leading rows' tiles lead it.
+static_assert(RICHENGINE_AFFINE_TILE_ROWS == QUANT_TILE_ROWS, "affine Q4 and GGUF planes share their tiles");
+
+bool Projection::takesPlaneViews() const noexcept {
+  if (planeInputs_) return false;
+  if (layout() == WeightLayout::Affine64) return true;
+  const std::vector<QuantizedSegment> &segments = blocks().segments;
+  return segments.size() == 1 && !segments.front().isFloat() && !rotation;
+}
+
+Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t rows) const {
+  requirePlaneViews(*this);
+  if (!rows || rows % QUANT_TILE_ROWS || rows > outputSize)
+    throw std::invalid_argument("a view of leading rows takes whole plane tiles of the projection's rows");
+  // The leading rows of a plane of `rowBytes` bytes per row.
+  const auto view = [&](const metal::MetalBuffer &plane, uint64_t rowBytes) {
+    return rowBytes ? backend.view(plane, 0, rows * rowBytes) : metal::MetalBuffer{};
+  };
+  if (layout() == WeightLayout::Affine64) {
+    const uint64_t groups = inputSize / kQuantGroup;
+    const AffineWeights &planes = affine();
+    return Projection(rows, inputSize,
+                      AffineWeights{view(planes.weights, groups * kQuantGroup / 2), view(planes.scales, groups * 2),
+                                    view(planes.biases, groups * 2)});
+  }
+  const QuantizedSegment &segment = blocks().segments.front();
+  const QuantFormat &format = segment.format();
+  const uint64_t groups = inputSize / 32;
+  return Projection(rows, inputSize,
+                    BlockWeights{{QuantizedSegment::planes(segment.formatId, rows, inputSize,
+                                                           view(segment.plane0, groups * format.plane0_bytes),
+                                                           view(segment.plane1, groups * format.plane1_bytes),
+                                                           view(segment.meta,
+                                                                groups / format.meta_groups * format.meta_bytes))}});
+}
+
+Projection Projection::leadingInputs(uint32_t inputs) const {
+  requirePlaneViews(*this);
+  const bool affineWeights = layout() == WeightLayout::Affine64;
+  const uint32_t unit = affineWeights ? kQuantGroup : 32 * blocks().segments.front().format().meta_groups;
+  if (!inputs || inputs > inputSize || inputs % unit)
+    throw std::invalid_argument("a view of leading inputs takes whole quant groups and meta units of the projection's");
+  const auto view = [&] {
+    if (affineWeights) return Projection(outputSize, inputs, affine());
+    const QuantizedSegment &segment = blocks().segments.front();
+    return Projection(outputSize, inputs,
+                      BlockWeights{{QuantizedSegment::planes(segment.formatId, outputSize, inputs, segment.plane0,
+                                                             segment.plane1, segment.meta)}});
+  };
+  Projection result = view();
+  result.planeInputs_ = inputSize;
+  return result;
+}
 
 // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
@@ -129,10 +204,16 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   if (p.layout() != WeightLayout::Affine64 || p.outputSize != matrix.outputSize ||
       p.inputSize != matrix.inputSize)
     throw std::invalid_argument("affine projection does not match plan");
-  requireBytes(p.affine().weights, uint64_t{matrix.outputSize} * matrix.inputSize / 2, "weight");
-  const uint64_t bytes = uint64_t{matrix.outputSize} * (matrix.inputSize / kQuantGroup) * 2;
-  requireBytes(p.affine().scales, bytes, "scale");
-  requireBytes(p.affine().biases, bytes, "bias");
+  // Each plane holds a scale, a bias or 64 weights per row and group, in
+  // tiles of RICHENGINE_AFFINE_TILE_ROWS rows, each tile's groups in order. It
+  // ends at the last group the projection reads of its last tile: a view of
+  // leading inputs leaves the tile's later groups unread.
+  const uint64_t groups = matrix.inputSize / kQuantGroup, rowGroups = p.planeInputSize() / kQuantGroup;
+  const uint64_t parameters =
+      uint64_t{matrix.outputSize} * rowGroups - RICHENGINE_AFFINE_TILE_ROWS * (rowGroups - groups);
+  requireBytes(p.affine().weights, parameters * kQuantGroup / 2, "projection weight");
+  requireBytes(p.affine().scales, parameters * 2, "projection scale");
+  requireBytes(p.affine().biases, parameters * 2, "projection bias");
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
@@ -771,6 +852,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     throw std::invalid_argument("projection layout does not match execution plan");
   if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
+  requireLeadingInputs(selected, p);
+  if (gate) requireLeadingInputs(selected, *gate);
   const uint64_t rows = selected.storageRows();
   requireBytes(b.input, rows * k * 2, "input");
   requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
@@ -858,11 +941,16 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   }
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
-    if (w.phase == LinearPhase::Prefill)
-      graph.add(std::string(name), bindings, Q4Params{n, k},
-          {selected.storageRows() / kAffinePrefillTileRows, n / selected.tileColumns(), 1},
-          {selected.threadsPerThreadgroup(), 1, 1});
-    else {
+    if (w.phase == LinearPhase::Prefill) {
+      const metal::DispatchSize groups{selected.storageRows() / kAffinePrefillTileRows,
+                                       n / selected.tileColumns(), 1};
+      const metal::DispatchSize threads{selected.threadsPerThreadgroup(), 1, 1};
+      if (p.planeInputs())
+        graph.add(leadingInputsInstance(name), bindings, Q4PrefillLeadingParams{{n, k}, p.planeInputs()}, groups,
+                  threads);
+      else
+        graph.add(std::string(name), bindings, Q4Params{n, k}, groups, threads);
+    } else {
       // Split128 binds its partials and counters after the sequential
       // kernel's buffers; every other decode tile runs one K split.
       const LinearConfig config = selected.configuration();
@@ -929,6 +1017,17 @@ PreparedInput Linear::addPrefillResidual(metal::CommandGraph &graph, metal::Meta
              {.input = input, .output = output, .sums = sums, .residual = residual, .scratch = scratch,
               .prepared = prepared},
              p, prefillPlan(p, rows, LinearEpilogue::Residual));
+}
+void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
+                              const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
+                              uint32_t rows) const {
+  // The gate's rotated rows stand in the scratch for the up pass, whose
+  // projection reads the same input and rotation signs.
+  const PreparedInput prepared =
+      addPrefill(graph, b.normalized, *ffn.gate, b.gateScratch, b.sums, rows, b.scratch);
+  addPrefillUpWithGate(graph, b.normalized, *ffn.up, b.gateScratch, b.intermediate, b.sums, b.downSums, rows,
+                       b.scratch, prepared);
+  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, b.downSums, rows, b.scratch);
 }
 PreparedInput Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input,
                                            const Projection &up, metal::MetalBuffer gateScratch,
