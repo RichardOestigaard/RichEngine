@@ -86,6 +86,12 @@ class ToolDialect:
     # call is one element.
     body_close: str = FUNCTION_END
     block_close: str = TOOL_CALL_CLOSE
+    # Whether param_close alone ends a value whatever follows it. False where
+    # a value may hold the closing tag as data when no tag follows it (the
+    # default's values need no CDATA); true where the template CDATA-wraps
+    # every value containing markup characters, so a bare close is always
+    # markup (minicpm5).
+    bare_close: bool = False
     # An optional separator a model may write between calls, consumed before
     # each call's marker ("" where calls run together).
     call_separator: str = ""
@@ -352,6 +358,7 @@ MINICPM5_XML = ToolDialect(
     call_close="</function>",
     body_close="</function>",
     block_close="",
+    bare_close=True,
     call_separator="<tool_sep>",
     cdata=True,
     structural=("<function", "</function>", "<param", "</param>"),

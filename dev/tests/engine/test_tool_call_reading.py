@@ -8,6 +8,8 @@ read as they do.
 import json
 import unittest
 
+from server import tool_schema
+
 from dev.tests.tool_output import (
     project,
     streamed_arguments,
@@ -200,6 +202,55 @@ class ToolCallReadingTests(unittest.TestCase):
         # A </think> in text is dropped.
         content, calls = self.read("Sure.</think> Here" + call("roll_cut"))
         self.assertEqual((content, calls), ("Sure. Here", [("roll_cut", {})]))
+
+    def test_minicpm5_dialect_reads(self):
+        """The minicpm5 dialect's calls — `<function name="n"><param
+        name="p">v</param></function>` elements apart by `<tool_sep>` or
+        space, values possibly CDATA-wrapped — read as the default
+        dialect's do."""
+        policy = tool_schema.ToolPolicy(
+            schemas=SCHEMAS,
+            required=False,
+            parallel=True,
+            strict=frozenset(),
+            constrained=False,
+            dialect=tool_schema.MINICPM5_XML,
+        )
+        cases = (
+            (
+                'Up next.\n<function name="roll_cut"><param name="item">s1</param>'
+                '<param name="shift">-0.5</param></function><tool_sep>'
+                '<function name="cut_at"><param name="time">'
+                "<![CDATA[12:00\n]]></param></function>",
+                "Up next.",
+                [
+                    ("roll_cut", {"item": "s1", "shift": -0.5}),
+                    ("cut_at", {"time": "12:00\n"}),
+                ],
+            ),
+            # Space the model leaves between the elements.
+            (
+                '<function name="roll_cut">\n<param name="item">s1</param>\n'
+                '<param name="shift">-0.5</param>\n</function>',
+                "",
+                [("roll_cut", {"item": "s1", "shift": -0.5})],
+            ),
+        )
+        for text, expected_content, expected_calls in cases:
+            for size in (None, 1, 5):
+                with self.subTest(size=size):
+                    content, calls, _ = project(text, policy, size=size)
+                    self.assertEqual(content.strip(), expected_content)
+                    self.assertEqual(
+                        [
+                            (
+                                call_["function"]["name"],
+                                json.loads(call_["function"]["arguments"]),
+                            )
+                            for call_ in calls
+                        ],
+                        expected_calls,
+                    )
 
     def test_values_convert_by_their_declared_types(self):
         for schema, text, value in CONVERSIONS:
