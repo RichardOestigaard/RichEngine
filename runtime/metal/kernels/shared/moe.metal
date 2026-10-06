@@ -438,14 +438,16 @@ inline void moe_group_routes_run(
     threadgroup uint *tile_offsets,
     threadgroup uint *simd_totals,
     threadgroup uint &routed_tiles,
-    uint thread_index, uint simd_lane, uint simd_group) {
+    uint thread_index, uint simd_lane, uint simd_group, uint threads) {
   constexpr uint Experts = 256;
   const uint routes_per_row = params.top_k + params.shared;
   const uint routes = params.rows * routes_per_row;
-  atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
-  atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
+  if (thread_index < Experts) {
+    atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
+    atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint route = thread_index; route < routes; route += Experts) {
+  for (uint route = thread_index; route < routes; route += threads) {
     if (!params.shared || route % routes_per_row != params.top_k) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
@@ -453,32 +455,41 @@ inline void moe_group_routes_run(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
-  uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
-  uint prefix = simd_prefix_exclusive_sum(expert_tiles);
-  if (simd_lane == 31)
-    simd_totals[simd_group] = prefix + expert_tiles;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint tile_offset = prefix;
-  for (uint group = 0; group < simd_group; ++group)
-    tile_offset += simd_totals[group];
-  tile_offsets[thread_index] = tile_offset;
-  if (thread_index == Experts - 1)
-    routed_tiles = tile_offset + expert_tiles;
-  for (uint tile = 0; tile < expert_tiles; ++tile) {
-    tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
-  }
-  if (expert_tiles) {
-    const uint last = tile_offset + expert_tiles - 1;
-    const uint live = count - (expert_tiles - 1) * params.tile_rows;
-    for (uint row = tile_offset * params.tile_rows + count;
-         row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
-         ++row)
-      grouped_routes[row] = ~0u;
+  // Threads past Experts (threadgroups wider than 256) help count and
+  // scatter below but hold no per-expert state.
+  if (thread_index < Experts) {
+    uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
+    uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
+    uint prefix = simd_prefix_exclusive_sum(expert_tiles);
+    if (simd_lane == 31)
+      simd_totals[simd_group] = prefix + expert_tiles;
+    tile_offsets[thread_index] = prefix;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint route = thread_index; route < routes; route += Experts) {
+  if (thread_index < Experts) {
+    uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
+    uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
+    uint tile_offset = tile_offsets[thread_index];
+    for (uint group = 0; group < simd_group; ++group)
+      tile_offset += simd_totals[group];
+    tile_offsets[thread_index] = tile_offset;
+    if (thread_index == Experts - 1)
+      routed_tiles = tile_offset + expert_tiles;
+    for (uint tile = 0; tile < expert_tiles; ++tile) {
+      tiles[tile_offset + tile] = MoeTileDescriptor{
+          thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+    }
+    if (expert_tiles) {
+      const uint last = tile_offset + expert_tiles - 1;
+      const uint live = count - (expert_tiles - 1) * params.tile_rows;
+      for (uint row = tile_offset * params.tile_rows + count;
+           row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
+           ++row)
+        grouped_routes[row] = ~0u;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint route = thread_index; route < routes; route += threads) {
     if (params.shared && route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
@@ -499,12 +510,12 @@ inline void moe_group_routes_run(
         (shared_tiles - 1) * params.tile_rows +
         moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
                         params.tile_rows);
-    for (uint tile = thread_index; tile < shared_tiles; tile += Experts) {
+    for (uint tile = thread_index; tile < shared_tiles; tile += threads) {
       tiles[routed_tiles + tile] = MoeTileDescriptor{
           params.experts,
           min(params.tile_rows, params.rows - tile * params.tile_rows)};
     }
-    for (uint row = thread_index; row < shared_rows; row += Experts) {
+    for (uint row = thread_index; row < shared_rows; row += threads) {
       if (row < params.rows) {
         uint route = row * routes_per_row + params.top_k;
         grouped_routes[shared_base + row] = route;
@@ -527,7 +538,8 @@ kernel void moe_group_routes(
     constant MoeGroupParams &params [[buffer(5)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
   constexpr uint Experts = 256;
   threadgroup atomic_uint counts[Experts];
   threadgroup atomic_uint cursors[Experts];
@@ -536,7 +548,8 @@ kernel void moe_group_routes(
   threadgroup uint routed_tiles;
   moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
                        params, counts, cursors, tile_offsets, simd_totals,
-                       routed_tiles, thread_index, simd_lane, simd_group);
+                       routed_tiles, thread_index, simd_lane, simd_group,
+                       tpg.x);
 }
 
 // The sigmoid-gated MoE router (GGUF expert_gating_func 2, LFM2-MoE): expert
@@ -674,7 +687,8 @@ kernel void moe_route_group_sigmoid(
     constant MoeRouteGroupParams &params [[buffer(8)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
   constexpr uint StorageN = 256;
   constexpr uint ExpertsPerLane = StorageN / 32;
   constexpr uint Simdgroups = 8;
@@ -706,7 +720,8 @@ kernel void moe_route_group_sigmoid(
   threadgroup uint routed_tiles;
   moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
                        params.group, counts, cursors, tile_offsets, simd_totals,
-                       routed_tiles, thread_index, simd_lane, simd_group);
+                       routed_tiles, thread_index, simd_lane, simd_group,
+                       tpg.x);
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,

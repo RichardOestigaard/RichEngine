@@ -182,8 +182,9 @@ ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
           threads};
 }
 
-void addAffineExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
-                      const AffineMoeWeights &weights, const MoePlan &plan) {
+void addAffineExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                      const MoeScratch &scratch, const AffineMoeWeights &weights,
+                      const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   // A shared-expert-free block's kernels never see the shared expert's id;
@@ -196,31 +197,37 @@ void addAffineExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
       shape.sharedExpert ? weights.sharedDown.packed : weights.expertDown.packed;
   // The two expert strides are the gate and up slabs of the fused tile; a
   // single-matrix pass reads only the first, so its params repeat one stride.
+  // routes_per_row rides in reserved0 so the indirect tiles can map a
+  // grouped row's route back to its input row.
+  const uint32_t routesPerRow = shape.routesPerToken();
   const MoeExpertParams gateUp{shape.hiddenSize, shape.expertIntermediateSize,
-                               shape.experts, 0,
+                               shape.experts, routesPerRow,
                                weights.expertGate.expertStrideBytes,
                                weights.expertUp.expertStrideBytes};
   const MoeExpertParams gate{shape.hiddenSize, shape.expertIntermediateSize,
-                             shape.experts, 0,
+                             shape.experts, routesPerRow,
                              weights.expertGate.expertStrideBytes,
                              weights.expertGate.expertStrideBytes};
   const MoeExpertParams up{shape.hiddenSize, shape.expertIntermediateSize,
-                           shape.experts, 0, weights.expertUp.expertStrideBytes,
+                           shape.experts, routesPerRow,
+                           weights.expertUp.expertStrideBytes,
                            weights.expertUp.expertStrideBytes};
   const MoeExpertParams down{shape.expertIntermediateSize, shape.hiddenSize,
-                             shape.experts, 0,
+                             shape.experts, routesPerRow,
                              weights.expertDown.expertStrideBytes,
                              weights.expertDown.expertStrideBytes};
   if (plan.splitExperts()) {
-    // The gate lands in expertOutput, which the down pass overwrites only
-    // after the up pass has consumed it.
-    graph.add("prefill_moe_expert_q4_n256_m32",
-              {scratch.groupedInput, scratch.tileDescriptors,
+    // The gate and up passes read each grouped row's input through
+    // grouped_routes — the gather does not run for affine plans. The gate
+    // lands in expertOutput, which the down pass overwrites only after the
+    // up pass has consumed it.
+    graph.add("prefill_moe_expert_q4_n256_indirect_m32",
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, weights.expertGate.packed,
                sharedGate, scratch.expertOutput},
               gate, {shape.expertIntermediateSize / 256, tiles, 1});
-    graph.add("prefill_moe_expert_q4_n256_up_silu_m32",
-              {scratch.groupedInput, scratch.tileDescriptors,
+    graph.add("prefill_moe_expert_q4_n256_up_silu_indirect_m32",
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, weights.expertUp.packed,
                sharedUp, scratch.expertOutput,
                scratch.expertIntermediate},
@@ -424,7 +431,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, affine.router.planes.weights, affine.router.planes.scales,
                affine.router.planes.biases, scratch.groupedInput},
               routeParams,
-              {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
+              {(rows + route.rows - 1) / route.rows,
+               (shape.experts + route.experts - 1) / route.experts, 1});
     if (shape.sharedExpert) {
       graph.add("moe_route_select_q8",
                 {scratch.groupedInput, buffers.input,
@@ -450,10 +458,13 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
               MoeRouteGroupParams{routeParams, groupParams}, {1, 1, 1});
   } else {
+    // The counting and scatter loops stride by the threadgroup width; a
+    // 1024-thread group quadruples both while threads past the 256 experts
+    // skip the per-expert bookkeeping between them.
     graph.add("moe_group_routes",
               {scratch.selectedExperts, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-              groupParams, {1, 1, 1});
+              groupParams, {1, 1, 1}, {1024, 1, 1});
   }
   // The packed path (packsDecode's MoE analog): a plan on the `_n` kernels
   // whose weights hold at least one MXFP4 expert segment gathers the packed
@@ -470,22 +481,27 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       (mxfp4Expert(weights.blocks().gate) || mxfp4Expert(weights.blocks().up) ||
        mxfp4Expert(weights.blocks().down));
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
-    graph.add("moe_gather_table16",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput, scratch.groupedSums},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  else if (packed)
-    graph.add("moe_gather_packed",
-              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
-               scratch.tileCount, scratch.groupedInput, scratch.groupedPacked,
-               scratch.groupedSums},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  else
-    graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
-               scratch.tileCount, scratch.groupedInput},
-              gather, {tiles, shape.hiddenSize / 256, 1});
+  // The gather materializes the grouped rows for GGUF plans and for the
+  // affine decode tiles; affine prefill's indirect gate and up passes read
+  // the rows' inputs through grouped_routes instead.
+  if (block || !plan.splitExperts()) {
+    if (plan.configuration().ggufTile == MoeGgufTile::Register)
+      graph.add("moe_gather_table16",
+                {buffers.input, scratch.groupedRoutes, scratch.tileCount,
+                 scratch.groupedInput, scratch.groupedSums},
+                gather, {tiles, shape.hiddenSize / 256, 1});
+    else if (packed)
+      graph.add("moe_gather_packed",
+                {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+                 scratch.tileCount, scratch.groupedInput, scratch.groupedPacked,
+                 scratch.groupedSums},
+                gather, {tiles, shape.hiddenSize / 256, 1});
+    else
+      graph.add("moe_gather_rows",
+                {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+                 scratch.tileCount, scratch.groupedInput},
+                gather, {tiles, shape.hiddenSize / 256, 1});
+  }
   // The GGUF expert kernels produce no output when they replay from an
   // indirect command buffer on this driver (gguf-moe's staged and register
   // decodes both): suspend their dispatches — a suspension also lifts them
@@ -495,7 +511,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (block)
     addGgufExperts(graph, scratch, weights.blocks(), plan, packed);
   else
-    addAffineExperts(graph, scratch, weights.affine(), plan);
+    addAffineExperts(graph, buffers, scratch, weights.affine(), plan);
   if (bakeable && block) graph.resumeBakedSpan();
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
