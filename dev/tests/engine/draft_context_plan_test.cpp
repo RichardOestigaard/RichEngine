@@ -19,7 +19,7 @@ namespace {
 using richengine::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
-  return planDraftContext(replayBegin, replayEnd, {});
+  return planDraftContext(replayBegin, replayEnd, {}, model::ExecutionLimits::draftContextTokens);
 }
 
 DraftContextPlan
@@ -27,7 +27,8 @@ cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
            std::initializer_list<uint32_t> materializationBoundaries) {
   return planDraftContext(
       replayBegin, replayEnd,
-      {materializationBoundaries.begin(), materializationBoundaries.size()});
+      {materializationBoundaries.begin(), materializationBoundaries.size()},
+      model::ExecutionLimits::draftContextTokens);
 }
 
 // The rows a plan captures for the boundaries of one purpose.
@@ -113,15 +114,15 @@ void testBenchmarkWorkIncludesRecoveryPoints() {
   // No checkpoint lies within one prefill chunk of an end: not 8192 before
   // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K
   // prompt's at 14080.
-  require(expectedDraftContextRows(10000, interval) == 4112,
+  require(expectedDraftContextRows(10000, interval, model::ExecutionLimits::draftContextTokens) == 4112,
           "10K cold benchmark omitted rolling recovery windows");
-  require(expectedDraftContextRows(14096, interval, 9984) == 2064,
+  require(expectedDraftContextRows(14096, interval, model::ExecutionLimits::draftContextTokens, 9984) == 2064,
           "4K suffix benchmark planned a checkpoint within a chunk of an end");
-  require(expectedDraftContextRows(14096, interval) == 6160,
+  require(expectedDraftContextRows(14096, interval, model::ExecutionLimits::draftContextTokens) == 6160,
           "partial-hit benchmark confused cold work with restored work");
-  require(expectedDraftContextRows(10000, 0) == 2064 &&
-              expectedDraftContextRows(2048, interval) == 2048 &&
-              expectedDraftContextRows(10000, interval, 9984) == 16,
+  require(expectedDraftContextRows(10000, 0, model::ExecutionLimits::draftContextTokens) == 2064 &&
+              expectedDraftContextRows(2048, interval, model::ExecutionLimits::draftContextTokens) == 2048 &&
+              expectedDraftContextRows(10000, interval, model::ExecutionLimits::draftContextTokens, 9984) == 16,
           "benchmark changed disabled, short, or exact-hit draft work");
 }
 

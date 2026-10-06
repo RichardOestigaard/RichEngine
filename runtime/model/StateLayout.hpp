@@ -69,9 +69,12 @@ struct DraftStateLayout final {
   uint32_t layers = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  // The draft's effective attention window: its declared sliding_window
+  // clamped to the ring's RICHENGINE_DRAFT_SLIDING_WINDOW physical slots.
+  uint32_t window = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension;
+    return layers && kvHeads && headDimension && window;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
     return uint64_t{kvHeads} * RICHENGINE_DRAFT_SLIDING_WINDOW * headDimension *

@@ -19,6 +19,9 @@ struct DraftAttentionShape final {
   // Nonzero selects the interleaved (GPT-J) rotary pairing over the default
   // half-split one (a DSpark draft's rope_is_neox_style = false).
   uint32_t ropeInterleaved = 0;
+  // The draft's declared sliding_window clamped to the ring capacity: how far
+  // back its attention reads, independent of the ring's physical size.
+  uint32_t slidingWindow = 0;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };

@@ -146,9 +146,15 @@ enum class HeadKernel : uint8_t { Q32K8D128, Q16K2D128, Q32K8D64Interleaved };
 
 [[nodiscard]] KernelLayout kernelShape(DraftAttentionShape shape) {
   static_cast<void>(headKernel(shape));
-  if (shape == DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128})
+  // slidingWindow is a horizon, not a kernel shape: it does not select a
+  // compiled layout.
+  if (shape.hiddenSize == 5120 && shape.dynamicSize == 1280 &&
+      shape.qkvSize == 6144 && shape.attentionSize == 4096 &&
+      shape.kvHeads == 8 && shape.headDimension == 128)
     return KernelLayout::Hidden5120;
-  if (shape == DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128})
+  if (shape.hiddenSize == 2048 && shape.dynamicSize == 512 &&
+      shape.qkvSize == 6144 && shape.attentionSize == 4096 &&
+      shape.kvHeads == 8 && shape.headDimension == 128)
     return KernelLayout::Hidden2048;
   // The plain transformer and DSpark drafts carry no dynamic-conv width.
   if (shape.dynamicSize == 0 && shape.hiddenSize == 5120)
@@ -268,7 +274,10 @@ void DraftAttention::addDecode(
     requireBuffer(buffers.persistentKeys[lane], ringBytes(shape));
     requireBuffer(buffers.persistentValues[lane], ringBytes(shape));
   }
-  DraftAttentionBatchParams params{kWindow, lanes, causal ? 1u : 0u, {}};
+  const uint32_t window =
+      std::max(1u, std::min(shape.slidingWindow, kWindow));
+  DraftAttentionBatchParams params{kWindow, window,
+                                   lanes, causal ? 1u : 0u, {}};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};

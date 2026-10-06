@@ -63,7 +63,8 @@ void Runtime::beginColdRequest(const ModelRequest &request,
   try {
     setDraftContextPlan(
         request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {},
+                         impl_->geometry.draft.draftWindow()));
   } catch (...) {
     end(request.id);
     throw;
@@ -176,7 +177,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
       impl_->states.metadata(entry.stateLane).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
       (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
+       !lengths.hasCompleteDraftWindow(impl_->geometry.draft.draftWindow())) ||
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
@@ -363,7 +364,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
         lengths = Impl::advanceDraftContext(lengths, nextLength,
                                             capture.absoluteBegin,
                                             capture.absoluteEnd,
-                                            capture.resetDraftState);
+                                            capture.resetDraftState,
+                                            impl->geometry.draft.draftWindow());
         impl->counters.draftContextRowsActive += capture.activeRows;
         impl->counters.draftContextRowsMaterialization +=
             capture.materializationRows;
@@ -873,7 +875,8 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                            lengths.targetTokens ==
                                1 + decoded[lane].outputTokens.size() -
                                    decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+                           lengths.hasCompleteDraftWindow(
+                               impl_->geometry.draft.draftWindow());
     }
     if (!committedEveryLane || impl_->counters.lastDecodeWidth != width) {
       throw std::runtime_error(
@@ -928,10 +931,11 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     beginColdRequest(request, 1);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
-    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
+    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {},
+                                             impl_->geometry.draft.draftWindow()));
     const auto &restored = impl_->states.metadata(1).lengths;
     if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !restored.hasCompleteDraftWindow(impl_->geometry.draft.draftWindow())) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -962,7 +966,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !continued.hasCompleteDraftWindow(impl_->geometry.draft.draftWindow()) ||
         continued.targetTokens <= promptTokens ||
         continued.targetTokens !=
             promptTokens + decoded[0].outputTokens.size() -
@@ -998,6 +1002,10 @@ ModelTelemetry Runtime::telemetry() const noexcept {
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
   }
   return result;
+}
+
+uint32_t Runtime::draftWindow() const noexcept {
+  return impl_->geometry.draft.draftWindow();
 }
 
 std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &model) {

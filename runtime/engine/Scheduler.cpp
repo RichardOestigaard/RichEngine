@@ -145,7 +145,10 @@ void Scheduler::remove(uint64_t id) {
 void Scheduler::setPrefillBoundary(uint64_t id,
                                          std::optional<uint32_t> boundary) {
   Request &request = get(id);
-  if (boundary && (*boundary <= request.promptPlanned ||
+  // Submit-ahead may already have committed a chunk that stops at this
+  // boundary: equality is legal. Only a boundary behind planned rows is
+  // crossed without ever being published.
+  if (boundary && (*boundary < request.promptPlanned ||
                    *boundary > request.spec.prefillTokens)) {
     throw std::invalid_argument("invalid prefill boundary");
   }
@@ -321,6 +324,11 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
     const uint32_t rows = std::min(dispatchRemaining(view), budget);
+    // A lane whose planned rows already reach an armed boundary contributes
+    // nothing until that chunk lands — possible only under submit-ahead,
+    // where promptPlanned runs ahead of promptProcessed.
+    if (!rows)
+      continue;
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;

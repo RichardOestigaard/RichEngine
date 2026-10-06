@@ -33,7 +33,7 @@ static_assert(model::ExecutionLimits::draftProposalTokens ==
               RICHENGINE_DRAFT_PROPOSAL_TOKENS);
 static_assert(model::ExecutionLimits::targetVerifyRows ==
               RICHENGINE_TARGET_VERIFY_ROWS);
-static_assert(model::ExecutionLimits::draftContextTokens ==
+static_assert(model::ExecutionLimits::draftRingCapacity ==
               RICHENGINE_DRAFT_SLIDING_WINDOW);
 static_assert(model::ExecutionLimits::speculativeScratchTokens ==
               RICHENGINE_SPECULATIVE_SCRATCH_TOKENS);

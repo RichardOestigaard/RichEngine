@@ -25,7 +25,7 @@ namespace richengine::model {
     }
     const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
     if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !metadata.lengths.hasCompleteDraftWindow(geometry.draft.draftWindow())) {
       throw std::logic_error("decode state length is not exact");
     }
     static_cast<void>(synchronizedPageTable(entry, item));

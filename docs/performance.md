@@ -16,20 +16,22 @@ within 0.5% of them on this M5 Pro
 ([upstream loading](../dev/benchmarks/upstream-loading.md)). GGUF targets run
 other kernels; [GGUF against llama.cpp](#gguf-against-llamacpp) compares them.
 
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
-| --- | ---: | ---: |
-| Decode · short prompt (B1) | 260 tok/s | 103 tok/s |
-| Decode · aggregate, 2 lanes (B2) | 458 tok/s | 177 tok/s |
-| Decode · aggregate, 3 lanes (B3) | 594 tok/s | 191 tok/s |
-| Decode · aggregate, 4 lanes (B4) | 714 tok/s | 246 tok/s |
-| Prefill · 14,096-token prompt, cold | 2,937 tok/s | 600 tok/s |
-| Time to first token · 14K prompt, 10K cached | 1.6 s | 7.4 s |
+| Metric | Qwen3.6-35B-A3B | Ornith-1.5-35B-A3B | Qwen3.8-27B |
+| --- | ---: | ---: | ---: |
+| Decode · short prompt (B1) | 260 tok/s | 161 tok/s | 103 tok/s |
+| Decode · aggregate, 2 lanes (B2) | 458 tok/s | 279 tok/s | 177 tok/s |
+| Decode · aggregate, 3 lanes (B3) | 594 tok/s | 358 tok/s | 191 tok/s |
+| Decode · aggregate, 4 lanes (B4) | 714 tok/s | 433 tok/s | 246 tok/s |
+| Prefill · 14,096-token prompt, cold | 2,937 tok/s | 2,960 tok/s | 600 tok/s |
+| Time to first token · 14K prompt, 10K cached | 1.6 s | 1.6 s | 7.4 s |
 
-Draft acceptance on the short-prompt decode: 69% on the 35B, 43% on the
-27B. Decode benchmarks run `--kv-format int8` (INT4 measurably lowers
-acceptance). The 27B's prefill rows run its calibrated Neural Engine split
-(share 0.41); with `--disable-ane` it prefills at 495 tok/s and reaches the
-first token in 8.7 s.
+Draft acceptance on the short-prompt decode: 69% on the 35B, 40% on the
+Ornith 35B-A3B, 43% on the 27B. Decode benchmarks run `--kv-format int8`
+(INT4 measurably lowers acceptance). The 27B's prefill rows run its
+calibrated Neural Engine split (share 0.41); with `--disable-ane` it
+prefills at 495 tok/s and reaches the first token in 8.7 s. The Ornith
+35B-A3B is MoE — its experts do not fit the dense split, so its prefill
+runs on the GPU alone.
 
 The 27B's draft acceptance is down from 87% in earlier measurements of the
 same benchmark — the KV format does not explain it (INT4 reads 51% here),

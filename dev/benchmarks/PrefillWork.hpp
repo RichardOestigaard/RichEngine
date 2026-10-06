@@ -21,6 +21,7 @@ inline uint64_t draftContextRows(const DraftContextPlan &plan) {
 // engine's rolling recovery points and final reusable replay state.
 inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
                                          uint32_t checkpointTokens,
+                                         uint32_t draftWindow,
                                          uint32_t restoredTokens = 0) {
   if (!promptTokens)
     return 0;
@@ -31,7 +32,7 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
   if (replayBoundary > restoredTokens)
     boundaries.push_back(replayBoundary);
   return draftContextRows(
-      planDraftContext(restoredTokens, promptTokens, boundaries));
+      planDraftContext(restoredTokens, promptTokens, boundaries, draftWindow));
 }
 
 } // namespace richengine::benchmark

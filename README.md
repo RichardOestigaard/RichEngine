@@ -166,17 +166,20 @@ using the native backend benchmark (`make test-performance-real`): a
 39-token prompt decoding 64 tokens per lane, and a 14,096-token
 partial-prefix request.
 
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
-| --- | ---: | ---: |
-| Decode · short prompt | 259 tok/s | 103 tok/s |
-| Prefill · 14K prompt | 2,937 tok/s | 600 tok/s |
-| Time to first token · 14K prompt, 10K cached | 1.7 s | 7.4 s |
-| Aggregate decode · 4 concurrent short prompts | 714 tok/s | 246 tok/s |
+| Metric | Qwen3.6-35B-A3B | Ornith-1.5-35B-A3B | Qwen3.8-27B |
+| --- | ---: | ---: | ---: |
+| Decode · short prompt | 259 tok/s | 161 tok/s | 103 tok/s |
+| Prefill · 14K prompt | 2,937 tok/s | 2,960 tok/s | 600 tok/s |
+| Time to first token · 14K prompt, 10K cached | 1.7 s | 1.6 s | 7.4 s |
+| Aggregate decode · 4 concurrent short prompts | 714 tok/s | 433 tok/s | 246 tok/s |
 
 Decode numbers run `--kv-format int8`; the benchmark's synthetic prompt
-reads 69% draft acceptance on the 35B and 43% on the 27B — the 27B's drop
+reads 69% draft acceptance on the 35B, 40% on the Ornith 35B-A3B and 43% on
+the 27B — the 27B's drop
 from an earlier 87% is under investigation (see
-[BENCHMARKING.md](BENCHMARKING.md)).
+[BENCHMARKING.md](BENCHMARKING.md)). Ornith's plain DFlash draft trains its
+sliding window at 4,096 tokens and the ring serves it in full, so its
+acceptance holds up longer contexts than the 2048-window drafts'.
 
 A dense model's prefill also runs its FFN on the Apple Neural Engine when
 calibration finds that faster — on this Mac the 27B's split at share 0.41

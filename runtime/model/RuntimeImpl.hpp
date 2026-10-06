@@ -587,14 +587,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // continue the ring, which must hold rows ending at `begin`.
   static QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      uint64_t begin, uint64_t end, bool reset) {
+                      uint64_t begin, uint64_t end, bool reset,
+                      uint32_t draftWindow) {
     if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
       throw std::logic_error("draft capture does not continue the draft ring");
     const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
     QwenLogicalLengths next = previous;
     next.targetTokens = targetTokens;
     next.draftLength =
-        static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
+        static_cast<uint32_t>(std::min<uint64_t>(combined, draftWindow));
     next.draftBase = end - next.draftLength;
     return next;
   }
@@ -1327,7 +1328,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           entry.stateLane,
           advanceDraftContext(states.metadata(entry.stateLane).lengths,
                               nextLength, items[lane].logicalPosition,
-                              nextLength, false));
+                              nextLength, false, geometry.draft.draftWindow()));
       entry.generatedTokens += laneResult.retained;
       if (adaptiveProposals_ && !tree) {
         entry.proposalAcceptedAvg =

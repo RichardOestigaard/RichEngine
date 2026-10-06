@@ -34,7 +34,10 @@ constexpr uint32_t kRows = 8;
 constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
+// The horizon the tested drafts declare; the rings are sized to the shipped
+// capacity, which may be wider.
 constexpr uint32_t kWindow = 2048;
+constexpr uint32_t kRing = RICHENGINE_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
@@ -45,8 +48,8 @@ constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
 constexpr float kScale = 0.08838834765F;
 
 constexpr std::array kShapes{
-    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128, 0, kWindow},
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128, 0, kWindow}};
 
 using richengine::test::require;
 
@@ -112,7 +115,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
         }
         score = dot * kScale;
       } else if (key >= hiddenPrefix) {
-        const uint32_t slot = (commonStart + key) % kWindow;
+        const uint32_t slot = (commonStart + key) % kRing;
         double dot = 0.0;
         for (uint32_t d = 0; d < kHeadDim; ++d) {
           dot += double(tuning::bf16ToFloat(query[d])) *
@@ -134,8 +137,8 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
         const float value =
             key >= oldCount
                 ? tuning::bf16ToFloat(queryValues[uint64_t{d} * kRows + key - oldCount])
-                : tuning::bf16ToFloat(values[uint64_t{d} * kWindow +
-                                    (commonStart + key) % kWindow]);
+                : tuning::bf16ToFloat(values[uint64_t{d} * kRing +
+                                    (commonStart + key) % kRing]);
         accumulated[d] += probability * value;
       }
     }
@@ -148,7 +151,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
-  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const uint64_t ringElements = uint64_t{kKvHeads} * kRing * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
   MetalBuffer queries = randomBfloat(
@@ -217,9 +220,9 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       referenceRows(
           input.data() + queryOffset,
           static_cast<const uint16_t *>(keys[lane].contents()) +
-              uint64_t{head} * kWindow * kHeadDim,
+              uint64_t{head} * kRing * kHeadDim,
           static_cast<const uint16_t *>(values[lane].contents()) +
-              uint64_t{head} * kWindow * kHeadDim,
+              uint64_t{head} * kRing * kHeadDim,
           static_cast<const uint16_t *>(queryKeys.contents()) +
               (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
@@ -254,7 +257,7 @@ void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
   const uint32_t groupRows = qPerKv * kRows;
   const float scale = 1.0F / std::sqrt(static_cast<float>(headDim));
   Random random(0x5eed9000ULL + cacheLengths[0]);
-  const uint64_t ringElements = uint64_t{kvHeads} * kWindow * headDim;
+  const uint64_t ringElements = uint64_t{kvHeads} * kRing * headDim;
   MetalBuffer queries = randomBfloat(
       backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
       random, "draft queries");
@@ -300,9 +303,9 @@ void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
       const uint16_t *qv = static_cast<const uint16_t *>(queryValues.contents()) +
                            (uint64_t{lane} * kvHeads + head) * headDim * kRows;
       const uint16_t *kk = static_cast<const uint16_t *>(keys[lane].contents()) +
-                           uint64_t{head} * kWindow * headDim;
+                           uint64_t{head} * kRing * headDim;
       const uint16_t *vv = static_cast<const uint16_t *>(values[lane].contents()) +
-                           uint64_t{head} * kWindow * headDim;
+                           uint64_t{head} * kRing * headDim;
       for (uint32_t row = 0; row < groupRows; ++row) {
         const uint32_t proposal = row % kRows;
         const uint32_t queryPosition = cacheLengths[lane] + proposal;
@@ -322,7 +325,7 @@ void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
                      tuning::bf16ToFloat(qk[current * headDim + d]);
             score = dot * scale;
           } else if (key >= hiddenPrefix) {
-            const uint32_t slot = (commonStart + key) % kWindow;
+            const uint32_t slot = (commonStart + key) % kRing;
             double dot = 0.0;
             for (uint32_t d = 0; d < headDim; ++d)
               dot += double(tuning::bf16ToFloat(query[d])) *
@@ -343,8 +346,8 @@ void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
             const float value =
                 key >= oldCount
                     ? tuning::bf16ToFloat(qv[uint64_t{d} * kRows + key - oldCount])
-                    : tuning::bf16ToFloat(vv[uint64_t{d} * kWindow +
-                                        (commonStart + key) % kWindow]);
+                    : tuning::bf16ToFloat(vv[uint64_t{d} * kRing +
+                                        (commonStart + key) % kRing]);
             accumulated[d] += probability * value;
           }
         }
@@ -575,7 +578,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 
 // The context writers against a CPU ring: a row's key is RMS-normalized,
 // scaled by the key norm and rotated, its value copied, into slot
-// position % 2048 of each KV head's ring (keys [head][slot][dim], values
+// position % capacity of each KV head's ring (keys [head][slot][dim], values
 // [head][dim][slot]); every other slot keeps its bits. The prefill writes
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read, and
@@ -584,7 +587,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
   constexpr uint16_t kUntouched = 0xC2C2;
-  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const uint64_t ringElements = uint64_t{kKvHeads} * kRing * kHeadDim;
   Random random(0xc0de0000ULL + shape.hiddenSize);
   const MetalBuffer keyNorm =
       randomBfloat(backend, kHeadDim, random, "draft key norm");
@@ -613,7 +616,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     std::vector<uint16_t> wantValues(ringElements, kUntouched);
     std::vector<float> wantKeys(ringElements, NAN);
     for (uint32_t row = 0; row < rows; ++row) {
-      const uint32_t slot = (start + row) % kWindow;
+      const uint32_t slot = (start + row) % kRing;
       for (uint32_t head = 0; head < kKvHeads; ++head) {
         const uint16_t *key =
             kv + uint64_t{row} * kRowWidth + kKeyColumn + head * kHeadDim;
@@ -629,7 +632,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
               tuning::floatToBf16(tuning::bf16ToFloat(key[d]) * inverse *
                                   tuning::bf16ToFloat(norm[d])));
         float *out =
-            wantKeys.data() + (uint64_t{head} * kWindow + slot) * kHeadDim;
+            wantKeys.data() + (uint64_t{head} * kRing + slot) * kHeadDim;
         for (uint32_t d = 0; d < kHeadDim / 2; ++d) {
           const float c = cosines[uint64_t{row} * kHeadDim / 2 + d],
                       s = sines[uint64_t{row} * kHeadDim / 2 + d];
@@ -638,7 +641,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
               normalized[d + kHeadDim / 2] * c + normalized[d] * s;
         }
         for (uint32_t d = 0; d < kHeadDim; ++d)
-          wantValues[(uint64_t{head} * kHeadDim + d) * kWindow + slot] =
+          wantValues[(uint64_t{head} * kHeadDim + d) * kRing + slot] =
               value[d];
       }
     }
@@ -763,7 +766,7 @@ int main(int argc, char **argv) {
     }
     // The MiniCPM5 DSpark geometry: 16 query heads over 2 KV heads of 128.
     const DraftAttentionShape dense{
-        2048, 0, 2560, 2048, 16, 2, 128};
+        2048, 0, 2560, 2048, 16, 2, 128, 0, kWindow};
     runCaseGeneric(backend, 1, dense, {58, 0, 0, 0});
     runCaseGeneric(backend, 2, dense, {2048, 2047, 0, 0});
     runCaseGeneric(backend, 4, dense, {512, 513, 1024, 1536});

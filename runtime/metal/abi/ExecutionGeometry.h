@@ -21,7 +21,10 @@
   (RICHENGINE_MAXIMUM_CONTEXT_TOKENS + RICHENGINE_SPECULATIVE_SCRATCH_TOKENS)
 #define RICHENGINE_MAXIMUM_BATCH_WIDTH 4u
 #define RICHENGINE_PREFILL_TOKEN_BUDGET 2048u
-#define RICHENGINE_DRAFT_SLIDING_WINDOW 2048u
+// Physical slots per KV head of the draft KV ring: the widest declared
+// draft sliding_window the runtime serves. A draft's own declared window
+// bounds how much of the ring its attention reads (DraftAttentionBatchParams).
+#define RICHENGINE_DRAFT_SLIDING_WINDOW 4096u
 #define RICHENGINE_TARGET_KV_BLOCK_TOKENS 32u
 // Rows per KV head (and per query group) of one lane's verify chunk staging:
 // one KV block, which holds the lane's RICHENGINE_TARGET_VERIFY_ROWS rows.

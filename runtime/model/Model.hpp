@@ -251,7 +251,8 @@ struct DispatchDraftCapturePlan final {
 // there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t draftWindow);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -387,7 +388,11 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
+  // The default trained draft window, and the contract DFlash2/DSpark
+  // checkpoints are checked against. Plain drafts may declare a wider
+  // sliding_window up to the ring's physical capacity.
   static constexpr uint32_t draftContextTokens = 2048;
+  static constexpr uint32_t draftRingCapacity = 4096;
   static constexpr uint32_t speculativeScratchTokens =
       RICHENGINE_TREE_VERIFY_NODES - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
@@ -535,6 +540,12 @@ public:
   // anchors are decided by the running step's results.
   [[nodiscard]] virtual bool prefillSubmitAheadAvailable() const noexcept {
     return false;
+  }
+  // The draft's effective attention window: its declared sliding_window
+  // clamped to the ring capacity. Drives draft context planning and ring
+  // length bookkeeping.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
+    return ExecutionLimits::draftContextTokens;
   }
   // Copies the request's committed state at its current page-aligned
   // boundary into the cached state's buffers. Returns nullptr when the pool

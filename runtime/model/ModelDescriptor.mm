@@ -7,6 +7,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -241,8 +242,15 @@ void validateExecutionGeometry(NSDictionary *manifest) {
                                "model execution geometry"),
                  "execution_geometry",
                  {{"draft_proposal_tokens", ExecutionLimits::draftProposalTokens},
-                  {"draft_query_rows", ExecutionLimits::draftQueryRows},
-                  {"draft_sliding_window", ExecutionLimits::draftContextTokens}});
+                  {"draft_query_rows", ExecutionLimits::draftQueryRows}});
+  // The recorded window is the trained context the draft was packed for;
+  // anything beyond the ring's physical capacity would be silently clamped.
+  const uint64_t recordedWindow = requireUnsigned(
+      requireObject(manifest, @"execution_geometry", "model execution geometry"),
+      @"draft_sliding_window", "execution_geometry draft_sliding_window");
+  if (recordedWindow > ExecutionLimits::draftRingCapacity)
+    throw std::invalid_argument(
+        "draft sliding_window exceeds the runtime ring");
 }
 
 void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
@@ -343,6 +351,7 @@ DFlashDraftLayout ornith9DFlash2DraftLayout() {
 DFlashDraftLayout ornith9PlainDraftLayout() {
   DFlashDraftLayout layout;
   layout.kind = DraftKind::Plain;
+  layout.slidingWindow = 4096;
   layout.causalLayers = 0x1F;
   layout.layers = 6;
   layout.hiddenSize = 4096;
@@ -361,6 +370,7 @@ DFlashDraftLayout ornith9PlainDraftLayout() {
 DFlashDraftLayout qwen36PlainDraftLayout() {
   DFlashDraftLayout layout;
   layout.kind = DraftKind::Plain;
+  layout.slidingWindow = 4096;
   layout.causalLayers = 0x1F;
   layout.layers = 6;
   layout.hiddenSize = 2048;
@@ -625,10 +635,8 @@ void validateQwen36(NSDictionary *manifest,
         requireUnsigned(draft, @"block_size", "draft block_size");
     if (blockSize < ExecutionLimits::draftQueryRows)
       throw std::invalid_argument("draft block_size is below the runtime query rows");
-    const uint64_t window =
-        requireUnsigned(draft, @"sliding_window", "draft sliding_window");
-    if (window < ExecutionLimits::draftContextTokens)
-      throw std::invalid_argument("draft sliding_window is below the runtime ring");
+    requireEqual(requireUnsigned(draft, @"sliding_window", "draft sliding_window"),
+                 uint64_t{draftLayout.slidingWindow}, "draft sliding_window");
   } else {
     for (const GeometryField &field : std::to_array<GeometryField>(
              {{"sliding_window", ExecutionLimits::draftContextTokens},
@@ -716,8 +724,8 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
             requireUnsigned(draft, @"causal_layers", "draft causal_layers"));
         const uint64_t window =
             requireUnsigned(draft, @"sliding_window", "draft sliding_window");
-        if (window < ExecutionLimits::draftContextTokens)
-          throw std::invalid_argument("draft sliding_window is below the runtime ring");
+        d.slidingWindow = static_cast<uint32_t>(
+            std::min<uint64_t>(window, ExecutionLimits::draftRingCapacity));
       }
     }
   } else {
@@ -1067,9 +1075,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.attentionHeadDimension = static_cast<uint32_t>(headDim);
     d.attentionSize = static_cast<uint32_t>(heads * headDim);
     d.qkvSize = static_cast<uint32_t>((heads + 2 * kvHeads) * headDim);
-    const uint64_t window = requireUnsigned(draft, @"sliding_window", "draft sliding_window");
-    if (window < ExecutionLimits::draftContextTokens)
-      throw std::invalid_argument("draft sliding_window is below the runtime ring");
+    d.slidingWindow = static_cast<uint32_t>(std::min<uint64_t>(
+        requireUnsigned(draft, @"sliding_window", "draft sliding_window"),
+        ExecutionLimits::draftRingCapacity));
     // Sliding layers attend causally inside the block unless the config
     // overrides is_causal; a full_attention layer never does.
     NSArray *types = requireArray(draft, @"layer_types", "draft layer_types");

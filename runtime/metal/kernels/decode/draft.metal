@@ -182,8 +182,8 @@ template <ushort M, ushort N, ushort D>
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
-    device float *partial, uint value_stride, uint cache_length, uint split,
-    bool causal,
+    device float *partial, uint value_stride, uint cache_length, uint window,
+    uint split, bool causal,
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
@@ -194,7 +194,7 @@ inline void draft_attention_split_phase(
   static_assert(D == 128 || D == 64, "uncompiled draft head dimension");
   static_assert(M % 8 == 0 && N % TileK == 0, "draft attention tile alignment");
   uint common_start =
-      cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
+      cache_length >= window - 1 ? cache_length - (window - 1) : 0;
   uint old_count = cache_length - common_start;
   uint physical_start = common_start % Window;
   // Live tiles: [0, wrapped) when the window wraps, then [resume, tail_end);
@@ -264,7 +264,7 @@ inline void draft_attention_split_phase(
       uint proposal_row = matrix_row % Rows;
       uint query_position = cache_length + proposal_row;
       uint row_start =
-          query_position >= Window - 1 ? query_position - (Window - 1) : 0;
+          query_position >= window - 1 ? query_position - (window - 1) : 0;
       uint hidden_prefix = row_start - common_start;
       float local_scores[N / 32];
       float tile_max = -INFINITY;
@@ -613,8 +613,8 @@ inline void draft_attention_split_impl(
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
-      partials, params.value_stride, params.cache_length[batch], group.z,
-      params.causal != 0, workspace, workspace + M * N,
+      partials, params.value_stride, params.cache_length[batch], params.window,
+      group.z, params.causal != 0, workspace, workspace + M * N,
       workspace + M * N + M, workspace + M * N + 2 * M, thread_index, lane,
       simd_group);
 }

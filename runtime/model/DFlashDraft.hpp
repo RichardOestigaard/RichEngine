@@ -91,17 +91,26 @@ struct DFlashDraftLayout final {
   uint32_t markovRank = 0;
   uint32_t blockSize = 0;
   uint32_t ropeInterleaved = 0;
+  // The trained attention window (the draft config's sliding_window): how far
+  // back attention reads. The ring's physical capacity is
+  // ExecutionLimits::draftRingCapacity; the effective window is clamped to it.
+  uint32_t slidingWindow = ExecutionLimits::draftContextTokens;
   // The norms' epsilon: 1e-6 unless the family declares another (LFM2's
   // 1e-5, which also selects the _e5 draft kernels).
   float rmsEpsilon = 1e-6F;
 
+  [[nodiscard]] constexpr uint32_t draftWindow() const noexcept {
+    return slidingWindow < ExecutionLimits::draftRingCapacity
+               ? slidingWindow
+               : ExecutionLimits::draftRingCapacity;
+  }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension};
+    return {layers, kvHeads, attentionHeadDimension, draftWindow()};
   }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension, ropeInterleaved};
+            attentionHeadDimension, ropeInterleaved, draftWindow()};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.

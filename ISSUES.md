@@ -76,8 +76,10 @@ config doesn't contradict it. A GGUF mislabeled without any Ornith name
 still resolves to Qwen3.6.
 
 ### Ornith draft sliding-window depth
-Engine ring is `RICHENGINE_DRAFT_SLIDING_WINDOW`=2048; the Ornith drafts declare
-4096. Draft quality degrades beyond 2048 ctx; verify correctness unaffected.
+Resolved: the ring is `RICHENGINE_DRAFT_SLIDING_WINDOW`=4096 physical slots and
+each draft's declared `sliding_window` is its per-model attention horizon
+(`DFlashDraftLayout::slidingWindow`, `DraftAttentionBatchParams::window`).
+Ornith's 4096-token window is fully served; 2048-window drafts are unchanged.
 
 ### `draft_select_plain` q-probabilities
 Sampled-lane acceptance uses a top-16 renormalized softmax (same approximation

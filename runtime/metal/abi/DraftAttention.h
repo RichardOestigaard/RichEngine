@@ -20,8 +20,10 @@ static_assert(sizeof(DraftConvBatchParams) == 4,
 
 // The attention core's split count (RICHENGINE_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (RICHENGINE_DRAFT_SLIDING_WINDOW) are compiled in.
-// value_stride, the values ring's stride between head dimensions, is the
-// window too (the op passes nothing else) but stays a run-time value: with it
+// window is how far back each lane's draft attends — the draft's declared
+// sliding_window clamped to the ring — while value_stride, the values ring's
+// stride between head dimensions, is the capacity itself (the op passes
+// nothing else) but stays a run-time value: with it
 // compiled into the value tiles, the split kernel returns wrong rows at random
 // on an M5 Max, and reports no error, when MTL_SHADER_VALIDATION instruments
 // threadgroup memory, tensors and resource usage together; with any of the
@@ -29,6 +31,7 @@ static_assert(sizeof(DraftConvBatchParams) == 4,
 // of the run-time stride.
 struct DraftAttentionBatchParams {
   uint32_t value_stride;
+  uint32_t window;
   uint32_t lanes;
   // Nonzero masks the eight current rows causally (a plain DFlash draft's
   // sliding layers); zero keeps the DFlash2 block-bidirectional pattern.
@@ -36,8 +39,8 @@ struct DraftAttentionBatchParams {
   uint32_t cache_length[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 28,
-              "Draft attention parameters are 28 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 32,
+              "Draft attention parameters are 32 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

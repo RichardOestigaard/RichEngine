@@ -165,12 +165,15 @@ cap exists because this same head serves verify; a sparse "rescoring" head
 for tree nodes (score only the ~64 union-of-candidates + argmax-check the
 rest) could enable wider trees.
 
-### L6. Ornith draft window 2048 → 4090-range
+### L6. Ornith draft window 2048 → 4090-range — DONE
 
-ISSUES.md: engine ring is `RICHENGINE_DRAFT_SLIDING_WINDOW` = 2048 while Ornith
-drafts declare 4096 — draft quality (hence acceptance) degrades past 2048
-context. Growing the ring is ring-buffer sizing + layout validation; direct
-acceptance win on long contexts for the families that declare it.
+Ring capacity is now `RICHENGINE_DRAFT_SLIDING_WINDOW` = 4096 and each draft's
+declared `sliding_window` is the per-model attention horizon
+(`DFlashDraftLayout::slidingWindow` → `DraftAttentionBatchParams::window`,
+validated `<=` capacity and clamped). Measured on Ornith-1.5-9B at ~6.3K
+context, varied-text prompt, greedy 192-token decode: 107.8 → 123.1 tok/s
+(+14%), draft acceptance 0.304 → 0.375. (ABBA harness:
+`dev/tests/ornith_window_ab.py`.)
 
 ### L7. Host turnaround — already specced, interacts with L1
 

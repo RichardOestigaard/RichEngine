@@ -1019,7 +1019,8 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries,
+                          model_.draftWindow());
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -1227,6 +1228,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     return Prepared::Runnable;
   }
 
+  // A submit-ahead plan yields nothing: suspending or failing a lane
+  // whose command is in flight mid-prepare is never worth the overlap.
+  // It also declines rather than failing when nothing was admissible —
+  // an ahead plan can be empty when every ready lane's planned rows already
+  // reach an armed boundary.
+  if (forAhead)
+    return Prepared::Waiting;
   // Partial admissions execute at their actual width. If no lane fits, the
   // lane to yield is chosen among all runnable residents: an unstarted peer
   // can release its lane before completed prefill is discarded.
@@ -1241,10 +1249,6 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       deferResourceRetry(request(entry.requestId), now, entry.denial);
     return Prepared::Waiting;
   }
-  // A submit-ahead plan yields nothing: suspending or failing a lane
-  // whose command is in flight mid-prepare is never worth the overlap.
-  if (forAhead)
-    return Prepared::Waiting;
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),
       [&](const Denied &left, const Denied &right) {
@@ -1288,7 +1292,7 @@ bool Engine::trySubmitAhead(double now) {
       excluded.push_back(id);
   }
   std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
-  if (!plan || plan->kind != WorkKind::Prefill)
+  if (!plan || plan->kind != WorkKind::Prefill || plan->empty())
     return false;
   std::vector<ModelBatchItem> items;
   if (prepare(*plan, items, now, /*forAhead=*/true) != Prepared::Runnable)

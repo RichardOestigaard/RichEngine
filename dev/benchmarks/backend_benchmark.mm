@@ -859,6 +859,7 @@ int main(int argc, char **argv) {
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    const uint32_t draftWindow = config.model.draft.draftWindow();
     // Prompt token ids stay inside the model's vocabulary; above 200,100 the
     // ids are exactly the historical ones.
     const uint32_t promptVocabulary =
@@ -1141,7 +1142,7 @@ int main(int argc, char **argv) {
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
         if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engine::kPrefillCheckpointTokens)) {
+                length, engine::kPrefillCheckpointTokens, draftWindow)) {
           throw std::runtime_error(
               "cold prefill performed unnecessary draft-context work");
         }
@@ -1187,7 +1188,7 @@ int main(int argc, char **argv) {
             ((partialBase.size() - 1) / kv::kPageTokens) *
             kv::kPageTokens;
         const uint64_t expectedPartialRows = expectedDraftContextRows(
-            partialPrompt.size(), engine::kPrefillCheckpointTokens,
+            partialPrompt.size(), engine::kPrefillCheckpointTokens, draftWindow,
             partialBoundary);
         if (partialSeed.cacheStatus != "miss" ||
             partialHit.cacheStatus != "prefix_hit" ||
