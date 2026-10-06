@@ -13,3 +13,4 @@ install/download-token
 *.gguf
 .venv-tq/
 .pytest_cache/
+/.playwright-mcp

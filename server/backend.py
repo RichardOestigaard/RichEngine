@@ -143,6 +143,7 @@ class CallbackStreamer:
         think_end_id=None,
         visible_token_ids=(),
         tool_call_open_id=None,
+        call_open=None,
     ):
         self.tokenizer = tokenizer
         self.think_end_id = (
@@ -154,6 +155,9 @@ class CallbackStreamer:
         self.tool_call_open_id = (
             TOOL_CALL_OPEN_TOKEN_ID if tool_call_open_id is None else tool_call_open_id
         )
+        # The dialect's call opening, as the reasoning count's text check
+        # spells it.
+        self.call_open = CALL_OPEN if call_open is None else call_open
         self.callback = callback
         self.stop_sequences = tuple(stop_sequences)
         self.on_stop = on_stop
@@ -283,13 +287,13 @@ class CallbackStreamer:
 
     def _opens_call(self, index):
         """Whether the text from the call-open token at `index` on begins
-        CALL_OPEN, decoded from as few tokens as decide it."""
+        the dialect's call opening, decoded from as few tokens as decide it."""
         text = ""
         for end in range(index + 1, len(self.token_ids) + 1):
             text = self.tokenizer.decode(self.token_ids[index:end])
-            if len(text) >= len(CALL_OPEN) or not CALL_OPEN.startswith(text):
+            if len(text) >= len(self.call_open) or not self.call_open.startswith(text):
                 break
-        return text.startswith(CALL_OPEN)
+        return text.startswith(self.call_open)
 
 
 @dataclass
@@ -681,6 +685,18 @@ class NativeBackend:
         def emit(text):
             job.events.put(("text", text))
 
+        # The call-open token is the request dialect's where it differs from
+        # the contract's.
+        call_open = None
+        call_open_id = self.tool_call_open_id
+        dialect = getattr(job.tool_policy, "dialect", None)
+        if dialect is not None and dialect.structural:
+            ids = self.tokenizer.encode(
+                dialect.structural[0], add_special_tokens=False
+            )
+            if len(ids) == 1:
+                call_open_id = ids[0]
+                call_open = dialect.call_open + dialect.name_prefix
         streamer = CallbackStreamer(
             self.tokenizer,
             emit,
@@ -688,7 +704,8 @@ class NativeBackend:
             stop_matched,
             think_end_id=self.think_end_id,
             visible_token_ids=self.visible_token_ids,
-            tool_call_open_id=self.tool_call_open_id,
+            tool_call_open_id=call_open_id,
+            call_open=call_open,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)

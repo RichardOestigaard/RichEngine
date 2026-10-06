@@ -452,6 +452,34 @@ class PartialToolOutputTests(unittest.TestCase):
                     ["why\n", "Hi\n\nyou"],
                 )
 
+    def test_a_leading_think_tag_opens_reasoning_the_template_did_not_mark(self):
+        # A hybrid-thinking model whose generation prompt ends at the role
+        # tag writes <think> itself (minicpm5 without enable_thinking); text
+        # before any tag stays content.
+        for text, expected in (
+            ("why\n<think>\nwhy</think>\n\nHi", ["", "why\n<think>\nwhy</think>\n\nHi"]),
+            ("<think>\nwhy</think>\n\nHi", ["\nwhy", "Hi"]),
+            ("\n<think>\nwhy</think>\n\nHi", ["\nwhy", "Hi"]),
+            ("Hi, no thinking", ["", "Hi, no thinking"]),
+            ("<think", ["", "<think"]),
+        ):
+            for size in range(1, len(text) + 1):
+                with self.subTest(text=text, size=size):
+                    splitter = model_output.ReasoningSplitter(False)
+                    parts = [
+                        part
+                        for offset in range(0, len(text), size)
+                        for part in splitter.put(text[offset : offset + size])
+                    ]
+                    parts += splitter.finish()
+                    self.assertEqual(
+                        [
+                            "".join(value for kind, value in parts if kind == field)
+                            for field in ("reasoning_content", "content")
+                        ],
+                        expected,
+                    )
+
     def test_a_call_ends_the_reasoning_where_a_call_may_follow(self):
         # A call's tag ends the reasoning too, and the call begins the
         # answer. Where no call may follow, the tag is reasoning text.

@@ -103,7 +103,7 @@
   .attachment img, .attachment-status { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 10px; object-fit: cover }
   .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
   .remove-image { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
-  textarea { display: block; width: 100%; max-height: 180px; padding: 4px 8px; resize: none; border: 0; outline: 0; background: transparent }
+  textarea { display: block; width: 100%; max-height: 180px; padding: 4px 8px; resize: none; border: 0; outline: 0; background: transparent; field-sizing: content }
   textarea::placeholder { color: var(--muted) }
   .toolbar { display: flex; align-items: center; gap: 4px }
   .toolbar .spacer { flex: 1 }
@@ -120,8 +120,10 @@
   #send:not(:disabled):hover { transform: scale(1.06) }
   #send:disabled { color: var(--muted); background: var(--hover) }
 
-  .content > :first-child { margin-top: 0 }
-  .content > :last-child { margin-bottom: 0 }
+  .md-done > :first-child, .md-tail > :first-child { margin-top: 0 }
+  .md-done > :last-child, .md-tail > :last-child { margin-bottom: 0 }
+  .message.live .code-head .copy { visibility: hidden }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; clip-path: inset(50%); overflow: hidden; white-space: nowrap }
   .content p { margin: 0 0 12px }
   .content h3, .content h4, .content h5, .content h6 { margin: 18px 0 8px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3 }
   .content h3 { font-size: 19px }
@@ -184,13 +186,14 @@
   <div class="brand">RichEngine</div>
   <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="m15 4 5 5M14 10l6-6"/></svg></button>
 </header>
-<main><div id="chat" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation"></div></main>
+<main><div id="chat" role="log" aria-live="off" aria-relevant="additions" aria-label="Conversation"></div></main>
+<div id="sr-status" class="visually-hidden" role="status"></div>
 <button id="to-bottom" type="button" hidden>&darr; Latest</button>
 <form id="form">
   <input id="image-input" type="file" accept="image/*" multiple hidden>
   <div class="composer">
     <div id="attachments" aria-label="Attached images"></div>
-    <textarea id="input" rows="1" placeholder="Message RichEngine" autofocus></textarea>
+    <textarea id="input" rows="1" placeholder="Message RichEngine" title="Enter to send · Shift+Enter for a new line" autofocus></textarea>
   </div>
   <div class="toolbar">
     <button id="attach" type="button" aria-label="Add images" title="Add images">
@@ -347,9 +350,13 @@
     return {...conversation, messages};
   }
 
-  function save() {
-    conversations.sort((a, b) => b.updated - a.updated);
-    conversations = conversations.slice(0, 20);
+  // The storage write serializes every chat, images included; it runs on an
+  // idle slice so a completed turn never blocks the next keystroke, and is
+  // flushed synchronously when the page goes away.
+  let saveScheduled = false;
+  const idleRun = window.requestIdleCallback || (fn => setTimeout(fn, 300));
+
+  function persistChats() {
     // Browser storage holds a few MB per site, which one photo can fill. Rather
     // than fail every later save, store the newest chats that fit, each with its
     // images if they still fit and without them otherwise, so a photo too large
@@ -363,8 +370,20 @@
         stored.push(fitting);
       }
     }
-    renderRecents();
   }
+
+  function save() {
+    conversations.sort((a, b) => b.updated - a.updated);
+    conversations = conversations.slice(0, 20);
+    renderRecents();
+    if (saveScheduled) return;
+    saveScheduled = true;
+    idleRun(() => { saveScheduled = false; persistChats(); }, {timeout: 2000});
+  }
+
+  addEventListener('pagehide', () => {
+    if (saveScheduled) { saveScheduled = false; persistChats(); }
+  });
 
   function titleFor(text) {
     const title = text.replace(/\s+/g, ' ').trim();
@@ -464,8 +483,44 @@
       `<pre><code>${escapeHtml(code.lines.join('\n'))}</code></pre></div>`;
   }
 
+  // The position after the last blank line outside a code fence: everything
+  // before it renders to finished blocks, everything after it may still grow.
+  function mdStableEnd(text) {
+    let end = 0, fence = false, offset = 0;
+    for (const line of text.split('\n')) {
+      if (/^```/.test(line)) fence = !fence;
+      // A blank line ends a block only where a newline follows it; the last
+      // line of the text has none and may still grow.
+      else if (!fence && !line.trim() && offset + line.length < text.length)
+        end = offset + line.length + 1;
+      offset += line.length + 1;
+    }
+    return end;
+  }
+
+  // Paint only the part of the markdown that can still change: finished
+  // blocks append once to .md-done, the open tail repaints in .md-tail, so a
+  // streamed reply does not rebuild (and de-focus) its earlier DOM per frame.
   function paintContent(box, text) {
-    box.querySelector('.content').innerHTML = renderMarkdown(displayContent(text));
+    const state = box._md || (box._md = {done: 0, doneText: ''});
+    const content = box.querySelector('.content');
+    if (!content.firstElementChild) {
+      content.innerHTML = '<div class="md-done"></div><div class="md-tail"></div>';
+    }
+    const [doneEl, tailEl] = content.children;
+    text = displayContent(text);
+    if (!text.startsWith(state.doneText)) {
+      state.done = 0;
+      state.doneText = '';
+      doneEl.innerHTML = '';
+    }
+    const end = mdStableEnd(text);
+    if (end > state.done) {
+      doneEl.insertAdjacentHTML('beforeend', renderMarkdown(text.slice(state.done, end)));
+      state.done = end;
+      state.doneText = text.slice(0, end);
+    }
+    tailEl.innerHTML = renderMarkdown(text.slice(state.done));
   }
 
   function nearBottom() {
@@ -507,27 +562,29 @@
     stats.hidden = !text;
   }
 
-  // Re-rendering the whole reply every token is wasteful; coalesce to frames.
+  // Re-rendering the whole reply every token is wasteful; coalesce paint and
+  // the follow-scroll to one layout per frame.
   function schedulePaint(box, text) {
     if (box.paintQueued) return;
     box.paintQueued = true;
     requestAnimationFrame(() => {
       box.paintQueued = false;
-      if (box.isConnected) paintContent(box, text);
+      if (!box.isConnected) return;
+      paintContent(box, text);
+      maybeScroll();
     });
   }
 
   function assistantBox(message, live = false) {
     const box = document.createElement('div');
-    box.className = 'message assistant';
+    box.className = `message assistant${live ? ' live' : ''}`;
     const details = document.createElement('details');
     details.open = live;
     details.hidden = !message.reasoning_content;
-    details.innerHTML = '<summary>Thinking</summary><div class="reasoning"></div>';
-    details.querySelector('.reasoning').textContent = message.reasoning_content || '';
+    details.innerHTML = `<summary><span class="think-label">${live ? 'Thinking…' : 'Thought'}</span></summary><div class="reasoning"></div>`;
+    details.querySelector('.reasoning').textContent = displayContent(message.reasoning_content || '');
     const content = document.createElement('div');
     content.className = 'content';
-    content.innerHTML = renderMarkdown(displayContent(message.content || ''));
     const waiting = document.createElement('div');
     waiting.className = 'waiting';
     waiting.hidden = !live || Boolean(message.content || message.reasoning_content);
@@ -543,6 +600,7 @@
     actions.innerHTML = '<button class="act regenerate" type="button" title="Regenerate" aria-label="Regenerate response">' +
       '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg></button>';
     box.append(details, content, waiting, stats, actions);
+    paintContent(box, message.content || '');
     return box;
   }
 
@@ -680,12 +738,16 @@
       conversations.push(conversation);
       activeId = conversation.id;
     }
+    if (!conversation.title) conversation.title = titleFor(firstPrompt);
     conversation.messages = messages;
     conversation.updated = Date.now();
     save();
   }
 
+  // field-sizing grows the textarea in CSS; the manual measure is the fallback.
+  const canFieldSize = typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content');
   function resize() {
+    if (canFieldSize) return;
     input.style.height = 'auto';
     input.style.height = `${input.scrollHeight}px`;
   }
@@ -799,7 +861,7 @@
       assistant.reasoning_content += delta.reasoning_content;
       const details = box.querySelector('details');
       details.hidden = false;
-      details.querySelector('.reasoning').textContent = assistant.reasoning_content;
+      details.querySelector('.reasoning').textContent = displayContent(assistant.reasoning_content);
     }
     if (delta.content) {
       if (!state.firstDeltaAt) state.firstDeltaAt = performance.now();
@@ -887,6 +949,7 @@
       box.querySelector('.waiting').hidden = true;
       paintContent(box, assistant.content);
       assistant.stats = statsText(assistant);
+      $('#sr-status').textContent = `Response complete${assistant.stats ? ` · ${assistant.stats}` : ''}`;
       messages.push(assistant);
       persist(firstPrompt);
     } catch (error) {
@@ -905,10 +968,14 @@
       const label = assistant.stopped ? 'stopped' : 'interrupted';
       assistant.stats = statsText(assistant) || label;
       paintStats(box, assistant);
+      $('#sr-status').textContent = `Response ${label}`;
       messages.push(assistant);
       persist(firstPrompt);
     } finally {
       box.querySelector('details')?.removeAttribute('open');
+      const label = box.querySelector('.think-label');
+      if (label) label.textContent = 'Thought';
+      box.classList.remove('live');
       box.querySelector('.actions').hidden = false;
       controller = undefined;
       setRunning(false);

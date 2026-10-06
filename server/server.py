@@ -880,7 +880,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
         policy = job.tool_policy
-        splitter = ReasoningSplitter(job.thinking, job.may_call_tools)
+        dialect = getattr(policy, "dialect", None)
+        splitter = ReasoningSplitter(
+            job.thinking,
+            job.may_call_tools,
+            None if dialect is None else dialect.call_open + dialect.name_prefix,
+        )
         # Output with tools is parsed as it arrives whether it streams or not.
         projector = (
             StreamingToolCallProjector(

@@ -1,6 +1,7 @@
 """Incremental model-output parsing, output blocks and final answer
 validation."""
 
+import ast
 import re
 from dataclasses import dataclass
 
@@ -42,20 +43,40 @@ def hold_partial(text, *markers):
 
 
 class ReasoningSplitter:
-    def __init__(self, thinking, tool_calls=False):
+    def __init__(self, thinking, tool_calls=False, call_open=None):
         self.reasoning = thinking
         self.pending = ""
         # Whether the newlines after </think>, which set the answer apart in
         # the chat template's layout of a turn, are still to be dropped.
         self.separator = False
         # Where a call may follow, a call's opening also ends the reasoning
-        # and begins the answer.
-        self.ends = (THINK_END, CALL_OPEN) if tool_calls else (THINK_END,)
+        # and begins the answer; call_open is the tool dialect's marker, the
+        # default dialect's where the request keeps it.
+        if call_open is None:
+            call_open = CALL_OPEN
+        self.ends = (THINK_END, call_open) if tool_calls else (THINK_END,)
+        # While no text has arrived, a leading <think> may still open
+        # reasoning a template did not mark: a hybrid-thinking model whose
+        # generation prompt ends at the role tag writes the tag itself
+        # (minicpm5 without enable_thinking).
+        self.undecided = not thinking
 
     def put(self, text):
-        if not self.reasoning:
-            return self._content(text)
         self.pending += text
+        if not self.reasoning:
+            if not self.undecided:
+                pending, self.pending = self.pending, ""
+                return self._content(pending)
+            head = self.pending.lstrip(NAME_SPACE)
+            if not head.startswith(THINK_OPEN):
+                # Hold the output while it may still grow into <think>.
+                if THINK_OPEN.startswith(head):
+                    return []
+                self.undecided = False
+                pending, self.pending = self.pending, ""
+                return self._content(pending)
+            self.reasoning = True
+            self.pending = head[len(THINK_OPEN) :]
         # A template that leaves reasoning open ends the prompt at the role
         # tag, so the model writes <think> itself; it marks the reasoning
         # rather than being part of it.
@@ -74,6 +95,7 @@ class ReasoningSplitter:
                 content = content[len(THINK_END) :]
             self.pending = ""
             self.reasoning = False
+            self.undecided = False
             self.separator = marker == THINK_END
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
@@ -622,11 +644,24 @@ class _PythonCallProjector(_ProjectorBase):
         kept = name and name not in self.parameter_names and self.call_id is not None
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
+        self.value_types = self.parameter_types.get(name, self.other_types)
         self.value_started = True
         self.value_parts = []
 
-    def _end_parameter_value(self, value, events):
+    def _end_parameter_value(self, value, events, raw=None):
+        """Emit the parameter's value as the JSON its declared types read it
+        as, as convert_value does: a string converts, any other kind emits
+        where declared and otherwise the raw token."""
         if self.parameter_name is not None:
+            types = self.value_types
+            if isinstance(value, str):
+                value = convert_value(value, types)
+            elif (
+                types is not None
+                and JSON_TYPES[type(value)] not in types
+                and not (JSON_TYPES[type(value)] == "integer" and "number" in types)
+            ):
+                value = raw if raw is not None else str(value)
             self._emit_argument(
                 self._key(self.parameter_name) + json_codec.dumps(value), events
             )
@@ -705,9 +740,9 @@ class _PythonCallProjector(_ProjectorBase):
             index += 1
         else:
             return False
-        token = self.pending[:index]
+        token = self.pending[:index].strip()
         self.pending = self.pending[index:]
-        self._end_parameter_value(_python_call_value(token), events)
+        self._end_parameter_value(_python_call_value(token), events, raw=token)
         self.state = "argument_sep"
         return True
 
@@ -720,8 +755,8 @@ class _PythonCallProjector(_ProjectorBase):
             self._end_parameter_value("".join(self.value_parts), events)
             self.pending = ""
         elif self.state == "argument_value":
-            token, self.pending = self.pending, ""
-            self._end_parameter_value(_python_call_value(token), events)
+            token, self.pending = self.pending.strip(), ""
+            self._end_parameter_value(_python_call_value(token), events, raw=token)
         if self.state in ("argument_head", "argument_sep") and self.call_id is not None:
             self._finish_call(events)
 
@@ -801,15 +836,35 @@ class _PythonCallProjector(_ProjectorBase):
 
 def _python_call_value(token):
     """A bare argument value of a python-call dialect: the template's scalar
-    spellings, or JSON for containers and quoted strings."""
+    spellings, or JSON for containers and quoted strings, else the literal
+    Python spellings of the same (single-quoted strings and containers),
+    else the token itself."""
     token = token.strip()
-    if token == "True":
-        return True
-    if token == "False":
-        return False
-    if token == "None":
-        return None
-    return json_value(token)
+    if token in _PYTHON_LITERALS:
+        return _PYTHON_LITERALS[token]
+    value = json_value(token)
+    if value is not token:
+        return value
+    try:
+        value = ast.literal_eval(token)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return token
+    try:
+        return _jsonable(value)
+    except (TypeError, RecursionError):
+        return token
+
+
+def _jsonable(value):
+    """`value` with tuples as lists, as JSON writes them; TypeError for a
+    literal with no JSON form (sets, bytes, dicts with unsized keys)."""
+    if isinstance(value, (str, int, float)) or value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {_jsonable(key): _jsonable(item) for key, item in value.items()}
+    raise TypeError("no JSON form")
 
 
 def argument_deltas(arguments):
