@@ -48,6 +48,19 @@ units, chunks of 512 rows or more, 27.5 ms per 2048-row FFN layer against
 | Prefill · 10,000-token prompt, cold | 19.7 s | 15.5 s (1.27×) |
 | Time to first token · 14K prompt, 10K cached | 8.7 s | 7.0 s (1.24×) |
 
+The split serves every dense target whose hidden size packs into whole
+512-channel blocks — Ornith 1.5 9B's 4096 channels run two 2048-channel
+segments (the 27B's 5120 run two of 2560). On the same Mac with the Ornith
+1.5 9B assembly (split at share 0.38 of 24 units, chunks of 512 rows or
+more, 14.7 ms per 2048-row FFN layer against 21.2 ms on the GPU alone,
+medians of three samples):
+
+| Metric | GPU alone | With the split |
+| --- | ---: | ---: |
+| Prefill · 14,096-token prompt, cold | 8.3 s | 6.7 s (1.24×) |
+| Prefill · 10,000-token prompt, cold | 5.9 s | 5.5 s (1.07×) |
+| Time to first token · 14K prompt, 10K cached | 2.7 s | 2.4 s (1.09×) |
+
 Decode is unchanged: its kernels do not run on the Neural Engine, and the
 split does not engage while other requests decode.
 
