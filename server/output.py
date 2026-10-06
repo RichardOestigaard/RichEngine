@@ -399,17 +399,16 @@ class _ProjectorBase:
         next call's opening, skip a call separator, drop a </think>. False
         while only a marker's partial prefix remains."""
         separator = self.dialect.call_separator
-        if separator and self.pending.startswith(separator):
-            self.pending = self.pending[len(separator) :]
-            return True
-        start, tag = self._next_tag(*self.text_tags)
+        markers = self.text_tags + ((separator,) if separator else ())
+        start, tag = self._next_tag(*markers)
         if tag is None:
-            markers = self.text_tags + ((separator,) if separator else ())
             ready, self.pending = hold_partial(self.pending, *markers)
             self._emit_content(ready, events)
             return False
         self._emit_content(self.pending[:start], events)
         self.pending = self.pending[start + len(tag) :]
+        if tag == separator:
+            return True
         if tag == self.call_marker:
             self.state = self._after_open
         return True
@@ -435,12 +434,18 @@ class _ProjectorBase:
         if self.state in ("closing", "call_sep"):
             self.pending = ""
             self.state = "content"
+        separator = self.dialect.call_separator
+        if separator and self.pending == separator:
+            self.pending = ""
         if (
             self.state in ("content", "output", "json")
             and self.pending
             and not (
                 incomplete
-                and any(tag.startswith(self.pending) for tag in self.text_tags)
+                and any(
+                    tag.startswith(self.pending)
+                    for tag in self.text_tags + ((separator,) if separator else ())
+                )
             )
         ):
             self.content_fragments.append(self.pending)
@@ -484,7 +489,10 @@ class _XmlToolCallProjector(_ProjectorBase):
         follows = (dialect.param_open, dialect.body_close) + (
             (dialect.block_close,) if dialect.block_close else ()
         )
-        self.value_ends = tuple(dialect.param_close + tag for tag in follows)
+        ends = tuple(dialect.param_close + tag for tag in follows)
+        if dialect.bare_close:
+            ends = (dialect.param_close,) + ends
+        self.value_ends = ends
         self.argument_tags = follows
 
     def _drain(self, events):
@@ -545,6 +553,16 @@ class _XmlToolCallProjector(_ProjectorBase):
             if self.state == "value":
                 ends = self.value_ends
                 skip = len(self.dialect.param_close)
+                if not self.value_started and not self.value_parts:
+                    # The name's close may end in markup the name scan leaves
+                    # for the value (minicpm5's `">`), unlike a whitespace
+                    # tail, which _put_value's leading-newline strip covers.
+                    tail = self.dialect.param_name_close[1:]
+                    if tail and tail.strip(NAME_SPACE):
+                        if self.pending.startswith(tail):
+                            self.pending = self.pending[len(tail) :]
+                        elif tail.startswith(self.pending):
+                            break
                 if (
                     self.dialect.cdata
                     and not self.value_started
@@ -560,9 +578,11 @@ class _XmlToolCallProjector(_ProjectorBase):
                             break
                         else:
                             self.cdata_open = False
-                    if self.cdata_open:
-                        ends = tuple("]]>" + end for end in ends)
-                        skip += 3
+                # A CDATA value's close starts with ]]>; keep the prefixed
+                # ends past the value's first part.
+                if self.cdata_open:
+                    ends = tuple("]]>" + end for end in ends)
+                    skip += 3
                 start, tag = self._next_tag(*ends)
                 if tag is None:
                     held = hold_partial(self.pending, *ends)[1]
