@@ -21,7 +21,7 @@ inline void richengine_store_verify_phase(
   constant RichChunkedPrefillParams &lane_params = params[batch];
   const uint rows = lane_params.chunk_tokens;
   if (!richengine_chunk_contract_valid(lane_params) ||
-      rows > RICHENGINE_TREE_VERIFY_NODES - 1 ||
+      rows > RICHENGINE_SPECULATIVE_SCRATCH_TOKENS ||
       lane_params.chunk_stride != RICHENGINE_VERIFY_CHUNK_STRIDE ||
       thread_index >= HeadDim)
     return;
@@ -184,6 +184,14 @@ VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_hd64, 8, bfloat, 64)
 VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_k8d128, 8, int8_t, 128)
 VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_k8d128, 8, RichKvPacked4, 128)
 VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_k8d128, 8, bfloat, 128)
+// Gemma 4: the sliding layers' KV8 pages of 256 and the global layers' KV2
+// pages of 512.
+VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_gemma_h256, 8, int8_t, 256)
+VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_gemma_h256, 8, RichKvPacked4, 256)
+VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_h256, 8, bfloat, 256)
+VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_gemma_hd512, 2, int8_t, 512)
+VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
+VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
 #undef VERIFY_ATTENTION_STORE_HD
 
 // Tree verify compaction. A tree lane's retained path names the scratch rows
@@ -307,4 +315,7 @@ VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_hd128, 2, bfloat, 128)
 VERIFY_TREE_COMPACT(verify_tree_attention_q8_compact_hd64, 8, int8_t, 64)
 VERIFY_TREE_COMPACT(verify_tree_attention_int4_compact_hd64, 8, RichKvPacked4, 64)
 VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_hd64, 8, bfloat, 64)
+VERIFY_TREE_COMPACT(verify_tree_attention_q8_compact_k8d128, 8, int8_t, 128)
+VERIFY_TREE_COMPACT(verify_tree_attention_int4_compact_k8d128, 8, RichKvPacked4, 128)
+VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_k8d128, 8, bfloat, 128)
 #undef VERIFY_TREE_COMPACT

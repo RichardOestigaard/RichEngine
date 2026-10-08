@@ -261,9 +261,9 @@ class ArchitectureTests(unittest.TestCase):
             "model/Qwen3_8.hpp",
             "model/QwenHybridLayout.hpp",
             "model/QwenState.hpp",
-            "model/QwenTarget.hpp",
-            "model/QwenTargetFiles.hpp",
-            "model/QwenTargetLoader.hpp",
+            "model/TargetModel.hpp",
+            "model/TargetFiles.hpp",
+            "model/TargetLoader.hpp",
             "model/Runtime.hpp",
             "model/WeightStore.hpp",
         )
@@ -309,7 +309,7 @@ class ArchitectureTests(unittest.TestCase):
                                 f"model {header}"
                             ],
                         )
-                for name in ("QwenTarget", "DFlashDraft", "Runtime"):
+                for name in ("TargetModel", "DFlashDraft", "Runtime"):
                     with self.subTest(source="startup", symbol=name):
                         startup.write_text(f"auto instance = model::{name}{{}};\n")
                         self.assertEqual(
@@ -345,16 +345,16 @@ class ArchitectureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "runtime/model").mkdir(parents=True)
-            (root / "runtime/model/QwenTarget.hpp").write_text("")
+            (root / "runtime/model/TargetModel.hpp").write_text("")
             policy = root / "runtime/engine/Scheduler.cpp"
             policy.parent.mkdir()
             with mock.patch.object(check_architecture, "ROOT", root):
                 for include in (
-                    '# include "model/QwenTarget.hpp"',
-                    '#include"model/QwenTarget.hpp"',
-                    "#  import <model/QwenTarget.hpp>",
-                    '#include "../model/QwenTarget.hpp"',
-                    '#include "model/../model/QwenTarget.hpp"',
+                    '# include "model/TargetModel.hpp"',
+                    '#include"model/TargetModel.hpp"',
+                    "#  import <model/TargetModel.hpp>",
+                    '#include "../model/TargetModel.hpp"',
+                    '#include "model/../model/TargetModel.hpp"',
                 ):
                     with self.subTest(include=include):
                         policy.write_text(include + "\n")
@@ -362,7 +362,7 @@ class ArchitectureTests(unittest.TestCase):
                             check_architecture.check(),
                             [
                                 "runtime/engine/Scheduler.cpp: engine policy "
-                                "depends on concrete model model/QwenTarget.hpp"
+                                "depends on concrete model model/TargetModel.hpp"
                             ],
                         )
 

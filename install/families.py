@@ -8,6 +8,7 @@ fields from a GGUF header. Legacy RichEngine packages pack these same layouts.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from . import models
@@ -63,6 +64,24 @@ DFLASH = (
     ("dflash_config.block_size", 16),
 )
 
+# The Gemma 4 dialect of a DFlash release (z-lab's DFlashDraftModel): a
+# causal qwen3 checkpoint of four sliding-attention layers and one
+# full-attention layer, which states its block size flat and its rope base
+# at the config's root rather than under rope_parameters.
+DFLASH_GEMMA4 = (
+    ("architectures", ("DFlashDraftModel",)),
+    ("model_type", "qwen3"),
+    ("sliding_window", 2048),
+    ("attention_bias", False),
+    ("tie_word_embeddings", False),
+    ("rms_norm_eps", 1e-6),
+    ("hidden_act", "silu"),
+    ("rope_theta", 1000000),
+    ("layer_types", ("sliding_attention",) * 4 + ("full_attention",)),
+    ("block_size", 16),
+    ("final_logit_softcapping", 30.0),
+)
+
 
 # The fields every DSpark draft the runtime loads states alike: a qwen3
 # checkpoint of five full-attention layers with a Markov head and a
@@ -82,6 +101,18 @@ DSPARK = (
 
 
 @dataclass(frozen=True)
+class FamilyDefaults:
+    """The family's install policy the signature cannot state: the packed
+    target format install/pack.py writes for it (one of pack.TARGET_FORMATS,
+    None for a family served from its MLX or GGUF checkpoint) and the
+    quantization its target ships. A family's Draft names the suggested
+    draft checkpoint."""
+
+    packed_format: str | None = None
+    quant: str = "q4"
+
+
+@dataclass(frozen=True)
 class ModelFamily:
     name: str
     # The text_config fields that identify the architecture, as an MLX config
@@ -94,6 +125,12 @@ class ModelFamily:
     # Whether the runtime serves this family's vision tower; a family without
     # one is installed text-only whatever --language-only says.
     vision: bool = True
+    # The (field, value) pairs the config must not state: a field naming
+    # another architecture's value disqualifies the family however it was
+    # found, strict signature or name. A field the config omits contradicts
+    # nothing.
+    forbids: tuple[tuple[str, object], ...] = ()
+    defaults: FamilyDefaults = FamilyDefaults()
 
 
 FAMILIES = (
@@ -162,6 +199,11 @@ FAMILIES = (
                 ("dflash_config.target_layer_ids", (5, 19, 33, 47, 61)),
             ),
         ),
+        # Qwen3.8 keeps its MTP head: its GGUF declares 65 blocks, one a
+        # nextn layer gguf.model_config subtracts, and Bonsai's ternary
+        # conversion drops it. A config stating the layer is the base
+        # model whatever its repository or file is named.
+        forbids=(("num_nextn_predict_layers", 1),),
     ),
     ModelFamily(
         "Ornith-1.5-9B",
@@ -426,6 +468,99 @@ FAMILIES = (
         None,
         vision=False,
     ),
+    ModelFamily(
+        "Gemma4-26B-A4B",
+        (
+            ("model_type", "gemma4_text"),
+            ("max_position_embeddings", 262144),
+            ("hidden_size", 2816),
+            ("num_hidden_layers", 30),
+            ("vocab_size", 262144),
+            # The local (sliding-attention) layers' heads; the global
+            # layers' wider heads and fewer KV heads are stated apart.
+            ("num_attention_heads", 16),
+            ("num_key_value_heads", 8),
+            ("num_global_key_value_heads", 2),
+            ("head_dim", 256),
+            ("global_head_dim", 512),
+            ("intermediate_size", 2112),
+            ("num_experts", 128),
+            ("top_k_experts", 8),
+            ("moe_intermediate_size", 704),
+            ("enable_moe_block", True),
+            ("sliding_window", 1024),
+            ("num_kv_shared_layers", 0),
+            ("attention_k_eq_v", True),
+            ("final_logit_softcapping", 30.0),
+            ("tie_word_embeddings", True),
+            # A global layer every sixth (5, 11, 17, 23, 29), as
+            # config.json's layer_types states them and the GGUF's
+            # sliding_window_pattern implies.
+            ("layer_types", tuple(
+                "full_attention" if index % 6 == 5 else "sliding_attention"
+                for index in range(30)
+            )),
+        ),
+        Draft(
+            "z-lab/gemma-4-26B-A4B-it-DFlash",
+            DFLASH_GEMMA4
+            + (
+                ("num_hidden_layers", 5),
+                ("num_target_layers", 30),
+                ("hidden_size", 2816),
+                ("vocab_size", 262144),
+                ("intermediate_size", 5632),
+                ("num_attention_heads", 32),
+                ("num_key_value_heads", 8),
+                ("head_dim", 128),
+                ("dflash_config.mask_token_id", 4),
+                ("dflash_config.target_layer_ids", (1, 6, 11, 17, 22, 27)),
+            ),
+        ),
+        # Gemma 4's released weights carry a vision tower the runtime does
+        # not serve.
+        vision=False,
+        defaults=FamilyDefaults(packed_format="packed-gemma4"),
+    ),
+    ModelFamily(
+        "DiffusionGemma-26B-A4B",
+        (
+            ("model_type", "diffusion_gemma_text"),
+            ("max_position_embeddings", 262144),
+            ("hidden_size", 2816),
+            ("num_hidden_layers", 30),
+            ("vocab_size", 262144),
+            # The local (sliding-attention) layers' heads; the global
+            # layers' wider heads and fewer KV heads are stated apart.
+            ("num_attention_heads", 16),
+            ("num_key_value_heads", 8),
+            ("num_global_key_value_heads", 2),
+            ("head_dim", 256),
+            ("global_head_dim", 512),
+            ("intermediate_size", 2112),
+            ("num_experts", 128),
+            ("top_k_experts", 8),
+            ("moe_intermediate_size", 704),
+            ("sliding_window", 1024),
+            # DiffusionGemma's text_config states bidirectional attention
+            # where Gemma 4's states attention_k_eq_v.
+            ("use_bidirectional_attention", "vision"),
+            ("final_logit_softcapping", 30.0),
+            ("tie_word_embeddings", True),
+            # A global layer every sixth (5, 11, 17, 23, 29), as
+            # config.json's layer_types states them.
+            ("layer_types", tuple(
+                "full_attention" if index % 6 == 5 else "sliding_attention"
+                for index in range(30)
+            )),
+        ),
+        # DiffusionGemma has no draft; the packed manifest keeps the Null
+        # predraft's magic.
+        draft=None,
+        # Its encoder's vision tower is not served.
+        vision=False,
+        defaults=FamilyDefaults(packed_format="packed-diffusiongemma"),
+    ),
 )
 
 
@@ -434,13 +569,24 @@ def named(name):
     return next((family for family in FAMILIES if family.name == name), None)
 
 
+def _names(family, hint):
+    """Whether the hint names the family: its name bounded by characters a
+    repository or file name separates tokens with, never inside another
+    word (NotBonsai-2-27B names no Bonsai)."""
+    pattern = r"(?<![0-9a-z])" + re.escape(family.name.lower()) + r"(?![0-9a-z])"
+    return re.search(pattern, hint.lower()) is not None
+
+
 def family_for(config, name=None):
     """The one family whose architecture the target's config states.
 
-    name is an optional hint such as a repository or GGUF name: a family it
-    names wins over a signature that matches only because the config omits
-    the deciding field (a GGUF states no router_aux_loss_coef). A named
-    family must still not contradict any field the config states."""
+    name is an optional hint such as a repository or GGUF name. It supplies
+    the fields a config omits: a family it names wins over a signature that
+    matches only because the config omits the deciding field (a GGUF states
+    no router_aux_loss_coef), and never over a strict match of its own
+    length or longer — a stated discriminator beats the name. A named
+    family must still not contradict any field the config states, and a
+    field a family forbids disqualifies it however it was found."""
     text = config.get("text_config") if isinstance(config, dict) else None
     if not isinstance(text, dict):
         # A text-only model (a llama or lfm2 checkpoint) states the same
@@ -456,17 +602,30 @@ def family_for(config, name=None):
             value = tuple(value)
         return value == expected
 
+    def forbidden(family):
+        # A stated field the family forbids is a contradiction whichever
+        # path found it; a field the config omits contradicts nothing.
+        return any(
+            key in text and stated(key, value, False)
+            for key, value in family.forbids
+        )
+
     matches = [
-        f for f in FAMILIES if all(stated(k, v, False) for k, v in f.signature)
+        f
+        for f in FAMILIES
+        if not forbidden(f) and all(stated(k, v, False) for k, v in f.signature)
     ]
     if name:
         named = [
             f
             for f in FAMILIES
-            if f.name.lower() in name.lower()
+            if _names(f, name)
+            and not forbidden(f)
             and all(stated(k, v, True) for k, v in f.signature)
         ]
-        if named:
+        if named and max(len(f.signature) for f in named) > max(
+            (len(f.signature) for f in matches), default=0
+        ):
             matches = named
     if not matches:
         keys = sorted({key for family in FAMILIES for key, _ in family.signature})

@@ -1,0 +1,78 @@
+/* Settings page specifics — shares the styles.css primitives. */
+
+.settings-page .badge.err { color: var(--danger) }
+
+/* Segmented theme picker: one bordered pill, active segment filled. */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.segmented button {
+  padding: 4px 12px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.segmented button:hover { color: var(--text) }
+.segmented button.active { color: var(--text); background: var(--bubble) }
+
+/* Inputs mirror .install-input / .store-search tokens. */
+.settings-input {
+  width: 300px;
+  max-width: 42vw;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+}
+.settings-select {
+  max-width: 46vw;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+}
+.settings-area {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* Checkbox row, same shape as .install-check / .dedupe-variants. */
+.settings-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.settings-check input { accent-color: var(--accent); margin: 0 }
+
+/* Rows that stack vertically (the system-prompt field). */
+.settings-page .panel-row.col { display: block }
+.field-note { color: var(--muted); font-size: 12.5px }
+.panel-row.col .field-note { display: block; margin-top: 6px }
+
+/* Danger-zone and note copy wraps instead of truncating. */
+.settings-page .panel-row.wrap .grow {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+.settings-page .panel-row.wrap .btn { flex-shrink: 0 }
+.settings-page .danger-zone { margin-top: 12px }

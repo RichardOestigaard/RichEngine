@@ -4,6 +4,7 @@
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/KernelNames.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 
@@ -50,7 +51,7 @@ int main(int argc, char **argv) {
         const MetalBuffer w1 = kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1) : meta;
         const MetalBuffer output = sharedBuffer(backend, uint64_t{N} * K * 2);
         CommandGraph graph;
-        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0},
+        graph.add(std::string(richengine::ops::kGgufTestDequant) + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
         static_cast<void>(backend.submitCommand(graph.dispatches()));
         const auto *got = static_cast<const uint16_t *>(output.contents());
@@ -64,7 +65,7 @@ int main(int argc, char **argv) {
           // coefficient (FmtMXFP4N; the production `n` kernels' dequantizer).
           const MetalBuffer nativeOutput = sharedBuffer(backend, uint64_t{N} * K * 2);
           CommandGraph nativeGraph;
-          nativeGraph.add("gguf_test_dequant_mxfp4n", {w0, w1, meta, nativeOutput},
+          nativeGraph.add(std::string(richengine::ops::kGgufTestDequantMxfp4n), {w0, w1, meta, nativeOutput},
                           GgufDecodeParams{K, 1, N, 0}, {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
           static_cast<void>(backend.submitCommand(nativeGraph.dispatches()));
           const auto *native = static_cast<const uint16_t *>(nativeOutput.contents());

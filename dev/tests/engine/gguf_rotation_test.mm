@@ -5,6 +5,7 @@
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/KernelNames.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 
@@ -116,7 +117,7 @@ int main(int argc, char **argv) {
           }
         const MetalBuffer in = upload(backend, input), out = sharedBuffer(backend, input.size() * 2);
         CommandGraph graph;
-        graph.add("gguf_rotate", {in, signBuffer, out}, GgufRotationParams{width}, {width / kBlock, rows, 1},
+        graph.add(std::string(richengine::ops::kGgufRotate), {in, signBuffer, out}, GgufRotationParams{width}, {width / kBlock, rows, 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
         static_cast<void>(backend.submitCommand(graph.dispatches()));
         failures += check("gguf_rotate H (D x)", static_cast<const uint16_t *>(out.contents()), fp32, fp64);
@@ -144,7 +145,7 @@ int main(int argc, char **argv) {
         const MetalBuffer tokenBuffer = upload(backend, tokens), rows = upload(backend, table);
         const MetalBuffer out = sharedBuffer(backend, fp32.size() * 2);
         CommandGraph graph;
-        graph.add("gguf_embed_rotated_pq20", {tokenBuffer, rows, signBuffer, out},
+        graph.add(std::string(richengine::ops::kGgufEmbedRotatedPq20), {tokenBuffer, rows, signBuffer, out},
                   GgufEmbedParams{uint32_t(tokens.size()), vocabulary, hidden}, {hidden / kBlock, uint32_t(tokens.size()), 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
         static_cast<void>(backend.submitCommand(graph.dispatches()));

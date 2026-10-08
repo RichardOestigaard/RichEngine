@@ -1,6 +1,7 @@
 #include "ops/Sampling.hpp"
 
 #include "metal/abi/Sampling.h"
+#include "ops/KernelNames.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -114,11 +115,11 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
   const metal::DispatchSize groups{
       (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
   if (!verify) {
-    graph.add("decode_sample_penalize", {buffers.logits, table.words}, params,
+    graph.add(std::string(kDecodeSamplePenalize), {buffers.logits, table.words}, params,
               groups, {kPenaltyThreads, 1, 1});
     return;
   }
-  graph.add("decode_sample_penalize_verify",
+  graph.add(std::string(kDecodeSamplePenalizeVerify),
             {buffers.logits, table.words, buffers.inputTokens}, params, groups,
             {kPenaltyThreads, 1, 1});
 }
@@ -218,31 +219,31 @@ void Sampling::addSelection(metal::CommandGraph &graph,
       // The fused head wrote per-(row, column tile) argmax partials and
       // skipped the logits entirely; reduce them directly. The tile width is
       // the affine head's 128 (fusedHead 1) or the GGUF tile's 64 (2).
-      graph.add(fusedHead == 2 ? "decode_head_argmax_reduce_tiles_gguf"
-                              : "decode_head_argmax_reduce_tiles",
+      graph.add(std::string(fusedHead == 2 ? kDecodeHeadArgmaxReduceTilesGguf
+                              : kDecodeHeadArgmaxReduceTiles),
                 {buffers.headArgmaxValues, buffers.headArgmaxIndices,
                  buffers.outputTokens},
                 params, {selected, 1, 1}, {32, 1, 1});
     } else {
-      graph.add("decode_sample_argmax_sharded",
+      graph.add(std::string(kDecodeSampleArgmaxSharded),
                 {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
                  buffers.argmaxIndices},
                 params, {selected * kTargetShards, 1, 1});
-      graph.add("decode_sample_argmax_reduce",
+      graph.add(std::string(kDecodeSampleArgmaxReduce),
                 {buffers.argmaxValues, buffers.argmaxIndices,
                  buffers.outputTokens},
                 params, {selected, 1, 1}, {32, 1, 1});
     }
   }
   if (params.sampling_mask) {
-    graph.add("decode_sample_mass_sharded",
+    graph.add(std::string(kDecodeSampleMassSharded),
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses},
               params, {selected * kTargetShards, 1, 1});
-    graph.add("decode_sample_vocabulary_search",
+    graph.add(std::string(kDecodeSampleVocabularySearch),
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
+    graph.add(std::string(kDecodeSampleVocabularyDraw),
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
@@ -257,7 +258,8 @@ void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
     std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-    uint32_t stopToken1, std::span<const uint32_t> proposals) const {
+    uint32_t stopToken1, std::span<const uint32_t> proposals,
+    uint32_t draftCandidateStride) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
       maximumRetained.size() > kMaximumLanes ||
       (!proposals.empty() && proposals.size() != policies.size()))
@@ -279,7 +281,8 @@ void Sampling::addAcceptance(
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add("decode_accept_dflash",
+  params.candidate_stride = draftCandidateStride;
+  graph.add(std::string(kDecodeAcceptDflash),
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
@@ -308,7 +311,7 @@ void Sampling::addTreeAcceptance(
       throw std::invalid_argument("invalid tree retention limit");
     params.remaining[lane] = maximumRetained[lane];
   }
-  graph.add("decode_accept_tree",
+  graph.add(std::string(kDecodeAcceptTree),
             {std::move(treeTokens), std::move(treeNodes),
              std::move(treeCounts), std::move(targetTokens),
              std::move(outputTokens), std::move(retainedCounts),
@@ -325,7 +328,7 @@ void Sampling::addTreeLeafPatch(metal::CommandGraph &graph,
   TreeLeafPatchParams params{};
   params.expected = expected;
   params.lanes = lanes;
-  graph.add("tree_leaf_patch",
+  graph.add(std::string(kTreeLeafPatch),
             {std::move(treeTokens), std::move(medusaTokens),
              std::move(medusaFlag), std::move(treeCounts)},
             params,

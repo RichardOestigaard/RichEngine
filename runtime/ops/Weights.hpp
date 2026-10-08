@@ -201,13 +201,20 @@ struct NativeRows final {
 class EmbeddingWeights final : public LayoutWeights<AffineWeights, NativeRows> {
 public:
   EmbeddingWeights() = default;
-  EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
+  EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights,
+                   bool tiled = false)
+      : LayoutWeights(std::move(weights)), outputSize(output),
+        inputSize(input), tiled(tiled) {}
   EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
       : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {}
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
+  // Whether an affine table's planes are the packed format's 256-row tiles:
+  // safetensors-sourced images copy the checkpoint's flat MLX-quantized
+  // rows, packed files quantize into the projection tiles (kernels/shared/
+  // embedding.metal's embedding_q4_h* vs embedding_q4t_h*).
+  bool tiled = false;
   // Native rows stored rotated, gathered as D (H r) (InputRotation).
   InputRotation rotation;
 };

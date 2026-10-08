@@ -83,6 +83,14 @@ public:
                 const DraftSelectorBuffers &buffers,
                 std::span<const uint32_t> anchors,
                 std::span<const SamplingPolicy> policies) const;
+  // The same plain selection ending in draft_select_plain_tree: treeMask
+  // lanes additionally write each position's rank-1 candidate as a sibling
+  // leaf of the verify comb.
+  void addPlainTree(metal::CommandGraph &graph,
+                    const DraftSelectorBuffers &buffers,
+                    std::span<const uint32_t> anchors,
+                    std::span<const SamplingPolicy> policies,
+                    uint32_t treeMask) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
   // dspark_select_edges + draft_select_dspark): like the plain path, but
   // position p reads logits row p (the anchor row already predicts a token)
@@ -91,12 +99,42 @@ public:
   // predecessor/candidate edge in advance — the predecessor set is the
   // previous position's unbiased top-16, not the walk's pick — and the walk
   // chooses the positions serially. selectorHidden is unused; unary holds
-  // the merged top-16 logits. There is no tree path.
+  // the merged top-16 logits.
   void addDSpark(metal::CommandGraph &graph,
                  const DraftSelectorBuffers &buffers,
                  const DraftMarkovHead &markov,
                  std::span<const uint32_t> anchors,
                  std::span<const SamplingPolicy> policies) const;
+  // The same DSpark pipeline ending in draft_select_dspark_tree, which
+  // emits each lane's verify tree tables: the chain plus, for lanes in
+  // treeMask, every position's biased runner-up as a sibling leaf.
+  void addDSparkTree(metal::CommandGraph &graph,
+                    const DraftSelectorBuffers &buffers,
+                    const DraftMarkovHead &markov,
+                    std::span<const uint32_t> anchors,
+                    std::span<const SamplingPolicy> policies,
+                    uint32_t treeMask) const;
+  // The DFlash2 selector over the whole shard pool
+  // (dflash_select_pool_edges + the shared draft_select_dspark pool walk):
+  // the hidden-conditioned codebook edge scores all 128 partial slots per
+  // position instead of the merged top-16, so a pick the merge truncated can
+  // still win the walk. Greedy batches only — a sampled lane's residual draw
+  // stages kDraftCandidates entries, so callers must check the policies
+  // first. candidates and unary are unused.
+  void addPool(metal::CommandGraph &graph,
+               const DraftSelectorBuffers &buffers,
+               const DraftCodebooks &codebooks,
+               std::span<const uint32_t> anchors,
+               std::span<const SamplingPolicy> policies) const;
+  // The same pool pipeline ending in the shared draft_select_dspark_tree
+  // walk: treeMask lanes get each position's biased pool runner-up as a
+  // sibling leaf.
+  void addPoolTree(metal::CommandGraph &graph,
+                   const DraftSelectorBuffers &buffers,
+                   const DraftCodebooks &codebooks,
+                   std::span<const uint32_t> anchors,
+                   std::span<const SamplingPolicy> policies,
+                   uint32_t treeMask) const;
 
 private:
   uint32_t vocabulary_ = 0;

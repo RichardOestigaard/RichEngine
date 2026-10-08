@@ -1,5 +1,7 @@
 #include "ops/ExecutionPlans.hpp"
 
+#include "Tuning.hpp"
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -23,10 +25,15 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      appleGpuFamily_(device.appleGpuFamily) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
+                               uint32_t moeUnionCap)
+    : policy_(DevicePolicy::of(device)),
+      linear_(policy_),
+      // RICHENGINE_MOE_UNION is the env form --moe-union overrides.
+      moeUnionCap_(moeUnionCap ? moeUnionCap
+                              : tuning().moeUnionCap),
+      moeRouteWideRows_(moeRouteWideRows(policy_.cores)),
+      moeDecodeSimdgroups_(moeDecodeSimdgroups(policy_)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
@@ -35,9 +42,10 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, bool tree) const {
+    std::span<const uint32_t> historyTokens, bool tree,
+    uint32_t liveNodes) const {
   return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens,
-                                    tree);
+                                    tree, liveNodes);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -48,23 +56,37 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
 // The router threshold, the expert tile, the simdgroups of a decode plan's
 // 8-row tiles and, for a GGUF plan, its tiles.
 MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
+  const bool canvas = phase == MoePhase::Canvas;
   const bool prefill = phase == MoePhase::Prefill;
   MoeConfig config;
   config.routeWideRows = moeRouteWideRows_;
+  if (!prefill && !canvas) {
+    config.unionCap = moeUnionCap_;
+    config.m8Simdgroups = moeDecodeSimdgroups_;
+  }
+  // Canvas plans take M16 tiles: a canvas step's union leaves experts well
+  // under 32 rows each, and the doubled tile count buys parallelism the
+  // weight re-reads cost (measured on the 25B MoE trunk at its 256-row
+  // canvas: up pass 742 -> 523 us, ~314 GB/s vs ~148). Prefill keeps M32 at
+  // any rows; the GGUF branch below overrides this for block weights.
   config.expertTile = prefill ? MoeExpertTile::M32 : MoeExpertTile::M8;
-  if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups_;
+  if (canvas) config.expertTile = MoeExpertTile::M16;
   if (shape.weightLayout == WeightLayout::Block32) {
-    const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
+    const MoeGgufTile tile = moeGgufTile(policy_, shape);
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     config.ggufTile = tile;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
-    config.mxfp4Native = appleGpuFamily_ >= 10;
+    config.mxfp4Native = policy_.nativeFormats();
   }
   return config;
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   return MoE::prefillPlan(shape, rows, moeConfig(shape, rows, MoePhase::Prefill));
+}
+
+MoePlan ExecutionPlans::moeCanvas(MoeShape shape, uint32_t rows) const {
+  return MoE::canvasPlan(shape, rows, moeConfig(shape, rows, MoePhase::Canvas));
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
@@ -99,6 +121,12 @@ MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
   auto bound = moePrefill(shape, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows)
     include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
+  // A canvas plan's M16 tiles need more tile descriptors than the same rows
+  // on M32; include its bound over the canvas row span. Canvas plans are
+  // affine-only, so the bound only exists for affine shapes.
+  if (shape.weightLayout == WeightLayout::Affine64)
+    for (uint32_t rows = 1; rows <= std::min(maximumRows, 256u); ++rows)
+      include(bound, moeCanvas(shape, rows).workspace(), kMoeWorkspaceFields);
   return bound;
 }
 

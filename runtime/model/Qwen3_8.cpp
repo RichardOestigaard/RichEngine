@@ -1,5 +1,5 @@
 #include "model/Qwen3_8.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 
 #include <cstring>
 #include <map>
@@ -35,7 +35,7 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
       rotate(mixer.inputProjection);
       rotate(mixer.outputProjection);
     }, layer.mixer);
-    if (auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
+    if (auto *gdn = std::get_if<GdnMixerWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
     rotate(layer.gateProjection);
     rotate(layer.upProjection);
     rotate(layer.downProjection);
@@ -49,9 +49,9 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 } // namespace
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                                  const QwenTargetFiles<Qwen3_8Layout> &files) {
+                                  const TargetFiles<Qwen3_8Layout> &files) {
   // The dense FFN reads the same projections from either format.
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -59,7 +59,7 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout la
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Qwen3_8Weights weights = loadQwenTarget<Qwen3_8Weights>(backend, layout, files, readFfn);
+  Qwen3_8Weights weights = loadTargetWeights<Qwen3_8Weights>(backend, layout, files, readFfn);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     if (const std::optional<GgufRotation> &rotation = gguf->get().rotation()) rotateInputs(backend, weights, *rotation);
   return weights;

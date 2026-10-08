@@ -71,6 +71,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (richengine serve --disable-ane turns
   // it off).
   bool neuralEngine = true;
+  // --moe-union EXPERTS: the decode step's routed-expert budget per MoE
+  // dispatch — a verify pass's rows share that many experts, the rest of
+  // their routes dropped. 0 keeps every route.
+  uint32_t moeUnionCap = 0;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -165,13 +169,10 @@ public:
     if (reported_)
       return;
     reported_ = true;
-    // Formatted without allocating: hold() must not throw.
-    char line[160];
-    std::snprintf(line, sizeof line,
-                  "RichEngine cannot keep the Mac awake while requests run (%s); "
-                  "it may sleep during one.",
-                  mach_error_string(result));
-    writeStderrLine(line);
+    // Formatted without allocating: hold() must not throw, and logLine's
+    // allocation failure is swallowed with the notice.
+    logLine(dim("RichEngine cannot keep the Mac awake while requests run ("),
+            mach_error_string(result), dim("); it may sleep during one."));
   }
 
 private:
@@ -186,7 +187,8 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
-      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]");
+      " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
+      " [--moe-union EXPERTS]");
 }
 
 template <typename T>
@@ -299,6 +301,9 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--moe-union") {
+      if (value != "0" && !parsePositive(value, result.moeUnionCap))
+        throw UsageError("--moe-union requires a nonnegative expert count");
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
@@ -349,6 +354,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.moeUnionCap = arguments.moeUnionCap;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;
@@ -409,16 +415,16 @@ void closePersistentCache(engine::FdTransport &transport,
   engine::NativeRuntime &loop = bootstrap.nativeLoop();
   const bool flushed = transport.runFlush(loop, kFlushBudget);
   if (!loop.engineHealthy()) {
-    writeStderrLine("error: the engine failed while it saved its newest restore points (" +
-                    loop.engineFailure() + ")");
+    writeErrorLine("the engine failed while it saved its newest restore points (" +
+                  loop.engineFailure() + ")");
     return;
   }
   if (!flushed)
-    writeStderrLine("Persistent cache: stopping before every newest restore point reached the "
-                    "disk.");
+    logLine("Persistent cache: stopping before every newest restore point reached the "
+            "disk.");
   if (!bootstrap.resources().closePersistentCache())
-    writeStderrLine("error: the persistent cache did not reach the disk; the next start takes it "
-                    "back on probation.");
+    writeErrorLine("the persistent cache did not reach the disk; the next start takes it back "
+                  "on probation.");
 }
 
 int runNative(const NativeArguments &arguments) {
@@ -457,9 +463,8 @@ int runNative(const NativeArguments &arguments) {
       if (!recoveryDeadline)
         throw;
       if (!reportedRecoveryWait) {
-        writeStderrLine(
-            "Waiting for sufficient available memory to start; "
-            "the macOS reserve remains protected...");
+        logLine(dim("Waiting for sufficient available memory to start; "
+                    "the macOS reserve remains protected..."));
         reportedRecoveryWait = true;
       }
       const auto resumeAt = std::min(now + kStartupMemoryRecoveryPoll, *recoveryDeadline);
@@ -483,12 +488,12 @@ int runNative(const NativeArguments &arguments) {
       closePersistentCache(transport, *bootstrap);
     break;
   case engine::NativeProcessExit::ProtocolFailure:
-    writeStderrLine(
-        "error: native transport stopped after a protocol failure");
+    writeErrorLine(
+        "native transport stopped after a protocol failure");
     break;
   case engine::NativeProcessExit::EngineFailure:
-    writeStderrLine(
-        "error: native transport stopped after an engine failure (" +
+    writeErrorLine(
+        "native transport stopped after an engine failure (" +
         (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
                                      : transport.failure()) +
         ")");
@@ -496,22 +501,22 @@ int runNative(const NativeArguments &arguments) {
     // wait for it. The OS and the driver reclaim everything, as after
     // SIGKILL.
     if (!bootstrap->resources().backend().healthy()) {
-      writeStderrLine(
-          "error: the Metal backend is unhealthy; exiting without teardown");
+      writeErrorLine(
+          "the Metal backend is unhealthy; exiting without teardown");
       _exit(static_cast<int>(exit));
     }
     break;
   case engine::NativeProcessExit::IoFailure:
-    writeStderrLine(
-        "error: native transport stopped after an I/O failure (" +
-        transport.failure() + ")");
+    writeErrorLine(
+        "native transport stopped after an I/O failure (" + transport.failure() +
+        ")");
     break;
   }
   return static_cast<int>(exit);
 }
 
 void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
-  writeStderrLine("error: " + report.describe());
+  writeErrorLine(report.describe());
   if (!report.memoryPlanJson.empty())
     writeStderrLine("memory_plan_json: " + report.memoryPlanJson);
 }
@@ -522,7 +527,7 @@ int checkDevice() {
   const auto message = metal::probeDeviceCapabilities().validationMessage();
   if (!message)
     return 0;
-  writeStderrLine("error: " + *message);
+  writeErrorLine(*message);
   return static_cast<int>(engine::NativeProcessExit::EngineFailure);
 }
 
@@ -537,7 +542,7 @@ int main(int argc, char **argv) {
       richengine::NativeArguments arguments = richengine::parseArguments(argc, argv);
       return richengine::runNative(arguments);
     } catch (const richengine::UsageError &error) {
-      richengine::writeStderrLine(std::string("error: ") + error.what());
+      richengine::writeErrorLine(error.what());
       richengine::printUsage(argc > 0 ? argv[0] : "richengine");
       return static_cast<int>(
           richengine::engine::NativeProcessExit::ProtocolFailure);
@@ -546,11 +551,11 @@ int main(int argc, char **argv) {
       return static_cast<int>(
           richengine::engine::NativeProcessExit::EngineFailure);
     } catch (const std::system_error &error) {
-      richengine::writeStderrLine(
-          std::string("error: native runtime I/O failed: ") + error.what());
+      richengine::writeErrorLine(
+          std::string("native runtime I/O failed: ") + error.what());
       return static_cast<int>(richengine::engine::NativeProcessExit::IoFailure);
     } catch (const std::exception &error) {
-      richengine::writeStderrLine(std::string("error: ") + error.what());
+      richengine::writeErrorLine(error.what());
       return static_cast<int>(
           richengine::engine::NativeProcessExit::EngineFailure);
     }

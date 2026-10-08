@@ -400,10 +400,11 @@ class ServerAccessTests(unittest.TestCase):
         for method in ("GET", "HEAD"):
             for path in ("/health", "/ready"):
                 self.assertEqual(harness.request(method, path)[0], 200)
-            for path in ("/", "/index.html?test=1", "/favicon.ico"):
+            for path in ("/", "/index.html?test=1", "/classic", "/favicon.ico"):
                 self.assertEqual(harness.request(method, path)[0], 404)
         default = self.harness()
         self.assertEqual(default.request("GET", "/")[0], 200)
+        self.assertEqual(default.request("GET", "/classic")[0], 200)
         self.assertEqual(default.request("GET", "/v1/models")[0], 200)
         protected = self.harness(api_key="test-server-key")
         status, _, html = protected.request("GET", "/")

@@ -2,6 +2,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "ScopedTestConfig.hpp"
+#include "ops/KernelNames.hpp"
 #include "TestBuffers.hpp"
 
 #import <Foundation/Foundation.h>
@@ -65,7 +66,7 @@ void require(bool condition, const std::string &message) {
 // words of `buffer`.
 ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count,
                          const uint32_t &increment) {
-    return {"test_add_u32", {{0, buffer}},
+    return {std::string(richengine::ops::kTestAddU32), {{0, buffer}},
             {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
             {1, 1, 1}, {1, 1, 1}};
 }
@@ -142,7 +143,7 @@ void completionDoesNotWaitForMemoryTelemetry(const std::string &metallibPath) {
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
-    dispatch.pipelineName = "test_add_u32";
+    dispatch.pipelineName = std::string(richengine::ops::kTestAddU32);
     dispatch.buffers = {{0, buffer}};
     dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
     dispatch.threadgroups = {1, 1, 1};
@@ -248,7 +249,7 @@ void terminalCommandRecovers(const std::string &metallibPath, bool failed,
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
-    dispatch.pipelineName = "test_add_u32";
+    dispatch.pipelineName = std::string(richengine::ops::kTestAddU32);
     dispatch.buffers = {{0, buffer}};
     dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
     dispatch.threadgroups = {1, 1, 1};
@@ -359,7 +360,7 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     *static_cast<uint32_t *>(buffer.contents()) = 0;
     const uint32_t count = 1, increment = 7;
     ComputeDispatch dispatch;
-    dispatch.pipelineName = "test_add_u32";
+    dispatch.pipelineName = std::string(richengine::ops::kTestAddU32);
     dispatch.buffers = {{0, buffer}};
     dispatch.bytes = {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}};
     dispatch.threadgroups = {1, 1, 1};
@@ -435,7 +436,7 @@ void synchronousWaitObeysTheWatchdog(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -478,7 +479,7 @@ void abandonedTicketReturnsAfterTheWatchdog(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -518,7 +519,7 @@ void stopRefusesSubmission(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     backend.stop();
@@ -545,7 +546,7 @@ void shutdownInterruptsACommandWait(const std::string &metallibPath) {
     backend.setWaitInterrupt([&] { return stop.load(); });
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -591,7 +592,7 @@ void shutdownLeavesTicketTeardownToTheCommand(const std::string &metallibPath) {
     backend.setWaitInterrupt([] { return true; });
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -627,7 +628,7 @@ void shutdownSparesACommandThatCompletes(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
     const uint32_t count = 1, increment = 7;
-    ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -670,7 +671,7 @@ void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
     auto *value = static_cast<uint32_t *>(buffer.contents());
     *value = 0;
     const uint32_t count = 1, increment = 1;
-    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     BackendInstrumentation::setDispatchProfiling(backend, true);
@@ -717,7 +718,7 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
     auto *value = static_cast<uint32_t *>(buffer.contents());
     *value = 0;
     const uint32_t count = 1, increment = 1;
-    const ComputeDispatch dispatch{"test_add_u32", {{0, buffer}},
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, buffer}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     backend.preparePipelines({&dispatch, 1});
@@ -733,7 +734,7 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
     requireBackendError([&] { backend.preparePipelines({&oversized, 1}); },
                         "a dispatch past its pipeline's thread limit was prepared");
     ComputeDispatch missing = dispatch;
-    missing.pipelineName = "does_not_exist";
+    missing.pipelineName = std::string(richengine::ops::kDoesNotExist);
     requireBackendError([&] { backend.preparePipelines({&missing, 1}); },
                         "a dispatch of a missing function was prepared");
     require(backend.healthy() &&
@@ -900,7 +901,7 @@ void buffersStayResident(const std::string &metallibPath) {
             "a buffer whose last view is gone is still a member");
     const uint32_t count = 1, increment = 7;
     *static_cast<uint32_t *>(used.contents()) = 0;
-    ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     const unsigned requested = calls.requests;
@@ -949,7 +950,7 @@ void allocationDoesNotRequestResidency(const std::string &metallibPath) {
     const uint64_t page = static_cast<uint64_t>(getpagesize());
     MetalBuffer used = sharedBuffer(backend, page);
     const uint32_t count = 1, increment = 7;
-    const ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     (void)backend.submitAsync(dispatch).wait();
@@ -997,7 +998,7 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
         }
     });
     const uint32_t count = 1, increment = 1;
-    ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+    ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, used}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     int lapses = 0;
@@ -1064,10 +1065,10 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     const uint32_t words = kWords;
     uint32_t seed = 0;
     const std::array<ComputeDispatch, 2> command{
-        ComputeDispatch{"addressed_write_u32", {{0, table}},
+        ComputeDispatch{std::string(richengine::ops::kAddressedWriteU32), {{0, table}},
             {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
             {kWords / 256, kBuffers, 1}, {256, 1, 1}},
-        ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
+        ComputeDispatch{std::string(richengine::ops::kAddressedCheckU32), {{0, table}, {3, mismatches}},
             {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
             {kWords / 256, kBuffers, 1}, {256, 1, 1}}};
     const std::array<ComputeDispatch, 1> check{command[1]};
@@ -1142,7 +1143,7 @@ void bindingRunsKeepOffsets(MetalBackend &backend) {
         in[word] = 100 + word;
         out[word] = 0;
     }
-    const ComputeDispatch dispatch{"test_copy_u32",
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestCopyU32),
         {{1, backend.view(destination, 4 * sizeof(uint32_t), 4 * sizeof(uint32_t))},
          {0, backend.view(source, 2 * sizeof(uint32_t), 4 * sizeof(uint32_t))}},
         {{2, &count, sizeof(count)}}, {1, 1, 1}, {count, 1, 1}};
@@ -1166,7 +1167,7 @@ void releasedMemory(const std::string &metallibPath) {
     const MetalBuffer view = backend.view(buffer, 0, sizeof(uint32_t));
     const uint64_t bytes = backend.memoryStats().allocatedBytes - before;
     const uint32_t count = 1, increment = 7;
-    const ComputeDispatch dispatch{"test_add_u32", {{0, view}},
+    const ComputeDispatch dispatch{std::string(richengine::ops::kTestAddU32), {{0, view}},
         {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
         {1, 1, 1}, {1, 1, 1}};
     const auto rejects = [](const auto &operation, std::string_view expected, const std::string &message) {
@@ -1221,7 +1222,7 @@ void wrappedMemory(const std::string &metallibPath) {
             "a wrapped page is not the memory it wraps or is not counted");
     *static_cast<uint32_t *>(memory) = 5;
     const uint32_t count = 1, increment = 7;
-    (void)backend.submit({"test_add_u32", {{0, backend.view(buffer, 0, sizeof(uint32_t))}},
+    (void)backend.submit({std::string(richengine::ops::kTestAddU32), {{0, backend.view(buffer, 0, sizeof(uint32_t))}},
                           {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
                           {1, 1, 1}, {1, 1, 1}});
     require(*static_cast<uint32_t *>(memory) == 12, "a kernel did not write the wrapped page");
@@ -1570,7 +1571,7 @@ void run(const std::string &metallibPath) {
     double lastWallSeconds = 0.0;
     {
         ComputeDispatch dispatch;
-        dispatch.pipelineName = "test_add_u32";
+        dispatch.pipelineName = std::string(richengine::ops::kTestAddU32);
         dispatch.buffers.push_back(BufferBinding{0, view});
         dispatch.bytes.push_back(BytesBinding{
             1, &kViewElementCount, sizeof(kViewElementCount)});
@@ -1641,7 +1642,7 @@ void run(const std::string &metallibPath) {
 
     {
         ComputeDispatch first;
-        first.pipelineName = "test_add_u32";
+        first.pipelineName = std::string(richengine::ops::kTestAddU32);
         first.buffers.push_back(BufferBinding{0, view});
         first.bytes.push_back(BytesBinding{
             1, &kViewElementCount, sizeof(kViewElementCount)});
@@ -1664,14 +1665,14 @@ void run(const std::string &metallibPath) {
         "out-of-range view was accepted");
 
     ComputeDispatch missingPipeline;
-    missingPipeline.pipelineName = "does_not_exist";
+    missingPipeline.pipelineName = std::string(richengine::ops::kDoesNotExist);
     requireBackendError(
         [&] { (void)backend.submit(missingPipeline); },
         "missing pipeline was accepted");
     {
         // A binding takes one of the argument table's 31 entries of its own.
         ComputeDispatch rebound;
-        rebound.pipelineName = "test_add_u32";
+        rebound.pipelineName = std::string(richengine::ops::kTestAddU32);
         rebound.buffers = {{0, view}};
         rebound.bytes = {{0, &kIncrement, sizeof(kIncrement)}};
         requireBackendError(
@@ -1740,15 +1741,15 @@ void run(const std::string &metallibPath) {
         richengine::metal::CommandGraph graph;
         // Outside the span, feeding its first dispatch: the replay must
         // still order after this write.
-        graph.add("test_copy_u32", {sourceA, copied}, kElementCount,
+        graph.add(std::string(richengine::ops::kTestCopyU32), {sourceA, copied}, kElementCount,
                   {1, 1, 1}, {kElementCount, 1, 1});
         graph.beginBakedSpan();
-        graph.add("test_copy_u32", {copied, copiedAgain}, kElementCount,
+        graph.add(std::string(richengine::ops::kTestCopyU32), {copied, copiedAgain}, kElementCount,
                   {1, 1, 1}, {kElementCount, 1, 1});
-        graph.add("test_copy_u32", {copiedAgain, copied}, kElementCount,
+        graph.add(std::string(richengine::ops::kTestCopyU32), {copiedAgain, copied}, kElementCount,
                   {1, 1, 1}, {kElementCount, 1, 1});
         graph.endBakedSpan();
-        graph.add("test_copy_u32", {copied, copiedAgain}, kElementCount,
+        graph.add(std::string(richengine::ops::kTestCopyU32), {copied, copiedAgain}, kElementCount,
                   {1, 1, 1}, {kElementCount, 1, 1});
         (void)backend.submitCommand(graph.dispatches());
         (void)backend.submitCommand(graph.dispatches());
@@ -1760,12 +1761,12 @@ void run(const std::string &metallibPath) {
         // Same span shape and position, a different bound buffer: the
         // snapshot mismatches and the span re-bakes rather than replaying.
         richengine::metal::CommandGraph drifted;
-        drifted.add("test_copy_u32", {sourceB, copied}, kElementCount,
+        drifted.add(std::string(richengine::ops::kTestCopyU32), {sourceB, copied}, kElementCount,
                     {1, 1, 1}, {kElementCount, 1, 1});
         drifted.beginBakedSpan();
-        drifted.add("test_copy_u32", {sourceB, copiedAgain}, kElementCount,
+        drifted.add(std::string(richengine::ops::kTestCopyU32), {sourceB, copiedAgain}, kElementCount,
                     {1, 1, 1}, {kElementCount, 1, 1});
-        drifted.add("test_copy_u32", {copiedAgain, copied}, kElementCount,
+        drifted.add(std::string(richengine::ops::kTestCopyU32), {copiedAgain, copied}, kElementCount,
                     {1, 1, 1}, {kElementCount, 1, 1});
         drifted.endBakedSpan();
         (void)backend.submitCommand(drifted.dispatches());
@@ -1794,11 +1795,11 @@ void run(const std::string &metallibPath) {
             richengine::metal::CommandGraph graph;
             graph.beginBakedSpan();
             if (patchable) {
-                graph.addPatchable("test_fill_u32", {filled},
+                graph.addPatchable(std::string(richengine::ops::kTestFillU32), {filled},
                                    FillParams{value, kElementCount},
                                    {1, 1, 1}, {kElementCount, 1, 1});
             } else {
-                graph.add("test_fill_u32", {filled},
+                graph.add(std::string(richengine::ops::kTestFillU32), {filled},
                           FillParams{value, kElementCount},
                           {1, 1, 1}, {kElementCount, 1, 1});
             }
@@ -1844,7 +1845,7 @@ void run(const std::string &metallibPath) {
         for (uint32_t span = 0; span < 40; ++span) {
             graph.beginBakedSpan();
             for (uint32_t dispatch = 0; dispatch < 7; ++dispatch)
-                graph.add("test_copy_u32", {words, wordsOut},
+                graph.add(std::string(richengine::ops::kTestCopyU32), {words, wordsOut},
                           kElementCount, {1, 1, 1},
                           {kElementCount, 1, 1});
             graph.endBakedSpan();

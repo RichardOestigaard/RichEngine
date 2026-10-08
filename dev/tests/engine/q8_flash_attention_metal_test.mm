@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "TestChecks.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
@@ -350,14 +351,14 @@ struct Pipelines {
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
-  result.splitName = std::string("verify_attention_q8_split") + shape.suffix;
+  result.splitName = std::string(richengine::ops::kVerifyAttentionQ8Split) + shape.suffix;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
-      device, library, std::string("verify_attention_reduce") + shape.suffix);
-  result.prefillSplitName = std::string("prefill_attention_q8_split") + shape.suffix;
+      device, library, std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix);
+  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionQ8Split) + shape.suffix;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
-      device, library, std::string("prefill_attention_reduce") + shape.suffix);
+      device, library, std::string(richengine::ops::kPrefillAttentionReduce) + shape.suffix);
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
@@ -729,7 +730,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
     const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, 8, 8, 0};
-    verify = reduce("verify_attention_reduce", params);
+    verify = reduce(std::string(richengine::ops::kVerifyAttentionReduce), params);
     check(verify);
     // The fused reduce/gate of a Plain-input out-projection: its attention
     // output is the plain reduce's bitwise, and its hidden rows are the
@@ -749,7 +750,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(
-                 device, library, "verify_attention_reduce_gate" + std::string(shape.suffix))];
+                 device, library, std::string(richengine::ops::kVerifyAttentionReduceGate) + std::string(shape.suffix))];
     [encoder setBuffer:partials offset:0 atIndex:0];
     [encoder setBuffer:stats offset:0 atIndex:1];
     [encoder setBuffer:fusedOutput offset:0 atIndex:2];
@@ -770,7 +771,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     command = [queue commandBuffer];
     encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(
-                 device, library, "verify_attention_gate" + std::string(shape.suffix))];
+                 device, library, std::string(richengine::ops::kVerifyAttentionGate) + std::string(shape.suffix))];
     [encoder setBuffer:packed offset:0 atIndex:0];
     [encoder setBuffer:verify offset:0 atIndex:1];
     [encoder setBuffer:referenceHidden offset:0 atIndex:2];
@@ -785,7 +786,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   if (splits <= RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits, 0};
-    id<MTLBuffer> prefill = reduce("prefill_attention_reduce", params);
+    id<MTLBuffer> prefill = reduce(std::string(richengine::ops::kPrefillAttentionReduce), params);
     check(prefill);
     if (verify)
       require(!std::memcmp(verify.contents, prefill.contents, verify.length),

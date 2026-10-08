@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace richengine {
 
@@ -20,7 +21,7 @@ struct DeviceCapabilities {
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
     uint32_t appleGpuFamily = 0;
     // IORegistry gpu-core-count; zero means unavailable. ops::plannedGpuCores
-    // substitutes ops::kAssumedGpuCores for kernel policy. Keep the missing
+    // substitutes kAssumedGpuCores for kernel policy. Keep the missing
     // value here (status reports it).
     uint32_t gpuCoreCount = 0;
     uint64_t physicalMemoryBytes = 0;
@@ -47,5 +48,29 @@ struct DeviceCapabilities {
     // what this Mac has, ending with the reason above.
     [[nodiscard]] std::optional<std::string> validationMessage() const;
 };
+
+// Missing core metadata uses one intermediate estimate for all families.
+// This is a fallback, not a calibrated optimum. Reported counts always win
+// (ops::plannedGpuCores performs the substitution for kernel policy).
+inline constexpr uint32_t kAssumedGpuCores = 32;
+
+// The first chip of an Apple GPU family, for messages: people know their
+// chip, not its GPU family number. A family without a public name here yet
+// maps to an empty one.
+[[nodiscard]] constexpr std::string_view
+chipName(uint32_t appleGpuFamily) noexcept {
+    switch (appleGpuFamily) {
+    case 7:
+        return "M1";
+    case 8:
+        return "M2";
+    case 9:
+        return "M3";
+    case 10:
+        return "M4";
+    default:
+        return {};
+    }
+}
 
 } // namespace richengine

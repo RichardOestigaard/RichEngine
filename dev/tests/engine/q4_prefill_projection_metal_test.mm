@@ -1,11 +1,13 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "metal/abi/Linear.h"
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
 #import <Foundation/Foundation.h>
 
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -25,6 +27,16 @@ constexpr uint32_t kTileRows = 32;
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
   std::exit(1);
+}
+
+void requireFinite(const MetalBuffer &buffer, uint64_t elements,
+                   const std::string &label) {
+  const auto *values = static_cast<const __bf16 *>(buffer.contents());
+  for (uint64_t index = 0; index < elements; ++index) {
+    if (!std::isfinite(static_cast<float>(values[index])))
+      fail(label + " produced a non-finite value at " +
+           std::to_string(index));
+  }
 }
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
@@ -94,7 +106,7 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
   const Q4Params params{shape.outputSize, shape.inputSize};
   {
     ComputeDispatch sum;
-    sum.pipelineName = "prefill_linear_q4_sums32";
+    sum.pipelineName = richengine::ops::kPrefillLinearQ4Sums32.data();
     sum.buffers = {{0, input}, {1, sums}};
     sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {rowTiles, 1, 1};
@@ -154,16 +166,19 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
       uint32_t threads;
     };
     const std::vector<Variant> variants{
-        {"prefill_linear_q4_n256", 256, 256},
-        {"prefill_linear_q4_n128", 128, 256},
-        {"prefill_linear_q4_n128_sg4", 128, 128}};
+        {richengine::ops::kPrefillLinearQ4N256.data(), 256, 256},
+        {richengine::ops::kPrefillLinearQ4N128.data(), 128, 256},
+        {richengine::ops::kPrefillLinearQ4N128Sg4.data(), 128, 128}};
     MetalBuffer reference = freshOutput(variants.front().pipeline);
     runPlain(variants.front().pipeline, variants.front().tileColumns,
              variants.front().threads, reference);
+    requireFinite(reference, outputElements, label + " plain reference");
     for (size_t index = 1; index < variants.size(); ++index) {
       MetalBuffer candidate = freshOutput(variants[index].pipeline);
       runPlain(variants[index].pipeline, variants[index].tileColumns,
                variants[index].threads, candidate);
+      requireFinite(candidate, outputElements,
+                    label + " " + variants[index].pipeline);
       if (std::memcmp(reference.contents(), candidate.contents(), outputBytes))
         fail(std::string(variants[index].pipeline) +
              " differs from the N256 prefill reference at " + label);
@@ -180,16 +195,19 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
       uint32_t threads;
     };
     const std::vector<Variant> variants{
-        {"prefill_linear_q4_n256_residual", 256, 256},
-        {"prefill_linear_q4_n128_residual", 128, 256},
-        {"prefill_linear_q4_n128_residual_sg4", 128, 128}};
+        {richengine::ops::kPrefillLinearQ4N256Residual.data(), 256, 256},
+        {richengine::ops::kPrefillLinearQ4N128Residual.data(), 128, 256},
+        {richengine::ops::kPrefillLinearQ4N128ResidualSg4.data(), 128, 128}};
     MetalBuffer reference = freshOutput(variants.front().pipeline);
     runResidual(variants.front().pipeline, variants.front().tileColumns,
                 variants.front().threads, reference);
+    requireFinite(reference, outputElements, label + " residual reference");
     for (size_t index = 1; index < variants.size(); ++index) {
       MetalBuffer candidate = freshOutput(variants[index].pipeline);
       runResidual(variants[index].pipeline, variants[index].tileColumns,
                   variants[index].threads, candidate);
+      requireFinite(candidate, outputElements,
+                    label + " " + variants[index].pipeline);
       if (std::memcmp(reference.contents(), candidate.contents(), outputBytes))
         fail(std::string(variants[index].pipeline) +
              " differs from the N256 residual reference at " + label);
@@ -201,19 +219,21 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
   // Fused up projection: activations and the fused output sums must both
   // match across the N256/8 and N128/4 kernels.
   {
-    MetalBuffer reference = freshOutput("prefill_linear_q4_n256_up_silu_sums");
+    MetalBuffer reference = freshOutput(richengine::ops::kPrefillLinearQ4N256UpSiluSums.data());
     MetalBuffer candidate =
-        freshOutput("prefill_linear_q4_n128_up_silu_sums_sg4");
+        freshOutput(richengine::ops::kPrefillLinearQ4N128UpSiluSumsSg4.data());
     MetalBuffer referenceSums = shared(
         backend, outputSumElements * sizeof(float), "up-sums-reference");
     MetalBuffer candidateSums =
         shared(backend, outputSumElements * sizeof(float), "up-sums-candidate");
     std::memset(referenceSums.contents(), 0, referenceSums.sizeBytes());
     std::memset(candidateSums.contents(), 0, candidateSums.sizeBytes());
-    runUpSilu("prefill_linear_q4_n256_up_silu_sums", 256, 256, reference,
+    runUpSilu(richengine::ops::kPrefillLinearQ4N256UpSiluSums.data(), 256, 256, reference,
               referenceSums);
-    runUpSilu("prefill_linear_q4_n128_up_silu_sums_sg4", 128, 128, candidate,
+    runUpSilu(richengine::ops::kPrefillLinearQ4N128UpSiluSumsSg4.data(), 128, 128, candidate,
               candidateSums);
+    requireFinite(reference, outputElements, label + " up/silu reference");
+    requireFinite(candidate, outputElements, label + " up/silu candidate");
     if (std::memcmp(reference.contents(), candidate.contents(), outputBytes))
       fail("prefill_linear_q4_n128_up_silu_sums_sg4 differs from the N256 "
            "up/silu reference at " + label);
@@ -265,7 +285,7 @@ void runLeadingInputs(MetalBackend &backend, std::mt19937 &random) {
   MetalBuffer sums = shared(backend, uint64_t{storage} * groups * sizeof(float), "leading-sums");
   {
     ComputeDispatch sum;
-    sum.pipelineName = "prefill_linear_q4_sums32";
+    sum.pipelineName = richengine::ops::kPrefillLinearQ4Sums32.data();
     sum.buffers = {{0, input}, {1, sums}};
     sum.bytes = {{2, &inputs, sizeof(inputs)}};
     sum.threadgroups = {rowTiles, 1, 1};
@@ -277,9 +297,9 @@ void runLeadingInputs(MetalBackend &backend, std::mt19937 &random) {
     const char *pipeline;
     uint32_t tileColumns, threads;
   };
-  for (const Kernel kernel : std::vector<Kernel>{{"prefill_linear_q4_n256_residual", 256, 256},
-                                                 {"prefill_linear_q4_n128_residual", 128, 256},
-                                                 {"prefill_linear_q4_n128_residual_sg4", 128, 128}}) {
+  for (const Kernel kernel : std::vector<Kernel>{{richengine::ops::kPrefillLinearQ4N256Residual.data(), 256, 256},
+                                                 {richengine::ops::kPrefillLinearQ4N128Residual.data(), 128, 256},
+                                                 {richengine::ops::kPrefillLinearQ4N128ResidualSg4.data(), 128, 128}}) {
     const auto run = [&](const std::string &pipeline, const MetalBuffer &w, const MetalBuffer &s,
                          const MetalBuffer &b, const void *params, size_t paramBytes) {
       MetalBuffer output = shared(backend, outputBytes, kernel.pipeline);
@@ -350,7 +370,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   const Q4Params prefillParams{shape.outputSize, shape.inputSize};
   {
     ComputeDispatch sum;
-    sum.pipelineName = "prefill_linear_q4_sums32";
+    sum.pipelineName = richengine::ops::kPrefillLinearQ4Sums32.data();
     sum.buffers = {{0, input}, {1, sums}};
     sum.bytes = {{2, &shape.inputSize, sizeof(shape.inputSize)}};
     sum.threadgroups = {1, 1, 1};
@@ -393,10 +413,10 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   // at the persistent group counts the decode policy actually dispatches.
   for (const auto &decodeCase :
        std::vector<std::pair<const char *, uint32_t>>{
-           {"decode_linear_q4_n256_m32", shape.outputSize / 256},
-           {"decode_linear_q4_n128_m32", shape.outputSize / 128}}) {
+           {richengine::ops::kDecodeLinearQ4N256M32.data(), shape.outputSize / 256},
+           {richengine::ops::kDecodeLinearQ4N128M32.data(), shape.outputSize / 128}}) {
     MetalBuffer prefillOut = freshOutput("q4-cross-prefill");
-    runPrefillPlain("prefill_linear_q4_n256", 256, prefillOut);
+    runPrefillPlain(richengine::ops::kPrefillLinearQ4N256.data(), 256, prefillOut);
     MetalBuffer decodeOut = freshOutput("q4-cross-decode");
     runDecodePlain(decodeCase.first, decodeCase.second, decodeOut);
     const bool identical =
@@ -417,8 +437,8 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   {
     MetalBuffer gateScratchA = freshOutput("q4-cross-gate-a");
     MetalBuffer gateScratchB = freshOutput("q4-cross-gate-b");
-    runPrefillPlain("prefill_linear_q4_n256", 256, gateScratchA);
-    runDecodePlain("decode_linear_q4_n256_m32", shape.outputSize / 256,
+    runPrefillPlain(richengine::ops::kPrefillLinearQ4N256.data(), 256, gateScratchA);
+    runDecodePlain(richengine::ops::kDecodeLinearQ4N256M32.data(), shape.outputSize / 256,
                    gateScratchB);
 
     MetalBuffer prefillOut = freshOutput("q4-cross-up-prefill");
@@ -427,7 +447,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
         uint64_t{shape.rows} * (shape.outputSize / kQuantGroup) * sizeof(float),
         "q4-cross-up-sums");
     ComputeDispatch up;
-    up.pipelineName = "prefill_linear_q4_n256_up_silu_sums";
+    up.pipelineName = richengine::ops::kPrefillLinearQ4N256UpSiluSums.data();
     up.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                   {4, gateScratchA}, {5, prefillOut}, {6, sums},
                   {7, outputSumsA}};
@@ -440,7 +460,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
     const Q4PersistentParams decodeParams{shape.outputSize, shape.inputSize,
                                           shape.outputSize / 256};
     ComputeDispatch upDecode;
-    upDecode.pipelineName = "decode_linear_q4_n256_up_silu_m32";
+    upDecode.pipelineName = richengine::ops::kDecodeLinearQ4N256UpSiluM32.data();
     upDecode.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                         {4, gateScratchB}, {5, decodeOut}};
     upDecode.bytes = {{6, &decodeParams, sizeof(decodeParams)}};
@@ -461,7 +481,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
   {
     MetalBuffer prefillOut = freshOutput("q4-cross-prefill-residual");
     ComputeDispatch prefill;
-    prefill.pipelineName = "prefill_linear_q4_n256_residual";
+    prefill.pipelineName = richengine::ops::kPrefillLinearQ4N256Residual.data();
     prefill.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                        {4, residual}, {5, prefillOut}, {6, sums}};
     prefill.bytes = {{7, &prefillParams, sizeof(prefillParams)}};
@@ -473,7 +493,7 @@ void runDecodeCrossCheck(MetalBackend &backend, std::mt19937 &random) {
     const Q4PersistentParams decodeParams{shape.outputSize, shape.inputSize,
                                           shape.outputSize / 128};
     ComputeDispatch decode;
-    decode.pipelineName = "decode_linear_q4_n128_residual_m32";
+    decode.pipelineName = richengine::ops::kDecodeLinearQ4N128ResidualM32.data();
     decode.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                       {4, residual}, {5, decodeOut}};
     decode.bytes = {{6, &decodeParams, sizeof(decodeParams)}};
@@ -499,6 +519,7 @@ void run(const std::string &metallibPath) {
   // (17408->5120). Rows cover a full chunk, a contended slice and a tail.
   for (const ProjectionShape shape : std::vector<ProjectionShape>{
            {1, 2048, 2048}, {31, 2048, 2048}, {33, 2048, 2048}, {176, 2048, 2048},
+           {256, 2816, 2304},
            {64, 6144, 5120}, {256, 5120, 14336}, {2048, 17408, 5120}})
     runShape(backend, shape, random);
   runLeadingInputs(backend, random);

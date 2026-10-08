@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/Sampling.h"
+#include "ops/KernelNames.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -18,7 +19,7 @@ const char *NativeRows::name() const noexcept { return kQuantFormats[formatId].n
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
-                    uint32_t rows) {
+                    uint32_t rows, float scale) {
   if (!rows || !table.outputSize || !table.inputSize)
     throw std::invalid_argument("invalid Q4 embedding shape");
   // Both gathers read `rows` token ids and write `rows` bf16 rows of the table's width.
@@ -37,11 +38,11 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
       // The GGUF decode kernels produce no output when they replay from an
       // indirect command buffer on this driver (the gguf expert kernels fail
       // the same way): never mark them.
-      graph.add("gguf_embed_rotated_pq20", {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
+      graph.add(std::string(kGgufEmbedRotatedPq20), {std::move(tokens), native.rows, table.rotation.signs, std::move(output)},
                 params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
       return;
     }
-    graph.add(std::string("gguf_embed_") + native.name(),
+    graph.add(std::string(kGgufEmbed) + native.name(),
               {std::move(tokens), native.rows, std::move(output)}, params,
               {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
     return;
@@ -49,10 +50,23 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   const uint32_t hiddenGroups = (table.inputSize + 127) / 128;
   const Q4EmbeddingParams params{rows, table.outputSize};
   const AffineWeights &affine = table.affine();
-  // One kernel per compiled hidden size (kernels/shared/embedding.metal).
+  if (scale != 0.0F) {
+    // Gemma's scaled gather (embedding_q4_scaled_h2816 only; other widths
+    // have no scaled kernel).
+    if (table.inputSize != 2816)
+      throw std::invalid_argument("no scaled embedding kernel for this width");
+    graph.addTail(std::string(kEmbeddingQ4ScaledH) + std::to_string(table.inputSize),
+                  {std::move(tokens), affine.weights, affine.scales, affine.biases,
+                   std::move(output)},
+                  params, scale, {hiddenGroups, 1, 1});
+    return;
+  }
+  // One kernel per compiled hidden size (kernels/shared/embedding.metal);
+  // the tiled variants read a packed install's 256-row planes.
   // Unmarked: the prefill path shares this op, and a one-dispatch span's
   // cached ICB and params arena cost more than its encode saves.
-  graph.add("embedding_q4_h" + std::to_string(table.inputSize),
+  graph.add(std::string(table.tiled ? kEmbeddingQ4tH : kEmbeddingQ4H) +
+                std::to_string(table.inputSize),
             {std::move(tokens), affine.weights, affine.scales, affine.biases, std::move(output)},
             params, {hiddenGroups, 1, 1});
 }
@@ -67,7 +81,7 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   const VerifyInputBatchParams params{vocabulary};
   // One static-parameter dispatch over stable arena buffers: replayable.
   graph.beginBakedSpan();
-  graph.add("verify_input_tokens",
+  graph.add(std::string(kVerifyInputTokens),
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},
             params, {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS, 1, 1},
@@ -89,7 +103,7 @@ void Embedding::addVerifyTreeInput(
   for (uint32_t lane = 0; lane < lanes; ++lane)
     for (uint32_t axis = 0; axis < 3; ++axis)
       params.base[lane][axis] = base[lane][axis];
-  graph.add("verify_input_tree_tokens",
+  graph.add(std::string(kVerifyInputTreeTokens),
             {std::move(treeTokens), std::move(treeNodes),
              std::move(treeCounts), std::move(verifyInputTokens),
              std::move(positions), std::move(masks)},
@@ -103,7 +117,7 @@ void Embedding::addTreeCaptureGather(
     metal::MetalBuffer destination, uint32_t width, uint32_t lanes) {
   if (!width || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid tree capture gather");
-  graph.add("tree_capture_gather",
+  graph.add(std::string(kTreeCaptureGather),
             {std::move(source), std::move(retainedPath), std::move(retained),
              std::move(destination)},
             width,

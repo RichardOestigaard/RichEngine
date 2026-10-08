@@ -1190,7 +1190,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     const uint64_t workEnd =
         plan.kind == WorkKind::Prefill
             ? position + scheduled.tokenCount
-            : position + model::ExecutionLimits::speculativeScratchTokens;
+            : position + model_.decodeAdmissionTokens();
     // A scheduled lane is resident: it grows as a request in service. The
     // lane that yields first if growth fails takes nothing in use, since its
     // own suspension, not another conversation's replay point, pays for it.
@@ -1202,6 +1202,13 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     const auto kv = allocate(
         [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true, upTo);
     if (!kv.admission.granted()) {
+      if (getenv("RICHENGINE_DENY_DEBUG"))
+        fprintf(stderr,
+                "deny id=%llu pos=%llu workEnd=%llu addPages=%u avail=%u af=%d pend=%d\n",
+                (unsigned long long)active.request.id,
+                (unsigned long long)position, (unsigned long long)workEnd,
+                kv.admission.additionalPages, kv.admission.availablePages,
+                (int)kv.admission.allocationFailure, (int)kv.denial.pending);
       denied.push_back(Denied{active.request.id, kv.admission, workEnd, kv.denial});
       continue;
     }
@@ -1743,6 +1750,13 @@ void Engine::apply(const BatchPlan &plan,
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
                       representativePrefillTiming);
+  if (getenv("RICHENGINE_DENY_DEBUG") && plan.kind == WorkKind::Decode) {
+    std::string ids;
+    for (const BatchItem &item : plan.items)
+      ids += std::to_string(item.requestId) + " ";
+    fprintf(stderr, "decode-plan width=%u items=[%s]\n", plan.width(),
+            ids.c_str());
+  }
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);

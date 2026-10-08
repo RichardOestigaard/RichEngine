@@ -1,0 +1,123 @@
+/* Judge page: scoring forms + result panels on styles.css primitives. */
+
+/* Tabs: an underline row above the panels. Terracotta sets aria-selected. */
+.judge-tabs .tab-list {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.judge-tabs .tab {
+  padding: 7px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.judge-tabs .tab:hover { color: var(--text) }
+.judge-tabs .tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* Fieldset doubles as the busy-state gate: it must not draw a box. */
+.judge fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.judge fieldset:disabled .field-label { opacity: .6 }
+
+/* Stacked block fields inside a panel (label over a full-width input). */
+.judge .field {
+  display: block;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+.judge .field-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.judge-input {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+}
+.judge .field .judge-input { width: 100% }
+.judge-input.w-160 { width: 160px }
+.judge-input.w-220 { width: 220px }
+.judge-area {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+.judge-area.tall { min-height: 200px }
+.judge-input:focus, .judge-area:focus {
+  border-color: var(--accent);
+  outline: 0;
+}
+
+/* Dynamic option rows: mono id, growing description, remove button. */
+.option-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.option-row .option-id { width: 140px }
+.option-row .grow { flex: 1; min-width: 0 }
+.judge .field > .btn.small { margin-top: 2px }
+
+/* Action row: copy on the left, submit on the right. */
+.judge .grow-left { margin-right: auto }
+
+/* Result panels sit below the form. */
+.judge-result, .answer-panel { margin-top: 16px }
+.judge .panel + .panel { margin-top: 12px }
+
+/* Chart + meter rows reuse the models-page rhythm. */
+.panel-row.chart-row { padding-top: 2px; padding-bottom: 12px }
+.panel-row.chart-row > div { width: 100%; min-width: 0 }
+.panel-row.meter-row { padding-top: 2px; padding-bottom: 14px }
+.panel-row.meter-row .meter { width: 100% }
+
+.meta-line {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+}
+
+/* Batch answers: compact probability bars inside each panel. */
+.panel-row.mini { padding-top: 6px; padding-bottom: 6px; font-size: 12.5px }
+.panel-row.mini .mini-label {
+  width: 110px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.panel-row.mini .meter { flex: 1 }
+.panel-row.mini .num { min-width: 52px; text-align: right }
+.panel-row.mini.legend { color: var(--muted) }
+.answer-head { font-weight: 600; color: var(--text) }
+
+/* 422 detail lines stack inside the error notice. */
+.judge .notice.error > div + div { margin-top: 4px }

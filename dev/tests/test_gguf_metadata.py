@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import re
 import shutil
 import struct
@@ -91,6 +92,36 @@ def loadable_tensors(values, directory):
     return {
         name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
         for name, types in gguf.loaded_tensors(header).items()
+    }
+
+
+def gemma4_fixture():
+    """The header fields google/gemma-4-26B-A4B-it-qat-q4_0-gguf states:
+    a global layer every sixth, wider and with fewer KV heads."""
+    pattern = [index % 6 != 5 for index in range(30)]
+    return {
+        "general.architecture": "gemma4",
+        "gemma4.embedding_length": 2816,
+        "gemma4.block_count": 30,
+        "gemma4.context_length": 262144,
+        "gemma4.feed_forward_length": 2112,
+        "gemma4.attention.head_count": 16,
+        "gemma4.attention.head_count_kv": [8 if swa else 2 for swa in pattern],
+        "gemma4.attention.key_length": 512,
+        "gemma4.attention.value_length": 512,
+        "gemma4.attention.key_length_swa": 256,
+        "gemma4.attention.value_length_swa": 256,
+        "gemma4.attention.sliding_window": 1024,
+        "gemma4.attention.sliding_window_pattern": pattern,
+        "gemma4.attention.shared_kv_layers": 0,
+        "gemma4.rope.freq_base": 1000000.0,
+        "gemma4.rope.freq_base_swa": 10000.0,
+        "gemma4.expert_count": 128,
+        "gemma4.expert_used_count": 8,
+        "gemma4.expert_feed_forward_length": 704,
+        "gemma4.final_logit_softcapping": 30.0,
+        "gemma4.embedding_length_per_layer_input": 0,
+        "tokenizer.ggml.tokens": [f"[token{i}]" for i in range(262144)],
     }
 
 
@@ -477,6 +508,156 @@ class GgufMetadataTests(unittest.TestCase):
         text = config["text_config"]
         self.assertEqual((text["num_experts"], text["num_experts_per_tok"]), (256, 8))
         self.assertEqual(families.family_for(config).name, "Qwen3.6-35B-A3B")
+
+    def test_gemma4_config_states_its_two_layer_kinds_and_identifies_the_family(self):
+        config = gguf.model_config(self.metadata(gemma4_fixture()))
+        text = config["text_config"]
+        self.assertEqual(config["model_type"], "gemma4")
+        self.assertEqual(text["model_type"], "gemma4_text")
+        # The local layers' geometry and the global layers' apart.
+        self.assertEqual((text["head_dim"], text["global_head_dim"]), (256, 512))
+        self.assertEqual(
+            (text["num_key_value_heads"], text["num_global_key_value_heads"]),
+            (8, 2),
+        )
+        self.assertEqual(text["layer_types"], [
+            "full_attention" if i % 6 == 5 else "sliding_attention"
+            for i in range(30)
+        ])
+        self.assertEqual(
+            (
+                text["num_experts"],
+                text["top_k_experts"],
+                text["moe_intermediate_size"],
+                text["intermediate_size"],
+            ),
+            (128, 8, 704, 2112),
+        )
+        self.assertEqual(text["sliding_window"], 1024)
+        self.assertEqual(text["num_kv_shared_layers"], 0)
+        self.assertEqual(text["final_logit_softcapping"], 30.0)
+        self.assertEqual(text["attention_k_eq_v"], True)
+        self.assertEqual(
+            text["rope_parameters"],
+            {
+                "full_attention": {
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default",
+                },
+            },
+        )
+        self.assertEqual(families.family_for(config).name, "Gemma4-26B-A4B")
+
+    def test_gemma4_config_rejects_geometry_the_runtime_does_not_serve(self):
+        for key, value, reason in (
+            (
+                "gemma4.attention.sliding_window_pattern",
+                None,
+                "sliding_window_pattern",
+            ),
+            (
+                "gemma4.attention.sliding_window_pattern",
+                [True] * 30,
+                "head_count_kv differs",
+            ),
+            (
+                "gemma4.attention.value_length",
+                256,
+                "key_length and its value_length differ",
+            ),
+            (
+                "gemma4.attention.value_length_swa",
+                512,
+                "key_length_swa and its value_length differ",
+            ),
+            (
+                "gemma4.embedding_length_per_layer_input",
+                256,
+                "embedding_length_per_layer_input must be 0",
+            ),
+            (
+                "gemma4.final_logit_softcapping",
+                None,
+                "final_logit_softcapping",
+            ),
+            ("gemma4.rope.freq_base_swa", None, "rope.freq_base_swa"),
+        ):
+            values = gemma4_fixture()
+            if value is None:
+                del values[key]
+            else:
+                values[key] = value
+            if key == "gemma4.attention.sliding_window_pattern" and value == [True] * 30:
+                values["gemma4.attention.head_count_kv"] = [8] * 30
+            with (
+                self.subTest(key=key, value=value),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
+                gguf.model_config(self.metadata(values))
+        # Per-layer KV head counts differing within a kind are refused.
+        values = gemma4_fixture()
+        values["gemma4.attention.head_count_kv"][0] = 4
+        with self.assertRaisesRegex(models.ModelError, "head_count_kv differs"):
+            gguf.model_config(self.metadata(values))
+
+    def test_gemma4_screening_names_its_loadable_tensors(self):
+        values = gemma4_fixture()
+        values["tokenizer.ggml.model"] = "gemma4"
+        header = gguf.Metadata(write_gguf(self.root / "g.gguf", values))
+        tensors = gguf.loaded_tensors(header)
+        self.assertEqual(
+            {k for k in tensors if not k.startswith("blk.")},
+            {"token_embd.weight", "output_norm.weight"},
+        )
+        # Sliding layers carry a V projection; the global (k_eq_v) layer none.
+        self.assertIn("blk.0.attn_v.weight", tensors)
+        self.assertNotIn("blk.5.attn_v.weight", tensors)
+        for name in (
+            "blk.0.attn_q_norm.weight",
+            "blk.0.post_ffw_norm_1.weight",
+            "blk.0.ffn_gate_inp.scale",
+            "blk.0.layer_output_scale.weight",
+            "blk.29.ffn_gate_up_exps.weight",
+        ):
+            self.assertIn(name, tensors)
+        header = gguf.Metadata(
+            write_gguf(
+                self.root / "g2.gguf",
+                values,
+                [(name, 12) for name in tensors],
+            ),
+            tensors=True,
+        )
+        with self.assertRaisesRegex(models.ModelError, "cannot load"):
+            gguf.require_loadable(header)
+
+    def test_gemma4_tokenizer_derives_a_unigram_backend(self):
+        tokens = ["<unk>", "<bos>", "<eos>", "<pad>", "▁", "a", "▁a", "b"]
+        types = [UNKNOWN, CONTROL, CONTROL, CONTROL, NORMAL, NORMAL, NORMAL, NORMAL]
+        values = gemma4_fixture() | {
+            "tokenizer.ggml.model": "gemma4",
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.token_type": types,
+            "tokenizer.ggml.scores": [0.0, 0.0, 0.0, 0.0, -1.0, -2.0, -0.5, -3.0],
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.bos_token_id": 1,
+            "tokenizer.ggml.eos_token_id": 2,
+            "tokenizer.ggml.padding_token_id": 3,
+            "tokenizer.ggml.add_bos_token": True,
+            "tokenizer.chat_template": "{{ bos_token }}",
+        }
+        files = gguf.tokenizer_files(self.metadata(values))
+        backend = Tokenizer.from_str(files["tokenizer/tokenizer.json"].decode())
+        encoded = backend.encode("ab")
+        self.assertEqual(encoded.ids[0], 1)  # BOS prepended.
+        config = json.loads(files["tokenizer/tokenizer_config.json"])
+        self.assertEqual(config["bos_token"], "<bos>")
+        self.assertEqual(config["eos_token"], "<eos>")
 
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()

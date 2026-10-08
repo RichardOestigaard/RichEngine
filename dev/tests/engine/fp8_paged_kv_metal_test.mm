@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "Fp8PageFormatReference.hpp"
+#include "ops/KernelNames.hpp"
 #include "Q8PageFormatReference.hpp"
 
 #include <algorithm>
@@ -117,11 +118,11 @@ void run(const char *libraryPath) {
         throw std::runtime_error(error.localizedDescription.UTF8String);
     }
     auto quantize = pipeline(
-        device, library, "richengine_fp8_quantize_kv_page");
+        device, library, richengine::ops::kRichengineFp8QuantizeKvPage.data());
     auto dequantize = pipeline(
-        device, library, "richengine_fp8_dequantize_kv_page");
+        device, library, richengine::ops::kRichengineFp8DequantizeKvPage.data());
     auto gather = pipeline(
-        device, library, "richengine_fp8_gather_logical_kv_page");
+        device, library, richengine::ops::kRichengineFp8GatherLogicalKvPage.data());
 
     std::vector<float> logicalKeys(
         uint64_t{validTokens} * kFp8KvHeads * kFp8HeadDimension);

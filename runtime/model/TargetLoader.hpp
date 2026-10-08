@@ -3,8 +3,8 @@
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenHybridLayout.hpp"
-#include "model/QwenTarget.hpp"
-#include "model/QwenTargetFiles.hpp"
+#include "model/TargetModel.hpp"
+#include "model/TargetFiles.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
@@ -22,10 +22,15 @@
 
 namespace richengine::model {
 
-// How a target's files store its tensors; loadQwenTarget pairs each source's
+// How a target's files store its tensors; loadTargetWeights pairs each source's
 // files with their format. Affine files, packed or written from MLX, hold
 // every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
+// tiledEmbedding marks the packed format's 256-row embedding planes; the
+// safetensors images' copies are the checkpoint's flat quantized rows.
 struct AffineTargetFormat final {
+  const bool tiledEmbedding;
+  AffineTargetFormat(bool tiledEmbedding = false)
+      : tiledEmbedding(tiledEmbedding) {}
   static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
 
   [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
@@ -43,7 +48,8 @@ struct AffineTargetFormat final {
   }
   [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
                                                 uint32_t inputSize) const {
-    return readAffineEmbedding(file, outputSize, inputSize, "embedding");
+    return readAffineEmbedding(file, outputSize, inputSize, "embedding",
+                               tiledEmbedding);
   }
 };
 
@@ -77,14 +83,14 @@ struct BlockTargetFormat final {
 // Reads the mixer sections that follow a layer's input norm, in file order
 // (instantiated for both formats).
 template <class Format>
-[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
+[[nodiscard]] MixerWeights readQwenMixer(WeightFile &file, const Format &format,
                                              const QwenMixerGeometry &geometry,
                                              bool fullAttention);
 
 // The family's mixer reader; the default reads a Qwen GDN/full-attention
 // mixer, Dense.hpp and Lfm2.hpp overload it for their mixers.
 template <class Layout, class Format>
-[[nodiscard]] QwenMixerWeights readTargetMixer(const Layout &, WeightFile &file,
+[[nodiscard]] MixerWeights readTargetMixer(const Layout &, WeightFile &file,
                                                const Format &format,
                                                const QwenMixerGeometry &geometry,
                                                bool fullAttention) {
@@ -97,6 +103,10 @@ template <class Layout> struct PackedTargetFiles final {
   WeightImages &images;
   std::filesystem::path directory;
   const Layout &layout;
+  // Whether the package's embedding.bin stores the 256-row tiled planes of
+  // install/pack.py's packed formats; the splash-packed-q4* formats store
+  // the checkpoint's flat quantized rows (ModelDescriptor::packedTiledEmbedding).
+  bool tiledEmbedding = false;
   [[nodiscard]] WeightFile layer(uint32_t index) const {
     const std::string filename = "layer-" + std::to_string(index) + ".bin";
     return images.load(packedImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
@@ -117,7 +127,7 @@ template <class Layout> struct PackedTargetFiles final {
 // head and the token embedding. Weights is the architecture's weight struct.
 template <class Weights, class Layout, class Files, class Format, class ReadFfn>
 [[nodiscard]] Weights
-readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
+readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
                       const Format &format, ReadFfn readFfn) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   Weights result;
@@ -167,7 +177,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
   uint32_t ffnWidth = 0;
   bool ffnZero = false;
   bool routingInconsistent = false;
-  if constexpr (Layout::ffnKind == QwenFfnKind::Dense) {
+  if constexpr (Layout::ffnKind == FfnKind::Dense) {
     ffnWidth = layout.intermediateSize;
     ffnZero = zero(ffnWidth);
   } else {
@@ -206,16 +216,16 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 // format.
 template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
+loadTargetWeights(metal::MetalBackend &backend, const Layout &layout, const TargetFiles<Layout> &files,
                ReadFfn readFfn) {
   requireQwenLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
-  const AffineTargetFormat affine{};
+    return readTargetModelWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readFfn);
-  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
-                                        readFfn);
+    return readTargetModelWeights<Weights>(backend, layout, mlx->get(), AffineTargetFormat{}, readFfn);
+  const auto &packed = std::get<PackedTargetFiles<Layout>>(files);
+  return readTargetModelWeights<Weights>(backend, layout, packed,
+                                        AffineTargetFormat{packed.tiledEmbedding}, readFfn);
 }
 
 } // namespace richengine::model

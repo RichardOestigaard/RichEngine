@@ -1,0 +1,39 @@
+/* Metrics page: /metrics exposition explorer on styles.css primitives. */
+
+/* Page header with the refresh controls (same shape as Models). */
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px }
+.page-head .head-side { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 6px }
+.freshness { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap }
+.freshness.stale { color: var(--warn) }
+.check { display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px; cursor: pointer; white-space: nowrap }
+.check input { accent-color: var(--accent); margin: 0 }
+
+/* Filter + copy row under the header. */
+.metric-toolbar { display: flex; align-items: center; gap: 10px; margin: -12px 0 20px }
+.metric-search { flex: 1; min-width: 140px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--composer); font-size: 13.5px }
+.metric-search:focus { border-color: var(--accent); outline: 0 }
+.match-count { font-size: 12.5px; white-space: nowrap }
+
+/* Family rows: name | type | help | series | value. */
+.metric-row { width: 100%; text-align: left; cursor: pointer }
+.metric-row:hover { background: var(--hover) }
+.metric-row.sel { background: var(--bubble) }
+.metric-row .grow { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px }
+.metric-row .help { flex: 0 1 240px; min-width: 0; overflow: hidden; text-overflow: ellipsis }
+.metric-row .metric-value { flex: 0 0 90px; text-align: right; overflow: hidden; text-overflow: ellipsis }
+.metric-empty { color: var(--muted); font-size: 13.5px }
+.card-value.err { color: var(--danger) }
+
+/* Detail block expands inline under the clicked family row. */
+.metric-detail { border-top: 1px solid var(--border); background: var(--side) }
+.series-row .mono { font-size: 12.5px }
+
+/* History chart row. */
+.panel-row.chart-row { padding-top: 2px; padding-bottom: 12px }
+.panel-row.chart-row > div { width: 100%; min-width: 0 }
+.chart-label { display: block; margin-bottom: 2px; color: var(--muted); font-size: 12.5px }
+
+/* Raw /metrics disclosure. */
+.metrics-raw summary { cursor: pointer; color: var(--muted); font-size: 13.5px; font-weight: 500 }
+.metrics-raw summary:hover { color: var(--text) }
+.metrics-pre { margin: 10px 0 0; padding: 12px 14px; overflow: auto; max-height: 420px; border: 1px solid var(--border); border-radius: 10px; background: var(--bubble); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre }

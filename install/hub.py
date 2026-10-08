@@ -20,7 +20,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import models
+from . import layout, models
 
 # Seconds the Hub may take to resolve a revision before the installed
 # assembly starts without it.
@@ -116,7 +116,9 @@ def pin_owner(installation: Path) -> str:
 def pinned(path: Path, installation: Path) -> Path:
     """installation's pin of the snapshot at path, the reference pin writes:
     refs/richengine/<installation>/<commit> in its repository's folder."""
-    return path.parent.parent / "refs" / "richengine" / pin_owner(installation) / path.name
+    return (
+        path.parent.parent / "refs" / "richengine" / pin_owner(installation) / path.name
+    )
 
 
 def pin(path: Path, repo_id: str, installation: Path) -> Path:
@@ -350,7 +352,8 @@ class Repository:
         if fetch:
             print(
                 f"Fetching {len(fetch)} file(s), {sum(fetch) / 1e9:.2f} GB, "
-                f"from {self.name}@{self.revision[:12]}; cached files are reused.",
+                f"from {models.accent(self.name)}{models.dim('@' + self.revision[:12])}"
+                f"{models.dim('; cached files are reused.')}",
                 flush=True,
             )
         path = Path(
@@ -385,7 +388,9 @@ def _cached_commits(name, revision, installation):
     commits = []
     if installation is not None:
         try:
-            sources = models.read_json(installation / "model.json").get("sources")
+            sources = models.read_json(installation / layout.ASSEMBLY_RECORD).get(
+                "sources"
+            )
         except models.ModelError:
             sources = None
         if isinstance(sources, dict):

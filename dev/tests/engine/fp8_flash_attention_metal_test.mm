@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "TestChecks.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Fp8PageFormatReference.hpp"
@@ -313,14 +314,14 @@ struct Pipelines {
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                       Shape shape) {
   Pipelines result;
-  result.splitName = std::string("verify_attention_fp8_split") + shape.suffix;
+  result.splitName = std::string(richengine::ops::kVerifyAttentionFp8Split) + shape.suffix;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
-      device, library, std::string("verify_attention_reduce") + shape.suffix);
-  result.prefillSplitName = std::string("prefill_attention_fp8_split") + shape.suffix;
+      device, library, std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix);
+  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionFp8Split) + shape.suffix;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
-      device, library, std::string("prefill_attention_reduce") + shape.suffix);
+      device, library, std::string(richengine::ops::kPrefillAttentionReduce) + shape.suffix);
   std::cout << "pipeline=" << result.splitName
             << " threadgroup_bytes=" << result.split.staticThreadgroupMemoryLength
             << '\n';
@@ -538,8 +539,8 @@ void benchmark(id<MTLDevice> device, id<MTLCommandQueue> queue,
                data.params.kv, splits, splits, 8, 8, 0});
   const uint64_t kvBytes =
       uint64_t{committed + kRows} * shape.kvHeads * kFp8HeadDimension * 2;
-  for (const char *base :
-       {"verify_attention_q8_split", "verify_attention_fp8_split"}) {
+  for (const char *base : {richengine::ops::kVerifyAttentionQ8Split.data(),
+                            richengine::ops::kVerifyAttentionFp8Split.data()}) {
     const std::string name = std::string(base) + shape.suffix;
     id<MTLComputePipelineState> split = makePipeline(device, library, name);
     // Warm up once so the measurement excludes pipeline setup.

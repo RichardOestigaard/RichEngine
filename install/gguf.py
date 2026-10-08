@@ -17,15 +17,15 @@ import contextlib
 import struct
 from pathlib import Path
 
-from . import models
+from . import layout, models
 from .models import ModelError
 
 # The files derived_files derives from a target GGUF, by assembly path.
 DERIVED_FILES = (
     "config.json",
-    "tokenizer/tokenizer.json",
-    "tokenizer/tokenizer_config.json",
-    "tokenizer/chat_template.jinja",
+    layout.TOKENIZER + "/tokenizer.json",
+    layout.TOKENIZER + "/tokenizer_config.json",
+    layout.TOKENIZER + "/chat_template.jinja",
 )
 
 
@@ -175,24 +175,21 @@ TOKENIZER_PROFILES = {
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
-# that are not special, and unused ones fill the vocabulary to its size.
+# that are not special, and unused ones fill the vocabulary to its size. A
+# SentencePiece (gemma4) vocabulary also holds unknown and byte-fallback
+# tokens, which stay ordinary vocabulary entries.
 NORMAL_TOKEN = 1
+UNKNOWN_TOKEN = 2
 CONTROL_TOKEN = 3
 USER_DEFINED_TOKEN = 4
 UNUSED_TOKEN = 5
+BYTE_TOKEN = 6
 
 
-def derived_files(target, vision=None):
-    """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
-    vision projector's (local paths)."""
-    metadata = Metadata(target)
-    config = model_config(metadata, None if vision is None else Metadata(vision))
-    return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
-
-
-def tokenizer_files(metadata):
+def _bpe_tokenizer(metadata, tokens, types):
+    """The byte-level BPE backend of a gpt2-model GGUF vocabulary, rebuilt as
+    the profiles TOKENIZER_PROFILES names describe it."""
     from tokenizers import (
-        AddedToken,
         Regex,
         Tokenizer,
         decoders,
@@ -202,8 +199,6 @@ def tokenizer_files(metadata):
     )
     from tokenizers import models as token_models
 
-    if metadata.require("tokenizer.ggml.model", str) != "gpt2":
-        raise ModelError("unsupported GGUF tokenizer model; expected gpt2")
     pre = metadata.require("tokenizer.ggml.pre", str)
     if pre not in TOKENIZER_PROFILES:
         raise ModelError(
@@ -212,21 +207,7 @@ def tokenizer_files(metadata):
             + f" (supported: {', '.join(sorted(TOKENIZER_PROFILES))})"
         )
     patterns, normalize = TOKENIZER_PROFILES[pre]
-    tokens = metadata.require("tokenizer.ggml.tokens", list)
-    types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
-    if (
-        not tokens
-        or not all(isinstance(t, str) and t for t in tokens)
-        or len(set(tokens)) != len(tokens)
-        or len(types) != len(tokens)
-        or any(
-            type(t) is not int
-            or t not in (NORMAL_TOKEN, CONTROL_TOKEN, USER_DEFINED_TOKEN, UNUSED_TOKEN)
-            for t in types
-        )
-    ):
-        raise ModelError("invalid or unsupported GGUF tokenizer vocabulary")
     if not set(pre_tokenizers.ByteLevel.alphabet()) <= set(tokens):
         raise ModelError("GGUF byte-level tokenizer is missing byte tokens")
     pairs = []
@@ -234,9 +215,6 @@ def tokenizer_files(metadata):
         if not isinstance(merge, str) or len(parts := merge.split(" ")) != 2:
             raise ModelError("invalid GGUF BPE merge")
         pairs.append(tuple(parts))
-    for key in ("tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token"):
-        if metadata.values.get(key, False) is not False:
-            raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
     try:
         backend = Tokenizer(
             token_models.BPE({t: i for i, t in enumerate(tokens)}, pairs)
@@ -260,6 +238,101 @@ def tokenizer_files(metadata):
         add_prefix_space=False, use_regex=False, trim_offsets=False
     )
     backend.decoder = decoders.ByteLevel()
+    return backend
+
+
+def _unigram_tokenizer(metadata, tokens, types):
+    """The SentencePiece unigram backend of a gemma4-model GGUF vocabulary:
+    its tokens and scores as the upstream tokenizer.json publishes them, with
+    SentencePiece's metaspace encoding and byte fallback. The GGUF carries no
+    precompiled normalizer, so none is applied — the vocabulary's literal ▁
+    pieces segment what Metaspace writes."""
+    from tokenizers import Tokenizer, decoders, pre_tokenizers, processors
+    from tokenizers import models as token_models
+
+    scores = metadata.require("tokenizer.ggml.scores", list)
+    if len(scores) != len(tokens) or not all(
+        type(score) in (int, float) for score in scores
+    ):
+        raise ModelError("invalid GGUF unigram vocabulary scores")
+    unknown = metadata.values.get("tokenizer.ggml.unknown_token_id")
+    if unknown is not None and not (
+        type(unknown) is int and 0 <= unknown < len(tokens)
+    ):
+        raise ModelError("invalid GGUF metadata: tokenizer.ggml.unknown_token_id")
+    try:
+        backend = Tokenizer(
+            token_models.Unigram(
+                [(token, float(score)) for token, score in zip(tokens, scores)],
+                unk_id=unknown,
+                byte_fallback=BYTE_TOKEN in types,
+            )
+        )
+    except Exception as error:
+        raise ModelError("invalid GGUF unigram vocabulary") from error
+    backend.pre_tokenizer = pre_tokenizers.Metaspace(
+        replacement="▁", prepend_scheme="always", split=True
+    )
+    backend.decoder = decoders.Metaspace(
+        replacement="▁", prepend_scheme="always", split=True
+    )
+    if metadata.values.get("tokenizer.ggml.add_bos_token") is True:
+        # SentencePiece prepends BOS; the BPE path refuses it (byte-level
+        # profiles state their own), but a gemma4 vocabulary expects it.
+        bos = metadata.values["tokenizer.ggml.bos_token_id"]
+        backend.post_processor = processors.TemplateProcessing(
+            single=f"{tokens[bos]} $A",
+            special_tokens=[(tokens[bos], bos)],
+        )
+    return backend
+
+
+def derived_files(target, vision=None):
+    """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
+    vision projector's (local paths)."""
+    metadata = Metadata(target)
+    config = model_config(metadata, None if vision is None else Metadata(vision))
+    return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
+
+
+def tokenizer_files(metadata):
+    from tokenizers import AddedToken
+
+    model = metadata.require("tokenizer.ggml.model", str)
+    if model not in ("gpt2", "gemma4"):
+        raise ModelError(
+            f"unsupported GGUF tokenizer model: {model}; expected gpt2 or gemma4"
+        )
+    tokens = metadata.require("tokenizer.ggml.tokens", list)
+    types = metadata.require("tokenizer.ggml.token_type", list)
+    # The llama_token_type values each supported model's vocabulary may hold:
+    # a gemma4 (SentencePiece) vocabulary also uses unknown and byte tokens.
+    allowed = (NORMAL_TOKEN, CONTROL_TOKEN, USER_DEFINED_TOKEN, UNUSED_TOKEN) + (
+        (UNKNOWN_TOKEN, BYTE_TOKEN) if model == "gemma4" else ()
+    )
+    if (
+        not tokens
+        or not all(isinstance(t, str) and t for t in tokens)
+        or len(set(tokens)) != len(tokens)
+        or len(types) != len(tokens)
+        or any(type(t) is not int or t not in allowed for t in types)
+    ):
+        raise ModelError("invalid or unsupported GGUF tokenizer vocabulary")
+    bos = metadata.values.get("tokenizer.ggml.bos_token_id")
+    for key in ("tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token"):
+        automatic = metadata.values.get(key, False)
+        if automatic is not False and not (
+            model == "gemma4"
+            and key == "tokenizer.ggml.add_bos_token"
+            and automatic is True
+            and type(bos) is int
+            and 0 <= bos < len(tokens)
+        ):
+            raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
+    if model == "gpt2":
+        backend = _bpe_tokenizer(metadata, tokens, types)
+    else:
+        backend = _unigram_tokenizer(metadata, tokens, types)
     # The index of each added token, and whether it is special.
     added = {
         index: kind == CONTROL_TOKEN
@@ -307,9 +380,9 @@ def tokenizer_files(metadata):
         },
     }
     return {
-        "tokenizer/tokenizer.json": backend.to_str().encode(),
-        "tokenizer/tokenizer_config.json": models.json_bytes(config),
-        "tokenizer/chat_template.jinja": template.encode(),
+        layout.TOKENIZER + "/tokenizer.json": backend.to_str().encode(),
+        layout.TOKENIZER + "/tokenizer_config.json": models.json_bytes(config),
+        layout.TOKENIZER + "/chat_template.jinja": template.encode(),
     }
 
 
@@ -322,6 +395,7 @@ TEXT_MODEL_TYPES = {
     "granite": "granite",
     "lfm2": "lfm2",
     "lfm2moe": "lfm2_moe",
+    "gemma4": "gemma4_text",
 }
 
 
@@ -339,31 +413,50 @@ def model_config(metadata, vision=None):
         "max_position_embeddings": "context_length",
         "num_attention_heads": "attention.head_count",
         "num_key_value_heads": "attention.head_count_kv",
-        "head_dim": "attention.key_length",
+        # gemma4's key_length is its global layers' head width; the local
+        # (sliding-attention) head width the config calls head_dim is
+        # key_length_swa.
+        "head_dim": (
+            "attention.key_length_swa" if arch == "gemma4" else "attention.key_length"
+        ),
     }
     text = {}
     for name, key in fields.items():
         value = metadata.values.get(arch + "." + key)
         if isinstance(value, list):
-            # lfm2 states head_count_kv per layer, 0 on its conv layers.
+            # Only the architectures whose layers differ in kind state
+            # head_count_kv per layer: lfm2's conv layers state 0, gemma4's
+            # two attention kinds state their own count (separated below).
+            # Any other array, and any lfm2 attention layers that disagree,
+            # is a geometry the runtime does not serve.
             if (
                 key != "attention.head_count_kv"
+                or arch not in ("lfm2", "lfm2moe", "gemma4")
                 or not all(type(item) is int and item >= 0 for item in value)
                 or not value
             ):
-                raise ModelError(
-                    "invalid GGUF metadata array: " + arch + "." + key
-                )
-            # Every attention layer shares one KV head count.
-            value = max(value)
-        elif value is None and name == "head_dim" and arch in ("lfm2", "lfm2moe", "granite"):
+                raise ModelError("invalid GGUF metadata array: " + arch + "." + key)
+            if arch == "gemma4":
+                value = max(value)
+            else:
+                counts = {item for item in value if item}
+                if len(counts) != 1:
+                    raise ModelError(
+                        "unsupported GGUF metadata: "
+                        + arch
+                        + ".attention.head_count_kv differs between attention layers"
+                    )
+                value = counts.pop()
+        elif (
+            value is None
+            and name == "head_dim"
+            and arch in ("lfm2", "lfm2moe", "granite")
+        ):
             # lfm2 and granite state no key_length; their head width divides
             # the hidden size evenly across the attention heads.
             continue
         if type(value) is not int or value <= 0:
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + "." + key
-            )
+            raise ModelError("missing or invalid GGUF metadata: " + arch + "." + key)
         text[name] = value
     if "head_dim" not in text:
         if text["hidden_size"] % text["num_attention_heads"]:
@@ -376,20 +469,22 @@ def model_config(metadata, vision=None):
         model_type=TEXT_MODEL_TYPES[arch],
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
-    if arch in ("llama", "lfm2", "lfm2moe", "granite"):
-        text["intermediate_size"] = metadata.positive(
-            arch + ".feed_forward_length"
-        )
+    if arch in ("llama", "lfm2", "lfm2moe", "granite", "gemma4"):
+        text["intermediate_size"] = metadata.positive(arch + ".feed_forward_length")
     if arch == "granite":
         # The runtime's config check reads rope_theta and the fixed softmax
         # multiplier.
         theta = metadata.values.get(arch + ".rope.freq_base")
         if type(theta) is not float or theta <= 0:
-            raise ModelError("missing or invalid GGUF metadata: " + arch + ".rope.freq_base")
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".rope.freq_base"
+            )
         text["rope_theta"] = theta
         scale = metadata.values.get(arch + ".attention.scale")
         if type(scale) is not float or scale <= 0:
-            raise ModelError("missing or invalid GGUF metadata: " + arch + ".attention.scale")
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".attention.scale"
+            )
         text["attention_multiplier"] = scale
         # Only the attention multiplier reaches the kernels. A granite that
         # also scales embeddings, residuals or logits (the 3.x series) would
@@ -398,17 +493,11 @@ def model_config(metadata, vision=None):
             value = metadata.values.get(arch + "." + other)
             if value is not None and (type(value) is not float or value != 1.0):
                 raise ModelError(
-                    "unsupported GGUF metadata: "
-                    + arch
-                    + "."
-                    + other
-                    + " must be 1.0"
+                    "unsupported GGUF metadata: " + arch + "." + other + " must be 1.0"
                 )
     if arch == "lfm2moe":
         text["num_experts"] = metadata.positive(arch + ".expert_count")
-        text["num_experts_per_tok"] = metadata.positive(
-            arch + ".expert_used_count"
-        )
+        text["num_experts_per_tok"] = metadata.positive(arch + ".expert_used_count")
         text["moe_intermediate_size"] = metadata.positive(
             arch + ".expert_feed_forward_length"
         )
@@ -430,6 +519,118 @@ def model_config(metadata, vision=None):
             num_experts=metadata.positive(arch + ".expert_count"),
             num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
         )
+    if arch == "gemma4":
+        layers = text["num_hidden_layers"]
+        # The sliding-window pattern names each layer's attention kind, as
+        # the config's layer_types does: True marks the local layers.
+        pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
+        if (
+            not isinstance(pattern, list)
+            or len(pattern) < layers
+            or not all(type(swa) is bool for swa in pattern[:layers])
+        ):
+            raise ModelError(
+                "missing or invalid GGUF metadata: "
+                + arch
+                + ".attention.sliding_window_pattern"
+            )
+        text["layer_types"] = [
+            "sliding_attention" if swa else "full_attention" for swa in pattern[:layers]
+        ]
+        # head_count_kv is per layer: the local layers' count is the
+        # config's num_key_value_heads, the global layers' its
+        # num_global_key_value_heads. Each kind states one count.
+        kv = metadata.values.get(arch + ".attention.head_count_kv")
+        if (
+            not isinstance(kv, list)
+            or len(kv) < layers
+            or not all(type(count) is int and count > 0 for count in kv[:layers])
+        ):
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
+            )
+        local = {kv[i] for i in range(layers) if pattern[i]}
+        wide = {kv[i] for i in range(layers) if not pattern[i]}
+        if len(local) != 1 or len(wide) != 1:
+            raise ModelError(
+                "unsupported GGUF metadata: "
+                + arch
+                + ".attention.head_count_kv differs between layers of a kind"
+            )
+        text["num_key_value_heads"] = local.pop()
+        text["num_global_key_value_heads"] = wide.pop()
+        text["global_head_dim"] = metadata.positive(arch + ".attention.key_length")
+        # Gemma 4 requires K == V head widths on both layer kinds
+        # (attention_k_eq_v); refuse a GGUF stating otherwise.
+        for swa in ("", "_swa"):
+            key = arch + ".attention.key_length" + swa
+            value = metadata.values.get(
+                arch + ".attention.value_length" + swa,
+                metadata.values.get(key),
+            )
+            if value != metadata.values.get(key):
+                raise ModelError(
+                    "unsupported GGUF metadata: " + key + " and its value_length differ"
+                )
+        text["attention_k_eq_v"] = True
+        text["sliding_window"] = metadata.positive(arch + ".attention.sliding_window")
+        shared = metadata.values.get(arch + ".attention.shared_kv_layers", 0)
+        if type(shared) is not int or shared < 0:
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".attention.shared_kv_layers"
+            )
+        text["num_kv_shared_layers"] = shared
+        # Per-layer token inputs (gemma4's per_layer_token_embd path) are
+        # unsupported; the field must state them absent.
+        per_layer = metadata.values.get(arch + ".embedding_length_per_layer_input", 0)
+        if type(per_layer) is not int or per_layer != 0:
+            raise ModelError(
+                "unsupported GGUF metadata: "
+                + arch
+                + ".embedding_length_per_layer_input must be 0"
+            )
+        text.update(
+            num_experts=metadata.positive(arch + ".expert_count"),
+            top_k_experts=metadata.positive(arch + ".expert_used_count"),
+            moe_intermediate_size=metadata.positive(
+                arch + ".expert_feed_forward_length"
+            ),
+            enable_moe_block=True,
+            tie_word_embeddings=True,
+        )
+        softcap = metadata.values.get(arch + ".final_logit_softcapping")
+        if type(softcap) is not float or softcap <= 0:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".final_logit_softcapping"
+            )
+        text["final_logit_softcapping"] = softcap
+        # The GGUF states the two rope bases flat, where config.json nests
+        # them under rope_parameters by layer kind; emit config.json's shape.
+        bases = {}
+        for kind, key in (
+            ("full_attention", "rope.freq_base"),
+            ("sliding_attention", "rope.freq_base_swa"),
+        ):
+            theta = metadata.values.get(arch + "." + key)
+            if type(theta) is not float or theta <= 0:
+                raise ModelError(
+                    "missing or invalid GGUF metadata: " + arch + "." + key
+                )
+            bases[kind] = theta
+        text["rope_parameters"] = {
+            "full_attention": {
+                "rope_theta": bases["full_attention"],
+                "rope_type": "proportional",
+                # The global layers' p-RoPE rotates the first 128 of 512
+                # head dimensions; GGUF states no factor, the checkpoint's
+                # config.json does.
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_theta": bases["sliding_attention"],
+                "rope_type": "default",
+            },
+        }
     for name in ("eos", "bos", "padding"):
         value = metadata.values.get(f"tokenizer.ggml.{name}_token_id")
         if value is not None and (type(value) is not int or value < 0):
@@ -652,14 +853,79 @@ LFM2MOE_TENSORS = {
 }
 
 
+# The gemma4 target (llama.cpp's tensor names): the shared expert rides the
+# dense FFN tensors, the MoE block adds its router (weights plus the learned
+# input scale at ffn_gate_inp.scale), its second pre-FFN norm and dual
+# post-FFN norms, and every layer ends in the scalar layer_output_scale.
+# Global layers have no V projection (k_eq_v); expert gate/up may be one
+# fused tensor (ffn_gate_up_exps) or split (ffn_gate_exps, ffn_up_exps).
+GEMMA4_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output_norm.weight": F32,
+}
+GEMMA4_LAYER_TENSORS = {
+    "attn_norm.weight": F32,
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_q_norm.weight": F32,
+    "attn_k_norm.weight": F32,
+    "attn_output.weight": QUANTIZED_TYPES,
+    "post_attention_norm.weight": F32,
+    "ffn_norm.weight": F32,
+    "ffn_gate.weight": QUANTIZED_TYPES,
+    "ffn_up.weight": QUANTIZED_TYPES,
+    "ffn_down.weight": QUANTIZED_TYPES,
+    "ffn_gate_inp.weight": F32,
+    "ffn_gate_inp.scale": F32,
+    "pre_ffw_norm_2.weight": F32,
+    "post_ffw_norm.weight": F32,
+    "post_ffw_norm_1.weight": F32,
+    "post_ffw_norm_2.weight": F32,
+    "ffn_down_exps.weight": QUANTIZED_TYPES,
+    "layer_output_scale.weight": F32,
+}
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th qwen35 layer is full attention, the others
     GDN; a llama is all attention, and an lfm2's per-layer KV head count
-    names its conv (0) and attention layers."""
+    names its conv (0) and attention layers. A gemma4's sliding-window
+    pattern names its local layers, which alone carry attn_v."""
     arch = text_architecture(metadata)
     layers = loaded_layers(metadata, arch)
+    if arch == "gemma4":
+        pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
+        if (
+            not isinstance(pattern, list)
+            or len(pattern) < layers
+            or not all(type(swa) is bool for swa in pattern[:layers])
+        ):
+            raise ModelError(
+                "missing or invalid GGUF metadata: "
+                + arch
+                + ".attention.sliding_window_pattern"
+            )
+        # The fused gate_up experts tensor and the split pair are
+        # alternatives; require whichever the file states (or the fused one
+        # when the header was read without its tensor table).
+        fused = not metadata.tensors or any(
+            name.endswith("ffn_gate_up_exps.weight") for name in metadata.tensors
+        )
+        tensors = dict(GEMMA4_MODEL_TENSORS)
+        for layer in range(layers):
+            expected = dict(GEMMA4_LAYER_TENSORS)
+            if pattern[layer]:
+                expected["attn_v.weight"] = QUANTIZED_TYPES
+            if fused:
+                expected["ffn_gate_up_exps.weight"] = QUANTIZED_TYPES
+            else:
+                expected["ffn_gate_exps.weight"] = QUANTIZED_TYPES
+                expected["ffn_up_exps.weight"] = QUANTIZED_TYPES
+            for name, types in expected.items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
     if arch in ("llama", "granite"):
         tensors = dict(MODEL_TENSORS)
         for layer in range(layers):
@@ -676,9 +942,7 @@ def loaded_tensors(metadata):
             or not all(type(count) is int and count >= 0 for count in kv[:layers])
         ):
             raise ModelError(
-                "missing or invalid GGUF metadata: "
-                + arch
-                + ".attention.head_count_kv"
+                "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
             )
         tensors = dict(LFM2_MODEL_TENSORS)
         dense_layers = (
@@ -688,11 +952,7 @@ def loaded_tensors(metadata):
         )
         for layer in range(layers):
             mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
-            ffn = (
-                DENSE_TENSORS
-                if layer < dense_layers
-                else LFM2MOE_TENSORS
-            )
+            ffn = DENSE_TENSORS if layer < dense_layers else LFM2MOE_TENSORS
             for name, types in (LLAMA_LAYER_TENSORS | mixer | ffn).items():
                 tensors[f"blk.{layer}.{name}"] = types
         return tensors

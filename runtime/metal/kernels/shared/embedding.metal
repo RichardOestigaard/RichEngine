@@ -2,15 +2,23 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/QuantTables.h"
 
-template <uint Hidden>
+template <uint Hidden, bool Tiled>
 inline void q4_embedding_impl(device const uint *tokens,
                               device const uchar *weights,
                               device const bfloat *scales,
                               device const bfloat *biases,
                               device bfloat *output,
                               constant Q4EmbeddingParams &params, uint index,
-                              uint grid_size) {
+                              uint grid_size, float scale = 1.0f) {
   constexpr uint QuantGroups = Hidden / 64;
+  // Two plane layouts exist. Safetensors-sourced installs store the
+  // checkpoint's quantized rows as found: codes [vocab][Hidden/2] bytes,
+  // scales and biases [vocab][QuantGroups] elements (Tiled=false). Packed
+  // installs reorder every plane into 256-row tiles of group units — codes
+  // [vocab/256][QuantGroups][256][32] bytes, scales and biases
+  // [vocab/256][QuantGroups][256] elements — so a tied head can read them
+  // as a projection (writeQuantizedStep, install/pack.py).
+  constexpr uint TileRows = 256;
   uint elements = params.rows * Hidden;
   for (uint element = index; element < elements; element += grid_size) {
     uint row = element / Hidden;
@@ -19,11 +27,17 @@ inline void q4_embedding_impl(device const uint *tokens,
     // Runtime validates every token. Keep the bounds guard local to the
     // storage table so a malformed direct operator call cannot read past it.
     uint token = raw_token < params.vocabulary_size ? raw_token : 0;
-    uchar packed = weights[ulong(token) * (Hidden / 2) + dim / 2];
+    const ulong tile =
+        Tiled ? (ulong(token / TileRows) * QuantGroups + dim / 64) *
+                        TileRows +
+                    token % TileRows
+              : ulong(token) * QuantGroups + dim / 64;
+    uchar packed = weights[tile * 32 + (dim % 64) / 2];
     float quantized = float((packed >> ((dim & 1) * 4)) & 15);
-    ulong parameter = ulong(token) * QuantGroups + dim / 64;
-    output[element] =
-        bfloat(quantized * float(scales[parameter]) + float(biases[parameter]));
+    ulong parameter = tile;
+    output[element] = bfloat(
+        (quantized * float(scales[parameter]) + float(biases[parameter])) *
+        scale);
   }
 }
 
@@ -37,14 +51,53 @@ inline void q4_embedding_impl(device const uint *tokens,
       constant Q4EmbeddingParams &params [[buffer(5)]],                      \
       uint index [[thread_position_in_grid]],                                \
       uint grid_size [[threads_per_grid]]) {                                 \
-    q4_embedding_impl<Hidden>(tokens, weights, scales, biases, output,       \
-                              params, index, grid_size);                     \
+    q4_embedding_impl<Hidden, false>(tokens, weights, scales, biases,        \
+                                     output, params, index, grid_size);      \
   }
 
 Q4_EMBEDDING_ENTRY(embedding_q4_h5120, 5120)
 Q4_EMBEDDING_ENTRY(embedding_q4_h4096, 4096)
 Q4_EMBEDDING_ENTRY(embedding_q4_h2048, 2048)
+Q4_EMBEDDING_ENTRY(embedding_q4_h2816, 2816)
 #undef Q4_EMBEDDING_ENTRY
+
+// The tiled variants of the same gathers for packed-install tables.
+#define Q4_EMBEDDING_TILED_ENTRY(Name, Hidden)                               \
+  kernel void Name(                                                          \
+      device const uint *tokens [[buffer(0)]],                               \
+      device const uchar *weights [[buffer(1)]],                             \
+      device const bfloat *scales [[buffer(2)]],                             \
+      device const bfloat *biases [[buffer(3)]],                             \
+      device bfloat *output [[buffer(4)]],                                   \
+      constant Q4EmbeddingParams &params [[buffer(5)]],                      \
+      uint index [[thread_position_in_grid]],                                \
+      uint grid_size [[threads_per_grid]]) {                                 \
+    q4_embedding_impl<Hidden, true>(tokens, weights, scales, biases,         \
+                                    output, params, index, grid_size);       \
+  }
+
+Q4_EMBEDDING_TILED_ENTRY(embedding_q4t_h5120, 5120)
+Q4_EMBEDDING_TILED_ENTRY(embedding_q4t_h4096, 4096)
+Q4_EMBEDDING_TILED_ENTRY(embedding_q4t_h2048, 2048)
+Q4_EMBEDDING_TILED_ENTRY(embedding_q4t_h2816, 2816)
+#undef Q4_EMBEDDING_TILED_ENTRY
+
+// Gemma 4's scaled gather: the same Q4 row times a constant (sqrt(hidden),
+// bound as a float). A scale of exactly 1 reproduces embedding_q4t_h2816; the
+// other h* entries never take this path.
+kernel void embedding_q4_scaled_h2816(
+    device const uint *tokens [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const bfloat *scales [[buffer(2)]],
+    device const bfloat *biases [[buffer(3)]],
+    device bfloat *output [[buffer(4)]],
+    constant Q4EmbeddingParams &params [[buffer(5)]],
+    constant float &embedding_scale [[buffer(6)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  q4_embedding_impl<2816, true>(tokens, weights, scales, biases, output,
+                                params, index, grid_size, embedding_scale);
+}
 
 // Token gathers from native GGUF rows (ops/Embedding.cpp): a row is
 // hidden / Weights blocks of Bytes bytes, each laid out as the format's ggml

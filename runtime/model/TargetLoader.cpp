@@ -1,4 +1,4 @@
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "Checked.hpp"
 
 #include <utility>
@@ -20,11 +20,11 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
 }
 
 template <class Format>
-QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
+MixerWeights readQwenMixer(WeightFile &file, const Format &format,
                                const QwenMixerGeometry &geometry, bool fullAttention) {
   constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
-    QwenAttentionWeights attention;
+    AttentionMixerWeights attention;
     attention.inputProjection =
         format.fused(file, geometry.packedFullWidth, geometry.hiddenSize, "attention-input",
                      {"attn-q", "attn-k", "attn-v"});
@@ -34,7 +34,7 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
         format.projection(file, geometry.hiddenSize, geometry.attentionWidth, "attention-output");
     return attention;
   }
-  QwenGdnWeights gdn;
+  GdnMixerWeights gdn;
   gdn.inputProjection = format.fused(file, geometry.packedGdnWidth, geometry.hiddenSize,
                                      "gdn-input", {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(
@@ -59,9 +59,9 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
   return gdn;
 }
 
-template QwenMixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
+template MixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
                                         const QwenMixerGeometry &, bool);
-template QwenMixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
+template MixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
                                         const QwenMixerGeometry &, bool);
 
 } // namespace richengine::model

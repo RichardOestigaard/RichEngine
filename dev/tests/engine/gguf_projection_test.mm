@@ -17,6 +17,7 @@
 #include "NormReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/KernelNames.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
 #include "ops/Embedding.hpp"
@@ -732,7 +733,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     CommandGraph graph;
     for (uint32_t i = 0; i < 2; ++i) {
       // A test kernel's copy poisons the partials in dispatch order.
-      graph.add("test_copy_u32", {poison, scratch.partials.view}, uint32_t(size.partials / 4),
+      graph.add(std::string(kTestCopyU32), {poison, scratch.partials.view}, uint32_t(size.partials / 4),
                 {(size.partials / 4 + 255) / 256, 1, 1}, {256, 1, 1});
       static_cast<void>(linear.add(graph, operands[i].bindings(plan(i, splits[i]), scratch), weights[i][0],
                                    plan(i, splits[i]), gateOf(i)));
@@ -803,7 +804,7 @@ void packedInput(MetalBackend &backend, const Linear &linear) {
            .gateScratch = fusedGate.view, .scratch = scratch.bindings(), .prepared = prepared},
           up, plan, gatep));
       uint32_t packs = 0;
-      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == "gguf_pack_half";
+      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == kGgufPackHalf;
       if (packs) fail(what + ": the projection still dispatches gguf_pack_half");
       static_cast<void>(backend.submitCommand(fused.dispatches()));
       // The same projection on the same rows with the consumer's pack: every
@@ -852,7 +853,7 @@ void packedInput(MetalBackend &backend, const Linear &linear) {
            .scratch = scratch.bindings(), .prepared = prepared},
           up, plan, nullptr));
       uint32_t packs = 0;
-      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == "gguf_pack_half";
+      for (const auto &dispatch : fused.dispatches()) packs += dispatch.pipelineName == kGgufPackHalf;
       if (packs) fail(what + ": the projection still dispatches gguf_pack_half");
       static_cast<void>(backend.submitCommand(fused.dispatches()));
       const Outcome want =

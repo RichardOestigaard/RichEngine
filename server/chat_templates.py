@@ -38,7 +38,7 @@ Tokenizer files and the tokenizer object are never modified.
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
@@ -157,6 +157,15 @@ class ChatTemplate:
     # The tool-call framing the template renders, None where no canary call
     # rendered a known one (requests then keep the default dialect).
     dialect: object = None
+    # Option keys whose probes disagree on the generation prompt: the
+    # template appends different text by context (Gemma 4 appends nothing
+    # after a tool response), so a request computes its own.
+    varies: set = field(default_factory=set)
+
+    def prompt_varies(self, options):
+        """Whether the generation prompt differs by context under these
+        request options, so the request's own render decides it."""
+        return _generation_key(options) in self.varies
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -272,10 +281,16 @@ def _prepare(render, encode, source):
         if patched is not None and _verified(render, source, patched):
             source, later_system = patched, PATCHED
 
+    varies = set()
+
     @lru_cache(maxsize=_PROBED_OPTIONS)
     def probe(key):
         options = {**json.loads(key), "add_generation_prompt": True}
-        return _generation_prompt(render, encode, source, options) or ("", ())
+        found = _generation_prompt(render, encode, source, options)
+        if found == "varies":
+            varies.add(key)
+            return ("", ())
+        return found if isinstance(found, tuple) else ("", ())
 
     return ChatTemplate(
         source,
@@ -284,6 +299,7 @@ def _prepare(render, encode, source):
         _generation_prompts(render, encode, source),
         probe,
         _tool_dialect(render, source),
+        varies,
     )
 
 
@@ -397,7 +413,8 @@ def _generation_prompts(render, encode, source):
             tools=None,
             add_generation_prompt=True,
         )
-        if found := _generation_prompt(render, encode, source, options):
+        found = _generation_prompt(render, encode, source, options)
+        if isinstance(found, tuple) and found[0]:
             prompts[_generation_key(options)] = found
     return prompts
 
@@ -405,7 +422,9 @@ def _generation_prompts(render, encode, source):
 def _generation_prompt(render, encode, source, options):
     """What add_generation_prompt appends under these options, with its
     tokens: kept where every probe conversation renders as a prefix of its
-    prompt and gains the same non-empty text."""
+    prompt and gains the same non-empty text. "varies" where they gain
+    different text (the prompt is context-dependent); None where a render
+    is no prefix or the shared text is empty."""
     texts = set()
     for messages in _FOLLOWED:
         prompt = _outcome(render, source, messages, options)
@@ -419,9 +438,10 @@ def _generation_prompt(render, encode, source, options):
         ):
             return None
         texts.add(prompt[len(history) :])
-    if len(texts) == 1 and (text := texts.pop()):
-        return text, tuple(encode(text))
-    return None
+    if len(texts) != 1:
+        return "varies"
+    text = texts.pop()
+    return (text, tuple(encode(text))) if text else None
 
 
 def _outcome(render, source, messages, options):

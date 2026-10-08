@@ -30,6 +30,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 if __name__ == "__main__" and not __package__:
     # Run as a script by make, the launcher and `python install/models.py`:
@@ -37,7 +38,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "install"
 
-from . import paths
+from . import layout, paths
 
 MODELS = paths.MODELS
 # The bound on one JSON metadata file.
@@ -50,20 +51,44 @@ VARIANT_SEPARATOR = ":"
 VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # What installation_kind finds at a selection link.
 ASSEMBLY, PACKAGE = "assembly", "package"
+InstallationKind = Literal["assembly", "package"]
 # Staging an interrupted installation leaves, which garbage collection
 # removes: a selection link being replaced (beside the link), and an assembly
 # or derived metadata entry being written (beside the published entries).
-LINK_STAGING = ".prepare-"
-ENTRY_STAGING = ".loading-"
+LINK_STAGING = layout.LINK_STAGING
+ENTRY_STAGING = layout.ENTRY_STAGING
 
 
 class ModelError(RuntimeError):
     pass
 
 
+def _styled(text, *codes, stream=sys.stdout):
+    """Wrap codes around text on a terminal with NO_COLOR unset — the
+    launcher's gate (install/launcher.py _ansi): piped output and log files
+    stay byte-plain."""
+    if stream.isatty() and "NO_COLOR" not in os.environ:
+        return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+    return text
+
+
+def accent(text):
+    """The launcher help's cyan: model and file names the user may reuse."""
+    return _styled(str(text), "36")
+
+
+def dim(text):
+    """The launcher help's 'Usage' gray: detail the user can skip."""
+    return _styled(str(text), "2")
+
+
 def warn(message):
     """Report something the user may need to act on, on stderr."""
-    print(f"Warning: {message}", file=sys.stderr, flush=True)
+    print(
+        f"{_styled('Warning:', '33', stream=sys.stderr)} {message}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def is_hex_digest(value, length: int) -> bool:
@@ -183,15 +208,27 @@ def selection_link(
         selection = json.dumps(
             [model_id, revision, language_only, draft_model], separators=(",", ":")
         )
-        return models / ".selections" / hashlib.sha256(selection.encode()).hexdigest()
+        return (
+            models / layout.SELECTIONS / hashlib.sha256(selection.encode()).hexdigest()
+        )
     if variant is None:
         return models / repo_id
     return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
 
 
 def selection_links(models: Path):
-    """Every selection link under models, in the places selection_link names."""
-    return [path for path in models.glob("*/*") if path.is_symlink()]
+    """Every selection link under models, in the places selection_link names:
+    OWNER/REPO and .selections/<hash>. A stray symlink elsewhere — under
+    .resolved, .metadata or .packed — is not one."""
+    return [
+        path
+        for path in models.glob("*/*")
+        if path.is_symlink()
+        and (
+            path.parent.name == layout.SELECTIONS
+            or not path.parent.name.startswith(".")
+        )
+    ]
 
 
 @dataclass(frozen=True)
@@ -232,12 +269,12 @@ class Selection:
         )
 
 
-def installation_kind(link: Path):
+def installation_kind(link: Path) -> InstallationKind | None:
     """What serves a selection link: an assembly (its model.json), a legacy
     RichEngine package (its manifest.json), or nothing (None)."""
-    if (link / "model.json").exists():
+    if (link / layout.ASSEMBLY_RECORD).exists():
         return ASSEMBLY
-    if (link / "manifest.json").exists():
+    if (link / layout.PACKAGE_MANIFEST).exists():
         return PACKAGE
     return None
 
@@ -245,13 +282,13 @@ def installation_kind(link: Path):
 @contextmanager
 def installation_lock(models: Path):
     """Exclusive access to everything written under models."""
-    lock_path = models / ".install.lock"
+    lock_path = models / layout.INSTALL_LOCK
     with lock_path.open("a+b") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(
-                "Another RichEngine model installation is running; waiting...",
+                dim("Another RichEngine model installation is running; waiting..."),
                 flush=True,
             )
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -319,7 +356,7 @@ def main(argv=None):
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
-    from . import assembly, legacy, upstream
+    from . import assembly, legacy, pack, upstream
 
     try:
         # The launcher starts this with the stop signals blocked, so that one
@@ -332,7 +369,12 @@ def main(argv=None):
             if kind == ASSEMBLY:
                 assembly.verify(selection.link, full=args.full)
             elif kind == PACKAGE:
-                legacy.verify(selection.link, selection.repo_id, full=args.full)
+                # A locally packed package (install/pack.py) verifies against
+                # its own manifest, not a Hub snapshot's.
+                if pack.is_built(selection.link):
+                    pack.verify(selection.link, full=args.full)
+                else:
+                    legacy.verify(selection.link, selection.repo_id, full=args.full)
             else:
                 raise ModelError(f"{args.model} is not installed in {args.models}")
             print(

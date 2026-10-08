@@ -176,7 +176,8 @@ public:
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1, std::span<const uint32_t> proposals = {}) const;
+      uint32_t stopToken1, std::span<const uint32_t> proposals = {},
+      uint32_t draftCandidateStride = RICHENGINE_DRAFT_CANDIDATES) const;
   // Greedy acceptance over the lanes' verify trees: the walk emits the
   // retained path's tokens and its emitted-row indices for the KV, GDN and
   // captured-hidden commits.

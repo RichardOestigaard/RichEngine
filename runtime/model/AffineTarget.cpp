@@ -95,7 +95,7 @@ Image layerImage(const Layout &layout, uint32_t layer) {
       projection(result, {{name + projectionName, n}}, n, k, 4, experts);
     }
   };
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
+  if constexpr (Layout::ffnKind == FfnKind::SparseMoe) {
     // The router and the shared-expert scalar gate are 8-bit, their rows padded to
     // whole 256-row tiles as the reader expects.
     projection(result, {{mlp + "gate", layout.experts}}, layout.experts, layout.hiddenSize, 8);
@@ -146,10 +146,13 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const DenseLayou
       {"num_attention_heads", layout.attentionQueryHeads},
       {"num_key_value_heads", layout.attentionKvHeads},
       {"intermediate_size", layout.intermediateSize}, {"rms_norm_eps", 1e-6},
-      {"rope_theta", layout.rotaryTheta}, {"attention_bias", 0},
+      {"rope_theta", layout.rotaryTheta},
       {"tie_word_embeddings", 0},
       {"max_position_embeddings", layout.maximumContextTokens}};
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  // The released MiniCPM5-2B-MLX config omits attention_bias (llama's false
+  // default); a stated true still fails.
+  source.requireConfigNumberOrAbsent("attention_bias", 0);
   source.requireConfigString("model_type", "llama");
   source.requireConfigString("hidden_act", "silu");
 }

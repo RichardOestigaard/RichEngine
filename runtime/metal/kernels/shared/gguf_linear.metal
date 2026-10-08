@@ -397,6 +397,7 @@ GGUF_PREFILL_FORMAT(FmtMXFP4N, mxfp4n)
                                   simd_group, p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);      \
   }
 QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
+GGUF_PREFILL_LEADING_INPUTS(FmtMXFP4N, mxfp4n)
 #undef GGUF_PREFILL_LEADING_INPUTS
 #undef GGUF_PREFILL_EPILOGUE
 #undef GGUF_PREFILL

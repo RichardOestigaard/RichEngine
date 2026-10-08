@@ -5,6 +5,7 @@
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/KernelNames.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -466,7 +467,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
     const auto add = [&](Matrix matrix, uint32_t row, uint32_t input, uint32_t width, uint32_t rows,
                          Rotation rotation) {
       const Planes &planes = layers_[layer].planes[static_cast<size_t>(matrix)];
-      graph.add(kernel("ane_ffn_row_scale", planes.suffix, rotation),
+      graph.add(kernel(kAneFfnRowScale.data(), planes.suffix, rotation),
                 {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), memory_.signs},
                 AneFfnWeightParams{planes.groups, row, input, width, 0, 0, planes.format},
                 {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
@@ -506,7 +507,7 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
     const uint32_t scaleStride = scale.strideBytes / uint32_t{sizeof(_Float16)};
     requireBytes(output.buffer, rowBytes(rows, output.strideBytes, width, 1), "ANE FFN weight surface");
     requireBytes(scale.buffer, rowBytes(rows, scaleStride, 1, sizeof(_Float16)), "ANE FFN weight scale surface");
-    graph.add(kernel("ane_ffn_weights", planes.suffix, rotation),
+    graph.add(kernel(kAneFfnWeights.data(), planes.suffix, rotation),
               {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), output.buffer,
                scale.buffer, memory_.signs},
               AneFfnWeightParams{planes.groups, row, input, width, output.strideBytes, scaleStride, planes.format},
@@ -562,10 +563,10 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   const auto index = static_cast<uint32_t>(found - evaluations_.begin());
   // Each command stages layer 0's weights, then each layer the next one's.
   if (!layer) addWeights(graph, 0, 0);
-  graph.add("ane_ffn_rotate", {ffn.normalized, memory_.signs, memory_.rotated, memory_.tokenScale.buffer},
+  graph.add(std::string(kAneFfnRotate), {ffn.normalized, memory_.signs, memory_.rotated, memory_.tokenScale.buffer},
             AneFfnRotateParams{shape_.hidden}, {rows, 1, 1}, {ANE_FFN_ROTATE_THREADS, 1, 1});
   for (uint32_t k = 0; k < memory_.inputs.size(); ++k)
-    graph.add("ane_ffn_pack", {memory_.rotated, memory_.inputs[k].buffer},
+    graph.add(std::string(kAneFfnPack), {memory_.rotated, memory_.inputs[k].buffer},
               AneFfnPackParams{shape_.hidden, k * shape_.inputSegment, memory_.inputs[k].strideBytes},
               {tiles, shape_.inputSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   const uint64_t ready = ane ? handoff_.next() : 0;
@@ -574,7 +575,7 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
-  graph.add("ane_ffn_join", {output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
+  graph.add(std::string(kAneFfnJoin), {output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
             AneFfnJoinParams{shape_.hidden, memory_.partial.strideBytes / uint32_t{sizeof(_Float16)}, rows},
             {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   if (ane) jobs_.push_back({index, set, ready, done});
@@ -644,7 +645,7 @@ bool AneFfn::release() {
     return false;
   }
   released_ = true;
-  logLine("Neural Engine FFN program unloaded while idle");
+  logLine(dim("Neural Engine FFN program unloaded while idle"));
   return true;
 }
 
@@ -656,8 +657,8 @@ void AneFfn::restore() noexcept {
   std::string failure = "an unknown exception";
   try {
     program_->load({kReloadLimit, {}});
-    logLine("Neural Engine FFN program reloaded in ", std::fixed, std::setprecision(2),
-            millisecondsSince(start) / 1000.0, " s");
+    logLine(dim("Neural Engine FFN program reloaded in "), std::fixed, std::setprecision(2),
+            millisecondsSince(start) / 1000.0, dim(" s"));
     return;
   } catch (const std::exception &error) {
     failure = error.what();

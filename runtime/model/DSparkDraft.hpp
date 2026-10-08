@@ -2,7 +2,7 @@
 
 #include "DFlashDraft.hpp"
 #include "Model.hpp"
-#include "PlainDraft.hpp"
+#include "DFlashV1Draft.hpp"
 #include "WeightImages.hpp"
 #include "WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
@@ -32,7 +32,7 @@ namespace richengine::model {
 // runtime loads but does not score.
 struct DSparkDraftWeights final {
   DFlashDraftLayout layout;
-  std::vector<PlainDraftLayerWeights> layers;
+  std::vector<DFlashV1DraftLayerWeights> layers;
   ops::Projection contextProjection;
   ops::NormWeights hiddenNorm;
   ops::NormWeights finalNorm;
@@ -85,8 +85,9 @@ public:
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
                  std::span<const uint32_t> cacheLengths) const;
-  // The DSpark draft has no candidate DAG, so treeMask is ignored: its
-  // selector always emits the seven-token chain.
+  // treeMask marks greedy, unconstrained lanes whose selector emits the
+  // pool's biased runner-up per position as a comb tree's sibling leaf; 0
+  // selects the chain-only pipeline.
   void addSelection(metal::CommandGraph &graph,
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
@@ -95,6 +96,9 @@ public:
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions) const;
+  // The loaded weights: RICHENGINE_DRAFT_CONF scores the proposals the
+  // loaded-but-unused confidence head gives them.
+  const DSparkDraftWeights &weights() const { return weights_; }
 
 private:
   const DSparkDraftWeights &weights_;

@@ -32,16 +32,19 @@ from server import (
     judgments,
     serve_options,
     tool_schema,
+    webfetch,
+    websearch,
 )
 from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
 from server import frontend as request_frontend
+from server import model_host as hosting
 from server import output as model_output
 from server import protocol as native_wire
 from server import server as api
 from server.api_shapes import _namespace_alias, normalize_responses_input
-from server.chat_templates import ChatTemplates
+from server.chat_templates import ChatTemplateError, ChatTemplates
 from server.metrics import metrics_dict
 from server.origins import ANY_ORIGIN, parse_allowed_origin
 from server.output import MAX_JSON_NESTING
@@ -519,7 +522,7 @@ def main_args(**overrides):
     """Parsed command-line arguments for main() tests."""
     return SimpleNamespace(
         **{
-            "model_root": "model",
+            "assembly_dir": "model",
             "tokenizer": "tokenizer",
             "model": "test-model",
             "served_model_name": [],
@@ -532,6 +535,10 @@ def main_args(**overrides):
             "persistent_cache": False,
             "cache_dir": None,
             "decode_share": None,
+            "disable_ane": False,
+            "moe_union": None,
+            "canvas_profile": "paper",
+            "shared_prefix_state": True,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,
@@ -545,6 +552,8 @@ def main_args(**overrides):
             "port": 0,
             "binary": "richengine",
             "kv_format": "int4",
+            "models_dir": None,
+            "unload_idle": None,
             **overrides,
         }
     )
@@ -1085,7 +1094,7 @@ class ServerTest(unittest.TestCase):
     def test_models_and_nonstream_reasoning(self):
         runtime = FakeRuntime(Plan([[1], [2], [3]]))
         harness = self.harness(runtime)
-        status, content_type, payload = harness.request("GET", "/")
+        status, content_type, payload = harness.request("GET", "/classic")
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/html; charset=utf-8")
         self.assertIn(b"/v1/chat/completions", payload)
@@ -3594,7 +3603,8 @@ class ServerTest(unittest.TestCase):
             model,
         ]
         for arguments in (
-            [],
+            # A bare serve now starts unloaded; a model directory without
+            # --model, and a malformed model, still fail.
             required[:-2],
             [*required[:-1], "qwen3.8-27b"],
             [*required[:-1], "Qwen3.8-27B"],
@@ -3607,21 +3617,24 @@ class ServerTest(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 api.parse_args(arguments)
+        empty = api.parse_args([])
+        self.assertIsNone(empty.model)
+        self.assertIsNone(empty.assembly_dir)
         args = api.parse_args(required)
-        self.assertEqual(Path(args.model_root), package)
+        self.assertEqual(Path(args.assembly_dir), package)
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
         self.assertEqual(args.max_cache_disk, 0)
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
-        self.assertEqual(api._native_command(disk_args)[-1], str(5 * 1024**3))
+        self.assertEqual(hosting._native_command(disk_args)[-1], str(5 * 1024**3))
         # A persistent cache names its directory; the server picks the default.
         persistent_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--persistent-cache"]
         )
         self.assertEqual(
-            api._native_command(persistent_args)[-3:],
+            hosting._native_command(persistent_args)[-3:],
             [str(5 * 1024**3), "--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
         )
         directory_args = api.parse_args(
@@ -3629,50 +3642,50 @@ class ServerTest(unittest.TestCase):
             + ["--cache-dir", "/srv/cache"]
         )
         self.assertEqual(
-            api._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
+            hosting._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
         )
         self.assertEqual(args.kv_format, "int4")
-        self.assertNotIn("--kv-format", api._native_command(args))
+        self.assertNotIn("--kv-format", hosting._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
-        self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        self.assertEqual(hosting._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
         fp8_args = api.parse_args([*required, "--kv-format", "fp8e4m3"])
-        self.assertEqual(api._native_command(fp8_args)[-2:], ["--kv-format", "fp8e4m3"])
+        self.assertEqual(hosting._native_command(fp8_args)[-2:], ["--kv-format", "fp8e4m3"])
         disk_bf16_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--kv-format", "bf16"]
         )
         self.assertEqual(
-            api._native_command(disk_bf16_args)[-3:],
+            hosting._native_command(disk_bf16_args)[-3:],
             [str(5 * 1024**3), "--kv-format", "bf16"],
         )
         # The engine keeps its own default unless told one.
         self.assertIsNone(args.idle_release)
-        self.assertNotIn("--idle-release", api._native_command(args))
+        self.assertNotIn("--idle-release", hosting._native_command(args))
         for value, text in (("30m", "1800.0"), ("off", "off")):
             release_args = api.parse_args([*required, "--idle-release", value])
             self.assertEqual(
-                api._native_command(release_args)[-2:], ["--idle-release", text]
+                hosting._native_command(release_args)[-2:], ["--idle-release", text]
             )
         self.assertIsNone(args.decode_share)
-        self.assertNotIn("--decode-share", api._native_command(args))
+        self.assertNotIn("--decode-share", hosting._native_command(args))
         share_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--decode-share", "0"]
         )
         self.assertEqual(
-            api._native_command(share_args)[-3:],
+            hosting._native_command(share_args)[-3:],
             [str(5 * 1024**3), "--decode-share", "0.0"],
         )
         # The engine's per-image patch limit follows the pixel cap: the most
         # patches a resized image can have, a whole number of merge units.
-        self.assertNotIn("--max-image-patches", api._native_command(args))
+        self.assertNotIn("--max-image-patches", hosting._native_command(args))
         for pixels, patches in (("1048576", "4096"), ("1000000", "3904")):
             pixel_args = api.parse_args([*required, "--max-image-pixels", pixels])
             self.assertEqual(
-                api._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
+                hosting._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
             )
-        self.assertNotIn("--idle-sleep", api._native_command(args))
+        self.assertNotIn("--idle-sleep", hosting._native_command(args))
         sleep_args = api.parse_args([*required, "--allow-idle-sleep"])
         self.assertEqual(
-            api._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
+            hosting._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
         )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
@@ -3745,12 +3758,10 @@ class ServerTest(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = main_args()
         runtime = mock.Mock()
-        runtime.readiness = native_wire.ReadyEvent(
-            max_concurrent_requests=4, max_context_tokens=262144, vision=False
-        )
         backend = mock.Mock()
+        host = mock.Mock(runtime=runtime, backend=backend)
+        host.app = mock.Mock(model="test-model", max_context=131072, vision=False)
         server = mock.Mock(server_port=8000)
-        tokenizer = object()
         handlers = {}
         order = []
         closing_handlers = []
@@ -3764,7 +3775,7 @@ class ServerTest(unittest.TestCase):
             if handler is not signal.SIG_IGN:
                 self.assertEqual(signum, signal.SIGINT)
 
-        backend.close.side_effect = lambda: closing_handlers.append(dict(handlers))
+        host.close.side_effect = lambda: closing_handlers.append(dict(handlers))
 
         def serve():
             self.assertEqual(set(handlers), {signal.SIGTERM, signal.SIGINT})
@@ -3774,25 +3785,11 @@ class ServerTest(unittest.TestCase):
             return server
 
         server.server_bind.side_effect = lambda: order.append("bind")
-
-        runtime.wait_ready.side_effect = lambda: order.append("runtime") or True
+        host.load_initial.side_effect = lambda: order.append("load")
         server.serve_forever.side_effect = serve
         with (
             mock.patch.object(api, "parse_args", return_value=args),
-            mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
-            ),
-            mock.patch.object(api, "validate_tokenizer") as validate,
-            mock.patch.object(api, "ChatTemplates"),
-            mock.patch.object(
-                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
-            ) as runtime_type,
-            mock.patch.object(
-                api, "NativeBackend", return_value=backend
-            ) as backend_type,
-            mock.patch.object(api, "ConstraintFactory", return_value=object()),
-            mock.patch.object(api, "Frontend", return_value=mock.Mock()) as app_type,
+            mock.patch.object(api, "ModelHost", return_value=host),
             mock.patch.object(api, "FrontendServer", side_effect=bind),
             mock.patch.object(api.signal, "signal", side_effect=install),
             mock.patch("sys.stdout", new_callable=io.StringIO),
@@ -3807,6 +3804,41 @@ class ServerTest(unittest.TestCase):
         runtime.kill.assert_not_called()
         closing[signal.SIGINT](signal.SIGINT, None)
         runtime.kill.assert_called_once_with()
+        host.load_initial.assert_called_once_with()
+        host.close.assert_called_once_with()
+        server.serve_forever.assert_called_once()
+        server.server_close.assert_called_once()
+        server.server_bind.assert_called_once_with()
+        server.server_activate.assert_called_once_with()
+        self.assertEqual(order, ["bind", "load"])
+
+    def test_host_build_wires_runtime_backend_and_frontend(self):
+        args = main_args()
+        runtime = mock.Mock()
+        runtime.readiness = native_wire.ReadyEvent(
+            max_concurrent_requests=4, max_context_tokens=262144, vision=False
+        )
+        backend = mock.Mock()
+        tokenizer = object()
+        with (
+            mock.patch.object(hosting, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                hosting.AutoTokenizer, "from_pretrained", return_value=tokenizer
+            ),
+            mock.patch.object(hosting, "validate_tokenizer") as validate,
+            mock.patch.object(hosting, "ChatTemplates"),
+            mock.patch.object(
+                hosting.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ) as runtime_type,
+            mock.patch.object(
+                hosting, "NativeBackend", return_value=backend
+            ) as backend_type,
+            mock.patch.object(hosting, "ConstraintFactory", return_value=object()),
+            mock.patch.object(hosting, "Frontend", return_value=mock.Mock()) as app_type,
+            mock.patch.object(hosting, "print_status"),
+        ):
+            host = hosting.ModelHost(args)
+            host.load_initial()
         runtime_type.assert_called_once_with(
             [
                 "richengine",
@@ -3815,7 +3847,7 @@ class ServerTest(unittest.TestCase):
                 "auto",
                 "auto",
             ],
-            startup_timeout=api.NATIVE_START_TIMEOUT,
+            startup_timeout=hosting.NATIVE_START_TIMEOUT,
             pending_limit=1,
             eager_start=False,
         )
@@ -3826,50 +3858,78 @@ class ServerTest(unittest.TestCase):
             think_end_id=validate.return_value.think_end_id,
             visible_token_ids=mock.ANY,
             tool_call_open_id=validate.return_value.tool_call_open_id,
+            diffusion=False,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.
         self.assertEqual(app_type.call_args.args[4], math.inf)
         self.assertEqual(app_type.call_args.args[5], 4)
         runtime.wait_ready.assert_called_once_with()
-        server.serve_forever.assert_called_once()
-        server.server_close.assert_called_once()
-        backend.close.assert_called_once()
-        server.server_bind.assert_called_once_with()
-        server.server_activate.assert_called_once_with()
-        self.assertEqual(order, ["bind", "runtime"])
+        self.assertIs(host.app, app_type.return_value)
 
-    def test_main_takes_vision_from_the_ready_event(self):
+    def test_host_build_marks_diffusion_models(self):
         args = main_args()
+        runtime = mock.Mock()
+        runtime.readiness = native_wire.ReadyEvent(
+            max_concurrent_requests=4, max_context_tokens=262144, vision=False
+        )
+        backend = mock.Mock()
+        with (
+            mock.patch.object(hosting, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                hosting.AutoTokenizer, "from_pretrained", return_value=object()
+            ),
+            mock.patch.object(hosting, "validate_tokenizer"),
+            mock.patch.object(hosting, "ChatTemplates"),
+            mock.patch.object(
+                hosting.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(
+                hosting, "NativeBackend", return_value=backend
+            ) as backend_type,
+            mock.patch.object(hosting, "ConstraintFactory", return_value=object()),
+            mock.patch.object(hosting, "Frontend", return_value=mock.Mock()),
+            mock.patch.object(hosting, "print_status"),
+            tempfile.TemporaryDirectory() as root,
+        ):
+            # A packed diffusion manifest marks the target for the backend's
+            # burst-aware throughput reporting.
+            Path(root, "manifest.json").write_text('{"diffusion": {}}')
+            Path(root, "tokenizer").mkdir()
+            args.assembly_dir = root
+            args.tokenizer = str(Path(root, "tokenizer"))
+            host = hosting.ModelHost(args)
+            host.load_initial()
+        self.assertTrue(backend_type.call_args.kwargs["diffusion"])
+        self.assertEqual(host.state, "loaded")
+
+    def test_host_takes_vision_from_the_ready_event(self):
         for vision in (True, False):
             with self.subTest(vision=vision):
                 runtime = mock.Mock()
                 runtime.readiness = native_wire.ReadyEvent(4, 131072, vision)
                 with (
-                    mock.patch.object(api, "parse_args", return_value=args),
-                    mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        hosting, "load_thinking_key", return_value=None
                     ),
-                    mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates") as templates_type,
                     mock.patch.object(
-                        api.engine_runtime,
+                        hosting.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
+                    ),
+                    mock.patch.object(hosting, "validate_tokenizer"),
+                    mock.patch.object(hosting, "ChatTemplates") as templates_type,
+                    mock.patch.object(
+                        hosting.engine_runtime,
                         "MultiplexedRuntime",
                         return_value=runtime,
                     ),
-                    mock.patch.object(api, "NativeBackend"),
-                    mock.patch.object(api, "ConstraintFactory"),
-                    mock.patch.object(api, "Frontend") as app_type,
-                    mock.patch.object(
-                        api,
-                        "FrontendServer",
-                        return_value=mock.Mock(server_port=8000),
-                    ),
-                    mock.patch.object(api.signal, "signal"),
-                    mock.patch.object(api, "print_status") as status,
+                    mock.patch.object(hosting, "NativeBackend"),
+                    mock.patch.object(hosting, "ConstraintFactory"),
+                    mock.patch.object(hosting, "Frontend") as app_type,
+                    mock.patch.object(hosting, "print_status") as status,
                 ):
-                    api.main()
+                    hosting.ModelHost(main_args()).load_initial()
                 self.assertIs(app_type.call_args.kwargs["vision"], vision)
                 self.assertIs(
                     app_type.call_args.kwargs["chat_templates"],
@@ -3882,11 +3942,7 @@ class ServerTest(unittest.TestCase):
                     status.call_args_list,
                 )
                 self.assertIn(
-                    mock.call(
-                        "Ready · test-model · context 128K"
-                        + ("" if vision else " · language only")
-                        + " · http://127.0.0.1:8000"
-                    ),
+                    mock.call("Loading · test-model"),
                     status.call_args_list,
                 )
 
@@ -3896,36 +3952,21 @@ class ServerTest(unittest.TestCase):
             "page open in a browser that reaches this server use it",
             error=True,
         )
+        host = mock.Mock()
+        host.app = mock.Mock(model="test-model", max_context=131072, vision=False)
         for origins, key, warned in (
             ([("tauri", "localhost", None)], None, False),
             ([ANY_ORIGIN], None, True),
             ([ANY_ORIGIN], "key", False),
         ):
             with self.subTest(origins=origins, key=key):
-                runtime = mock.Mock()
-                runtime.readiness = native_wire.ReadyEvent(
-                    max_concurrent_requests=4, max_context_tokens=131072, vision=False
-                )
                 with (
                     mock.patch.object(
                         api,
                         "parse_args",
                         return_value=main_args(allowed_origin=origins, api_key=key),
                     ),
-                    mock.patch.object(api, "load_thinking_key", return_value=None),
-                    mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
-                    ),
-                    mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates"),
-                    mock.patch.object(
-                        api.engine_runtime,
-                        "MultiplexedRuntime",
-                        return_value=runtime,
-                    ),
-                    mock.patch.object(api, "NativeBackend"),
-                    mock.patch.object(api, "ConstraintFactory"),
-                    mock.patch.object(api, "Frontend"),
+                    mock.patch.object(api, "ModelHost", return_value=host),
                     mock.patch.object(
                         api,
                         "FrontendServer",
@@ -3942,22 +3983,12 @@ class ServerTest(unittest.TestCase):
 
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
         args = main_args(max_context=128, max_memory=32 * 1024**3)
-        runtime = mock.Mock()
-        runtime.wait_ready.side_effect = api.engine_runtime.EngineUnhealthy("late")
-        backend = mock.Mock()
+        host = mock.Mock(backend=None, runtime=None)
+        host.load_initial.side_effect = api.engine_runtime.EngineUnhealthy("late")
         server = mock.Mock()
         with (
             mock.patch.object(api, "parse_args", return_value=args),
-            mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
-            ),
-            mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
-            mock.patch.object(
-                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
-            ),
-            mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ModelHost", return_value=host),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -3967,33 +3998,25 @@ class ServerTest(unittest.TestCase):
         server.server_bind.assert_called_once_with()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
-        backend.close.assert_called_once()
+        host.close.assert_called_once_with()
         self.assertIn("Error · late", stderr.getvalue())
 
-    def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
-        server = mock.Mock()
+    def test_build_rejects_an_unservable_chat_template_before_starting_native(self):
         with (
-            mock.patch.object(api, "parse_args", return_value=main_args()),
-            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(hosting, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer,
+                hosting.AutoTokenizer,
                 "from_pretrained",
                 return_value=SimpleNamespace(chat_template=None),
             ),
-            mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
-            mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.signal, "signal"),
-            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
-            self.assertRaisesRegex(SystemExit, "1"),
+            mock.patch.object(hosting, "validate_tokenizer"),
+            mock.patch.object(
+                hosting.engine_runtime, "MultiplexedRuntime"
+            ) as runtime,
+            self.assertRaises(ChatTemplateError),
         ):
-            api.main()
+            hosting.ModelHost(main_args()).load_initial()
         runtime.assert_not_called()
-        server.server_activate.assert_not_called()
-        server.server_close.assert_called_once_with()
-        self.assertIn(
-            "Error · the tokenizer defines no chat template", stderr.getvalue()
-        )
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = main_args(port=8000)
@@ -4002,18 +4025,123 @@ class ServerTest(unittest.TestCase):
         with (
             mock.patch.object(api, "parse_args", return_value=args),
             mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
-            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(api, "ModelHost") as host_type,
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             self.assertRaisesRegex(SystemExit, "1"),
         ):
             api.main()
-        tokenizer.assert_not_called()
-        runtime.assert_not_called()
+        host_type.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
         self.assertIn("Address already in use", stderr.getvalue())
+
+    def loaded_host(self, harness):
+        """A real ModelHost publishing the harness's app, with no engine."""
+        with mock.patch.object(hosting, "load_thinking_key", return_value=None):
+            host = hosting.ModelHost(main_args())
+        host.app = harness.app
+        host.backend = harness.backend
+        host.state = "loaded"
+        harness.server.host = host
+        return host
+
+    def test_unload_frees_the_served_model(self):
+        harness = self.harness(FakeRuntime())
+        host = self.loaded_host(harness)
+        with mock.patch.object(hosting, "print_status"):
+            status, _, payload = harness.request("POST", "/v1/models/unload", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["model"], "test-model")
+        self.assertIsNone(host.app)
+        self.assertEqual(host.state, "unloaded")
+        status, _, payload = harness.request("GET", "/ready")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(payload)["status"], "unloaded")
+        status, _, payload = harness.request("GET", "/v1/models")
+        self.assertEqual(json.loads(payload)["data"], [])
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(payload)["error"]["code"], "model_not_loaded"
+        )
+
+    def test_unload_refuses_while_requests_run_unless_forced(self):
+        harness = self.harness(FakeRuntime())
+        host = self.loaded_host(harness)
+        busy = mock.MagicMock()
+        busy.active = {"job": object()}
+        host.backend = busy
+        status, _, payload = harness.request("POST", "/v1/models/unload", {})
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload)["error"]["code"], "engine_busy")
+        busy.close.assert_not_called()
+        status, _, payload = harness.request(
+            "POST", "/v1/models/unload", {"force": True}
+        )
+        self.assertEqual(status, 200)
+        busy.close.assert_called_once_with()
+        self.assertIsNone(host.app)
+
+    def test_load_swaps_to_an_installed_model(self):
+        harness = self.harness(FakeRuntime())
+        host = self.loaded_host(harness)
+        new_backend = mock.MagicMock()
+        new_app = mock.Mock(
+            model="owner/repo",
+            max_context=131072,
+            vision=True,
+            input_modalities=["text", "image", "pdf"],
+        )
+        with (
+            mock.patch.object(host, "_hold", return_value=(Path("/tmp/repo"), None)),
+            mock.patch.object(
+                host,
+                "_build",
+                return_value=(mock.Mock(), new_backend, new_app, 131072, True),
+            ),
+            mock.patch.object(hosting, "print_status"),
+        ):
+            status, _, payload = harness.request(
+                "POST", "/v1/models/load", {"model": "owner/repo"}
+            )
+        self.assertEqual(status, 200)
+        loaded = json.loads(payload)
+        self.assertEqual(loaded["status"], "loaded")
+        self.assertEqual(loaded["model"], "owner/repo")
+        self.assertIs(host.app, new_app)
+        self.assertEqual(host.state, "loaded")
+        # The previous model's engine was freed before the new one started.
+        self.assertIs(host.backend, new_backend)
+
+    def test_load_refuses_a_model_that_is_not_installed(self):
+        harness = self.harness(FakeRuntime())
+        with tempfile.TemporaryDirectory() as models:
+            with mock.patch.object(
+                hosting, "load_thinking_key", return_value=None
+            ):
+                host = hosting.ModelHost(main_args(models_dir=models))
+            host.app = harness.app
+            host.backend = harness.backend
+            host.state = "loaded"
+            harness.server.host = host
+            status, _, payload = harness.request(
+                "POST", "/v1/models/load", {"model": "owner/repo"}
+            )
+        self.assertEqual(status, 404)
+        self.assertIn("not installed", json.loads(payload)["error"]["message"])
+        # The served model keeps serving; nothing was swapped.
+        self.assertIs(host.app, harness.app)
+
+    def test_load_rejects_a_malformed_model_id(self):
+        harness = self.harness(FakeRuntime())
+        self.loaded_host(harness)
+        status, _, payload = harness.request(
+            "POST", "/v1/models/load", {"model": "not-a-repo"}
+        )
+        self.assertEqual(status, 400)
 
     def test_tools_history_choice_and_output(self):
         runtime = FakeRuntime(Plan([[5]]))
@@ -9345,6 +9473,76 @@ class MessageNormalizationTest(unittest.TestCase):
                 vision=True,
                 deadline=FOREVER,
             )
+
+
+class WebFetchEndpointTest(unittest.TestCase):
+    """POST /v1/tools/fetch serves the chat page's web_fetch tool; it runs
+    beside generation like the disk and model control endpoints."""
+
+    def setUp(self):
+        self.harness = Harness(FakeRuntime())
+        self.addCleanup(self.harness.close)
+
+    def test_fetch_returns_the_result(self):
+        harness = self.harness
+        result = {"url": "https://example.com/", "status": 200, "text": "hi"}
+        with mock.patch.object(webfetch, "fetch", return_value=result) as fetch:
+            status, _, payload = harness.request(
+                "POST", "/v1/tools/fetch", {"url": "https://example.com/"}
+            )
+        fetch.assert_called_once_with("https://example.com/")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), result)
+
+    def test_fetch_rejects_a_missing_url(self):
+        status, _, payload = self.harness.request("POST", "/v1/tools/fetch", {})
+        self.assertEqual(status, 400)
+        self.assertIn("url", json.loads(payload)["error"]["message"])
+
+    def test_fetch_refuses_local_addresses(self):
+        status, _, payload = self.harness.request(
+            "POST", "/v1/tools/fetch", {"url": "http://127.0.0.1:9/internal"}
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(json.loads(payload)["error"]["code"], "unsupported")
+
+
+class WebSearchEndpointTest(unittest.TestCase):
+    """POST /v1/tools/search backs the chat page's web_search tool."""
+
+    def setUp(self):
+        self.harness = Harness(FakeRuntime())
+        self.addCleanup(self.harness.close)
+
+    def test_search_returns_the_result(self):
+        result = {
+            "provider": "bing",
+            "results": [{"title": "T", "url": "u", "snippet": "s"}],
+        }
+        with mock.patch.object(
+            websearch, "search", return_value=result
+        ) as search:
+            status, _, payload = self.harness.request(
+                "POST",
+                "/v1/tools/search",
+                {"query": "apple silicon", "provider": "bing"},
+            )
+        search.assert_called_once_with(
+            "apple silicon", provider="bing", api_key="", instance="", count=8
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), result)
+
+    def test_search_rejects_a_missing_query(self):
+        status, _, payload = self.harness.request("POST", "/v1/tools/search", {})
+        self.assertEqual(status, 400)
+        self.assertIn("query", json.loads(payload)["error"]["message"])
+
+    def test_search_rejects_an_unknown_provider(self):
+        status, _, _payload = self.harness.request(
+            "POST", "/v1/tools/search", {"query": "q", "provider": "altavista"}
+        )
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

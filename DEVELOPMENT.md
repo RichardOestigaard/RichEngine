@@ -297,6 +297,24 @@ Jinja's `string` filter spell them. Calls are not validated against their
 schemas; a client reports what its tool rejects. A `stop` string cannot be
 combined with tools a call may name, since it could cut a call.
 
+The chat page ships four built-in tools, each toggleable in the composer
+menu: `get_current_time` answers the local date, time and timezone from the
+browser; `memory_save`, `memory_list` and `memory_delete` keep keyed facts in
+browser storage across chats; `web_fetch` reads a public web page through
+`POST /v1/tools/fetch`, which accepts `{"url": ...}` and returns its status,
+content type, title and extracted text; and `web_search` queries the provider
+the Settings page picks through `POST /v1/tools/search`, which accepts
+`{"query", "provider", "api_key", "instance", "count"}` and returns matching
+pages as title, URL and snippet. Providers: `bing` (public RSS, no key),
+`brave` and `tavily` (the caller's key), and `searxng` (the caller's instance
+URL — the one tool endpoint where a private address is allowed, since a
+self-hosted instance is the point). The fetch endpoint runs beside
+generation like the other control routes, needs no loaded model, follows
+redirects that each pass the same check, and refuses non-http(s) URLs, URLs
+carrying credentials, and names resolving to private, loopback or
+link-local addresses. Fetched bodies are limited to 2 MB of text content
+types and 60k characters of returned text.
+
 ## Upstream model loading
 
 `install/upstream.py` installs a model from its upstream repository: it
@@ -333,6 +351,15 @@ richengine serve --model mlx-community/Qwen3.8-27B-4bit --language-only
 
 A model ID with `--revision`, `--language-only` or `--draft-model` is a
 separate installation from the same ID without them.
+
+The Gemma 4 families (`Gemma4-26B-A4B`,
+`DiffusionGemma-26B-A4B`) are neither GGUF nor MLX targets: upstream.py
+packs the safetensors checkpoint into a local
+`richengine-packed-q4-*` package at install time (`install/pack.py`),
+including the plain DFlash draft for the AR model and the
+self-conditioning/encoder-scalar files for the diffusion model. Their
+packages live under `models/.packed/`, and everything else in this
+section — revisions, pins, atomic links — applies unchanged.
 
 ### Revisions
 
@@ -409,7 +436,7 @@ family's draft signature (`Draft.signature`), every field and value native
 loading requires, so a draft of another architecture never replaces one that
 loads. Native loading validates the configuration against the target and
 loads the draft like a target ([Weight loading](#weight-loading)):
-`DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a RichEngine
+`DFlash2CheckpointLoader` (`DraftCheckpoint.cpp`) plans the images of a RichEngine
 package's packed draft files, `layer-<N>.bin` and `model.bin`, and
 `AffinePreparation` quantizes each projection to 4 bits in groups of 64 as
 MLX's affine quantization rounds it and copies every other tensor as stored.
@@ -508,7 +535,7 @@ draft and any vision tower in the packed layouts of RichEngine packages, which r
 the same kernels, and a GGUF target in the `MDGG0001` layout of the GGUF
 kernels. Each source adapter is a loader, which validates the source's metadata
 and plans its images, and a writer: `AffineTargetLoader` (`AffineTarget.cpp`)
-and `AffinePreparation` for an MLX target, `DraftCheckpointLoader`
+and `AffinePreparation` for an MLX target, `DFlash2CheckpointLoader`
 (`DraftCheckpoint.cpp`) and `AffinePreparation` for the draft,
 `GgufTargetLoader` (`GgufTarget.cpp`, planned by `GgufImage.cpp`) and
 `GgufPreparation` for a GGUF target, `VisionLoader` and `VisionPreparation` for
@@ -618,8 +645,8 @@ requests on the moved pages. The counts and the longest allocation include the
 runway allocated at startup, before serving begins; how long a whole pass holds
 the loop shows in `loop.max_tick_ms`.
 
-`loadQwenTarget` (`QwenTargetLoader.hpp`) reads a target's images
-(`QwenTargetFiles`: a package's packed files, or the images
+`loadTargetWeights` (`TargetLoader.hpp`) reads a target's images
+(`TargetFiles`: a package's packed files, or the images
 `AffineTargetLoader` or `GgufTargetLoader` plans) through the format that
 stores them. `AffineTargetFormat`, for packed and MLX images, reads every
 projection, a fused one too, as one affine Q4 tensor and the norms as bf16.

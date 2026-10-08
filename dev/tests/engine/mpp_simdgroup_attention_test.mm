@@ -5,6 +5,8 @@
 // usage: mpp-simdgroup-attention METALLIB [groups] [pages] [reps]
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+
+#include "ops/KernelNames.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -128,8 +130,8 @@ int main(int argc, const char *argv[]) {
       return ts[ts.size() / 2];
     };
 
-    run(@"mpp_attention_threadgroup", oBuf2, stBuf2, false);
-    run(@"mpp_attention_simdgroup", oBuf, stBuf, false);
+    run(@(richengine::ops::kMppAttentionThreadgroup.data()), oBuf2, stBuf2, false);
+    run(@(richengine::ops::kMppAttentionSimdgroup.data()), oBuf, stBuf, false);
     uint32_t *fl = (uint32_t *)flBuf.contents;
     printf("flags: left_compat=%u iter_compat=%u scores_cap=%u running_cap=%u rowred_cap=%u tg_running_cap=%u\n",
            fl[0], fl[1], fl[2], fl[3], fl[4], fl[8]);
@@ -204,8 +206,8 @@ int main(int argc, const char *argv[]) {
     printf("verify: |sg-ref|max=%.5g |tg-ref|max=%.5g over %u groups\n",
            refDiff1, refDiff2, groups);
 
-    double tsg = run(@"mpp_attention_simdgroup", oBuf, stBuf, true);
-    double ttg = run(@"mpp_attention_threadgroup", oBuf2, stBuf2, true);
+    double tsg = run(@(richengine::ops::kMppAttentionSimdgroup.data()), oBuf, stBuf, true);
+    double ttg = run(@(richengine::ops::kMppAttentionThreadgroup.data()), oBuf2, stBuf2, true);
     printf("groups=%u pages=%u reps=%u\n", groups, pages, reps);
     printf("simdgroup-chained: %.3f ms\n", tsg * 1e3);
     printf("threadgroup-staged: %.3f ms\n", ttg * 1e3);

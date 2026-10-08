@@ -96,24 +96,51 @@ void run(const std::string &metallibPath) {
       {"dense_attn_out_q6k", 2'048, 2'048, GGUF_FMT_Q6K},
       {"dense_qkv_q6k", 2'048, 2'048, GGUF_FMT_Q6K},
       {"dense_kv_q6k", 512, 2'048, GGUF_FMT_Q6K},
-      {"dense_up_q6k", 3'072, 2'048, GGUF_FMT_Q6K},
+      {"dense_up_q6k", 6'144, 2'048, GGUF_FMT_Q6K},
       {"dense_down_q6k", 2'048, 6'144, GGUF_FMT_Q6K},
-      {"dense_up", 3'072, 2'048, GGUF_FMT_Q4K},
+      {"dense_up", 6'144, 2'048, GGUF_FMT_Q4K},
       {"dense_down", 2'048, 6'144, GGUF_FMT_Q4K},
       {"dense_head", 130'560, 2'048, GGUF_FMT_Q6K},
-      // LFM2.5-2.6B (2048-wide).
+      // LFM2.5-2.6B (2048-wide): the Q4_K_M install quantizes four attn_v
+      // and fourteen ffn_down tensors as Q6_K.
       {"lfm_qkv_q", 2'048, 2'048, GGUF_FMT_Q4K},
       {"lfm_qkv_kv", 1'024, 2'048, GGUF_FMT_Q4K},
+      {"lfm_v_q6k", 512, 2'048, GGUF_FMT_Q6K},
+      {"lfm_conv_in", 6'144, 2'048, GGUF_FMT_Q4K},
+      {"lfm_gateup", 10'752, 2'048, GGUF_FMT_Q4K},
       {"lfm_down", 2'048, 10'752, GGUF_FMT_Q4K},
+      {"lfm_down_q6k", 2'048, 10'752, GGUF_FMT_Q6K},
       {"lfm_head", 128'000, 2'048, GGUF_FMT_Q6K},
+      {"lfm_head_q4k", 128'000, 2'048, GGUF_FMT_Q4K},
+      // LFM2.5-8B-A1B's two leading dense FFNs (gate/up 7168 x 2048).
+      {"a1b_dense_up", 7'168, 2'048, GGUF_FMT_Q4K},
+      {"a1b_dense_down", 2'048, 7'168, GGUF_FMT_Q4K},
       // The 2B shapes' MXFP4 decode tiers on family 10: the staged table
-      // decode (mxfp4n) against the multiplane tile (mxfp4m).
+      // decode (mxfp4n), the multiplane tile (mxfp4m) and the packed
+      // activation decode (mxfp4p) production single-tensor plans run.
+      {"mx_conv_staged", 6'144, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx_conv_multi", 6'144, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx_conv_packed", 6'144, 2'048, GGUF_FMT_MXFP4, "mxfp4p"},
+      {"mx_up_staged", 10'752, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx_up_multi", 10'752, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx_up_packed", 10'752, 2'048, GGUF_FMT_MXFP4, "mxfp4p"},
+      {"mx_down_packed", 2'048, 10'752, GGUF_FMT_MXFP4, "mxfp4p"},
+      {"mx_out_packed", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4p"},
       {"mx_qkv_staged", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
       {"mx_qkv_multi", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
       {"mx_down_staged", 2'048, 10'752, GGUF_FMT_MXFP4, "mxfp4n"},
       {"mx_down_multi", 2'048, 10'752, GGUF_FMT_MXFP4, "mxfp4m"},
       {"mx_head_staged", 128'000, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
       {"mx_head_multi", 128'000, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      // MiniCPM5-2B's MXFP4 shapes: fused-QKV's Q segment, gate/up and down.
+      {"mx5_qkv_staged", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx5_qkv_multi", 2'048, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx5_up_staged", 6'144, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx5_up_multi", 6'144, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx5_down_staged", 2'048, 6'144, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx5_down_multi", 2'048, 6'144, GGUF_FMT_MXFP4, "mxfp4m"},
+      {"mx5_head_staged", 130'560, 2'048, GGUF_FMT_MXFP4, "mxfp4n"},
+      {"mx5_head_multi", 130'560, 2'048, GGUF_FMT_MXFP4, "mxfp4m"},
       // LFM2.5-8B-A1B's tied head: Q8_0, 128K rows of 2048.
       {"a1b_head", 128'000, 2'048, GGUF_FMT_Q80},
       // Granite-4.2-3B (2560-wide): gate and up share one packed projection,
@@ -137,8 +164,14 @@ void run(const std::string &metallibPath) {
   const FusedShape fused[] = {
       // MiniCPM5-2B: q + kv + kv (16 query heads, 2 KV heads x 128).
       {"dense_qkv", {2'048, 256, 256}, 2'048, GGUF_FMT_Q4K},
-      // LFM2.5-2.6B: q + kv + kv (2 KV heads x 128 on the 2048 model).
+      {"mx5_qkv", {2'048, 256, 256}, 2'048, GGUF_FMT_MXFP4},
+      // LFM2.5-2.6B: q + kv + kv (2 KV heads x 128 on the 2048 model) and
+      // gate + up (production runs them as two staged dispatches; the fused
+      // numbers judge whether that leaves anything behind).
       {"lfm_qkv", {2'048, 512, 512}, 2'048, GGUF_FMT_Q4K},
+      {"lfm_qkv_mx", {2'048, 512, 512}, 2'048, GGUF_FMT_MXFP4},
+      {"lfm_gateup", {10'752, 10'752}, 2'048, GGUF_FMT_Q4K},
+      {"lfm_gateup_mx", {10'752, 10'752}, 2'048, GGUF_FMT_MXFP4},
       // Granite-4.2-3B: q + k + v (8 KV heads of 64) and gate + up; its V is
       // Q6_K while the sweep's segments share one format, so the QKV numbers
       // read slightly slow against the mixed projection.
@@ -165,17 +198,29 @@ void run(const std::string &metallibPath) {
     const Image image =
         allocateImage(backend, shape, shape.label);
     for (const auto &tile : tiles) {
+      const std::string_view kernelName =
+          shape.kernel ? shape.kernel : f.name;
       char name[64];
       std::snprintf(name, sizeof(name), tile.kernel,
-                    shape.kernel ? shape.kernel : f.name);
-      // The mxfp4m decoders exist only where the multiplane fp4 tensor does.
-      if (std::string_view(shape.kernel ? shape.kernel : "") == "mxfp4m" &&
+                    std::string(kernelName).c_str());
+      const bool packedInput = kernelName == "mxfp4p";
+      // The mxfp4m/mxfp4p decoders exist only where the multiplane fp4
+      // tensor does.
+      if ((kernelName == "mxfp4m" || packedInput) &&
           capabilities.appleGpuFamily < 10)
         continue;
       const uint32_t columnTiles = shape.outputSize / GGUF_TILE_COLUMNS;
+      // mxfp4p reads the pre-packed fp16 operand; buffer 2 carries its
+      // exponent bytes instead of a second weight plane.
       MetalBuffer input = backend.allocateBuffer(
-          uint64_t{tile.rows} * shape.inputSize * sizeof(__bf16),
+          uint64_t{tile.rows} * shape.inputSize *
+              (packedInput ? sizeof(__fp16) : sizeof(__bf16)),
           BufferStorage::Shared, "input");
+      MetalBuffer exponents;
+      if (packedInput)
+        exponents = backend.allocateBuffer(
+            uint64_t{tile.rows} * shape.inputSize / 32,
+            BufferStorage::Shared, "exponents");
       MetalBuffer output = backend.allocateBuffer(
           uint64_t{tile.rows} * shape.outputSize * sizeof(__bf16),
           BufferStorage::Shared, "output");
@@ -194,7 +239,7 @@ void run(const std::string &metallibPath) {
         dispatch.pipelineName = name;
         const MetalBuffer &plane1 = image.plane1 ? image.plane1 : image.meta;
         dispatch.buffers = {
-            {0, input},  {1, image.plane0}, {2, plane1},
+            {0, input},  {1, image.plane0}, {2, packedInput ? exponents : plane1},
             {3, image.meta}, {4, output}, {5, partials}, {6, counters},
             {7, output}};
         GgufDecodeParams params{shape.inputSize, splits, shape.outputSize, 0};

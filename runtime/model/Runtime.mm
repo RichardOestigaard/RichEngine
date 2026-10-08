@@ -3,13 +3,14 @@
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
 #include "model/QwenState.hpp"
-#include "model/QwenTarget.hpp"
+#include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
+#include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
@@ -314,6 +315,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
       ++impl->counters.aneFfnReruns;
     }
     impl->releasePrefillInputBank(inputBank);
+    // RICHENGINE_MOE_STATS readback; a no-op unless the flag is "1".
+    ops::MoE::logStats(impl->prefillArena->moeScratch().tileCount);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {
@@ -345,7 +348,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
       // The anchor this chunk selects when it completes a generation prompt.
       std::optional<uint32_t> selected;
       if (nextLength == entry.promptTokens && !entry.replayingGeneration &&
-          entry.scoreTokens.empty() && entry.constraint == ConstraintMode::None) {
+          !impl->diffusion && entry.scoreTokens.empty() &&
+          entry.constraint == ConstraintMode::None) {
         selected = impl->initialToken(lane);
         if (std::string failure = impl->invalidSelection({&*selected, 1});
             !failure.empty()) {
@@ -404,10 +408,11 @@ Runtime::prefillAsync(const BatchPlan &plan,
         } else if (selected) {
           impl->commitSelected(entry, {&*selected, 1});
           impl->emitTerminalAnchor(entry, result);
-        } else {
+        } else if (!impl->diffusion) {
           // The first token waits for the request's first mask. A replay
           // never gets here: it keeps its stage, and a request that holds
-          // its mask asks for none.
+          // its mask asks for none. DiffusionGemma selects no anchor at all:
+          // its canvas commits the first tokens.
           impl->captureFinalHidden(entry, lane);
           entry.decodeStage = DecodeStage::ApplyInitialMask;
           result.nextDecodeStage = DecodeStage::ApplyInitialMask;
@@ -445,6 +450,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
           "only constrained decode uses a specialized decode stage");
     }
     return impl_->submitInitialSelection(items, std::move(completion));
+  }
+  // DiffusionGemma's decode is the whole canvas denoising loop, synchronous
+  // and single-lane: it selects no anchors and commits up to a canvas of
+  // tokens per step (RuntimeDiffusion.mm).
+  if (impl_->diffusion) {
+    return impl_->decodeDiffusion(plan, items, std::move(completion));
   }
 
   const uint32_t width = static_cast<uint32_t>(items.size());
@@ -490,12 +501,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
     // The lane's proposal budget caps acceptance at one row below its
     // retention limit anyway; a lane near its output cap verifies only the
-    // rows it could still keep.
+    // rows it could still keep. The draft checkpoint's trained block bounds
+    // the ceiling: queries past it emit picks the block never learned.
+    const uint32_t proposalCap =
+        std::getenv("RICHENGINE_PROPOSAL_CAP")
+            ? static_cast<uint32_t>(
+                  std::atoi(std::getenv("RICHENGINE_PROPOSAL_CAP")))
+            : impl_->geometry.draft.proposalLimit();
     const uint32_t budget =
         impl_->adaptiveProposals_ && !constrained
-            ? std::clamp(entry.proposalBudget, uint32_t{1},
-                         uint32_t{kDraftProposalTokens})
-            : uint32_t{kDraftProposalTokens};
+            ? std::clamp(entry.proposalBudget,
+                         std::min<uint32_t>(1, proposalCap), proposalCap)
+            : proposalCap;
     proposals[lane] =
         std::min(budget, laneResult.maximumRetained - 1);
     liveRows[lane] = proposals[lane] + 1;
@@ -514,22 +531,70 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
-  // A completed ANE predraft stands in for the draft forward when its assumed
-  // anchors and positions match every lane — the chain path consumes its
-  // proposals; there is no tree table, so a predrafted batch stays a chain.
-  // A Null draft (Granite) has nothing to encode even for a constrained
-  // batch: the n-gram predraft writes its ProposedTokens in its place.
   const bool nullDraft =
       std::holds_alternative<NullDraft>(impl_->draftModel);
+  // The tree decision needs every lane's policy: a tree batch is all greedy,
+  // unconstrained, unpenalized draft lanes, at most two wide. It is decided
+  // before the predraft so a Null draft's n-gram chain can leave as a comb
+  // table instead of a bare chain.
+  const bool treeBatch =
+      !constrained && impl_->treeVerifyBatch(entries, width, constrained);
+  // A completed ANE predraft stands in for the draft forward when its assumed
+  // anchors and positions match every lane — the chain path consumes its
+  // proposals; there is no tree table, so it stays a chain. The n-gram
+  // predraft does emit comb tables for a tree-eligible Null draft batch.
+  impl_->predraftedTree_ = false;
   const bool predrafted =
       (!constrained || nullDraft) &&
       (impl_->applyAnePredraft(entries, items, width) ||
-       impl_->applyNgramPredraft(entries, width));
-  // The tree decision needs every lane's policy: a tree batch is all greedy,
-  // unconstrained, unpenalized DFlash lanes, at most two wide.
-  const bool tree =
-      !predrafted && !constrained &&
-      impl_->treeVerifyBatch(entries, width, constrained);
+       impl_->applyNgramPredraft(entries, width, nullDraft && treeBatch));
+  // Adaptive draft bypass: when every lane's acceptance EWMA sits below the
+  // draft's break-even cost, the batch decodes anchor-only — the draft
+  // forward, its vocabulary head read and the selector all skip. A lane
+  // whose probe is due keeps the whole batch drafted so its EWMA recovers.
+  bool draftBypassed = false;
+  if (!predrafted && !constrained && !nullDraft && impl_->draftBypass_) {
+    draftBypassed = true;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const Impl::Request &entry = *entries[lane];
+      // draftProbeAt is only scheduled by a bypassed step; zero means the
+      // lane never bypassed and owes no probe.
+      if (entry.proposalAcceptedAvg >= impl_->draftBypassExpect_ ||
+          (entry.draftProbeAt && entry.generatedTokens >= entry.draftProbeAt)) {
+        draftBypassed = false;
+        break;
+      }
+    }
+    if (draftBypassed) {
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        Impl::Request &entry = *entries[lane];
+        // The acceptance kernel reads proposals=0 as "uncapped", so the
+        // bypass is expressed through the buffer: anchor-repeat proposals
+        // almost never match the target's argmax, and a lucky match only
+        // emits real verified tokens. All verify rows stay live so a
+        // matched row never emits a dead row's stale argmax.
+        proposals[lane] = 0;
+        liveRows[lane] = kDecodeRows;
+        entry.draftBypassed = true;
+        std::fill_n(
+            contents<uint32_t>(
+                impl_->decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                "bypass proposals"),
+            kDraftProposalTokens, *entry.pendingToken);
+        if (impl_->draftDebug_)
+          fprintf(stderr, "draft-bypass lane=%u ewma=%.2f\n", lane,
+                  entry.proposalAcceptedAvg);
+      }
+    }
+  }
+  const bool tree = !draftBypassed && treeBatch &&
+                    (predrafted ? impl_->predraftedTree_ : true);
+  if (impl_->treeDebug_)
+    fprintf(stderr,
+            "tree-gate width=%u treeBatch=%d drafted=%d predrafted=%d "
+            "predraftedTree=%d constrained=%d bypassed=%d\n",
+            width, treeBatch, !draftBypassed, predrafted,
+            impl_->predraftedTree_, constrained, draftBypassed);
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   if (tree) {
@@ -544,7 +609,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::RopeCos, 2 * width),
         impl_->decodeArena->packed(DecodeTensor::RopeSin, 2 * width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
-        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width),
+        impl_->decodeArena->packed(DecodeTensor::RopeCosAlt, 2 * width),
+        impl_->decodeArena->packed(DecodeTensor::RopeSinAlt, 2 * width));
   } else {
     impl_->addRopeTables(
         commandGraph,
@@ -553,9 +620,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
         ropeRows, impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::RopeSin, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
-        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width),
+        impl_->decodeArena->packed(DecodeTensor::RopeCosAlt, width),
+        impl_->decodeArena->packed(DecodeTensor::RopeSinAlt, width));
   }
-  if (!predrafted) {
+  if (!predrafted && !draftBypassed) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width);
     impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -590,7 +659,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::RopeCos, 2 * width),
         impl_->decodeArena->packed(DecodeTensor::RopeSin, 2 * width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
-        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width),
+        impl_->decodeArena->packed(DecodeTensor::RopeCosAlt, 2 * width),
+        impl_->decodeArena->packed(DecodeTensor::RopeSinAlt, 2 * width));
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width, 2);
     if (!skipForward)
@@ -604,7 +675,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->encodeBatchTreeKvCompact(commandGraph, entries, items);
     if (!skipCommits && !skipGdn)
       impl_->encodeBatchGdnCommit(commandGraph, entries, true);
-    if (!skipCommits && !skipDraft)
+    // A Null draft keeps no context: its capture gather and context commit
+    // would dispatch work whose result nothing consumes.
+    if (!skipCommits && !skipDraft && !nullDraft)
       impl_->encodeDraftStateCommitBatch(commandGraph, entries, items, true);
   } else {
     impl_->encodeBatchVerifyInput(commandGraph, width);
@@ -829,6 +902,9 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
+  // A diffusion warmup decode runs a whole canvas per lane; canvases are
+  // serial, so the width ladder buys nothing — one lane covers the path.
+  if (impl_->diffusion) width = 1;
   // Plan order is deliberately unrelated to state-lane order. DecodeArena
   // lanes follow the explicit BatchPlan, while recurrent and KV state stay
   // addressed by each request's state lane; batching must never assume lanes
@@ -845,7 +921,20 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
       beginColdRequest(request, stateLaneOrder[lane]);
-      pages[lane] = {5 + lane};
+      impl_->request(request.id).warmup = true;
+      if (impl_->diffusion) {
+        // The canvas writes KV into the request's own admitted pages:
+        // admit the whole canvas page range up front (position 1 + 256
+        // tokens → 9 pages), the way real admission does through
+        // decodeAdmissionTokens.
+        const uint32_t canvasPages =
+            (decodeAdmissionTokens() + kv::kPageTokens) /
+            kv::kPageTokens;
+        pages[lane].resize(1 + canvasPages);
+        std::iota(pages[lane].begin(), pages[lane].end(), lane * 16);
+      } else {
+        pages[lane] = {5 + lane};
+      }
       requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
                             .items = {{request.id, 1}},
@@ -870,15 +959,20 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
       const auto &lengths = impl_->states.metadata(stateLaneOrder[lane]).lengths;
-      committedEveryLane = !decoded[lane].outputTokens.empty() &&
-                           lengths.targetTokens > 1 &&
-                           lengths.targetTokens ==
-                               1 + decoded[lane].outputTokens.size() -
-                                   decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(
-                               impl_->geometry.draft.draftWindow());
+      // A diffusion decode commits a whole canvas, not the single anchor
+      // the draft/verify arithmetic expects.
+      committedEveryLane = impl_->diffusion
+          ? !decoded[lane].outputTokens.empty() && lengths.targetTokens > 1
+          : !decoded[lane].outputTokens.empty() &&
+                lengths.targetTokens > 1 &&
+                lengths.targetTokens ==
+                    1 + decoded[lane].outputTokens.size() -
+                        decoded[lane].outputTokensWithoutKv &&
+                lengths.hasCompleteDraftWindow(
+                    impl_->geometry.draft.draftWindow());
     }
-    if (!committedEveryLane || impl_->counters.lastDecodeWidth != width) {
+    if (!committedEveryLane ||
+        (!impl_->diffusion && impl_->counters.lastDecodeWidth != width)) {
       throw std::runtime_error(
           "decode warmup B" + std::to_string(width) +
           " mismatch [committed=" + std::to_string(committedEveryLane) +
@@ -912,9 +1006,19 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   std::shared_ptr<const CompositeState> cachedState;
   double wallSeconds = 0.0;
   beginColdRequest(request, 0);
+  impl_->request(id).warmup = true;
   try {
     // Deliberately non-contiguous physical ids exercise page-table lookup.
-    const std::vector<uint32_t> pages{12, 10, 11};
+    // The diffusion canvas writes KV into the admitted page range, so its
+    // warmup admits position + canvas-length pages like a real request.
+    std::vector<uint32_t> pages{12, 10, 11};
+    if (impl_->diffusion) {
+      const uint32_t needed =
+          (promptTokens + decodeAdmissionTokens() + kv::kPageTokens - 1) /
+          kv::kPageTokens;
+      pages.resize(needed);
+      std::iota(pages.begin(), pages.end(), 3);
+    }
     requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, prefixTokens}},
@@ -929,6 +1033,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
       throw metal::MetalAllocationError("prefix warmup state allocation failed");
     end(id);
     beginColdRequest(request, 1);
+    impl_->request(id).warmup = true;
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
     setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {},
@@ -965,12 +1070,18 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
         impl_->counters.lastDecodeWallSeconds;
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
-    if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(impl_->geometry.draft.draftWindow()) ||
-        continued.targetTokens <= promptTokens ||
-        continued.targetTokens !=
-            promptTokens + decoded[0].outputTokens.size() -
-                decoded[0].outputTokensWithoutKv) {
+    const bool continuedExactly =
+        impl_->diffusion
+            ? !decoded[0].outputTokens.empty() &&
+                  continued.targetTokens > promptTokens
+            : !decoded[0].outputTokens.empty() &&
+                  continued.hasCompleteDraftWindow(
+                      impl_->geometry.draft.draftWindow()) &&
+                  continued.targetTokens > promptTokens &&
+                  continued.targetTokens ==
+                      promptTokens + decoded[0].outputTokens.size() -
+                          decoded[0].outputTokensWithoutKv;
+    if (decoded.size() != 1 || !continuedExactly) {
       throw std::runtime_error(
           "restored historical prefix did not continue exactly");
     }
@@ -1008,6 +1119,14 @@ uint32_t Runtime::draftWindow() const noexcept {
   return impl_->geometry.draft.draftWindow();
 }
 
+uint32_t Runtime::decodeAdmissionTokens() const noexcept {
+  if (impl_->diffusion) {
+    return std::get<DiffusionGemmaLayout>(impl_->package.descriptor.target)
+        .diffusion.canvasLength;
+  }
+  return ExecutionLimits::speculativeScratchTokens;
+}
+
 std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &model) {
   std::vector<ops::SwiGluProjections> layers;
   std::visit(
@@ -1016,8 +1135,12 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &model) {
             typename std::decay_t<decltype(weights.layers)>::value_type;
         // Every dense target's layers carry the SwiGLU projections the
         // split can take; a MoE target's routed blocks do not.
-        if constexpr (std::is_same_v<Layer, Qwen3_8LayerWeights>) {
-          for (const Qwen3_8LayerWeights &layer : weights.layers)
+        if constexpr (requires(const Layer &layer) {
+                        layer.gateProjection;
+                        layer.upProjection;
+                        layer.downProjection;
+                      }) {
+          for (const Layer &layer : weights.layers)
             layers.push_back({&layer.gateProjection, &layer.upProjection,
                               &layer.downProjection});
         }
@@ -1030,7 +1153,7 @@ void withPrefillArena(
     MetalBackend &backend, const ModelPackage &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
   const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
-  const QwenTargetPrefillBuffers buffers = detail::prefillBuffers(arena);
+  const TargetModelPrefillBuffers buffers = detail::prefillBuffers(arena);
   use(buffers.ffn(), buffers.hidden);
 }
 
@@ -1039,8 +1162,8 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format format) {
   requireCompatibleModelPackage(package);
-  if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
-    throw std::invalid_argument("model runtime requires Apple tensor BF16");
+  if (const auto error = device.validationError()) {
+    throw std::invalid_argument(*error);
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().laneBytes(),

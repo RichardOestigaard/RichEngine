@@ -2,8 +2,8 @@
 
 #include "Qwen3_8.hpp"
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -16,7 +16,7 @@ namespace richengine::model {
 struct Ornith9BLayout final : QwenHybridLayout<8> {
   static constexpr std::string_view layerMagic = "MDFL0006";
   static constexpr std::string_view headMagic = "MDFL0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  static constexpr FfnKind ffnKind = FfnKind::Dense;
 
   uint32_t intermediateSize = 12288;
 
@@ -44,10 +44,10 @@ struct Ornith9BLayout final : QwenHybridLayout<8> {
 };
 
 // The dense FFN reads the same per-layer tensors as the 27B.
-using Ornith9BWeights = QwenTargetWeights<Ornith9BLayout, Qwen3_8LayerWeights>;
+using Ornith9BWeights = TargetModelWeights<Ornith9BLayout, DenseLayerWeights>;
 
 [[nodiscard]] Ornith9BWeights
 loadOrnith9BWeights(metal::MetalBackend &backend, Ornith9BLayout layout,
-                    const QwenTargetFiles<Ornith9BLayout> &files);
+                    const TargetFiles<Ornith9BLayout> &files);
 
 } // namespace richengine::model

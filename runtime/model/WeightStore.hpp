@@ -102,10 +102,13 @@ readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                                        uint32_t inputSize, std::string_view label);
 
 // Embedding weights, scales and biases are independently aligned sections
-// so token gather can bind each table directly.
+// so token gather can bind each table directly. `tiled` records the packed
+// format's 256-row plane layout (pack.py); safetensors-sourced images copy
+// flat MLX rows and pass false.
 [[nodiscard]] ops::EmbeddingWeights
 readAffineEmbedding(WeightFile &file, uint32_t outputSize,
-                           uint32_t inputSize, std::string_view label);
+                           uint32_t inputSize, std::string_view label,
+                           bool tiled = false);
 
 [[nodiscard]] ops::Q8Projection
 readAffineQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,

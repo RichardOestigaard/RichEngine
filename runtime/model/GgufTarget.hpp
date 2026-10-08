@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "model/GgufFile.hpp"
@@ -49,6 +50,8 @@ private:
 };
 
 struct DenseLayout;
+struct DiffusionGemmaLayout;
+struct Gemma4MoeLayout;
 struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
@@ -59,6 +62,19 @@ struct Lfm2MoeLayout;
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout);
+
+// Gemma 4 has no GGUF image plan: the packed files only. The overload keeps
+// the target variant's generic dispatch compilable; the DiffusionGemma one
+// must be exact — the generic template below would otherwise win over the
+// base-class overload.
+[[nodiscard]] inline gguf::TargetGeometry
+ggufTargetGeometry(const Gemma4MoeLayout &) {
+  throw std::invalid_argument("Gemma 4 targets load from packed files only");
+}
+[[nodiscard]] inline gguf::TargetGeometry
+ggufTargetGeometry(const DiffusionGemmaLayout &) {
+  throw std::invalid_argument("Gemma 4 targets load from packed files only");
+}
 
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE
 // FFN.
@@ -78,7 +94,7 @@ template <class Layout>
   geometry.rotaryPairs = layout.rotaryPairs;
   geometry.rotaryTheta = layout.rotaryTheta;
   geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
-  if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
+  if constexpr (Layout::ffnKind == FfnKind::SparseMoe) {
     geometry.experts = layout.experts;
     geometry.expertsPerToken = layout.expertsPerToken;
     geometry.expertIntermediateSize = layout.expertIntermediateSize;

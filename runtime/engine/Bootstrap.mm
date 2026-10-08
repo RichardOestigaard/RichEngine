@@ -108,7 +108,9 @@ protocol::ProtocolLimits protocolLimitsFor(
   protocol::ProtocolLimits limits;
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
-  limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
+  limits.maxTokenBatch = capabilities.maximumStepTokens
+                             ? capabilities.maximumStepTokens
+                             : model::ExecutionLimits::maximumStepTokens;
   limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
                         (model::ExecutionLimits::draftQueryRows + 1);
@@ -290,12 +292,13 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
       memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
                        config.nativeLoop.engine.maxContext)) {
-    logStartup("The ", *hostAvailable / kMiB,
-               " MiB this Mac had available at startup may not hold a ",
+    logStartup(dim("The "), *hostAvailable / kMiB,
+               dim(" MiB this Mac had available at startup may not hold a "),
                config.nativeLoop.engine.maxContext,
-               "-token request; one that runs out of memory is suspended"
-               " and replays its prompt. --max-cache-disk SIZE keeps its"
-               " progress and cached prefixes on SSD.");
+               dim("-token request; one that runs out of memory is suspended"
+                   " and replays its prompt. "),
+               accent("--max-cache-disk"),
+               dim(" SIZE keeps its progress and cached prefixes on SSD."));
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;

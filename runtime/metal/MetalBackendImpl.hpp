@@ -485,6 +485,10 @@ private:
     }
 };
 
+// RICHENGINE_OP_TIMINGS: merges one dispatch's measured GPU seconds into
+// the per-pipeline table (MetalEncode.mm).
+void recordOpTiming(const std::string &name, double gpuSeconds);
+
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;

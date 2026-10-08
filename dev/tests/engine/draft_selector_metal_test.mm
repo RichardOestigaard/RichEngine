@@ -35,6 +35,7 @@ using namespace richengine::ops;
 constexpr uint32_t kRows = RICHENGINE_DRAFT_QUERY_ROWS;
 constexpr uint32_t kPositions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kCandidates = RICHENGINE_DRAFT_CANDIDATES;
+constexpr uint32_t kShards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
 constexpr uint32_t kRank = RICHENGINE_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
 
@@ -292,7 +293,9 @@ void runCase(MetalBackend &backend, const Case &c) {
                     std::fabs(scores[selected] - scores[expectedSelection]) < 1e-5,
                 "draft selector picked a different greedy candidate");
         if (expectedRunner < kCandidates &&
-            candidates[global * kCandidates + expectedRunner] != token) {
+            candidates[global * kCandidates + expectedRunner] != token &&
+            RICHENGINE_TREE_VERIFY_NODES / 2 + position <
+                RICHENGINE_TREE_VERIFY_NODES) {
           expectedLeaves.push_back(
               candidates[global * kCandidates + expectedRunner]);
           expectedLeafParents.push_back(position);
@@ -310,6 +313,10 @@ void runCase(MetalBackend &backend, const Case &c) {
             "verify tree anchor node is malformed");
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t row = laneBase + position + 1;
+      // A tree lane's comb holds the chain in the node block's front half
+      // only; a chain lane's block is the whole chain.
+      if (treeLane && position + 1 >= RICHENGINE_TREE_VERIFY_NODES / 2)
+        continue;
       require(treeTokens[row] == tokens[lane * kPositions + position] &&
                   RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) == position &&
                   RICHENGINE_TREE_NODE_DEPTH(treeNodes[row]) == position + 1 &&
@@ -317,11 +324,12 @@ void runCase(MetalBackend &backend, const Case &c) {
               "verify tree chain node is malformed");
     }
     const uint32_t expectedCount =
-        kPositions + 1 + (treeLane ? expectedLeaves.size() : 0);
+        std::min<uint32_t>(kPositions + 1, RICHENGINE_TREE_VERIFY_NODES);
     require(treeCounts[lane] == expectedCount,
             "verify tree node count is wrong");
     for (uint32_t leaf = 0; leaf < expectedLeaves.size(); ++leaf) {
-      const uint32_t row = laneBase + kPositions + 1 + leaf;
+      const uint32_t row = laneBase + RICHENGINE_TREE_VERIFY_NODES / 2 +
+                           expectedLeafParents[leaf];
       require(treeTokens[row] == expectedLeaves[leaf] &&
                   RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) ==
                       expectedLeafParents[leaf] &&
@@ -334,13 +342,30 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 }
 
-// The DSpark selector against the same references: position p reads logits
-// row p (the anchor row already predicts), the Markov bias W2[candidate] .
-// W1[predecessor] replaces the codebook edge, and the parallel edge pass
-// must agree with the serial walk the reference models.
-void runDSparkCase(MetalBackend &backend, const Case &c) {
+// The row's sixteen largest tokens inside [begin, end): value descending,
+// id ascending on ties; one DSpark pool shard covers such a range.
+std::vector<uint32_t> referenceRangeTop16(const float *row, uint32_t begin,
+                                        uint32_t end) {
+  std::vector<uint32_t> order(end - begin);
+  std::iota(order.begin(), order.end(), begin);
+  const auto beats = [&](uint32_t a, uint32_t b) {
+    return row[a] > row[b] || (row[a] == row[b] && a < b);
+  };
+  const size_t keep = std::min<size_t>(kCandidates, order.size());
+  std::partial_sort(order.begin(), order.begin() + keep, order.end(), beats);
+  order.resize(keep);
+  return order;
+}
+
+// The DSpark selector against a direct reference: position p reads logits
+// row p (the anchor row already predicts), the pool is every shard's own
+// top-16 rather than a merged list, and the Markov bias W2[candidate] .
+// W1[predecessor] scores the whole pool. Sampled cases mix sampled and
+// greedy lanes per batch so a tree dispatch exercises both masks at once.
+void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
   Random random(0xd5a9ec + uint64_t{c.vocabulary} * 8 + c.lanes * 2 +
-                c.sampling);
+                c.sampling + tree);
+  constexpr uint32_t kPool = RICHENGINE_DSPARK_POOL;
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
@@ -380,101 +405,480 @@ void runDSparkCase(MetalBackend &backend, const Case &c) {
   std::vector<SamplingPolicy> policies(c.lanes);
   for (uint32_t lane = 0; lane < c.lanes; ++lane) {
     anchors[lane] = random.next() % c.vocabulary;
-    policies[lane] = SamplingPolicy{16, c.sampling ? 0.8F : 0.0F, 1.0F, false};
+    const bool laneSamples = c.sampling && (lane & 1);
+    policies[lane] = SamplingPolicy{16, laneSamples ? 0.8F : 0.0F, 1.0F, false};
   }
 
   CommandGraph graph;
-  selector.addDSpark(graph, buffers, markov, anchors, policies);
+  const uint32_t treeMask = (1U << c.lanes) - 1;
+  if (tree)
+    selector.addDSparkTree(graph, buffers, markov, anchors, policies, treeMask);
+  else
+    selector.addDSpark(graph, buffers, markov, anchors, policies);
   require(graph.dispatches().size() == 3,
           "dspark selector dispatch count changed");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
 
-  const auto *candidates =
-      static_cast<const uint32_t *>(buffers.candidates.contents());
-  const auto *unary = static_cast<const float *>(buffers.unary.contents());
+  const auto *poolIds =
+      static_cast<const uint32_t *>(buffers.partialIds.contents());
+  const auto *poolValues =
+      static_cast<const float *>(buffers.partialValues.contents());
   const auto *tokens =
       static_cast<const uint32_t *>(buffers.proposedTokens.contents());
   const auto *probabilities =
       static_cast<const float *>(buffers.proposalProbabilities.contents());
+  const auto *treeTokens =
+      static_cast<const uint32_t *>(buffers.treeTokens.contents());
+  const auto *treeNodes =
+      static_cast<const uint32_t *>(buffers.treeNodes.contents());
+  const auto *treeCounts =
+      static_cast<const uint32_t *>(buffers.treeCounts.contents());
   const auto *w1 = static_cast<const uint16_t *>(markov.embedding.contents());
   const auto *w2 =
       static_cast<const uint16_t *>(markov.projection.contents());
+  const uint32_t shardTokens = (c.vocabulary + kShards - 1) / kShards;
 
   for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    const bool laneSamples = c.sampling && (lane & 1);
+    const bool treeLane = tree && !laneSamples;
+    std::vector<uint32_t> expectedLeaves;
     uint32_t predecessor = anchors[lane];
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t global = lane * kPositions + position;
       const float *row =
           logitRows + (uint64_t{lane} * kRows + position) * c.vocabulary;
-      const auto expected = referenceTop16(row, c.vocabulary);
-      for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-        const uint32_t id = candidates[global * kCandidates + rank];
-        const float value = unary[global * kCandidates + rank];
-        if (rank < expected.size()) {
-          require(id == expected[rank] && value == row[expected[rank]],
-                  "dspark top-16 candidates differ from the exact sorted order");
-        } else {
-          require(id == 0xFFFFFFFFU && value == -INFINITY,
-                  "dspark top-16 padding lost the empty sentinel");
+      std::array<double, kPool> scores{};
+      for (uint32_t shard = 0; shard < kShards; ++shard) {
+        const uint32_t begin = std::min(shard * shardTokens, c.vocabulary);
+        const uint32_t end = std::min(begin + shardTokens, c.vocabulary);
+        const auto expected = referenceRangeTop16(row, begin, end);
+        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+          const uint32_t slot = shard * kCandidates + rank;
+          const uint32_t id = poolIds[global * kPool + slot];
+          const float value = poolValues[global * kPool + slot];
+          if (rank < expected.size()) {
+            require(id == expected[rank] && value == row[expected[rank]],
+                    "dspark pool shard lost its exact sorted order");
+          } else {
+            require(id == 0xFFFFFFFFU && value == -INFINITY,
+                    "dspark pool padding lost the empty sentinel");
+          }
+          const uint32_t candidate = std::min(id, c.vocabulary - 1);
+          const uint32_t safePredecessor =
+              std::min(predecessor, c.vocabulary - 1);
+          double bias = 0.0;
+          for (uint32_t dim = 0; dim < kRank; ++dim)
+            bias += double(tuning::bf16ToFloat(
+                        w2[uint64_t{candidate} * kRank + dim])) *
+                    tuning::bf16ToFloat(
+                        w1[uint64_t{safePredecessor} * kRank + dim]);
+          scores[slot] = double(value) + bias;
         }
       }
 
-      std::array<double, kCandidates> scores{};
-      for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-        const uint32_t candidate =
-            std::min(candidates[global * kCandidates + rank], c.vocabulary - 1);
-        double bias = 0.0;
-        for (uint32_t dim = 0; dim < kRank; ++dim)
-          bias += double(tuning::bf16ToFloat(
-                      w2[uint64_t{candidate} * kRank + dim])) *
-                  tuning::bf16ToFloat(
-                      w1[uint64_t{predecessor} * kRank + dim]);
-        scores[rank] = double(unary[global * kCandidates + rank]) + bias;
-      }
       const uint32_t token = tokens[global];
-      uint32_t selected = kCandidates;
-      for (uint32_t rank = 0; rank < kCandidates; ++rank)
-        if (candidates[global * kCandidates + rank] == token)
-          selected = selected == kCandidates ? rank : selected;
-      require(selected < kCandidates,
-              "dspark selector proposed a token outside its candidates");
-      if (c.sampling) {
-        const double maximum = *std::max_element(scores.begin(), scores.end());
+      uint32_t selected = kPool;
+      for (uint32_t slot = 0; slot < kPool; ++slot)
+        if (poolIds[global * kPool + slot] == token)
+          selected = selected == kPool ? slot : selected;
+      require(selected < kPool,
+              "dspark selector proposed a token outside its pool");
+      if (laneSamples) {
+        double maximum = -INFINITY;
+        for (uint32_t slot = 0; slot < kPool; ++slot)
+          maximum = std::max(maximum, scores[slot] / 0.8);
         double sum = 0.0;
-        std::array<double, kCandidates> reference{};
-        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-          reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
-          sum += reference[rank];
+        std::array<double, kPool> weights{};
+        for (uint32_t slot = 0; slot < kPool; ++slot) {
+          weights[slot] = std::exp(scores[slot] / 0.8 - maximum);
+          sum += weights[slot];
         }
         const float uniform = uniforms[lane * RICHENGINE_SAMPLING_UNIFORMS +
                                        RICHENGINE_UNIFORM_PROPOSALS + position];
-        std::array<double, kCandidates> cumulative{};
-        uint32_t expectedSelection = kCandidates - 1;
-        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
-          const float probability = probabilities[global * kCandidates + rank];
-          require(std::fabs(probability - reference[rank] / sum) < 1e-4,
+        for (uint32_t slot = 0; slot < kPool; ++slot)
+          require(std::fabs(probabilities[global * kPool + slot] -
+                            weights[slot] / sum) < 1e-4,
                   "dspark selector probabilities diverged from the softmax");
-          cumulative[rank] =
-              (rank ? cumulative[rank - 1] : 0.0) + reference[rank] / sum;
-          if (expectedSelection == kCandidates - 1 &&
-              cumulative[rank] > uniform)
-            expectedSelection = rank;
+        // The kernel draws in lane-major order: lane l owns slots l+32k.
+        std::array<double, kPool> cumulative{};
+        std::array<uint32_t, kPool> drawOrder{};
+        uint32_t expectedSelection = kPool - 1;
+        double run = 0.0;
+        for (uint32_t orderLane = 0; orderLane < 32; ++orderLane) {
+          for (uint32_t k = 0; k < kPool / 32; ++k) {
+            const uint32_t slot = orderLane + 32 * k;
+            run += weights[slot] / sum;
+            cumulative[slot] = run;
+            drawOrder[slot] = orderLane * (kPool / 32) + k;
+            if (expectedSelection == kPool - 1 && run > uniform)
+              expectedSelection = slot;
+          }
         }
-        const double boundary = std::fabs(
-            cumulative[std::min(selected, expectedSelection)] - uniform);
+        const uint32_t earlier =
+            drawOrder[selected] < drawOrder[expectedSelection] ? selected
+                                                             : expectedSelection;
+        const double boundary = std::fabs(cumulative[earlier] - uniform);
         require(selected == expectedSelection || boundary < 1e-5,
                 "dspark selector drew a different candidate than the reference");
       } else {
         uint32_t expectedSelection = 0;
-        for (uint32_t rank = 1; rank < kCandidates; ++rank)
-          if (scores[rank] > scores[expectedSelection])
-            expectedSelection = rank;
+        for (uint32_t slot = 1; slot < kPool; ++slot)
+          if (scores[slot] > scores[expectedSelection])
+            expectedSelection = slot;
         require(selected == expectedSelection ||
                     std::fabs(scores[selected] - scores[expectedSelection]) <
                         1e-5,
                 "dspark selector picked a different greedy candidate");
+        if (treeLane) {
+          uint32_t expectedRunner = kPool;
+          for (uint32_t slot = 0; slot < kPool; ++slot)
+            if (slot != selected &&
+                (expectedRunner == kPool ||
+                 scores[slot] > scores[expectedRunner]))
+              expectedRunner = slot;
+          const uint32_t runnerToken =
+              expectedRunner < kPool ? poolIds[global * kPool + expectedRunner]
+                                     : 0xFFFFFFFFU;
+          expectedLeaves.push_back(runnerToken < c.vocabulary ? runnerToken
+                                                              : 0xFFFFFFFFU);
+        }
       }
       predecessor = token;
+    }
+
+    if (tree) {
+      const uint32_t laneBase = lane * RICHENGINE_TREE_VERIFY_NODES;
+      require(treeTokens[laneBase] == anchors[lane] &&
+                  RICHENGINE_TREE_NODE_PARENT(treeNodes[laneBase]) ==
+                      RICHENGINE_TREE_NODE_NONE &&
+                  RICHENGINE_TREE_NODE_DEPTH(treeNodes[laneBase]) == 0,
+              "dspark tree anchor node is malformed");
+      for (uint32_t position = 0; position < kPositions; ++position) {
+        const uint32_t row = laneBase + position + 1;
+        // A tree lane's comb holds the chain in the node block's front half
+        // only; a chain lane's block is the whole chain.
+        if (!(treeLane && position + 1 >= RICHENGINE_TREE_VERIFY_NODES / 2))
+          require(treeTokens[row] ==
+                          tokens[lane * kPositions + position] &&
+                      RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) ==
+                          position &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[row]) ==
+                          position + 1 &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[row]) ==
+                          position,
+                  "dspark tree chain node is malformed");
+        const uint32_t leafRow =
+            laneBase + RICHENGINE_TREE_VERIFY_NODES / 2 + position;
+        // The comb's back half holds one leaf slot per leading position; a
+        // chain lane's block carries chain rows there instead.
+        if (!treeLane ||
+            RICHENGINE_TREE_VERIFY_NODES / 2 + position >=
+                RICHENGINE_TREE_VERIFY_NODES)
+          continue;
+        if (treeLane && expectedLeaves[position] != 0xFFFFFFFFU) {
+          require(treeTokens[leafRow] == expectedLeaves[position] &&
+                      RICHENGINE_TREE_NODE_PARENT(treeNodes[leafRow]) ==
+                          position &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[leafRow]) ==
+                          position + 1 &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[leafRow]) ==
+                          position,
+                  "dspark tree leaf node is malformed");
+        } else {
+          require(RICHENGINE_TREE_NODE_PARENT(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE,
+                  "dspark tree dead leaf kept a live node");
+        }
+      }
+      if (1 + kPositions < RICHENGINE_TREE_VERIFY_NODES) {
+        const uint32_t spare = laneBase + RICHENGINE_TREE_VERIFY_NODES - 1;
+        require(RICHENGINE_TREE_NODE_PARENT(treeNodes[spare]) ==
+                        RICHENGINE_TREE_NODE_NONE &&
+                    RICHENGINE_TREE_NODE_DEPTH(treeNodes[spare]) ==
+                        RICHENGINE_TREE_NODE_NONE,
+                "dspark tree spare row kept a live node");
+      }
+      uint32_t emittedLeaves = 0;
+      for (uint32_t position = 0; position < kPositions; ++position)
+        emittedLeaves +=
+            position < expectedLeaves.size() &&
+            expectedLeaves[position] != 0xFFFFFFFFU &&
+            RICHENGINE_TARGET_VERIFY_ROWS + position <
+                RICHENGINE_TREE_VERIFY_NODES;
+      require(treeCounts[lane] ==
+                  std::min<uint32_t>(
+                      1 + kPositions + (treeLane ? emittedLeaves : 0),
+                      RICHENGINE_TREE_VERIFY_NODES),
+              "dspark tree node count is wrong");
+    }
+  }
+}
+
+// The DFlash pool selector against a direct reference: same shard-pool
+// layout as the DSpark case, but position p reads logits row p + 1 and the
+// edge is the codebook score (W_pred[predecessor] ⊙ hidden[p + 1]) .
+// W_succ[candidate] of draft_select_edges, scored over all 128 slots.
+void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
+  Random random(0xdf1a5c + uint64_t{c.vocabulary} * 8 + c.lanes * 2 +
+                c.sampling + tree);
+  constexpr uint32_t kPool = RICHENGINE_DSPARK_POOL;
+  const uint32_t rows = c.lanes * kRows;
+  const uint32_t positions = c.lanes * kPositions;
+  const auto workspace = DraftSelector::workspace(positions);
+  const DraftSelector selector(c.vocabulary);
+
+  MetalBuffer logits =
+      allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
+  auto *logitRows = static_cast<float *>(logits.contents());
+  const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
+                            Pattern::Sparse};
+  for (uint32_t row = 0; row < rows; ++row)
+    fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
+            patterns[(row / kRows + row % kRows) % patterns.size()], random);
+  const MetalBuffer selectorHidden =
+      randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F);
+  const DraftCodebooks codebooks{
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
+      randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  DraftSelectorBuffers buffers{
+      logits,
+      allocate(backend, workspace.partialIdsBytes),
+      allocate(backend, workspace.partialValuesBytes),
+      allocate(backend, workspace.candidatesBytes),
+      allocate(backend, workspace.unaryBytes),
+      selectorHidden,
+      allocate(backend,
+               uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
+      allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend,
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend,
+               uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
+  auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
+  for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
+    uniforms[index] = (random.unit() + 1.0F) * 0.5F;
+  std::vector<uint32_t> anchors(c.lanes);
+  std::vector<SamplingPolicy> policies(c.lanes);
+  for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    anchors[lane] = random.next() % c.vocabulary;
+    const bool laneSamples = c.sampling && (lane & 1);
+    policies[lane] = SamplingPolicy{16, laneSamples ? 0.8F : 0.0F, 1.0F, false};
+  }
+
+  CommandGraph graph;
+  const uint32_t treeMask = (1U << c.lanes) - 1;
+  if (tree)
+    selector.addPoolTree(graph, buffers, codebooks, anchors, policies,
+                         treeMask);
+  else
+    selector.addPool(graph, buffers, codebooks, anchors, policies);
+  require(graph.dispatches().size() == 3,
+          "dflash pool selector dispatch count changed");
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+
+  const auto *poolIds =
+      static_cast<const uint32_t *>(buffers.partialIds.contents());
+  const auto *poolValues =
+      static_cast<const float *>(buffers.partialValues.contents());
+  const auto *tokens =
+      static_cast<const uint32_t *>(buffers.proposedTokens.contents());
+  const auto *probabilities =
+      static_cast<const float *>(buffers.proposalProbabilities.contents());
+  const auto *treeTokens =
+      static_cast<const uint32_t *>(buffers.treeTokens.contents());
+  const auto *treeNodes =
+      static_cast<const uint32_t *>(buffers.treeNodes.contents());
+  const auto *treeCounts =
+      static_cast<const uint32_t *>(buffers.treeCounts.contents());
+  const auto *hidden =
+      static_cast<const uint16_t *>(selectorHidden.contents());
+  const auto *predecessors =
+      static_cast<const uint16_t *>(codebooks.predecessor.contents());
+  const auto *successors =
+      static_cast<const uint16_t *>(codebooks.successor.contents());
+  const uint32_t shardTokens = (c.vocabulary + kShards - 1) / kShards;
+
+  for (uint32_t lane = 0; lane < c.lanes; ++lane) {
+    const bool laneSamples = c.sampling && (lane & 1);
+    const bool treeLane = tree && !laneSamples;
+    std::vector<uint32_t> expectedLeaves;
+    uint32_t predecessor = anchors[lane];
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      const uint32_t global = lane * kPositions + position;
+      const float *row =
+          logitRows + (uint64_t{lane} * kRows + position + 1) * c.vocabulary;
+      std::array<double, kPool> scores{};
+      for (uint32_t shard = 0; shard < kShards; ++shard) {
+        const uint32_t begin = std::min(shard * shardTokens, c.vocabulary);
+        const uint32_t end = std::min(begin + shardTokens, c.vocabulary);
+        const auto expected = referenceRangeTop16(row, begin, end);
+        for (uint32_t rank = 0; rank < kCandidates; ++rank) {
+          const uint32_t slot = shard * kCandidates + rank;
+          const uint32_t id = poolIds[global * kPool + slot];
+          const float value = poolValues[global * kPool + slot];
+          if (rank < expected.size()) {
+            require(id == expected[rank] && value == row[expected[rank]],
+                    "dflash pool shard lost its exact sorted order");
+          } else {
+            require(id == 0xFFFFFFFFU && value == -INFINITY,
+                    "dflash pool padding lost the empty sentinel");
+          }
+          const uint32_t candidate = std::min(id, c.vocabulary - 1);
+          const uint32_t safePredecessor =
+              std::min(predecessor, c.vocabulary - 1);
+          double edge = 0.0;
+          for (uint32_t dim = 0; dim < kRank; ++dim)
+            edge += double(tuning::bf16ToFloat(
+                        predecessors[uint64_t{safePredecessor} * kRank + dim])) *
+                    tuning::bf16ToFloat(
+                        hidden[(uint64_t{lane} * kRows + position + 1) * kRank +
+                               dim]) *
+                    double(tuning::bf16ToFloat(
+                        successors[uint64_t{candidate} * kRank + dim]));
+          scores[slot] = double(value) + edge;
+        }
+      }
+
+      const uint32_t token = tokens[global];
+      uint32_t selected = kPool;
+      for (uint32_t slot = 0; slot < kPool; ++slot)
+        if (poolIds[global * kPool + slot] == token)
+          selected = selected == kPool ? slot : selected;
+      require(selected < kPool,
+              "dflash pool selector proposed a token outside its pool");
+      if (laneSamples) {
+        double maximum = -INFINITY;
+        for (uint32_t slot = 0; slot < kPool; ++slot)
+          maximum = std::max(maximum, scores[slot] / 0.8);
+        double sum = 0.0;
+        std::array<double, kPool> weights{};
+        for (uint32_t slot = 0; slot < kPool; ++slot) {
+          weights[slot] = std::exp(scores[slot] / 0.8 - maximum);
+          sum += weights[slot];
+        }
+        const float uniform = uniforms[lane * RICHENGINE_SAMPLING_UNIFORMS +
+                                       RICHENGINE_UNIFORM_PROPOSALS + position];
+        for (uint32_t slot = 0; slot < kPool; ++slot)
+          require(std::fabs(probabilities[global * kPool + slot] -
+                            weights[slot] / sum) < 1e-4,
+                  "dflash pool selector probabilities diverged from the softmax");
+        // The kernel draws in lane-major order: lane l owns slots l+32k.
+        std::array<double, kPool> cumulative{};
+        std::array<uint32_t, kPool> drawOrder{};
+        uint32_t expectedSelection = kPool - 1;
+        double run = 0.0;
+        for (uint32_t orderLane = 0; orderLane < 32; ++orderLane) {
+          for (uint32_t k = 0; k < kPool / 32; ++k) {
+            const uint32_t slot = orderLane + 32 * k;
+            run += weights[slot] / sum;
+            cumulative[slot] = run;
+            drawOrder[slot] = orderLane * (kPool / 32) + k;
+            if (expectedSelection == kPool - 1 && run > uniform)
+              expectedSelection = slot;
+          }
+        }
+        const uint32_t earlier =
+            drawOrder[selected] < drawOrder[expectedSelection] ? selected
+                                                             : expectedSelection;
+        const double boundary = std::fabs(cumulative[earlier] - uniform);
+        require(selected == expectedSelection || boundary < 1e-5,
+                "dflash pool selector drew a different candidate than the reference");
+      } else {
+        uint32_t expectedSelection = 0;
+        for (uint32_t slot = 1; slot < kPool; ++slot)
+          if (scores[slot] > scores[expectedSelection])
+            expectedSelection = slot;
+        require(selected == expectedSelection ||
+                    std::fabs(scores[selected] - scores[expectedSelection]) <
+                        1e-5,
+                "dflash pool selector picked a different greedy candidate");
+        if (treeLane) {
+          uint32_t expectedRunner = kPool;
+          for (uint32_t slot = 0; slot < kPool; ++slot)
+            if (slot != selected &&
+                (expectedRunner == kPool ||
+                 scores[slot] > scores[expectedRunner]))
+              expectedRunner = slot;
+          const uint32_t runnerToken =
+              expectedRunner < kPool ? poolIds[global * kPool + expectedRunner]
+                                     : 0xFFFFFFFFU;
+          expectedLeaves.push_back(runnerToken < c.vocabulary ? runnerToken
+                                                              : 0xFFFFFFFFU);
+        }
+      }
+      predecessor = token;
+    }
+
+    if (tree) {
+      const uint32_t laneBase = lane * RICHENGINE_TREE_VERIFY_NODES;
+      require(treeTokens[laneBase] == anchors[lane] &&
+                  RICHENGINE_TREE_NODE_PARENT(treeNodes[laneBase]) ==
+                      RICHENGINE_TREE_NODE_NONE &&
+                  RICHENGINE_TREE_NODE_DEPTH(treeNodes[laneBase]) == 0,
+              "dflash pool tree anchor node is malformed");
+      for (uint32_t position = 0; position < kPositions; ++position) {
+        const uint32_t row = laneBase + position + 1;
+        // A tree lane's comb holds the chain in the node block's front half
+        // only; a chain lane's block is the whole chain.
+        if (!(treeLane && position + 1 >= RICHENGINE_TREE_VERIFY_NODES / 2))
+          require(treeTokens[row] == tokens[lane * kPositions + position] &&
+                      RICHENGINE_TREE_NODE_PARENT(treeNodes[row]) == position &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[row]) ==
+                          position + 1 &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[row]) ==
+                          position,
+                  (fprintf(stderr,
+                           "pool chain fail lane=%u pos=%u row_tok=%u "
+                           "tok=%u node=%x\n",
+                           lane, position, treeTokens[row],
+                           tokens[lane * kPositions + position],
+                           treeNodes[row]),
+                   "dflash pool tree chain node is malformed"));
+        // The comb's back half holds one leaf slot per leading position; a
+        // chain lane's block carries chain rows there instead.
+        if (!treeLane ||
+            RICHENGINE_TREE_VERIFY_NODES / 2 + position >=
+                RICHENGINE_TREE_VERIFY_NODES)
+          continue;
+        const uint32_t leafRow =
+            laneBase + RICHENGINE_TREE_VERIFY_NODES / 2 + position;
+        if (treeLane && expectedLeaves[position] != 0xFFFFFFFFU) {
+          require(treeTokens[leafRow] == expectedLeaves[position] &&
+                      RICHENGINE_TREE_NODE_PARENT(treeNodes[leafRow]) ==
+                          position &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[leafRow]) ==
+                          position + 1 &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[leafRow]) ==
+                          position,
+                  "dflash pool tree leaf node is malformed");
+        } else {
+          require(RICHENGINE_TREE_NODE_PARENT(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE &&
+                      RICHENGINE_TREE_NODE_DEPTH(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE &&
+                      RICHENGINE_TREE_NODE_POSITION(treeNodes[leafRow]) ==
+                          RICHENGINE_TREE_NODE_NONE,
+                  "dflash pool tree dead leaf kept a live node");
+        }
+      }
+      if (1 + kPositions < RICHENGINE_TREE_VERIFY_NODES) {
+        const uint32_t spare = laneBase + RICHENGINE_TREE_VERIFY_NODES - 1;
+        require(RICHENGINE_TREE_NODE_PARENT(treeNodes[spare]) ==
+                        RICHENGINE_TREE_NODE_NONE &&
+                    RICHENGINE_TREE_NODE_DEPTH(treeNodes[spare]) ==
+                        RICHENGINE_TREE_NODE_NONE,
+                "dflash pool tree spare row kept a live node");
+      }
+      require(treeCounts[lane] ==
+                  std::min<uint32_t>(1 + kPositions,
+                                     RICHENGINE_TREE_VERIFY_NODES),
+              "dflash pool tree node count is wrong");
     }
   }
 }
@@ -517,8 +921,14 @@ int main(int argc, char **argv) {
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
         runCase(backend, {vocabulary, lanes, false});
         runCase(backend, {vocabulary, lanes, true});
-        runDSparkCase(backend, {vocabulary, lanes, false});
-        runDSparkCase(backend, {vocabulary, lanes, true});
+        runDSparkCase(backend, {vocabulary, lanes, false}, false);
+        runDSparkCase(backend, {vocabulary, lanes, true}, false);
+        runDSparkCase(backend, {vocabulary, lanes, false}, true);
+        runDSparkCase(backend, {vocabulary, lanes, true}, true);
+        runDFlashPoolCase(backend, {vocabulary, lanes, false}, false);
+        runDFlashPoolCase(backend, {vocabulary, lanes, true}, false);
+        runDFlashPoolCase(backend, {vocabulary, lanes, false}, true);
+        runDFlashPoolCase(backend, {vocabulary, lanes, true}, true);
       }
     }
     std::cout << "draft_selector_metal_test: PASS\n";

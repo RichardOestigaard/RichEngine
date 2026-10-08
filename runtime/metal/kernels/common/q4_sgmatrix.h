@@ -42,5 +42,13 @@ struct Table64 {
                     uint lane, bfloat a, bfloat b) {
     write_input(table, sums, group, row, lane, a, b);
   }
+  // A producer that owns a multi-tile row range writes absolute row `row`
+  // into its eight-row tile.
+  static void write_row(device bfloat *table, device float *sums, uint width,
+                        uint group, uint row, uint lane, bfloat a, bfloat b) {
+    write(table + (row / kRows) * uint64_t{width} * kRows,
+          sums + (row / kRows) * sums_per_tile(width), width, group,
+          row % kRows, lane, a, b);
+  }
 };
 } // namespace q4sg

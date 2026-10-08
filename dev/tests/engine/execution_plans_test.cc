@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "ops/DeviceTuning.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 using namespace richengine;
@@ -127,7 +129,7 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8 &&
-                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
+                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(DevicePolicy{family}),
                 "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
@@ -143,7 +145,7 @@ void moeDeviceTiles() {
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     const auto expected = family == 9 ? MoeExpertSimdgroups::Four
                                       : MoeExpertSimdgroups::Eight;
-    require(moeDecodeSimdgroups(family) == expected,
+    require(moeDecodeSimdgroups(DevicePolicy{family}) == expected,
             "decode expert simdgroups are not gated on GPU family 9");
     const ExecutionPlans plans(device(family));
     for (auto shape : moeShapes) {
@@ -173,7 +175,7 @@ void ggufMoePlans() {
   for (uint32_t family : {0U, 9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
     const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
-    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+    require(moeGgufTile(DevicePolicy{family}, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
@@ -199,7 +201,8 @@ void ggufMoePlans() {
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+    require(moeGgufTile(DevicePolicy{family}, staged) == MoeGgufTile::Staged &&
+                moeGgufTile(DevicePolicy{family}, q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
@@ -215,12 +218,15 @@ void ggufMoePlans() {
     // routes average at most one row per expert (32 rows of 8 of 256
     // experts). The router's float tile follows Linear::ggufFloatTile (32
     // assumed cores: the neural accelerator from 321 rows, never on Apple9).
+    // The register plans' sums slot also holds the packed plane's exponent
+    // bytes on Apple10+, as in the decode plans.
     for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
       const MoePlan plan = plans.moePrefill(shape, rows);
       const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
       const FloatTile router = family != 9 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
+      const bool sums = expected == MoeGgufTile::Register || plan.configuration().mxfp4Native;
       require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
-                  (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
+                  (plan.workspace().groupedSumsBytes > 0) == sums &&
                   plan.configuration().ggufRouterTile == router,
               "GGUF MoE prefill plan left the device's tile");
       covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
@@ -246,6 +252,67 @@ void ggufMoePlans() {
   rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
+}
+
+// A family the tuning tables have not been re-measured for inherits the
+// Apple10 policy and every Apple10-scoped measured row by design: isApple9
+// stays exact, families at or above 10 form the Apple10 tier, and a
+// measured row scoped {10, 0, ...} carries forward. A row still steers
+// only the devices its scope names — its family range and a reported core
+// count — which is how a newer family's own row out-scores the rows it
+// inherited when it lands. These pins make a change to that carry-forward
+// loud rather than silent.
+void futureFamilies() {
+  for (uint32_t family : {0U, 8U}) {
+    const DevicePolicy older{family};
+    require(older.tier() == DevicePolicy::Tier::Unknown && !older.isApple9() &&
+                !older.apple10Plus() && !older.nativeFormats(),
+            "a family below Apple9 took a measured tier");
+  }
+  const DevicePolicy future{99}, apple10{10};
+  require(!future.isApple9() && future.apple10Plus() &&
+              future.tier() == DevicePolicy::Tier::Apple10 &&
+              future.nativeFormats() == apple10.nativeFormats() &&
+              std::string_view{future.nativeFormatSuffix()} ==
+                  std::string_view{apple10.nativeFormatSuffix()},
+          "a family above the measured ones lost the Apple10 tier");
+  require(stagedTiers(future).data() == stagedTiers(apple10).data() &&
+              stagedTiers(future).data() != stagedTiers(DevicePolicy{9}).data(),
+          "a newer family's GGUF decode left the Apple10 split tiers");
+
+  // A probed newer family reports its cores, and the Apple10-scoped
+  // measured rows — the {10, 0, 0} affine and staged-split rows and the
+  // {10, 0, 20} core-scoped rows alike — carry forward to it.
+  DeviceCapabilities capabilities = device(99);
+  capabilities.gpuCoreCount = 20;
+  const DevicePolicy measured = DevicePolicy::of(capabilities);
+  require(measured.family == 99 && measured.cores == 20 && measured.coresReported,
+          "probing a newer family lost its reported core count");
+  const LinearWorkload measuredShape{{1280, 5120}, 32, LinearPhase::Decode,
+                                     LinearEpilogue::None};
+  require(measuredLinearPlan(measured, measuredShape) ==
+                  LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, 4} &&
+              measuredGgufSplits(measured, 2048, 2048, 8, false) == 4 &&
+              measuredGgufSplits(measured, 17408, 5120, 8, false) == 4 &&
+              measuredGgufSplits(measured, 128000, 2048, 16, true) == 2 &&
+              stagedDecode(measured, 2048, 2048) ==
+                  stagedDecode(DevicePolicy{10, 20, true}, 2048, 2048),
+          "an Apple10-scoped measured row stopped carrying forward to a newer family");
+  // The same scope that carries a row forward keeps it exact: a core-scoped
+  // row does not steer a newer family reporting other cores, and the rows'
+  // family floor keeps Apple9 and older out of every Apple10 row.
+  const DevicePolicy otherCores{99, 24, true}, apple9{9, 20, true};
+  require(measuredGgufSplits(otherCores, 17408, 5120, 8, false) == 0 &&
+              measuredGgufSplits(otherCores, 2048, 2048, 8, false) == 4 &&
+              measuredGgufSplits(apple9, 2048, 2048, 8, false) == 0 &&
+              !measuredLinearPlan(apple9, measuredShape),
+          "a measured row steered a device outside its scope");
+  // An assumed count is a plan, not a measurement: coresReported == false
+  // never matches a core-scoped row, even at the row's own count.
+  const DevicePolicy assumed{99, 20, false};
+  require(measuredGgufSplits(assumed, 17408, 5120, 8, false) == 0 &&
+              measuredGgufSplits(assumed, 2048, 2048, 8, false) == 4,
+          "an assumed core count matched a core-scoped measured row");
 }
 
 // A device that reports no core count gets the plans of kAssumedGpuCores
@@ -336,11 +403,12 @@ int main() {
     baselinePlans();
     moeDeviceTiles();
     ggufMoePlans();
+    futureFamilies();
     unknownCoreCount();
     workspaceBounds();
     invalidLookupsAndContextEdges();
-    std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
-                 "and prefill workspace bounds (CPU only)\n";
+    std::cout << "PASS execution plans: device policies and family carry-forward, "
+                 "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

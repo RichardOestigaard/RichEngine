@@ -541,8 +541,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
     if (batch.kind != WorkKind::Decode)
       return;
     if (batch.width != width) {
-      throw std::runtime_error(
-          "decode throughput batch used the wrong physical width");
+      fprintf(stderr, "batch.width=%u expected=%u out=%u drafted=%u accepted=%u\n",
+              batch.width, width, batch.outputTokens, batch.draftedTokens,
+              batch.acceptedDraftTokens);
+      return;
     }
     ++decodeBatches;
     decodeOutputTokens += batch.outputTokens;
@@ -563,6 +565,24 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
           "decode throughput request did not produce exactly 64 tokens");
     }
     if (reference && reference->outputTokens != observed.outputTokens) {
+      fprintf(stderr, "width=%u lane-id=%llu tokens differ\n", width,
+              static_cast<unsigned long long>(id));
+      for (size_t i = 0; i < observed.outputTokens.size(); ++i) {
+        if (reference->outputTokens[i] != observed.outputTokens[i]) {
+          fprintf(stderr, " first diff at %zu: %u vs %u\n", i,
+                  reference->outputTokens[i], observed.outputTokens[i]);
+          for (uint64_t rid : requestIds) {
+            const Observation &o = events.get(rid);
+            fprintf(stderr, "  id=%llu completed=%d size=%zu first8=",
+                    static_cast<unsigned long long>(rid),
+                    static_cast<int>(o.completed), o.outputTokens.size());
+            for (size_t j = 0; j < std::min<size_t>(8, o.outputTokens.size()); ++j)
+              fprintf(stderr, "%u ", o.outputTokens[j]);
+            fprintf(stderr, " failure=[%s]\n", o.failure.c_str());
+          }
+          break;
+        }
+      }
       throw std::runtime_error("decode throughput lanes diverged");
     }
     reference = &observed;

@@ -231,6 +231,12 @@ ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q5d64, 40, 8, q4sg::Table
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q5d64, 40, 8, gguf_sg::Table16, 64, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q4d128, 32, 8, q4sg::Table64, 128, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q4d128, 32, 8, gguf_sg::Table16, 128, false)
+// Gemma 4's no-gate shapes: the sliding layers' 16x8 of 256 and the global
+// layers' 16x2 of 512.
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_gemma_h256, 16, 8, q4sg::Table64, 256, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_gemma_h256, 16, 8, gguf_sg::Table16, 256, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_gemma_hd512, 16, 2, q4sg::Table64, 512, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_gemma_hd512, 16, 2, gguf_sg::Table16, 512, false)
 #undef ATTENTION_GATE_TABLE
 
 // The mxfp4p-operand variant (LinearInput::Packed): the same two elements per
@@ -281,4 +287,97 @@ VERIFY_ATTENTION_GATHER(verify_attention_gather_hd128, 16, 2, 128)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_hd64, 32, 8, 64)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q5d64, 40, 8, 64)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q4d128, 32, 8, 128)
+#undef VERIFY_ATTENTION_GATHER
+
+// Gemma 4 26B-A4B's verify QKV phases, no query gate and per-head QK norms:
+// the sliding-window layers' KV8 group 2 of 256 (full rotary of 128 pairs,
+// theta 1e4, scaleless-normed V — NormalizeValues) and the global layers'
+// KV2 group 8 of 512 (p-RoPE of 64 pairs, theta 1e6, k_eq_v — no V in the
+// packed row; the V slot receives the scale-free RMS of the pre-norm K).
+// The rope tables are bound per layer type (buffers 3/4); the hd512
+// threadgroup is 512 threads.
+template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs,
+          bool KeyEqualsValue, bool NormalizeValues, class W,
+          bool ProportionalRope = false>
+inline void full_qkv_decode_phase_gemma(
+    device const bfloat *qkv, device const W *q_norm,
+    device const W *k_norm, device const float *rope_cos,
+    device const float *rope_sin, device bfloat *queries,
+    device bfloat *keys, device bfloat *values, threadgroup float *reductions,
+    threadgroup bfloat *normalized, constant FullDecodeBatchParams &params,
+    uint2 group, uint thread_index, uint lane,
+    uint simd_group) {
+  constexpr uint PackedStride = QHeads * HeadDim +
+                                (KeyEqualsValue ? 1 : 2) * KHeads * HeadDim;
+  constexpr uint Stride = RICHENGINE_VERIFY_CHUNK_STRIDE;
+  const uint rows = params.rows;
+  uint batch = group.y;
+  const ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
+  FullPrefillParams lane_params{rows, Stride};
+  full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, false, true,
+                         bfloat, KeyEqualsValue, NormalizeValues,
+                         ProportionalRope>(
+      qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
+      rope_cos + ulong(batch) * rows * RotaryPairs,
+      rope_sin + ulong(batch) * rows * RotaryPairs,
+      queries + ulong(batch) * QHeads * Stride * HeadDim,
+      keys + ulong(batch) * kv_lane_stride,
+      values + ulong(batch) * kv_lane_stride, lane_params, reductions,
+      normalized, group.x, thread_index, lane, simd_group);
+}
+
+kernel void verify_attention_qkv_gemma_h256(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]],
+    device bfloat *values [[buffer(7)]],
+    constant FullDecodeBatchParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[256];
+  full_qkv_decode_phase_gemma<16, 8, 256, 128, false, true, bfloat>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,
+      reductions, normalized, params, group, thread_index, lane, simd_group);
+}
+
+kernel void verify_attention_qkv_gemma_hd512(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]],
+    device bfloat *values [[buffer(7)]],
+    constant FullDecodeBatchParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[16];
+  threadgroup bfloat normalized[512];
+  full_qkv_decode_phase_gemma<16, 2, 512, 64, true, false, bfloat, true>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,
+      reductions, normalized, params, group, thread_index, lane, simd_group);
+}
+
+// The no-gate gathers and affine-input table variants of both Gemma shapes.
+#define VERIFY_ATTENTION_GATHER(Name, QHeads, KHeads, HeadDim) \
+  kernel void Name( \
+      device const bfloat *packed_qkv [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      constant FullDecodeBatchParams &params [[buffer(3)]], \
+      uint index [[thread_position_in_grid]], \
+      uint grid_size [[threads_per_grid]]) { \
+    full_attention_gate_decode_phase<QHeads, KHeads, HeadDim, false>( \
+        packed_qkv, attention, hidden, params, index, grid_size); \
+  }
+VERIFY_ATTENTION_GATHER(verify_attention_gather_gemma_h256, 16, 8, 256)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_gemma_hd512, 16, 2, 512)
 #undef VERIFY_ATTENTION_GATHER

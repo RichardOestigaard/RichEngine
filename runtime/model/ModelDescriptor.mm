@@ -1,6 +1,7 @@
 #include "ModelDescriptor.hpp"
+#include "families/FamilyMakers.hpp"
 #include "DSparkDraft.hpp"
-#include "PlainDraft.hpp"
+#include "DFlashV1Draft.hpp"
 #include "QwenVision.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -269,7 +270,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
 
 [[nodiscard]] std::string_view draftLayerMagic(const DFlashDraftLayout &draft) {
   switch (draft.kind) {
-  case DraftKind::Plain: return kPlainDraftMagic;
+  case DraftKind::DFlashV1: return kDFlashV1DraftMagic;
   case DraftKind::DSpark: return kDSparkDraftMagic;
   default: return kDFlashLayerMagic;
   }
@@ -283,7 +284,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
 
 [[nodiscard]] std::string_view draftArchitecture(const DFlashDraftLayout &draft) {
   switch (draft.kind) {
-  case DraftKind::Plain: return "DFlashDraftModel";
+  case DraftKind::DFlashV1: return "DFlashDraftModel";
   case DraftKind::DSpark: return "Qwen3DSparkModel";
   default: return "DFlash2DraftModel";
   }
@@ -291,16 +292,16 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
 
 // A packed manifest selects its draft format by the layer files' magic:
 // MDFD0004 is a packed DFlash2 draft, MDFP0005 a packed plain-transformer
-// DFlash draft. `plainLayout` is null for a target with no plain draft.
+// DFlash draft. `dflashV1Layout` is null for a target with no plain draft.
 void applyManifestDraftKind(NSDictionary *format, ModelDescriptor &descriptor,
-                            const DFlashDraftLayout *plainLayout,
+                            const DFlashDraftLayout *dflashV1Layout,
                             const DFlashDraftLayout &dflash2Layout) {
   const std::string magic =
       requireString(format, @"draft_layer_magic", "draft_layer_magic");
   if (magic == kDFlashLayerMagic) {
     descriptor.draft = dflash2Layout;
-  } else if (magic == kPlainDraftMagic && plainLayout) {
-    descriptor.draft = *plainLayout;
+  } else if (magic == kDFlashV1DraftMagic && dflashV1Layout) {
+    descriptor.draft = *dflashV1Layout;
     // The DFlash drafts ship their causal sliding layers first and one full
     // layer last; a manifest may override with an explicit causal_layers mask.
     id causal = format[@"causal_layers"];
@@ -313,204 +314,13 @@ void applyManifestDraftKind(NSDictionary *format, ModelDescriptor &descriptor,
   descriptor.stateLayout.draft = descriptor.draft.stateLayout();
 }
 
-DFlashDraftLayout qwen36DraftLayout() {
-  DFlashDraftLayout layout;
-  layout.layers = 6;
-  layout.hiddenSize = 2048;
-  layout.dynamicSize = 512;
-  layout.intermediateSize = 6144;
-  layout.targetHiddenSize = 16384;
-  return layout;
-}
-
-ModelDescriptor qwen38Descriptor(std::string name) {
-  return makeModelDescriptor(std::move(name), Qwen3_8Layout{},
-                             DFlashDraftLayout{}, ops::VisionLayout{});
-}
-
-// A hypothetical DFlash2 draft for Ornith 9B, kept for source assemblies
-// whose draft config declares DFlash2DraftModel: same six layers over
-// hidden 4096 and eight captures.
-DFlashDraftLayout ornith9DFlash2DraftLayout() {
-  DFlashDraftLayout layout;
-  layout.layers = 6;
-  layout.hiddenSize = 4096;
-  layout.dynamicSize = 1024;
-  layout.qkvSize = 6144;
-  layout.attentionSize = 4096;
-  layout.intermediateSize = 12288;
-  layout.targetHiddenSize = 32768;
-  layout.kvHeads = 8;
-  return layout;
-}
-
-// Ornith 1.5 9B's released DFlash draft (ornith-ai/Ornith-1.5-9B-DFlash): a
-// plain six-layer transformer over hidden 4096 reading the target's eight
-// capture layers — fused fc + hidden_norm features injected as every layer's
-// context K/V. Five causal sliding layers, one full-attention layer last.
-DFlashDraftLayout ornith9PlainDraftLayout() {
-  DFlashDraftLayout layout;
-  layout.kind = DraftKind::Plain;
-  layout.slidingWindow = 4096;
-  layout.causalLayers = 0x1F;
-  layout.layers = 6;
-  layout.hiddenSize = 4096;
-  layout.dynamicSize = 0;
-  layout.qkvSize = 6144;
-  layout.attentionSize = 4096;
-  layout.intermediateSize = 12288;
-  layout.targetHiddenSize = 32768;
-  layout.selectorRank = 0;
-  layout.kvHeads = 8;
-  return layout;
-}
-
-// Ornith 1.5 35B-A3B's released DFlash draft (ornith-ai/Ornith-1.5-35B-A3B-DFlash):
-// the same plain structure over hidden 2048 (attention stays 4096 wide).
-DFlashDraftLayout qwen36PlainDraftLayout() {
-  DFlashDraftLayout layout;
-  layout.kind = DraftKind::Plain;
-  layout.slidingWindow = 4096;
-  layout.causalLayers = 0x1F;
-  layout.layers = 6;
-  layout.hiddenSize = 2048;
-  layout.dynamicSize = 0;
-  layout.qkvSize = 6144;
-  layout.attentionSize = 4096;
-  layout.intermediateSize = 6144;
-  layout.targetHiddenSize = 16384;
-  layout.selectorRank = 0;
-  layout.kvHeads = 8;
-  return layout;
-}
-
-// Ornith is text-only: no vision layout, and no vision weights to load.
-ModelDescriptor ornithDescriptor(std::string name) {
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = Ornith9BLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Ornith9BLayout{}, ornith9PlainDraftLayout(), vision);
-  descriptor.visionSource = VisionSource::None;
-  return descriptor;
-}
-
-// The packed/source defaults of the dense and LFM2 targets' drafts: the
-// released DSpark drafts (openbmb/MiniCPM5-2B-DSpark, five layers of
-// 16x2x128 heads over a 2560-wide fused QKV, block_size 7; and
-// LiquidAI/LFM2.5-2.6B-DSpark, five layers of interleaved-rotary 32x8x64
-// over 3072, block_size 9), whose geometry the draft config or the packed
-// manifest declares.
-DFlashDraftLayout denseDraftLayout() {
-  DFlashDraftLayout layout;
-  layout.kind = DraftKind::DSpark;
-  layout.layers = 5;
-  layout.hiddenSize = DenseLayout{}.hiddenSize;
-  layout.vocabularySize = DenseLayout{}.vocabularySize;
-  layout.dynamicSize = 0;
-  layout.qkvSize = 2560;
-  layout.attentionSize = 2048;
-  layout.intermediateSize = 6144;
-  layout.attentionHeadDimension = 128;
-  layout.rotaryTheta = 5'000'000.0F;
-  layout.targetHiddenSize = DenseLayout{}.capturedHiddenSize();
-  layout.selectorRank = 0;
-  layout.kvHeads = 2;
-  layout.markovRank = 256;
-  layout.blockSize = 7;
-  return layout;
-}
-
-DFlashDraftLayout lfm2DraftLayout() {
-  DFlashDraftLayout layout = denseDraftLayout();
-  layout.vocabularySize = Lfm2Layout{}.vocabularySize;
-  layout.qkvSize = 3072;
-  layout.attentionHeadDimension = 64;
-  layout.rotaryTheta = 10'000'000.0F;
-  layout.targetHiddenSize = Lfm2Layout{}.capturedHiddenSize();
-  layout.kvHeads = 8;
-  layout.blockSize = 9;
-  layout.ropeInterleaved = 1;
-  layout.rmsEpsilon = 1e-5F;
-  return layout;
-}
-
-// The LFM2.5-8B-A1B target's DSpark draft (LiquidAI/LFM2.5-8B-A1B-DSpark):
-// the same five-layer 32x8x64 interleaved-rotary block as LFM2.5-2.6B's,
-// over a 3072-wide fused QKV, block_size 9 — at the target's 5e6 RoPE base.
-DFlashDraftLayout lfm2moeDraftLayout() {
-  DFlashDraftLayout layout = lfm2DraftLayout();
-  layout.rotaryTheta = 5'000'000.0F;
-  layout.targetHiddenSize = Lfm2MoeLayout{}.capturedHiddenSize();
-  return layout;
-}
-
-// The dense target is text-only: no vision layout, no vision weights.
-ModelDescriptor denseDescriptor(std::string name) {
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = DenseLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), DenseLayout{}, denseDraftLayout(), vision);
-  descriptor.visionSource = VisionSource::None;
-  return descriptor;
-}
-
-ModelDescriptor lfm2Descriptor(std::string name) {
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = Lfm2Layout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Lfm2Layout{}, lfm2DraftLayout(), vision);
-  descriptor.visionSource = VisionSource::None;
-  return descriptor;
-}
-
-ModelDescriptor lfm2moeDescriptor(std::string name) {
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = Lfm2MoeLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Lfm2MoeLayout{}, lfm2moeDraftLayout(), vision);
-  descriptor.visionSource = VisionSource::None;
-  return descriptor;
-}
-
-// Granite 4.2 ships no GPU draft (no DFlash/DSpark/MTP checkpoint exists);
-// the Null layout satisfies the geometry contract while the n-gram predraft
-// supplies every proposal.
-DFlashDraftLayout graniteNullDraftLayout(const GraniteLayout &target) {
-  // The planning paths still size draft workspaces from the layout, so it
-  // describes the compiled Q32K8D128 head even though nothing encodes.
-  DFlashDraftLayout layout;
-  layout.kind = DraftKind::Null;
-  layout.layers = 1;
-  layout.hiddenSize = target.hiddenSize;
-  layout.vocabularySize = target.vocabularySize;
-  layout.dynamicSize = 1280;
-  layout.qkvSize = 6144;
-  layout.attentionSize = 4096;
-  layout.intermediateSize = 17408;
-  layout.attentionHeadDimension = 128;
-  layout.targetHiddenSize = target.capturedHiddenSize();
-  layout.selectorRank = 256;
-  layout.kvHeads = 8;
-  return layout;
-}
-
-// The granite targets are text-only: no vision layout, no vision weights.
-ModelDescriptor graniteDescriptor(std::string name, const GraniteLayout &target) {
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = target.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), target, graniteNullDraftLayout(target), vision);
-  descriptor.visionSource = VisionSource::None;
-  return descriptor;
-}
-
-ModelDescriptor qwen36Descriptor(std::string name) {
-  constexpr Qwen3_6MoeLayout target;
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = target.hiddenSize;
-  return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
-                             vision);
-}
+// Defined below validateNewPackedFormat, which it calls.
+void validateGemma4(NSDictionary *manifest,
+                    const std::filesystem::path &root,
+                    const ModelDescriptor &descriptor);
+void validateDiffusionGemma(NSDictionary *manifest,
+                            const std::filesystem::path &root,
+                            const ModelDescriptor &descriptor);
 
 void validateTokenizer(const std::filesystem::path &root,
                        const ModelDescriptor &descriptor,
@@ -617,7 +427,7 @@ void validateQwen36(NSDictionary *manifest,
                                  field.name),
                  field.value, field.name);
   }
-  if (draftLayout.kind == DraftKind::Plain) {
+  if (draftLayout.kind == DraftKind::DFlashV1) {
     // The packed plain draft may declare its own geometry: the trained
     // block must cover the engine's eight rows, and the sliding window the
     // ring holds may be shallower than the model's declared one.
@@ -631,16 +441,16 @@ void validateQwen36(NSDictionary *manifest,
                                    field.name),
                    field.value, field.name);
     }
-    const uint64_t blockSize =
-        requireUnsigned(draft, @"block_size", "draft block_size");
-    if (blockSize < ExecutionLimits::draftQueryRows)
-      throw std::invalid_argument("draft block_size is below the runtime query rows");
+    // The packed plain draft's trained block must match the family layout's;
+    // the runtime may dispatch more query rows than it trains for.
+    requireEqual(requireUnsigned(draft, @"block_size", "draft block_size"),
+                 uint64_t{draftLayout.blockSize}, "draft block_size");
     requireEqual(requireUnsigned(draft, @"sliding_window", "draft sliding_window"),
                  uint64_t{draftLayout.slidingWindow}, "draft sliding_window");
   } else {
     for (const GeometryField &field : std::to_array<GeometryField>(
              {{"sliding_window", ExecutionLimits::draftContextTokens},
-              {"block_size", ExecutionLimits::draftQueryRows},
+              {"block_size", draftLayout.blockSize},
               {"dynamic_conv_group_size", 16},
               {"dynamic_conv_kernel_size", 2},
               {"selector_rank", draftLayout.selectorRank},
@@ -696,13 +506,11 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
           requireUnsigned(draft, @"rope_theta", "draft rope_theta"));
       const uint64_t blockSize =
           requireUnsigned(draft, @"block_size", "draft block_size");
-      // A plain draft's trained block must cover the engine's eight rows; a
-      // DSpark block only needs to cover the seven emitted proposals (the
-      // runtime pads or truncates to its eight query rows).
-      if (blockSize <
-          (dspark ? ExecutionLimits::draftProposalTokens
-                  : ExecutionLimits::draftQueryRows))
-        throw std::invalid_argument("draft block_size is below the runtime rows");
+      // The runtime dispatches draftQueryRows regardless of the trained
+      // block; the cap on acceptance is the block's proposals — block_size
+      // rows for a plain draft, block_size proposals for a DSpark.
+      if (blockSize < (dspark ? 1 : 2))
+        throw std::invalid_argument("draft block_size is below a proposal row");
       d.blockSize = static_cast<uint32_t>(blockSize);
       if (dspark) {
         d.causalLayers = 0;
@@ -763,6 +571,106 @@ void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> f
     requireEqual(requireUnsigned(object, [NSString stringWithUTF8String:field.name], field.name), field.value, field.name);
 }
 
+// The packed gemma4 manifest: the shared format fields plus the target's
+// dual attention geometry and MoE sizes.
+void validateGemma4(NSDictionary *manifest,
+                    const std::filesystem::path &root,
+                    const ModelDescriptor &descriptor) {
+  validateNewPackedFormat(manifest, root, descriptor, "gemma4_text");
+  const Gemma4MoeLayout &targetLayout =
+      std::get<Gemma4MoeLayout>(descriptor.target);
+  NSDictionary *target =
+      requireObject(manifest, @"target", "target declaration");
+  requireEqual(requireString(target, @"architecture", "target architecture"),
+               "gemma4_text", "target architecture");
+  requireNumbers(target, "target",
+                 {{"layers", targetLayout.layers},
+                  {"hidden_size", targetLayout.hiddenSize},
+                  {"vocabulary_size", targetLayout.vocabularySize},
+                  {"num_attention_heads", targetLayout.attentionQueryHeads},
+                  {"num_key_value_heads", targetLayout.attentionKvHeads},
+                  {"head_dim", targetLayout.attentionHeadDimension},
+                  {"global_num_key_value_heads", targetLayout.globalKvHeads},
+                  {"global_head_dim", targetLayout.globalHeadDimension},
+                  {"sliding_window", targetLayout.slidingWindowTokens},
+                  {"experts", targetLayout.experts},
+                  {"experts_per_token", targetLayout.expertsPerToken},
+                  {"moe_intermediate_size",
+                   targetLayout.expertIntermediateSize},
+                  {"shared_expert_intermediate_size",
+                   targetLayout.sharedIntermediateSize},
+                  {"final_logit_softcapping", targetLayout.logitSoftcap},
+                  {"global_rope_theta",
+                   static_cast<uint64_t>(targetLayout.globalRotaryTheta)},
+                  {"rope_theta",
+                   static_cast<uint64_t>(targetLayout.rotaryTheta)}});
+  requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
+                    targetLayout, @"full_attention", @"sliding_attention",
+                    "target layer_types");
+}
+
+// The packed diffusiongemma manifest: the Gemma 4 target declaration plus a
+// top-level `diffusion` block carrying the denoising schedule, and no draft.
+void validateDiffusionGemma(NSDictionary *manifest,
+                            const std::filesystem::path &root,
+                            const ModelDescriptor &descriptor) {
+  validateNewPackedFormat(manifest, root, descriptor,
+                          "diffusion_gemma_text");
+  const DiffusionGemmaLayout &targetLayout =
+      std::get<DiffusionGemmaLayout>(descriptor.target);
+  NSDictionary *target =
+      requireObject(manifest, @"target", "target declaration");
+  requireEqual(requireString(target, @"architecture", "target architecture"),
+               "diffusion_gemma_text", "target architecture");
+  requireNumbers(target, "target",
+                 {{"layers", targetLayout.layers},
+                  {"hidden_size", targetLayout.hiddenSize},
+                  {"vocabulary_size", targetLayout.vocabularySize},
+                  {"num_attention_heads", targetLayout.attentionQueryHeads},
+                  {"num_key_value_heads", targetLayout.attentionKvHeads},
+                  {"head_dim", targetLayout.attentionHeadDimension},
+                  {"global_num_key_value_heads", targetLayout.globalKvHeads},
+                  {"global_head_dim", targetLayout.globalHeadDimension},
+                  {"sliding_window", targetLayout.slidingWindowTokens},
+                  {"experts", targetLayout.experts},
+                  {"experts_per_token", targetLayout.expertsPerToken},
+                  {"moe_intermediate_size",
+                   targetLayout.expertIntermediateSize},
+                  {"shared_expert_intermediate_size",
+                   targetLayout.sharedIntermediateSize},
+                  {"final_logit_softcapping", targetLayout.logitSoftcap},
+                  {"global_rope_theta",
+                   static_cast<uint64_t>(targetLayout.globalRotaryTheta)},
+                  {"rope_theta",
+                   static_cast<uint64_t>(targetLayout.rotaryTheta)}});
+  requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
+                    targetLayout, @"full_attention", @"sliding_attention",
+                    "target layer_types");
+  if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]])
+    throw std::invalid_argument("diffusion gemma targets take no draft");
+  NSDictionary *diffusion =
+      requireObject(manifest, @"diffusion", "diffusion schedule");
+  const DiffusionSchedule &schedule = targetLayout.diffusion;
+  // The schedule's float fields compare as floats: a JSON 0.1 has no exact
+  // double equal of 0.1f.
+  const auto requireFloat = [&](const char *key, float expected) {
+    id value = diffusion[@(key)];
+    if (![value isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID() ||
+        static_cast<float>([value doubleValue]) != expected)
+      throw std::invalid_argument(std::string("diffusion schedule ") + key +
+                                  " mismatch");
+  };
+  requireNumbers(diffusion, "diffusion schedule",
+                 {{"canvas_length", schedule.canvasLength},
+                  {"max_denoising_steps", schedule.maxDenoisingSteps},
+                  {"stability_threshold", schedule.stabilityThreshold}});
+  requireFloat("t_min", schedule.tMin);
+  requireFloat("t_max", schedule.tMax);
+  requireFloat("entropy_bound", schedule.entropyBound);
+  requireFloat("confidence_threshold", schedule.confidenceThreshold);
+}
+
 // The target's text configuration. Every one holds the sizes the descriptor
 // shares with it. An MLX target's config.json, which is target/config.json
 // too and which its images are planned from, also holds the rest of what the
@@ -788,7 +696,7 @@ void validateTextConfig(NSDictionary *text, const Layout &target,
                   {"linear_conv_kernel_dim", kGdnConvolutionTaps},
                   {"full_attention_interval", target.fullAttentionPeriod},
                   {"rms_norm_eps", 1e-6}});
-  if constexpr (std::decay_t<Layout>::ffnKind == QwenFfnKind::SparseMoe)
+  if constexpr (std::decay_t<Layout>::ffnKind == FfnKind::SparseMoe)
     requireNumbers(text, "text config",
                    {{"num_experts", target.experts},
                     {"num_experts_per_tok", target.expertsPerToken},
@@ -823,10 +731,11 @@ void validateTextConfig(NSDictionary *text, const Layout &target,
 
 // A DFlash2 checkpoint's config: the draft's layout; the block, window,
 // convolutions and selector the draft kernels are built for; and the target's
-// mask token and the layers the draft reads.
-void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
-                         uint32_t maskToken,
-                         std::span<const uint32_t> captureLayers) {
+// mask token and the layers the draft reads. Returns the declared block_size:
+// the runtime may dispatch more query rows than the block trains for.
+uint32_t validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
+                             uint32_t maskToken,
+                             std::span<const uint32_t> captureLayers) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 ||
@@ -858,9 +767,12 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
                  {{"rope_theta", layout.rotaryTheta}});
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
+  const uint64_t blockSize =
+      requireUnsigned(flash, @"block_size", "draft config block_size");
+  if (blockSize < 2)
+    throw std::invalid_argument("draft block_size is below a proposal row");
   requireNumbers(flash, "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
-                  {"conv_group_size", kDraftConvolutionGroup},
+                 {{"conv_group_size", kDraftConvolutionGroup},
                   {"conv_kernel_size", kDraftConvolutionTaps},
                   {"selector_rank", layout.selectorRank},
                   {"selector_top_k", RICHENGINE_DRAFT_CANDIDATES},
@@ -868,7 +780,37 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
   requireNumbers(requireArray(flash, @"target_layer_ids",
                               "draft config target_layer_ids"),
                  captureLayers, "draft config target_layer_ids");
+  return static_cast<uint32_t>(blockSize);
 }
+
+// The families an assembly's model.json may name (install/families.py's
+// FAMILIES), each with the model_type its upstream config states. The
+// record's family selects the descriptor — the installer resolved it from
+// the same configuration — and the config is then validated against it;
+// the runtime never re-guesses a family from the geometry.
+struct FamilyDescriptor {
+  const char *name;
+  const char *modelType;
+  // A model_type an early release of the family also stated, else null.
+  const char *legacyType;
+  ModelDescriptor (*make)(std::string name);
+};
+
+constexpr FamilyDescriptor kModelFamilies[] = {
+    {"Qwen3.8-27B", "qwen3_5_text", nullptr, qwen38Descriptor},
+    {"Bonsai-2-27B", "qwen3_5_text", nullptr, qwen38Descriptor},
+    {"Ornith-1.5-9B", "qwen3_5_text", nullptr, ornithDescriptor},
+    {"Qwen3.6-35B-A3B", "qwen3_5_moe_text", nullptr, qwen36Descriptor},
+    {"Ornith-1.5-35B-A3B", "qwen3_5_moe_text", nullptr, qwen36Descriptor},
+    // MiniCPM5's early releases stated model_type "minicpm".
+    {"MiniCPM5-2B", "llama", "minicpm", denseDescriptor},
+    {"LFM2.5-2.6B", "lfm2", nullptr, lfm2Descriptor},
+    {"LFM2.5-8B-A1B", "lfm2_moe", nullptr, lfm2moeDescriptor},
+    {"Granite-4.2-3B", "granite", nullptr, granite3BDescriptor},
+    {"Granite-4.2-8B", "granite", nullptr, granite8BDescriptor},
+    {"Gemma4-26B-A4B", "gemma4_text", nullptr, gemma4Descriptor},
+    {"DiffusionGemma-26B-A4B", "diffusion_gemma_text", nullptr, diffusionGemmaDescriptor},
+};
 
 ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   std::string sourceIdentity;
@@ -881,44 +823,17 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (![text isKindOfClass:[NSDictionary class]]) text = config;
   const auto type = requireString(text, @"model_type", "text model type");
   const auto name = requireString(record, @"model", "model name");
-  ModelDescriptor result;
-  if (type == "qwen3_5_moe_text") {
-    result = qwen36Descriptor(name);
-  } else if (type == "qwen3_5_text") {
-    // The dense families share a model type; the layer count names the model.
-    // validateTextConfig rules it a JSON number; here it only picks a family.
-    const id layersValue = text[@"num_hidden_layers"];
-    requireNumber(layersValue, [layersValue doubleValue],
-                  "text config num_hidden_layers");
-    const uint64_t layers = [layersValue unsignedLongLongValue];
-    if (layers == Qwen3_8Layout{}.layers) result = qwen38Descriptor(name);
-    else if (layers == Ornith9BLayout{}.layers) result = ornithDescriptor(name);
-    else throw std::invalid_argument("unsupported qwen3_5_text layer count: " +
-                                     std::to_string(layers));
-  } else if (type == "minicpm" || type == "llama") {
-    // MiniCPM5 states model_type "llama" (an early release said "minicpm").
-    result = denseDescriptor(name);
-  } else if (type == "lfm2") {
-    result = lfm2Descriptor(name);
-  } else if (type == "lfm2_moe") {
-    result = lfm2moeDescriptor(name);
-  } else if (type == "granite") {
-    // Granite 4.2 3B/8B share model_type; hidden_size names the model.
-    const id hiddenValue = text[@"hidden_size"];
-    requireNumber(hiddenValue, [hiddenValue doubleValue],
-                  "text config hidden_size");
-    const uint64_t hidden = [hiddenValue unsignedLongLongValue];
-    if (hidden == GraniteLayout{}.hiddenSize) {
-      result = graniteDescriptor(name, GraniteLayout{});
-    } else if (hidden == granite8BLayout().hiddenSize) {
-      result = graniteDescriptor(name, granite8BLayout());
-    } else {
-      throw std::invalid_argument("unsupported granite hidden size: " +
-                                  std::to_string(hidden));
-    }
-  } else {
-    throw std::invalid_argument("unsupported model architecture: " + type);
-  }
+  const auto family = requireString(record, @"family", "model family");
+  const auto entry = std::ranges::find(kModelFamilies, family,
+                                       &FamilyDescriptor::name);
+  if (entry == std::end(kModelFamilies))
+    throw std::invalid_argument("unsupported model family: " + family);
+  if (type != entry->modelType &&
+      !(entry->legacyType && type == entry->legacyType))
+    throw std::invalid_argument(
+        "model family " + family + " states model_type " + entry->modelType +
+        ", not " + type);
+  ModelDescriptor result = entry->make(name);
   std::visit([&](const auto &layout) {
     using Layout = std::decay_t<decltype(layout)>;
     if constexpr (std::is_same_v<Layout, DenseLayout>) {
@@ -994,6 +909,19 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         requireEqual(actual ? actual : "", expected,
                      "target layer " + std::to_string(layer));
       }
+    } else if constexpr (std::is_same_v<Layout, Gemma4MoeLayout> ||
+                         std::is_same_v<Layout, DiffusionGemmaLayout>) {
+      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+          {"vocab_size", layout.vocabularySize}, {"num_attention_heads", layout.attentionQueryHeads},
+          {"num_key_value_heads", layout.attentionKvHeads}, {"head_dim", layout.attentionHeadDimension},
+          {"global_num_key_value_heads", layout.globalKvHeads},
+          {"global_head_dim", layout.globalHeadDimension},
+          {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
+          {"moe_intermediate_size", layout.expertIntermediateSize},
+          {"shared_expert_intermediate_size", layout.sharedIntermediateSize},
+          {"sliding_window", layout.slidingWindowTokens}});
+      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                    "max_position_embeddings");
     }
     // The Qwen families' text config is checked by validateTextConfig once
     // the target format is known.
@@ -1009,19 +937,27 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
                   std::is_same_v<Layout, Qwen3_6MoeLayout>)
       validateTextConfig(text, layout, result.targetSource);
   }, result.target);
-  if (result.draft.kind != DraftKind::Null) {
+  // Gemma 4's default draft is Null, but an assembly that ships a draft/
+  // config.json declares one anyway (its plain DFlash block).
+  const bool gemmaDraftDeclared =
+      std::holds_alternative<Gemma4MoeLayout>(result.target) &&
+      std::filesystem::exists(root / "draft" / "config.json");
+  if (std::holds_alternative<DiffusionGemmaLayout>(result.target) &&
+      std::filesystem::exists(root / "draft" / "config.json"))
+    throw std::invalid_argument("diffusion gemma targets take no draft");
+  if (result.draft.kind != DraftKind::Null || gemmaDraftDeclared) {
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1)
     throw std::invalid_argument("draft must declare exactly one architecture");
   const std::string draftArch = architectures[0] && [architectures[0] isKindOfClass:[NSString class]]
       ? std::string(static_cast<NSString *>(architectures[0]).UTF8String) : "";
-  const bool plainDraft = draftArch == "DFlashDraftModel";
+  const bool dflashV1Draft = draftArch == "DFlashDraftModel";
   const bool dsparkDraft = isDSparkArchitecture(draftArch);
-  if (!plainDraft && !dsparkDraft && draftArch != "DFlash2DraftModel")
+  if (!dflashV1Draft && !dsparkDraft && draftArch != "DFlash2DraftModel")
     throw std::invalid_argument("draft is not a DFlash, DFlash2 or DSpark model");
   DFlashDraftLayout d = result.draft;
-  if (!plainDraft && !dsparkDraft && d.kind == DraftKind::Plain) {
+  if (!dflashV1Draft && !dsparkDraft && d.kind == DraftKind::DFlashV1) {
     // The descriptor's default draft for this target is plain, but the
     // assembly declares a DFlash2 draft: swap in its DFlash2 layout.
     std::visit(
@@ -1040,18 +976,19 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   }
   // A DFlash2 draft's config is the checkpoint's: one rule checks it before
   // the dialect parsers below read the fields it names.
-  if (!plainDraft && !dsparkDraft) {
+  if (!dflashV1Draft && !dsparkDraft) {
     std::visit([&](const auto &layout) {
-      validateDraftConfig(draft, result.draft, layout.maskToken,
-                          layout.hiddenCaptureLayers);
+      result.draft.blockSize = validateDraftConfig(draft, result.draft,
+                                                 layout.maskToken,
+                                                 layout.hiddenCaptureLayers);
     }, result.target);
   }
-  if (plainDraft) {
+  if (dflashV1Draft) {
     // The plain transformer draft: the layout is read from the config.
     // The compiled attention core fixes the head pattern at 32 x 8 x 128
     // over a 6144-wide fused QKV (DraftAttention.cpp's kernel shapes).
     d = {};
-    d.kind = DraftKind::Plain;
+    d.kind = DraftKind::DFlashV1;
     // No dynamic convolutions or candidate selector exist in this format.
     d.dynamicSize = 0;
     d.selectorRank = 0;
@@ -1096,6 +1033,13 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       const uint32_t all = (uint32_t{1} << d.layers) - 1;
       d.causalLayers = [causalFlag boolValue] ? all : 0;
     }
+    // Gemma 4's draft shares its target's logit softcap; other families'
+    // plain drafts leave it disabled.
+    std::visit([&](const auto &layout) {
+      if constexpr (std::is_same_v<std::decay_t<decltype(layout)>,
+                                   Gemma4MoeLayout>)
+        d.logitSoftcap = layout.logitSoftcap;
+    }, result.target);
   } else if (dsparkDraft) {
     // The DSpark draft: a block-bidirectional qwen3 block plus a Markov and
     // a confidence head. MiniCPM5's config states its fields flat, LFM2.5's
@@ -1198,7 +1142,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   } else {
     ropeTheta = requireUnsigned(draft, @"rope_theta", "draft rotary theta");
   }
-  if (dsparkDraft || plainDraft)
+  if (dsparkDraft || dflashV1Draft)
     d.rotaryTheta = static_cast<float>(ropeTheta);
   else
     requireEqual(ropeTheta, 10000000, "draft rotary theta");
@@ -1211,21 +1155,24 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     else
       flash = requireObject(draft, @"dflash_config", "draft configuration");
   }
-  if (plainDraft) {
+  if (dflashV1Draft) {
     const uint64_t blockSize =
         requireUnsigned(flash, @"block_size", "draft block_size");
-    if (blockSize < ExecutionLimits::draftQueryRows)
-      throw std::invalid_argument("draft block_size is below the runtime query rows");
+    // The runtime always dispatches draftQueryRows query rows: a shorter
+    // trained block is padded with mask rows whose proposals never accept.
+    if (blockSize < 2)
+      throw std::invalid_argument("draft block_size is below a proposal row");
+    d.blockSize = static_cast<uint32_t>(blockSize);
   } else if (dsparkDraft) {
     // block_size is a root field in both DSpark dialects; only LFM2.5 nests
     // the mask and capture fields under dflash_config.
     d.blockSize = static_cast<uint32_t>(
         requireUnsigned(draft, @"block_size", "draft block_size"));
-    // The runtime always dispatches its eight query rows: a shorter trained
-    // block is padded with mask rows, a longer one truncated to seven
-    // proposals.
-    if (d.blockSize < ExecutionLimits::draftProposalTokens)
-      throw std::invalid_argument("draft block_size is below the runtime proposals");
+    // The runtime always dispatches draftQueryRows query rows: a shorter
+    // trained block is padded with mask rows, a longer one truncated to the
+    // proposal budget.
+    if (d.blockSize < 1)
+      throw std::invalid_argument("draft block_size is below a proposal row");
     if (id layers = flash[@"num_target_layers"]) {
       std::visit([&](const auto &layout) {
         requireEqual(requireUnsigned(flash, @"num_target_layers",
@@ -1235,7 +1182,15 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       static_cast<void>(layers);
     }
   } else {
-    requireNumbers(flash, {{"block_size", ExecutionLimits::draftQueryRows}, {"conv_group_size", 16},
+    const uint64_t blockSize =
+        requireUnsigned(flash, @"block_size", "draft block_size");
+    // A DFlash2 block_size counts the block's query rows; the runtime may
+    // dispatch wider and cap acceptance at the trained block's proposals.
+    if (blockSize < 2)
+      throw std::invalid_argument("draft block_size is below a proposal row");
+    d.blockSize = static_cast<uint32_t>(blockSize);
+    result.draft.blockSize = d.blockSize;
+    requireNumbers(flash, {{"conv_group_size", 16},
         {"conv_kernel_size", 2}, {"selector_rank", d.selectorRank}, {"selector_top_k", 16}});
   }
   NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
@@ -1247,11 +1202,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       if (![value isKindOfClass:[NSNumber class]] || [value unsignedLongLongValue] != layout.hiddenCaptureLayers[i])
         throw std::invalid_argument("draft target capture layers do not match this model");
     }
-    if (plainDraft || dsparkDraft)
+    if (dflashV1Draft || dsparkDraft)
       d.targetHiddenSize = static_cast<uint32_t>(
           capture.count * layout.hiddenSize);
   }, result.target);
-  if (plainDraft || dsparkDraft) {
+  if (dflashV1Draft || dsparkDraft) {
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
   }
@@ -1266,7 +1221,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         std::holds_alternative<DenseLayout>(result.target) ||
         std::holds_alternative<GraniteLayout>(result.target) ||
         std::holds_alternative<Lfm2Layout>(result.target) ||
-        std::holds_alternative<Lfm2MoeLayout>(result.target))
+        std::holds_alternative<Lfm2MoeLayout>(result.target) ||
+        std::holds_alternative<Gemma4MoeLayout>(result.target) ||
+        std::holds_alternative<DiffusionGemmaLayout>(result.target))
       throw std::invalid_argument("unsupported vision source format: " + vision);
     if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
     else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
@@ -1300,6 +1257,10 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
                                layout.maximumContextTokens};
+        if constexpr (std::is_same_v<std::decay_t<decltype(layout)>,
+                                     DiffusionGemmaLayout>)
+          result.capabilities.maximumStepTokens =
+              layout.diffusion.canvasLength;
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -1346,33 +1307,46 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
             : format;
     ModelDescriptor descriptor;
     if (canonicalFormat == "richengine-packed-q4") {
-      // Both dense families share the packed format; the tokenizer config's
-      // hidden size names the model.
-      NSDictionary *tokenizerConfig =
-          readObject(root / "tokenizer" / "config.json", "tokenizer model config");
-      NSDictionary *text = requireObject(tokenizerConfig, @"text_config",
-                                         "text model config");
-      const uint64_t hiddenSize =
-          requireUnsigned(text, @"hidden_size", "hidden_size");
-      if (hiddenSize == Ornith9BLayout{}.hiddenSize)
-        descriptor = ornithDescriptor(model);
-      else
-        descriptor = qwen38Descriptor(model);
+      if (manifest[@"family"]) {
+        // A manifest written by install/pack.py names its family outright;
+        // it selects the descriptor the same way a source record's does.
+        const std::string family =
+            requireString(manifest, @"family", "model family");
+        const auto entry = std::ranges::find(kModelFamilies, family,
+                                             &FamilyDescriptor::name);
+        if (entry == std::end(kModelFamilies))
+          throw std::invalid_argument("unsupported model family: " + family);
+        descriptor = entry->make(model);
+      } else {
+        // Both dense families share the packed format; a legacy manifest
+        // without a family names the model by the tokenizer config's
+        // hidden size.
+        NSDictionary *tokenizerConfig =
+            readObject(root / "tokenizer" / "config.json", "tokenizer model config");
+        NSDictionary *text = requireObject(tokenizerConfig, @"text_config",
+                                           "text model config");
+        const uint64_t hiddenSize =
+            requireUnsigned(text, @"hidden_size", "hidden_size");
+        if (hiddenSize == Ornith9BLayout{}.hiddenSize)
+          descriptor = ornithDescriptor(model);
+        else
+          descriptor = qwen38Descriptor(model);
+      }
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      const DFlashDraftLayout plainLayout = ornith9PlainDraftLayout();
+      const DFlashDraftLayout dflashV1Layout = ornith9DFlashV1DraftLayout();
       const bool ornith =
           std::holds_alternative<Ornith9BLayout>(descriptor.target);
       applyManifestDraftKind(
-          weightFormat, descriptor, ornith ? &plainLayout : nullptr,
+          weightFormat, descriptor, ornith ? &dflashV1Layout : nullptr,
           ornith ? ornith9DFlash2DraftLayout() : DFlashDraftLayout{});
       validateQwen38(manifest, root, descriptor);
     } else if (canonicalFormat == "richengine-packed-q4-moe") {
       descriptor = qwen36Descriptor(model);
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      const DFlashDraftLayout plainLayout = qwen36PlainDraftLayout();
-      applyManifestDraftKind(weightFormat, descriptor, &plainLayout,
+      const DFlashDraftLayout dflashV1Layout = qwen36DFlashV1DraftLayout();
+      applyManifestDraftKind(weightFormat, descriptor, &dflashV1Layout,
                              qwen36DraftLayout());
       validateQwen36(manifest, root, descriptor);
     } else if (canonicalFormat == "richengine-packed-q4-dense") {
@@ -1393,6 +1367,22 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
           requireObject(manifest, @"format", "model weight format");
       applyDeclaredDraft(manifest, weightFormat, descriptor, lfm2moeDraftLayout());
       validateNewPackedFormat(manifest, root, descriptor, "lfm2_moe");
+    } else if (canonicalFormat == "richengine-packed-q4-gemma4") {
+      descriptor = gemma4Descriptor(model);
+      descriptor.packedTiledEmbedding = true;
+      // A package whose manifest declares a draft ships the plain DFlash
+      // block; one without keeps the Null layout and its n-gram predraft.
+      if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *weightFormat =
+            requireObject(manifest, @"format", "model weight format");
+        applyDeclaredDraft(manifest, weightFormat, descriptor,
+                           gemma4DFlashV1DraftDefaults());
+      }
+      validateGemma4(manifest, root, descriptor);
+    } else if (canonicalFormat == "richengine-packed-q4-diffusiongemma") {
+      descriptor = diffusionGemmaDescriptor(model);
+      descriptor.packedTiledEmbedding = true;
+      validateDiffusionGemma(manifest, root, descriptor);
     } else {
       throw std::invalid_argument("unsupported weight format: " + format);
     }

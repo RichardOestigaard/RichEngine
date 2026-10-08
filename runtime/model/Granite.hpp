@@ -2,8 +2,8 @@
 
 #include "Qwen3_8.hpp"
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -20,7 +20,7 @@ namespace richengine::model {
 struct GraniteLayout final {
   static constexpr std::string_view layerMagic = "MGRN0001";
   static constexpr std::string_view headMagic = "MGRN0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  static constexpr FfnKind ffnKind = FfnKind::Dense;
   static constexpr uint32_t attentionQueryStride = 1;
   static constexpr bool attentionQkNorm = false;
 
@@ -98,10 +98,10 @@ struct GraniteLayout final {
   return layout;
 }
 
-using GraniteWeights = QwenTargetWeights<GraniteLayout, Qwen3_8LayerWeights>;
+using GraniteWeights = TargetModelWeights<GraniteLayout, DenseLayerWeights>;
 
 [[nodiscard]] GraniteWeights
 loadGraniteWeights(metal::MetalBackend &backend, GraniteLayout layout,
-                   const QwenTargetFiles<GraniteLayout> &files);
+                   const TargetFiles<GraniteLayout> &files);
 
 } // namespace richengine::model

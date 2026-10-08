@@ -52,3 +52,37 @@ Raw results land in `build/release/bench/*.json` (or `--output-dir` under
 `make test-performance-real`, which also supports `BASELINE=<checkout>`
 for ABBA-order comparisons against another build and
 `ANE_FFN_SHARE=<share>` to pin the split).
+
+## DiffusionGemma microbenchmarks
+
+The `decode` scenario does not apply to the diffusion model: a denoise
+step produces a 256-token canvas, not one retained token, and the
+committed canvas is what the wall number divides. Until a canvas-aware
+scenario exists, the kernels are benchmarked directly:
+
+```sh
+make build/engine-tests/canvas-kernels
+./build/engine-tests/canvas-kernels build/richengine.metallib
+make build/engine-tests/hd512-attention
+./build/engine-tests/hd512-attention build/richengine.metallib
+```
+
+`canvas-kernels` prints µs/dispatch (median of 20 GPU-timestamped
+reps) for the logit-tail kernels over a real-size 256×262144 fp32
+logits buffer — the old and fused paths side by side — and checks
+argmax/entropy/sample parity against a CPU reference on three
+adversarial row bands. `hd512-attention` does the same old-vs-m2
+comparison for the head_dim-512 attention splits at prefixes
+{0, 1024, 8192} in each KV format.
+
+Conventions for quoting diffusion numbers:
+
+- Cite the flags: the fused paths default on — `RICHENGINE_CANVAS_EMBED_HIST`,
+  `RICHENGINE_CANVAS_STATS_FUSED`, `RICHENGINE_CANVAS_STEPS_PER_CMD` (2),
+  `RICHENGINE_CANVAS_PREFIX_EXIT`, `RICHENGINE_CANVAS_COMMIT_TAIL`.
+  Set any of them to `0`/`1` for the pre-optimization baselines.
+- Committed throughput is `committed_tokens / wall`, not tokens/forward;
+  report both canvas steps used and tokens committed per canvas.
+- `canvas_soft_embed_topk` is the reference implementation kept for
+  A/B only (`RICHENGINE_CANVAS_EMBED_HIST=0` selects it; `exact=true`
+  selects the full-table exact kernel — never quote it for production).

@@ -1,6 +1,7 @@
 #include "ops/LfmConv.hpp"
 
 #include "metal/abi/LfmConv.h"
+#include "ops/KernelNames.hpp"
 
 #include <stdexcept>
 
@@ -48,12 +49,12 @@ void LfmConv::addPrefill(metal::CommandGraph &graph, const LfmConvPrefillBuffers
   const auto p = params(rows, shape, tapsMajor, 0, 0, 1);
   const uint64_t tasks = uint64_t{rows} + shape.taps - 1;
   if (shape.dimension % 4 == 0) {
-    graph.add("prefill_lfm_conv_v4",
+    graph.add(std::string(kPrefillLfmConvV4),
               {buffers.packed, buffers.weights, buffers.stateIn, buffers.stateOut,
                buffers.output},
               p, groups(tasks * (shape.dimension / 4)));
   } else {
-    graph.add("prefill_lfm_conv",
+    graph.add(std::string(kPrefillLfmConv),
               {buffers.packed, buffers.weights, buffers.stateIn, buffers.stateOut,
                buffers.output},
               p, groups(tasks * shape.dimension));
@@ -74,12 +75,12 @@ void LfmConv::addVerify(metal::CommandGraph &graph, const LfmConvVerifyBuffers &
   if (shape.dimension % kVerifyChannelBlock == 0 &&
       uint64_t{rows} * kVerifyVecColumns <= 1024) {
     graph.addPatchable(
-        "verify_lfm_conv_v4", bindings, p,
+        std::string(kVerifyLfmConvV4), bindings, p,
         {static_cast<uint32_t>(uint64_t{lanes} * shape.dimension / kVerifyChannelBlock), 1, 1},
         {static_cast<uint32_t>(rows * kVerifyVecColumns), 1, 1});
     return;
   }
-  graph.addPatchable("verify_lfm_conv", bindings, p,
+  graph.addPatchable(std::string(kVerifyLfmConv), bindings, p,
                      groups(uint64_t{lanes} * rows * shape.dimension));
 }
 
@@ -102,9 +103,9 @@ void LfmConv::addCommit(metal::CommandGraph &graph, const LfmConvCommitBuffers &
   const uint64_t tasks =
       uint64_t{layers} * lanes * (shape.taps - 1) * shape.dimension;
   if (shape.dimension % 4 == 0) {
-    graph.addPatchable("commit_lfm_conv_v4", bindings, p, groups(tasks / 4));
+    graph.addPatchable(std::string(kCommitLfmConvV4), bindings, p, groups(tasks / 4));
   } else {
-    graph.addPatchable("commit_lfm_conv", bindings, p, groups(tasks));
+    graph.addPatchable(std::string(kCommitLfmConv), bindings, p, groups(tasks));
   }
 }
 

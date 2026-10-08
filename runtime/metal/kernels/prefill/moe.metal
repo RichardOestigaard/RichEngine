@@ -19,7 +19,7 @@
 // remains unmeasured.
 constant constexpr uint PrefillMoeTileRows = 32;
 
-template <ushort Rows, bool MultiplySiluGate>
+template <ushort Rows, ushort MaxRows, bool MultiplySiluGate>
 inline void prefill_moe_expert_tile(device bfloat *grouped_input,
                                     device const MoeTileDescriptor *tiles,
                                     device uchar *packed, device uchar *shared,
@@ -30,7 +30,7 @@ inline void prefill_moe_expert_tile(device bfloat *grouped_input,
   const MoeQ4Slab slab = moe_q4_slab(
       packed, shared, tiles[group.y].expert, params.experts,
       params.expert_stride_bytes_0, params.output_size, params.input_size);
-  const ulong row = ulong(group.y) * PrefillMoeTileRows;
+  const ulong row = ulong(group.y) * MaxRows;
   q4_mpp_tile<Rows, 256, false, false, MultiplySiluGate>(
       grouped_input + row * params.input_size, slab.weights, slab.scales,
       slab.biases, output + row * params.output_size, slab.weights,
@@ -41,7 +41,7 @@ inline void prefill_moe_expert_tile(device bfloat *grouped_input,
 
 // The indirect form for the gate and up passes: tile row r reads input row
 // row_routes[r] / routes_per_row through a staged Rows x 256 block.
-template <ushort Rows, bool MultiplySiluGate>
+template <ushort Rows, ushort MaxRows, bool MultiplySiluGate>
 inline void prefill_moe_expert_tile_indirect(
     device const bfloat *input, device const uint *grouped_routes,
     device const MoeTileDescriptor *tiles, device uchar *packed,
@@ -52,7 +52,7 @@ inline void prefill_moe_expert_tile_indirect(
   const MoeQ4Slab slab = moe_q4_slab(
       packed, shared, tiles[group.y].expert, params.experts,
       params.expert_stride_bytes_0, params.output_size, params.input_size);
-  const ulong row = ulong(group.y) * PrefillMoeTileRows;
+  const ulong row = ulong(group.y) * MaxRows;
   q4_mpp_tile_sums_indirect<Rows, 256, false, 8>(
       input, grouped_routes + row, params.reserved0, params.input_size,
       slab.weights, slab.scales, slab.biases, slab.weights, slab.scales,
@@ -71,7 +71,7 @@ inline void prefill_moe_expert_tile_indirect(
       });
 }
 
-template <bool MultiplySiluGate>
+template <ushort MaxRows, bool MultiplySiluGate>
 inline void prefill_moe_expert(device bfloat *grouped_input,
                                device const MoeTileDescriptor *tiles,
                                device const uint *tile_count,
@@ -82,14 +82,14 @@ inline void prefill_moe_expert(device bfloat *grouped_input,
                                uint simd_group) {
   if (group.y >= *tile_count)
     return;
-  moe_live_rows<PrefillMoeTileRows>(tiles[group.y].rows, [&](auto rows) {
-    prefill_moe_expert_tile<decltype(rows)::value, MultiplySiluGate>(
+  moe_live_rows<MaxRows>(tiles[group.y].rows, [&](auto rows) {
+    prefill_moe_expert_tile<decltype(rows)::value, MaxRows, MultiplySiluGate>(
         grouped_input, tiles, packed, shared, gate, output, params, group,
         input_sums, simd_lane, simd_group);
   });
 }
 
-template <bool MultiplySiluGate>
+template <ushort MaxRows, bool MultiplySiluGate>
 inline void prefill_moe_expert_indirect(
     device const bfloat *input, device const uint *grouped_routes,
     device const MoeTileDescriptor *tiles, device const uint *tile_count,
@@ -99,8 +99,9 @@ inline void prefill_moe_expert_indirect(
     uint simd_group, uint threads) {
   if (group.y >= *tile_count)
     return;
-  moe_live_rows<PrefillMoeTileRows>(tiles[group.y].rows, [&](auto rows) {
-    prefill_moe_expert_tile_indirect<decltype(rows)::value, MultiplySiluGate>(
+  moe_live_rows<MaxRows>(tiles[group.y].rows, [&](auto rows) {
+    prefill_moe_expert_tile_indirect<decltype(rows)::value, MaxRows,
+                                     MultiplySiluGate>(
         input, grouped_routes, tiles, packed, shared, gate, output, params,
         group, staged, input_sums, simd_lane, simd_group, threads);
   });
@@ -119,7 +120,7 @@ kernel void prefill_moe_expert_q4_n256_m32(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float input_sums[8 * PrefillMoeTileRows];
-  prefill_moe_expert<false>(grouped_input, tiles, tile_count, packed, shared,
+  prefill_moe_expert<32, false>(grouped_input, tiles, tile_count, packed, shared,
                             output, output, params, group, input_sums,
                             simd_lane, simd_group);
 }
@@ -140,7 +141,7 @@ kernel void prefill_moe_expert_q4_n256_indirect_m32(
     uint2 tpg [[threads_per_threadgroup]]) {
   threadgroup bfloat staged[PrefillMoeTileRows * 256];
   threadgroup float input_sums[8 * PrefillMoeTileRows];
-  prefill_moe_expert_indirect<false>(input, grouped_routes, tiles, tile_count,
+  prefill_moe_expert_indirect<32, false>(input, grouped_routes, tiles, tile_count,
                                      packed, shared, output, output, params,
                                      group, staged, input_sums, simd_lane,
                                      simd_group, tpg.x);
@@ -163,8 +164,159 @@ kernel void prefill_moe_expert_q4_n256_up_silu_indirect_m32(
     uint2 tpg [[threads_per_threadgroup]]) {
   threadgroup bfloat staged[PrefillMoeTileRows * 256];
   threadgroup float input_sums[8 * PrefillMoeTileRows];
-  prefill_moe_expert_indirect<true>(input, grouped_routes, tiles, tile_count,
+  prefill_moe_expert_indirect<32, true>(input, grouped_routes, tiles, tile_count,
                                     up_packed, shared_up, gate, output, params,
                                     group, staged, input_sums, simd_lane,
                                     simd_group, tpg.x);
+}
+
+// Gemma 4's GeGLU up pass: the indirect up tile whose store multiplies each
+// output by gelu_pytorch_tanh of the gate pass's bf16 result (the
+// MultiplySiluGate epilogue with gelu in place of silu).
+kernel void prefill_moe_expert_q4_n256_up_gelu_indirect_m32(
+    device const bfloat *input [[buffer(0)]],
+    device const uint *grouped_routes [[buffer(1)]],
+    device const MoeTileDescriptor *tiles [[buffer(2)]],
+    device const uint *tile_count [[buffer(3)]],
+    device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_up [[buffer(5)]],
+    device bfloat *gate [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  threadgroup bfloat staged[PrefillMoeTileRows * 256];
+  threadgroup float input_sums[8 * PrefillMoeTileRows];
+  if (group.y >= *tile_count)
+    return;
+  const MoeQ4Slab slab = moe_q4_slab(
+      up_packed, shared_up, tiles[group.y].expert, params.experts,
+      params.expert_stride_bytes_0, params.output_size, params.input_size);
+  const ulong row = ulong(group.y) * 32;
+  q4_mpp_tile_sums_indirect<32, 256, false, 8>(
+      input, grouped_routes + row, params.reserved0, params.input_size,
+      slab.weights, slab.scales, slab.biases, slab.weights, slab.scales,
+      slab.biases, staged, input_sums, group.x * 256, simd_lane, simd_group,
+      tpg.x,
+      [&](thread auto &accumulated, thread auto &, Q4Traversal traversal)
+          __attribute__((always_inline)) {
+        q4_visit(accumulated, traversal, [&](ushort i) {
+          auto index = accumulated.get_multidimensional_index(i);
+          const uint output_index =
+              index[1] * params.output_size + group.x * 256 + index[0];
+          const ulong at = row * params.output_size + output_index;
+          output[at] = bfloat(richengine_gelu_tanh(float(gate[at])) *
+                              float(bfloat(accumulated[i])));
+        });
+      });
+}
+
+// 16-row forms of the passes above, for plans whose expert tiles hold sixteen
+// rows (ExecutionPlans picks M16 at small rows, e.g. a 256-row canvas: the
+// union leaves each expert well under 32 live rows, so the extra tiles'
+// added weight reads are repaid by the larger, more parallel grid).
+kernel void prefill_moe_expert_q4_n256_m16(
+    device bfloat *grouped_input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]],
+    device const uint *tile_count [[buffer(2)]],
+    device uchar *packed [[buffer(3)]],
+    device uchar *shared [[buffer(4)]],
+    device bfloat *output [[buffer(5)]],
+    constant MoeExpertParams &params [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float input_sums[8 * 16];
+  prefill_moe_expert<16, false>(grouped_input, tiles, tile_count, packed,
+                                shared, output, output, params, group,
+                                input_sums, simd_lane, simd_group);
+}
+
+kernel void prefill_moe_expert_q4_n256_indirect_m16(
+    device const bfloat *input [[buffer(0)]],
+    device const uint *grouped_routes [[buffer(1)]],
+    device const MoeTileDescriptor *tiles [[buffer(2)]],
+    device const uint *tile_count [[buffer(3)]],
+    device uchar *packed [[buffer(4)]],
+    device uchar *shared [[buffer(5)]],
+    device bfloat *output [[buffer(6)]],
+    constant MoeExpertParams &params [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  threadgroup bfloat staged[16 * 256];
+  threadgroup float input_sums[8 * 16];
+  prefill_moe_expert_indirect<16, false>(input, grouped_routes, tiles,
+                                         tile_count, packed, shared, output,
+                                         output, params, group, staged,
+                                         input_sums, simd_lane, simd_group,
+                                         tpg.x);
+}
+
+kernel void prefill_moe_expert_q4_n256_up_silu_indirect_m16(
+    device const bfloat *input [[buffer(0)]],
+    device const uint *grouped_routes [[buffer(1)]],
+    device const MoeTileDescriptor *tiles [[buffer(2)]],
+    device const uint *tile_count [[buffer(3)]],
+    device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_up [[buffer(5)]],
+    device bfloat *gate [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  threadgroup bfloat staged[16 * 256];
+  threadgroup float input_sums[8 * 16];
+  prefill_moe_expert_indirect<16, true>(input, grouped_routes, tiles,
+                                        tile_count, up_packed, shared_up,
+                                        gate, output, params, group, staged,
+                                        input_sums, simd_lane, simd_group,
+                                        tpg.x);
+}
+
+kernel void prefill_moe_expert_q4_n256_up_gelu_indirect_m16(
+    device const bfloat *input [[buffer(0)]],
+    device const uint *grouped_routes [[buffer(1)]],
+    device const MoeTileDescriptor *tiles [[buffer(2)]],
+    device const uint *tile_count [[buffer(3)]],
+    device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_up [[buffer(5)]],
+    device bfloat *gate [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  threadgroup bfloat staged[16 * 256];
+  threadgroup float input_sums[8 * 16];
+  if (group.y >= *tile_count)
+    return;
+  const MoeQ4Slab slab = moe_q4_slab(
+      up_packed, shared_up, tiles[group.y].expert, params.experts,
+      params.expert_stride_bytes_0, params.output_size, params.input_size);
+  const ulong row = ulong(group.y) * 16;
+  moe_live_rows<16>(tiles[group.y].rows, [&](auto rows) {
+    q4_mpp_tile_sums_indirect<decltype(rows)::value, 256, false, 8>(
+        input, grouped_routes + row, params.reserved0, params.input_size,
+        slab.weights, slab.scales, slab.biases, slab.weights, slab.scales,
+        slab.biases, staged, input_sums, group.x * 256, simd_lane, simd_group,
+        tpg.x,
+        [&](thread auto &accumulated, thread auto &, Q4Traversal traversal)
+            __attribute__((always_inline)) {
+          q4_visit(accumulated, traversal, [&](ushort i) {
+            auto index = accumulated.get_multidimensional_index(i);
+            const uint output_index =
+                index[1] * params.output_size + group.x * 256 + index[0];
+            const ulong at = row * params.output_size + output_index;
+            output[at] = bfloat(richengine_gelu_tanh(float(gate[at])) *
+                                float(bfloat(accumulated[i])));
+          });
+        });
+  });
 }

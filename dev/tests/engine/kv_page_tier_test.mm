@@ -1,4 +1,5 @@
 #include "engine/cache/KvPageTier.hpp"
+#include "ops/KernelNames.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "tests/engine/ScopedTestConfig.hpp"
 #include "tests/engine/TestBuffers.hpp"
@@ -345,12 +346,12 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   // Writes seed ^ (131071 * entry + word) to every word of every slab of a
   // table, or counts the words that hold something else.
   const auto write = [&](const metal::MetalBuffer &table, size_t entries, const uint32_t &seed) {
-    return metal::ComputeDispatch{"addressed_write_u32", {{0, table}},
+    return metal::ComputeDispatch{std::string(ops::kAddressedWriteU32), {{0, table}},
         {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
         {words / 256, entries, 1}, {256, 1, 1}};
   };
   const auto check = [&](const metal::MetalBuffer &table, size_t entries, const uint32_t &seed) {
-    return metal::ComputeDispatch{"addressed_check_u32", {{0, table}, {3, mismatches}},
+    return metal::ComputeDispatch{std::string(ops::kAddressedCheckU32), {{0, table}, {3, mismatches}},
         {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
         {words / 256, entries, 1}, {256, 1, 1}};
   };

@@ -1,5 +1,5 @@
 #include "model/Granite.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -11,9 +11,9 @@ namespace {
 // The granite attention mixer is the dense one: fused QKV (query rows
 // alone), no per-head norms, output projection.
 template <class Format>
-QwenMixerWeights readGraniteAttention(WeightFile &file, const Format &format,
+MixerWeights readGraniteAttention(WeightFile &file, const Format &format,
                                       const QwenMixerGeometry &geometry) {
-  QwenAttentionWeights attention;
+  AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
                    "attention-input", {"attn-q", "attn-k", "attn-v"});
@@ -56,7 +56,7 @@ void requireGraniteLayout(const GraniteLayout &layout) {
 
 // The granite mixer's reader (found by readTargetMixer's ADL).
 template <class Format>
-QwenMixerWeights readTargetMixer(const GraniteLayout &, WeightFile &file,
+MixerWeights readTargetMixer(const GraniteLayout &, WeightFile &file,
                                  const Format &format,
                                  const QwenMixerGeometry &geometry, bool) {
   return readGraniteAttention(file, format, geometry);
@@ -64,9 +64,9 @@ QwenMixerWeights readTargetMixer(const GraniteLayout &, WeightFile &file,
 
 GraniteWeights loadGraniteWeights(metal::MetalBackend &backend,
                                   GraniteLayout layout,
-                                  const QwenTargetFiles<GraniteLayout> &files) {
+                                  const TargetFiles<GraniteLayout> &files) {
   requireGraniteLayout(layout);
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -75,7 +75,7 @@ GraniteWeights loadGraniteWeights(metal::MetalBackend &backend,
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<GraniteWeights>(backend, layout, gguf->get(),
+    return readTargetModelWeights<GraniteWeights>(backend, layout, gguf->get(),
                                                  BlockTargetFormat{}, readFfn);
   throw WeightStoreError("granite targets load from GGUF only");
 }

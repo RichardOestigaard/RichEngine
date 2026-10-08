@@ -1,5 +1,5 @@
 #include "model/Lfm2Moe.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -15,9 +15,9 @@ constexpr uint64_t kBfloat16 = kBFloat16Bytes;
 // (query rows alone), the per-head q/k RMS norms of head dimension 64, and
 // the output projection.
 template <class Format>
-QwenMixerWeights readLfmAttention(WeightFile &file, const Format &format,
+MixerWeights readLfmAttention(WeightFile &file, const Format &format,
                                 const QwenMixerGeometry &geometry) {
-  QwenAttentionWeights attention;
+  AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
                    "attention-input", {"attn-q", "attn-k", "attn-v"});
@@ -33,7 +33,7 @@ QwenMixerWeights readLfmAttention(WeightFile &file, const Format &format,
 // channel-major ([dim, taps]): the GGUF's squeezed [dim, 1, taps] HF
 // tensor, packed and MLX images alike.
 template <class Format>
-QwenMixerWeights readLfmConv(WeightFile &file, const Format &format,
+MixerWeights readLfmConv(WeightFile &file, const Format &format,
                              const QwenMixerGeometry &geometry) {
   LfmConvWeights conv;
   conv.inputProjection = format.projection(file, geometry.packedGdnWidth,
@@ -60,7 +60,8 @@ void requireLfm2MoeLayout(const Lfm2MoeLayout &layout) {
       layout.attentionKvHeads != 8 || layout.attentionHeadDimension != 64 ||
       layout.rotaryPairs != 32 || !(layout.rotaryTheta > 0.0F) ||
       !layout.maximumContextTokens || !layout.intermediateSize ||
-      layout.experts != 32 || layout.expertsPerToken != 4 ||
+      layout.experts != 32 || !layout.expertsPerToken ||
+      layout.expertsPerToken > 4 ||
       layout.expertIntermediateSize != 1792 ||
       layout.attentionLayerCount() != 6 ||
       Lfm2MoeLayout::denseLayers >= layout.layers ||
@@ -138,7 +139,7 @@ void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
 // The LFM2-MoE mixers' reader (found by readTargetMixer's ADL), identical to
 // LFM2's.
 template <class Format>
-QwenMixerWeights readTargetMixer(const Lfm2MoeLayout &, WeightFile &file,
+MixerWeights readTargetMixer(const Lfm2MoeLayout &, WeightFile &file,
                                  const Format &format,
                                  const QwenMixerGeometry &geometry,
                                  bool fullAttention) {
@@ -148,7 +149,7 @@ QwenMixerWeights readTargetMixer(const Lfm2MoeLayout &, WeightFile &file,
 
 Lfm2MoeWeights loadLfm2MoeWeights(metal::MetalBackend &backend,
                                   Lfm2MoeLayout layout,
-                                  const QwenTargetFiles<Lfm2MoeLayout> &files) {
+                                  const TargetFiles<Lfm2MoeLayout> &files) {
   requireLfm2MoeLayout(layout);
   // Layers are read in order; the leading denseLayers carry a dense FFN.
   uint32_t layerIndex = 0;
@@ -160,7 +161,7 @@ Lfm2MoeWeights loadLfm2MoeWeights(metal::MetalBackend &backend,
   };
   const auto load = [&](auto &&source, const auto &format) {
     layerIndex = 0;
-    Lfm2MoeWeights weights = readQwenTargetWeights<Lfm2MoeWeights>(
+    Lfm2MoeWeights weights = readTargetModelWeights<Lfm2MoeWeights>(
         backend, layout, std::forward<decltype(source)>(source), format, readFfn);
     if (layerIndex != layout.layers)
       throw WeightStoreError("LFM2-MoE layer count mismatch");
@@ -168,7 +169,7 @@ Lfm2MoeWeights loadLfm2MoeWeights(metal::MetalBackend &backend,
     for (auto &layer : weights.layers) {
       layer.inputNorm = e5(layer.inputNorm);
       layer.postAttentionNorm = e5(layer.postAttentionNorm);
-      if (auto *attention = std::get_if<QwenAttentionWeights>(&layer.mixer)) {
+      if (auto *attention = std::get_if<AttentionMixerWeights>(&layer.mixer)) {
         attention->queryNorm = e5(attention->queryNorm);
         attention->keyNorm = e5(attention->keyNorm);
       }
@@ -178,10 +179,10 @@ Lfm2MoeWeights loadLfm2MoeWeights(metal::MetalBackend &backend,
   };
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return load(gguf->get(), BlockTargetFormat{});
-  const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return load(mlx->get(), affine);
-  return load(std::get<PackedTargetFiles<Lfm2MoeLayout>>(files), affine);
+    return load(mlx->get(), AffineTargetFormat{});
+  const auto &packed = std::get<PackedTargetFiles<Lfm2MoeLayout>>(files);
+  return load(packed, AffineTargetFormat{packed.tiledEmbedding});
 }
 
 } // namespace richengine::model

@@ -29,19 +29,22 @@ class AneFfn;
 namespace richengine::model {
 
 struct Qwen3_8Layout;
-struct Qwen3_8LayerWeights;
+struct DenseLayerWeights;
 struct Ornith9BLayout;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
 struct DenseLayout;
+struct Gemma4MoeLayout;
+struct Gemma4MoeLayerWeights;
 struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
 struct Lfm2MoeLayerWeights;
+struct DiffusionGemmaLayout;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
-struct QwenGdnWeights final {
+struct GdnMixerWeights final {
   ops::Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
   metal::MetalBuffer decay;
@@ -53,7 +56,7 @@ struct QwenGdnWeights final {
   ops::GdnHeadOrder outputHeadOrder = ops::GdnHeadOrder::Grouped;
 };
 
-struct QwenAttentionWeights final {
+struct AttentionMixerWeights final {
   ops::Projection inputProjection;
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
@@ -71,12 +74,12 @@ struct LfmConvWeights final {
   bool convolutionTapsMajor = false;
 };
 
-using QwenMixerWeights =
-    std::variant<QwenGdnWeights, QwenAttentionWeights, LfmConvWeights>;
+using MixerWeights =
+    std::variant<GdnMixerWeights, AttentionMixerWeights, LfmConvWeights>;
 
 // A Qwen target's weights outside its layers and the record of every file
 // its weights were read from.
-struct QwenTargetWeightsBase {
+struct TargetModelWeightsBase {
   ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
   ops::EmbeddingWeights tokenEmbedding;
@@ -86,7 +89,9 @@ struct QwenTargetWeightsBase {
 };
 
 // The weights of a target of Layout, whose layers the family keeps in Layer.
-template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
+// Not final: DiffusionGemmaWeights derives from the DiffusionGemmaLayout
+// instantiation to add the self-conditioning block and encoder scalars.
+template <class Layout, class Layer> struct TargetModelWeights : TargetModelWeightsBase {
   Layout layout;
   std::vector<Layer> layers;
 };
@@ -94,7 +99,7 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid
 // targets. It describes semantics only; operators remain responsible for
 // choosing device-specific Metal pipelines and compute tiles.
-struct QwenTargetGeometry final {
+struct TargetModelGeometry final {
   static constexpr uint32_t maximumCaptureLayers = 8;
 
   uint32_t layers = 0;
@@ -119,7 +124,7 @@ struct QwenTargetGeometry final {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
-  QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  FfnKind ffnKind = FfnKind::Dense;
   // The stateLayout.layers recurrent slots are gdnLayers GDN layers plus
   // convLayers LFM2 convolution layers; a pure dense target has neither.
   uint32_t gdnLayers = 0;
@@ -147,6 +152,25 @@ struct QwenTargetGeometry final {
   uint32_t captureLayerCount = 0;
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  // Gemma 4's second attention geometry: layers whose bit is set in
+  // altAttentionMask are the global layers — altKvHeads KV heads of
+  // altHeadDimension, rotary of altRotaryPairs at altRotaryTheta, k_eq_v and
+  // full causal. The rest run the primary geometry masked to the trailing
+  // slidingWindowTokens. kvLayout carries the same mask and alternate sizes.
+  uint64_t altAttentionMask = 0;
+  uint32_t altKvHeads = 0;
+  uint32_t altHeadDimension = 0;
+  uint32_t altRotaryPairs = 0;
+  float altRotaryTheta = 0.0F;
+  uint32_t slidingWindowTokens = 0;
+  // Gemma 4's MoE routes from the post-attention residual and runs its
+  // shared expert as a dense GeGLU block beside the routed experts, whose
+  // slab width is the padded packed width (768), not the logical 704.
+  bool gemmaMoe = false;
+  // sqrt(hiddenSize) embedding scale and the final logit softcap; each 0
+  // disables.
+  float embeddingScale = 0.0F;
+  float logitSoftcap = 0.0F;
   // Distinct operator requirements, collected from the loaded weights.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
@@ -167,7 +191,7 @@ struct QwenTargetGeometry final {
   // blocks' expert width.
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return std::max(denseIntermediateSize,
-                    ffnKind == QwenFfnKind::SparseMoe ? expertIntermediateSize : uint32_t{0});
+                    ffnKind == FfnKind::SparseMoe ? expertIntermediateSize : uint32_t{0});
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
@@ -186,6 +210,71 @@ struct QwenTargetGeometry final {
   }
   [[nodiscard]] constexpr ops::LfmConvShape convShape() const noexcept {
     return {convolutionDimension, convolutionTaps, packedGdnWidth};
+  }
+  // The dual-geometry accessors: without altAttentionMask every layer takes
+  // the primary geometry.
+  [[nodiscard]] constexpr bool isAltAttentionLayer(uint32_t layer) const noexcept {
+    return (altAttentionMask >> layer) & 1;
+  }
+  // The per-layer kernel layout: attentionLayers 1, the layer kind's KV
+  // geometry and, on the sliding layers, the window. Kernel names and
+  // prefill/verify plans derive from it; it never addresses pages.
+  [[nodiscard]] constexpr kv::Layout layerKvLayout(bool alt) const noexcept {
+    kv::Layout layout = kvLayout;
+    layout.attentionLayers = 1;
+    layout.altLayerMask = 0;
+    layout.altKvHeads = 0;
+    layout.altHeadDimension = 0;
+    layout.windowTokens = 0;
+    if (alt) {
+      layout.kvHeads = altKvHeads;
+      layout.headDimension = altHeadDimension;
+    } else {
+      layout.windowTokens = slidingWindowTokens;
+    }
+    return layout;
+  }
+  [[nodiscard]] constexpr uint32_t layerHeadDimension(uint32_t layer) const noexcept {
+    return isAltAttentionLayer(layer) ? altHeadDimension : attentionHeadDimension;
+  }
+  [[nodiscard]] constexpr uint32_t layerKvHeads(uint32_t layer) const noexcept {
+    return isAltAttentionLayer(layer) ? altKvHeads : attentionKvHeads;
+  }
+  [[nodiscard]] constexpr uint32_t rotaryPairsAt(uint32_t layer) const noexcept {
+    return isAltAttentionLayer(layer) ? altRotaryPairs : rotaryPairs;
+  }
+  // The packed QKV row width of `layer`: the globals' rows have no V block.
+  [[nodiscard]] constexpr uint32_t layerPackedWidth(uint32_t layer) const noexcept {
+    if (isAltAttentionLayer(layer))
+      return attentionQueryHeads * altHeadDimension +
+             altKvHeads * altHeadDimension;
+    return packedFullWidth;
+  }
+  [[nodiscard]] constexpr uint32_t layerAttentionWidth(uint32_t layer) const noexcept {
+    return attentionQueryHeads * layerHeadDimension(layer);
+  }
+  // The buffer widths a dual-geometry target needs: the wider of the two
+  // layer kinds'.
+  [[nodiscard]] constexpr uint32_t maximumAttentionWidth() const noexcept {
+    return altAttentionMask
+               ? std::max(attentionWidth, attentionQueryHeads * altHeadDimension)
+               : attentionWidth;
+  }
+  [[nodiscard]] constexpr uint32_t maximumPackedWidth() const noexcept {
+    const uint32_t alt =
+        altAttentionMask
+            ? attentionQueryHeads * altHeadDimension + altKvHeads * altHeadDimension
+            : 0;
+    return std::max(packedFullWidth, alt);
+  }
+  [[nodiscard]] constexpr uint32_t maximumHeadDimension() const noexcept {
+    return std::max(attentionHeadDimension, altHeadDimension);
+  }
+  // One chunk's per-layer KV staging elements: max(kvHeads, altKvHeads
+  // scaled by the head widths).
+  [[nodiscard]] constexpr uint32_t chunkLayerWidth() const noexcept {
+    return std::max(attentionKvHeads * attentionHeadDimension,
+                    altAttentionMask ? altKvHeads * altHeadDimension : 0u);
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The projection lists hold every projection the weights dispatch,
@@ -206,8 +295,15 @@ struct QwenTargetGeometry final {
            recurrentShape &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
+           kvLayout.altLayerMask == altAttentionMask &&
+           // The alternate regions exist exactly for the marked layers.
+           (!altAttentionMask ||
+            (altKvHeads && altHeadDimension && altRotaryPairs &&
+             altRotaryTheta > 0.0F && slidingWindowTokens &&
+             kvLayout.altKvHeads == altKvHeads &&
+             kvLayout.altHeadDimension == altHeadDimension)) &&
            sized(prefillProjections) && sized(decodeProjections) &&
-           (ffnKind == QwenFfnKind::Dense
+           (ffnKind == FfnKind::Dense
                 ? denseIntermediateSize && sized(gateUpProjections)
                 : moeShape().valid() &&
                       // A mixed target's leading dense FFN layers.
@@ -216,13 +312,13 @@ struct QwenTargetGeometry final {
   }
 };
 
-struct QwenTargetPrefillCapture final {
+struct TargetModelPrefillCapture final {
   uint32_t sourceStart = 0;
   uint32_t destinationStart = 0;
   uint32_t rows = 0;
 };
 
-struct QwenTargetPrefillSequence final {
+struct TargetModelPrefillSequence final {
   uint32_t rowBegin = 0;
   uint32_t rows = 0;
   uint32_t attentionStride = 0;
@@ -234,11 +330,17 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> convolutionOut;
   std::span<const metal::MetalBuffer> recurrentIn;
   std::span<const metal::MetalBuffer> recurrentOut;
-  std::array<QwenTargetPrefillCapture, 2> captures{};
+  std::array<TargetModelPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // A canvas (DiffusionGemma decoder) sequence: its chunk's committed_tokens
+  // is the read-only prefix length, its rows the canvas positions, and its
+  // page table the prefix pages followed by the canvas scratch pages. The
+  // bidirectional canvas splits replace the causal prefill splits; every
+  // other dispatch is the ordinary prefill layer's.
+  bool canvas = false;
 };
 
-struct QwenTargetPrefillBuffers final {
+struct TargetModelPrefillBuffers final {
   // Split projections of chunks of up to 32 rows (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
@@ -266,6 +368,13 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer downProjectionSums;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
+  // The global layers' rope tables (altRotaryPairs/altRotaryTheta); empty on
+  // single-geometry targets.
+  metal::MetalBuffer ropeCosAlt;
+  metal::MetalBuffer ropeSinAlt;
+  // Gemma's MoE combine binds a zeroed hidden-width residual so the routed
+  // sum lands unmixed; empty elsewhere.
+  metal::MetalBuffer zeroResidual;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   // WY/UT scratch for the chunked GDN scan; empty keeps the serial scan.
@@ -278,7 +387,7 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
-struct QwenTargetVerifyBuffers final {
+struct TargetModelVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
@@ -294,6 +403,14 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer attentionOutput;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
+  // The global layers' rope tables (altRotaryPairs/altRotaryTheta); empty on
+  // single-geometry targets.
+  metal::MetalBuffer ropeCosAlt;
+  metal::MetalBuffer ropeSinAlt;
+  // Gemma's layer scratch: the post-attention residual the FFN's router and
+  // experts both read, and the zeroed rows the routed combine adds to.
+  metal::MetalBuffer gemmaResidual;
+  metal::MetalBuffer zeroResidual;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -327,7 +444,7 @@ struct QwenTargetVerifyBuffers final {
   ops::MoeScratch moe;
 };
 
-struct QwenTargetCommitBuffers final {
+struct TargetModelCommitBuffers final {
   metal::MetalBuffer packed;
   metal::MetalBuffer mixed;
   metal::MetalBuffer decay;
@@ -340,15 +457,15 @@ struct QwenTargetCommitBuffers final {
 };
 
 template <class Layout, class Layer>
-[[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
+[[nodiscard]] TargetModelGeometry
+targetModelGeometry(const TargetModelWeights<Layout, Layer> &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
-class QwenTarget final {
+class TargetModel final {
 public:
   template <class Layout, class Layer>
-  QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
+  TargetModel(const TargetModelWeights<Layout, Layer> &weights, const TargetModelGeometry &geometry,
              metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
 
   [[nodiscard]] const ops::Projection &
@@ -363,24 +480,32 @@ public:
   // Returns the hidden buffer that holds the last layer's output rows. The
   // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
   // Neural Engine on `aneFfn`, when given.
+  // layerScalars, when nonempty, replaces each layer's packed layer_scalar —
+  // the DiffusionGemma encoder pass runs the trunk with the separately
+  // packed encoder scalars while its canvas pass keeps the files' (decoder)
+  // values.
   [[nodiscard]] metal::MetalBuffer addPrefill(
-      metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
-      std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const RichKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+      metal::CommandGraph &graph, TargetModelPrefillBuffers buffers,
+      std::span<const TargetModelPrefillSequence> sequences, uint32_t rows,
+      std::span<const RichKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr,
+      std::span<const float> layerScalars = {}) const;
   // liveRows, when nonempty, gives each chain lane's live verify row count
   // for the GDN scan (adaptive proposal budgets); ignored for tree batches.
+  // liveNodes bounds a tree batch's live node count when the caller already
+  // knows the emitted counts — the attention splits and verify stores then
+  // size for the real rows instead of the scratch's full capacity.
   void addVerify(
-      metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+      metal::CommandGraph &graph, TargetModelVerifyBuffers buffers,
       std::span<const RichKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, bool tree = false,
-      std::span<const uint32_t> liveRows = {}) const;
+      std::span<const uint32_t> liveRows = {}, uint32_t liveNodes = 0) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                     uint32_t lanes, ops::LinearScratch scratch,
-                    const QwenTargetVerifyBuffers *fused = nullptr) const;
+                    const TargetModelVerifyBuffers *fused = nullptr) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
@@ -400,23 +525,25 @@ public:
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
-                      QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+                      TargetModelCommitBuffers buffers, uint32_t lanes) const;
   // The tree batch's commit: the retained path replays its DFS rows through
   // each layer's states instead of a chain's prefix rows.
   void addStateCommitTree(metal::CommandGraph &graph,
-                          QwenTargetCommitBuffers buffers,
+                          TargetModelCommitBuffers buffers,
                           metal::MetalBuffer retainedPath,
                           uint32_t lanes) const;
 
 private:
   using WeightView =
-      std::variant<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Ornith9BLayout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
-                   const QwenTargetWeights<DenseLayout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Lfm2Layout, Qwen3_8LayerWeights> *,
-                   const QwenTargetWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *,
-                   const QwenTargetWeights<GraniteLayout, Qwen3_8LayerWeights> *>;
+      std::variant<const TargetModelWeights<Qwen3_8Layout, DenseLayerWeights> *,
+                   const TargetModelWeights<Ornith9BLayout, DenseLayerWeights> *,
+                   const TargetModelWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
+                   const TargetModelWeights<DenseLayout, DenseLayerWeights> *,
+                   const TargetModelWeights<Lfm2Layout, DenseLayerWeights> *,
+                   const TargetModelWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *,
+                   const TargetModelWeights<Gemma4MoeLayout, Gemma4MoeLayerWeights> *,
+                   const TargetModelWeights<DiffusionGemmaLayout, Gemma4MoeLayerWeights> *,
+                   const TargetModelWeights<GraniteLayout, DenseLayerWeights> *>;
   struct PrefillStep;
   struct VerifyStep;
 
@@ -426,22 +553,22 @@ private:
                       ops::WeightLayout consumer) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
-  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const GdnMixerWeights &mixer, const ops::NormWeights &norm,
                                      metal::MetalBuffer input) const;
-  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
+  metal::MetalBuffer addPrefillMixer(PrefillStep &step, const AttentionMixerWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const LfmConvWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
   // The FFN of layer `index`; the dense FFN runs on `step.aneFfn` when set.
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const DenseLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_6MoeLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addPrefillFfn(PrefillStep &step, uint32_t index, const Lfm2MoeLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, const ops::NormWeights &norm,
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const GdnMixerWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
-  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer,
+  metal::MetalBuffer addVerifyMixer(VerifyStep &step, const AttentionMixerWeights &mixer,
                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const LfmConvWeights &mixer,
                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
@@ -449,16 +576,33 @@ private:
                          const ops::Projection &gate, const ops::Projection &up,
                          const ops::Projection &down, metal::MetalBuffer residual,
                          metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+  void addVerifyFfn(VerifyStep &step, const DenseLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const;
   void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const;
   void addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const;
+  // Gemma 4's whole layer: the dual-geometry attention mixer, the post-
+  // attention residual both the router and the FFN-normed experts read, and
+  // the routed plus shared-expert GeGLU block whose normed outputs join the
+  // residual before layer_scalar.
+  void addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWeights &layer,
+                            uint32_t index, metal::MetalBuffer input,
+                            metal::MetalBuffer output) const;
+  void addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeights &layer,
+                           uint32_t index, metal::MetalBuffer input,
+                           metal::MetalBuffer output) const;
+  // The elementwise helpers Gemma's layer epilogue shares with the draft
+  // kernels: a flat bf16 residual add and the in-place scalar multiply.
+  static void addResidualAdd(metal::CommandGraph &graph, metal::MetalBuffer input,
+                             metal::MetalBuffer residual, metal::MetalBuffer output,
+                             uint32_t elements);
+  static void addLayerScalar(metal::CommandGraph &graph, metal::MetalBuffer values,
+                             float scale, uint32_t count);
 
   WeightView weights_;
-  const QwenTargetWeightsBase &weightsBase_;
-  QwenTargetGeometry geometry_;
+  const TargetModelWeightsBase &weightsBase_;
+  TargetModelGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
 };

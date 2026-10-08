@@ -448,10 +448,12 @@ inline void moe_group_routes_run(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += threads) {
-    if (!params.shared || route % routes_per_row != params.top_k) {
-      atomic_fetch_add_explicit(&counts[selected[route]], 1u,
-                                memory_order_relaxed);
-    }
+    if (params.shared && route % routes_per_row == params.top_k)
+      continue;
+    const uint expert = selected[route];
+    if (expert == ~0u)
+      continue; // dead route: moe_route_cap dropped it over budget
+    atomic_fetch_add_explicit(&counts[expert], 1u, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -493,6 +495,12 @@ inline void moe_group_routes_run(
     if (params.shared && route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
+    if (expert == ~0u) {
+      // Dead routes get a valid row so moe_combine's weight-0 load is in
+      // bounds.
+      route_rows[route] = 0;
+      continue;
+    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;
@@ -525,8 +533,24 @@ inline void moe_group_routes_run(
       }
     }
   }
-  if (thread_index == 0)
+  if (thread_index == 0) {
     *tile_count = routed_tiles + shared_tiles;
+    if (params.stats) {
+      // RICHENGINE_MOE_STATS: the distinct routed experts this dispatch
+      // touched, beside the tile count and in the ring the host prints.
+      uint distinct = 0;
+      for (uint expert = 0; expert < Experts; ++expert)
+        distinct +=
+            atomic_load_explicit(&counts[expert], memory_order_relaxed) ? 1 : 0;
+      tile_count[1] = distinct;
+      device MoeStatsRecord *records =
+          reinterpret_cast<device MoeStatsRecord *>(
+              reinterpret_cast<device char *>(tile_count) +
+              kMoeStatsLogOffset);
+      records[(params.stats - 1) % kMoeStatsLogSlots] = MoeStatsRecord{
+          params.stats, params.rows, distinct, routed_tiles + shared_tiles};
+    }
+  }
 }
 
 kernel void moe_group_routes(
@@ -550,6 +574,68 @@ kernel void moe_group_routes(
                        params, counts, cursors, tile_offsets, simd_totals,
                        routed_tiles, thread_index, simd_lane, simd_group,
                        tpg.x);
+}
+
+// RICHENGINE_MOE_UNION (ops/MoE.cpp), decode plans only: keeps the `budget`
+// routed experts with the largest summed routing weight over the dispatch's
+// rows and dead-marks the rest (selected ~0u, weight 0). The shared route
+// selects no routed expert — its id `experts` never enters a lane slot.
+kernel void moe_route_cap(
+    device uint *selected [[buffer(0)]],
+    device float *routing_weights [[buffer(1)]],
+    constant MoeCapParams &params [[buffer(2)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  constexpr uint Experts = 256;
+  constexpr uint ExpertsPerLane = Experts / 32;
+  threadgroup float scores[Experts];
+  threadgroup uint kept[Experts / 32];
+  if (thread_index < Experts / 32)
+    kept[thread_index] = 0;
+  const uint routes = params.rows * params.routes_per_row;
+  if (thread_index < Experts) {
+    float score = 0.0f;
+    for (uint route = 0; route < routes; ++route)
+      if (selected[route] == thread_index)
+        score += routing_weights[route];
+    scores[thread_index] = score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // The same argmax loop as the selects: lane l holds experts l, l + 32, ...
+  if (simd_group == 0) {
+    float lane_scores[ExpertsPerLane];
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot)
+      lane_scores[slot] = scores[simd_lane + 32 * slot];
+    for (uint rank = 0; rank < params.budget; ++rank) {
+      float best = -numeric_limits<float>::infinity();
+      uint best_slot = 0;
+      for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+        if (lane_scores[slot] > best) {
+          best = lane_scores[slot];
+          best_slot = slot;
+        }
+      }
+      const float row_best = simd_max(best);
+      const uint candidate =
+          best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+      const uint winner = simd_min(candidate);
+      if (candidate == winner)
+        lane_scores[best_slot] = -numeric_limits<float>::infinity();
+      if (simd_lane == 0 && winner < params.experts)
+        kept[winner >> 5] |= 1u << (winner & 31);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint route = thread_index; route < routes; route += tpg.x) {
+    const uint expert = selected[route];
+    if (expert < params.experts &&
+        !((kept[expert >> 5] >> (expert & 31)) & 1)) {
+      selected[route] = ~0u;
+      routing_weights[route] = 0.0f;
+    }
+  }
 }
 
 // The sigmoid-gated MoE router (GGUF expert_gating_func 2, LFM2-MoE): expert
@@ -1000,4 +1086,322 @@ kernel void moe_combine(
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+}
+
+// ---------------------------------------------------------------------------
+// Gemma 4 26B-A4B's router and GeGLU expert epilogue.
+
+// The router's score pass: a dense bf16 linear of `experts` rows (expert-major
+// [expert][input_size]) over each bf16 input row, fp32 scores. The caller
+// normalizes the input first — Gemma runs a scaleless RMS norm on the
+// post-attention residual (norm_rms_scaleless) times the learned scale *
+// hidden^-0.5 (layer_scalar_scale or folded into the router weights). One
+// simdgroup per expert, the lanes striding the row; scores keep the
+// StorageN=256 row stride of the other score passes.
+kernel void moe_route_scores_gemma(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *router_weights [[buffer(1)]],
+    device float *scores [[buffer(2)]],
+    constant MoeRouteParams &params [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  const uint row = group.x;
+  if (row >= params.rows)
+    return;
+  const uint expert = group.y * 8 + simd_group;
+  if (expert >= params.experts)
+    return;
+  device const bfloat *row_input = input + ulong(row) * params.input_size;
+  device const bfloat *row_weights =
+      router_weights + ulong(expert) * params.input_size;
+  float sum = 0.0f;
+  for (uint dimension = simd_lane; dimension < params.input_size;
+       dimension += 32)
+    sum += float(row_input[dimension]) * float(row_weights[dimension]);
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    scores[ulong(row) * StorageN + expert] = sum;
+}
+
+// Canvas form of the score pass above: the threadgroup stages its input
+// row once (the eight expert simdgroups share it instead of re-reading it
+// from device memory) and the dot product strides bfloat4s — a quarter of
+// the scalar pass's load instructions at 4x their width. The input row
+// staging bounds this to hidden sizes of 4096 or less (8 KB).
+kernel void moe_route_scores_gemma_vec(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *router_weights [[buffer(1)]],
+    device float *scores [[buffer(2)]],
+    constant MoeRouteParams &params [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  constexpr uint kMaxHidden = 4096;
+  const uint row = group.x;
+  if (row >= params.rows || params.input_size > kMaxHidden)
+    return;
+  threadgroup bfloat staged[kMaxHidden];
+  const ulong row_base = ulong(row) * params.input_size;
+  for (uint dimension = thread_index; dimension < params.input_size;
+       dimension += 256)
+    staged[dimension] = input[row_base + dimension];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint expert = group.y * 8 + simd_group;
+  if (expert >= params.experts)
+    return;
+  device const bfloat4 *row_weights = reinterpret_cast<device const bfloat4 *>(
+      router_weights + ulong(expert) * params.input_size);
+  const uint vectors = params.input_size / 4;
+  float sum = 0.0f;
+  for (uint v = simd_lane; v < vectors; v += 32) {
+    const bfloat4 w = row_weights[v];
+    const uint d = v * 4;
+    sum += float(staged[d]) * float(w.x) + float(staged[d + 1]) * float(w.y) +
+           float(staged[d + 2]) * float(w.z) + float(staged[d + 3]) * float(w.w);
+  }
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    scores[ulong(row) * StorageN + expert] = sum;
+}
+
+// Four-row form of the staged score pass: one threadgroup scores four rows
+// against its eight experts, so each expert weight row is read a quarter as
+// often — the pass's dominant traffic. Bounds the hidden size to 3584
+// (4 rows x 7 KB of staged input).
+kernel void moe_route_scores_gemma_vec4(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *router_weights [[buffer(1)]],
+    device float *scores [[buffer(2)]],
+    constant MoeRouteParams &params [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  constexpr uint kRows = 4;
+  constexpr uint kMaxHidden = 3584;
+  if (params.input_size > kMaxHidden)
+    return;
+  const uint row0 = group.x * kRows;
+  if (row0 >= params.rows)
+    return;
+  threadgroup bfloat staged[kRows * kMaxHidden];
+  for (uint i = thread_index; i < kRows * params.input_size; i += 256) {
+    const uint r = i / params.input_size, d = i - r * params.input_size;
+    staged[i] = row0 + r < params.rows
+                    ? input[ulong(row0 + r) * params.input_size + d]
+                    : bfloat(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint expert = group.y * 8 + simd_group;
+  if (expert >= params.experts)
+    return;
+  device const bfloat4 *row_weights = reinterpret_cast<device const bfloat4 *>(
+      router_weights + ulong(expert) * params.input_size);
+  const uint vectors = params.input_size / 4;
+  float sums[kRows] = {};
+  for (uint v = simd_lane; v < vectors; v += 32) {
+    const bfloat4 w = row_weights[v];
+    const uint d = v * 4;
+    for (uint r = 0; r < kRows; ++r)
+      sums[r] += float(staged[r * params.input_size + d]) * float(w.x) +
+                 float(staged[r * params.input_size + d + 1]) * float(w.y) +
+                 float(staged[r * params.input_size + d + 2]) * float(w.z) +
+                 float(staged[r * params.input_size + d + 3]) * float(w.w);
+  }
+  for (uint r = 0; r < kRows; ++r) {
+    const float total = simd_sum(sums[r]);
+    if (simd_lane == 0 && row0 + r < params.rows)
+      scores[ulong(row0 + r) * StorageN + expert] = total;
+  }
+}
+
+// Gemma's selection: fp32 softmax over ALL experts of the row, top_k by
+// score (softmax preserves order), the winners' probabilities renormalized
+// over the winners, each times per_expert_scale[expert]. No shared-expert
+// route slot — a row's routes are its top_k alone, as the sigmoid select
+// lays them out; the dense shared expert runs its own projection. One row
+// per threadgroup; simdgroup 0 orders descending score, ascending id, the
+// same order every select uses.
+kernel void moe_route_select_gemma(
+    device const float *scores [[buffer(0)]],
+    device const float *per_expert_scale [[buffer(1)]],
+    device uint *selected [[buffer(2)]],
+    device float *routing_weights [[buffer(3)]],
+    constant MoeRouteParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  constexpr uint ExpertsPerLane = StorageN / 32;
+  const uint row = group;
+  if (row >= params.rows)
+    return;
+  threadgroup float row_scores[StorageN];
+  threadgroup float ordered[256];
+  threadgroup uint ordered_ids[256];
+  threadgroup float winner_probs[256];
+  row_scores[thread_index] =
+      thread_index < params.experts
+          ? scores[ulong(row) * StorageN + thread_index]
+          : -numeric_limits<float>::infinity();
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group != 0)
+    return;
+  float lane_scores[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot)
+    lane_scores[slot] = row_scores[simd_lane + 32 * slot];
+  const ulong row_routes = ulong(row) * params.top_k;
+  for (uint rank = 0; rank < params.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity();
+    uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+      if (lane_scores[slot] > best) {
+        best = lane_scores[slot];
+        best_slot = slot;
+      }
+    }
+    const float row_best = simd_max(best);
+    const uint candidate =
+        best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner)
+      lane_scores[best_slot] = -numeric_limits<float>::infinity();
+    if (simd_lane == 0) {
+      ordered[rank] = row_best;
+      ordered_ids[rank] = winner;
+      selected[row_routes + rank] = winner;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  // softmax over all experts against the top score (row_scores is intact;
+  // lane_scores' consumed slots were reset), then the winners'
+  // renormalization and per-expert scale.
+  float total = 0.0f;
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+    const float s = row_scores[simd_lane + 32 * slot];
+    total += s == -numeric_limits<float>::infinity()
+                 ? 0.0f
+                 : fast::exp2((s - ordered[0]) * 1.44269504089f);
+  }
+  total = simd_sum(total);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  float winner_total = 0.0f;
+  if (simd_lane < params.top_k) {
+    const float p =
+        fast::exp2((ordered[simd_lane] - ordered[0]) * 1.44269504089f) /
+        total;
+    winner_probs[simd_lane] = p;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint rank = 0; rank < params.top_k; ++rank)
+    winner_total += winner_probs[rank];
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32)
+    routing_weights[row_routes + rank] =
+        winner_probs[rank] / winner_total *
+        per_expert_scale[ordered_ids[rank]];
+}
+
+// gelu_pytorch_tanh(gate) * up on flat rows — Gemma's GeGLU combine for the
+// dense shared expert (and any split gate/up path): out = gelu(gate) * up.
+kernel void geglu_multiply(device const bfloat *gate [[buffer(0)]],
+                           device const bfloat *up [[buffer(1)]],
+                           device bfloat *output [[buffer(2)]],
+                           constant uint &count [[buffer(3)]],
+                           uint index [[thread_position_in_grid]],
+                           uint grid_size [[threads_per_grid]]) {
+  for (uint element = index; element < count; element += grid_size)
+    output[element] = bfloat(richengine_gelu_tanh(float(gate[element])) *
+                             float(up[element]));
+}
+
+// The fused GeGLU gate/up expert tile: moe_expert_tile<GateUp>'s structure
+// with gelu_pytorch_tanh replacing silu, the bf16-rounded gate and up as
+// q4_store_output's epilogue rounds them.
+template <ushort TileN = 128, ushort Simdgroups = 8>
+inline void moe_expert_tile_gelu(device bfloat *grouped_input,
+                                 device const MoeTileDescriptor *tiles,
+                                 device const uint *tile_count,
+                                 device uchar *packed_0, device uchar *packed_1,
+                                 device uchar *shared_0, device uchar *shared_1,
+                                 device bfloat *output,
+                                 constant MoeExpertParams &params, uint2 group,
+                                 threadgroup float *input_sums, uint simd_lane,
+                                 uint simd_group) {
+  if (group.y >= *tile_count)
+    return;
+  const uint expert = tiles[group.y].expert;
+  const MoeQ4Slab slab_0 =
+      moe_q4_slab(packed_0, shared_0, expert, params.experts,
+                  params.expert_stride_bytes_0, params.output_size,
+                  params.input_size);
+  const MoeQ4Slab slab_1 =
+      moe_q4_slab(packed_1, shared_1, expert, params.experts,
+                  params.expert_stride_bytes_1, params.output_size,
+                  params.input_size);
+  device bfloat *input = grouped_input + ulong(group.y) * 8 * params.input_size;
+  device bfloat *tile_output =
+      output + ulong(group.y) * 8 * params.output_size;
+  q4_mpp_tile_sums<8, TileN, true, Simdgroups, false>(
+      input, slab_0.weights, slab_0.scales, slab_0.biases, slab_1.weights,
+      slab_1.scales, slab_1.biases, params.input_size, input_sums,
+      group.x * TileN, 0, params.input_size / 64, simd_lane, simd_group,
+      [&](thread auto &sums_0, thread auto &sums_1,
+          Q4Traversal traversal) __attribute__((always_inline)) {
+        q4_visit(sums_0, traversal,
+                 [&](ushort i) __attribute__((always_inline)) {
+          auto index = sums_0.get_multidimensional_index(i);
+          const uint output_index =
+              index[1] * params.output_size + group.x * TileN + index[0];
+          tile_output[output_index] =
+              bfloat(richengine_gelu_tanh(float(bfloat(sums_0[i]))) *
+                     float(bfloat(sums_1[i])));
+        });
+      });
+  // As q4_mpp_tile: finish every simdgroup before the scratch is reused.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void moe_expert_gate_up_q4_m8_gelu(
+    device bfloat *grouped_input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]],
+    device const uint *tile_count [[buffer(2)]],
+    device uchar *gate_packed [[buffer(3)]],
+    device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_gate [[buffer(5)]],
+    device uchar *shared_up [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float input_sums[64];
+  moe_expert_tile_gelu(grouped_input, tiles, tile_count, gate_packed,
+                       up_packed, shared_gate, shared_up, output, params,
+                       group, input_sums, simd_lane, simd_group);
+}
+
+kernel void moe_expert_gate_up_q4_m8_gelu_n128_sg4(
+    device bfloat *grouped_input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]],
+    device const uint *tile_count [[buffer(2)]],
+    device uchar *gate_packed [[buffer(3)]],
+    device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_gate [[buffer(5)]],
+    device uchar *shared_up [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float input_sums[64];
+  moe_expert_tile_gelu<128, 4>(grouped_input, tiles, tile_count, gate_packed,
+                               up_packed, shared_gate, shared_up, output,
+                               params, group, input_sums, simd_lane,
+                               simd_group);
 }

@@ -1,5 +1,5 @@
 #include "model/Dense.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -10,9 +10,9 @@ namespace {
 // The dense attention mixer: a fused QKV projection (query rows alone), no
 // per-head norms, and the output projection.
 template <class Format>
-QwenMixerWeights readDenseAttention(WeightFile &file, const Format &format,
+MixerWeights readDenseAttention(WeightFile &file, const Format &format,
                                     const QwenMixerGeometry &geometry) {
-  QwenAttentionWeights attention;
+  AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
                    "attention-input", {"attn-q", "attn-k", "attn-v"});
@@ -51,16 +51,16 @@ void requireDenseLayout(const DenseLayout &layout) {
 
 // The dense mixer's reader (found by readTargetMixer's ADL).
 template <class Format>
-QwenMixerWeights readTargetMixer(const DenseLayout &, WeightFile &file,
+MixerWeights readTargetMixer(const DenseLayout &, WeightFile &file,
                                  const Format &format,
                                  const QwenMixerGeometry &geometry, bool) {
   return readDenseAttention(file, format, geometry);
 }
 
 DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
-                              const QwenTargetFiles<DenseLayout> &files) {
+                              const TargetFiles<DenseLayout> &files) {
   requireDenseLayout(layout);
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -69,14 +69,14 @@ DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<DenseWeights>(backend, layout, gguf->get(),
+    return readTargetModelWeights<DenseWeights>(backend, layout, gguf->get(),
                                                BlockTargetFormat{}, readFfn);
-  const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<DenseWeights>(backend, layout, mlx->get(), affine, readFfn);
-  return readQwenTargetWeights<DenseWeights>(backend, layout,
-                                             std::get<PackedTargetFiles<DenseLayout>>(files), affine,
-                                             readFfn);
+    return readTargetModelWeights<DenseWeights>(backend, layout, mlx->get(),
+                                               AffineTargetFormat{}, readFfn);
+  const auto &packed = std::get<PackedTargetFiles<DenseLayout>>(files);
+  return readTargetModelWeights<DenseWeights>(backend, layout, packed,
+                                             AffineTargetFormat{packed.tiledEmbedding}, readFfn);
 }
 
 } // namespace richengine::model

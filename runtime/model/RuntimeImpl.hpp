@@ -5,18 +5,22 @@
 // RuntimeEncode.mm, RuntimeAne.mm and RuntimeNgram.mm.
 
 #include "model/Runtime.hpp"
+#include "model/DiffusionGemma.hpp"
+#include "model/DiffusionSampler.hpp"
 #include "model/RuntimeRequest.hpp"
 #include "AwakeClock.hpp"
 #include "Env.hpp"
+#include "Tuning.hpp"
 #include "model/AnePredictor.hpp"
 #include "model/NullDraft.hpp"
 #include "model/QwenState.hpp"
-#include "model/QwenTarget.hpp"
+#include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
+#include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
@@ -27,11 +31,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -107,9 +114,9 @@ private:
 };
 
 // A prefill arena's tensors as the target's prefill reads them.
-inline QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
+inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
   auto p = [&](PrefillTensor tensor) { return arena.get(tensor); };
-  QwenTargetPrefillBuffers buffers;
+  TargetModelPrefillBuffers buffers;
   // Prefill plans read plain bf16 rows; the input and sums slots hold a
   // GGUF chunk's packed plane and exponent bytes (ops::LinearGguf.cpp).
   buffers.linearScratch = {.input = p(PrefillTensor::LinearPacked),
@@ -146,12 +153,30 @@ inline QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena) {
   buffers.downProjectionSums = p(PrefillTensor::DownProjectionSums);
   buffers.ropeCos = p(PrefillTensor::RopeCos);
   buffers.ropeSin = p(PrefillTensor::RopeSin);
+  buffers.ropeCosAlt = p(PrefillTensor::RopeCosAlt);
+  buffers.ropeSinAlt = p(PrefillTensor::RopeSinAlt);
+  buffers.zeroResidual = p(PrefillTensor::ZeroResidual);
   buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
   buffers.chunkValues = p(PrefillTensor::ChunkValues);
   buffers.gdnChunkScratch = p(PrefillTensor::GdnChunkScratch);
   buffers.moe = arena.moeScratch();
   return buffers;
 }
+
+// The draft variant Impl holds.
+using DraftModel =
+    std::variant<NullDraft, DFlashDraft, DFlashV1Draft, DSparkDraft>;
+
+// The DraftModel alternative each draft weights type constructs. The
+// mapping is total: a weights type with no specialization fails to compile
+// here rather than building the neighboring draft by default.
+template <class Weights> struct DraftModelFor;
+template <> struct DraftModelFor<NullDraftWeights> { using Type = NullDraft; };
+template <> struct DraftModelFor<DFlashDraftWeights> { using Type = DFlashDraft; };
+template <> struct DraftModelFor<DFlashV1DraftWeights> {
+  using Type = DFlashV1Draft;
+};
+template <> struct DraftModelFor<DSparkDraftWeights> { using Type = DSparkDraft; };
 
 } // namespace detail
 
@@ -237,34 +262,131 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
-  QwenTarget targetModel;
-  std::variant<NullDraft, DFlashDraft, PlainDraft, DSparkDraft> draftModel;
+  // DiffusionGemma: its package's target is a DiffusionGemmaWeights, its
+  // decodes run the canvas denoising loop (RuntimeDiffusion.mm) instead of
+  // draft/verify, single-lane and synchronous.
+  const bool diffusion;
+  // shared_ptr, not unique_ptr: the pointer's deleter binds when the arena
+  // is made, so the constructor's unwind path needs no complete type.
+  struct DiffusionCanvasArena;
+  std::shared_ptr<DiffusionCanvasArena> canvasArena_;
+  [[nodiscard]] DiffusionCanvasArena &canvasArena();
+  [[nodiscard]] const DiffusionGemmaWeights &diffusionWeights() const;
+  // The encoder pass's per-layer scalars: nonempty only for a diffusion
+  // target (encoder_scalars.bin), which its prefills override the packed
+  // decoder scalars with.
+  [[nodiscard]] std::span<const float> encoderLayerScalars() const;
+  std::unique_ptr<ModelBatchTicket>
+  decodeDiffusion(const BatchPlan &plan,
+                  std::span<const ModelBatchItem> items,
+                  std::function<void()> completion);
+  // Canvas step chunking and exit policy (RuntimeDiffusion.mm):
+  // RICHENGINE_CANVAS_STEPS_PER_CMD (default 2, clamped to 1..4): denoise
+  // steps encoded per command buffer; the stats and argmax rings carry one
+  // slot per step so a mid-chunk early exit still drains in order — the
+  // extra steps past it were dead compute only. 1 restores the old
+  // encode/wait-per-step loop.
+  const uint32_t canvasStepsPerCmd_ = tuning().canvasStepsPerCmd;
+  // RICHENGINE_CANVAS_PREFIX_EXIT (default 1; "0" disables): early exit
+  // judges argmax stability over the prefix bounded by the first stop
+  // token, so churn past it does not hold the canvas alive.
+  const bool canvasPrefixExit_ = tuning().canvasPrefixExit;
+  // RICHENGINE_CANVAS_COMMIT_TAIL (default 1; "0" disables): the last
+  // scheduled step encodes without canvas_entropy_accept — the commit
+  // reads the row-stats argmax directly.
+  const bool canvasCommitTail_ = tuning().canvasCommitTail;
+  // RICHENGINE_CANVAS_SPECULATIVE_PREFILL (default on; "0" disables): once
+  // a drained step leaves the whole-canvas argmax unchanged, the encoder
+  // commit prefill is encoded ahead of the formal exit on dedicated
+  // buffers and skipped later if the commit mismatches.
+  const bool canvasSpecPrefill_ = tuning().canvasSpeculativePrefill;
+  // RICHENGINE_CANVAS_PROFILE ("paper"|"balanced"|"fast"): bundles the
+  // speed/quality knobs below for serve's --canvas-profile. Each knob's own
+  // RICHENGINE_* variable wins over the profile when set.
+  const std::string_view canvasProfile_ = tuning().canvasProfile;
+  // RICHENGINE_CANVAS_EXIT_STABLE (default 0.9; "0" disables): the
+  // fraction-settled exit — at least this share of argmax-stable rows whose
+  // mean entropy is under the confidence threshold commits early. Renoised
+  // rows never settle on open-ended prompts, so the paper's strict
+  // whole-canvas mean is otherwise unreachable.
+  const float canvasExitStable_ = tuning().canvasExitStable;
+  // RICHENGINE_CANVAS_EXIT_DRIFT (default 0; "1" enables): fraction-settled
+  // exit without the confidence check — commits a mostly-stable canvas's
+  // argmax, freezing its churning minority early.
+  const bool canvasDriftExit_ = tuning().canvasDriftExit;
+  // RICHENGINE_CANVAS_MAX_STEPS (default 0 = the manifest's 48): caps the
+  // denoising schedule. Prose canvases never settle inside 48 steps, so
+  // the cap is the speed/quality dial — 24 roughly doubles throughput.
+  const uint32_t canvasMaxSteps_ = tuning().canvasMaxSteps;
+  // RICHENGINE_CANVAS_PROBE ("notrunk"|"notail"|"nosc"): a timing probe
+  // that skips the named stage of every canvas step — the trunk pass, the
+  // head+row-stats+accept tail, or the self-conditioning chain. Output is
+  // garbage; use with CANVAS_TIMING to attribute the per-step cost.
+  const std::string_view canvasProbe_ = tuning().canvasProbe;
+  // Canvas batching (RuntimeDiffusion.mm): every decode item is a lane
+  // with its own tokens/argmax/entropy scratch; each denoising step runs
+  // one trunk pass over the concatenated lane rows.
+  struct DiffusionLaneArena;
+  // One lane of a canvas commit (or speculative commit) prefill.
+  struct CommitLane final {
+    Request &entry;
+    uint64_t position;
+    uint32_t rows;
+    MetalBuffer pageTable;
+    uint32_t pageTableEntries;
+    MetalBuffer tokens;
+    MetalBuffer ropePositions;
+  };
+  // A lane's share of one denoising step before the shared trunk: rope
+  // positions, the scaled embedding into the lane's hidden slice, the
+  // previous step's self-conditioning chain and the rope table slice.
+  void encodeCanvasLaneFront(CommandGraph &graph, const Request &entry,
+                             DiffusionLaneArena &lane,
+                             const DiffusionSchedule &schedule, uint32_t step,
+                             uint32_t prefixTokens, uint32_t rows,
+                             uint32_t rowOffset,
+                             TargetModelPrefillBuffers &buffers);
+  // The lane's share after the shared trunk and head: row stats and the
+  // entropy-bounded accept on the lane's logits slice and ring buffers.
+  // `commitOnly` (the commit-tail flag) ends after the row stats — the
+  // accept's outputs have no consumer once the schedule is done.
+  void encodeCanvasLaneBack(CommandGraph &graph, DiffusionLaneArena &lane,
+                            const DiffusionSchedule &schedule, uint32_t step,
+                            uint32_t canvasIndex, uint32_t seed,
+                            uint32_t rows, uint32_t rowOffset,
+                            MetalBuffer argmaxPrev, MetalBuffer argmaxOut,
+                            MetalBuffer statsSlot, MetalBuffer entropySlot,
+                            bool commitOnly);
+  // The encoder pass over committed canvases: an ordinary causal prefill of
+  // every lane's committed tokens at their logical positions, into the
+  // requests' real pages, in one trunk pass.
+  void encodeCanvasCommitPrefill(CommandGraph &graph,
+                                 std::span<const CommitLane> lanes);
+  TargetModel targetModel;
+  detail::DraftModel draftModel;
   ops::AneFfn *aneFfn;
   // Tree verify (docs/TREE_VERIFY_DESIGN.md): the selector emits each greedy,
-  // unconstrained lane's comb tree when the draft is a DFlash2. Measured a
-  // net loss on the decode benchmark (identical accepted tokens at ~2x
-  // verify rows), so it is opt-in: RICHENGINE_VERIFY_TREE=1 enables.
-  const bool verifyTreeEnabled = envFlagOn("RICHENGINE_VERIFY_TREE");
+  // unconstrained lane's comb tree when the draft is tree-capable. DFlash2's
+  // 87%-acceptance benchmark measured identical tokens at ~2x verify rows,
+  // so it stays opt-in; DSpark's low chain acceptance leaves ~19% of its
+  // rejections to the comb's sibling leaves, so it defaults on.
+  // RICHENGINE_VERIFY_TREE=1 forces on for either kind, =0 forces off.
+  const bool verifyTreeEnvSet_ = tuning().verifyTreeSet;
+  const bool verifyTreeEnabled = tuning().verifyTree;
   // Adaptive proposal budgets (docs/SPEC_DECODE_BOOST.md L3): a chain lane's
   // accepted-token cap tracks its rolling acceptance EWMA, so a lane that
   // keeps rejecting pays for fewer live verify rows — GDN scan depth and
   // the per-row vocabulary/argmax sweeps — instead of the fixed eight.
   // On by default; RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
-  const bool adaptiveProposals_ =
-      ![] {
-        const char *value = std::getenv("RICHENGINE_ADAPTIVE_PROPOSALS");
-        return value && std::string_view(value) == "0";
-      }();
+  const bool adaptiveProposals_ = tuning().adaptiveProposals;
   // Per-step debug gates, read once: getenv scans environ linearly and these
   // ran inside the decode/finalize paths on every command.
-  const bool treeDebug_ = envFlag("RICHENGINE_TREE_DEBUG");
-  const bool draftDebug_ = envFlag("RICHENGINE_DRAFT_DEBUG");
-  const std::string treeSkip_ = [] {
-    const char *value = std::getenv("RICHENGINE_TREE_SKIP");
-    return value ? std::string(value) : std::string();
-  }();
-  const bool aneDebug_ = envFlag("RICHENGINE_ANE_DEBUG");
-  const bool ngramDebug_ = envFlag("RICHENGINE_NGRAM_DEBUG");
+  const bool treeDebug_ = tuning().treeDebug;
+  const bool draftDebug_ = tuning().draftDebug;
+  const bool draftConfDebug_ = tuning().draftConf;
+  const std::string treeSkip_ = tuning().treeSkip;
+  const bool aneDebug_ = tuning().aneDebug;
+  const bool ngramDebug_ = tuning().ngramDebug;
   // Opt-in ANE speculation (docs/ANE_DRAFTING.md): RICHENGINE_ANE_MEDUSA names a
   // CoreML package whose leaf alternates replace a tree batch's sibling
   // leaves; RICHENGINE_ANE_PREDRAFT names one that drafts the next step's
@@ -286,18 +408,34 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::array<uint64_t, kLaneCount> anePositions_{};
   std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
       aneProposals_{};
-  const uint32_t aneWaitMs_ = envUint("RICHENGINE_ANE_WAIT_MS", 3);
-  // Learning-free predraft (opt-in, RICHENGINE_NGRAM_PREDRAFT=1): an n-gram
-  // table over each lane's prompt+generated stream feeds the same
-  // ProposedTokens injection the ANE artifact uses — a wrong candidate
-  // only wastes verify rows.
-  const bool ngramPredraft_ = envFlagOn("RICHENGINE_NGRAM_PREDRAFT");
+  const uint32_t aneWaitMs_ = tuning().aneWaitMs;
+  // Learning-free predraft (default on; RICHENGINE_NGRAM_PREDRAFT=0
+  // disables): an n-gram table over each lane's prompt+generated stream
+  // feeds the same ProposedTokens injection the ANE artifact uses — a wrong
+  // candidate only wastes verify rows.
+  const bool ngramPredraft_ = tuning().ngramPredraft;
+  // Adaptive draft bypass (default on): when every lane's acceptance EWMA
+  // falls below the draft's break-even cost — the draft's per-step weight
+  // traffic as a share of the whole step — the batch decodes anchor-only
+  // and skips the draft forward, its vocabulary head read and the selector.
+  // A lane probes again each kDraftProbeTokens so a recovered EWMA
+  // re-enables it. RICHENGINE_DRAFT_BYPASS=0 disables.
+  const bool draftBypass_ = tuning().draftBypass;
+  // Break-even measured on the M5 Pro's MiniCPM5-2B-MLX: the draft pass is
+  // ~14% of a drafted step, so anchor-only wins once the accepted-token EWMA
+  // sits under ~0.16. 0.15 keeps a hair of margin below it.
+  const double draftBypassExpect_ = tuning().draftBypassExpect;
+  static constexpr uint32_t kDraftProbeTokens = 256;
   // Acceptance gate (SSSD-style): a batch goes n-gram-predrafted when the
   // lanes' expected accepted-token scores total at least what the GPU draft
   // would have delivered. A lane with a weak EWMA or no match drags the
   // total down and can veto; a cold lane re-probes each kNgramProbeTokens.
-  const double ngramDraftExpect_ = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
-  const uint32_t ngramWarmup_ = envUint("RICHENGINE_NGRAM_WARMUP", 8);
+  const double ngramDraftExpect_ = tuning().ngramDraftExpect;
+  const uint32_t ngramWarmup_ = tuning().ngramWarmup;
+  // The comb tree's admission: a lane's acceptance EWMA must reach this
+  // before its table emits sibling leaves — a proposer that rarely lands
+  // rescues nothing, and the tree's wider verify would cost for free rows.
+  const double ngramTreeMin_ = tuning().ngramTreeMin;
   static constexpr uint32_t kNgramProbeTokens = 256;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -307,34 +445,29 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         kvPages(value.kvPages),
         states(value.stateStorage),
         sampling(geometry.target.vocabularySize),
+        // RICHENGINE_DIFFUSION_AR=1 drops a diffusion package onto the
+        // ordinary autoregressive decode path: the trunk is the same
+        // Gemma4Moe weights, and the model keeps its AR capability. The
+        // canvas machinery (arena, warmup, admission) stays parked.
+        diffusion(std::holds_alternative<DiffusionGemmaWeights>(
+                      value.package.target) &&
+                  !tuning().diffusionAr),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return QwenTarget(weights, geometry.target,
+                          return TargetModel(weights, geometry.target,
                                             value.backend, operators);
                         },
                         value.package.target)),
         draftModel(std::visit(
-                       [&](const auto &weights)
-                           -> std::variant<NullDraft, DFlashDraft, PlainDraft,
-                                           DSparkDraft> {
-                         using W = std::decay_t<decltype(weights)>;
-                         using Draft = std::conditional_t<
-                             std::is_same_v<W, NullDraftWeights>, NullDraft,
-                             std::conditional_t<
-                                 std::is_same_v<W, DFlashDraftWeights>,
-                                 DFlashDraft,
-                                 std::conditional_t<
-                                     std::is_same_v<W, PlainDraftWeights>,
-                                     PlainDraft, DSparkDraft>>>;
+                       [&](const auto &weights) -> detail::DraftModel {
+                         using Draft = typename detail::DraftModelFor<
+                             std::decay_t<decltype(weights)>>::Type;
                          if constexpr (std::is_same_v<Draft, NullDraft>)
-                           return std::variant<NullDraft, DFlashDraft,
-                                               PlainDraft, DSparkDraft>(
-                               std::in_place_type<Draft>);
+                           return detail::DraftModel(std::in_place_type<Draft>);
                          else
-                           return std::variant<NullDraft, DFlashDraft,
-                                               PlainDraft, DSparkDraft>(
-                               std::in_place_type<Draft>, weights,
-                               value.backend, operators);
+                           return detail::DraftModel(std::in_place_type<Draft>,
+                                                     weights, value.backend,
+                                                     operators);
                        },
                        value.package.draft)),
         aneFfn(value.aneFfn) {
@@ -347,7 +480,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
     preparePolicyPipelines();
-    if (const char *path = std::getenv("RICHENGINE_ANE_MEDUSA")) {
+    if (const char *path = tuning().aneMedusa) {
       std::string error;
       aneMedusa_ = AnePredictor::load(path, error);
       if (!aneMedusa_)
@@ -359,7 +492,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                         BufferStorage::Shared, "ane-flag");
       *static_cast<uint32_t *>(aneFlag_.contents()) = 0xffffffffu;
     }
-    if (const char *path = std::getenv("RICHENGINE_ANE_PREDRAFT")) {
+    if (const char *path = tuning().anePredraft) {
       std::string error;
       anePredraft_ = AnePredictor::load(path, error);
       if (!anePredraft_)
@@ -552,11 +685,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   [[nodiscard]] MetalBuffer synchronizedPageTable(Request &entry,
                                                   const ModelBatchItem &item);
 
+  // The alt tables, when bound, hold the target's alternate rotary (Gemma's
+  // global layers): same positions, altRotaryPairs dims.
   void addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
                      uint32_t targetRows, MetalBuffer draftPositions,
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
-                     MetalBuffer draftSin) const;
+                     MetalBuffer draftSin, MetalBuffer targetCosAlt = {},
+                     MetalBuffer targetSinAlt = {}) const;
   // A constrained lane keeps its final prompt row, which prefill leaves at
   // row 0 of its Hidden0 block, until its first mask arrives.
   void captureFinalHidden(Request &entry, uint32_t lane) const {
@@ -635,18 +771,38 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
             samplingPenalties(entry), entry.sampling.minP};
   }
+  // A draft kind emits tree tables when trees are on for it: the env's
+  // opt-in covers DFlash2, DSpark and NullDraft; unset, DSpark and
+  // NullDraft default on — DSpark's comb leaves rescue a measured share of
+  // chain rejections and the n-gram predraft's alternates rescue draft-free
+  // lanes the same way, where DFlash2's high-acceptance benchmark found
+  // none worth the extra rows.
+  bool treeDraftCapable() const {
+    // The comb layout halves the node block: the chain's front rows anchor
+    // it and each leading position's runner-up becomes a sibling leaf in
+    // the back half, so the chain never needs more than half the stride.
+    static_assert(RICHENGINE_TREE_VERIFY_NODES >= 2 &&
+                      RICHENGINE_TREE_VERIFY_NODES % 2 == 0,
+                  "the comb splits the verify nodes into equal halves");
+    const bool defaultsOn = std::holds_alternative<DSparkDraft>(draftModel) ||
+                            std::holds_alternative<NullDraft>(draftModel);
+    if (!defaultsOn &&
+        !std::holds_alternative<DFlashDraft>(draftModel) &&
+        !std::holds_alternative<DFlashV1Draft>(draftModel))
+      return false;
+    return verifyTreeEnvSet_ ? verifyTreeEnabled : defaultsOn;
+  }
   // A batch verifies the selector's comb trees only when every lane can:
-  // greedy, unconstrained and unpenalized DFlash lanes, at most two wide
-  // (a tree lane doubles its row block, and four virtual lanes is the row
-  // budget), on a target with the tree kernels — GDN and attention mixers,
-  // dense FFN, no fp8 KV. Anything else runs the chain verify.
+  // greedy, unconstrained and unpenalized tree-capable lanes, at most two
+  // wide (a tree lane doubles its row block, and four virtual lanes is the
+  // row budget), on a target with the tree kernels — GDN and attention
+  // mixers, dense FFN, no fp8 KV. Anything else runs the chain verify.
   bool treeVerifyBatch(std::span<Request *const> entries, uint32_t width,
                        bool constrained) const {
-    if (constrained || !verifyTreeEnabled || !width ||
+    if (constrained || !treeDraftCapable() || !width ||
         width > kLaneCount / 2 ||
-        !std::holds_alternative<DFlashDraft>(draftModel) ||
-        geometry.target.convLayers ||
-        geometry.target.ffnKind == QwenFfnKind::SparseMoe ||
+        (geometry.target.convLayers && !geometry.target.gdnLayers) ||
+        geometry.target.ffnKind == FfnKind::SparseMoe ||
         geometry.target.kvLayout.format == kv::Format::Float8E4M3)
       return false;
     for (uint32_t lane = 0; lane < width; ++lane) {
@@ -972,7 +1128,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                   pi(PrefillTensor::DraftPositions), batch.capturedRows,
                   p(PrefillTensor::RopeCos), p(PrefillTensor::RopeSin),
                   p(PrefillTensor::DraftRopeCos),
-                  p(PrefillTensor::DraftRopeSin));
+                  p(PrefillTensor::DraftRopeSin),
+                  p(PrefillTensor::RopeCosAlt), p(PrefillTensor::RopeSinAlt));
 
     targetModel.addEmbedding(graph, pi(PrefillTensor::InputTokens),
                              p(PrefillTensor::Hidden0), batch.rows);
@@ -980,7 +1137,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
     }
 
-    std::array<QwenTargetPrefillSequence, kLaneCount> modelSequences{};
+    std::array<TargetModelPrefillSequence, kLaneCount> modelSequences{};
     const uint32_t modelSequenceCount =
         static_cast<uint32_t>(batch.sequences.size());
     const uint64_t stateBindingCount = uint64_t{modelSequenceCount} *
@@ -991,7 +1148,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::vector<MetalBuffer> recurrentOut(stateBindingCount);
     for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
       const PackedPrefillSequence &sequence = batch.sequences[lane];
-      QwenTargetPrefillSequence &destination = modelSequences[lane];
+      TargetModelPrefillSequence &destination = modelSequences[lane];
       destination.rowBegin = sequence.rowBegin;
       destination.rows = sequence.item->tokenCount;
       destination.attentionStride = sequence.attentionStride;
@@ -1036,11 +1193,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             capture.absoluteEnd - capture.absoluteBegin};
       }
     }
-    QwenTargetPrefillBuffers buffers = detail::prefillBuffers(*prefillArena);
+    TargetModelPrefillBuffers buffers = detail::prefillBuffers(*prefillArena);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
-        kvPages.layers(), aneFfn);
+        kvPages.layers(), aneFfn, encoderLayerScalars());
     addPackedDraftContext(graph, batch);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0
@@ -1054,7 +1211,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       Request &entry = *sequence.entry;
       const ModelBatchItem &item = *sequence.item;
-      if (entry.replayingGeneration ||
+      if (diffusion || entry.replayingGeneration ||
           item.logicalPosition + item.tokenCount != entry.promptTokens)
         continue;
       const uint32_t hidden = geometry.target.hiddenSize;
@@ -1133,21 +1290,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   bool applyAnePredraft(std::span<Request *const> entries,
                         std::span<const ModelBatchItem> items,
                         uint32_t width);
-  // The vocabulary is under 2^18, so three tokens pack into one key.
-  static uint64_t ngramKey(const uint32_t *tokens) {
-    return uint64_t{tokens[0]} | (uint64_t{tokens[1]} << 18) |
-           (uint64_t{tokens[2]} << 36);
-  }
-  static constexpr uint32_t kNgramNone = ~0u;
-  void noteNgramAt(Request &entry, uint32_t start);
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
-  // tokens then append through commitSelected.
+  // tokens then append through commitSelected. NgramIndex.hpp owns the
+  // table logic.
   void seedNgramHistory(Request &entry, std::span<const uint32_t> prompt);
   void appendNgramTokens(Request &entry, std::span<const uint32_t> tokens);
-  // Follows the most recent earlier occurrences of the stream's closing
-  // 3-gram — the stream's own tail is a key's newest start, so each key
-  // keeps two. The candidate with the longest backward extension wins.
-  uint32_t ngramLookup(const Request &entry, uint32_t *out) const;
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after
@@ -1158,9 +1305,17 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // repeats its anchor (a wrong guess only wastes its verify rows). The
   // batch goes predrafted when the lanes' expected scores total what the
   // GPU draft would have accepted — mixed-quality lanes no longer veto.
-  // Greedy lanes only: injected proposals carry no probabilities.
+  // Greedy lanes only: injected proposals carry no probabilities. When
+  // emitTree is set the lane also writes a comb tree table — chain rows,
+  // one sibling leaf per proposal position that has a distinct alternate —
+  // and predraftedTree_ reports whether the batch left as a tree.
   bool applyNgramPredraft(std::span<Request *const> entries,
-                          uint32_t width);
+                          uint32_t width, bool emitTree);
+  bool predraftedTree_ = false;
+  // The batch-maximum live node count of the emitted comb, known at encode
+  // time because the host wrote the table — the verify plan and its KV
+  // stores size for it instead of the scratch's full capacity.
+  uint32_t predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
@@ -1218,6 +1373,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing, bool tree = false) {
+    // RICHENGINE_MOE_STATS: the step's MoE layers left a record each in the
+    // shared tile-count scratch; this readback is why the flag is debug-only.
+    ops::MoE::logStats(decodeArena->moeScratch(1).tileCount);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
       auto d = [&](DecodeTensor tensor) {
@@ -1251,14 +1409,211 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       if (draftDebug_ && !tree) {
         const uint32_t *props = contents<uint32_t>(
             d(DecodeTensor::ProposedTokens), "proposed tokens");
+        const uint16_t *hidden = contents<uint16_t>(
+            d(DecodeTensor::FinalHidden), "final hidden");
+        uint64_t h0 = 1469598103934665603ULL;
+        for (uint32_t e = 0; e < geometry.target.hiddenSize; ++e) {
+          h0 = (h0 ^ hidden[e]) * 1099511628211ULL;
+        }
+        const float *logits = contents<float>(
+            d(DecodeTensor::Logits), "logits");
+        float lmax = -INFINITY; uint32_t lmaxi = 0; uint32_t lnans = 0;
+        for (uint32_t e = 0; e < geometry.target.vocabularySize; ++e) {
+          const float v = logits[e];
+          if (!std::isfinite(v)) { ++lnans; continue; }
+          if (v > lmax) { lmax = v; lmaxi = e; }
+        }
+        const uint32_t *flatOut = contents<uint32_t>(
+            decodeArena->packed(DecodeTensor::OutputTokens,
+                                uint32_t(lanes.size())),
+            "flat out");
+        fprintf(stderr, "  lane=%u lmax=%f@%u nans=%u in0=%u flat=[%u %u %u %u]\n",
+                lane, lmax, lmaxi, lnans,
+                *contents<uint32_t>(d(DecodeTensor::InputTokens), "in"),
+                flatOut[lane * 16], flatOut[lane * 16 + 1],
+                flatOut[lane * 16 + 2], flatOut[lane * 16 + 15]);
         std::string p, t;
         for (uint32_t i = 0; i < kDraftProposalTokens; ++i)
           p += (i ? " " : "") + std::to_string(props[i]);
         for (uint32_t i = 0; i < laneResult.retained && i < 9; ++i)
           t += (i ? " " : "") + std::to_string(targetTokens[i]);
-        fprintf(stderr, "draft lane=%u pos=%llu props=[%s] retained=%u accepted=%u out=[%s]\n",
+        fprintf(stderr, "draft lane=%u pos=%llu props=[%s] retained=%u accepted=%u out=[%s] h0=%016llx\n",
                 lane, static_cast<unsigned long long>(items[lane].logicalPosition), p.c_str(),
-                laneResult.retained, laneResult.accepted, t.c_str());
+                laneResult.retained, laneResult.accepted, t.c_str(),
+                static_cast<unsigned long long>(h0));
+      }
+      // RICHENGINE_DRAFT_CONF: the confidence head ships loaded but unscored.
+      // Score each emitted proposal three ways — its own markov_w1 and w2
+      // rows, and its predecessor's w1 (the anchor's at position 0) — against
+      // the position's final hidden, to learn which tail makes the head
+      // predict the chain's accept prefix (accepted is that prefix's length).
+      if (draftConfDebug_ && !tree) {
+        if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+          const DSparkDraftWeights &w = dspark->weights();
+          if (w.confidenceWeight.storage() != BufferStorage::Shared ||
+              w.confidenceBias.storage() != BufferStorage::Shared ||
+              w.markovEmbedding.storage() != BufferStorage::Shared ||
+              w.markovProjection.storage() != BufferStorage::Shared) {
+            fprintf(stderr, "conf lane=%u confidence weights not CPU-visible\n",
+                    lane);
+          } else {
+          const uint32_t hiddenSize = w.layout.hiddenSize;
+          const uint32_t rank = w.layout.markovRank;
+          const uint32_t vocab =
+              uint32_t(w.markovEmbedding.sizeBytes() / (2 * size_t{rank}));
+          const auto bf = [](uint16_t bits) {
+            return std::bit_cast<float>(uint32_t{bits} << 16);
+          };
+          const uint16_t *hidden = contents<uint16_t>(
+              d(DecodeTensor::DraftFinalHidden), "draft final hidden");
+          const uint32_t *props = contents<uint32_t>(
+              d(DecodeTensor::ProposedTokens), "proposed tokens");
+          const uint32_t *anchor = contents<uint32_t>(
+              d(DecodeTensor::InputTokens), "decode anchor");
+          const uint16_t *cw = contents<uint16_t>(w.confidenceWeight,
+                                                  "confidence weight");
+          const uint16_t *w1 = contents<uint16_t>(w.markovEmbedding,
+                                                  "markov w1");
+          const uint16_t *w2 = contents<uint16_t>(w.markovProjection,
+                                                  "markov w2");
+          const float bias = bf(*contents<uint16_t>(w.confidenceBias,
+                                                    "confidence bias"));
+          std::string c1, c2, c3;
+          for (uint32_t p = 0; p < kDraftProposalTokens; ++p) {
+            const uint16_t *h = hidden + p * hiddenSize;
+            const uint32_t token = props[p];
+            const uint32_t prev = p ? props[p - 1] : anchor[0];
+            if (token >= vocab || prev >= vocab)
+              break;
+            for (uint32_t table = 0; table < 3; ++table) {
+              const uint16_t *m =
+                  (table == 0 ? w1 + size_t{token} * rank
+                              : table == 1 ? w2 + size_t{token} * rank
+                                           : w1 + size_t{prev} * rank);
+              float logit = bias;
+              for (uint32_t i = 0; i < hiddenSize; ++i)
+                logit += bf(cw[i]) * bf(h[i]);
+              for (uint32_t i = 0; i < rank; ++i)
+                logit += bf(cw[hiddenSize + i]) * bf(m[i]);
+              char number[16];
+              std::snprintf(number, sizeof(number), "%s%.3f", p ? " " : "",
+                            1.0F / (1.0F + std::exp(-logit)));
+              (table == 0 ? c1 : table == 1 ? c2 : c3) += number;
+            }
+          }
+          fprintf(stderr,
+                  "conf lane=%u retained=%u accepted=%u w1=[%s] w2=[%s] prev=[%s]\n",
+                  lane, laneResult.retained, laneResult.accepted, c1.c_str(),
+                  c2.c_str(), c3.c_str());
+          // Rerank probe: score every pool slot with the same head. At the
+          // first rejected position the target's pick is known — if it sat
+          // in the pool and out-scored the selected candidate on confidence,
+          // a conf-reranked chain would have extended the accept.
+          const uint32_t *cands = contents<uint32_t>(
+              d(DecodeTensor::TopPartialIds), "draft pool candidates");
+          const float *poolUnary = contents<float>(
+              d(DecodeTensor::TopPartialValues), "draft pool scores");
+          constexpr uint32_t kPool = RICHENGINE_DSPARK_POOL;
+          std::string line;
+          char cell[128];
+          for (uint32_t p = 0; p < kDraftProposalTokens; ++p) {
+            const uint16_t *h = hidden + p * hiddenSize;
+            auto confOf = [&](uint32_t token, const uint16_t *table) {
+              const uint16_t *m = table + size_t{token} * rank;
+              float logit = bias;
+              for (uint32_t i = 0; i < hiddenSize; ++i)
+                logit += bf(cw[i]) * bf(h[i]);
+              for (uint32_t i = 0; i < rank; ++i)
+                logit += bf(cw[hiddenSize + i]) * bf(m[i]);
+              return 1.0F / (1.0F + std::exp(-logit));
+            };
+            const uint32_t *row = cands + p * kPool;
+            const uint32_t sel = props[p];
+            int selIdx = -1;
+            float bestConf = -1.0F;
+            uint32_t bestIdx = 0;
+            for (uint32_t c = 0; c < kPool; ++c) {
+              if (row[c] >= vocab)
+                continue;
+              if (row[c] == sel)
+                selIdx = int(c);
+              const float s = confOf(row[c], w2);
+              if (s > bestConf) {
+                bestConf = s;
+                bestIdx = c;
+              }
+            }
+            std::snprintf(cell, sizeof(cell), " p%u:sel@%d best@%u/%.3f", p,
+                          selIdx, bestIdx, bestConf);
+            line += cell;
+            // The target's pick exists only at the first rejected position.
+            if (p == laneResult.accepted && p < kDraftProposalTokens) {
+              const uint32_t tgt = targetTokens[p];
+              // Exact margin when the pick is in-pool: its biased score
+              // minus the selected's. Out of pool only the bias advantage
+              // over the headroom to the weakest pool score is knowable.
+              float margin = -999.0F;
+              const uint32_t prevTok = p ? props[p - 1] : anchor[0];
+              int tgtIdx = -1;
+              const float *urow = poolUnary + p * kPool;
+              for (uint32_t c = 0; c < kPool; ++c)
+                if (row[c] == tgt)
+                  tgtIdx = int(c);
+              int biasedRank = -1;
+              if (tgt < vocab && prevTok < vocab && selIdx >= 0 &&
+                  tgtIdx >= 0) {
+                const uint16_t *fp = w1 + size_t{prevTok} * rank;
+                auto biasOf = [&](uint32_t tok) {
+                  const uint16_t *m = w2 + size_t{tok} * rank;
+                  float b = 0.0F;
+                  for (uint32_t i = 0; i < rank; ++i)
+                    b += bf(fp[i]) * bf(m[i]);
+                  return b;
+                };
+                const float tgtBiased = urow[tgtIdx] + biasOf(tgt);
+                margin = tgtBiased - (urow[selIdx] + biasOf(sel));
+                // The pick's rank among the pool's biased scores is what a
+                // sibling-leaf verify could reach.
+                biasedRank = 1;
+                for (uint32_t c = 0; c < kPool; ++c) {
+                  if (row[c] >= vocab || int(c) == tgtIdx)
+                    continue;
+                  if (urow[c] + biasOf(row[c]) > tgtBiased)
+                    ++biasedRank;
+                }
+              }
+              int tgtRank = -1;
+              float tgtConf = 0.0F;
+              std::vector<std::pair<float, uint32_t>> scored;
+              scored.reserve(kPool);
+              for (uint32_t c = 0; c < kPool; ++c) {
+                if (row[c] >= vocab)
+                  continue;
+                const float s = confOf(row[c], w2);
+                scored.emplace_back(s, c);
+                if (row[c] == tgt) {
+                  tgtIdx = int(c);
+                  tgtConf = s;
+                }
+              }
+              if (tgtIdx >= 0) {
+                std::sort(scored.begin(), scored.end(),
+                          [](auto a, auto b) { return a.first > b.first; });
+                for (uint32_t c = 0; c < scored.size(); ++c)
+                  if (scored[c].second == uint32_t(tgtIdx))
+                    tgtRank = int(c) + 1;
+              }
+              std::snprintf(cell, sizeof(cell),
+                            " REJ tgt=%u idx=%d margin=%.2f brank=%d conf=%.3f rank=%d selconf=%.3f",
+                            tgt, tgtIdx, margin, biasedRank, tgtConf, tgtRank,
+                            selIdx >= 0 ? confOf(row[selIdx], w2) : -1.0F);
+              line += cell;
+            }
+          }
+          fprintf(stderr, "cands lane=%u acc=%u%s\n", lane,
+                  laneResult.accepted, line.c_str());
+          }
+        }
       }
       laneResult.failure = invalidSelection({targetTokens, laneResult.retained});
       if (tree && treeDebug_) {
@@ -1282,14 +1637,29 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         const uint32_t medusaFlag = aneFlag_
             ? *static_cast<uint32_t *>(aneFlag_.contents())
             : 0u;
+        if (lane == 0) {
+          const uint32_t *nd = contents<uint32_t>(
+              d(DecodeTensor::TreeNodes), "tree nodes");
+          std::string dump;
+          for (uint32_t r = 0; r < 16; ++r) {
+            char c[64];
+            std::snprintf(c, sizeof(c), " %u:t%u/p%ud%u/x%x", r, treeTok[r],
+                          RICHENGINE_TREE_NODE_PARENT(nd[r]),
+                          RICHENGINE_TREE_NODE_DEPTH(nd[r]), msk[r]);
+            dump += c;
+          }
+          fprintf(stderr, "tree-nodes lane=0%s\n", dump.c_str());
+        }
         fprintf(stderr,
-                "tree-step lane=%u retained=%u accepted=%u out=[%u %u %u %u] "
+                "tree-step lane=%u retained=%u accepted=%u out=[%u %u %u %u %u %u %u %u] "
                 "tree=[%u %u %u %u %u] sel=[%u %u %u %u %u] "
                 "in=[%u %u %u] pos=[%u %u %u] mask=[%x %x %x] "
                 "path=[%u %u %u %u] mflag=%u fail=%s\n",
                 lane, laneResult.retained, laneResult.accepted,
                 targetTokens[0], targetTokens[1], targetTokens[2],
-                targetTokens[3], treeTok[0], treeTok[1], treeTok[2],
+                targetTokens[3], targetTokens[4], targetTokens[5],
+                targetTokens[6], targetTokens[7],
+                treeTok[0], treeTok[1], treeTok[2],
                 treeTok[8], treeTok[9], sel[0], sel[1], sel[2], sel[8], sel[9],
                 inp[0], inp[1], inp[9], pos[0], pos[3], pos[27],
                 msk[1], msk[9], msk[15], rpath[0], rpath[1], rpath[2], rpath[3],
@@ -1330,14 +1700,19 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                               nextLength, items[lane].logicalPosition,
                               nextLength, false, geometry.draft.draftWindow()));
       entry.generatedTokens += laneResult.retained;
-      if (adaptiveProposals_ && !tree) {
+      if (entry.draftBypassed) {
+        // A bypassed step offered no draft proposals: a fake zero would
+        // poison the EWMA, so only the next probe is scheduled.
+        entry.draftBypassed = false;
+        entry.draftProbeAt = entry.generatedTokens + kDraftProbeTokens;
+      } else if (adaptiveProposals_ && !tree) {
         entry.proposalAcceptedAvg =
             0.75 * entry.proposalAcceptedAvg + 0.25 * laneResult.accepted;
         if (laneResult.accepted >= entry.proposalBudget) {
           // A capped count can't show how much further the chain would have
-          // run; widen until the cap stops binding.
+          // run; widen until the trained block's cap stops binding.
           entry.proposalBudget =
-              std::min<uint32_t>(kDraftProposalTokens,
+              std::min<uint32_t>(geometry.draft.proposalLimit(),
                                  entry.proposalBudget + 1);
         } else {
           // Shrink toward the EWMA target one row per step: a single-visit

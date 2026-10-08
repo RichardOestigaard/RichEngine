@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "TestChecks.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
@@ -29,11 +30,11 @@ namespace {
 constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
 constexpr std::string_view kChunkedPrefillStorePipeline =
-    "prefill_attention_q8_store";
+    richengine::ops::kPrefillAttentionQ8Store;
 constexpr std::string_view kPrefillAttentionSplitPipeline =
-    "prefill_attention_q8_split";
+    richengine::ops::kPrefillAttentionQ8Split;
 constexpr std::string_view kPrefillAttentionReducePipeline =
-    "prefill_attention_reduce";
+    richengine::ops::kPrefillAttentionReduce;
 struct AttentionPipelines {
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
@@ -912,7 +913,7 @@ void run(const char *libraryPath) {
       makePipeline(device, library, kPrefillAttentionSplitPipeline.data()),
       makePipeline(device, library, kPrefillAttentionReducePipeline.data())};
   id<MTLComputePipelineState> verifyStore =
-      makePipeline(device, library, "verify_attention_q8_store");
+      makePipeline(device, library, richengine::ops::kVerifyAttentionQ8Store.data());
   id<MTLCommandQueue> queue = [device newCommandQueue];
   testContract();
   testAttentionAndDirectStore(device, queue, store, attention);

@@ -1,0 +1,185 @@
+{
+ "install/models/openbmb/MiniCPM5-2B-GGUF:Q4_K_M": {
+  "device": "Apple M5 Pro",
+  "prompt_sha256": "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982",
+  "decode": {
+   "1": {
+    "hash": "8963959696275473840",
+    "acceptance": 0.0748,
+    "drafted_tokens": 294
+   },
+   "2": {
+    "hash": "8963959696275473840",
+    "acceptance": 0.0748,
+    "drafted_tokens": 588
+   },
+   "3": {
+    "hash": "8963959696275473840",
+    "acceptance": 0.0748,
+    "drafted_tokens": 882
+   },
+   "4": {
+    "hash": "8963959696275473840",
+    "acceptance": 0.0748,
+    "drafted_tokens": 1176
+   }
+  },
+  "requests": {
+   "partial_4k_cold": [
+    367
+   ],
+   "partial_4k_seed": [
+    220
+   ],
+   "partial_4k_hit": [
+    367
+   ],
+   "short:480": [
+    242
+   ],
+   "short:512": [
+    220
+   ],
+   "short:544": [
+    84
+   ],
+   "short:640": [
+    84
+   ],
+   "short:672": [
+    342
+   ],
+   "short:1024": [
+    242
+   ],
+   "short:1536": [
+    84
+   ],
+   "short:2016": [
+    220
+   ]
+  }
+ },
+ "install/models/openbmb/MiniCPM5-2B-GGUF:MXFP4": {
+  "device": "Apple M5 Pro",
+  "prompt_sha256": "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982",
+  "decode": {
+   "1": {
+    "hash": "4660161958682145449",
+    "acceptance": 0.1143,
+    "drafted_tokens": 245
+   },
+   "2": {
+    "hash": "13674218857995076079",
+    "acceptance": 0.1071,
+    "drafted_tokens": 504
+   },
+   "3": {
+    "hash": "11083042485027366452",
+    "acceptance": 0.126,
+    "drafted_tokens": 714
+   },
+   "4": {
+    "hash": "11083042485027366452",
+    "acceptance": 0.126,
+    "drafted_tokens": 952
+   }
+  },
+  "requests": {
+   "partial_4k_cold": [
+    104
+   ],
+   "partial_4k_seed": [
+    5817
+   ],
+   "partial_4k_hit": [
+    104
+   ],
+   "short:480": [
+    84
+   ],
+   "short:512": [
+    242
+   ],
+   "short:544": [
+    84
+   ],
+   "short:640": [
+    84
+   ],
+   "short:672": [
+    422
+   ],
+   "short:1024": [
+    242
+   ],
+   "short:1536": [
+    84
+   ],
+   "short:2016": [
+    84
+   ]
+  }
+ },
+ "install/models/openbmb/MiniCPM5-2B-MLX": {
+  "device": "Apple M5 Pro",
+  "prompt_sha256": "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982",
+  "decode": {
+   "1": {
+    "hash": "9517058732146313779",
+    "acceptance": 0.1521,
+    "drafted_tokens": 217
+   },
+   "2": {
+    "hash": "9517058732146313779",
+    "acceptance": 0.1521,
+    "drafted_tokens": 434
+   },
+   "3": {
+    "hash": "9517058732146313779",
+    "acceptance": 0.1521,
+    "drafted_tokens": 651
+   },
+   "4": {
+    "hash": "9517058732146313779",
+    "acceptance": 0.1521,
+    "drafted_tokens": 868
+   }
+  },
+  "requests": {
+   "partial_4k_cold": [
+    367
+   ],
+   "partial_4k_seed": [
+    367
+   ],
+   "partial_4k_hit": [
+    367
+   ],
+   "short:480": [
+    84
+   ],
+   "short:512": [
+    367
+   ],
+   "short:544": [
+    367
+   ],
+   "short:640": [
+    84
+   ],
+   "short:672": [
+    342
+   ],
+   "short:1024": [
+    84
+   ],
+   "short:1536": [
+    84
+   ],
+   "short:2016": [
+    84
+   ]
+  }
+ }
+}

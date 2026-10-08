@@ -2,6 +2,7 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Linear.h"
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -184,9 +185,9 @@ std::vector<uint8_t> runSplitPlan(MetalBackend &backend, const richengine::ops::
   // The poison before each of the plan's dispatches (gate/up runs two), and
   // the output's before the second run.
   richengine::metal::CommandGraph poisoning;
-  poisoning.add("test_copy_u32", {poison, partials.view}, uint32_t(scratch.partials / 4),
+  poisoning.add(std::string(richengine::ops::kTestCopyU32), {poison, partials.view}, uint32_t(scratch.partials / 4),
                 {uint32_t((scratch.partials / 4 + 255) / 256), 1, 1}, {256, 1, 1});
-  poisoning.add("test_copy_u32", {poison, output.view}, uint32_t(output.bytes / 4),
+  poisoning.add(std::string(richengine::ops::kTestCopyU32), {poison, output.view}, uint32_t(output.bytes / 4),
                 {uint32_t((output.bytes / 4 + 255) / 256), 1, 1}, {256, 1, 1});
   std::vector<ComputeDispatch> dispatches;
   for (uint32_t run = 0; run < 2; ++run) {
@@ -362,7 +363,7 @@ void run(const std::string &metallibPath) {
   singles.clear();
   for (uint32_t lane = 0; lane < kMaximumBatch; ++lane) {
     singles.push_back(affine(
-        "decode_linear_q4_n128",
+        std::string(richengine::ops::kDecodeLinearQ4N128),
         backend.view(input, uint64_t{lane} * inputElements * sizeof(__bf16),
                      inputElements * sizeof(__bf16)),
         weights, scales, biases,
@@ -382,7 +383,7 @@ void run(const std::string &metallibPath) {
   std::vector<ComputeDispatch> pairedSingles;
   for (uint32_t lane = 0; lane < kMaximumBatch; ++lane) {
     pairedSingles.push_back(affine(
-        "decode_linear_q4_n128_paired",
+        std::string(richengine::ops::kDecodeLinearQ4N128Paired),
         backend.view(input, uint64_t{lane} * inputElements * sizeof(__bf16),
                      inputElements * sizeof(__bf16)),
         weights, scales, biases,
@@ -394,16 +395,15 @@ void run(const std::string &metallibPath) {
   if (std::memcmp(reference.contents(), paired.contents(), paired.sizeBytes()))
     fail("paired M8 projection differs from the sequential M8 projection");
   std::cout << "PASS q4 paired M8 exact=true\n";
-  constexpr std::array<const char *, 3> genericPipelines{
-      "decode_linear_q4_n128_m16", "decode_linear_q4_n128_m24",
-      "decode_linear_q4_n128_m32"};
+  constexpr std::array genericPipelines{richengine::ops::kDecodeLinearQ4N128M16,
+      richengine::ops::kDecodeLinearQ4N128M24, richengine::ops::kDecodeLinearQ4N128M32};
   for (uint32_t width = 2; width <= kMaximumBatch; ++width) {
     MetalBuffer candidate =
         shared(backend, uint64_t{width} * outputElements * sizeof(__bf16),
                "q4-generic-batch-output");
     std::memset(candidate.contents(), 0, candidate.sizeBytes());
     ComputeDispatch batch = affine(
-        genericPipelines[width - 2],
+        std::string(genericPipelines[width - 2]),
         backend.view(input, 0,
                      uint64_t{width} * inputElements * sizeof(__bf16)),
         weights, scales, biases, candidate, params);
@@ -425,7 +425,7 @@ void run(const std::string &metallibPath) {
   std::array<ComputeDispatch, 3> gateUpSingles;
   for (uint32_t lane = 0; lane < gateUpSingles.size(); ++lane) {
     gateUpSingles[lane] = gateUp(
-        "decode_linear_q4_n256_gate_up",
+        std::string(richengine::ops::kDecodeLinearQ4N256GateUp),
         backend.view(input, uint64_t{lane} * inputElements * sizeof(__bf16),
                      inputElements * sizeof(__bf16)),
         weights, scales, biases,
@@ -436,10 +436,10 @@ void run(const std::string &metallibPath) {
   }
   (void)backend.submitCommand(gateUpSingles);
   std::array<ComputeDispatch, 2> splitDispatches{
-      affine("decode_linear_q4_n256_m24",
+      affine(std::string(richengine::ops::kDecodeLinearQ4N256M24),
              backend.view(input, 0, uint64_t{3} * inputElements * sizeof(__bf16)),
              weights, scales, biases, gateScratch, params),
-      upSilu("decode_linear_q4_n256_up_silu_m24",
+      upSilu(std::string(richengine::ops::kDecodeLinearQ4N256UpSiluM24),
              backend.view(input, 0, uint64_t{3} * inputElements * sizeof(__bf16)),
              weights, scales, biases, gateScratch, combined, params)};
   const auto timing = backend.submitCommand(splitDispatches);
@@ -469,7 +469,7 @@ void run(const std::string &metallibPath) {
     std::vector<ComputeDispatch> dispatches;
     for (uint32_t lane = 0; lane < kPersistentLanes; ++lane) {
       dispatches.push_back(affine(
-          "decode_linear_q4_n128",
+          std::string(richengine::ops::kDecodeLinearQ4N128),
           backend.view(input, lane * laneInputBytes, laneInputBytes), weights,
           scales, biases,
           backend.view(singleTile, lane * laneOutputBytes, laneOutputBytes),
@@ -477,7 +477,7 @@ void run(const std::string &metallibPath) {
     }
     const Q4PersistentParams oneGroup{kPersistentOutput, persistentInput, 1};
     dispatches.push_back(affine(
-        "decode_linear_q4_n128_m24",
+        std::string(richengine::ops::kDecodeLinearQ4N128M24),
         backend.view(input, 0, kPersistentLanes * laneInputBytes), weights,
         scales, biases, persistent, oneGroup));
     (void)backend.submitCommand(dispatches);
@@ -498,7 +498,7 @@ void run(const std::string &metallibPath) {
   for (const uint32_t groups : {20u, kOutput / 256}) {
     std::memset(wide.contents(), 0, laneBytes);
     const Q4PersistentParams wideParams{kOutput, kInput, groups};
-    (void)backend.submit(withThreads(affine("decode_linear_q4_n256_paired_sg4", lane0Input,
+    (void)backend.submit(withThreads(affine(std::string(richengine::ops::kDecodeLinearQ4N256PairedSg4), lane0Input,
                                             weights, scales, biases, wide, wideParams), 128));
     if (std::memcmp(lane0Reference.contents(), wide.contents(), laneBytes))
       fail("four-simdgroup N256 M8 projection differs from the sequential N128 projection");

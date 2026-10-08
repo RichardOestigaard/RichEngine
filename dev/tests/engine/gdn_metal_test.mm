@@ -6,6 +6,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
+#include "../../../runtime/ops/KernelNames.hpp"
 #include "metal/abi/GDN.h"
 #include "tuning/LinearNumerics.hpp"
 
@@ -406,7 +407,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
     MetalBuffer sums =
         shared(backend, uint64_t{tokens} * quantGroups * 4, "gate sums");
     richengine::metal::ComputeDispatch gate;
-    gate.pipelineName = std::string("prefill_gdn_gate_sums") +
+    gate.pipelineName = std::string(richengine::ops::kPrefillGdnGateSums) +
                         (valueHeads == 32 ? "_vh32" : "") +
                         (float32 ? "_f32" : "");
     gate.buffers = {{0, buffers.recurrentRows},

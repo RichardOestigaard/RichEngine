@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import math
 import os
 import queue
 import re
@@ -22,10 +21,8 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from huggingface_hub.utils import validate_repo_id
-from transformers import AutoTokenizer
 
-from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import disk, installer, json_codec, judgments, serve_options
 from . import runtime as engine_runtime
 from .api_shapes import (
     anthropic_response,
@@ -43,15 +40,14 @@ from .api_shapes import (
     text_completion_chunk,
     text_completion_response,
 )
-from .backend import NativeBackend, NativeResult, remaining_request_time
-from .chat_templates import ChatTemplateError, ChatTemplates
-from .constraints import ConstraintFactory, validate_tokenizer
-from .diagnostics import log_unexpected, print_request, print_status
+from .backend import NativeResult, remaining_request_time
+from .chat_templates import ChatTemplateError
+from .diagnostics import accent, dim, log_unexpected, print_status
 from .errors import APIError, ContextLengthError
-from .frontend import Frontend
 from .http_security import OriginRefused, authenticate, validate_headers
-from .latency import RequestLatency
+from .latency import LatencyMetrics, RequestLatency
 from .metrics import prometheus_metrics, timings_dict, usage_dict
+from .model_host import ModelHost
 from .origins import ANY_ORIGIN
 from .output import (
     BlockSequencer,
@@ -59,7 +55,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
-from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+from .thinking import ThinkingKeyError
 
 # Request bodies held at once, from upload through preparation and, for what
 # a generation retains of them, until it ends, take at most max(this, twice
@@ -73,12 +69,28 @@ CLIENT_DISCONNECT_POLL = 0.1
 # How long a connection refused unread may take its client to close.
 REFUSED_LINGER_SECONDS = 2.0
 SSE_KEEPALIVE_SECONDS = 2.0
-NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 # The chat page's brand mark, in its text colors, which the page shows too.
 # Browsers, and other clients, ask for a site's icon at /favicon.ico.
 FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
+WEBUI_DIR = Path(__file__).with_name("webui")
+# The single-page app `make webui` builds; without it "/" falls back to the
+# classic chat page.
+try:
+    WEBUI_INDEX = (WEBUI_DIR / "index.html").read_bytes()
+except OSError:
+    WEBUI_INDEX = None
+# The suffixes the bundle emits and the content type each is served as.
+WEBUI_ASSET_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".map": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".woff2": "font/woff2",
+    ".webmanifest": "application/manifest+json",
+}
 # The answer to a connection that gets no slot, or gives up its slot before
 # its request is read. With no request path, no API dialect is known: a
 # generic server error with its stable diagnostic code.
@@ -232,8 +244,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and self.route
-                in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
+                and (
+                    self.route
+                    in (
+                        "/",
+                        "/index.html",
+                        "/classic",
+                        "/favicon.ico",
+                        "/health",
+                        "/ready",
+                    )
+                    # The page's scripts and styles load without the key too.
+                    or self.route.startswith("/assets/")
+                )
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -260,7 +283,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     @property
     def app(self):
-        return self.server.app
+        # The Frontend a request's dispatch captured: an in-flight request
+        # keeps the model it was admitted under even after an unload swaps
+        # the host's app out.
+        captured = getattr(self, "_request_app", None)
+        return captured if captured is not None else self.server.app
+
+    def _require_app(self):
+        app = self.app
+        if app is None:
+            raise APIError(503, "no model is loaded", "model_not_loaded")
+        return app
 
     @property
     def route(self):
@@ -439,22 +472,38 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.route
-        if path in ("/", "/index.html", "/favicon.ico"):
+        if path in ("/", "/index.html", "/classic", "/favicon.ico"):
             if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
             elif path == "/favicon.ico":
                 self._send(200, FAVICON_SVG, "image/svg+xml")
-            else:
+            elif path == "/classic" or WEBUI_INDEX is None:
                 self._send(200, CHAT_HTML, "text/html; charset=utf-8")
+            else:
+                self._send(200, WEBUI_INDEX, "text/html; charset=utf-8")
+            return
+        if path.startswith("/assets/"):
+            self._webui_asset(path)
             return
         if path == "/health":
             self._json(200, {"status": "ok"})
             return
         if path == "/ready":
-            ready = self.app.backend.is_ready()
+            app = self.app
+            ready = app is not None and app.backend.is_ready()
+            host_state = (
+                self.server.host.state if self.server.host is not None else None
+            )
             self._json(
                 200 if ready else 503,
-                {"status": "ready" if ready else "unavailable"},
+                {
+                    "status": (
+                        "ready"
+                        if ready
+                        else host_state if host_state in ("loading", "unloaded")
+                        else "unavailable"
+                    )
+                },
                 retry_after=not ready,
             )
             return
@@ -468,32 +517,67 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "text/plain; version=0.0.4; charset=utf-8",
             )
             return
+        if path == "/v1/disk":
+            self._json(200, disk.stores(self.server.server_port))
+            return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:
-            stored = self.app.response_store.get(response_match.group(1))
+            app = self.app
+            if app is None:
+                self._safe_error(
+                    APIError(503, "no model is loaded", "model_not_loaded")
+                )
+                return
+            stored = app.response_store.get(response_match.group(1))
             if stored is None:
                 self._safe_error(APIError(404, "response not found", "not_found_error"))
             else:
                 self._json(200, stored.response)
             return
+        if path == "/v1/models/available":
+            # Installed selections the load endpoint can serve; imported late,
+            # like disk.py, so startup never touches the install package.
+            from install import launcher
+
+            try:
+                installed = launcher._installed_details()
+            except launcher.LauncherError as error:
+                self._safe_error(APIError(500, str(error)))
+                return
+            current = None if self.app is None else self.app.model
+            for entry in installed:
+                entry["serving"] = entry["model"] == current
+            self._json(
+                200,
+                {
+                    "object": "list",
+                    "data": installed,
+                    "suggested": launcher._suggested_models(),
+                },
+            )
+            return
+        if path == "/v1/models/install":
+            self._json(200, self._installer().status())
+            return
         if path == "/v1/models" or path.startswith("/v1/models/"):
-            models = [
+            app = self.app
+            models = [] if app is None else [
                 {
                     "id": name,
                     "object": "model",
                     "created": 0,
                     "owned_by": "richengine",
-                    "max_model_len": self.app.max_context,
-                    "context_length": self.app.max_context,
-                    "vision": self.app.vision,
-                    "input_modalities": self.app.input_modalities,
+                    "max_model_len": app.max_context,
+                    "context_length": app.max_context,
+                    "vision": app.vision,
+                    "input_modalities": app.input_modalities,
                     **(
-                        {"root": self.app.response_model}
-                        if name != self.app.response_model
+                        {"root": app.response_model}
+                        if name != app.response_model
                         else {}
                     ),
                 }
-                for name in self.app.model_names
+                for name in app.model_names
             ]
             if path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
@@ -518,6 +602,26 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         self._safe_error(APIError(404, "not found", "not_found"))
 
+    def _webui_asset(self, path):
+        """One file of the built web app. _normalize_path already collapsed
+        any traversal; the basename check is defense in depth."""
+        name = path.rsplit("/", 1)[-1]
+        content_type = WEBUI_ASSET_TYPES.get(Path(name).suffix)
+        data = None
+        if (
+            self.server.webui
+            and content_type is not None
+            and re.fullmatch(r"[A-Za-z0-9._-]+", name)
+        ):
+            try:
+                data = (WEBUI_DIR / "assets" / name).read_bytes()
+            except OSError:
+                pass
+        if data is None:
+            self._safe_error(APIError(404, "not found", "not_found"))
+            return
+        self._send(200, data, content_type)
+
     def do_DELETE(self):
         path = self.route
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
@@ -525,7 +629,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         response_id = response_match.group(1)
-        if not self.app.response_store.delete(response_id):
+        app = self.app
+        if app is None or not app.response_store.delete(response_id):
             self._safe_error(APIError(404, "response not found", "not_found_error"))
             return
         self._json(
@@ -540,6 +645,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._body_reservation = None
         submitted = False
         path = self.route
+        # A keep-alive connection reuses this handler; a captured app must
+        # not outlive the request that captured it.
+        self._request_app = None
         count_tokens = path == "/v1/messages/count_tokens"
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
@@ -555,10 +663,39 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/apply-template",
             "/v1/judgments",
             "/v1/systemone",
+            "/v1/disk/wipe",
+            "/v1/disk/dedupe",
+            "/v1/models/load",
+            "/v1/models/unload",
+            "/v1/models/install",
+            "/v1/models/install/cancel",
+            "/v1/tools/fetch",
+            "/v1/tools/search",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
-        refusal = None if prompt_only else self.app.backend.refusal()
+        if (
+            path.startswith("/v1/disk/")
+            or path.startswith("/v1/models/")
+            or path == "/v1/tools/fetch"
+            or path == "/v1/tools/search"
+        ):
+            # Control endpoints answer while the engine refuses, serves or is
+            # unloaded: they hold no generation slot and no refusal gate
+            # applies to them.
+            self._control(path, started_at)
+            return
+        # From here the request is a model request; a None app means unloaded.
+        app = self.app
+        if app is None:
+            self._safe_error(
+                APIError(503, "no model is loaded", "model_not_loaded"), anthropic
+            )
+            return
+        self._request_app = app
+        if not prompt_only and self.server.host is not None:
+            self.server.host.note_request()
+        refusal = None if prompt_only else app.backend.refusal()
         if refusal is not None:
             if systemone and refusal.status == 503:
                 refusal = APIError(529, refusal.message, refusal.code)
@@ -581,9 +718,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         try:
             with self.app.latencies.measure("upload"):
                 try:
-                    body = self._read_json_body(
-                        started_at + self.app.request_timeout
-                    )
+                    body = self._read_json_body(started_at + self.app.request_timeout)
                 except (ValueError, RecursionError):
                     # Text that is not JSON, or JSON nested deeper than the
                     # parser reads.
@@ -607,7 +742,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     ) from error
                 raise
             if path == "/tokenize":
-                self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
+                self._json(200, self.app.tokenize(body, deadline=deadline))
                 return
             if path == "/apply-template":
                 self._json(
@@ -625,8 +760,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/judgments":
                 job, row = self.app.prepare_judgment(
-                    body, deadline=deadline,
-                    disconnected=self._client_disconnected
+                    body, deadline=deadline, disconnected=self._client_disconnected
                 )
                 remaining_request_time(deadline)
                 if self._client_disconnected():
@@ -742,6 +876,191 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._body_reservation = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
+
+    def _control(self, path, started_at):
+        """A disk or model request, dispatched with its own error and
+        accounting path so it runs beside generation rather than inside its
+        gates — even while no model is loaded."""
+        try:
+            app = self.app
+            latencies = app.latencies if app is not None else self.server.latencies
+            if self.headers.get("Content-Length") is None:
+                body = {}
+            else:
+                with latencies.measure("upload"):
+                    try:
+                        body = self._read_json_body(
+                            started_at
+                            + (
+                                app.request_timeout
+                                if app is not None
+                                else HTTP_IO_TIMEOUT
+                            )
+                        )
+                    except (ValueError, RecursionError):
+                        # Text that is not JSON, or JSON nested deeper than the
+                        # parser reads.
+                        raise APIError(400, "invalid JSON request body") from None
+            if not isinstance(body, dict):
+                raise APIError(400, "request body must be an object")
+            if path == "/v1/tools/fetch":
+                # Imported late, like install.paths: the endpoint is a web UI
+                # tool, not part of every request's serving path.
+                from . import webfetch
+
+                self._json(200, webfetch.fetch(body.get("url")))
+                return
+            if path == "/v1/tools/search":
+                from . import websearch
+
+                self._json(
+                    200,
+                    websearch.search(
+                        body.get("query"),
+                        provider=body.get("provider", "bing"),
+                        api_key=body.get("api_key", ""),
+                        instance=body.get("instance", ""),
+                        count=body.get("count", 8),
+                    ),
+                )
+                return
+            if path == "/v1/models/load":
+                if self.server.host is None:
+                    raise APIError(
+                        503, "this server cannot load models", "unsupported"
+                    )
+                self._model_load(body)
+                return
+            if path == "/v1/models/unload":
+                if self.server.host is None:
+                    raise APIError(
+                        503, "this server cannot unload models", "unsupported"
+                    )
+                model = self.server.host.unload(force=body.get("force") is True)
+                self._json(200, {"status": "unloaded", "model": model})
+                return
+            if path == "/v1/disk/wipe":
+                store = body.get("store")
+                model = body.get("model")
+                if not isinstance(store, str):
+                    raise APIError(400, '"store" must be a string')
+                if model is not None and not isinstance(model, str):
+                    raise APIError(400, '"model" must be a string or null')
+                if body.get("confirm") is not True:
+                    raise APIError(
+                        400, "confirmation required", "confirmation_required"
+                    )
+                self._json(200, disk.wipe(store, model, self.server.server_port))
+                return
+            if path == "/v1/models/install":
+                model = body.get("model")
+                if not isinstance(model, str) or not model:
+                    raise APIError(400, '"model" must be a model ID string')
+                revision = body.get("revision")
+                draft_model = body.get("draft_model")
+                language_only = body.get("language_only", False)
+                if revision is not None and not isinstance(revision, str):
+                    raise APIError(400, '"revision" must be a string or null')
+                if draft_model is not None and not isinstance(draft_model, str):
+                    raise APIError(400, '"draft_model" must be a string or null')
+                if not isinstance(language_only, bool):
+                    raise APIError(400, '"language_only" must be a boolean')
+                self._json(
+                    200,
+                    self._installer().start(
+                        self._models_root(),
+                        model,
+                        revision=revision,
+                        draft_model=draft_model,
+                        language_only=language_only,
+                    ),
+                )
+                return
+            if path == "/v1/models/install/cancel":
+                cancelled = self._installer().cancel()
+                self._json(200, {"status": "cancelled" if cancelled else "idle"})
+                return
+            variants = body.get("variants", False)
+            apply = body.get("apply", False)
+            if not isinstance(variants, bool) or not isinstance(apply, bool):
+                raise APIError(400, '"variants" and "apply" must be booleans')
+            if apply and body.get("confirm") is not True:
+                raise APIError(400, "confirmation required", "confirmation_required")
+            self._json(200, disk.dedupe(variants, apply))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except TimeoutError:
+            self._safe_error(APIError(408, "HTTP I/O timed out", "request_timeout"))
+        except APIError as error:
+            self._safe_error(error)
+        except Exception as error:
+            log_unexpected(error)
+            self._safe_error(
+                APIError(500, "internal server error", "internal_server_error"),
+                log=False,
+            )
+        finally:
+            if self._body_reservation is not None:
+                self._body_reservation.release()
+                self._body_reservation = None
+            app = self.app
+            (
+                app.latencies if app is not None else self.server.latencies
+            ).observe("http_request", time.monotonic() - started_at)
+
+    def _installer(self):
+        """The server's one install job runner, created on first use."""
+        instance = getattr(self.server, "installer", None)
+        if instance is None:
+            instance = installer.Installer()
+            self.server.installer = instance
+        return instance
+
+    def _models_root(self):
+        """Where installs land and loads look: the host's --models-dir when
+        the server hosts models, else the install package's default root."""
+        host = getattr(self.server, "host", None)
+        if host is not None:
+            return host._models_root()
+        try:
+            from install import paths
+        except ImportError:
+            raise APIError(
+                503, "this server cannot install models", "unsupported"
+            ) from None
+        return paths.MODELS
+
+    def _model_load(self, body):
+        """POST /v1/models/load: swap the served model to an installed one."""
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            raise APIError(400, '"model" must be a model ID string')
+        revision = body.get("revision")
+        draft_model = body.get("draft_model")
+        language_only = body.get("language_only", False)
+        if revision is not None and not isinstance(revision, str):
+            raise APIError(400, '"revision" must be a string or null')
+        if draft_model is not None and not isinstance(draft_model, str):
+            raise APIError(400, '"draft_model" must be a string or null')
+        if not isinstance(language_only, bool):
+            raise APIError(400, '"language_only" must be a boolean')
+        app = self.server.host.load(
+            model,
+            force=body.get("force") is True,
+            revision=revision,
+            draft_model=draft_model,
+            language_only=language_only,
+        )
+        self._json(
+            200,
+            {
+                "status": "loaded",
+                "model": app.model,
+                "context_length": app.max_context,
+                "vision": app.vision,
+                "input_modalities": app.input_modalities,
+            },
+        )
 
     def _await_done(self, job):
         """The result of a score job, which emits only start and done."""
@@ -885,6 +1204,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             job.thinking,
             job.may_call_tools,
             None if dialect is None else dialect.call_open + dialect.name_prefix,
+            think_open=getattr(job, "think_open", "<think>"),
+            think_end=getattr(job, "think_end", "</think>"),
         )
         # Output with tools is parsed as it arrives whether it streams or not.
         projector = (
@@ -1764,8 +2085,9 @@ class RefusedOriginLog:
             # Visible ASCII, as parse_origin admits, but of any length.
             shown = origin[:256]
             print_status(
-                f"Refused · Origin {shown} · restart with --allowed-origin "
-                f"{shlex.quote(shown)} to accept it",
+                f"Refused · Origin {shown} · {dim('restart with')} "
+                f"{accent(f'--allowed-origin {shlex.quote(shown)}')} "
+                f"{dim('to accept it')}",
                 error=True,
             )
 
@@ -1827,15 +2149,42 @@ class FrontendServer(ThreadingHTTPServer):
         self.refused = LingeringCloser(
             self.refused_connection_capacity, REFUSED_LINGER_SECONDS
         )
+        # Latency accounting for control requests when no model is loaded;
+        # while one is, they land on the app's own metrics as before.
+        self.latencies = LatencyMetrics()
+        # A ModelHost owns the served stack once set; before that, the
+        # constructor's app stands in (the test harness passes one directly).
+        self.host = None
         super().__init__(address, FrontendHandler, bind_and_activate)
-        self.app = app
+        self._app = app
+
+    @property
+    def app(self):
+        host = self.host
+        return host.app if host is not None else self._app
 
     def status(self):
-        status = self.app.status()
+        app = self.app
+        status = (
+            app.status()
+            if app is not None
+            else {
+                "latency": self.latencies.snapshot(),
+            }
+        )
+        if self.host is not None:
+            status["model_state"] = self.host.state
+            if self.host.error:
+                status["model_error"] = self.host.error
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
-            "model": self.app.model,
+            "model": app.model if app is not None else None,
+            "assembly_dir": (
+                str(self.host.assembly_dir)
+                if self.host is not None and self.host.assembly_dir is not None
+                else None
+            ),
             "host": self.server_address[0],
             "port": self.server_address[1],
             "started_at": self.started_at,
@@ -1894,13 +2243,15 @@ def _parse_model_id(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "model_root",
+        "assembly_dir",
         metavar="MODEL_DIRECTORY",
-        help="installed model directory holding target/ and draft/",
+        nargs="?",
+        help="installed model directory holding target/ and draft/; omit to "
+        "start unloaded and load a model over the API",
     )
-    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--tokenizer")
     parser.add_argument(
-        "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
+        "--model", type=_parse_model_id, metavar="OWNER/REPO"
     )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "richengine"))
@@ -1909,40 +2260,15 @@ def parse_args(argv=None):
     serve_options.check_serve_arguments(parser, args)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
+    if args.model is None:
+        if args.assembly_dir is not None:
+            parser.error("MODEL_DIRECTORY requires --model")
+    else:
+        if args.assembly_dir is None:
+            parser.error("--model requires MODEL_DIRECTORY")
+        if args.tokenizer is None:
+            parser.error("--model requires --tokenizer")
     return args
-
-
-def _native_command(args):
-    command = [
-        args.binary,
-        "serve-native",
-        args.model_root,
-        "auto" if args.max_context is None else str(args.max_context),
-        "auto" if args.max_memory is None else str(args.max_memory),
-    ]
-    if args.max_cache_disk:
-        command.append(str(args.max_cache_disk))
-    if args.persistent_cache:
-        command.extend(
-            ("--cache-dir", str(args.cache_dir or serve_options.DEFAULT_CACHE_DIR))
-        )
-    if args.kv_format != "int4":
-        command.extend(("--kv-format", args.kv_format))
-    if args.idle_release is not None:
-        command.extend(
-            ("--idle-release", serve_options.idle_release_text(args.idle_release))
-        )
-    if args.disable_ane:
-        command.extend(("--ane", "off"))
-    if args.decode_share is not None:
-        command.extend(("--decode-share", str(args.decode_share)))
-    if args.max_image_pixels != image_input.MAX_PIXELS:
-        command.extend(
-            ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
-        )
-    if args.allow_idle_sleep:
-        command.extend(("--idle-sleep", "allow"))
-    return command
 
 
 def _interrupt(_signum, _frame):
@@ -1952,8 +2278,7 @@ def _interrupt(_signum, _frame):
 def main():
     args = parse_args()
     server = None
-    runtime = None
-    backend = None
+    host = None
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1980,94 +2305,37 @@ def main():
         server.server_bind()
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
             print_status(
-                "Warning · --allowed-origin '*' without --api-key lets every web "
-                "page open in a browser that reaches this server use it",
+                f"Warning · {accent('--allowed-origin')} '*' without "
+                f"{accent('--api-key')} lets every web page open in a "
+                "browser that reaches this server use it",
                 error=True,
             )
-        thinking_codec = ThinkingCodec(load_thinking_key())
-        print_status(f"Loading · {args.model}")
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, local_files_only=True, trust_remote_code=False
-        )
-        contract = validate_tokenizer(tokenizer, args.tokenizer)
-        chat_templates = ChatTemplates(tokenizer)
-        print_status(f"Chat template · {chat_templates.describe()}")
-        # Special tokens the output parser needs as text: the dialect's call
-        # markup, and the think-close token where it is a special token.
-        visible_token_ids = {contract.think_end_id}
-        for template in chat_templates.templates.values():
-            dialect = template.dialect
-            if dialect is None:
-                continue
-            for marker in dialect.structural:
-                ids = tokenizer.encode(marker, add_special_tokens=False)
-                if len(ids) == 1:
-                    visible_token_ids.add(ids[0])
-        visible_token_ids.discard(None)
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args),
-            startup_timeout=NATIVE_START_TIMEOUT,
-            pending_limit=args.queue_size,
-            eager_start=False,
-        )
-        backend = NativeBackend(
-            runtime,
-            tokenizer,
-            request_logger=print_request,
-            think_end_id=contract.think_end_id,
-            visible_token_ids=visible_token_ids,
-            tool_call_open_id=contract.tool_call_open_id,
-        )
-        if not runtime.wait_ready():
-            raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        readiness = runtime.readiness
-        if (
-            readiness is None
-            or not 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
-            or (
-                args.max_context is not None
-                and readiness.max_context_tokens != args.max_context
-            )
-        ):
-            raise engine_runtime.EngineUnhealthy(
-                "native runtime reported an invalid context window"
-            )
-        effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer, contract)
-        app = Frontend(
-            tokenizer,
-            backend,
-            args.model,
-            effective_context,
-            # No deadline unless given, as in vLLM and SGLang; a request still
-            # ends when its client disconnects.
-            math.inf if args.request_timeout is None else args.request_timeout,
-            readiness.max_concurrent_requests,
-            constraint_factory=constraint_factory,
-            chat_templates=chat_templates,
-            max_image_pixels=args.max_image_pixels,
-            thinking_codec=thinking_codec,
-            served_model_names=args.served_model_name,
-            announce_served_name=args.announce_served_name,
-            default_reasoning_effort=args.default_reasoning_effort,
-            vision=readiness.vision,
-            contract=contract,
-            shared_prefix_states=args.shared_prefix_state,
-        )
-        server.app = app
+        host = ModelHost(args)
+        server.host = host
+        host.load_initial()
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
-        )
-        mode = "" if readiness.vision else " · language only"
-        print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
+        app = host.app
+        if app is None:
+            print_status(
+                f"Ready · {accent(address)} · "
+                + dim("no model — load one over /v1/models/load")
+            )
+        else:
+            context = (
+                f"{app.max_context // 1024}K"
+                if app.max_context % 1024 == 0
+                else f"{app.max_context:,}"
+            )
+            mode = "" if app.vision else " · language only"
+            print_status(
+                f"Ready · {accent(args.model)} · {dim(f'context {context}{mode}')}"
+                f" · {accent(address)}"
+            )
         if sys.stdout.isatty():
             print_status(
-                f"Next · open {address} or connect an agent: "
-                "richengine opencode / claude / codex / hermes / pi"
+                f"Next · {dim(f'open {address} or connect an agent:')} "
+                + accent("richengine opencode / claude / codex / hermes / pi")
             )
         server.serve_forever()
     except (
@@ -2090,12 +2358,15 @@ def main():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(
             signal.SIGINT,
-            signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
+            signal.SIG_IGN
+            if host is None or host.runtime is None
+            else lambda *_: host.runtime.kill(),
         )
         try:
-            if backend is not None:
-                print_status("Stopping · releasing engine resources")
-                backend.close()
+            if host is not None:
+                if host.backend is not None:
+                    print_status(f"Stopping · {dim('releasing engine resources')}")
+                host.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:

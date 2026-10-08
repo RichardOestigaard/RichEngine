@@ -404,4 +404,9 @@ private:
   friend class BackendInstrumentation;
 };
 
+// RICHENGINE_OP_TIMINGS=1 instruments the encode loop with timestamp
+// sampling around every dispatch; dumpOpTimings() prints the accumulated
+// per-pipeline GPU table to stderr.
+void dumpOpTimings();
+
 } // namespace richengine::metal

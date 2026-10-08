@@ -1,0 +1,182 @@
+/* Chat page — chat.html's <style> scoped under .chat-shell.
+   Element resets, :root vars, and body font rules live in styles.css.
+   Everything sits below the global topbar (--topbar, 52px). */
+
+.chat-shell aside { position: fixed; top: var(--topbar); bottom: 0; left: 0; z-index: 20; overflow-y: auto; width: var(--sidebar); height: calc(100% - var(--topbar)); padding: 14px 10px; background: var(--side); border-right: 1px solid var(--border) }
+.chat-shell #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 12px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-weight: 500; text-align: left }
+.chat-shell #new-chat:hover { background: var(--hover) }
+.chat-shell #new-chat svg { width: 17px; height: 17px }
+.chat-shell #export-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 8px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 13px; text-align: left }
+.chat-shell #export-chat:hover { background: var(--hover); color: var(--text) }
+.chat-shell #export-chat svg { width: 15px; height: 15px }
+.chat-shell .recent-search { width: 100%; margin-top: 14px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 13px }
+.chat-shell .recent-empty { padding: 8px 10px; font-size: 13px }
+.chat-shell .sys-prompt { margin: 18px 4px 0; padding-top: 12px; border-top: 1px solid var(--border) }
+.chat-shell .sys-prompt summary { margin-left: -6px; padding: 2px 6px; border-radius: 6px; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
+.chat-shell .sys-prompt textarea { width: 100%; margin-top: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 12.5px; line-height: 1.4; resize: vertical }
+.chat-shell .sys-hint { margin-top: 6px; font-size: 11.5px }
+.chat-shell .recent-label { margin: 26px 10px 6px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
+.chat-shell .recent-label.group { margin: 16px 10px 4px }
+.chat-shell #recents > .recent-label.group:first-child { margin-top: 26px }
+.chat-shell #recents { display: grid; gap: 1px }
+.chat-shell .recent { display: flex; align-items: center; border-radius: 8px }
+.chat-shell .recent:hover { background: var(--hover) }
+.chat-shell .recent.active { background: var(--hover) }
+.chat-shell .recent.active .recent-title { font-weight: 550 }
+.chat-shell .recent-title { overflow: hidden; flex: 1; min-width: 0; padding: 8px 4px 8px 10px; font-size: 14px; text-align: left; text-overflow: ellipsis; white-space: nowrap }
+.chat-shell .recent-edit { flex: 1; min-width: 0; margin: 0 4px 0 10px; padding: 5px 0; border: 0; border-bottom: 1px solid var(--accent); outline: 0; background: transparent; font-size: 14px }
+.chat-shell .recent-ago { flex: none; align-self: center; margin-right: 2px; font-size: 11px; font-variant-numeric: tabular-nums }
+.chat-shell .recent:hover .recent-ago, .chat-shell .recent:focus-within .recent-ago { display: none }
+.chat-shell .recent-act { display: none; width: 24px; height: 24px; flex: none; place-items: center; margin-right: 2px; border-radius: 6px; color: var(--muted); font-size: 13px }
+.chat-shell .recent:hover .recent-act, .chat-shell .recent:focus-within .recent-act { display: grid }
+.chat-shell .recent-act:hover { color: var(--text); background: var(--bg) }
+
+.chat-shell main { min-height: 100vh; margin-left: var(--sidebar); padding-top: var(--topbar) }
+.chat-shell #chat { width: min(720px, 100%); margin: auto; padding: 48px 24px 160px }
+.chat-shell #empty { position: fixed; top: calc(50% - 118px + var(--topbar) / 2); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 24px; font-weight: 600; letter-spacing: -.03em; text-align: center }
+.chat-shell .empty-hints { display: flex; flex-wrap: wrap; gap: 4px 16px; justify-content: center; margin-top: 14px; color: var(--muted); font-size: 12.5px; font-weight: 400; letter-spacing: normal; white-space: nowrap }
+.chat-shell .message { margin: 32px 0; white-space: pre-wrap; overflow-wrap: anywhere }
+.chat-shell .user { position: relative; width: fit-content; max-width: 78%; margin-left: auto; padding: 9px 15px; border-radius: 18px 18px 4px 18px; background: var(--bubble) }
+.chat-shell .user .actions { position: absolute; top: calc(100% + 2px); right: 0; margin-top: 0 }
+.chat-shell .user-images { display: flex; flex-wrap: wrap; gap: 8px }
+.chat-shell .user-text + .user-images, .chat-shell .user-text + .user-files, .chat-shell .user-images + .user-files { margin-top: 9px }
+.chat-shell .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 10px; object-fit: cover; cursor: zoom-in }
+.chat-shell .user-files { display: flex; flex-wrap: wrap; gap: 6px }
+.chat-shell .file-chip { padding: 3px 10px; border-radius: 8px; background: color-mix(in srgb, var(--text) 8%, transparent); font-size: 12.5px; white-space: nowrap }
+.chat-shell .tool-runs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px }
+.chat-shell .tool-runs[hidden] { display: none }
+.chat-shell .tool-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: none; color: var(--muted); font: inherit; font-size: 11.5px; white-space: nowrap; cursor: pointer }
+.chat-shell .tool-chip.open { color: var(--text); border-color: var(--text) }
+.chat-shell .tool-chip.running { color: var(--text) }
+.chat-shell .tool-chip.running::before { content: ""; width: 8px; height: 8px; flex: none; border: 1.5px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
+.chat-shell .tool-chip.error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)) }
+.chat-shell .tool-out { flex-basis: 100%; max-height: 220px; margin: 2px 0 4px; padding: 8px 12px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--side); color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere }
+.chat-shell .tool-out[hidden] { display: none }
+.chat-shell .assistant { padding: 0 2px }
+.chat-shell .waiting { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
+@keyframes spin { to { transform: rotate(360deg) } }
+.chat-shell details { margin-bottom: 14px; color: var(--muted); font-size: 13.5px }
+.chat-shell summary { width: fit-content; margin-left: -8px; padding: 2px 8px; border-radius: 7px; cursor: pointer; user-select: none; font-weight: 500 }
+.chat-shell summary:hover { background: var(--hover) }
+.chat-shell .reasoning { margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--border) }
+.chat-shell .stats { margin-top: 14px; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; letter-spacing: .02em; line-height: 1 }
+.chat-shell .error { color: var(--danger) }
+.chat-shell .actions { display: flex; gap: 4px; margin-top: 8px; opacity: 0; transition: opacity .12s ease }
+.chat-shell .message:hover .actions, .chat-shell .actions:focus-within { opacity: 1 }
+.chat-shell .actions[hidden] { display: none }
+.chat-shell .act { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; color: var(--muted) }
+.chat-shell .act:hover { color: var(--text); background: var(--hover) }
+.chat-shell .codeblock { margin: 0 0 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--bubble) }
+.chat-shell .codeblock > pre { margin: 0; border: 0; border-radius: 0; background: none }
+.chat-shell .code-head { display: flex; align-items: center; justify-content: space-between; min-height: 30px; padding: 3px 6px 3px 14px; color: var(--muted); font-size: 11.5px; border-bottom: 1px solid var(--border) }
+.chat-shell .copy { padding: 3px 8px; border-radius: 6px; color: var(--muted); font-size: 11.5px }
+.chat-shell .copy:hover { color: var(--text); background: var(--hover) }
+.chat-shell #to-bottom { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: 96px; z-index: 9; transform: translateX(-50%); padding: 6px 14px; border: 1px solid var(--border); border-radius: 999px; background: var(--composer); box-shadow: var(--shadow); color: var(--muted); font-size: 12.5px }
+.chat-shell #to-bottom:hover { color: var(--text) }
+.chat-shell #to-bottom[hidden] { display: none }
+.chat-shell .down-banner { margin: 16px 0; padding: 12px 16px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border)); border-radius: 10px; background: var(--composer); color: var(--danger); font-size: 13.5px }
+.chat-shell .down-banner code { padding: 2px 5px; border-radius: 5px; background: var(--bubble); color: var(--text); font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace }
+.chat-shell .down-retry { color: var(--accent); text-decoration: underline }
+.chat-shell .drop-overlay { position: fixed; inset: calc(var(--topbar) + 8px) 8px 8px; z-index: 40; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 16px; background: color-mix(in srgb, var(--bg) 82%, transparent); color: var(--accent); font-size: 15px; font-weight: 600; pointer-events: none }
+.chat-shell .lightbox { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; background: #000a; cursor: zoom-out }
+.chat-shell .lightbox img { max-width: 92vw; max-height: 90vh; border-radius: 12px; box-shadow: 0 8px 48px #000c }
+
+.chat-shell form { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: max(20px, env(safe-area-inset-bottom)); z-index: 10; display: flex; flex-direction: column; gap: 2px; width: min(720px, calc(100vw - var(--sidebar) - 32px)); transform: translateX(-50%); padding: 10px 10px 8px; border: 1px solid var(--border); border-radius: 24px; background: var(--composer); box-shadow: var(--shadow); transition: border-color .15s ease, box-shadow .15s ease }
+.chat-shell form:focus-within { border-color: color-mix(in srgb, var(--text) 30%, var(--border)); box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent) }
+.chat-shell.empty form { top: 50%; bottom: auto }
+.chat-shell .composer { min-width: 0 }
+.chat-shell #attachments { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px }
+.chat-shell #attachments:empty { display: none }
+.chat-shell .attachment { position: relative; width: 58px; height: 58px; flex: none }
+.chat-shell .attachment img, .chat-shell .attachment-status, .chat-shell .attachment-pdf { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 10px; object-fit: cover }
+.chat-shell .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
+.chat-shell .attachment.pdf { width: auto; min-width: 120px; max-width: 220px }
+.chat-shell .attachment-pdf { display: flex; align-items: center; gap: 8px; padding: 8px; background: var(--bubble); color: var(--muted); font-size: 11.5px; object-fit: unset }
+.chat-shell .attachment-pdf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.chat-shell .remove-image { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
+.chat-shell textarea { display: block; width: 100%; max-height: 180px; padding: 4px 8px; resize: none; border: 0; outline: 0; background: transparent; field-sizing: content }
+.chat-shell textarea::placeholder { color: var(--muted) }
+.chat-shell .toolbar { display: flex; align-items: center; gap: 4px }
+.chat-shell .toolbar .spacer { flex: 1 }
+.chat-shell .token-meter { align-self: center; margin-right: 4px; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap }
+.chat-shell .token-meter.warn { color: var(--warn) }
+.chat-shell .token-meter.danger { color: var(--danger) }
+.chat-shell .stop-hint { align-self: center; margin-right: 4px; font-size: 11.5px; white-space: nowrap }
+.chat-shell #attach[hidden] { display: none }
+.chat-shell #attach { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
+.chat-shell #attach:hover { color: var(--text); background: var(--hover) }
+.chat-shell .tools-menu { position: relative }
+.chat-shell #tools { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
+.chat-shell #tools:hover { color: var(--text); background: var(--hover) }
+.chat-shell #tools.on { color: var(--accent) }
+.chat-shell .tools-pop { position: absolute; bottom: calc(100% + 10px); left: 0; z-index: 30; width: 250px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow) }
+.chat-shell .tools-pop-title { padding: 6px 8px 4px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
+.chat-shell .tools-row { display: flex; align-items: flex-start; gap: 9px; padding: 8px; border-radius: 8px; cursor: pointer }
+.chat-shell .tools-row:hover { background: var(--hover) }
+.chat-shell .tools-row input { margin-top: 2px; accent-color: var(--accent) }
+.chat-shell .tools-row-text { display: grid; min-width: 0 }
+.chat-shell .tools-row-label { font-size: 13px }
+.chat-shell .tools-row-hint { color: var(--muted); font-size: 11.5px }
+.chat-shell .effort[hidden] { display: none }
+.chat-shell .effort { position: relative; display: flex; align-items: center; gap: 5px; height: 32px; padding: 0 24px 0 12px; border-radius: 999px; color: var(--muted); font-size: 13px; line-height: 1 }
+.chat-shell .effort:hover, .chat-shell .effort:focus-within { color: var(--text); background: var(--hover) }
+.chat-shell .effort::after { position: absolute; top: 50%; right: 10px; transform: translateY(-50%); content: '\2304'; font-size: 11px; pointer-events: none }
+.chat-shell .effort > span { flex: none }
+.chat-shell select { display: block; min-width: 0; max-width: 140px; overflow: hidden; padding: 0; border: 0; outline: 0; background: transparent; text-overflow: ellipsis; white-space: nowrap; cursor: pointer }
+.chat-shell #send { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border-radius: 50%; color: var(--composer); background: var(--text); font-size: 15px; transition: transform .12s ease }
+.chat-shell #send:not(:disabled):hover { transform: scale(1.06) }
+.chat-shell #send:disabled { color: var(--muted); background: var(--hover) }
+
+.chat-shell .md-done > :first-child, .chat-shell .md-tail > :first-child { margin-top: 0 }
+.chat-shell .md-done > :last-child, .chat-shell .md-tail > :last-child { margin-bottom: 0 }
+.chat-shell .message.live .code-head .copy { visibility: hidden }
+.chat-shell .visually-hidden { position: absolute; width: 1px; height: 1px; clip-path: inset(50%); overflow: hidden; white-space: nowrap }
+.chat-shell .content p { margin: 0 0 12px }
+.chat-shell .content h3, .chat-shell .content h4, .chat-shell .content h5, .chat-shell .content h6 { margin: 18px 0 8px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3 }
+.chat-shell .content h3 { font-size: 19px }
+.chat-shell .content h4 { font-size: 16px }
+.chat-shell .content h5, .chat-shell .content h6 { font-size: 14px }
+.chat-shell .content ul, .chat-shell .content ol { margin: 0 0 12px; padding-left: 22px }
+.chat-shell .content li { margin: 3px 0 }
+.chat-shell .content blockquote { margin: 0 0 12px; padding-left: 12px; color: var(--muted); border-left: 2px solid var(--border) }
+.chat-shell .content del { color: var(--muted) }
+.chat-shell .tablewrap { margin: 0 0 12px; overflow-x: auto; border: 1px solid var(--border); border-radius: 10px }
+.chat-shell .content table { width: 100%; border-collapse: collapse; font-size: 13.5px }
+.chat-shell .content th { padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bubble); text-align: left; font-weight: 600 }
+.chat-shell .content td { padding: 7px 12px; border-top: 1px solid var(--border) }
+.chat-shell .content tbody tr:first-child td { border-top: 0 }
+.chat-shell .content li.task { margin-left: -20px; list-style: none }
+.chat-shell .content li.task input { margin-right: 2px; accent-color: var(--accent); vertical-align: -1px }
+.chat-shell .content a { color: var(--accent); text-decoration: none }
+.chat-shell .content a:hover { text-decoration: underline }
+.chat-shell .content code { padding: 2px 5px; border-radius: 6px; background: var(--bubble); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace }
+.chat-shell .content pre { margin: 0 0 12px; overflow-x: auto; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bubble) }
+.chat-shell .content pre code { padding: 0; border-radius: 0; background: none; white-space: pre }
+
+/* Sidebar drawer scrim and the menu button that opens it (replaces the old
+   in-header #menu; floats just under the topbar on narrow screens). */
+.chat-shell .scrim { display: none }
+.chat-shell .menu-btn { position: fixed; top: calc(var(--topbar) + 8px); left: 10px; z-index: 31; display: none; width: 34px; height: 34px; place-items: center; border: 1px solid var(--border); border-radius: 9px; background: var(--composer); box-shadow: var(--shadow) }
+.chat-shell .menu-btn:hover { background: var(--hover) }
+
+@media (max-width: 720px) {
+  .chat-shell { --sidebar: 0px }
+  .chat-shell aside { width: 260px; transform: translateX(-100%); transition: transform .18s ease }
+  .chat-shell.menu-open aside { transform: none }
+  .chat-shell .scrim { position: fixed; inset: 0; z-index: 15; background: #0005 }
+  .chat-shell.menu-open .scrim { display: block }
+  .chat-shell .menu-btn { display: grid }
+  .chat-shell #chat { padding: 14px 16px 140px }
+  .chat-shell #empty { top: calc(50% - 118px); left: 50%; font-size: 23px }
+  .chat-shell form { left: 50%; bottom: max(8px, env(safe-area-inset-bottom)); width: calc(100% - 16px) }
+  .chat-shell textarea { max-height: 140px }
+}
+@media (max-width: 430px) {
+  .chat-shell .effort { padding-left: 5px }
+  .chat-shell .effort > span { display: none }
+  .chat-shell .user { max-width: 88% }
+}
+@media (min-width: 1400px) {
+  .chat-shell #chat { width: min(860px, 100%) }
+  .chat-shell form { width: min(860px, calc(100vw - var(--sidebar) - 48px)) }
+}

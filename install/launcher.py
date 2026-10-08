@@ -299,14 +299,13 @@ def _serve_lock_owner(lock):
     if (
         type(pid) is not int
         or pid <= 0
-        or not isinstance(model, str)
-        or not model
-        or not model.isprintable()
+        # A server can run with no model loaded; the field is then null.
+        or not (model is None or (isinstance(model, str) and model.isprintable()))
         or type(port) is not int
         or not 1 <= port <= 65535
     ):
         return ""
-    return f" (PID {pid}, model {model}, port {port})"
+    return f" (PID {pid}, model {model or 'none'}, port {port})"
 
 
 def _check_port(host, port):
@@ -333,6 +332,13 @@ def _check_port(host, port):
 
 
 def serve(args):
+    if args.model is None and (
+        args.dry_run
+        or args.revision is not None
+        or args.language_only
+        or args.draft_model is not None
+    ):
+        raise LauncherError("a serve without a model takes no model options")
     if args.dry_run:
         # The plan alone: resolve the selection and report what is installed,
         # without locks, downloads, builds or an engine check.
@@ -346,13 +352,18 @@ def serve(args):
         kind = model_artifacts.installation_kind(selection.link)
         fields = [
             ("model", selection.model),
-            ("revision", selection.revision or "repository default"),
-            ("draft", selection.draft_model or "auto (family's draft)"),
-            ("vision", "skipped" if selection.language_only else "prepared"),
-            ("variant", selection.variant or "none (MLX or single GGUF)"),
+            ("revision", selection.revision or _styled("repository default", "2")),
+            ("draft", selection.draft_model or _styled("auto (family's draft)", "2")),
+            (
+                "vision",
+                _styled("skipped", "2") if selection.language_only else "prepared",
+            ),
+            ("variant", selection.variant or _styled("none (MLX or single GGUF)", "2")),
             (
                 "installed",
-                f"{kind} at {selection.link}" if kind else "no — serve would download it",
+                f"{_styled(kind, '32')} at {_styled(str(selection.link), '2')}"
+                if kind
+                else _styled("no — serve would download it", "33"),
             ),
         ]
         for label, value in fields:
@@ -388,7 +399,9 @@ def serve(args):
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
+        json.dump(
+            {"pid": os.getpid(), "model": args.model, "port": args.port}, lock
+        )
         lock.flush()
         # Fail before downloads/builds if another service owns the selected port.
         # The HTTP server also binds before loading weights, closing the race.
@@ -399,20 +412,22 @@ def serve(args):
                 f"cannot bind {args.host}:{args.port}: {error}",
                 hint="choose a different port with --port",
             ) from None
-        selection = model_artifacts.Selection.of(
-            paths.MODELS,
-            args.model,
-            revision=args.revision,
-            language_only=args.language_only,
-            draft_model=args.draft_model,
-        )
-        _ensure_installed(selection)
-        # A concurrent install may advance the selection link. Keep this
-        # process's tokenizer, draft and target on one immutable assembly,
-        # held until the server exits.
-        root, record = assembly.hold(selection.link, selection.models_root)
-        if record is not None:
-            os.set_inheritable(record.fileno(), True)
+        record = None
+        if args.model is not None:
+            selection = model_artifacts.Selection.of(
+                paths.MODELS,
+                args.model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
+            )
+            _ensure_installed(selection)
+            # A concurrent install may advance the selection link. Keep this
+            # process's tokenizer, draft and target on one immutable
+            # assembly, held until the server exits.
+            root, record = assembly.hold(selection.link, selection.models_root)
+            if record is not None:
+                os.set_inheritable(record.fileno(), True)
         # The server package of this installation, from any working
         # directory: -P keeps the directory, which may hold a package of the
         # same name, off sys.path, and PYTHONPATH names the root.
@@ -422,11 +437,19 @@ def serve(args):
             "-P",
             "-m",
             "server.server",
-            str(root),
-            "--tokenizer",
-            str(root / "tokenizer"),
-            "--model",
-            args.model,
+            *(
+                [
+                    str(root),
+                    "--tokenizer",
+                    str(root / "tokenizer"),
+                    "--model",
+                    args.model,
+                ]
+                if args.model is not None
+                else []
+            ),
+            "--models-dir",
+            str(paths.MODELS),
             "--binary",
             str(paths.BINARY),
             "--port",
@@ -636,9 +659,7 @@ def _serve_owner(port):
     if (
         type(pid) is not int
         or pid <= 0
-        or not isinstance(model, str)
-        or not model
-        or not model.isprintable()
+        or not (model is None or (isinstance(model, str) and model.isprintable()))
         or owner.get("port") != port
     ):
         return None
@@ -824,18 +845,27 @@ def doctor(args):
     return 1 if failed else 0
 
 
+# The splash store keys are user-facing — MODEL_STORES keys are what
+# `disk wipe` accepts — and predate the RichEngine rename; the values must
+# not change.
+STORE_SPLASH = "splash"
+STORE_SPLASH_CACHE = "splash-cache"
+# Both splash keys together: the "is serving" lock and disk.py's version of
+# it guard them as one.
+SPLASH_STORES = (STORE_SPLASH, STORE_SPLASH_CACHE)
+
 # The directories other local model tools keep their weights in; each name is
 # what `disk` lists and `disk wipe` accepts. Every store lists candidates —
 # tools have moved these between versions.
 # Each store: display name, candidate directories, and how deep its model
 # entries nest (2 for author/repo layouts like LM Studio's and our own).
 MODEL_STORES = {
-    "splash": (
+    STORE_SPLASH: (
         "Splash/RichEngine",
         lambda: [paths.MODELS],
         2,
     ),
-    "splash-cache": (
+    STORE_SPLASH_CACHE: (
         "RichEngine caches",
         lambda: [
             # Compiled weights and the KV prefix cache; both rebuild on demand.
@@ -1062,9 +1092,9 @@ def disk(args):
 
 # Stores a model may be served or linked from: dedupe never removes from
 # them, so splash assemblies (symlink trees into the Hub cache) stay valid.
-DEDUPE_KEEPS = ("splash", "huggingface")
+DEDUPE_KEEPS = (STORE_SPLASH, "huggingface")
 # Stores whose entries are not model trees at all.
-DEDUPE_SKIPS = ("splash-cache",)
+DEDUPE_SKIPS = (STORE_SPLASH_CACHE,)
 # Wipe order when a model is absent from the keeps: earlier wins.
 DEDUPE_PRIORITY = (
     "lm-studio",
@@ -1091,7 +1121,7 @@ def _dedupe_key(store, name, variants=False):
     """The normalized owner/repo an entry stands for. Splash links may carry
     a :VARIANT; bare LM Studio dirs have no owner and match weakly. With
     variants, format suffixes strip to the base model name."""
-    if store == "splash":
+    if store == STORE_SPLASH:
         name = name.split(":", 1)[0]
     owner, _, repo = name.rpartition("/")
     if variants:
@@ -1325,7 +1355,7 @@ def _disk_wipe(args):
             print(f"{row['title']}: nothing to wipe.")
         return 0
     owner = _serve_owner(args.port)
-    if name.startswith("splash") and owner is not None and _pid_running(owner["pid"]):
+    if name in SPLASH_STORES and owner is not None and _pid_running(owner["pid"]):
         raise LauncherError(
             "RichEngine is serving from the splash stores",
             hint="stop the server (Ctrl+C) before wiping it",
@@ -1375,7 +1405,7 @@ def _disk_wipe_model(args, row):
     for path in targets:
         bytes_ += _dir_bytes(path)
         # A splash link's assembly must resolve before the link goes away.
-        assembly = _splash_assembly(path) if args.store == "splash" else None
+        assembly = _splash_assembly(path) if args.store == STORE_SPLASH else None
         try:
             if path.is_symlink() or path.is_file():
                 path.unlink()
@@ -1499,9 +1529,9 @@ def _build_parser():
     server.add_argument(
         "--model",
         type=model_artifacts.parse_model_id,
-        required=True,
         metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M); "
+        "omit to start unloaded and load one later over the API",
     )
     server.add_argument(
         "--revision",

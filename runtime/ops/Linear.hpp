@@ -2,6 +2,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/DevicePolicy.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Sampling.h"
 #include "ops/Weights.hpp"
@@ -82,7 +83,7 @@ inline constexpr uint32_t kMaximumDecodeTileRows = RICHENGINE_MAXIMUM_BATCH_WIDT
 // register tiles build from grid lookups beside their matrix operations
 // (LinearGguf.cpp, MoE.hpp).
 [[nodiscard]] bool apple9StagesFormat(uint32_t format) noexcept;
-enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
+enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8, Sixteen = 16 };
 
 struct LinearWorkload final {
   LinearMatrix matrix;
@@ -90,6 +91,10 @@ struct LinearWorkload final {
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
   WeightLayout weightLayout = WeightLayout::Affine64;
+  // A DiffusionGemma canvas step's projection: prefill-shaped, but on the
+  // canvas plan family so canvas-only tiles never alter a normal chunk's
+  // plan. Part of the plan key (operator<=>).
+  bool canvas = false;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -273,20 +278,13 @@ struct LinearBuffers final {
   PreparedInput prepared{};
 };
 
-// Missing core metadata uses one intermediate estimate for all families.
-// This is a fallback, not a calibrated optimum. Reported counts always win.
-inline constexpr uint32_t kAssumedGpuCores = 32;
-// The GPU core count kernel policy plans for: the reported one, or
-// kAssumedGpuCores when the device does not report it.
-[[nodiscard]] constexpr uint32_t plannedGpuCores(const DeviceCapabilities &device) noexcept {
-  return device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores;
-}
-
 // Owns projection pipeline selection and dispatch for both weight layouts.
-// Device policy uses GPU family, core count and workload tile counts.
+// Device policy comes from one DevicePolicy (ops/DevicePolicy.hpp); the
+// measured choices it scopes live in ops/DeviceTuning.cpp.
 class Linear final {
 public:
   explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DevicePolicy &policy) noexcept;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` in the projection's weight layout, into its destination type; a gate/up plan also runs
@@ -298,8 +296,10 @@ public:
   [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
   // The plans of this projection's matrix in its layout. A decode plan's
   // input() is the layout its producer writes.
+  // `canvas` marks a DiffusionGemma trunk pass's projection.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue) const;
+                                       LinearEpilogue epilogue,
+                                       bool canvas = false) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
@@ -332,21 +332,26 @@ public:
   // describes the scratch as a producer left it (the rotated rows of a
   // rotated projection just run on `input`), and each returns what it
   // describes after its dispatch.
+  // `canvas` marks a DiffusionGemma trunk pass's projection.
   PreparedInput addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                            metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                           LinearScratch scratch = {}, PreparedInput prepared = {}) const;
+                           LinearScratch scratch = {}, PreparedInput prepared = {},
+                           bool canvas = false) const;
   PreparedInput addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                                      metal::MetalBuffer gateScratch, metal::MetalBuffer output,
                                      metal::MetalBuffer sums, metal::MetalBuffer downSums, uint32_t rows,
-                                     LinearScratch scratch, PreparedInput prepared = {}) const;
+                                     LinearScratch scratch, PreparedInput prepared = {},
+                                     bool canvas = false) const;
   PreparedInput addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input,
                                    const Projection &projection, metal::MetalBuffer residual,
                                    metal::MetalBuffer output, metal::MetalBuffer sums,
-                                   uint32_t rows, LinearScratch scratch, PreparedInput prepared = {}) const;
+                                   uint32_t rows, LinearScratch scratch, PreparedInput prepared = {},
+                                   bool canvas = false) const;
   // output = residual + down(silu(gate x) * up x) of `rows` normalized rows,
   // whose Q4 sums the norm wrote.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
-                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) const;
+                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+                        bool canvas = false) const;
 
   // The fused greedy head of a block projection (gguf_decode_*_m*_amax in
   // shared/gguf_linear.metal): the vocabulary projection's staged decode,
@@ -383,8 +388,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
-  uint32_t appleGpuFamily_ = 0;
-  uint32_t gpuCores_ = 0;
+  DevicePolicy policy_{};
 };
 
 } // namespace richengine::ops

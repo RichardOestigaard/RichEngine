@@ -1,5 +1,5 @@
 #include "model/Lfm2.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -14,9 +14,9 @@ constexpr uint64_t kBfloat16 = kBFloat16Bytes;
 // LFM2's attention mixer: a fused QKV projection (query rows alone), the
 // per-head q/k RMS norms of head dimension 64, and the output projection.
 template <class Format>
-QwenMixerWeights readLfmAttention(WeightFile &file, const Format &format,
+MixerWeights readLfmAttention(WeightFile &file, const Format &format,
                                   const QwenMixerGeometry &geometry) {
-  QwenAttentionWeights attention;
+  AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
                    "attention-input", {"attn-q", "attn-k", "attn-v"});
@@ -31,7 +31,7 @@ QwenMixerWeights readLfmAttention(WeightFile &file, const Format &format,
 // out_proj. Every source stores the kernel channel-major ([dim, taps]): the
 // GGUF's squeezed [dim, 1, taps] HF tensor, packed and MLX images alike.
 template <class Format>
-QwenMixerWeights readLfmConv(WeightFile &file, const Format &format,
+MixerWeights readLfmConv(WeightFile &file, const Format &format,
                              const QwenMixerGeometry &geometry) {
   LfmConvWeights conv;
   conv.inputProjection = format.projection(file, geometry.packedGdnWidth,
@@ -87,7 +87,7 @@ ops::NormWeights e5(ops::NormWeights weights) {
 
 // The LFM2 mixers' reader (found by readTargetMixer's ADL).
 template <class Format>
-QwenMixerWeights readTargetMixer(const Lfm2Layout &, WeightFile &file,
+MixerWeights readTargetMixer(const Lfm2Layout &, WeightFile &file,
                                  const Format &format,
                                  const QwenMixerGeometry &geometry,
                                  bool fullAttention) {
@@ -96,9 +96,9 @@ QwenMixerWeights readTargetMixer(const Lfm2Layout &, WeightFile &file,
 }
 
 Lfm2Weights loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
-                            const QwenTargetFiles<Lfm2Layout> &files) {
+                            const TargetFiles<Lfm2Layout> &files) {
   requireLfm2Layout(layout);
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -107,13 +107,13 @@ Lfm2Weights loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
   const auto load = [&](auto &&source, const auto &format) {
-    Lfm2Weights weights = readQwenTargetWeights<Lfm2Weights>(
+    Lfm2Weights weights = readTargetModelWeights<Lfm2Weights>(
         backend, layout, std::forward<decltype(source)>(source), format, readFfn);
     // The norm_eps 1e-5 of every layer, head and final norm.
     for (auto &layer : weights.layers) {
       layer.inputNorm = e5(layer.inputNorm);
       layer.postAttentionNorm = e5(layer.postAttentionNorm);
-      if (auto *attention = std::get_if<QwenAttentionWeights>(&layer.mixer)) {
+      if (auto *attention = std::get_if<AttentionMixerWeights>(&layer.mixer)) {
         attention->queryNorm = e5(attention->queryNorm);
         attention->keyNorm = e5(attention->keyNorm);
       }
@@ -123,10 +123,10 @@ Lfm2Weights loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
   };
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return load(gguf->get(), BlockTargetFormat{});
-  const AffineTargetFormat affine{};
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return load(mlx->get(), affine);
-  return load(std::get<PackedTargetFiles<Lfm2Layout>>(files), affine);
+    return load(mlx->get(), AffineTargetFormat{});
+  const auto &packed = std::get<PackedTargetFiles<Lfm2Layout>>(files);
+  return load(packed, AffineTargetFormat{packed.tiledEmbedding});
 }
 
 } // namespace richengine::model

@@ -10,7 +10,7 @@
 
 namespace richengine::model {
 
-enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
+enum class FfnKind : uint8_t { Dense, SparseMoe };
 
 // The magic of a Qwen target's packed embedding file, whatever its family.
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";

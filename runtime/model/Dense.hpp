@@ -2,8 +2,8 @@
 
 #include "Qwen3_8.hpp"
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -18,7 +18,7 @@ namespace richengine::model {
 struct DenseLayout final {
   static constexpr std::string_view layerMagic = "MDFN0001";
   static constexpr std::string_view headMagic = "MDFN0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  static constexpr FfnKind ffnKind = FfnKind::Dense;
   // The packed QKV rows hold the query heads alone (no interleaved gate).
   static constexpr uint32_t attentionQueryStride = 1;
   static constexpr bool attentionQkNorm = false;
@@ -74,10 +74,10 @@ struct DenseLayout final {
   bool operator==(const DenseLayout &) const = default;
 };
 
-using DenseWeights = QwenTargetWeights<DenseLayout, Qwen3_8LayerWeights>;
+using DenseWeights = TargetModelWeights<DenseLayout, DenseLayerWeights>;
 
 [[nodiscard]] DenseWeights
 loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
-                 const QwenTargetFiles<DenseLayout> &files);
+                 const TargetFiles<DenseLayout> &files);
 
 } // namespace richengine::model

@@ -1,6 +1,8 @@
-#include "PlainDraft.hpp"
+#include "DFlashV1Draft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+
+#include "ops/KernelNames.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -10,7 +12,7 @@ namespace richengine::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
-  if (layout.kind != DraftKind::Plain)
+  if (layout.kind != DraftKind::DFlashV1)
     throw WeightStoreError("a plain draft requires a plain layout");
   if (!layout.layers || layout.layers > 32 || !layout.hiddenSize ||
       !layout.vocabularySize || !layout.qkvSize || !layout.attentionSize ||
@@ -31,7 +33,7 @@ void requireLayout(const DFlashDraftLayout &layout) {
 // (AffinePreparation), so rows from a tile boundary on are one range of
 // each plane.
 std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
-                                           const PlainDraftWeights &weights) {
+                                           const DFlashV1DraftWeights &weights) {
   const DFlashDraftLayout &layout = weights.layout;
   if (layout.attentionSize >= layout.qkvSize ||
       layout.attentionSize % kQ4StorageN) {
@@ -40,7 +42,7 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   }
   std::vector<ops::Projection> result;
   result.reserve(weights.layers.size());
-  for (const PlainDraftLayerWeights &layer : weights.layers) {
+  for (const DFlashV1DraftLayerWeights &layer : weights.layers) {
     const ops::AffineWeights &fused = layer.qkvProjection.affine();
     const auto rows = [&](const metal::MetalBuffer &plane) {
       const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;
@@ -57,22 +59,25 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
 
 } // namespace
 
-PlainDraft::PlainDraft(const PlainDraftWeights &weights,
+DFlashV1Draft::DFlashV1Draft(const DFlashV1DraftWeights &weights,
                        metal::MetalBackend &backend,
                        const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(weights.layout.vocabularySize),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
-void PlainDraft::addSelection(
+void DFlashV1Draft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
     std::span<const ops::SamplingPolicy> policies,
-    uint32_t /*treeMask*/) const {
-  selector_.addPlain(graph, buffers, anchors, policies);
+    uint32_t treeMask) const {
+  if (treeMask)
+    selector_.addPlainTree(graph, buffers, anchors, policies, treeMask);
+  else
+    selector_.addPlain(graph, buffers, anchors, policies);
 }
 
-void PlainDraft::addContextPrefill(
+void DFlashV1Draft::addContextPrefill(
     metal::CommandGraph &graph, DFlashPrefillBuffers buffers, uint32_t rows,
     std::span<const DFlashPrefillSpan> spans) const {
   if (!rows || rows > ExecutionLimits::prefillTokenBudget || spans.empty())
@@ -117,7 +122,7 @@ void PlainDraft::addContextPrefill(
   }
 }
 
-void PlainDraft::addDecode(
+void DFlashV1Draft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
     const ops::Projection &vocabularyProjection,
     std::span<const uint32_t> cacheLengths) const {
@@ -143,7 +148,7 @@ void PlainDraft::addDecode(
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const bool causal = (layout.causalLayers >> layer) & 1;
-    const PlainDraftLayerWeights &weights = weights_.layers[layer];
+    const DFlashV1DraftLayerWeights &weights = weights_.layers[layer];
     const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
@@ -198,10 +203,17 @@ void PlainDraft::addDecode(
   linear.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  // Gemma's softcap applies to the draft's proposal logits too.
+  if (layout.logitSoftcap > 0.0F) {
+    const uint32_t count = rows * layout.vocabularySize;
+    graph.addTail(std::string(ops::kDecodeLogitSoftcap), {buffers.logits},
+                  layout.logitSoftcap, count,
+                  {(count + 255) / 256, 1, 1}, {256, 1, 1});
+  }
   graph.endBakedSpan();
 }
 
-void PlainDraft::addContextCommit(
+void DFlashV1Draft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
     std::span<const uint32_t> startPositions) const {
   const uint32_t lanes = static_cast<uint32_t>(startPositions.size());
@@ -243,10 +255,10 @@ namespace {
 // Reads a plain draft's files in their section order: each layer, then
 // model.bin.
 template <class Files>
-PlainDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
+DFlashV1DraftWeights readDraft(metal::MetalBackend &backend, Files &files,
                             const DFlashDraftLayout &layout) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
-  PlainDraftWeights result;
+  DFlashV1DraftWeights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
   const uint64_t headNormBytes = checkedMultiply<WeightStoreError>(
@@ -255,7 +267,7 @@ PlainDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     WeightFile file = files.layer(layerIndex);
-    PlainDraftLayerWeights layer;
+    DFlashV1DraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.qkvProjection = readAffineProjection(
         file, layout.qkvSize, layout.hiddenSize, "qkv");
@@ -295,25 +307,25 @@ PlainDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
 } // namespace
 
-WeightFile PackedPlainDraftFiles::layer(uint32_t index) const {
+WeightFile PackedDFlashV1DraftFiles::layer(uint32_t index) const {
   const std::string filename = "layer-" + std::to_string(index) + ".bin";
   return images.load(packedImage(directory / filename, "draft/" + filename,
-                                 kPlainDraftMagic, index, 0));
+                                 kDFlashV1DraftMagic, index, 0));
 }
 
-WeightFile PackedPlainDraftFiles::model() const {
+WeightFile PackedDFlashV1DraftFiles::model() const {
   return images.load(packedImage(directory / "model.bin", "draft/model.bin",
-                                 kPlainDraftMagic, layout.layers, 1));
+                                 kDFlashV1DraftMagic, layout.layers, 1));
 }
 
-PlainDraftWeights loadPlainDraftWeights(metal::MetalBackend &backend,
-                                        const PlainDraftFiles &files,
+DFlashV1DraftWeights loadDFlashV1DraftWeights(metal::MetalBackend &backend,
+                                        const DFlashV1DraftFiles &files,
                                         DFlashDraftLayout layout) {
   requireLayout(layout);
   if (const auto *checkpoint =
-          std::get_if<std::reference_wrapper<PlainDraftCheckpointLoader>>(&files))
+          std::get_if<std::reference_wrapper<DFlashV1DraftCheckpointLoader>>(&files))
     return readDraft(backend, checkpoint->get(), layout);
-  return readDraft(backend, std::get<PackedPlainDraftFiles>(files), layout);
+  return readDraft(backend, std::get<PackedDFlashV1DraftFiles>(files), layout);
 }
 
 } // namespace richengine::model

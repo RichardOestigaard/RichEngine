@@ -106,19 +106,14 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
 // Packed-INT4 pages feed matmul2d as native int4b operands; no staging.
 PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t, 256)
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g4, 4, 4, int8_t, 256)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t, 256)
 PAGED_VERIFY_SPLIT(verify_attention_int4_split, 4, 6, RichKvPacked4, 256)
 PAGED_VERIFY_SPLIT(verify_attention_int4_split_kv4_g4, 4, 4, RichKvPacked4, 256)
-PAGED_VERIFY_SPLIT(verify_attention_int4_split_kv2_g8, 2, 8, RichKvPacked4, 256)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat, 256)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g4, 4, 4, bfloat, 256)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, 256)
 // Head-dimension variants: the dense target's KV2/Group8 of 128 (_hd128)
 // and LFM2's KV8/Group4 of 64 (_hd64).
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_hd128, 2, 8, int8_t, 128)
-PAGED_VERIFY_SPLIT(verify_attention_int4_split_hd128, 2, 8, RichKvPacked4, 128)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_hd128, 2, 8, bfloat, 128)
+
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_hd64, 8, 4, int8_t, 64)
 PAGED_VERIFY_SPLIT(verify_attention_int4_split_hd64, 8, 4, RichKvPacked4, 64)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_hd64, 8, 4, bfloat, 64)
@@ -129,7 +124,128 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k8q5d64, 8, 5, bfloat, 64)
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_k8q4d128, 8, 4, int8_t, 128)
 PAGED_VERIFY_SPLIT(verify_attention_int4_split_k8q4d128, 8, 4, RichKvPacked4, 128)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k8q4d128, 8, 4, bfloat, 128)
+// Gemma 4: the sliding layers' KV8 group-2 pages of 256 and the global
+// layers' KV2 group-8 pages of 512.
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_gemma_h256, 8, 2, int8_t, 256)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_gemma_h256, 8, 2, RichKvPacked4, 256)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_gemma_h256, 8, 2, bfloat, 256)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_gemma_hd512, 2, 8, int8_t, 512)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_gemma_hd512, 2, 8, RichKvPacked4, 512)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_gemma_hd512, 2, 8, bfloat, 512)
 #undef PAGED_VERIFY_SPLIT
+
+// The _m2 hd512 verify variants run the tile in two fused-row passes
+// (MP = M/2 = 32), halving the PV accumulator's ~128 fp32/thread — the M5
+// per-core register/SRAM pool — plus the score/probability scratch. The
+// signature, grid (kv heads, splits, lanes), threadgroup count (256), slot
+// layout and the shared gemma_hd512 reduces are the plain variants'; the
+// host only swaps the pipeline name.
+#define PAGED_VERIFY_SCRATCH_M2(Group)                                       \
+  constexpr uint M = Group * RICHENGINE_TARGET_VERIFY_ROWS;                       \
+  constexpr uint MP = M / 2;                                                 \
+  constexpr uint N = RichKvPageTokens;                                       \
+  alignas(16) threadgroup float scores[MP * N];                              \
+  alignas(16) threadgroup bfloat probabilities[2 * MP * N];                  \
+  threadgroup float row_max[MP];                                             \
+  threadgroup float row_sum[MP];                                             \
+  threadgroup float previous_scale[MP];                                      \
+  threadgroup atomic_uint rescale;
+
+#define PAGED_VERIFY_SPLIT_M2(Name, Heads, Group, CacheElement, HeadDim)     \
+  PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                       \
+    PAGED_VERIFY_SCRATCH_M2(Group)                                           \
+    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                              \
+    richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
+                                CacheElement, HeadDim, 2>(                   \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, nullptr,                \
+        params[group.z].score_scale, scores,                                 \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index);                                                         \
+  }
+PAGED_VERIFY_SPLIT_M2(verify_attention_q8_split_gemma_hd512_m2, 2, 8, int8_t, 512)
+PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_gemma_hd512_m2, 2, 8, RichKvPacked4, 512)
+PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_gemma_hd512_m2, 2, 8, bfloat, 512)
+// The kv2/g8 head-dimension-128 variants fuse M = 8 x VERIFY_ROWS rows: at
+// 16 verify rows the full-M scratch overflows the 32 KB threadgroup budget,
+// so they run the same two-pass halving the hd512 shapes use. The group-8
+// head-dimension-256 layout (_kv2_g8) overflows the same way.
+PAGED_VERIFY_SPLIT_M2(verify_attention_q8_split_hd128, 2, 8, int8_t, 128)
+PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_hd128, 2, 8, RichKvPacked4, 128)
+PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_hd128, 2, 8, bfloat, 128)
+PAGED_VERIFY_SPLIT_M2(verify_attention_q8_split_kv2_g8, 2, 8, int8_t, 256)
+PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_kv2_g8, 2, 8, RichKvPacked4, 256)
+PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, 256)
+#undef PAGED_VERIFY_SPLIT_M2
+
+// Sliding-window variants of the two Gemma shapes: the same verify split
+// plus buffer(8), the per-dispatch window in tokens (0 = full causal). The
+// reduce pass needs no window; a fully masked page's statistics carry zero
+// weight.
+#define PAGED_VERIFY_SPLIT_SWA(Name, Heads, Group, CacheElement, HeadDim)    \
+  kernel void Name(                                                          \
+      device bfloat *queries [[buffer(0)]],                                  \
+      device float *partials [[buffer(1)]],                                  \
+      device float *statistics [[buffer(2)]],                                \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      constant uint &window_tokens [[buffer(8)]],                            \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    PAGED_VERIFY_SCRATCH(Group)                                              \
+    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                              \
+    richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
+                                CacheElement, HeadDim>(                        \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, nullptr,                \
+        params[group.z].score_scale, scores,                                 \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index, window_tokens);                                        \
+  }
+PAGED_VERIFY_SPLIT_SWA(verify_attention_q8_split_swa_h256, 8, 2, int8_t, 256)
+PAGED_VERIFY_SPLIT_SWA(verify_attention_int4_split_swa_h256, 8, 2, RichKvPacked4, 256)
+PAGED_VERIFY_SPLIT_SWA(verify_attention_bf16_split_swa_h256, 8, 2, bfloat, 256)
+PAGED_VERIFY_SPLIT_SWA(verify_attention_q8_split_swa_hd512, 2, 8, int8_t, 512)
+PAGED_VERIFY_SPLIT_SWA(verify_attention_int4_split_swa_hd512, 2, 8, RichKvPacked4, 512)
+PAGED_VERIFY_SPLIT_SWA(verify_attention_bf16_split_swa_hd512, 2, 8, bfloat, 512)
+#undef PAGED_VERIFY_SPLIT_SWA
+
+// Windowed _m2 hd512 verify variants: the two-pass tile plus buffer(8), the
+// per-dispatch window in tokens (0 = full causal).
+#define PAGED_VERIFY_SPLIT_SWA_M2(Name, Heads, Group, CacheElement, HeadDim) \
+  kernel void Name(                                                          \
+      device bfloat *queries [[buffer(0)]],                                  \
+      device float *partials [[buffer(1)]],                                  \
+      device float *statistics [[buffer(2)]],                                \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      constant uint &window_tokens [[buffer(8)]],                            \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    PAGED_VERIFY_SCRATCH_M2(Group)                                           \
+    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                              \
+    richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
+                                CacheElement, HeadDim, 2>(                   \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, nullptr,                \
+        params[group.z].score_scale, scores,                                 \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index, window_tokens);                                        \
+  }
+PAGED_VERIFY_SPLIT_SWA_M2(verify_attention_q8_split_swa_hd512_m2, 2, 8, int8_t, 512)
+PAGED_VERIFY_SPLIT_SWA_M2(verify_attention_int4_split_swa_hd512_m2, 2, 8, RichKvPacked4, 512)
+PAGED_VERIFY_SPLIT_SWA_M2(verify_attention_bf16_split_swa_hd512_m2, 2, 8, bfloat, 512)
+#undef PAGED_VERIFY_SPLIT_SWA_M2
+#undef PAGED_VERIFY_SCRATCH_M2
 
 // The tree verify splits: RICHENGINE_TREE_VERIFY_NODES rows of a lane's comb.
 // The emitted nodes occupy scratch slots committed..committed+rows-1 in row
@@ -176,20 +292,71 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k8q4d128, 8, 4, bfloat, 128)
 
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split, 4, 6, int8_t, 256)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_kv4_g4, 4, 4, int8_t, 256)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_kv2_g8, 2, 8, int8_t, 256)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split, 4, 6, RichKvPacked4, 256)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_kv4_g4, 4, 4, RichKvPacked4, 256)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_kv2_g8, 2, 8, RichKvPacked4, 256)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split, 4, 6, bfloat, 256)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_kv4_g4, 4, 4, bfloat, 256)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_kv2_g8, 2, 8, bfloat, 256)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_hd128, 2, 8, int8_t, 128)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_hd128, 2, 8, RichKvPacked4, 128)
-PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_hd128, 2, 8, bfloat, 128)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_hd64, 8, 4, int8_t, 64)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_hd64, 8, 4, RichKvPacked4, 64)
 PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_hd64, 8, 4, bfloat, 64)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_k8q5d64, 8, 5, int8_t, 64)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_k8q5d64, 8, 5, RichKvPacked4, 64)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_k8q5d64, 8, 5, bfloat, 64)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_q8_split_k8q4d128, 8, 4, int8_t, 128)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_int4_split_k8q4d128, 8, 4, RichKvPacked4, 128)
+PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_k8q4d128, 8, 4, bfloat, 128)
 #undef PAGED_VERIFY_TREE_SPLIT
+
+// The Group-8 tree layouts fuse 128 rows (8 query heads x 16 tree nodes) —
+// the score/probability scratch alone is 34 KB, over the 32 KB threadgroup
+// limit — so they run the tile in two fused-row passes, the gemma_hd512
+// verify splits' halving. The shared reduces are unchanged.
+#define PAGED_VERIFY_TREE_SCRATCH_M2(Group)                                    \
+  constexpr uint M = Group * RICHENGINE_TREE_VERIFY_NODES;                         \
+  constexpr uint MP = M / 2;                                                 \
+  constexpr uint N = RichKvPageTokens;                                       \
+  alignas(16) threadgroup float scores[MP * N];                              \
+  alignas(16) threadgroup bfloat probabilities[2 * MP * N];                  \
+  threadgroup float row_max[MP];                                             \
+  threadgroup float row_sum[MP];                                             \
+  threadgroup float previous_scale[MP];                                      \
+  threadgroup atomic_uint rescale;
+
+#define PAGED_VERIFY_TREE_SPLIT_M2(Name, Heads, Group, CacheElement, HeadDim)  \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      device const uint *row_masks [[buffer(7)]],                              \
+      constant RichVerifyAttentionParams *params [[buffer(8)]],              \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    PAGED_VERIFY_TREE_SCRATCH_M2(Group)                                        \
+    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                                \
+    device const uint *lane_masks =                                            \
+        row_masks + ulong(group.z) * params[group.z].row_capacity;             \
+    richengine_paged_attention_tile<Heads, Group, RICHENGINE_TREE_VERIFY_NODES,        \
+                                CacheElement, HeadDim, 2>(                     \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
+        tile.committed_tokens, tile.active_rows, tile.splits,                  \
+        tile.split, partials, statistics, tile.slot, lane_masks,             \
+        params[group.z].score_scale, scores,                                   \
+        probabilities,                                                         \
+        row_max, row_sum, previous_scale, &rescale, thread_index);             \
+  }
+
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_q8_split_hd128_m2, 2, 8, int8_t, 128)
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_int4_split_hd128_m2, 2, 8, RichKvPacked4, 128)
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_bf16_split_hd128_m2, 2, 8, bfloat, 128)
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_q8_split_kv2_g8_m2, 2, 8, int8_t, 256)
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_int4_split_kv2_g8_m2, 2, 8, RichKvPacked4, 256)
+PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_bf16_split_kv2_g8_m2, 2, 8, bfloat, 256)
+#undef PAGED_VERIFY_TREE_SPLIT_M2
+#undef PAGED_VERIFY_TREE_SCRATCH_M2
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_TREE_SCRATCH
 #undef PAGED_VERIFY_SCRATCH
@@ -353,6 +520,37 @@ PAGED_VERIFY_REDUCE_HD(verify_attention_reduce_k8q5d64, 8, 5, 64)
 PAGED_VERIFY_REDUCE_HD(verify_attention_reduce_k8q4d128, 8, 4, 128)
 #undef PAGED_VERIFY_REDUCE_HD
 
+// Gemma 4's reduces: the sliding layers' KV8 group-2 of 256 (threadgroup
+// 256, eight simdgroup maxima) and the global layers' KV2 group-8 of 512
+// (threadgroup 512, sixteen).
+kernel void verify_attention_reduce_gemma_h256(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant RichVerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichVerifyMaximumSplits];
+  threadgroup float group_values[8];
+  richengine_verify_attention_reduce_phase<8, 2, 256>(
+      partials, statistics, output, params, group, thread_index, weights,
+      group_values);
+}
+
+kernel void verify_attention_reduce_gemma_hd512(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant RichVerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichVerifyMaximumSplits];
+  threadgroup float group_values[16];
+  richengine_verify_attention_reduce_phase<2, 8, 512>(
+      partials, statistics, output, params, group, thread_index, weights,
+      group_values);
+}
+
 // The reduce/gather fusion of the no-gate targets (dense hd128, LFM2 hd64):
 // the reduce/gate kernel's structure minus the gate multiply — the same
 // per-row split reduce as verify_attention_reduce_hd*, writing the bf16
@@ -412,6 +610,36 @@ PAGED_VERIFY_REDUCE_GATHER(verify_attention_reduce_gather_k8q5d64, 8, 5, 64)
 PAGED_VERIFY_REDUCE_GATHER(verify_attention_reduce_gather_k8q4d128, 8, 4, 128)
 #undef PAGED_VERIFY_REDUCE_GATHER
 
+// Gemma's fused reduce/gathers, with group_values sized to the head
+// dimension's simdgroup count (hd512's sixteen).
+kernel void verify_attention_reduce_gather_gemma_h256(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant RichVerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichVerifyMaximumSplits];
+  threadgroup float group_values[8];
+  richengine_verify_attention_reduce_gather_phase<8, 2, 256>(
+      partials, statistics, hidden, params, group, thread_index, weights,
+      group_values);
+}
+
+kernel void verify_attention_reduce_gather_gemma_hd512(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant RichVerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichVerifyMaximumSplits];
+  threadgroup float group_values[16];
+  richengine_verify_attention_reduce_gather_phase<2, 8, 512>(
+      partials, statistics, hidden, params, group, thread_index, weights,
+      group_values);
+}
+
 // The tree reduces: a RICHENGINE_TREE_VERIFY_NODES-row tile per lane, with the
 // runtime active row count deciding which rows carry splits. Rows past a
 // lane's emitted nodes reduce to zeros, exactly as inactive chain rows do.
@@ -462,6 +690,8 @@ PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_kv4_g4, 4, 4, 256)
 PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_kv2_g8, 2, 8, 256)
 PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_hd128, 2, 8, 128)
 PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_hd64, 8, 4, 64)
+PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_k8q5d64, 8, 5, 64)
+PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_k8q4d128, 8, 4, 128)
 #undef PAGED_VERIFY_TREE_REDUCE
 
 // The tree reduce/gate fusion: the same per-element gate as the chain's,

@@ -145,7 +145,8 @@ ops::Projection readAffineProjection(WeightFile &file, uint32_t outputSize, uint
 ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
                                              uint32_t outputSize,
                                              uint32_t inputSize,
-                                             std::string_view label) {
+                                             std::string_view label,
+                                             bool tiled) {
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const std::string prefix(label);
     // Braced initializers read the sections in file order.
@@ -154,7 +155,8 @@ ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
                 file.section(elements / 2, prefix + "-weights"),
                 file.section(elements / 32, prefix + "-scales"),
                 file.section(elements / 32, prefix + "-biases"),
-            }};
+            },
+            tiled};
 }
 
 ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,

@@ -8,6 +8,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Gguf.h"
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
 #include <cstdint>
@@ -29,12 +30,12 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
   if (layout == ops::LinearInput::Packed) {
     // The pack dispatch the mxfp4p consumers run when no producer wrote the
     // operand (ops/LinearGguf.cpp's single-tensor branch).
-    graph.add("gguf_pack_half", {input, table, sums, input, input, input, input, input},
+    graph.add(std::string(ops::kGgufPackHalf), {input, table, sums, input, input, input, input, input},
               GgufDecodeParams{width, 1, 0, 0}, {uint64_t{lanes} * 8 * width / 32, 1, 1}, {32, 1, 1});
     return;
   }
-  graph.add(layout == ops::LinearInput::Table16 ? "decode_linear_gguf_prepare"
-                                                : "decode_linear_q4_prepare",
+  graph.add(std::string(layout == ops::LinearInput::Table16 ? ops::kDecodeLinearGgufPrepare
+                                                : ops::kDecodeLinearQ4Prepare),
             {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
 }
 

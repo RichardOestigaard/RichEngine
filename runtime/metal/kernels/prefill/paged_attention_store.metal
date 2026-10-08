@@ -146,4 +146,12 @@ PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_hd64, 8, bfloat, 64)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_k8d128, 8, int8_t, 128)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_k8d128, 8, RichKvPacked4, 128)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_k8d128, 8, bfloat, 128)
+// Gemma 4: the sliding layers' KV8 pages of 256 and the global layers' KV2
+// pages of 512 (threadgroups of 256 and 512 threads).
+PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_gemma_h256, 8, int8_t, 256)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_gemma_h256, 8, RichKvPacked4, 256)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_h256, 8, bfloat, 256)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_gemma_hd512, 2, int8_t, 512)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
 #undef PREFILL_ATTENTION_STORE_HD

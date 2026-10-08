@@ -66,6 +66,52 @@ medians of three samples):
 Decode is unchanged: its kernels do not run on the Neural Engine, and the
 split does not engage while other requests decode.
 
+### Gemma 4 / DiffusionGemma
+
+Both Gemma 4 targets are 26B-A4B MoE (25.2B total, 3.8B active, packed Q4
+~14.5 GB) and install from safetensors into the packed
+`richengine-packed-q4-*` formats. `Gemma4-26B-A4B` decodes
+autoregressively with the z-lab DFlash block-diffusion draft (Plain
+draft, 8-row blocks from a block-16 training); `DiffusionGemma-26B-A4B`
+generates a 256-token canvas per block through bidirectional denoising
+(≤48 steps, entropy-bound acceptance, ~13–17 steps typical upstream).
+
+No end-to-end model benchmark has been run yet — the numbers below are
+GPU-timestamped kernel microbenchmarks on this Mac
+(`make test-canvas-kernels`, `make test-hd512`, medians over 20 reps)
+plus the bandwidth roofline in
+[GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md](GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md).
+
+Measured kernel results (kept on by default):
+
+| Kernel | Before | After |
+| --- | ---: | ---: |
+| `canvas_soft_embed_topk` → histogram | ~91–155 ms | ~7–16 ms |
+| `canvas_row_stats` → fused single pass | 2.7 ms | 1.4 ms |
+| softcap + temperature elementwise passes | ~4.0 ms/step | 0 (fused on load) |
+| hd512 attention → M-split | baseline | 18–45% faster (q8/int4/bf16) |
+
+Step-driver flags (all default on unless noted):
+`RICHENGINE_CANVAS_STEPS_PER_CMD` (2), `RICHENGINE_CANVAS_PREFIX_EXIT`,
+`RICHENGINE_CANVAS_COMMIT_TAIL`; `RICHENGINE_CANVAS_SPECULATIVE_PREFILL`
+is off pending a real-model measurement.
+
+Projected committed-throughput roofline after fixes (~16.3 GB/step,
+13–17 steps/canvas + one re-prefill): ~130–175 tok/s M5, ~260–350
+M5 Pro, ~380–520 M5 Max 32-core, ~510–690 M5 Max 40-core. Upstream
+(vLLM on H100/H200 FP8) reports ~1,000–1,300 tok/s.
+
+KV sizing for the Gemma 4 dual geometry (25 sliding + 5 global layers,
+K-only globals): ~111.6 KB/token `int8`/`fp8e4m3`, ~56.6 KB `int4`,
+~220 KB `bf16` — about 29 MB per committed 256-token canvas at `int8`.
+Quantized KV extents on this layout round to 256 pages (~0.5–0.9 GB),
+so small canvas scratch allocations ride the request's own extent.
+
+Serving floor: 32 GB Macs (int4 KV, ~110–140K context), 48 GB
+comfortable, 64 GB+ for the full 262K context at `int8`. The ANE
+prefill split does not apply — the shared expert fails the shape gates
+and the canvas step is DRAM-bound regardless.
+
 ### 2B-class models
 
 The same benchmark on the same Mac, on the GGUF installs

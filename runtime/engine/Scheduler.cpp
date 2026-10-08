@@ -381,6 +381,12 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   for (const auto &[id, request] : requests_) {
     if (request.phase == Phase::Decode && !listed(excluded, id))
       ready.push_back(&request);
+    else if (getenv("RICHENGINE_DENY_DEBUG") &&
+             !terminal(request.phase) && request.phase != Phase::Prefill &&
+             (request.phase != Phase::Decode || listed(excluded, id)))
+      fprintf(stderr, "not-ready id=%llu phase=%d excl=%d\n",
+              (unsigned long long)id, (int)request.phase,
+              (int)listed(excluded, id));
   }
   if (ready.empty())
     return std::nullopt;
@@ -400,8 +406,13 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
         request->spec.constrained != plan.constrained ||
-        request->decodeStage != decodeStage)
+        request->decodeStage != decodeStage) {
+      if (getenv("RICHENGINE_DENY_DEBUG"))
+        fprintf(stderr, "stage-split id=%llu stage=%d want=%d\n",
+                (unsigned long long)request->spec.id,
+                (int)request->decodeStage, (int)decodeStage);
       continue;
+    }
     plan.items.push_back({request->spec.id, 0, 0});
     if (plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;

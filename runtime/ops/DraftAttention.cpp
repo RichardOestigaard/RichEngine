@@ -1,6 +1,7 @@
 #include "ops/DraftAttention.hpp"
 
 #include "metal/abi/DraftAttention.h"
+#include "ops/KernelNames.hpp"
 #include "ops/LaneBindings.hpp"
 
 #include <algorithm>
@@ -14,6 +15,10 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kRows = RICHENGINE_DRAFT_QUERY_ROWS;
+// A draft attention threadgroup covers M block rows per KV head; query
+// blocks wider than 8 rows split the group's heads into Rows/8 tiles, which
+// share the grid's x dimension with the KV heads.
+constexpr uint32_t kRowTiles = kRows / 8;
 constexpr uint32_t kWindow = RICHENGINE_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 // Each split leaves an (queries-per-KV-head x Rows) x (headDim + max + sum)
@@ -69,7 +74,7 @@ void requireLanes(uint32_t lanes) {
     throw std::invalid_argument("invalid draft batch width");
 }
 
-enum class KernelLayout : uint8_t { Hidden5120, Hidden2048, Plain5120, Plain4096, Plain2048 };
+enum class KernelLayout : uint8_t { Hidden5120, Hidden2048, Plain5120, Plain4096, Plain2816, Plain2048 };
 
 // The head geometry selects the compiled attention kernels: the 32x8x128
 // blocks of the DFlash2 and plain drafts, the 16x2x128 of MiniCPM5's DSpark
@@ -93,52 +98,52 @@ enum class HeadKernel : uint8_t { Q32K8D128, Q16K2D128, Q32K8D64Interleaved };
                                          std::string_view base) {
   // The kernels of each geometry carry their shape's suffix; the original
   // 32x8x128 instantiations keep the unsuffixed names.
-  if (base == "draft_attention_qkv") {
+  if (base == kDraftAttentionQkv) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "draft_attention_qkv";
-    case HeadKernel::Q16K2D128: return "draft_attention_qkv_q16k2";
+    case HeadKernel::Q32K8D128: return kDraftAttentionQkv.data();
+    case HeadKernel::Q16K2D128: return kDraftAttentionQkvQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "draft_attention_qkv_q32k8d64i";
+      return kDraftAttentionQkvQ32k8d64i.data();
     }
   }
-  if (base == "draft_attention_bf16_split") {
+  if (base == kDraftAttentionBf16Split) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "draft_attention_bf16_split";
-    case HeadKernel::Q16K2D128: return "draft_attention_bf16_split_q16k2";
+    case HeadKernel::Q32K8D128: return kDraftAttentionBf16Split.data();
+    case HeadKernel::Q16K2D128: return kDraftAttentionBf16SplitQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "draft_attention_bf16_split_q32k8d64i";
+      return kDraftAttentionBf16SplitQ32k8d64i.data();
     }
   }
-  if (base == "draft_attention_bf16_reduce") {
+  if (base == kDraftAttentionBf16Reduce) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "draft_attention_bf16_reduce";
-    case HeadKernel::Q16K2D128: return "draft_attention_bf16_reduce_q16k2";
+    case HeadKernel::Q32K8D128: return kDraftAttentionBf16Reduce.data();
+    case HeadKernel::Q16K2D128: return kDraftAttentionBf16ReduceQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "draft_attention_bf16_reduce_q32k8d64i";
+      return kDraftAttentionBf16ReduceQ32k8d64i.data();
     }
   }
-  if (base == "draft_attention_reorder") {
+  if (base == kDraftAttentionReorder) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "draft_attention_reorder";
-    case HeadKernel::Q16K2D128: return "draft_attention_reorder_q16k2";
+    case HeadKernel::Q32K8D128: return kDraftAttentionReorder.data();
+    case HeadKernel::Q16K2D128: return kDraftAttentionReorderQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "draft_attention_reorder_q32k8d64i";
+      return kDraftAttentionReorderQ32k8d64i.data();
     }
   }
-  if (base == "draft_context_kv_commit") {
+  if (base == kDraftContextKvCommit) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "draft_context_kv_commit";
-    case HeadKernel::Q16K2D128: return "draft_context_kv_commit_q16k2";
+    case HeadKernel::Q32K8D128: return kDraftContextKvCommit.data();
+    case HeadKernel::Q16K2D128: return kDraftContextKvCommitQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "draft_context_kv_commit_q32k8d64i";
+      return kDraftContextKvCommitQ32k8d64i.data();
     }
   }
-  if (base == "prefill_draft_context_kv") {
+  if (base == kPrefillDraftContextKv) {
     switch (kernel) {
-    case HeadKernel::Q32K8D128: return "prefill_draft_context_kv";
-    case HeadKernel::Q16K2D128: return "prefill_draft_context_kv_q16k2";
+    case HeadKernel::Q32K8D128: return kPrefillDraftContextKv.data();
+    case HeadKernel::Q16K2D128: return kPrefillDraftContextKvQ16k2.data();
     case HeadKernel::Q32K8D64Interleaved:
-      return "prefill_draft_context_kv_q32k8d64i";
+      return kPrefillDraftContextKvQ32k8d64i.data();
     }
   }
   throw std::invalid_argument("unknown draft attention kernel");
@@ -161,6 +166,10 @@ enum class HeadKernel : uint8_t { Q32K8D128, Q16K2D128, Q32K8D64Interleaved };
     return KernelLayout::Plain5120;
   if (shape.dynamicSize == 0 && shape.hiddenSize == 4096)
     return KernelLayout::Plain4096;
+  // Gemma 4's DFlash draft: hidden 2816 over the shared 32x8x128 head
+  // geometry, so it reuses the plain draft's compiled kernels.
+  if (shape.dynamicSize == 0 && shape.hiddenSize == 2816)
+    return KernelLayout::Plain2816;
   if (shape.dynamicSize == 0 && shape.hiddenSize == 2048)
     return KernelLayout::Plain2048;
   throw std::invalid_argument("unsupported compiled draft attention shape");
@@ -210,10 +219,10 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   const char *name;
   switch (kernel) {
   case KernelLayout::Hidden5120:
-    name = "draft_conv";
+    name = kDraftConv.data();
     break;
   case KernelLayout::Hidden2048:
-    name = "draft_conv_h2048";
+    name = kDraftConvH2048.data();
     break;
   default:
     throw std::invalid_argument("a plain draft has no dynamic convolutions");
@@ -246,7 +255,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const uint64_t ropeBytes = uint64_t{lanes} * kRows * shape.headDimension / 2 * 4;
   requireBuffer(buffers.ropeCos, ropeBytes);
   requireBuffer(buffers.ropeSin, ropeBytes);
-  graph.add(headKernelName(headKernel(shape), "draft_attention_qkv"),
+  graph.add(headKernelName(headKernel(shape), kDraftAttentionQkv),
             {std::move(buffers.qkv), std::move(buffers.groupedQueries),
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
              std::move(buffers.ropeCos), std::move(buffers.ropeSin),
@@ -290,12 +299,12 @@ void DraftAttention::addDecode(
   // enclosing baked span replays the pair with the lengths rewritten into
   // its parameter arena.
   const HeadKernel kernel = headKernel(shape);
-  graph.addPatchable(headKernelName(kernel, "draft_attention_bf16_split"),
+  graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Split),
                      std::move(bindings), params,
-                     {shape.kvHeads, lanes, kSplits});
-  graph.addPatchable(headKernelName(kernel, "draft_attention_bf16_reduce"),
+                     {shape.kvHeads * kRowTiles, lanes, kSplits});
+  graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Reduce),
                      {buffers.groupedQueries}, params,
-                     {shape.kvHeads, lanes, 1});
+                     {shape.kvHeads * kRowTiles, lanes, 1});
 }
 
 void DraftAttention::addResidual(metal::CommandGraph &graph,
@@ -308,7 +317,7 @@ void DraftAttention::addResidual(metal::CommandGraph &graph,
   requireBuffer(input, bytes);
   requireBuffer(residual, bytes);
   requireBuffer(output, bytes);
-  graph.add("draft_residual_add", {std::move(input), std::move(residual), std::move(output)},
+  graph.add(std::string(kDraftResidualAdd), {std::move(input), std::move(residual), std::move(output)},
             static_cast<uint32_t>(elements),
             {phaseGroups(elements), plan.lanes(), 1});
 }
@@ -323,7 +332,7 @@ void DraftAttention::addReorder(metal::CommandGraph &graph,
   const uint32_t lanes = plan.lanes();
   requireBuffer(grouped, queryRowsBytes(plan));
   requireBuffer(packed, queryRowsBytes(plan));
-  graph.add(headKernelName(headKernel(shape), "draft_attention_reorder"),
+  graph.add(headKernelName(headKernel(shape), kDraftAttentionReorder),
             {std::move(grouped), std::move(packed)},
             {groups, lanes, 1});
 }
@@ -341,7 +350,7 @@ void DraftAttention::addContextPrefill(
   requireBuffer(keys, ringBytes(shape));
   requireBuffer(values, ringBytes(shape));
   const DraftContextParams params{tokens, startPosition};
-  graph.add(headKernelName(headKernel(shape), "prefill_draft_context_kv"),
+  graph.add(headKernelName(headKernel(shape), kPrefillDraftContextKv),
             {std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
             params, {uint64_t{tokens} * shape.kvHeads, 1, 1});
@@ -378,7 +387,7 @@ void DraftAttention::addContextCommit(
   bindings.reserve(2 * kMaximumLanes + 5);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
-  graph.add(headKernelName(headKernel(shape), "draft_context_kv_commit"),
+  graph.add(headKernelName(headKernel(shape), kDraftContextKvCommit),
             std::move(bindings), params,
             {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
              1});

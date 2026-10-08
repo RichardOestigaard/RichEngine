@@ -20,11 +20,11 @@ struct PlannedCheckpoint;
 // every projection quantized to affine Q4 as those drafts were, every other
 // tensor copied as stored. The checkpoint is planned once; each file is
 // written into memory when it is opened.
-class DraftCheckpointLoader final {
+class DFlash2CheckpointLoader final {
 public:
-  DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+  DFlash2CheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                         const DFlashDraftLayout &layout);
-  ~DraftCheckpointLoader();
+  ~DFlash2CheckpointLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
 
@@ -38,14 +38,14 @@ private:
 [[nodiscard]] std::vector<affine::Image> draftCheckpointImages(const DFlashDraftLayout &layout);
 
 // A plain transformer DFlash checkpoint ("DFlashDraftModel"), config.json
-// and BF16 safetensors -> the packed files PlainDraft.cpp reads: every
+// and BF16 safetensors -> the packed files DFlashV1Draft.cpp reads: every
 // projection quantized to affine Q4, norms copied as stored. No
 // convolutions, selector projection or codebooks exist to write.
-class PlainDraftCheckpointLoader final {
+class DFlashV1DraftCheckpointLoader final {
 public:
-  PlainDraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+  DFlashV1DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                              const DFlashDraftLayout &layout);
-  ~PlainDraftCheckpointLoader();
+  ~DFlashV1DraftCheckpointLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
 
@@ -54,7 +54,7 @@ private:
   std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, then model.bin
 };
 
-[[nodiscard]] std::vector<affine::Image> plainDraftCheckpointImages(const DFlashDraftLayout &layout);
+[[nodiscard]] std::vector<affine::Image> dflashV1DraftCheckpointImages(const DFlashDraftLayout &layout);
 
 // A DSpark checkpoint ("Qwen3DSparkModel"/"Lfm2DSparkDraftModel"),
 // config.json and BF16 safetensors -> the packed files DSparkDraft.cpp

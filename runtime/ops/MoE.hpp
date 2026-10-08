@@ -87,9 +87,23 @@ struct AffineMoeWeights final {
 // this value only exposes semantic projections to the operator.
 using MoeWeights = LayoutWeights<AffineMoeWeights, BlockMoeWeights>;
 
+// Gemma 4's MoE weights: a bias-free bf16 router ([experts][hidden],
+// expert-major), the F32 per-expert routing scale and Q4 expert slabs whose
+// per-expert stride holds the logical width (704) padded to the expert
+// tiles' 128-column granularity (768) — the padding reads and writes zeros.
+// The dense shared expert is not a routed slot: it runs as ordinary
+// projections beside this block.
+struct GemmaMoeWeights final {
+  metal::MetalBuffer routerWeights;
+  metal::MetalBuffer perExpertScale;
+  ExpertProjection expertGate;
+  ExpertProjection expertUp;
+  ExpertProjection expertDown;
+};
+
 // Router score tiles: 8 x 32 for short chunks, 32 x 128 for longer chunks.
 // The measured Apple10 crossover is about 26 rows per GPU core; an unknown
-// core count plans for ops::kAssumedGpuCores (Linear.hpp). Both tiles
+// core count plans for kAssumedGpuCores (DeviceCapabilities.hpp). Both tiles
 // preserve scores.
 struct MoeRouteTile final {
   uint32_t rows;
@@ -208,9 +222,12 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // consume Q4 expert slabs in StorageN=256 order: decode plans run the fused
 // gate/up tile on M8 tiles, prefill plans the experts on M32 tiles as three
 // N256 passes (gate, up with the silu gate, down) whose tiles shrink to the
-// descriptor's live rows. GGUF plans run three passes of M8 tiles, or of M32
+// descriptor's live rows; prefill plans at <= 256 rows use M16 tiles: the
+// union leaves experts well under 32 rows each, and the extra tiles' weight
+// reads are repaid by the more parallel grid (~314 GB/s vs ~148 GB/s on the
+// DiffusionGemma up pass at its 256-row canvas shape). GGUF plans run three passes of M8 tiles, or of M32
 // tiles to prefill (moeGgufPrefillTile).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+enum class MoeExpertTile : uint8_t { M8 = 8, M16 = 16, M32 = 32 };
 
 // Simdgroups per affine 8-row expert tile, a device policy the execution
 // plans set. Eight is the shipped N128 tile for both projections.
@@ -231,9 +248,9 @@ enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
 // Families below 9 are rejected at startup; 10 and later keep the shipped
 // tile, as does an unknown family.
 [[nodiscard]] constexpr MoeExpertSimdgroups
-moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily == 9 ? MoeExpertSimdgroups::Four
-                             : MoeExpertSimdgroups::Eight;
+moeDecodeSimdgroups(const DevicePolicy &device) noexcept {
+  return device.isApple9() ? MoeExpertSimdgroups::Four
+                           : MoeExpertSimdgroups::Eight;
 }
 
 // The expert tile of GGUF plans, which run three grouped passes (gate, up
@@ -253,9 +270,9 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
-  return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
-                                                                         : MoeGgufTile::Staged;
+[[nodiscard]] inline MoeGgufTile moeGgufTile(const DevicePolicy &device, MoeShape shape) noexcept {
+  return device.isApple9() && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+                                                                      : MoeGgufTile::Staged;
 }
 
 // The rows of a GGUF prefill plan's tiles on the device's `tile`: 8 on the
@@ -275,7 +292,11 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
              : MoeExpertTile::M32;
 }
 
-enum class MoePhase : uint8_t { Prefill, Decode };
+enum class MoePhase : uint8_t { Prefill, Decode,
+  // The DiffusionGemma trunk's grouped-expert sweep over a canvas's rows: a
+  // prefill-shaped pass, but its own plan family so canvas tuning (the M16
+  // tile) never changes a normal chunk's plan.
+  Canvas };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
@@ -297,6 +318,9 @@ struct MoeConfig final {
   // GGUF plans only: the `_n` expert kernels, whose MXFP4 segments decode on
   // the Metal 4.1 packed FP4-E2M1 path. Set on Apple GPU family 10 and up.
   bool mxfp4Native = false;
+  // Decode plans only: the union cap moe_route_cap applies (serve-native's
+  // --moe-union); 0 keeps every selected route.
+  uint32_t unionCap = 0;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -334,14 +358,32 @@ struct MoeBuffers final {
   metal::MetalBuffer residual;
   metal::MetalBuffer output;
   MoeScratch scratch;
+  // Gemma 4 routes from the post-attention residual, not the FFN input: the
+  // rows the router reads, when different from `input`. Empty binds `input`.
+  metal::MetalBuffer routerInput;
 };
 
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
+  // The DiffusionGemma trunk's expert sweep: prefill-shaped dispatches on a
+  // canvas plan family.
+  [[nodiscard]] static MoePlan canvasPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
+  // Gemma 4's block: moe_route_scores_gemma over `routerInput` (or `input`),
+  // moe_route_select_gemma's softmax-top_k-renormalized routes scaled by
+  // perExpertScale, the grouped GeGLU expert tiles and moe_combine into
+  // `output` on `residual` (the caller's zero residual keeps the routed sum
+  // unmixed). The plan's shape carries the padded expert width.
+  static void addGemma(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                       const GemmaMoeWeights &weights, const MoePlan &plan);
+  // RICHENGINE_MOE_STATS: prints "moe-stats rows=N union=E tiles=T" for
+  // every dispatch record written since the last call. The tile-count
+  // scratch is Shared storage; call only after the command completed — a
+  // readback mid-command stalls. A no-op unless the flag is "1".
+  static void logStats(const metal::MetalBuffer &tileCount);
 };
 
 } // namespace richengine::ops

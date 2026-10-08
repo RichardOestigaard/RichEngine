@@ -39,12 +39,15 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Literal
 
-from . import gguf, hub, models
+from . import gguf, hub, layout, models
 
-GGUF_VISION = "vision/mmproj.gguf"
-TARGET_FORMATS = ("mlx-affine", "gguf")
-VISION_FORMATS = ("none", "safetensors", "gguf")
+GGUF_VISION = layout.GGUF_VISION
+TargetFormat = Literal["mlx-affine", "gguf"]
+VisionFormat = Literal["none", "safetensors", "gguf"]
+TARGET_FORMATS: tuple[TargetFormat, ...] = ("mlx-affine", "gguf")
+VISION_FORMATS: tuple[VisionFormat, ...] = ("none", "safetensors", "gguf")
 RECORD_KEYS = {
     "version",
     "model",
@@ -67,9 +70,9 @@ def build(models_root: Path, record, files) -> Path:
             link = stage / name
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(path.absolute())
-        _write_durably(stage / "model.json", encoded)
+        _write_durably(stage / layout.ASSEMBLY_RECORD, encoded)
 
-    destination = models_root / ".resolved" / hashlib.sha256(encoded).hexdigest()
+    destination = models_root / layout.RESOLVED / hashlib.sha256(encoded).hexdigest()
     _reuse_or_write(destination, write, verify)
     return destination
 
@@ -84,10 +87,13 @@ def _reuse_or_write(destination, write, check):
             check(destination)
             return
         except (models.ModelError, OSError) as error:
-            print(f"Rebuilding the damaged {destination}: {error}", flush=True)
+            print(
+                f"Rebuilding the damaged {models.dim(destination)}: {error}",
+                flush=True,
+            )
             shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=models.ENTRY_STAGING, dir=destination.parent))
+    stage = Path(tempfile.mkdtemp(prefix=layout.ENTRY_STAGING, dir=destination.parent))
     try:
         write(stage)
         os.rename(stage, destination)
@@ -146,7 +152,7 @@ def verify(assembly: Path, *, full=False):
     records, and each assembly path still links the file it records, with
     the recorded size and times (with full, the recorded content). Needs no
     Hub access."""
-    record = models.read_json(assembly / "model.json")
+    record = models.read_json(assembly / layout.ASSEMBLY_RECORD)
     if not _well_formed(record):
         raise models.ModelError("invalid resolved model record")
     if _packed_draft(record["files"]):
@@ -182,7 +188,7 @@ def _well_formed(record):
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
         and isinstance(sources, dict)
         # A draft-less family (Granite) records its target source alone.
-        and set(sources) in ({"target"}, {"target", "draft"})
+        and set(sources) in ({layout.TARGET}, {layout.TARGET, layout.DRAFT})
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}
@@ -215,7 +221,9 @@ def _packed_draft(files):
     """Whether the assembly links a packed draft, draft/model.bin and
     draft/layer-N.bin, as assemblies did before drafts were prepared from
     their DFlash2 checkpoints; the runtime loads only a checkpoint now."""
-    return any(name.startswith("draft/") and name.endswith(".bin") for name in files)
+    return any(
+        name.startswith(layout.DRAFT + "/") and name.endswith(".bin") for name in files
+    )
 
 
 def pins(record):
@@ -242,7 +250,7 @@ def recorded_pins(link: Path):
     them whether or not the assembly still verifies; none without a record
     of the shape build writes."""
     try:
-        record = models.read_json(link / "model.json")
+        record = models.read_json(link / layout.ASSEMBLY_RECORD)
     except models.ModelError:
         return []
     return pins(record) if _well_formed(record) else []
@@ -252,7 +260,9 @@ def _metadata_inputs(files):
     """The assembly paths of the GGUF files the derived metadata comes from,
     in order: the target, then the vision projector."""
     targets = [
-        n for n in sorted(files) if n.startswith("target/") and n.endswith(".gguf")
+        n
+        for n in sorted(files)
+        if n.startswith(layout.TARGET + "/") and n.endswith(".gguf")
     ]
     return targets + ([GGUF_VISION] if GGUF_VISION in files else [])
 
@@ -297,18 +307,18 @@ def derived_metadata(models_root: Path, files):
         hashes = {
             name: hashlib.sha256(data).hexdigest() for name, data in contents.items()
         }
-        _write_durably(stage / "files.json", models.json_bytes(hashes))
+        _write_durably(stage / layout.METADATA_RECORD, models.json_bytes(hashes))
 
-    entry = models_root / ".metadata" / key
+    entry = models_root / layout.METADATA / key
     _reuse_or_write(entry, write, _check_metadata)
     derived = {name: entry / name for name in gguf.DERIVED_FILES}
-    derived["tokenizer/config.json"] = entry / "config.json"
+    derived[layout.TOKENIZER + "/config.json"] = entry / "config.json"
     return key, derived
 
 
 def _check_metadata(entry):
     """Raise unless a metadata entry holds its files as its files.json lists them."""
-    hashes = models.read_json(entry / "files.json")
+    hashes = models.read_json(entry / layout.METADATA_RECORD)
     if set(hashes) != set(gguf.DERIVED_FILES):
         raise models.ModelError("invalid prepared GGUF metadata record")
     for name in gguf.DERIVED_FILES:
@@ -327,7 +337,7 @@ def hold(link: Path, models_root: Path):
         return link, None
     with models.installation_lock(models_root):
         assembly = link.resolve(strict=True)
-        record = (assembly / "model.json").open("rb")
+        record = (assembly / layout.ASSEMBLY_RECORD).open("rb")
         fcntl.flock(record, fcntl.LOCK_SH)
     return assembly, record
 
@@ -335,7 +345,7 @@ def hold(link: Path, models_root: Path):
 def is_held(assembly: Path) -> bool:
     """Whether a server holds the assembly (hold)."""
     try:
-        with (assembly / "model.json").open("rb") as record:
+        with (assembly / layout.ASSEMBLY_RECORD).open("rb") as record:
             fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return True
@@ -349,8 +359,15 @@ def collect_garbage(models_root: Path):
     and no server holds, metadata entries the remaining assemblies do not
     link, and staging an interrupted installation left. Call it under the
     installation lock, where all of these are written."""
-    resolved, derived = models_root / ".resolved", models_root / ".metadata"
+    resolved = models_root / layout.RESOLVED
+    derived = models_root / layout.METADATA
     linked = {link.resolve() for link in models.selection_links(models_root)}
+    # Locally packed packages (install/pack.py) are collected like
+    # assemblies: a package no selection links is deleted, its staging too.
+    packed = models_root / layout.PACKED
+    for entry in sorted(packed.iterdir()) if packed.is_dir() else ():
+        if entry.name.startswith(layout.PACK_STAGING) or entry not in linked:
+            shutil.rmtree(entry, ignore_errors=True)
     used = set()
     for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
         if assembly not in linked and not is_held(assembly):
@@ -358,7 +375,7 @@ def collect_garbage(models_root: Path):
             continue
         # A damaged record protects no metadata: its assembly is rebuilt.
         try:
-            files = models.read_json(assembly / "model.json").get("files")
+            files = models.read_json(assembly / layout.ASSEMBLY_RECORD).get("files")
         except models.ModelError:
             continue
         for entry in files.values() if isinstance(files, dict) else ():
@@ -368,5 +385,5 @@ def collect_garbage(models_root: Path):
     for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
         if entry.name not in used:
             shutil.rmtree(entry)
-    for stage in models_root.glob(f"*/{models.LINK_STAGING}*"):
+    for stage in models_root.glob(f"*/{layout.LINK_STAGING}*"):
         shutil.rmtree(stage)

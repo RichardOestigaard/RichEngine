@@ -125,20 +125,31 @@ SHARED_PREFIX_PROBE = {"role": "user", "content": "⁣"}
 IMAGE_RENDER_MARKER = f"__richengine_image_{secrets.token_hex(16)}__"
 
 
-def _generation_prompt(probed, rendered, tokens):
-    """Whether the generation prompt opens a think block, and how many of the
-    prompt's last tokens it is (zero where they differ from its tokens).
-    `probed` is its text and tokens, as the startup probe found them for the
-    request's template options, and the rendered prompt must end with that
-    text."""
+def _generation_prompt(
+    probed, rendered, tokens, *, think_open="<think>", think_end=THINK_END,
+    think_flag=None,
+):
+    """Whether generation opens a think block, and how many of the prompt's
+    last tokens the generation prompt is (zero where they differ from its
+    tokens). `probed` is its text and tokens, as the startup probe found
+    them for the request's template options, and the rendered prompt must
+    end with that text.
+
+    Generation thinks where the prompt ends inside an open think block, or
+    where the model writes the block's open itself and the template marks
+    the prompt with the family's thinking flag (Gemma 4's think token in
+    its system turn)."""
     text, ids = probed
     if not text or not rendered.endswith(text):
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
         )
     count = len(ids)
+    thinking = text.rfind(think_open) > text.rfind(think_end) or (
+        think_flag is not None and think_flag in rendered
+    )
     return (
-        text.rfind("<think>") > text.rfind(THINK_END),
+        thinking,
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -297,6 +308,10 @@ class Frontend:
         self.think_end_id = (
             THINK_END_TOKEN_ID if contract is None else contract.think_end_id
         )
+        # The think block's spellings; the defaults are Qwen's.
+        self.think_open = "<think>" if contract is None else contract.think_open
+        self.think_end = THINK_END if contract is None else contract.think_end
+        self.think_flag = None if contract is None else contract.think_flag
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, None if contract is None else contract.marker
         )
@@ -602,20 +617,40 @@ class Frontend:
         add_special = body.get("add_special", False)
         if not isinstance(add_special, bool):
             raise APIError(400, "add_special must be a boolean")
-        for option, supported in (("parse_special", True), ("with_pieces", False)):
+        for option, supported in (("parse_special", True),):
             if body.get(option, supported) is not supported:
                 raise APIError(
                     400, f"only {option}={str(supported).lower()} is supported"
                 )
+        with_pieces = body.get("with_pieces", False)
+        if not isinstance(with_pieces, bool):
+            raise APIError(400, "with_pieces must be a boolean")
         with self._preparation(deadline):
             try:
-                tokens = self._tokenize(content, add_special_tokens=add_special)[
-                    "input_ids"
-                ]
+                encoded = self._tokenize(
+                    content,
+                    add_special_tokens=add_special,
+                    **(
+                        {"return_offsets_mapping": True}
+                        if with_pieces
+                        else {}
+                    ),
+                )
+            except NotImplementedError as error:
+                raise APIError(
+                    400, "this tokenizer cannot report token offsets"
+                ) from error
             except Exception as error:
                 raise APIError(400, "content could not be tokenized") from error
             remaining_request_time(deadline)
-            return tokens
+            response = {"tokens": encoded["input_ids"]}
+            if with_pieces:
+                # Char spans into `content` for each id; specials report (0, 0).
+                offsets = encoded.get("offset_mapping") or []
+                response["offsets"] = [
+                    [int(start), int(end)] for start, end in offsets
+                ]
+            return response
 
     def _priority(self, body):
         priority_name = body.get("priority", "normal")
@@ -962,9 +997,25 @@ class Frontend:
         remaining_request_time(deadline)
         thinking, generation_prompt_tokens = False, 0
         if add_generation_prompt:
-            thinking, generation_prompt_tokens = _generation_prompt(
-                chat_template.generation_prompt(template), rendered, tokens
-            )
+            probed = chat_template.generation_prompt(template)
+            if not probed[0] and chat_template.prompt_varies(template):
+                # The startup probe found no generation prompt common to
+                # its conversations: this template appends different text
+                # depending on the last turn (Gemma 4 appends nothing after
+                # a tool response). The request's own is the suffix over
+                # the same conversation rendered without it.
+                probed = self._request_generation_prompt(
+                    prompt.messages, template, rendered, tokens
+                )
+            if probed[0] or not chat_template.prompt_varies(template):
+                thinking, generation_prompt_tokens = _generation_prompt(
+                    probed,
+                    rendered,
+                    tokens,
+                    think_open=self.think_open,
+                    think_end=self.think_end,
+                    think_flag=self.think_flag,
+                )
         requested = template.get("enable_thinking")
         if (
             add_generation_prompt
@@ -996,6 +1047,25 @@ class Frontend:
             generation_prompt_tokens,
             shared_prefix_tokens,
         )
+
+    def _request_generation_prompt(self, messages, template, rendered, tokens):
+        """This request's generation prompt as a (text, tokens) pair, when
+        no probe conversation's prompt could stand for it: the suffix the
+        same render gains from add_generation_prompt, with its token count
+        where the prompt's tokens are a suffix of the prompt's."""
+        history = self._apply_chat_template(
+            messages, {**template, "add_generation_prompt": False}
+        )
+        if not rendered.startswith(history):
+            return "", ()
+        suffix = rendered[len(history) :]
+        if not suffix:
+            return "", ()
+        history_tokens = self.prompt_tokenizer.encode(history)
+        count = len(history_tokens)
+        ids = tokens[count:] if tokens[:count] == history_tokens else ()
+        return suffix, tuple(ids)
+
 
     def _prepare(
         self,
@@ -1079,7 +1149,10 @@ class Frontend:
                 else:
                     constraint = self.constraint_factory.create(
                         json_grammar(
-                            response_schema, thinking, think_end_id=self.think_end_id
+                            response_schema,
+                            thinking,
+                            think_end_id=self.think_end_id,
+                            think_end_text=self.think_end,
                         ),
                         timeout=remaining_request_time(deadline),
                     )
@@ -1235,6 +1308,8 @@ class Frontend:
                 if options.ignore_eos
                 else wire.RequestFlag(0)
             ),
+            think_open=self.think_open,
+            think_end=self.think_end,
             public_id=secrets.token_hex(16),
             **fields,
         )

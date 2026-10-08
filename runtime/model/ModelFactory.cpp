@@ -4,7 +4,7 @@
 #include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 
 #include <functional>
 #include <limits>
@@ -37,39 +37,56 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const QwenTargetFiles<Qwen3_8Layout> &files) {
+                         const TargetFiles<Qwen3_8Layout> &files) {
   return loadQwen3_8Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Ornith9BLayout &layout,
-                         const QwenTargetFiles<Ornith9BLayout> &files) {
+                         const TargetFiles<Ornith9BLayout> &files) {
   return loadOrnith9BWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
+                         const TargetFiles<Qwen3_6MoeLayout> &files) {
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const DenseLayout &layout,
-                         const QwenTargetFiles<DenseLayout> &files) {
+                         const TargetFiles<DenseLayout> &files) {
   return loadDenseWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2Layout &layout,
-                         const QwenTargetFiles<Lfm2Layout> &files) {
+                         const TargetFiles<Lfm2Layout> &files) {
   return loadLfm2Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2MoeLayout &layout,
-                         const QwenTargetFiles<Lfm2MoeLayout> &files) {
+                         const TargetFiles<Lfm2MoeLayout> &files) {
   return loadLfm2MoeWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const GraniteLayout &layout,
-                         const QwenTargetFiles<GraniteLayout> &files) {
+                         const TargetFiles<GraniteLayout> &files) {
   return loadGraniteWeights(backend, layout, files);
 }
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Gemma4MoeLayout &layout,
+                         const TargetFiles<Gemma4MoeLayout> &files) {
+  return loadGemma4MoeWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend,
+                         const DiffusionGemmaLayout &layout,
+                         const TargetFiles<DiffusionGemmaLayout> &files) {
+  return loadDiffusionGemmaWeights(backend, layout, files);
+}
+
+// Whether the layout declares packed-only loading
+// (Gemma4MoeLayout::packedOnly): true only where the member exists and is
+// true, false for a layout without it.
+template <class Layout>
+concept PackedOnlyLayout = requires { requires Layout::packedOnly; };
 
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
   uint64_t total = 0;
@@ -92,14 +109,14 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   const bool nullDraft = result.descriptor.draft.kind == DraftKind::Null;
-  const bool plainDraft = result.descriptor.draft.kind == DraftKind::Plain;
+  const bool dflashV1Draft = result.descriptor.draft.kind == DraftKind::DFlashV1;
   const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
-  std::optional<DraftCheckpointLoader> draft;
-  std::optional<PlainDraftCheckpointLoader> plainDraftLoader;
+  std::optional<DFlash2CheckpointLoader> draft;
+  std::optional<DFlashV1DraftCheckpointLoader> dflashV1DraftLoader;
   std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
   if (result.descriptor.draftFromCheckpoint() && !nullDraft) {
-    if (plainDraft)
-      plainDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
+    if (dflashV1Draft)
+      dflashV1DraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else if (dsparkDraft)
       dsparkDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else
@@ -111,14 +128,28 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Packed:
-          return readTarget(backend, layout, PackedTargetFiles<Layout>{images, directory, layout});
+          return readTarget(backend, layout,
+                            PackedTargetFiles<Layout>{images, directory, layout,
+                                                      result.descriptor.packedTiledEmbedding});
         case TargetSource::Mlx: {
-          AffineTargetLoader loader(images, directory, layout);
-          return readTarget(backend, layout, std::ref(loader));
+          // A packed-only layout declares it (Gemma4MoeLayout::packedOnly);
+          // the affine and GGUF planners have no tensor map for it.
+          if constexpr (PackedOnlyLayout<Layout>)
+            throw std::invalid_argument(
+                "this target loads from packed files only");
+          else {
+            AffineTargetLoader loader(images, directory, layout);
+            return readTarget(backend, layout, std::ref(loader));
+          }
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
-          return readTarget(backend, layout, std::ref(loader));
+          if constexpr (PackedOnlyLayout<Layout>)
+            throw std::invalid_argument(
+                "this target loads from packed files only");
+          else {
+            GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
+            return readTarget(backend, layout, std::ref(loader));
+          }
         }
         }
         throw std::invalid_argument("unknown target source");
@@ -126,12 +157,12 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
       result.descriptor.target);
   if (nullDraft) {
     result.draft = NullDraftWeights{result.descriptor.draft, {}, 0};
-  } else if (plainDraft) {
-    result.draft = loadPlainDraftWeights(
+  } else if (dflashV1Draft) {
+    result.draft = loadDFlashV1DraftWeights(
         backend,
-        plainDraftLoader
-            ? PlainDraftFiles(std::ref(*plainDraftLoader))
-            : PlainDraftFiles(PackedPlainDraftFiles{images, root / "draft", result.descriptor.draft}),
+        dflashV1DraftLoader
+            ? DFlashV1DraftFiles(std::ref(*dflashV1DraftLoader))
+            : DFlashV1DraftFiles(PackedDFlashV1DraftFiles{images, root / "draft", result.descriptor.draft}),
         result.descriptor.draft);
   } else if (dsparkDraft) {
     result.draft = loadDSparkDraftWeights(
@@ -190,8 +221,8 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   }
   if (descriptor.draftFromCheckpoint() &&
       descriptor.draft.kind != DraftKind::Null)
-    bytes += descriptor.draft.kind == DraftKind::Plain
-                 ? imageBytes(plainDraftCheckpointImages(descriptor.draft))
+    bytes += descriptor.draft.kind == DraftKind::DFlashV1
+                 ? imageBytes(dflashV1DraftCheckpointImages(descriptor.draft))
                  : descriptor.draft.kind == DraftKind::DSpark
                        ? imageBytes(dsparkDraftCheckpointImages(descriptor.draft))
                        : imageBytes(draftCheckpointImages(descriptor.draft));
@@ -199,7 +230,11 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     bytes += visionImageBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
-    if (directory == "draft" && descriptor.draftFromCheckpoint()) continue;
+    if (directory == "draft" &&
+        (descriptor.draftFromCheckpoint() ||
+         descriptor.draft.kind == DraftKind::Null))
+      continue;
+    if (!std::filesystem::exists(root / directory)) continue;
     if (directory == "target" && descriptor.targetSource != TargetSource::Packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(root / directory)) {
       if (!entry.is_regular_file()) continue;

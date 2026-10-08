@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MetalBackend.hpp"
+#include "Tuning.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,75 @@ public:
                               payloads_.back().data(), sizeof(Params)});
   }
 
+  // A dispatch whose kernel takes two constant payloads after its buffers,
+  // `params` at index n and `tail` at n + 1 (the paged attention splits'
+  // window_tokens argument).
+  template <class Params, class Tail>
+  void addTail(std::string pipeline, std::vector<MetalBuffer> buffers,
+               const Params &params, const Tail &tail, DispatchSize groups,
+               DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    static_assert(std::is_trivially_copyable_v<Params> &&
+                      std::is_trivially_copyable_v<Tail>,
+                  "dispatch parameters must be plain data");
+    payloads_.emplace_back(sizeof(Params));
+    std::vector<std::byte> &first = payloads_.back();
+    std::memcpy(first.data(), &params, sizeof(Params));
+    payloads_.emplace_back(sizeof(Tail));
+    std::vector<std::byte> &second = payloads_.back();
+    std::memcpy(second.data(), &tail, sizeof(Tail));
+    ComputeDispatch &dispatch =
+        push(std::move(pipeline), std::move(buffers), groups, threads);
+    const uint32_t at = static_cast<uint32_t>(dispatch.buffers.size());
+    dispatch.bytes.push_back({at, first.data(), sizeof(Params)});
+    dispatch.bytes.push_back({at + 1, second.data(), sizeof(Tail)});
+  }
+
+  // A dispatch whose parameter payload binds at `paramsIndex`, which may sit
+  // before the last buffer: `buffers` holds the payload-free indices in
+  // order — the entry that would land at `paramsIndex` binds at
+  // paramsIndex + 1 instead (canvas_entropy_accept keeps a device buffer at
+  // index 7 behind its constant parameters at index 6).
+  template <class Params>
+  void addParamsAt(std::string pipeline, std::vector<MetalBuffer> buffers,
+                   const Params &params, uint32_t paramsIndex,
+                   DispatchSize groups,
+                   DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    static_assert(std::is_trivially_copyable_v<Params>,
+                  "dispatch parameters must be plain data");
+    if (paramsIndex > buffers.size()) {
+      throw std::invalid_argument(
+          "dispatch parameter index past the buffer list");
+    }
+    ComputeDispatch &dispatch = push(std::move(pipeline), {},
+                                   groups, threads);
+    dispatch.buffers.reserve(buffers.size());
+    for (uint32_t index = 0; index < buffers.size(); ++index) {
+      const uint32_t at = index < paramsIndex ? index : index + 1;
+      dispatch.buffers.push_back({at, std::move(buffers[index])});
+    }
+    payloads_.emplace_back(sizeof(Params));
+    std::memcpy(payloads_.back().data(), &params, sizeof(Params));
+    dispatch.bytes.push_back(
+        {paramsIndex, payloads_.back().data(), sizeof(Params)});
+  }
+
+  // The two-payload form of addPatchable().
+  template <class Params, class Tail>
+  void addPatchableTail(std::string pipeline,
+                        std::vector<MetalBuffer> buffers,
+                        const Params &params, const Tail &tail,
+                        DispatchSize groups,
+                        DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    addTail(std::move(pipeline), std::move(buffers), params, tail, groups,
+            threads);
+    static const bool disabled = tuning().patchableOff;
+    if (disabled) {
+      dispatches_.back().bakeable = false;
+    } else {
+      dispatches_.back().patchableBytes = true;
+    }
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.
@@ -72,8 +142,7 @@ public:
                     const Params &params, DispatchSize groups,
                     DispatchSize threads = {kDefaultThreads, 1, 1}) {
     add(std::move(pipeline), std::move(buffers), params, groups, threads);
-    static const bool disabled =
-        std::getenv("RICHENGINE_PATCHABLE_OFF") != nullptr;
+    static const bool disabled = tuning().patchableOff;
     if (disabled) {
       dispatches_.back().bakeable = false;
     } else {

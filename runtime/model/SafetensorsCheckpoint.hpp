@@ -20,6 +20,9 @@ public:
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
   void requireConfigNumber(std::string_view key, double expected) const;
+  // Passes when `key` is absent or equals `expected`; for fields such as
+  // `attention_bias` whose configs omit the default value.
+  void requireConfigNumberOrAbsent(std::string_view key, double expected) const;
   // The source may declare a smaller value than `maximum` (e.g. a context
   // budget narrower than the layout's); larger values are rejected.
   void requireConfigNumberAtMost(std::string_view key, double maximum) const;

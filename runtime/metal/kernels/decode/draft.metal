@@ -591,11 +591,16 @@ inline void draft_attention_split_impl(
     constant DraftAttentionBatchParams &params, threadgroup float *workspace,
     uint3 group, uint thread_index, uint lane, uint simd_group) {
   constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
-  // The lane's grouped query rows: M / Rows query heads per KV head.
-  constexpr ulong Attention = ulong(M) / Rows * KVHeads * HeadDim;
+  // M rows of a KV group's head block per threadgroup: at 8-row blocks the
+  // tile covers the group's M/8 heads outright; wider blocks split the group
+  // into Rows/8 head tiles, which group.x walks before the KV head.
+  constexpr uint RowTiles = Rows / 8;
+  static_assert(RowTiles >= 1 && (M / 8) * Rows % M == 0,
+                "draft attention head tiles do not tile the KV group");
+  constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
   constexpr ulong Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
-  uint batch = group.y;
+  uint batch = group.y, kv_head = group.x / RowTiles;
   device bfloat *keys =
       batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
   device bfloat *values = batch == 0
@@ -605,14 +610,14 @@ inline void draft_attention_split_impl(
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
-      ((batch * KVHeads + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS + group.z) *
+      ((batch * KVHeads * RowTiles + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS + group.z) *
           PartialFloats;
   draft_attention_split_phase<M, N, HeadDim>(
       queries + batch * Rows * Attention + group.x * M * HeadDim,
-      keys + group.x * Window * HeadDim, values + group.x * Window * HeadDim,
-      query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
+      keys + kv_head * Window * HeadDim, values + kv_head * Window * HeadDim,
+      query_keys + batch * KVHeads * Rows * HeadDim + kv_head * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
-          group.x * Rows * HeadDim,
+          kv_head * Rows * HeadDim,
       partials, params.value_stride, params.cache_length[batch], params.window,
       group.z, params.causal != 0, workspace, workspace + M * N,
       workspace + M * N + M, workspace + M * N + 2 * M, thread_index, lane,
@@ -690,13 +695,14 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
                                         constant DraftAttentionBatchParams &params,
                                         uint2 group, uint thread_index) {
   constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
-  constexpr ulong Attention = ulong(M) / Rows * KVHeads * HeadDim;
+  constexpr ulong RowTiles = Rows / 8;
+  constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y;
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
-      (batch * KVHeads + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS *
+      (batch * KVHeads * RowTiles + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS *
           PartialFloats;
   draft_attention_reduce_phase<M, HeadDim>(
       partials,

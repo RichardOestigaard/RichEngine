@@ -131,9 +131,45 @@ struct Layout final {
   // head dimension's default 1/sqrt(d). Granite declares a fixed
   // attention_multiplier (1/d) instead.
   float scoreScale = 0.0F;
+  // A second KV geometry in the same pool (Gemma 4's k_eq_v global layers):
+  // layers whose bit of altLayerMask is set hold pages of altKvHeads x
+  // altHeadDimension instead of kvHeads x headDimension. The layer's region
+  // still holds K, K scales, V and V scales in order; a k_eq_v layer's V
+  // region receives the normalized K rows its QKV kernel writes to the value
+  // slot. All zero keeps every layer uniform.
+  uint32_t altKvHeads = 0;
+  uint32_t altHeadDimension = 0;
+  uint64_t altLayerMask = 0;
+  // The trailing context window the split kernels mask to (the sliding
+  // layers' window in tokens); zero is full causal attention. Storage
+  // geometry ignores it — a windowed layer's pages are page-identical to a
+  // full layer's — so it travels on the per-layer layout the attention
+  // dispatches take, not on the pool's.
+  uint32_t windowTokens = 0;
+
+  [[nodiscard]] constexpr bool isAltLayer(uint32_t layer) const noexcept {
+    return layer < 64 && ((altLayerMask >> layer) & 1);
+  }
+  [[nodiscard]] constexpr uint32_t kvHeadsAt(uint32_t layer) const noexcept {
+    return isAltLayer(layer) ? altKvHeads : kvHeads;
+  }
+  [[nodiscard]] constexpr uint32_t headDimensionAt(uint32_t layer) const noexcept {
+    return isAltLayer(layer) ? altHeadDimension : headDimension;
+  }
+  // The uniform one-layer layout a layer's kernels take.
+  [[nodiscard]] constexpr Layout layerLayout(uint32_t layer) const noexcept {
+    return {1, kvHeadsAt(layer), headDimensionAt(layer), format, scoreScale,
+            0, 0, 0, windowTokens};
+  }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return attentionLayers && kvHeads && headDimension && validFormat(format);
+    if (!attentionLayers || !kvHeads || !headDimension || !validFormat(format))
+      return false;
+    if (!altLayerMask)
+      return true;
+    // An alternate geometry names only attention layers of this model.
+    return altKvHeads && altHeadDimension && attentionLayers <= 64 &&
+           !(altLayerMask >> attentionLayers);
   }
   [[nodiscard]] constexpr bool quantized() const noexcept {
     return format != Format::BFloat16;
@@ -142,14 +178,26 @@ struct Layout final {
     return quantized() ? headDimension : 0;
   }
   [[nodiscard]] constexpr uint64_t elementsPerLayerPage() const noexcept {
-    return uint64_t{kPageTokens} * kvHeads * headDimension;
+    return elementsPerLayerPageAt(0);
+  }
+  [[nodiscard]] constexpr uint64_t elementsPerLayerPageAt(
+      uint32_t layer) const noexcept {
+    return uint64_t{kPageTokens} * kvHeadsAt(layer) * headDimensionAt(layer);
   }
   [[nodiscard]] constexpr uint64_t scalesPerTensorLayerPage() const noexcept {
-    return quantized() ? uint64_t{kPageTokens} * kvHeads : 0;
+    return scalesPerTensorLayerPageAt(0);
+  }
+  [[nodiscard]] constexpr uint64_t scalesPerTensorLayerPageAt(
+      uint32_t layer) const noexcept {
+    return quantized() ? uint64_t{kPageTokens} * kvHeadsAt(layer) : 0;
   }
   // Keys and values share one data and one scale geometry per layer page.
   [[nodiscard]] constexpr uint64_t dataBytesPerLayerPage() const noexcept {
-    const uint64_t elements = elementsPerLayerPage();
+    return dataBytesPerLayerPageAt(0);
+  }
+  [[nodiscard]] constexpr uint64_t dataBytesPerLayerPageAt(
+      uint32_t layer) const noexcept {
+    const uint64_t elements = elementsPerLayerPageAt(layer);
     if (format == Format::BFloat16)
       return elements * 2;
     if (format == Format::Int4)
@@ -158,13 +206,24 @@ struct Layout final {
     return elements;
   }
   [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPage() const noexcept {
-    return scalesPerTensorLayerPage() * sizeof(float);
+    return scaleBytesPerLayerPageAt(0);
+  }
+  [[nodiscard]] constexpr uint64_t scaleBytesPerLayerPageAt(
+      uint32_t layer) const noexcept {
+    return scalesPerTensorLayerPageAt(layer) * sizeof(float);
   }
   [[nodiscard]] constexpr uint64_t bytesPerLayerPage() const noexcept {
-    return 2 * (dataBytesPerLayerPage() + scaleBytesPerLayerPage());
+    return bytesPerLayerPageAt(0);
+  }
+  [[nodiscard]] constexpr uint64_t bytesPerLayerPageAt(
+      uint32_t layer) const noexcept {
+    return 2 * (dataBytesPerLayerPageAt(layer) + scaleBytesPerLayerPageAt(layer));
   }
   [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
-    return uint64_t{attentionLayers} * bytesPerLayerPage();
+    uint64_t total = 0;
+    for (uint32_t layer = 0; layer < attentionLayers; ++layer)
+      total += bytesPerLayerPageAt(layer);
+    return total;
   }
 
   // An extent holds a whole number of these pages, so that every tensor
@@ -173,12 +232,26 @@ struct Layout final {
   // needs only 1 or 2 pages. This is allocation geometry only; prefix
   // matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
-    if (format == Format::BFloat16)
-      return static_cast<uint32_t>(
-          detail::pagesForAlignedRegion(dataBytesPerLayerPage()));
-    return static_cast<uint32_t>(detail::lcm(
-        detail::pagesForAlignedRegion(dataBytesPerLayerPage()),
-        detail::pagesForAlignedRegion(scaleBytesPerLayerPage())));
+    uint64_t pages;
+    if (format == Format::BFloat16) {
+      pages = detail::pagesForAlignedRegion(dataBytesPerLayerPageAt(0));
+    } else {
+      pages = detail::lcm(
+          detail::pagesForAlignedRegion(dataBytesPerLayerPageAt(0)),
+          detail::pagesForAlignedRegion(scaleBytesPerLayerPageAt(0)));
+    }
+    if (altLayerMask) {
+      // A layer's region is (data + scales) * 2 for keys and values; align
+      // each geometry's regions, not just the primary's.
+      const uint32_t altLayer =
+          static_cast<uint32_t>(__builtin_ctzll(altLayerMask));
+      const uint64_t altData = dataBytesPerLayerPageAt(altLayer);
+      const uint64_t altScale = scaleBytesPerLayerPageAt(altLayer);
+      pages = detail::lcm(pages, detail::pagesForAlignedRegion(altData));
+      if (altScale)
+        pages = detail::lcm(pages, detail::pagesForAlignedRegion(altScale));
+    }
+    return static_cast<uint32_t>(pages);
   }
 
   // Extents hold whole alignment units, between half and one and a half

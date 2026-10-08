@@ -1,8 +1,8 @@
 #pragma once
 
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -14,7 +14,7 @@ namespace richengine::model {
 struct Qwen3_8Layout final : QwenHybridLayout<5> {
   static constexpr std::string_view layerMagic = "MDFL0006";
   static constexpr std::string_view headMagic = "MDFL0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::Dense;
+  static constexpr FfnKind ffnKind = FfnKind::Dense;
 
   uint32_t intermediateSize = 17408;
 
@@ -41,19 +41,19 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
   bool operator==(const Qwen3_8Layout &) const = default;
 };
 
-struct Qwen3_8LayerWeights final {
+struct DenseLayerWeights final {
   ops::NormWeights inputNorm;
-  QwenMixerWeights mixer;
+  MixerWeights mixer;
   ops::NormWeights postAttentionNorm;
   ops::Projection gateProjection;
   ops::Projection upProjection;
   ops::Projection downProjection;
 };
 
-using Qwen3_8Weights = QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights>;
+using Qwen3_8Weights = TargetModelWeights<Qwen3_8Layout, DenseLayerWeights>;
 
 [[nodiscard]] Qwen3_8Weights
 loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                   const QwenTargetFiles<Qwen3_8Layout> &files);
+                   const TargetFiles<Qwen3_8Layout> &files);
 
 } // namespace richengine::model

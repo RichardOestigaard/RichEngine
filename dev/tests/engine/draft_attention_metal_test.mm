@@ -30,7 +30,7 @@ using richengine::metal::MetalBuffer;
 using richengine::metal::CommandGraph;
 using namespace richengine::ops;
 
-constexpr uint32_t kRows = 8;
+constexpr uint32_t kRows = RICHENGINE_DRAFT_QUERY_ROWS;
 constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
@@ -42,7 +42,8 @@ constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
 constexpr uint32_t kSplits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
-constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
+constexpr uint64_t kPartialBytes =
+    uint64_t{kQueryHeadsPerKv} * kRows * (kHeadDim + 2) * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
 constexpr float kScale = 0.08838834765F;
@@ -190,10 +191,10 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
-              dispatches[0].threadgroups.x == kKvHeads &&
+              dispatches[0].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[0].threadgroups.y == lanes &&
               dispatches[0].threadgroups.z == kSplits &&
-              dispatches[1].threadgroups.x == kKvHeads &&
+              dispatches[1].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
           "draft attention core dispatch changed");
@@ -383,8 +384,8 @@ void planGeometry() {
                   workspace.groupedQueriesBytes ==
                       rows * 4096 * 2 +
                           uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
-                  workspace.queryKeysBytes == rows * 8 * 128 * 2 &&
-                  workspace.queryValuesBytes == rows * 8 * 128 * 2,
+                  workspace.queryKeysBytes == rows * kKvHeads * kHeadDim * 2 &&
+                  workspace.queryValuesBytes == rows * kKvHeads * kHeadDim * 2,
               "draft plan padded lanes or changed tensor storage");
     }
     rejects([&] { (void)DraftAttention::plan(shape, 0); });
@@ -764,6 +765,14 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    // The Gemma 4 DFlash draft geometry: a plain draft (no convolutions) of
+    // hidden 2816 over the shared 32x8x128 head pattern.
+    const DraftAttentionShape gemma{
+        2816, 0, 6144, 4096, 32, 8, 128, 0, kWindow};
+    runCaseGeneric(backend, 1, gemma, {58, 0, 0, 0});
+    runCaseGeneric(backend, 2, gemma, {2048, 2047, 0, 0});
+    runCaseGeneric(backend, 4, gemma, {512, 513, 1024, 1536});
+    contextWriters(backend, gemma);
     // The MiniCPM5 DSpark geometry: 16 query heads over 2 KV heads of 128.
     const DraftAttentionShape dense{
         2048, 0, 2560, 2048, 16, 2, 128, 0, kWindow};

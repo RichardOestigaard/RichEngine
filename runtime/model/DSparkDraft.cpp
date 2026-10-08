@@ -44,7 +44,7 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   }
   std::vector<ops::Projection> result;
   result.reserve(weights.layers.size());
-  for (const PlainDraftLayerWeights &layer : weights.layers) {
+  for (const DFlashV1DraftLayerWeights &layer : weights.layers) {
     const ops::AffineWeights &fused = layer.qkvProjection.affine();
     const auto rows = [&](const metal::MetalBuffer &plane) {
       const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;
@@ -71,8 +71,14 @@ DSparkDraft::DSparkDraft(const DSparkDraftWeights &weights,
 void DSparkDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies,
-    uint32_t /*treeMask*/) const {
+    std::span<const ops::SamplingPolicy> policies, uint32_t treeMask) const {
+  if (treeMask) {
+    selector_.addDSparkTree(
+        graph, buffers,
+        {weights_.markovEmbedding, weights_.markovProjection}, anchors,
+        policies, treeMask);
+    return;
+  }
   selector_.addDSpark(graph, buffers,
                       {weights_.markovEmbedding, weights_.markovProjection},
                       anchors, policies);
@@ -149,7 +155,7 @@ void DSparkDraft::addDecode(
     const uint32_t current = layer & 1;
     const uint32_t next = current ^ 1;
     const bool causal = (layout.causalLayers >> layer) & 1;
-    const PlainDraftLayerWeights &weights = weights_.layers[layer];
+    const DFlashV1DraftLayerWeights &weights = weights_.layers[layer];
     const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes);
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
@@ -262,7 +268,7 @@ DSparkDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     WeightFile file = files.layer(layerIndex);
-    PlainDraftLayerWeights layer;
+    DFlashV1DraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.inputNorm.rmsEpsilon = layout.rmsEpsilon;
     layer.qkvProjection = readAffineProjection(

@@ -10,7 +10,9 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/WeightStore.hpp"
 #include "../../../runtime/ops/ExecutionPlans.hpp"
+#include "../../../runtime/ops/KernelNames.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/MoE.h"
 
 #import <Foundation/Foundation.h>
@@ -31,6 +33,7 @@
 
 namespace {
 
+using richengine::kAssumedGpuCores;
 using richengine::metal::BackendInstrumentation;
 using richengine::metal::BufferStorage;
 using richengine::metal::CommandGraph;
@@ -39,9 +42,9 @@ using richengine::metal::MetalBuffer;
 using richengine::model::kBFloat16Bytes;
 using richengine::model::q4PackedBytes;
 using richengine::ops::AffineMoeWeights;
+using richengine::ops::DevicePolicy;
 using richengine::ops::ExecutionPlans;
 using richengine::ops::ExpertProjection;
-using richengine::ops::kAssumedGpuCores;
 using richengine::ops::kMoeScratchFields;
 using richengine::ops::MoE;
 using richengine::ops::MoeBuffers;
@@ -566,12 +569,20 @@ void planBounds() {
                   plan.splitExperts() && plan.rows() == rows,
               "prefill plans run the split 32-row expert passes over their actual rows");
       checkPlan(plan);
+      // Canvas plans take the 16-row tiles at every row count.
+      const MoePlan canvas = shipped.moeCanvas(shape, rows);
+      require(canvas.configuration() == MoeConfig{MoeExpertTile::M16, moeRouteWideRows(kGpuCores)} &&
+                  canvas.splitExperts() && canvas.rows() == rows &&
+                  canvas.phase() == MoePhase::Canvas,
+              "canvas plans run the split 16-row expert tiles");
+      checkPlan(canvas);
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = shipped.moeDecode(shape, lanes);
       require(plan.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)} &&
-                  !plan.splitExperts() && plan.rows() == lanes * 8,
-              "decode plans run the fused 8-row expert tile over the DFlash rows");
+                  !plan.splitExperts() &&
+                  plan.rows() == lanes * RICHENGINE_TARGET_VERIFY_ROWS,
+              "decode plans run the fused 8-row expert tile over the verify rows");
       checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped plan.
@@ -595,10 +606,10 @@ void planBounds() {
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; an unknown family
   // and families 10 and later keep the shipped tile.
-  require(richengine::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
-              richengine::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
-              richengine::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
-              richengine::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
+  require(richengine::ops::moeDecodeSimdgroups(DevicePolicy{9}) == MoeExpertSimdgroups::Four &&
+              richengine::ops::moeDecodeSimdgroups(DevicePolicy{10}) == MoeExpertSimdgroups::Eight &&
+              richengine::ops::moeDecodeSimdgroups(DevicePolicy{11}) == MoeExpertSimdgroups::Eight &&
+              richengine::ops::moeDecodeSimdgroups(DevicePolicy{0}) == MoeExpertSimdgroups::Eight,
           "decode expert simdgroups are not gated on GPU family 9");
 }
 
@@ -613,23 +624,24 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
           "MoE plan must encode the entire operator");
   const auto route =
       richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
-  const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
-                                             : "moe_route_scores_q8_m32";
+  const std::string scores(route.rows == 8 ? richengine::ops::kMoeRouteScoresQ8M8
+                                           : richengine::ops::kMoeRouteScoresQ8M32);
   const size_t experts = split ? 3 : 4;
   const size_t combine = experts + expertPasses;
   require(dispatches[0].pipelineName == scores &&
-              dispatches[1].pipelineName == "moe_route_select_q8" &&
-              dispatches[2].pipelineName == "moe_group_routes" &&
-              (split || dispatches[3].pipelineName == "moe_gather_rows") &&
-              dispatches[combine].pipelineName == "moe_combine",
+              dispatches[1].pipelineName == richengine::ops::kMoeRouteSelectQ8 &&
+              dispatches[2].pipelineName == richengine::ops::kMoeGroupRoutes &&
+              (split || dispatches[3].pipelineName == richengine::ops::kMoeGatherRows) &&
+              dispatches[combine].pipelineName == richengine::ops::kMoeCombine,
           "MoE plan chose inconsistent pipelines");
   if (split) {
+    const std::string m = plan.tileRows() == 16 ? "_m16" : "_m32";
     require(dispatches[experts].pipelineName ==
-                    "prefill_moe_expert_q4_n256_indirect_m32" &&
+                    std::string(richengine::ops::kPrefillMoeExpertQ4N256Indirect) + m &&
                 dispatches[experts + 1].pipelineName ==
-                    "prefill_moe_expert_q4_n256_up_silu_indirect_m32" &&
+                    std::string(richengine::ops::kPrefillMoeExpertQ4N256UpSiluIndirect) + m &&
                 dispatches[experts + 2].pipelineName ==
-                    "prefill_moe_expert_q4_n256_m32",
+                    std::string(richengine::ops::kPrefillMoeExpertQ4N256) + m,
             "split MoE plan chose inconsistent expert pipelines");
     // The gate parks in expertOutput and the up pass reads it back.
     const auto &gate = dispatches[experts].buffers[6].buffer;
@@ -643,10 +655,10 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
     const bool four = plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
-    const std::string gateUp = four ? "moe_expert_gate_up_q4_m8_n128_sg4"
-                                    : "moe_expert_gate_up_q4_m8";
-    const std::string down = four ? "moe_expert_down_q4_m8_n256_sg4"
-                                  : "moe_expert_down_q4_m8";
+    const std::string gateUp(four ? richengine::ops::kMoeExpertGateUpQ4M8N128Sg4
+                                  : richengine::ops::kMoeExpertGateUpQ4M8);
+    const std::string down(four ? richengine::ops::kMoeExpertDownQ4M8N256Sg4
+                                : richengine::ops::kMoeExpertDownQ4M8);
     require(dispatches[experts].pipelineName == gateUp &&
                 dispatches[experts + 1].pipelineName == down,
             "fused MoE plan chose inconsistent expert pipelines");
@@ -664,7 +676,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
     const bool expertPass = pass >= experts && pass < combine;
     require((expertPass ||
              dispatches[pass].threadsPerThreadgroup.x ==
-                 (dispatches[pass].pipelineName == "moe_group_routes" ? 1024 : 256)) &&
+                 (dispatches[pass].pipelineName == richengine::ops::kMoeGroupRoutes ? 1024 : 256)) &&
                 dispatches[pass].threadsPerThreadgroup.y == 1 &&
                 dispatches[pass].threadsPerThreadgroup.z == 1,
             "MoE plan changed a non-expert threadgroup width");
@@ -685,6 +697,7 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   const ExecutionPlans shipped = plans(10);
   // The split prefill passes and the fused decode tile.
   for (const MoePlan &plan : {shipped.moePrefill(fixture.shape, 33),
+                              shipped.moeCanvas(fixture.shape, 33),
                               shipped.moeDecode(fixture.shape, 4)}) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const char *label) {
@@ -752,7 +765,9 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
     }
   }
   const auto smallTiles = shipped.moeDecode(fixture.shape, 4);
-  const auto largeTiles = shipped.moePrefill(fixture.shape, 33);
+  // 512 rows keeps this prefill plan's scratch bound above the decode
+  // plan's even on the 16-row tiles (prefill <= 256 rows uses M16).
+  const auto largeTiles = shipped.moePrefill(fixture.shape, 512);
   allocateScratch(backend, fixture, smallTiles);
   CommandGraph graph;
   rejects([&] { MoE::add(graph, fixture.buffers, fixture.weights, largeTiles); },
@@ -798,11 +813,11 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
     const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
     CommandGraph graph;
-    graph.add("moe_route_scores_q8_m8",
+    graph.add(std::string(richengine::ops::kMoeRouteScoresQ8M8),
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, narrow},
               params, {(rows + 7) / 8, kStorageColumns / 32, 1});
-    graph.add("moe_route_scores_q8_m32",
+    graph.add(std::string(richengine::ops::kMoeRouteScoresQ8M32),
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
                router.planes.biases, wide},
               params, {(rows + 31) / 32, kStorageColumns / 128, 1});
@@ -922,6 +937,9 @@ void run(const std::string &metallibPath) {
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
                           255U, 256U, 263U, 519U, kMaximumRows})
       (void)execute(shipped.moePrefill(fixture.shape, rows), "prefill rows=" + std::to_string(rows));
+    // The canvas plans run the same routing fixtures on 16-row tiles.
+    for (uint32_t rows : {1U, 9U, 16U, 33U, 100U, 255U, 256U, 263U, 519U})
+      (void)execute(shipped.moeCanvas(fixture.shape, rows), "canvas rows=" + std::to_string(rows));
   }
   std::cout << "moe_metal_test: PASS cases=" << cases
             << " wall_seconds=" << wallSeconds << '\n';

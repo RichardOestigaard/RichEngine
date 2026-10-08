@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, legacy, models
+from . import assembly, families, gguf, hub, layout, legacy, models, pack
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -39,10 +39,11 @@ TOKENIZER_FILES = (
 class Target:
     """What the target repository supplies, known before any weight download."""
 
-    # The record's target_format: "mlx-affine" or "gguf".
-    format: str
+    # The record's target_format: "mlx-affine" or "gguf", or a pack.py
+    # packed format, which produces a package instead of an assembly.
+    format: assembly.TargetFormat | pack.PackedFormat
     # The record's vision_format: "none", "safetensors" or "gguf".
-    vision_format: str
+    vision_format: assembly.VisionFormat
     # The configuration that identifies the target's family.
     config: dict
     # Assembly path -> repository file, for every path a repository file
@@ -147,28 +148,36 @@ def _gguf_target(repo, variant, language_only):
     name, by_ending = select_gguf(repo.files, variant)
     if by_ending:
         print(
-            f"No GGUF is named for :{variant} alone; using {name}, the only one "
-            f"whose name ends in -{variant}.",
+            f"No GGUF is named for {models.accent(':' + variant)} alone; using "
+            f"{models.accent(name)}, the only one whose name ends in -{variant}.",
             flush=True,
         )
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
+    config = gguf.model_config(header)
     # The family bounds the layers whose tensors the screening lists; one the
     # runtime serves text-only is installed so whatever the selection asked.
     # The names hint the fields a GGUF omits (router_aux_loss_coef).
     family = families.family_for(
-        gguf.model_config(header),
+        config,
         name=f"{repo.name} {name} {header.values.get('general.name', '')}",
     )
     language_only = language_only or not family.vision
+    if pack.packable(config):
+        # The runtime has no gemma4/diffusion_gemma GGUF tensor map; the
+        # safetensors checkpoint is packed at installation instead.
+        raise models.ModelError(
+            "this model loads from packed files only; install its safetensors "
+            "checkpoint (google/gemma-4-26B-A4B-it or "
+            "google/diffusiongemma-26B-A4B-it), not a GGUF"
+        )
     gguf.require_loadable(header)
-    files = {"target/" + name: name}
-    vision_header = None
+    files = {layout.TARGET + "/" + name: name}
     if not language_only:
-        files[assembly.GGUF_VISION], vision_header = select_vision(repo)
+        files[layout.GGUF_VISION], vision_header = select_vision(repo)
         _validate_processor(gguf.processor_config(vision_header))
-    config = gguf.model_config(header, vision_header)
-    print(f"Selected {name} from {repo.name}.", flush=True)
+        config["vision_config"] = gguf.vision_config(vision_header)
+    print(f"Selected {models.accent(name)} from {repo.name}.", flush=True)
     return Target("gguf", "none" if language_only else "gguf", config, files)
 
 
@@ -200,6 +209,8 @@ def _mlx_target(repo, language_only):
             )
         language_only = True
     config = models.read_json(repo.file("config.json"))
+    if pack.packable(config):
+        return _packed_target(repo, config)
     # MLX states its quantization under "quantization"; a transformers
     # quantization_config alone describes another method (GPTQ, AWQ, ...).
     quant = config.get("quantization")
@@ -214,14 +225,18 @@ def _mlx_target(repo, language_only):
         )
     # A family the runtime serves text-only takes no tower, whether or not
     # the repository describes one; _install resolves the family again.
-    language_only = language_only or not families.family_for(
-        config, name=repo.name
-    ).vision
+    language_only = (
+        language_only or not families.family_for(config, name=repo.name).vision
+    )
     files = {
         path: "config.json"
-        for path in ("config.json", "target/config.json", "tokenizer/config.json")
+        for path in (
+            "config.json",
+            layout.TARGET + "/config.json",
+            layout.TOKENIZER + "/config.json",
+        )
     }
-    files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
+    files |= {layout.TOKENIZER + "/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     if not language_only:
         _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
         shards = _weight_files(repo, "vision_tower.")
@@ -229,12 +244,25 @@ def _mlx_target(repo, language_only):
             raise models.ModelError(
                 f"{repo.name} has no vision tower; use --language-only to serve text only"
             )
-        files["vision/config.json"] = "config.json"
-        files |= {"vision/" + n: n for n in shards}
-    files |= {"target/" + n: n for n in _weight_files(repo)}
+        files[layout.VISION + "/config.json"] = "config.json"
+        files |= {layout.VISION + "/" + n: n for n in shards}
+    files |= {layout.TARGET + "/" + n: n for n in _weight_files(repo)}
     return Target(
         "mlx-affine", "none" if language_only else "safetensors", config, files
     )
+
+
+def _packed_target(repo, config):
+    """The packed-only target (Gemma 4): the safetensors checkpoint and the
+    tokenizer the installer packs (install/pack.py). The runtime loads no
+    GGUF or MLX source for it; a repository with no safetensors checkpoint
+    cannot be installed."""
+    files = {"config.json": "config.json"}
+    files |= {name: name for name in TOKENIZER_FILES if name in repo.files}
+    if "model.safetensors.index.json" in repo.files:
+        files["model.safetensors.index.json"] = "model.safetensors.index.json"
+    files |= {name: name for name in _weight_files(repo)}
+    return Target(pack.target_format(config)[1], "none", config, files)
 
 
 def _weight_files(repo, prefix=""):
@@ -309,15 +337,18 @@ def prepare(selection):
     legacy.prepare."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
-        legacy.prepare(selection)
+        if pack.is_built(selection.link):
+            _prepare_packed(selection, pack.manifest_of(selection.link))
+        else:
+            legacy.prepare(selection)
         return
     installed = None
     if kind == models.ASSEMBLY:
         try:
             installed = assembly.verify(selection.link)
         except (models.ModelError, OSError) as error:
-            print(f"Reinstalling {selection.model}: {error}", flush=True)
-    installed_commit = installed and installed["sources"]["target"]["revision"]
+            print(f"Reinstalling {models.accent(selection.model)}: {error}", flush=True)
+    installed_commit = installed and installed["sources"][layout.TARGET]["revision"]
     target = hub.Repository.resolve(
         selection.repo_id,
         selection.revision,
@@ -330,6 +361,45 @@ def prepare(selection):
         _start_installed(selection, target, installed)
     else:
         _install_commit(selection, target, installed)
+
+
+def _prepare_packed(selection, installed):
+    """Prepare a selection already installed as a locally packed package: the
+    recorded commit's package stands when the Hub cannot answer or names the
+    same revision; a moved target is packed again by _install."""
+    recorded = installed["sources"][layout.TARGET]
+    target = hub.Repository.resolve(
+        selection.repo_id,
+        selection.revision,
+        installation=selection.link,
+        installed=recorded["revision"],
+    )
+    if target.unreachable_reason or target.revision == recorded["revision"]:
+        if target.unreachable_reason:
+            print(
+                f"Could not reach the Hub ({target.unreachable_reason}); "
+                f"using the installed {selection.repo_id}@{recorded['revision'][:12]}.",
+                flush=True,
+            )
+        try:
+            pack.verify(selection.link)
+        except (models.ModelError, OSError) as error:
+            print(f"Repacking {models.accent(selection.model)}: {error}", flush=True)
+        else:
+            print(
+                f"RichEngine model {models.accent(selection.model)} is already "
+                f"installed in {models.dim(selection.link)}",
+                flush=True,
+            )
+            return
+    else:
+        print(
+            f"{models.accent(selection.repo_id)} moved from "
+            f"{models.dim(recorded['revision'][:12])} "
+            f"to {models.dim(target.revision[:12])}; repacking.",
+            flush=True,
+        )
+    _install(selection, target, None)
 
 
 def _is_legacy_package(repo, model):
@@ -351,21 +421,25 @@ def _start_installed(selection, target, installed):
     current Hub cache."""
     if target.unreachable_reason:
         print(
-            f"Could not reach the Hub ({target.unreachable_reason}); "
-            f"using the installed {selection.repo_id}@{target.revision[:12]}.",
+            f"Could not reach the Hub {models.dim('(' + target.unreachable_reason + ')')}; "
+            f"using the installed {models.accent(selection.repo_id)}"
+            f"{models.dim('@' + target.revision[:12])}.",
             flush=True,
         )
-    recorded = installed["sources"]["target"]
+    recorded = installed["sources"][layout.TARGET]
     family = families.named(installed["family"])
     draft = family and _resolve_draft(family, selection, installed, target)
     if draft and draft.unreachable_reason:
         print(
-            f"Could not reach the Hub ({draft.unreachable_reason}); "
-            f"using the installed draft {_at(draft)}.",
+            f"Could not reach the Hub {models.dim('(' + draft.unreachable_reason + ')')}; "
+            f"using the installed draft {models.accent(_at(draft))}.",
             flush=True,
         )
     if changes := _changes(installed, family, draft):
-        print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
+        print(
+            f"Updating {models.accent(selection.model)}: {'; '.join(changes)}.",
+            flush=True,
+        )
         with _keeping_installation(
             selection, installed, f"update it ({'; '.join(changes)})"
         ):
@@ -373,13 +447,14 @@ def _start_installed(selection, target, installed):
         return
     if (replaced := _retain_installed(selection)) is None:
         print(
-            f"RichEngine model {selection.model} is already installed in {selection.link}",
+            f"RichEngine model {models.accent(selection.model)} is already "
+            f"installed in {models.dim(selection.link)}",
             flush=True,
         )
         return
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
-    print(f"Reinstalling {selection.model}: {replaced}", flush=True)
+    print(f"Reinstalling {models.accent(selection.model)}: {replaced}", flush=True)
     _install(selection, hub.Repository.recorded(recorded), installed, draft)
 
 
@@ -388,15 +463,16 @@ def _install_commit(selection, target, installed):
     verified installation of another commit is kept if that fails."""
     if target.unreachable_reason:
         print(
-            f"Could not reach the Hub ({target.unreachable_reason}); installing "
-            f"{selection.repo_id}@{target.revision[:12]} from the Hub cache.",
+            f"Could not reach the Hub {models.dim('(' + target.unreachable_reason + ')')}; "
+            f"installing {models.accent(selection.repo_id)}"
+            f"{models.dim('@' + target.revision[:12])} from the Hub cache.",
             flush=True,
         )
     elif installed is not None:
         print(
-            f"{selection.repo_id} moved from "
-            f"{installed['sources']['target']['revision'][:12]} "
-            f"to {target.revision[:12]}.",
+            f"{models.accent(selection.repo_id)} moved from "
+            f"{models.dim(installed['sources'][layout.TARGET]['revision'][:12])} "
+            f"to {models.dim(target.revision[:12])}.",
             flush=True,
         )
     if installed is None:
@@ -415,7 +491,7 @@ def _keeping_installation(selection, installed, attempt):
     try:
         yield
     except (models.ModelError, OSError) as error:
-        commit = installed["sources"]["target"]["revision"]
+        commit = installed["sources"][layout.TARGET]["revision"]
         models.warn(
             f"keeping the installed {selection.repo_id}@{commit[:12]}; "
             f"cannot {attempt}: {error}"
@@ -450,12 +526,27 @@ def _install(selection, repo, installed, draft=None):
             draft = _resolve_draft(family, selection, installed, repo)
         draft, files = _draft(family, installed, draft)
         print(
-            f"Installing {selection.model} as {family.name} ({target.format}); "
-            f"draft {draft.name if draft else 'none'}; "
-            f"vision {'disabled' if target.vision_format == 'none' else 'enabled'}.",
+            f"Installing {models.accent(selection.model)} as "
+            f"{models.accent(family.name)} {models.dim('(' + target.format + ')')}; "
+            f"draft {models.accent(draft.name) if draft else models.dim('none')}; "
+            f"vision {models.dim('disabled') if target.vision_format == 'none' else 'enabled'}.",
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))
+    if target.format in pack.TARGET_FORMATS:
+        # The packed-only target: quantize and write the package the
+        # runtime loads, under the lock as every models-root write is.
+        selection.models_root.mkdir(parents=True, exist_ok=True)
+        with models.installation_lock(selection.models_root):
+            pack.install(
+                selection, family, target.config, repo, downloaded, draft, files
+            )
+        print(
+            f"Installed verified RichEngine model {models.accent(selection.model)} "
+            f"in {models.dim(selection.link)}",
+            flush=True,
+        )
+        return
     files |= {path: downloaded[name] for path, name in target.files.items()}
     record = {
         "version": 1,
@@ -463,8 +554,8 @@ def _install(selection, repo, installed, draft=None):
         "family": family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity()}
-        | ({"draft": draft.identity()} if draft else {}),
+        "sources": {layout.TARGET: repo.identity()}
+        | ({layout.DRAFT: draft.identity()} if draft else {}),
     }
     models_root = selection.models_root
     models_root.mkdir(parents=True, exist_ok=True)
@@ -502,7 +593,7 @@ def _changes(installed, family, draft):
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
-    recorded = installed["sources"].get("draft")
+    recorded = installed["sources"].get(layout.DRAFT)
     if draft is None:
         if recorded is not None:
             changes.append("its draft is now none")
@@ -530,7 +621,7 @@ def _resolve_draft(family, selection, installed, target):
         # A draft-less family (Granite: n-gram predrafts).
         return None
     name = selection.draft_model or family.draft.repo
-    recorded = installed and installed["sources"].get("draft")
+    recorded = installed and installed["sources"].get(layout.DRAFT)
     asked = _answered(target)
     if recorded and not asked:
         return hub.Repository(recorded["repo"], recorded["revision"], frozenset())
@@ -562,7 +653,7 @@ def _draft(family, installed, draft):
     (downloaded and checked)."""
     if draft is None:
         return None, {}
-    recorded = installed and installed["sources"].get("draft")
+    recorded = installed and installed["sources"].get(layout.DRAFT)
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
@@ -616,7 +707,7 @@ def _draft_files(repo, family):
             + "; ".join(differences)
         )
     downloaded = repo.download({"config.json", *weights})
-    return {"draft/" + name: path for name, path in downloaded.items()}
+    return {layout.DRAFT + "/" + name: path for name, path in downloaded.items()}
 
 
 def _config_value(config, key):

@@ -1,6 +1,6 @@
 #include "model/RuntimeArenas.hpp"
 
-#include "Env.hpp"
+#include "Tuning.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
@@ -44,7 +44,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   {
     // RICHENGINE_GDN_CHUNKED (32/64/128) sizes the WY/UT scratch at this
     // geometry's GDN shape; the serial scan binds nothing here.
-    const uint32_t factor = envUint("RICHENGINE_GDN_CHUNKED", 0);
+    const uint32_t factor = tuning().gdnChunked;
     if (factor == 32 || factor == 64 || factor == 128) {
       put(PrefillTensor::GdnChunkScratch,
           bytesFor<float>(ops::GDN::chunkScratchFloats(
@@ -67,24 +67,35 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          geometry.target.denseIntermediateSize));
   put(PrefillTensor::FullPacked,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
-                         geometry.target.packedFullWidth));
+                         geometry.target.maximumPackedWidth()));
   put(PrefillTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kPackedAttentionRows *
-                         geometry.target.attentionHeadDimension));
+                         geometry.target.maximumHeadDimension()));
   put(PrefillTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kPackedAttentionRows *
-                         geometry.target.attentionHeadDimension));
-  const ops::AttentionWorkspace attentionWorkspace =
+                         geometry.target.maximumHeadDimension()));
+  // A dual-geometry target needs the larger of its layer kinds' workspaces.
+  ops::AttentionWorkspace attentionWorkspace =
       operators.prefillAttentionWorkspace(
           kPrefillRows, geometry.target.attentionQueryHeads,
-          geometry.target.kvLayout);
+          geometry.target.layerKvLayout(false));
+  if (geometry.target.altAttentionMask) {
+    const ops::AttentionWorkspace alt =
+        operators.prefillAttentionWorkspace(
+            kPrefillRows, geometry.target.attentionQueryHeads,
+            geometry.target.layerKvLayout(true));
+    attentionWorkspace.partialsBytes =
+        std::max(attentionWorkspace.partialsBytes, alt.partialsBytes);
+    attentionWorkspace.statisticsBytes =
+        std::max(attentionWorkspace.statisticsBytes, alt.statisticsBytes);
+  }
   put(PrefillTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(PrefillTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(PrefillTensor::AttentionHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
-                         geometry.target.attentionWidth));
+                         geometry.target.maximumAttentionWidth()));
   put(PrefillTensor::AttentionOutput,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   put(PrefillTensor::ProjectionSums,
@@ -105,6 +116,17 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
   put(PrefillTensor::RopeSin,
       bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
+  put(PrefillTensor::TargetInverseFrequencies2,
+      bytesFor<float>(geometry.target.altRotaryPairs));
+  put(PrefillTensor::RopeCosAlt,
+      bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.altRotaryPairs));
+  put(PrefillTensor::RopeSinAlt,
+      bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.altRotaryPairs));
+  // Gemma's routed combine residual: zeroed hidden rows.
+  put(PrefillTensor::ZeroResidual,
+      geometry.target.gemmaMoe
+          ? bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize)
+          : 0);
   put(PrefillTensor::ContextProjected,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
@@ -119,13 +141,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(uint64_t{kPrefillRows} *
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
-      bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kPackedAttentionRows *
-                         geometry.target.attentionHeadDimension));
+      bytesFor<uint16_t>(uint64_t{geometry.target.chunkLayerWidth()} *
+                         kPackedAttentionRows));
   put(PrefillTensor::ChunkValues,
-      bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kPackedAttentionRows *
-                         geometry.target.attentionHeadDimension));
+      bytesFor<uint16_t>(uint64_t{geometry.target.chunkLayerWidth()} *
+                         kPackedAttentionRows));
   // The split partials and counters and the rotated rows of the largest
   // prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
@@ -136,7 +156,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearPacked, linear.input);
     put(PrefillTensor::LinearExponents, linear.sums);
   }
-  if (envFlag("RICHENGINE_PREFILL_FAST_INT8")) {
+  if (tuning().prefillFastInt8) {
     const uint64_t inputWidth =
         uint64_t{geometry.projectionSumsWidth()} * kQ4GroupElements;
     put(PrefillTensor::I8Codes, uint64_t{kPrefillRows} * inputWidth);
@@ -146,7 +166,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::I8ParamsLo,
         uint64_t{kPrefillRows} * geometry.projectionSumsWidth() * 16);
   }
-  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
+  if (geometry.target.ffnKind == FfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeShape(), kPrefillRows);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
@@ -182,9 +202,9 @@ static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
                             geometry.target.gdnValueHeads);
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                            kv::kVerifyChunkStride *
-                            geometry.target.attentionHeadDimension);
+  // The layer slab covers the wider of the target's two KV geometries.
+  return bytesFor<uint16_t>(uint64_t{geometry.target.chunkLayerWidth()} *
+                            kv::kVerifyChunkStride);
 }
 
 std::array<uint64_t, decodeTensorCount>
@@ -220,22 +240,33 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Intermediate,
       bytesFor<uint16_t>(r * geometry.target.denseIntermediateSize));
   put(DecodeTensor::FullPacked,
-      bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
+      bytesFor<uint16_t>(r * geometry.target.maximumPackedWidth()));
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kv::kVerifyChunkStride *
-                         geometry.target.attentionHeadDimension));
-  const ops::AttentionWorkspace attentionWorkspace =
+                         geometry.target.maximumHeadDimension()));
+  ops::AttentionWorkspace attentionWorkspace =
       operators.verifyAttentionWorkspacePerLane(
-          geometry.target.attentionQueryHeads, geometry.target.kvLayout);
+          geometry.target.attentionQueryHeads,
+          geometry.target.layerKvLayout(false));
+  if (geometry.target.altAttentionMask) {
+    const ops::AttentionWorkspace alt =
+        operators.verifyAttentionWorkspacePerLane(
+            geometry.target.attentionQueryHeads,
+            geometry.target.layerKvLayout(true));
+    attentionWorkspace.partialsBytes =
+        std::max(attentionWorkspace.partialsBytes, alt.partialsBytes);
+    attentionWorkspace.statisticsBytes =
+        std::max(attentionWorkspace.statisticsBytes, alt.statisticsBytes);
+  }
   put(DecodeTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
                          kv::kVerifyChunkStride *
-                         geometry.target.attentionHeadDimension));
+                         geometry.target.maximumHeadDimension()));
   put(DecodeTensor::AttentionHidden,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
+      bytesFor<uint16_t>(r * geometry.target.maximumAttentionWidth()));
   put(DecodeTensor::AttentionOutput,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Positions, bytesFor<uint32_t>(r * 3));
@@ -244,6 +275,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(r * geometry.target.rotaryPairs));
   put(DecodeTensor::RopeSin,
       bytesFor<float>(r * geometry.target.rotaryPairs));
+  put(DecodeTensor::RopeCosAlt,
+      bytesFor<float>(r * geometry.target.altRotaryPairs));
+  put(DecodeTensor::RopeSinAlt,
+      bytesFor<float>(r * geometry.target.altRotaryPairs));
   put(DecodeTensor::ContextProjected,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
@@ -329,6 +364,16 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::CapturedPath,
       bytesFor<uint16_t>(uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
                          geometry.draft.targetHiddenSize));
+  // Gemma's layer scratch: the post-attention residual and the zeroed rows
+  // the routed combine adds to.
+  put(DecodeTensor::GemmaResidual,
+      geometry.target.gemmaMoe
+          ? bytesFor<uint16_t>(r * geometry.target.hiddenSize)
+          : 0);
+  put(DecodeTensor::ZeroResidual,
+      geometry.target.gemmaMoe
+          ? bytesFor<uint16_t>(r * geometry.target.hiddenSize)
+          : 0);
   put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
@@ -350,7 +395,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ChunkValuesBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));
-  if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
+  if (geometry.target.ffnKind == FfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moeDecodeWorkspacePerLane(geometry.target.moeShape());
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)

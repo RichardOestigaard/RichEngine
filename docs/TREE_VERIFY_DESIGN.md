@@ -101,3 +101,59 @@ Bugs found by the correctness work:
 - `richengine_compact_verify_tree_phase` treated packed-INT4 values as
   dimension-major nibbles; values are token-major [token][dim pair]
   bytes, exactly like keys — RMW corrupted the value slab.
+
+## DSpark trees (MiniCPM5)
+
+The same comb layout and tree-verify machinery serve DSpark drafts.
+`draft_select_dspark_tree` walks the 128-slot shard pool exactly as
+`draft_select_dspark` does — biased score `partial_value + W2[candidate] .
+W1[predecessor]` — and additionally emits each position's biased runner-up
+as the sibling leaf at fixed row `RICHENGINE_TARGET_VERIFY_ROWS + position`
+(parent = the chain row that was the position's predecessor). Sampled lanes
+draw identically and emit the linear table; dead or sentinel runner-ups emit
+`TREE_NODE_NONE` descriptors. `tree_counts` is 15 for tree lanes, 8 for
+linear lanes.
+
+Gating is per batch: all lanes greedy, unconstrained, unpenalized, width
+≤ half the lane capacity, dense target (no conv/GDN path, no sparse MoE,
+no fp8 KV). `RICHENGINE_VERIFY_TREE` is tri-state: unset defaults tree ON
+for DSpark and off for DFlash; `=1` forces on for either, `=0` forces off.
+
+### Threadgroup fit
+
+A tree lane's scratch doubles the fused rows, so the Kv2Group8 layouts'
+128-row single-pass tile exceeds the 32 KB threadgroup budget (≈34.3 KB).
+Group-8 tree splits take two-pass `_m2` variants — the same pattern Gemma's
+hd512 splits already use — with `row_masks` honored per M pass.
+
+### Numerics caveat
+
+Tree verify runs 15 live rows through the two-pass tile while chain verify
+runs ≤8 through the single-pass one. Both compute the same softmax·V, but
+the accumulation order differs, so on near-tie logits the greedy argmax can
+flip — the first chain-vs-tree output divergence observed (token 91 of a
+story prompt) was a pure-chain path where the target's row-1 argmax flipped
+this way. Every emitted token is still the target's own argmax of its
+verify row; the divergence is reduction-order noise of the same class as
+chain's own variable `liveRows` widths, not a masking or acceptance bug.
+Consequence: tree and chain greedy completions are not guaranteed
+bit-identical.
+
+### Measured (MiniCPM5-2B-DSpark, M5 Pro, greedy)
+
+Leaf rescues are frequent where DFlash2 saw none: ~21% of tree steps
+accepted through a sibling leaf in a story-generation run, matching the
+offline estimate (~19% of rejected positions rank the target's pick at
+biased rank 2). Story prompt, 400-token generations:
+
+| | steps | accepted/step | retained/step |
+|---|---|---|---|
+| tree | 408 | 1.95 | 2.95 |
+| chain (`VERIFY_TREE=0`) | 475 | 1.46 | 2.46 |
+
+A related pool-rework bug the selector test exposed: the sampled draw
+reduced picks with `simd_min` over slot indices, but the pool's lane-major
+CDF needs the earliest draw position — crossings in slots ≥32 were stolen
+by later lanes' first slots, biasing sampled DSpark draws toward shards
+0-1. `draft_select_dspark{,_tree}` now reduce over `lane * Owned + k` and
+decode the slot after the min.

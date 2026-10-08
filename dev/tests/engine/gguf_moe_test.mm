@@ -43,6 +43,7 @@
 namespace {
 
 using richengine::DeviceCapabilities;
+using richengine::kAssumedGpuCores;
 using richengine::metal::BufferStorage;
 using richengine::metal::CommandGraph;
 using richengine::metal::MetalBackend;
@@ -56,7 +57,6 @@ using richengine::ops::MoE;
 using richengine::ops::MoeBuffers;
 using richengine::ops::MoeConfig;
 using richengine::ops::MoeScratchField;
-using richengine::ops::kAssumedGpuCores;
 using richengine::ops::kMoeScratchFields;
 using richengine::ops::MoeExpertSimdgroups;
 using richengine::ops::MoeExpertTile;

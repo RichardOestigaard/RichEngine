@@ -92,7 +92,7 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
         bothPhases(mixer.inputProjection);
         bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
-      if constexpr (decltype(target.layout)::ffnKind == QwenFfnKind::Dense) {
+      if constexpr (decltype(target.layout)::ffnKind == FfnKind::Dense) {
         projection(layer.gateProjection, LinearPhase::Prefill,
                      LinearEpilogue::None);
         projection(layer.upProjection, LinearPhase::Prefill,

@@ -2,7 +2,7 @@
 #include "model/AffinePlan.hpp"
 #include "model/DFlashDraft.hpp"
 #include "model/DSparkDraft.hpp"
-#include "model/PlainDraft.hpp"
+#include "model/DFlashV1Draft.hpp"
 
 #include <string>
 #include <utility>
@@ -73,10 +73,10 @@ Image modelImage(const DFlashDraftLayout &layout) {
   return result;
 }
 
-// The plain transformer draft's files, in the order PlainDraft.cpp reads
+// The plain transformer draft's files, in the order DFlashV1Draft.cpp reads
 // them: the same fused QKV tile split as DFlash2, minus its convolutions.
-Image plainLayerImage(const DFlashDraftLayout &layout, uint32_t layer) {
-  Image result = affine::image("layer-" + std::to_string(layer) + ".bin", kPlainDraftMagic, layer, 0);
+Image dflashV1LayerImage(const DFlashDraftLayout &layout, uint32_t layer) {
+  Image result = affine::image("layer-" + std::to_string(layer) + ".bin", kDFlashV1DraftMagic, layer, 0);
   const std::string prefix = "layers." + std::to_string(layer) + ".";
   const std::string attention = prefix + "self_attn.";
   const uint32_t hidden = layout.hiddenSize;
@@ -94,8 +94,8 @@ Image plainLayerImage(const DFlashDraftLayout &layout, uint32_t layer) {
   return result;
 }
 
-Image plainModelImage(const DFlashDraftLayout &layout) {
-  Image result = affine::image("model.bin", kPlainDraftMagic, layout.layers, 1);
+Image dflashV1ModelImage(const DFlashDraftLayout &layout) {
+  Image result = affine::image("model.bin", kDFlashV1DraftMagic, layout.layers, 1);
   quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
   copy(result, "hidden_norm.weight", {layout.hiddenSize});
   copy(result, "norm.weight", {layout.hiddenSize});
@@ -126,47 +126,47 @@ std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
   return result;
 }
 
-DraftCheckpointLoader::DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+DFlash2CheckpointLoader::DFlash2CheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                                              const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = draftCheckpointImages(layout);
   for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
-DraftCheckpointLoader::~DraftCheckpointLoader() = default;
-WeightFile DraftCheckpointLoader::layer(uint32_t index) {
+DFlash2CheckpointLoader::~DFlash2CheckpointLoader() = default;
+WeightFile DFlash2CheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
   return images_.load(affine::imagePlan(planned_, index, "draft"));
 }
-WeightFile DraftCheckpointLoader::model() {
+WeightFile DFlash2CheckpointLoader::model() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
 }
 
-std::vector<Image> plainDraftCheckpointImages(const DFlashDraftLayout &layout) {
+std::vector<Image> dflashV1DraftCheckpointImages(const DFlashDraftLayout &layout) {
   std::vector<Image> result;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(plainLayerImage(layout, layer));
-  result.push_back(plainModelImage(layout));
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(dflashV1LayerImage(layout, layer));
+  result.push_back(dflashV1ModelImage(layout));
   return result;
 }
 
-PlainDraftCheckpointLoader::PlainDraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+DFlashV1DraftCheckpointLoader::DFlashV1DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                                                      const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
-  planned_->images = plainDraftCheckpointImages(layout);
+  planned_->images = dflashV1DraftCheckpointImages(layout);
   for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
-PlainDraftCheckpointLoader::~PlainDraftCheckpointLoader() = default;
-WeightFile PlainDraftCheckpointLoader::layer(uint32_t index) {
+DFlashV1DraftCheckpointLoader::~DFlashV1DraftCheckpointLoader() = default;
+WeightFile DFlashV1DraftCheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
   return images_.load(affine::imagePlan(planned_, index, "draft"));
 }
-WeightFile PlainDraftCheckpointLoader::model() {
+WeightFile DFlashV1DraftCheckpointLoader::model() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
 }
 
 std::vector<Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout) {
   std::vector<Image> result;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    Image layerImage = plainLayerImage(layout, layer);
+    Image layerImage = dflashV1LayerImage(layout, layer);
     layerImage.magic = std::string(kDSparkDraftMagic);
     result.push_back(std::move(layerImage));
   }

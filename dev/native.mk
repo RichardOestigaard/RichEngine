@@ -81,6 +81,7 @@ TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
+TEST_NGRAM_INDEX_TEST := $(ENGINE_TEST_BUILD)/ngram-index
 TEST_KV_FIRST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/kv-first-engine
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
 TEST_PROTOCOL_TEST := $(ENGINE_TEST_BUILD)/protocol
@@ -112,7 +113,10 @@ TEST_OPERATOR_TUNING := $(ENGINE_TEST_BUILD)/operator-tuning
 TEST_OPERATOR_MEASUREMENT := $(ENGINE_TEST_BUILD)/operator-measurement
 TEST_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/execution-plans
 TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
+TEST_GEMMA4_TARGET := $(ENGINE_TEST_BUILD)/gemma4-target
+TEST_DIFFUSION_GEMMA := $(ENGINE_TEST_BUILD)/diffusion-gemma
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
+TEST_HD512_ATTENTION := $(ENGINE_TEST_BUILD)/hd512-attention
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_LINEAR_TUNING := $(ENGINE_TEST_BUILD)/linear-tuning
 TEST_TUNING_WORKLOADS := $(ENGINE_TEST_BUILD)/tuning-workloads
@@ -122,6 +126,8 @@ TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
 TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
+TEST_CANVAS_KERNELS_TEST := $(ENGINE_TEST_BUILD)/canvas-kernels
+TEST_GELU_SATURATION_TEST := $(ENGINE_TEST_BUILD)/gelu-saturation
 TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_GGUF_DECODE_SWEEP := $(ENGINE_TEST_BUILD)/gguf-decode-sweep
@@ -161,6 +167,11 @@ TEST_FP8_KERNEL_SOURCES := \
 	runtime/metal/kernels/prefill/fp8_attention_store.metal
 TEST_FP8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_FP8_KERNEL_SOURCES))
 TEST_FP8_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/fp8-attention.metallib
+# Bench-only MoE expert-pass variants (canvas-step tuning); production
+# dispatch never names them.
+TEST_MOE_PREFILL_BENCH := $(ENGINE_TEST_BUILD)/moe-prefill-bench
+TEST_MOE_PREFILL_AIR := $(ENGINE_TEST_BUILD)/moe-prefill-bench.air
+TEST_MOE_PREFILL_LIB := $(ENGINE_TEST_BUILD)/moe-prefill-bench.metallib
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.
 TEST_RESIDENCY_AIR := $(ENGINE_TEST_BUILD)/kernels/shared/residency.air
@@ -186,12 +197,15 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREP
 	$(TEST_ANE_FFN_STARTUP) \
 	$(TEST_EXECUTION_PLANS) \
 	$(TEST_MODEL_EXECUTION_PLANS) \
+	$(TEST_GEMMA4_TARGET) \
+	$(TEST_DIFFUSION_GEMMA) \
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
 	$(TEST_KV_FIRST_CACHE_TEST) \
 	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
+	$(TEST_NGRAM_INDEX_TEST) \
 	$(TEST_KV_FIRST_ENGINE_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
 	$(TEST_PROTOCOL_TEST) \
@@ -215,6 +229,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_LINEAR_TUNING) \
 	$(TEST_ATTENTION_PLAN) \
+	$(TEST_HD512_ATTENTION) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
 	$(TEST_KV_PAGE_TIER_TEST) \
@@ -235,6 +250,8 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GDN_DECODE_TEST) \
 	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_TARGET_SAMPLING_TEST) \
+	$(TEST_CANVAS_KERNELS_TEST) \
+	$(TEST_GELU_SATURATION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
@@ -250,7 +267,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MTL4_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) \
-	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB)
+	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB) \
+	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS) $(WEIGHT_DIGESTS)
@@ -361,6 +379,10 @@ $(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
 		dev/tests/engine/ragged_scheduler_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
+$(TEST_NGRAM_INDEX_TEST): runtime/model/NgramIndex.hpp \
+		dev/tests/engine/ngram_index_test.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
 $(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) runtime/model/SlotFile.cpp \
 		dev/tests/engine/kv_first_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
@@ -461,6 +483,25 @@ $(TEST_MPP_ATTENTION_TEST): dev/tests/engine/mpp_simdgroup_attention_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		-framework Foundation -framework Metal -o $@
 
+$(TEST_MOE_PREFILL_AIR): dev/tests/engine/moe_prefill_bench.metal \
+		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
+
+$(TEST_MOE_PREFILL_LIB): $(TEST_MOE_PREFILL_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_MOE_PREFILL_BENCH): dev/tests/engine/moe_prefill_bench_metal_test.mm \
+		$(TEST_MOE_PREFILL_LIB) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+# A benchmark, not a parity gate: no MTL_SHADER_VALIDATION — it inflates
+# every kernel ~10x. Parity still runs inside the binary (exit non-zero on
+# failure); for a validated run, prefix MTL_SHADER_VALIDATION=1 by hand.
+.PHONY: test-moe-prefill-bench
+test-moe-prefill-bench: $(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_LIB) $(LIB)
+	$(TEST_MOE_PREFILL_BENCH) $(LIB) $(TEST_MOE_PREFILL_LIB)
+
 # The prototype check runs on demand only; it is not part of test-engine-metal.
 .PHONY: test-mpp-attention
 test-mpp-attention: $(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_LIB)
@@ -542,6 +583,16 @@ $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_GEMMA4_TARGET): dev/tests/engine/gemma4_target_test.cpp \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_DIFFUSION_GEMMA): dev/tests/engine/diffusion_gemma_test.cpp \
+		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_LINEAR_TUNING): dev/tests/engine/linear_tuning_test.cc $(TUNING_SOURCES) \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
@@ -568,6 +619,15 @@ $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
+
+# The hd512 (Gemma 4 global) split kernels' one-pass vs two-pass parity and
+# timing, dispatched straight against the production metallib. Standalone:
+# the kernels live in $(LIB) and the test pool uses only the inline ABI
+# placement helpers, so it links no engine objects.
+$(TEST_HD512_ATTENTION): dev/tests/engine/hd512_attention_metal_test.mm \
+		$(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
 
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm $(TUNING_SOURCES) \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
@@ -598,6 +658,27 @@ $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
+
+# Standalone like the mpp probe: the kernels live in the production
+# metallib, so the test links no engine objects and takes $(LIB) as argv[1].
+$(TEST_CANVAS_KERNELS_TEST): dev/tests/engine/canvas_kernels_metal_test.mm \
+	$(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+# CANVAS_KERNELS_ARGS passes the metallib path then [reps].
+.PHONY: test-canvas-kernels
+test-canvas-kernels: $(TEST_CANVAS_KERNELS_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_CANVAS_KERNELS_TEST) $(LIB) $(CANVAS_KERNELS_ARGS)
+
+.PHONY: test-gelu-saturation
+test-gelu-saturation: $(TEST_GELU_SATURATION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_GELU_SATURATION_TEST) $(LIB)
+
+$(TEST_GELU_SATURATION_TEST): dev/tests/engine/gelu_saturation_metal_test.mm \
+	$(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
 
 $(TEST_Q4_PREFILL_PROFILE): dev/benchmarks/q4_prefill_profile.mm \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -746,6 +827,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_ANE_FFN_STARTUP)
 	$(TEST_EXECUTION_PLANS)
 	$(TEST_MODEL_EXECUTION_PLANS)
+	$(TEST_GEMMA4_TARGET)
+	$(TEST_DIFFUSION_GEMMA)
 	$(TEST_MEMORY_TEST)
 	$(TEST_KV_PAGE_CACHE_TEST)
 	$(TEST_KV_FIRST_CACHE_TEST)
@@ -780,6 +863,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_HD512_ATTENTION) $(LIB) --quick
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(TEST_LINEAR_PLAN) --capabilities $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
@@ -802,8 +886,14 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_CANVAS_KERNELS_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
+
+# The hd512 m2 parity and timing test alone (also part of test-engine-metal).
+.PHONY: test-hd512
+test-hd512: $(TEST_HD512_ATTENTION) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_HD512_ATTENTION) $(LIB)
 
 .PHONY: test-real
 # The vision fixture is named after the installed model's family: model.json

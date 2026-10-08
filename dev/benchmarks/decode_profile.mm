@@ -144,6 +144,7 @@ struct Lane final {
   std::vector<uint32_t> pages;
   // The pages never change, so the page table keeps its first revision.
   uint64_t pageTableRevision = 1;
+  std::vector<uint32_t> emitted;
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
@@ -209,6 +210,9 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
               results[index].outputTokensWithoutKv;
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
+    lanes[index].emitted.insert(lanes[index].emitted.end(),
+                                results[index].outputTokens.begin(),
+                                results[index].outputTokens.end());
   }
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
@@ -224,12 +228,13 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--prompt-file PATH]\n";
+                     "[--prompt-file PATH] [--dump-tokens PATH]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
       const char *promptFile = nullptr;
+      const char *dumpTokens = nullptr;
       kv::Format format = kv::Format::Int8;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
@@ -239,6 +244,8 @@ int main(int argc, char **argv) {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
         else if (option == "--prompt-file")
           promptFile = argv[index + 1];
+        else if (option == "--dump-tokens")
+          dumpTokens = argv[index + 1];
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--kv-format") {
@@ -292,7 +299,7 @@ int main(int argc, char **argv) {
       std::array<Lane, 4> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {
         lanes[index] = {index + 1, index, 0,
-                        pageRange(index * pagesPerLane, pagesPerLane)};
+                        pageRange(index * pagesPerLane, pagesPerLane), 1, {}};
       }
       // Warm prefill and B1 decode with real work before measuring.
       prefill(executor, lanes[0], prompt);
@@ -355,6 +362,14 @@ int main(int argc, char **argv) {
 
       for (Lane &lane : lanes)
         executor.end(lane.id);
+      if (dumpTokens) {
+        FILE *file = std::fopen(dumpTokens, "wb");
+        if (!file) throw std::runtime_error("cannot open --dump-tokens path");
+        for (const Lane &lane : lanes)
+          static_cast<void>(std::fwrite(lane.emitted.data(), sizeof(uint32_t),
+                                        lane.emitted.size(), file));
+        std::fclose(file);
+      }
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

@@ -1,7 +1,9 @@
 #include "DFlashDraft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+#include "Tuning.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -96,12 +98,35 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(weights.layout.vocabularySize),
+      poolSelector_(tuning().dflashPoolSet
+                        ? tuning().dflashPool
+                        : weights.layout.poolSelector),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
     std::span<const ops::SamplingPolicy> policies, uint32_t treeMask) const {
+  // The pool walk is greedy-only: a sampled lane's residual draw stages
+  // kDraftCandidates entries, so any sampling policy falls the whole batch
+  // back to the merged-16 path.
+  const bool pool =
+      poolSelector_ &&
+      std::none_of(policies.begin(), policies.end(),
+                   [](const ops::SamplingPolicy &policy) {
+                     return policy.samples();
+                   });
+  if (pool) {
+    const ops::DraftCodebooks codebooks{weights_.predecessorCodebook,
+                                        weights_.successorCodebook};
+    if (treeMask) {
+      selector_.addPoolTree(graph, buffers, codebooks, anchors, policies,
+                            treeMask);
+      return;
+    }
+    selector_.addPool(graph, buffers, codebooks, anchors, policies);
+    return;
+  }
   if (treeMask) {
     selector_.addTree(graph, buffers,
                       {weights_.predecessorCodebook,
@@ -397,7 +422,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
                                           DFlashDraftLayout layout) {
   requireLayout(layout);
   if (const auto *checkpoint =
-          std::get_if<std::reference_wrapper<DraftCheckpointLoader>>(&files))
+          std::get_if<std::reference_wrapper<DFlash2CheckpointLoader>>(&files))
     return readDraft(backend, checkpoint->get(), layout);
   return readDraft(backend, std::get<PackedDraftFiles>(files), layout);
 }

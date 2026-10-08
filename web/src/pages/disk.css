@@ -1,0 +1,32 @@
+/* Disk page specifics. */
+
+.disk-page .notice { margin: 0 0 12px }
+
+/* Stacked store and dedupe-group panels. */
+.store-panel { margin-bottom: 12px }
+.store-panel.store-missing { opacity: .65 }
+.store-head .store-title { font-weight: 600 }
+.store-head .badge { white-space: nowrap }
+.store-path { padding-top: 4px; padding-bottom: 4px }
+
+/* Dedupe controls and result blocks. */
+.dedupe-controls { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; flex-wrap: wrap }
+.dedupe-variants { display: inline-flex; align-items: center; gap: 7px; font-size: 13.5px; cursor: pointer }
+.dedupe-variants input { accent-color: var(--accent); margin: 0 }
+.dedupe-group { margin-bottom: 12px }
+.dedupe-head { font-weight: 500 }
+.dedupe-group .panel-row .badge { flex-shrink: 0 }
+.panel-row.weak .grow { opacity: .6 }
+.dedupe-footer .panel-row { justify-content: flex-end }
+.dedupe-footer .grow { flex: 1 }
+
+/* Stores section header with filter/sort controls. */
+.stores-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px }
+.stores-head h2 { flex: 1; margin: 0 }
+.store-search { width: 180px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 13px }
+.store-sort { padding: 5px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted); font-size: 13px }
+
+/* KV disk cache meter. */
+.kv-meter { padding: 14px 16px 8px }
+.kv-meter .meter > i { transition: width .4s ease }
+.panel-row .num .badge { margin-left: 6px }

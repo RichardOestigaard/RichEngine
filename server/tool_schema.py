@@ -41,6 +41,9 @@ FUNCTION_CLOSE = f"{FUNCTION_END}\n{TOOL_CALL_CLOSE}"
 # The chat template's token ids where no tokenizer contract supplies them
 # (tests); the server always passes its validated contract's.
 THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
+# The alternate tool-call-open spelling of families that mark their own
+# (gemma4's <|tool_call>).
+TOOL_CALL_OPEN_ALT = "<|tool_call>"
 TOOL_CALL_OPEN_TOKEN_ID = 248058  # and its call-open token
 # A function's or parameter's name is at most this long, and reading strips
 # this space around it, so a name the grammars write neither starts nor ends
@@ -110,6 +113,10 @@ class ToolDialect:
     # The regex fragment, an alternation of call markup spellings, that
     # unconstrained TEXT must not contain.
     barrier: str = "<tool_call>"
+    # The reasoning-close spelling the output projector drops from text; a
+    # family whose think blocks close differently says so (gemma4's
+    # `<channel|>`).
+    think_end: str = THINK_END
 
     def call_opening(self, name):
         """The tokens that begin a call of tool `name`, through the name."""
@@ -121,6 +128,8 @@ class ToolDialect:
         """The lark grammar of one tool's argument list."""
         if self.kind == "python":
             return _python_argument_grammar(schema)
+        if self.kind == "gemma4":
+            return _gemma4_argument_grammar(schema)
         return _argument_grammar(schema, self)
 
     def spelling(self, text):
@@ -176,6 +185,8 @@ class ToolDialect:
         parameters in the dialect's framing, each with raw text."""
         if self.kind == "python":
             return _PYTHON_FREE_ARGUMENTS
+        if self.kind == "gemma4":
+            return _GEMMA4_FREE_ARGUMENTS
         name_open = json.dumps(self.param_open)
         name_close = json.dumps(self.param_name_close)
         closing = json.dumps(self.param_close)
@@ -341,6 +352,251 @@ _PYTHON_FREE_ARGUMENTS = (
 )
 
 
+
+# A string in a gemma4 call: `<|"|>` opens it and closes it, with no
+# escapes, so its text is anything that does not spell the delimiter.
+_GEMMA4_QUOTE = json.dumps('<|"|>')
+_GEMMA4_STRING_BODY = (
+    r"/(?s:.*)/ & ~/(?s:.*)" + re.escape('<|"|>') + r"(?s:.*)/"
+)
+
+# The arguments of an unconstrained gemma4 call: `key:value` pairs joined
+# by "," inside the call's braces, values as the template writes them.
+_GEMMA4_FREE_ARGUMENTS = (
+    "%llguidance {}\n"
+    'start: (NAME ":" value ("," NAME ":" value)*)?\n'
+    "value: string | number | object | array | boolean | null\n"
+    "string: " + _GEMMA4_QUOTE + " string_body " + _GEMMA4_QUOTE + "\n"
+    "string_body: " + _GEMMA4_STRING_BODY + "\n"
+    'object: "{" (NAME ":" value ("," NAME ":" value)*)? "}"\n'
+    'array: "[" (value ("," value)*)? "]"\n'
+    'boolean: "true" | "false"\n'
+    'null: "null"\n'
+    "NAME: /[A-Za-z0-9_-]+/\n"
+    "number: " + _PYTHON_NUMBER + "\n"
+)
+
+
+def _gemma4_literal(value):
+    """`value` as a gemma4 call spells it: a string between `<|"|>`
+    delimiters, scalars as JSON, and containers with bare keys."""
+    if isinstance(value, str):
+        return '<|"|>' + value + '<|"|>'
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{key}:{_gemma4_literal(item)}" for key, item in value.items()
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_gemma4_literal(item) for item in value) + "]"
+    return json.dumps(value, allow_nan=False)
+
+
+def _gemma4_pairs(rule, schema, ancestors):
+    """The rules spelling an object's `key:value` list under `rule`: the
+    declared parameters in schema order, the required ones present, then
+    any others the schema allows. None when no value is possible; the
+    chain a required parameter cannot spell makes it impossible."""
+    properties = schema["properties"]
+    required = schema["required"]
+    rules = []
+    sequence = []
+    for index, (name, value_schema) in enumerate(properties.items()):
+        parameter_rule = f"{rule}_parameter_{index}"
+        if value_schema is not False and (
+            not isinstance(name, str)
+            or not name
+            or len(name) > MAX_NAME_LENGTH
+            or name != name.strip(NAME_SPACE)
+            or any(character in name for character in ':{},"|<> \t\n\r')
+        ):
+            raise APIError(400, "invalid tool parameter name")
+        parameter_rules = _gemma4_value_rules(
+            parameter_rule, value_schema, schema, ancestors
+        )
+        if parameter_rules is None:
+            if name in required:
+                return None
+            continue
+        rules.extend(parameter_rules)
+        call = f'{json.dumps(name + ":")} {parameter_rule}'
+        sequence.append((call, name in required))
+    additional = schema["additionalProperties"]
+    if additional is not False:
+        extra_rules = _gemma4_value_rules(
+            f"{rule}_extra", additional, schema, ancestors
+        )
+        if extra_rules is not None:
+            declared = " | ".join(json.dumps(name) for name in properties)
+            rules.append(
+                "EXTRA_NAME: /[A-Za-z0-9_-]+/"
+                + (f" & ~({declared})" if declared else "")
+            )
+            rules.extend(extra_rules)
+            sequence.append((f'EXTRA_NAME ":" {rule}_extra', None))
+            tail = f'("," EXTRA_NAME ":" {rule}_extra {rule}_tail)?'
+            rules.append(f"{rule}_tail: {tail}")
+            many = True
+    # chain_i reads parameter i on, seq_i the same once a comma preceded it.
+    n = len(sequence)
+    chains = []
+    for index in range(n):
+        call, required_flag = sequence[index]
+        body = call + f" {rule}_seq_{index + 1}"
+        if required_flag is True:
+            chains.append(f"{rule}_chain_{index}: {body}")
+            chains.append(f'{rule}_seq_{index}: "," {body}')
+        elif required_flag is False:
+            chains.append(
+                f"{rule}_chain_{index}: ({body})? {rule}_chain_{index + 1}"
+            )
+            chains.append(
+                f'{rule}_seq_{index}: ("," {body})? {rule}_seq_{index + 1}'
+            )
+        else:
+            # The trailing extras rule: any number of further pairs.
+            chains.append(
+                f"{rule}_chain_{index}: ({call} {rule}_tail)?"
+            )
+            chains.append(
+                f'{rule}_seq_{index}: ("," {call} {rule}_tail)?'
+            )
+    chains.append(f"{rule}_chain_{n}:")
+    chains.append(f"{rule}_seq_{n}:")
+    return rules + chains, f"{rule}_chain_0"
+
+
+def _gemma4_value_rules(rule, value_schema, root, ancestors):
+    """The rules naming `rule` the spelling of one gemma4 argument value of
+    `value_schema`, or None where no spelling exists. A string spells
+    between `<|"|>` delimiters, scalars as JSON, and containers nest
+    the same syntax."""
+    schema = _resolve_tool_schema(value_schema, root)
+    if schema is False:
+        return None
+    if id(schema) in ancestors:
+        # A recursive reference spells as any gemma4 value.
+        return [f"{rule}: free_value"]
+    ancestors = ancestors | {id(schema)}
+    union = schema.get("anyOf", schema.get("oneOf")) if isinstance(schema, dict) else None
+    if union:
+        options = []
+        for option_index, option_schema in enumerate(union):
+            option_rule = f"{rule}_option_{option_index}"
+            option_rules = _gemma4_value_rules(
+                option_rule, option_schema, root, ancestors
+            )
+            if option_rules is not None:
+                options.append((option_rule, option_rules))
+        if not options:
+            return None
+        rules = [f"{rule}: " + " | ".join(name for name, _ in options)]
+        for _name, option_rules in options:
+            rules.extend(option_rules)
+        return rules
+    values = _enumeration(schema) if isinstance(schema, dict) else None
+    if values is not None and all(
+        value is None or isinstance(value, (str, bool, int, float))
+        for value in values
+    ):
+        if any(isinstance(value, str) and '<|"|>' in value for value in values):
+            raise APIError(400, "string tool parameter enum contains framing")
+        return [f"{rule}: (" + " | ".join(
+            json.dumps(_gemma4_literal(value)) for value in values
+        ) + ")"]
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    kinds = kind if isinstance(kind, list) else [kind]
+    string_schema = raw_string_schema(schema, '<|"|>')
+    if string_schema is not None and (kind is None or "string" in (kinds or ())):
+        if string_schema[0] == "raw":
+            return [
+                f"{rule}: "
+                + _GEMMA4_QUOTE
+                + f" {rule}_body "
+                + _GEMMA4_QUOTE,
+                f"{rule}_body: " + _GEMMA4_STRING_BODY,
+            ]
+        return [
+            f"{rule}: ("
+            + " | ".join(
+                json.dumps(_gemma4_literal(value)) for value in string_schema[1]
+            )
+            + ")"
+        ]
+    if kinds == ["boolean"]:
+        return [f'{rule}: ("true" | "false")']
+    if kinds == ["null"]:
+        return [f'{rule}: "null"']
+    if kinds and all(k in ("integer", "number") for k in kinds):
+        return [f"{rule}: " + _PYTHON_NUMBER]
+    if (
+        isinstance(schema, dict)
+        and (kind == "object" or "properties" in schema)
+    ):
+        pairs = _gemma4_pairs(
+            rule,
+            {
+                "properties": schema.get("properties", {}),
+                "required": schema.get("required", []),
+                "additionalProperties": schema.get("additionalProperties", True),
+            },
+            ancestors,
+        )
+        if pairs is None:
+            return None
+        pair_rules, start = pairs
+        return pair_rules + [f'{rule}: "{{" ({start})? "}}"']
+    if kind == "array" or (isinstance(schema, dict) and "items" in schema):
+        items = schema.get("items", True) if isinstance(schema, dict) else True
+        item_rules = _gemma4_value_rules(
+            f"{rule}_item", items, root, ancestors
+        )
+        if item_rules is None:
+            return None
+        return item_rules + [
+            f'{rule}: "[" ({rule}_item ("," {rule}_item)*)? "]"'
+        ]
+    return [f"{rule}: free_value"]
+
+
+def _gemma4_argument_grammar(schema):
+    """The arguments of a strict gemma4 tool: the declared parameters in
+    schema order as `key:value` pairs joined by ",", each required one
+    present, then any others the schema allows. A `free_value` covers what
+    a schema leaves unconstrained."""
+    pairs = _gemma4_pairs("args", schema, frozenset())
+    if pairs is None:
+        raise APIError(400, "required tool parameter cannot have a value")
+    rules, start = pairs
+    return (
+        "%llguidance {}\n"
+        f"start: {start}\n"
+        + "\n".join(rules)
+        + "\n"
+        + _GEMMA4_FREE_VALUE_RULES
+    )
+
+
+# A gemma4 value of any shape: a `<|"|>` string, a scalar, or a
+# container of further values, used where a schema leaves a value free.
+_GEMMA4_FREE_VALUE_RULES = (
+    "free_value: free_string | number | object | array | boolean | null\n"
+    "free_string: " + _GEMMA4_QUOTE + " free_body " + _GEMMA4_QUOTE + "\n"
+    "free_body: " + _GEMMA4_STRING_BODY + "\n"
+    'object: "{" (NAME ":" free_value ("," NAME ":" free_value)*)? "}"\n'
+    'array: "[" (free_value ("," free_value)*)? "]"\n'
+    'boolean: "true" | "false"\n'
+    'null: "null"\n'
+    "NAME: /[A-Za-z0-9_-]+/\n"
+    "number: " + _PYTHON_NUMBER + "\n"
+)
+
+
 # The framing each supported chat template writes its calls in, detected at
 # startup from a rendered canary call.
 QWEN3_XML = ToolDialect(
@@ -380,7 +636,30 @@ LFM25_PYTHON = ToolDialect(
     barrier=r"<\|tool_call_start\|>",
 )
 
+# Gemma 4's tool-call spelling, as its chat template lays a call out:
+# `<|tool_call>call:NAME{key:<|"|>value<|"|>,k2:42}<tool_call|>`. Calls concatenate with no separator; keys are bare
+# and `<|"|>` is one token that delimits strings without
+# escapes. The reasoning stream opens `<|channel>thought\n` and
+# closes `<channel|>`.
+GEMMA4 = ToolDialect(
+    name="gemma4",
+    kind="gemma4",
+    call_open="<|tool_call>",
+    name_prefix="call:",
+    name_close="{",
+    call_close="}<tool_call|>",
+    body_close="}",
+    block_close="",
+    structural=("<|tool_call>", "<tool_call|>", '<|"|>'),
+    param_name_forbidden=':{},"|<> \t\n\r',
+    extra_name_pattern=r'[^:{},"|<> \t\n\r]+',
+    value_barrier='<|"|>',
+    barrier=r"<\|tool_call",
+    think_end="<channel|>",
+)
+
 _DIALECT_MARKERS = (
+    ("<|tool_call>", GEMMA4),
     ("<|tool_call_start|>", LFM25_PYTHON),
     ('<function name="', MINICPM5_XML),
     ("<function=", QWEN3_XML),
@@ -1187,6 +1466,11 @@ def _lark_regex(pattern):
     return "/" + pattern.replace("/", r"\/") + "/"
 
 
+def _regex_text(text):
+    """`text` as a regex matching itself inside a lark /.../ literal."""
+    return re.escape(text).replace("/", r"\/")
+
+
 _RAW_VALUE = "/(?s:.*)/"
 
 
@@ -1326,7 +1610,7 @@ def _argument_grammar(schema, dialect=None):
     )
 
 
-def json_grammar(schema, thinking, *, think_end_id=None):
+def json_grammar(schema, thinking, *, think_end_id=None, think_end_text=THINK_END):
     start = "start: " + ("think " if thinking else "") + "WS %json "
     grammar = [
         "%llguidance {}",
@@ -1337,7 +1621,10 @@ def json_grammar(schema, thinking, *, think_end_id=None):
             THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         )
         grammar.append(f"think: TEXT <[{think_end}]>")
-        grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
+        grammar.append(
+            r"TEXT: /(?s:.*)/ & ~/(?s:.*)" + _regex_text(think_end_text)
+            + r"(?s:.*)/"
+        )
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
@@ -1529,7 +1816,9 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
         [
             *calls,
             WHITESPACE_RULE,
-            rf"TEXT: /(?s:.*)/ & ~/(?s:.*)({dialect.barrier}|<\/think>)(?s:.*)/",
+            "TEXT: /(?s:.*)/ & ~/(?s:.*)("
+            + dialect.barrier
+            + "|" + _regex_text(dialect.think_end) + ")(?s:.*)/",
         ]
     )
     side_grammars.insert(

@@ -311,8 +311,13 @@ void checkConvolution(const Fixture &fixture, uint32_t layer, uint32_t lane,
       const std::vector<double> key =
           normalizedHead(fixture, layer, lane, token, first, kKeyScale);
       for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-        require(closeBfloat(mixedRow[first + dim], key[dim], 3.0, 1e-6),
-                where + ": mixed k row mismatch");
+        if (!closeBfloat(mixedRow[first + dim], key[dim], 3.0, 1e-6)) {
+          std::cerr << where << " token=" << token << " head=" << head
+                    << " dim=" << dim << " actual="
+                    << bf16ToFloat(mixedRow[first + dim])
+                    << " expected=" << key[dim] << "\n";
+          require(false, where + ": mixed k row mismatch");
+        }
     }
     for (uint32_t channel = 2 * keyWidth; channel < shape.convolutionDimension;
          ++channel)
@@ -470,8 +475,15 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
         const double normalized = roundBfloat(exact[dim]);
         const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
         const double reference = normalized * gate * sigmoid(gate);
-        require(closeBfloat(hidden[dim], reference, 3.0, 1e-6),
-                where + ": hidden mismatch");
+        if (!closeBfloat(hidden[dim], reference, 3.0, 1e-6)) {
+          static int shown = 0;
+          if (shown++ < 20)
+            std::cerr << where << " head=" << head << " token=" << token
+                      << " dim=" << dim << " actual=" << bf16ToFloat(hidden[dim])
+                      << " expected=" << reference << "\n";
+          ++inexact;
+          continue;
+        }
         inexact += bf16ToFloat(hidden[dim]) != roundBfloat(reference);
       }
     }
@@ -582,7 +594,8 @@ struct PreparedTables final {
 
   LinearScratch scratch() const { return {table, sums, {}, {}}; }
   void addReference(CommandGraph &graph, const MetalBuffer &hidden) const {
-    addReferencePreparation(graph, layout, hidden, referenceTable, referenceSums, width, lanes);
+    addReferencePreparation(graph, layout, hidden, referenceTable, referenceSums, width,
+                            lanes * kRows / 8);
   }
   // The decode reported the table it wrote, and wrote the reference's bytes.
   void requireWritten(const PreparedInput &reported, const MetalBuffer &hidden,

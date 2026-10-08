@@ -38,6 +38,7 @@
 #include "TestFiles.hpp"
 #include "ane/ProgramInstrumentation.hpp"
 #include "metal/CommandGraph.hpp"
+#include "ops/KernelNames.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
@@ -174,12 +175,12 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
   const MetalBuffer rotated = test::sharedBuffer(backend, x.size() * sizeof(uint16_t));
   const MetalBuffer scales = filled(backend, kRows * sizeof(uint16_t), kUntouched);
   CommandGraph graph;
-  graph.add("ane_ffn_rotate", {upload(backend, x), signs, rotated, scales}, AneFfnRotateParams{kHidden},
+  graph.add(std::string(kAneFfnRotate), {upload(backend, x), signs, rotated, scales}, AneFfnRotateParams{kHidden},
             {kRows, 1, 1}, {ANE_FFN_ROTATE_THREADS, 1, 1});
   std::vector<MetalBuffer> packed;
   for (uint32_t segment = 0; segment < kHidden / kSegment; ++segment) {
     packed.push_back(filled(backend, uint64_t{kSegment} * kStride, kUntouched));
-    graph.add("ane_ffn_pack", {rotated, packed.back()}, AneFfnPackParams{kHidden, segment * kSegment, kStride},
+    graph.add(std::string(kAneFfnPack), {rotated, packed.back()}, AneFfnPackParams{kHidden, segment * kSegment, kStride},
               {kRows / ANE_FFN_TILE, kSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   }
   run(backend, graph);
@@ -281,10 +282,10 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
   const MetalBuffer scales = filled(backend, uint64_t{rows} * scaleStride * sizeof(uint16_t), kUntouched);
   const auto &[a, b, c] = source.planes;
   CommandGraph graph;
-  graph.add("ane_ffn_row_scale" + source.suffix + variant, {a, b, c, rowScales, signs},
+  graph.add(std::string(kAneFfnRowScale) + source.suffix + variant, {a, b, c, rowScales, signs},
             AneFfnWeightParams{source.groups, row, scaled, kWeightInputs - scaled, 0, 0, source.format},
             {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
-  graph.add("ane_ffn_weights" + source.suffix + variant, {a, b, c, rowScales, output, scales, signs},
+  graph.add(std::string(kAneFfnWeights) + source.suffix + variant, {a, b, c, rowScales, output, scales, signs},
             AneFfnWeightParams{source.groups, row, input, width, stride, scaleStride, source.format},
             {rows / ANE_FFN_WEIGHT_ROWS, width / block, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   run(backend, graph);
@@ -342,7 +343,7 @@ uint32_t joined(MetalBackend &backend, const MetalBuffer &output, const std::vec
                 const std::vector<uint16_t> &tokenScale, uint32_t stride, uint32_t rows) {
   const MetalBuffer status = filled(backend, sizeof(uint32_t), 0);
   CommandGraph graph;
-  graph.add("ane_ffn_join", {output, upload(backend, partial), upload(backend, tokenScale), status},
+  graph.add(std::string(kAneFfnJoin), {output, upload(backend, partial), upload(backend, tokenScale), status},
             AneFfnJoinParams{kHidden, stride, rows},
             {(rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, kHidden / ANE_FFN_TILE, 1},
             {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});

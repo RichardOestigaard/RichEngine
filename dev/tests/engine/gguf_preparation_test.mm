@@ -10,7 +10,7 @@
 #include "model/GgufPreparation.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/Qwen3_8.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -345,7 +345,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
-  check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");
+  check(model::targetModelGeometry(weights).valid(), "GGUF target: a valid target geometry");
   for (uint32_t index = 0; index < weights.layers.size(); ++index) {
     const auto &layer = weights.layers[index];
     const std::string at = "GGUF target layer " + std::to_string(index) + ": ";
@@ -356,7 +356,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
           at + "up block projection");
     check(blockProjection(layer.downProjection, hidden, layout.intermediateSize, {hidden}),
           at + "down block projection");
-    if (const auto *gdn = std::get_if<model::QwenGdnWeights>(&layer.mixer)) {
+    if (const auto *gdn = std::get_if<model::GdnMixerWeights>(&layer.mixer)) {
       check(blockProjection(gdn->inputProjection, layout.packedGdnWidth, hidden,
                             {layout.convolutionDimension, valueRows, QUANT_TILE_ROWS}) &&
                 gdn->inputProjection.blocks().segments[2].formatId == GGUF_FMT_IQ4XS,
@@ -365,7 +365,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
       check(gdn->mixerNorm.float32, at + "F32 GDN norm");
       check(gdn->outputHeadOrder == ops::GdnHeadOrder::Tiled, at + "GDN output in the GGUF's tiled head order");
     } else {
-      const auto &attention = std::get<model::QwenAttentionWeights>(layer.mixer);
+      const auto &attention = std::get<model::AttentionMixerWeights>(layer.mixer);
       check(blockProjection(attention.inputProjection, layout.packedFullWidth, hidden,
                             {2 * layout.attentionWidth, kvRows, kvRows}),
             at + "attention input segments q and gate | k | v");

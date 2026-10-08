@@ -6,11 +6,31 @@ namespace richengine::model {
                      uint32_t targetRows, MetalBuffer draftPositions,
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
-                     MetalBuffer draftSin) const {
+                     MetalBuffer draftSin, MetalBuffer targetCosAlt,
+                     MetalBuffer targetSinAlt) const {
+    // A Null draft has no rotary pairs: its IF slot is unallocated, so the
+    // draft side borrows the target's (it stays unwritten at 0 draft rows).
+    const MetalBuffer draftIf =
+        prefillArena->get(geometry.draftRotaryPairs()
+                              ? PrefillTensor::DraftInverseFrequencies
+                              : PrefillTensor::TargetInverseFrequencies);
+    // The dual-geometry target's second target table: the same positions at
+    // the alternate pairs and theta; its draft side stays unwritten.
+    if (targetCosAlt) {
+      ops::RoPE::addTables(
+          graph, targetPositions, draftPositions,
+          prefillArena->get(PrefillTensor::TargetInverseFrequencies2),
+          draftIf,
+          std::move(targetCosAlt), std::move(targetSinAlt), draftCos,
+          draftSin,
+          {targetRows, 0, geometry.target.altRotaryPairs,
+           geometry.target.ropeAxes},
+          kPrefillRows);
+    }
     ops::RoPE::addTables(
         graph, std::move(targetPositions), std::move(draftPositions),
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-        prefillArena->get(PrefillTensor::DraftInverseFrequencies),
+        draftIf,
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
         {targetRows, draftRows, geometry.target.rotaryPairs,
@@ -115,9 +135,7 @@ namespace richengine::model {
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     uint32_t treeMask = 0;
-    const bool treeCapable =
-        verifyTreeEnabled &&
-        std::holds_alternative<DFlashDraft>(draftModel);
+    const bool treeCapable = treeDraftCapable();
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = laneEntry(entries, lane);
       if (!entry.pendingToken)
@@ -170,7 +188,7 @@ namespace richengine::model {
     std::vector<MetalBuffer> gdnBeta(gdnLayers);
     std::vector<MetalBuffer> chunkKeys(attentionLayers);
     std::vector<MetalBuffer> chunkValues(attentionLayers);
-    QwenTargetVerifyBuffers buffers;
+    TargetModelVerifyBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
@@ -186,6 +204,10 @@ namespace richengine::model {
     buffers.attentionOutput = d(DecodeTensor::AttentionOutput);
     buffers.ropeCos = d(DecodeTensor::RopeCos);
     buffers.ropeSin = d(DecodeTensor::RopeSin);
+    buffers.ropeCosAlt = d(DecodeTensor::RopeCosAlt);
+    buffers.ropeSinAlt = d(DecodeTensor::RopeSinAlt);
+    buffers.gemmaResidual = d(DecodeTensor::GemmaResidual);
+    buffers.zeroResidual = d(DecodeTensor::ZeroResidual);
     buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
@@ -203,8 +225,10 @@ namespace richengine::model {
         headShape.outputSize % 64 == 0 &&
         headShape.inputSize % 64 == 0;
     static const bool headFusedOff = envFlag("RICHENGINE_HEAD_FUSED_OFF");
-    buffers.fusedHead = !headFusedOff &&
-        !tree && uint64_t{lanes} * ExecutionLimits::targetVerifyRows <= 32 &&
+    // The fused head's argmax tile holds 32 rows; banding wider batches
+    // through it measured no better than the ordinary projection.
+    buffers.fusedHead = !headFusedOff && !tree &&
+        uint64_t{lanes} * ExecutionLimits::targetVerifyRows <= 32 &&
         ((headShape.layout() == ops::WeightLayout::Affine64 &&
           headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0) ||
          ggufHead);
@@ -247,11 +271,17 @@ namespace richengine::model {
       buffers.capturedPath =
           decodeArena->packed(DecodeTensor::CapturedPath, lanes);
     }
+    // A host-emitted comb's node count is already known; a kernel-emitted
+    // tree's is on the GPU, so it keeps the scratch's full capacity.
+    const uint32_t liveNodes =
+        predraftedTree_ ? predraftedTreeNodes_
+                        : RICHENGINE_TREE_VERIFY_NODES;
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] =
           tree ? ops::PagedAttention::verifyTreeParams(
                      items[lane].logicalPosition,
-                     static_cast<uint32_t>(items[lane].pageTable.size()))
+                     static_cast<uint32_t>(items[lane].pageTable.size()),
+                     liveNodes)
                : ops::PagedAttention::verifyParams(
                      items[lane].logicalPosition,
                      static_cast<uint32_t>(items[lane].pageTable.size()));
@@ -277,7 +307,7 @@ namespace richengine::model {
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes, tree,
-                          liveRows);
+                          liveRows, liveNodes);
   }
 
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
@@ -325,7 +355,11 @@ namespace richengine::model {
         !headShape.blocks().segments.front().isFloat() &&
         headShape.outputSize % 64 == 0 &&
         headShape.inputSize % 64 == 0;
-    uint32_t fusedHead = headFusedOff ? 0 :
+    // The fused head path must match addHeadBatch's 32-row bound: taking
+    // partials for a head that never ran would reduce stale scratch — the
+    // logits it skipped are never written.
+    uint32_t fusedHead = headFusedOff ||
+            uint64_t{lanes} * ExecutionLimits::targetVerifyRows > 32 ? 0 :
         headShape.layout() == ops::WeightLayout::Affine64 &&
                 headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0
             ? 1
@@ -427,10 +461,15 @@ namespace richengine::model {
           geometry.target.stopTokens[1]);
       return;
     }
+    // DSpark emits its proposals from the merged shard pool, so a sampled
+    // lane's draft-distribution lookup reads the pool's ids and
+    // probabilities at the pool stride instead of the merged top-16's.
+    const bool dspark = std::holds_alternative<DSparkDraft>(draftModel);
     sampling.addAcceptance(
         graph,
         {decodeArena->packed(DecodeTensor::ProposedTokens, width),
-         decodeArena->packed(DecodeTensor::Candidates, width),
+         dspark ? decodeArena->packed(DecodeTensor::TopPartialIds, width)
+                : decodeArena->packed(DecodeTensor::Candidates, width),
          decodeArena->packed(DecodeTensor::ProposalProbs, width),
          decodeArena->packed(DecodeTensor::TargetVocabularyRows, width),
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
@@ -439,7 +478,8 @@ namespace richengine::model {
          decodeArena->packed(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1],
-        proposals);
+        proposals,
+        dspark ? RICHENGINE_DSPARK_POOL : RICHENGINE_DRAFT_CANDIDATES);
   }
 
   void Runtime::Impl::encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
@@ -499,10 +539,13 @@ namespace richengine::model {
     std::array<MetalBuffer, kLaneCount> pageTables;
     std::array<kv::ChunkedPrefillParams, kLaneCount> chunks;
     bindPageTables(entries, pageTables);
+    const uint32_t liveNodes =
+        predraftedTree_ ? predraftedTreeNodes_
+                        : RICHENGINE_TREE_VERIFY_NODES;
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyTreeParams(
           items[lane].logicalPosition,
-          static_cast<uint32_t>(items[lane].pageTable.size()));
+          static_cast<uint32_t>(items[lane].pageTable.size()), liveNodes);
     for (uint32_t layer = 0; layer < attentionLayers; ++layer) {
       ops::PagedAttention::addVerifyTreeCompact(
           graph, kvPages.layers()[layer], pageTables,
@@ -525,7 +568,7 @@ namespace richengine::model {
     std::array<MetalBuffer, kLaneCount> currentStates;
     std::array<MetalBuffer, kLaneCount> nextStates;
     bindGdnStates(lanes, currentStates, nextStates);
-    QwenTargetCommitBuffers buffers{
+    TargetModelCommitBuffers buffers{
         decodeArena->gdnStorage(DecodeTensor::VerifyPackedBase),
         decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
         decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),

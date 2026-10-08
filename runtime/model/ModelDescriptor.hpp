@@ -2,6 +2,8 @@
 
 #include "DFlashDraft.hpp"
 #include "Dense.hpp"
+#include "DiffusionGemma.hpp"
+#include "Gemma4Moe.hpp"
 #include "Granite.hpp"
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
@@ -20,7 +22,8 @@ namespace richengine::model {
 
 using TargetLayout =
     std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout, DenseLayout,
-                 Lfm2Layout, Lfm2MoeLayout, GraniteLayout>;
+                 Lfm2Layout, Lfm2MoeLayout, GraniteLayout, Gemma4MoeLayout,
+                 DiffusionGemmaLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX or GGUF checkpoint prepared into images when it loads. The vision
@@ -41,6 +44,10 @@ struct ModelDescriptor final {
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource = TargetSource::Packed;
   VisionSource visionSource = VisionSource::Packed;
+  // Only the packed formats install/pack.py writes (richengine-packed-q4-
+  // gemma4, -diffusiongemma) store the token table as 256-row tiles; the
+  // splash-packed-q4* formats keep the checkpoint's flat quantized rows.
+  bool packedTiledEmbedding = false;
   // The SHA-256 of the record that names the digest of every source file,
   // an assembly's model.json or a package's manifest.json, which the
   // installer verifies at every start (inspectModelPackage): what every

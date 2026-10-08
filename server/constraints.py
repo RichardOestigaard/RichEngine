@@ -17,7 +17,22 @@ from llguidance.numpy import (
 
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
-from .tool_schema import THINK_END, TOOL_CALL_OPEN
+from .tool_schema import (
+    THINK_END,
+    THINK_OPEN,
+    TOOL_CALL_OPEN,
+    TOOL_CALL_OPEN_ALT,
+)
+
+
+# The think-block spellings the served families use, in preference order:
+# (close text, open text, leading special token of the open, system-turn
+# flag that marks a thinking-enabled prompt).
+THINK_FRAMINGS = (
+    (THINK_END, THINK_OPEN, THINK_OPEN, None),
+    ("<channel|>", "<|channel>thought\n", "<|channel>", "<|think|>"),
+)
+
 
 
 @dataclass(frozen=True)
@@ -40,6 +55,15 @@ class TokenizerContract:
     # a tokenizer that spells tool calls differently (a model without one
     # cannot emit a call the grammars write anyway).
     tool_call_open_id: int | None = None
+    # The think framing's open spelling and the special token that begins it
+    # (decoded despite skip_special_tokens so the output parser sees it),
+    # plus think_end's spelling, and the system-turn flag that marks a
+    # thinking-enabled prompt where the family has one (gemma4's think
+    # token).
+    think_open_id: int | None = None
+    think_open: str = "<think>"
+    think_end: str = THINK_END
+    think_flag: str | None = None
 
 
 class TokenConstraint:
@@ -135,9 +159,11 @@ def validate_tokenizer(tokenizer, config):
     config is the configuration mapping itself, or the directory holding it:
     the tokenizer files an assembly links sit beside a copy of the model's
     config.json."""
+    generation_config = None
     if not isinstance(config, dict):
+        config_dir = config
         try:
-            config = json.loads(Path(config, "config.json").read_bytes())
+            config = json.loads(Path(config_dir, "config.json").read_bytes())
         except (OSError, ValueError, TypeError) as error:
             raise engine_runtime.EngineUnhealthy(
                 f"model configuration is unreadable: {error}"
@@ -146,6 +172,15 @@ def validate_tokenizer(tokenizer, config):
             raise engine_runtime.EngineUnhealthy(
                 "model configuration is not an object"
             )
+        # The generation configuration's own stop ids — a family whose
+        # serving configuration stops on more than the model card's, as
+        # Gemma 4 does on its tool-response token — count too.
+        try:
+            generation_config = json.loads(
+                Path(config_dir, "generation_config.json").read_bytes()
+            )
+        except (OSError, ValueError, TypeError):
+            generation_config = None
     text_config = config.get("text_config")
     if not isinstance(text_config, dict):
         text_config = config
@@ -157,7 +192,7 @@ def validate_tokenizer(tokenizer, config):
     # Stop ids live in both the top-level (generation) configuration and the
     # text configuration; every one the model states stops generation.
     eos_ids = set()
-    for source in (config, text_config):
+    for source in (config, text_config, generation_config or {}):
         eos = source.get("eos_token_id")
         if type(eos) is list:
             eos_ids.update(eos)
@@ -184,12 +219,40 @@ def validate_tokenizer(tokenizer, config):
         raise engine_runtime.EngineUnhealthy(
             "tokenizer assigns a native token id to several tokens"
         )
-    think_end_id = vocabulary.get(THINK_END)
-    tool_call_open_id = vocabulary.get(TOOL_CALL_OPEN)
+    # The think framing is the family's whose close token the vocabulary
+    # has; the open's leading special token decodes for the output parser.
+    framing = next(
+        (
+            item
+            for item in THINK_FRAMINGS
+            if vocabulary.get(item[0]) is not None
+        ),
+        None,
+    )
+    think_end, think_open, open_token, think_flag = (
+        framing if framing is not None else (THINK_END, THINK_OPEN, None, None)
+    )
+    think_end_id = vocabulary.get(think_end)
+    think_open_id = (
+        vocabulary.get(open_token) if open_token is not None else None
+    )
+    # The call-open token is the default framing's or the family's.
+    tool_call_open_id = next(
+        (
+            token_id
+            for token in (TOOL_CALL_OPEN, TOOL_CALL_OPEN_ALT)
+            if (token_id := vocabulary.get(token)) is not None
+        ),
+        None,
+    )
     expected = [(by_id.get(token_id), token_id) for token_id in eos_tokens]
-    expected.append((THINK_END, think_end_id))
+    expected.append((think_end, think_end_id))
+    if think_open_id is not None:
+        expected.append((open_token, think_open_id))
     if tool_call_open_id is not None:
-        expected.append((TOOL_CALL_OPEN, tool_call_open_id))
+        expected.append(
+            (TOOL_CALL_OPEN if vocabulary.get(TOOL_CALL_OPEN) is not None else TOOL_CALL_OPEN_ALT, tool_call_open_id)
+        )
     for token, token_id in expected:
         if token is None or token_id is None:
             raise engine_runtime.EngineUnhealthy(
@@ -209,7 +272,15 @@ def validate_tokenizer(tokenizer, config):
             "tokenizer EOS token is not in its vocabulary"
         )
     return TokenizerContract(
-        vocabulary_size, eos_tokens, marker, think_end_id, tool_call_open_id
+        vocabulary_size,
+        eos_tokens,
+        marker,
+        think_end_id,
+        tool_call_open_id,
+        think_open_id,
+        think_open,
+        think_end,
+        think_flag,
     )
 
 

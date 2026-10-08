@@ -70,6 +70,15 @@ automatically (Granite has none and speculates with n-grams instead):
 | Granite-4.2-3B | `ibm-granite/granite-4.2-3b-GGUF:Q4_K_M` | — |
 | Granite-4.2-8B | `ibm-granite/granite-4.2-8b-GGUF:Q4_K_M` | — |
 
+Gemma 4 models install from safetensors and are packed to the runtime's Q4
+format at install time (~14.5 GB for 26B-A4B; GGUF/MLX sources are not
+accepted):
+
+| Model | Install |
+| --- | --- |
+| Gemma4-26B-A4B | `richengine install google/gemma-4-26B-A4B-it` (pairs the z-lab DFlash draft) |
+| DiffusionGemma-26B-A4B | `richengine install google/diffusiongemma-26B-A4B-it` |
+
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
 `UD-Q8_K_XL` and BF16 targets are not supported.
 [Prism ML Ternary Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
@@ -186,6 +195,25 @@ calibration finds that faster — on this Mac the 27B's split at share 0.41
 cuts a cold 14K prefill from 28.4 s to 22.5 s (1.26×), decode unchanged.
 `--disable-ane` keeps prefill on the GPU alone.
 
+DiffusionGemma-26B-A4B generates a 256-token canvas per block through
+iterative denoising instead of one token per step. Kernel-level numbers
+on this Mac (GPU-timestamped microbenchmarks; a real-model end-to-end
+benchmark is pending — see
+[docs/GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md](docs/GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md)):
+
+| Optimization measured | Before | After |
+| --- | ---: | ---: |
+| Canvas soft-embedding pass | ~91–155 ms | ~7–16 ms (~10–13×) |
+| Canvas logit statistics pass | 2.7 ms | 1.4 ms |
+| head_dim-512 attention (M-split, all KV formats) | — | 18–45% faster |
+| Softcap + temperature passes | ~4.0 ms/step | fused into the readers |
+
+Projected committed-throughput roofline after the bandwidth fixes (per
+256-token canvas at ~13–17 denoise steps): ~130–175 tok/s on M5,
+~260–350 on M5 Pro, ~380–690 on M5 Max — versus ~1,000+ tok/s reported
+upstream on H100/H200. Decode commits tokens in bursts of up to 256;
+streaming and tool calling work as with the other families.
+
 The same benchmark on the 2B-class GGUF installs on this Mac:
 
 | Metric | LFM2.5-2.6B (`MXFP4`) | MiniCPM5-2B (`Q4_K_M`) |
@@ -207,6 +235,35 @@ the GPU alone:
 | Prefill · 14K prompt | 2,117 tok/s | 1,226 tok/s |
 | Time to first token · 14K prompt, 10K cached | 2.6 s | 4.1 s |
 | Aggregate decode · 4 concurrent short prompts | 883 tok/s | 363 tok/s |
+
+### MiniCPM5-2B with tree-verified DSpark
+
+The MiniCPM5 MLX package pairs the target with its ~266 MiB DSpark draft:
+an eight-shard top-16 pool (128 candidate slots) rescored by the Markov
+tables, and a verify tree that adds each position's biased runner-up as a
+sibling leaf. Tree verification is on by default for DSpark drafts
+(`RICHENGINE_VERIFY_TREE=0` falls back to the chain). Decode speed is
+set by tokens kept per verify step — the step rate itself is a constant
+~88 steps/s on this Mac, so throughput tracks how predictable the output
+is rather than the prompt:
+
+| Workload (greedy) | Decode | Retained/step | Accepted/step | Leaf rescues |
+| --- | ---: | ---: | ---: | ---: |
+| Math word problem | 415 tok/s | 4.79 | 3.82 | 20% |
+| Count to 40 | 326 tok/s | 3.69 | 2.70 | <1% |
+| Write a palindrome function | 314 tok/s | 3.44 | 2.44 | 5% |
+| "hey" greeting | 273 tok/s | 3.11 | 2.14 | 2% |
+| Explain why the sky is blue | 257 tok/s | 2.91 | 1.94 | <1% |
+
+Burst and expectation: the best observed decode is 478 tok/s on
+in-distribution content; typical chat sits at 255–330 tok/s. The model
+card's ~5.5 retained/step at this step rate would be ~485 tok/s — the gap
+is draft-backbone ranking on out-of-distribution text, not verify cost.
+On a story prompt the tree lifted retained tokens from 2.46 to 2.95 per
+step over the chain (~20% of steps rescue through a sibling leaf), worth
+~15–20% throughput on this draft whose acceptance is lower than DFlash2's.
+Sampled requests (temperature > 0) verify with the same pool — the count
+prompt at T=0.8 measured 296 tok/s.
 
 Agent-style follow-ups that share a chat template's leading system prompt and
 tools resume from a shared-prefix junction: 2.5 s to first token against

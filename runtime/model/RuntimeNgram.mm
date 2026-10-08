@@ -2,77 +2,22 @@
 
 namespace richengine::model {
 
-  void Runtime::Impl::noteNgramAt(Request &entry, uint32_t start) {
-    auto &seen = entry.ngramIndex
-                     .try_emplace(ngramKey(entry.ngramHistory.data() + start),
-                                  std::array{kNgramNone, kNgramNone,
-                                             kNgramNone, kNgramNone})
-                     .first->second;
-    seen = {start, seen[0], seen[1], seen[2]};
-  }
-
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
   // tokens then append through commitSelected.
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
     if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
       return;
-    entry.ngramHistory.assign(prompt.begin(), prompt.end());
-    entry.ngramIndex.clear();
+    ngram::seed(entry.ngram, prompt);
     entry.ngramRounds = 0;
     entry.ngramAcceptedAvg = 0;
     entry.ngramProbeAt = 0;
     entry.ngramInFlight = false;
-    for (uint32_t i = 0; i + 3 <= entry.ngramHistory.size(); ++i)
-      noteNgramAt(entry, i);
   }
 
   void Runtime::Impl::appendNgramTokens(Request &entry, std::span<const uint32_t> tokens) {
     if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
       return;
-    for (const uint32_t token : tokens) {
-      entry.ngramHistory.push_back(token);
-      const uint32_t size = static_cast<uint32_t>(entry.ngramHistory.size());
-      if (size >= 3)
-        noteNgramAt(entry, size - 3);
-    }
-  }
-
-  // Follows the most recent earlier occurrences of the stream's closing
-  // 3-gram — the stream's own tail is a key's newest start, so each key
-  // keeps two. The candidate with the longest backward extension wins.
-  uint32_t Runtime::Impl::ngramLookup(const Request &entry, uint32_t *out) const {
-    const std::vector<uint32_t> &history = entry.ngramHistory;
-    const uint32_t size = static_cast<uint32_t>(history.size());
-    if (size < 4)
-      return 0;
-    const auto found =
-        entry.ngramIndex.find(ngramKey(history.data() + size - 3));
-    if (found == entry.ngramIndex.end())
-      return 0;
-    bool have = false;
-    uint32_t best = 0, bestExtension = 0, bestFollowers = 0;
-    for (const uint32_t start : found->second) {
-      if (start == kNgramNone || start + 3 >= size)
-        continue;
-      uint32_t extension = 0;
-      while (extension < start &&
-             history[start - 1 - extension] == history[size - 4 - extension])
-        ++extension;
-      const uint32_t followers = size - (start + 3);
-      if (!have || extension > bestExtension ||
-          (extension == bestExtension && followers > bestFollowers)) {
-        have = true;
-        best = start;
-        bestExtension = extension;
-        bestFollowers = followers;
-      }
-    }
-    if (!have)
-      return 0;
-    const uint32_t followers =
-        std::min<uint32_t>(RICHENGINE_DRAFT_PROPOSAL_TOKENS, bestFollowers);
-    std::copy_n(history.data() + best + 3, followers, out);
-    return followers;
+    ngram::append(entry.ngram, tokens);
   }
 
   // A lane's expected accepted tokens if its n-gram chain is used now:
@@ -95,14 +40,17 @@ namespace richengine::model {
   // GPU draft would have accepted — mixed-quality lanes no longer veto.
   // Greedy lanes only: injected proposals carry no probabilities.
   bool Runtime::Impl::applyNgramPredraft(std::span<Request *const> entries,
-                          uint32_t width) {
+                          uint32_t width, bool emitTree) {
     // A NullDraft model (Granite) has no GPU draft: the n-gram predraft is
     // its only proposer, so the gates below do not veto it.
     const bool nullDraft = std::holds_alternative<NullDraft>(draftModel);
     if (!ngramPredraft_ && !nullDraft)
       return false;
+    predraftedTree_ = false;
+    predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
     std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
         proposals{};
+    std::array<uint32_t, kLaneCount> foundCounts{};
     double score = 0;
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = *entries[lane];
@@ -111,7 +59,8 @@ namespace richengine::model {
       // rejected, wasting only rows).
       if (samplingEnabled(entry) && !nullDraft)
         return false;
-      const uint32_t found = ngramLookup(entry, proposals[lane].data());
+      const uint32_t found = ngram::lookup(entry.ngram, proposals[lane].data());
+      foundCounts[lane] = found;
       if (found) {
         // Repeat the last real candidate: a duplicate only loses its row.
         for (uint32_t j = found; j < RICHENGINE_DRAFT_PROPOSAL_TOKENS; ++j)
@@ -127,6 +76,16 @@ namespace richengine::model {
     }
     if (score < width * ngramDraftExpect_ && !nullDraft)
       return false;
+    // The comb costs a wider verify per step; emit it only while some lane's
+    // acceptance EWMA says the proposer is landing often enough for sibling
+    // leaves to rescue. A cold batch falls back to the bare chain.
+    if (emitTree) {
+      bool hot = false;
+      for (uint32_t lane = 0; lane < width; ++lane)
+        hot |= entries[lane]->ngramAcceptedAvg >= ngramTreeMin_;
+      if (!hot)
+        emitTree = false;
+    }
     for (uint32_t lane = 0; lane < width; ++lane) {
       std::memcpy(contents<uint32_t>(
                       decodeArena->get(lane, DecodeTensor::ProposedTokens),
@@ -135,6 +94,33 @@ namespace richengine::model {
                   RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
       entries[lane]->ngramInFlight = true;
     }
+    if (!emitTree)
+      return true;
+    uint32_t liveNodes = RICHENGINE_TARGET_VERIFY_ROWS;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const Request &entry = *entries[lane];
+      std::array<uint32_t, RICHENGINE_TREE_VERIFY_NODES> tokens;
+      std::array<uint32_t, RICHENGINE_TREE_VERIFY_NODES> nodes;
+      const uint32_t count =
+          ngram::combTable(entry.ngram,
+                           entry.pendingToken ? *entry.pendingToken : 0,
+                           proposals[lane].data(), foundCounts[lane],
+                           tokens.data(), nodes.data());
+      liveNodes = std::max(liveNodes, count);
+      std::memcpy(contents<uint32_t>(
+                      decodeArena->get(lane, DecodeTensor::TreeTokens),
+                      "ngram tree tokens"),
+                  tokens.data(), tokens.size() * sizeof(uint32_t));
+      std::memcpy(contents<uint32_t>(
+                      decodeArena->get(lane, DecodeTensor::TreeNodes),
+                      "ngram tree nodes"),
+                  nodes.data(), nodes.size() * sizeof(uint32_t));
+      *contents<uint32_t>(
+          decodeArena->get(lane, DecodeTensor::TreeCounts),
+          "ngram tree counts") = count;
+    }
+    predraftedTreeNodes_ = liveNodes;
+    predraftedTree_ = true;
     return true;
   }
 

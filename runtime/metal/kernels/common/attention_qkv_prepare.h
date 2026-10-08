@@ -9,8 +9,20 @@
 // full-rotary variants), QueryGate whether every query head is stored as
 // [query | gate] pairs (Qwen) or plain rows, Norms whether the per-head RMS
 // norms run at all (the dense target has none), eps their epsilon.
+// KeyEqualsValue (Gemma 4's k_eq_v global layers): the packed row carries no
+// V region, and the V slot of chunk_values instead receives the scale-free
+// RMS norm of the head's pre-norm K — element * inverse, the value before the
+// learned k_norm scale multiplies in. NormalizeValues (Gemma 4's sliding
+// layers): the packed row does carry V, and the stored value is its
+// scale-free RMS norm. Both leave the layout and every other entry unchanged.
+// ProportionalRope (HF rope_type "proportional"): the first RotaryPairs
+// angles rotate as full-head NeoX pairs (i, i + HeadDim/2) — not the
+// contiguous rotated-section pairs (i, i + RotaryPairs) a default partial
+// rotary (Qwen's 256/32) uses.
 template <uint QHeads, uint KHeads, uint HeadDim = 256, uint RotaryPairs = 32,
-          bool QueryGate = true, bool Norms = true, class W = bfloat>
+          bool QueryGate = true, bool Norms = true, class W = bfloat,
+          bool KeyEqualsValue = false, bool NormalizeValues = false,
+          bool ProportionalRope = false>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -21,8 +33,10 @@ inline void full_qkv_storage_phase(
     uint simd_group, float eps = kRmsEpsilon) {
   static_assert(QHeads % KHeads == 0);
   static_assert(RotaryPairs * 2 <= HeadDim);
+  static_assert(!(KeyEqualsValue && NormalizeValues));
   constexpr uint QStride = QueryGate ? 2 * HeadDim : HeadDim;
-  constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
+  constexpr uint PackedStride =
+      QHeads * QStride + (KeyEqualsValue ? 1 : 2) * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
   constexpr uint Simdgroups = HeadDim / 32;
   uint query_tasks = params.tokens * QHeads;
@@ -66,18 +80,42 @@ inline void full_qkv_storage_phase(
     ulong value_offset =
         (ulong(head_index) * HeadDim + thread_index) * params.stride +
         position;
-    chunk_values[value_offset] = source[KWidth + thread_index];
+    if constexpr (KeyEqualsValue) {
+      // With Norms, `inverse` is already the pre-norm K's inverse RMS;
+      // without them a second reduction of the same elements computes it.
+      float value_inverse = inverse;
+      if constexpr (!Norms) {
+        value_inverse = rms_inverse_of_sums<Simdgroups>(
+            element * element, HeadDim, reductions, thread_index, lane,
+            simd_group, eps);
+      }
+      chunk_values[value_offset] = bfloat(element * value_inverse);
+    } else if constexpr (NormalizeValues) {
+      const float value = float(source[KWidth + thread_index]);
+      const float value_inverse = rms_inverse_of_sums<Simdgroups>(
+          value * value, HeadDim, reductions, thread_index, lane, simd_group,
+          eps);
+      chunk_values[value_offset] = bfloat(value * value_inverse);
+    } else {
+      chunk_values[value_offset] = source[KWidth + thread_index];
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr uint partner =
+      ProportionalRope ? HeadDim / 2 : RotaryPairs;
   if (thread_index < RotaryPairs) {
     float first = float(normalized[thread_index]);
-    float second = float(normalized[thread_index + RotaryPairs]);
+    float second = float(normalized[thread_index + partner]);
     float cosine = rope_cos[ulong(row) * RotaryPairs + thread_index];
     float sine = rope_sin[ulong(row) * RotaryPairs + thread_index];
     destination[thread_index] = bfloat(first * cosine - second * sine);
-    destination[thread_index + RotaryPairs] =
+    destination[thread_index + partner] =
         bfloat(second * cosine + first * sine);
-  } else if (thread_index >= 2 * RotaryPairs) {
+  } else if (ProportionalRope
+                 ? ((thread_index >= RotaryPairs &&
+                     thread_index < HeadDim / 2) ||
+                    thread_index >= HeadDim / 2 + RotaryPairs)
+                 : (thread_index >= 2 * RotaryPairs)) {
     destination[thread_index] = normalized[thread_index];
   }
 }

@@ -34,10 +34,19 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument(
             "KV page pool is not a whole number of extents");
     }
-    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
-    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-        layers_.push_back(richengine_kv_layer(extentPages_, data, scale, layer));
+    // Layer regions pack back to back, each its own data and scale
+    // geometry: a dual-geometry pool (Gemma 4's local h256 and global hd512
+    // layers) prices each layer's region at that layer's shape, and the
+    // extent size keeps every region 64 KiB-aligned by
+    // extentAlignmentPages()'s stride.
+    uint64_t offset = 0;
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        layers_.push_back({extentPages_, static_cast<uint32_t>(offset)});
+        offset += extentPages_ * layout_.bytesPerLayerPageAt(layer);
+    }
+    if (offset != extentBytes()) {
+        throw std::logic_error("KV layer regions do not fill the extent");
+    }
     extents_.resize(pageCount_ / extentPages_);
     extentAddresses_.resize(extents_.size());
 }
@@ -147,18 +156,25 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
         throw std::logic_error("KV page " + std::to_string(page) +
                                " is in an extent that is not allocated");
     }
-    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
-    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        for (uint32_t tensor = RICHENGINE_KV_KEYS; tensor <= RICHENGINE_KV_VALUE_SCALES;
-             ++tensor) {
-            if (const uint32_t bytes = richengine_kv_page_bytes(data, scale, tensor)) {
-                result.emplace_back(extent + richengine_kv_offset(extentPages_, data,
-                                                              scale, layer,
-                                                              tensor, index),
+        const auto data =
+            static_cast<uint32_t>(layout_.dataBytesPerLayerPageAt(layer));
+        const auto scale =
+            static_cast<uint32_t>(layout_.scaleBytesPerLayerPageAt(layer));
+        // Same within-region math as richengine_kv_offset, with the layer's
+        // own region base in place of a uniform stride.
+        const uint64_t base = layers_[layer].offset;
+        for (uint32_t tensor = RICHENGINE_KV_KEYS;
+             tensor <= RICHENGINE_KV_VALUE_SCALES; ++tensor) {
+            if (const uint32_t bytes =
+                    richengine_kv_page_bytes(data, scale, tensor)) {
+                const uint64_t before =
+                    (tensor + 1) / 2 * uint64_t(data) +
+                    tensor / 2 * uint64_t(scale);
+                result.emplace_back(extent + base + extentPages_ * before +
+                                        uint64_t(index) * bytes,
                                     bytes);
             }
         }

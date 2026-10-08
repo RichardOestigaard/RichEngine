@@ -1,5 +1,6 @@
 #include "metal/abi/Gguf.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -1343,6 +1344,74 @@ kernel void draft_select_edges(
   }
 }
 
+// The pool-wide variant of draft_select_edges: the same hidden-conditioned
+// codebook edge, but over every shard partial slot (the 128-entry pool the
+// merged top-16 truncates away), matching dspark_select_edges' table shape
+// so the shared pool walk consumes either draft kind. No merge is needed —
+// predecessors and successors are read straight from the shard partials,
+// with the anchor as position zero's only predecessor. A simdgroup still
+// takes one predecessor's eight-candidate slice per task so the dot rounds
+// in the same fixed per-lane order as the merged table's.
+kernel void dflash_select_pool_edges(
+    device const uint *partial_ids [[buffer(0)]],
+    device float *partial_values [[buffer(1)]],
+    device const bfloat *hidden [[buffer(2)]],
+    device const bfloat *predecessor_codebook [[buffer(3)]],
+    device const bfloat *successor_codebook [[buffer(4)]],
+    constant SelectorBatchParams &params [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Pool = Shards * Candidates;
+  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
+  constexpr uint TaskCandidates = 8, Dims = Rank / 32;
+  const uint batch = row / Positions;
+  const uint position = row % Positions;
+  device float *table = partial_values +
+                        ulong(params.lanes) * Positions * Pool +
+                        ulong(row) * Pool * Pool;
+  device const bfloat *row_hidden =
+      hidden + (ulong(batch) * Rows + position + 1) * Rank;
+  const uint tasks = (position ? Pool : 1u) * (Pool / TaskCandidates);
+  for (uint task = simd_group; task < tasks; task += threads / 32) {
+    const uint predecessor_index = task / (Pool / TaskCandidates);
+    const uint first_candidate =
+        task % (Pool / TaskCandidates) * TaskCandidates;
+    const uint previous =
+        position ? partial_ids[(row - 1) * Pool + predecessor_index]
+                 : params.anchor[batch];
+    const uint safe_predecessor = min(previous, params.vocabulary - 1u);
+    float context[Dims];
+    float successor[TaskCandidates][Dims];
+    for (uint i = 0; i < Dims; ++i) {
+      uint dim = lane + i * 32;
+      context[i] = float(predecessor_codebook[safe_predecessor * Rank + dim]) *
+                   float(row_hidden[dim]);
+    }
+    for (uint j = 0; j < TaskCandidates; ++j) {
+      const uint safe_candidate =
+          min(partial_ids[row * Pool + first_candidate + j],
+              params.vocabulary - 1u);
+      for (uint i = 0; i < Dims; ++i)
+        successor[j][i] =
+            float(successor_codebook[safe_candidate * Rank + lane + i * 32]);
+    }
+    for (uint j = 0; j < TaskCandidates; ++j) {
+      float score = 0.0f;
+      for (uint i = 0; i < Dims; ++i)
+        score += context[i] * successor[j][i];
+      score = simd_sum(score);
+      if (lane == 0)
+        table[predecessor_index * Pool + first_candidate + j] = score;
+    }
+  }
+}
+
 // One thread per lane walks the seven positions: the score of a candidate is
 // its unary score plus the edge from the previously chosen candidate, read
 // from the table draft_select_edges left in the partial-values scratch.
@@ -1409,13 +1478,14 @@ kernel void draft_select_dflash(
 }
 
 // draft_select_dflash plus tree emission: the same chain fills
-// tree_tokens/nodes rows 1..7, and lanes in tree_mask additionally record
-// each position's runner-up candidate under the chain's chosen predecessor
-// as a sibling leaf at the fixed row 8 + position (parent = the
-// predecessor's chain row). tokens[] still receives the chain so every
-// chain-mode consumer is unchanged; tree_counts is 8 for a chain lane
-// (anchor + 7 proposals) and RICHENGINE_TREE_VERIFY_NODES - 1 for a tree lane,
-// whose row 15 stays a dead RICHENGINE_TREE_NODE_NONE descriptor.
+// tree_tokens/nodes rows 1..RICHENGINE_DRAFT_PROPOSAL_TOKENS for a chain
+// lane, while a lane in tree_mask fills a comb: the chain holds the front
+// half of the node block (rows 0..Nodes/2-1) and each of its positions'
+// runner-up candidate under the chain's chosen predecessor becomes a
+// sibling leaf in the back half (row Nodes/2 + position, parent = the
+// predecessor's chain row). tokens[] still receives the full chain so every
+// chain-mode consumer is unchanged; tree_counts is 1 + Positions for a
+// chain lane and fills the node stride for a tree lane.
 kernel void draft_select_tree(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
@@ -1430,6 +1500,9 @@ kernel void draft_select_tree(
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  // The comb splits the node stride in halves: chain nodes lead it, one leaf
+  // per leading position follows.
+  constexpr uint ChainRows = RICHENGINE_TREE_VERIFY_NODES / 2;
   candidates += batch * Positions * Candidates;
   unary += batch * Positions * Candidates;
   device const float *tables = partial_values +
@@ -1446,7 +1519,7 @@ kernel void draft_select_tree(
   tree_tokens[0] = params.anchor[batch];
   tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
                   (RICHENGINE_TREE_NODE_NONE << 16);
-  uint leaves [[maybe_unused]] = 0;
+
   uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
     device const float *edges =
@@ -1493,31 +1566,37 @@ kernel void draft_select_tree(
       }
     }
     const uint chain_row = position + 1;
-    tree_tokens[chain_row] = candidates[position * Candidates + selected];
-    tree_nodes[chain_row] = (chain_row - 1) | (chain_row << 8) |
-                            (position << 16);
+    if (!tree || chain_row < ChainRows) {
+      tree_tokens[chain_row] = candidates[position * Candidates + selected];
+      tree_nodes[chain_row] = (chain_row - 1) | (chain_row << 8) |
+                              (position << 16);
+    }
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
-    const uint leaf_row = RICHENGINE_TARGET_VERIFY_ROWS + position;
-    if (tree && runner != Candidates) {
+    // The runner-up under the chain's predecessor becomes the leaf in the
+    // comb's back half; a chain lane's block holds chain rows instead.
+    const uint leaf_row = ChainRows + position;
+    if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES &&
+        runner != Candidates) {
       tree_tokens[leaf_row] = candidates[position * Candidates + runner];
       // The leaf's parent is the chain node that was this position's
       // predecessor (row 0 for position 0, row p for position p).
       tree_nodes[leaf_row] = position | (chain_row << 8) | (position << 16);
-      ++leaves;
-    } else {
+    } else if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES) {
       tree_tokens[leaf_row] = 0;
       tree_nodes[leaf_row] = RICHENGINE_TREE_NODE_NONE |
                              (RICHENGINE_TREE_NODE_NONE << 8) |
                              (RICHENGINE_TREE_NODE_NONE << 16);
     }
   }
-  tree_tokens[RICHENGINE_TREE_VERIFY_NODES - 1] = 0;
-  tree_nodes[RICHENGINE_TREE_VERIFY_NODES - 1] =
-      RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 8) |
-      (RICHENGINE_TREE_NODE_NONE << 16);
-  tree_counts[batch] =
-      tree ? RICHENGINE_TREE_VERIFY_NODES - 1 : 1 + Positions;
+  if (1 + Positions < RICHENGINE_TREE_VERIFY_NODES) {
+    tree_tokens[RICHENGINE_TREE_VERIFY_NODES - 1] = 0;
+    tree_nodes[RICHENGINE_TREE_VERIFY_NODES - 1] =
+        RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 8) |
+        (RICHENGINE_TREE_NODE_NONE << 16);
+  }
+  tree_counts[batch] = min(ulong(1) + Positions,
+                           ulong(RICHENGINE_TREE_VERIFY_NODES));
 }
 
 // The plain DFlash draft's per-position policy, the DFlash2 walk without the
@@ -1571,145 +1650,374 @@ kernel void draft_select_plain(
     tokens[batch * Positions + position] = chosen;
 }
 
-// One group per DSpark proposal row. Simdgroup 0 merges the row's top-16
-// candidates and unary scores; simdgroup 1 merges the preceding row's
-// (position zero's only predecessor is the anchor). Every remaining thread
-// then accumulates one predecessor/candidate edge's Markov bias
-// W2[candidate] . W1[predecessor] over the rank in order, so each entry
-// rounds exactly as the serial walk's per-lane dot did. The table follows
-// the shard partials in partial-values scratch, laid out as
-// draft_select_edges lays it out. The bias reaches only the candidates the
-// unbiased top-16 kept, the same candidate restriction the DFlash2
-// selector's codebook edges apply.
-kernel void dspark_select_edges(
+// draft_select_plain plus comb-tree emission: the per-row merge, sampling
+// draw and tokens[] write are identical, and lanes in tree_mask also fill
+// the node's block — the chain in its front half, the position's rank-1
+// merged candidate as a sibling leaf in the back half (row Nodes/2 +
+// position, parent = the position's predecessor chain row). The plain draft
+// has no predecessor edges, so a leaf is just the position's runner-up.
+kernel void draft_select_plain_tree(
     device const uint *partial_ids [[buffer(0)]],
-    device float *partial_values [[buffer(1)]],
-    device uint *candidates [[buffer(2)]],
-    device float *unary [[buffer(3)]],
-    device const bfloat *markov_w1 [[buffer(4)]],
-    device const bfloat *markov_w2 [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
-  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
-  const uint batch = row / Positions;
-  const uint position = row % Positions;
-  threadgroup uint successors[Candidates];
-  threadgroup uint predecessors[Candidates];
-  if (simd_group == 0) {
-    float value;
-    uint token;
-    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
-    if (lane < Candidates) {
-      candidates[row * Candidates + lane] = token;
-      unary[row * Candidates + lane] = value;
-      successors[lane] = token;
-    }
-  } else if (simd_group == 1) {
-    uint token = params.anchor[batch];
-    if (position > 0) {
-      float value;
-      top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
-                         token);
-    }
-    if (lane < Candidates)
-      predecessors[lane] = token;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // One thread per edge: the bias sums the rank's products in order in one
-  // lane, so the table's entries are bitwise the serial walk's dots.
-  const uint predecessor = thread_index / Candidates;
-  const uint candidate = thread_index % Candidates;
-  if (predecessor >= (position ? Candidates : 1u))
-    return;
-  device float *table =
-      partial_values +
-      ulong(params.lanes) * Positions * Shards * Candidates +
-      ulong(row) * Candidates * Candidates;
-  // Ids are produced by the top-k selection and are always in range; the
-  // clamp only keeps a corrupted id inside the Markov tables.
-  const uint safe_predecessor =
-      min(predecessors[predecessor], params.vocabulary - 1u);
-  const uint safe_candidate =
-      min(successors[candidate], params.vocabulary - 1u);
-  device const bfloat *feature_row =
-      markov_w1 + ulong(safe_predecessor) * Rank;
-  device const bfloat *bias_row = markov_w2 + ulong(safe_candidate) * Rank;
-  float bias = 0.0f;
-  for (uint dim = 0; dim < Rank; ++dim)
-    bias += float(bias_row[dim]) * float(feature_row[dim]);
-  table[predecessor * Candidates + candidate] = bias;
-}
-
-// One simdgroup per lane walks a DSpark draft's proposal positions in order:
-// each position's score is its candidate's unary score plus the edge the
-// parallel dspark_select_edges pass scored for the previously chosen
-// candidate — the anchor's row for position zero — then the greedy or drawn
-// pick feeds the next position, exactly as the serial Markov walk did.
-kernel void draft_select_dspark(
-    device const uint *candidates [[buffer(0)]],
-    device const float *unary [[buffer(1)]],
-    device const float *partial_values [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device uint *candidates [[buffer(3)]],
     device float *probabilities [[buffer(4)]],
     device uint *tokens [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
-    uint batch [[threadgroup_position_in_grid]],
+    device uint *tree_tokens [[buffer(6)]],
+    device uint *tree_nodes [[buffer(7)]],
+    device uint *tree_counts [[buffer(8)]],
+    constant SelectorBatchParams &params [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Nodes = RICHENGINE_TREE_VERIFY_NODES;
+  constexpr uint ChainRows = Nodes / 2;
+  const uint batch = row / Positions;
+  const uint position = row % Positions;
+  float value;
+  uint token;
+  top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+  if (lane < Candidates)
+    candidates[row * Candidates + lane] = token;
+
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  const float scaled = lane < Candidates ? value / temperature : -INFINITY;
+  const float maximum = simd_max(scaled);
+  const float weight =
+      lane < Candidates ? fast::exp(scaled - maximum) : 0.0f;
+  const float probability = weight / simd_sum(weight);
+  if (lane < Candidates)
+    probabilities[row * Candidates + lane] = probability;
+
+  uint selected = 0;
+  if (sampling) {
+    const float uniform = uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                                   RICHENGINE_UNIFORM_PROPOSALS + position];
+    const float prefix = simd_prefix_inclusive_sum(probability);
+    const bool hit =
+        lane < Candidates && prefix - probability <= uniform && prefix > uniform;
+    selected = simd_min(hit ? lane : 0xffffffffu);
+    if (selected == 0xffffffffu)
+      selected = Candidates - 1;
+  }
+  const uint chosen = simd_broadcast(token, selected);
+  const uint runner_up = simd_broadcast(token, 1);
+  if (lane == 0) {
+    tokens[batch * Positions + position] = chosen;
+    device uint *tt = tree_tokens + batch * Nodes;
+    device uint *tn = tree_nodes + batch * Nodes;
+    if (position == 0) {
+      tt[0] = params.anchor[batch];
+      tn[0] = RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 16);
+      tree_counts[batch] = min(ulong(1) + Positions, ulong(Nodes));
+    }
+    const uint chain_row = position + 1;
+    if (!tree || chain_row < ChainRows) {
+      tt[chain_row] = chosen;
+      tn[chain_row] = (chain_row - 1) | (chain_row << 8) | (position << 16);
+    }
+    const uint leaf_row = ChainRows + position;
+    if (tree && leaf_row < Nodes && runner_up != 0xffffffffu &&
+        runner_up != chosen) {
+      tt[leaf_row] = runner_up;
+      tn[leaf_row] = position | (chain_row << 8) | (position << 16);
+    } else if (tree && leaf_row < Nodes) {
+      tt[leaf_row] = 0;
+      tn[leaf_row] = RICHENGINE_TREE_NODE_NONE |
+                     (RICHENGINE_TREE_NODE_NONE << 8) |
+                     (RICHENGINE_TREE_NODE_NONE << 16);
+    }
+  }
+}
+
+// One group per DSpark proposal row scores every predecessor/candidate edge
+// of the merged shard pool: all 128 partial slots the top-16 shards emitted,
+// not just their best sixteen. The reference applies the Markov bias over
+// the whole vocabulary; the pool covers every token any shard ranked, so a
+// low-logit token the bias favors can still win the walk. Position zero's
+// only predecessor is the anchor, every other row's predecessors are the
+// previous row's pool. Each entry accumulates W2[candidate] . W1[predecessor]
+// over the rank in order in one thread, so it rounds exactly as the serial
+// walk's per-lane dot did. The table follows the shard partials in
+// partial-values scratch.
+kernel void dspark_select_edges(
+    device const uint *partial_ids [[buffer(0)]],
+    device float *partial_values [[buffer(1)]],
+    device const bfloat *markov_w1 [[buffer(2)]],
+    device const bfloat *markov_w2 [[buffer(3)]],
+    constant SelectorBatchParams &params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Pool = Shards * Candidates;
+  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
+  const uint batch = row / Positions;
+  const uint position = row % Positions;
+  device float *table =
+      partial_values + ulong(params.lanes) * Positions * Pool +
+      ulong(row) * Pool * Pool;
+  const uint edges = position ? Pool * Pool : Pool;
+  for (uint e = thread_index; e < edges; e += 256) {
+    const uint predecessor = e / Pool;
+    const uint candidate = e % Pool;
+    // Ids come from the shard top-k and are always in range; the clamp only
+    // keeps a corrupted id inside the Markov tables.
+    const uint prev_token = position
+        ? partial_ids[(row - 1) * Pool + predecessor]
+        : params.anchor[batch];
+    const uint safe_predecessor = min(prev_token, params.vocabulary - 1u);
+    const uint safe_candidate =
+        min(partial_ids[row * Pool + candidate], params.vocabulary - 1u);
+    device const bfloat *feature_row =
+        markov_w1 + ulong(safe_predecessor) * Rank;
+    device const bfloat *bias_row = markov_w2 + ulong(safe_candidate) * Rank;
+    float bias = 0.0f;
+    for (uint dim = 0; dim < Rank; ++dim)
+      bias += float(bias_row[dim]) * float(feature_row[dim]);
+    table[predecessor * Pool + candidate] = bias;
+  }
+}
+
+// One simdgroup per lane walks a DSpark draft's proposal positions in order:
+// each position's score is its pool slot's shard score plus the edge the
+// parallel dspark_select_edges pass scored for the previously chosen slot —
+// the anchor's row for position zero — then the greedy or drawn pick feeds
+// the next position, exactly as the serial Markov walk did. Each lane owns
+// four of the pool's 128 slots.
+kernel void draft_select_dspark(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device float *probabilities [[buffer(3)]],
+    device uint *tokens [[buffer(4)]],
+    constant SelectorBatchParams &params [[buffer(5)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Pool = Shards * Candidates;
+  constexpr uint Owned = Pool / 32;
   device const float *tables =
-      partial_values +
-      ulong(params.lanes) * Positions * Shards * Candidates +
-      ulong(batch) * Positions * Candidates * Candidates;
+      partial_values + ulong(params.lanes) * Positions * Pool +
+      ulong(batch) * Positions * Pool * Pool;
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   const float temperature = sampling ? params.temperature[batch] : 1.0f;
   uint predecessor_index = 0;
   for (uint position = 0; position < Positions; ++position) {
     const uint row = batch * Positions + position;
-    const uint token =
-        lane < Candidates ? candidates[row * Candidates + lane] : 0xffffffffu;
-    const float value =
-        lane < Candidates ? unary[row * Candidates + lane] : -INFINITY;
-    const float edge =
-        tables[(position * Candidates + predecessor_index) * Candidates +
-               min(lane, uint(Candidates - 1))];
-    const float biased = lane < Candidates ? value + edge : -INFINITY;
+    device const float *edge =
+        tables + (ulong(position) * Pool + predecessor_index) * Pool;
+    float biased[Owned];
+    float local_best = -INFINITY;
+    uint local_slot = 0;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      biased[k] = partial_values[row * Pool + slot] + edge[slot];
+      if (biased[k] > local_best) {
+        local_best = biased[k];
+        local_slot = slot;
+      }
+    }
 
-    const float scaled = lane < Candidates ? biased / temperature : -INFINITY;
-    const float maximum = simd_max(scaled);
-    const float weight =
-        lane < Candidates ? fast::exp(scaled - maximum) : 0.0f;
-    const float probability = weight / simd_sum(weight);
-    if (lane < Candidates)
-      probabilities[row * Candidates + lane] = probability;
+    // Sampled softmax over the pool; the CDF order is lane-major, which is a
+    // valid draw order for the same distribution.
+    float weights[Owned];
+    float weight_sum = 0.0f;
+    const float maximum = simd_max(local_best / temperature);
+    for (uint k = 0; k < Owned; ++k)
+      weight_sum += weights[k] =
+          fast::exp((biased[k] / temperature) - maximum);
+    const float lane_prefix =
+        simd_prefix_inclusive_sum(weight_sum) - weight_sum;
+    const float total = simd_sum(weight_sum);
+    float run = lane_prefix;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      probabilities[row * Pool + slot] = weights[k] / total;
+    }
 
     uint selected;
     if (sampling) {
-      const float uniform = uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
-                                     RICHENGINE_UNIFORM_PROPOSALS + position];
-      const float prefix = simd_prefix_inclusive_sum(probability);
-      const bool hit = lane < Candidates &&
-                       prefix - probability <= uniform && prefix > uniform;
-      selected = simd_min(hit ? lane : 0xffffffffu);
-      if (selected == 0xffffffffu)
-        selected = Candidates - 1;
+      const float uniform =
+          uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                   RICHENGINE_UNIFORM_PROPOSALS + position] * total;
+      // The crossing must be found by draw position (lane * Owned + k), not
+      // slot: simd_min over slots would steal the draw for any later lane's
+      // first slot, which is always below 32.
+      uint pick = 0xffffffffu;
+      for (uint k = 0; k < Owned; ++k) {
+        run += weights[k];
+        if (pick == 0xffffffffu && run > uniform)
+          pick = lane * Owned + k;
+      }
+      selected = simd_min(pick);
+      selected = selected == 0xffffffffu
+                     ? Pool - 1
+                     : selected / Owned + 32 * (selected % Owned);
     } else {
-      selected = simd_min(biased == maximum ? lane : 0xffffffffu);
+      const float top = simd_max(local_best);
+      selected = simd_min(local_best == top ? local_slot : 0xffffffffu);
       if (selected == 0xffffffffu)
         selected = 0;
     }
-    const uint chosen = simd_broadcast(token, selected);
     if (lane == 0)
-      tokens[row] = chosen;
+      tokens[row] = partial_ids[row * Pool + selected];
     predecessor_index = selected;
+  }
+}
+
+// draft_select_dspark plus comb-tree emission: the same chain fills
+// tree_tokens/nodes rows 1..7, and lanes in tree_mask additionally record
+// each position's biased runner-up under the chain's chosen predecessor as
+// a sibling leaf at the fixed row 8 + position (parent = the predecessor's
+// chain row), matching draft_select_tree's table layout so the shared
+// tree-verify path consumes either draft kind. The pool's runner-up needs a
+// second simd pass per position; sampled lanes draw the chain identically
+// and emit the degenerate linear table.
+kernel void draft_select_dspark_tree(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device float *probabilities [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device uint *tree_tokens [[buffer(5)]],
+    device uint *tree_nodes [[buffer(6)]],
+    device uint *tree_counts [[buffer(7)]],
+    constant SelectorBatchParams &params [[buffer(8)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
+  constexpr ulong Candidates = RICHENGINE_DRAFT_CANDIDATES;
+  constexpr uint Pool = Shards * Candidates;
+  constexpr uint Owned = Pool / 32;
+  // The comb splits the node stride in halves: chain nodes lead it, one leaf
+  // per leading position follows.
+  constexpr uint ChainRows = RICHENGINE_TREE_VERIFY_NODES / 2;
+  device const float *tables =
+      partial_values + ulong(params.lanes) * Positions * Pool +
+      ulong(batch) * Positions * Pool * Pool;
+  tree_tokens += batch * RICHENGINE_TREE_VERIFY_NODES;
+  tree_nodes += batch * RICHENGINE_TREE_VERIFY_NODES;
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  if (lane == 0) {
+    tree_tokens[0] = params.anchor[batch];
+    tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
+                    (RICHENGINE_TREE_NODE_NONE << 16);
+  }
+  uint predecessor_index = 0;
+  for (uint position = 0; position < Positions; ++position) {
+    const uint row = batch * Positions + position;
+    device const float *edge =
+        tables + (ulong(position) * Pool + predecessor_index) * Pool;
+    float biased[Owned];
+    float local_best = -INFINITY;
+    uint local_slot = 0;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      biased[k] = partial_values[row * Pool + slot] + edge[slot];
+      if (biased[k] > local_best) {
+        local_best = biased[k];
+        local_slot = slot;
+      }
+    }
+
+    float weights[Owned];
+    float weight_sum = 0.0f;
+    const float maximum = simd_max(local_best / temperature);
+    for (uint k = 0; k < Owned; ++k)
+      weight_sum += weights[k] =
+          fast::exp((biased[k] / temperature) - maximum);
+    const float lane_prefix =
+        simd_prefix_inclusive_sum(weight_sum) - weight_sum;
+    const float total = simd_sum(weight_sum);
+    float run = lane_prefix;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      probabilities[row * Pool + slot] = weights[k] / total;
+    }
+
+    uint selected;
+    uint runner = Pool;
+    if (sampling) {
+      const float uniform =
+          uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                   RICHENGINE_UNIFORM_PROPOSALS + position] * total;
+      uint pick = 0xffffffffu;
+      for (uint k = 0; k < Owned; ++k) {
+        run += weights[k];
+        if (pick == 0xffffffffu && run > uniform)
+          pick = lane * Owned + k;
+      }
+      selected = simd_min(pick);
+      selected = selected == 0xffffffffu
+                     ? Pool - 1
+                     : selected / Owned + 32 * (selected % Owned);
+    } else {
+      const float top = simd_max(local_best);
+      selected = simd_min(local_best == top ? local_slot : 0xffffffffu);
+      if (selected == 0xffffffffu)
+        selected = 0;
+      if (tree) {
+        // The runner-up under the chain's predecessor becomes the leaf at
+        // this position's fixed row; a dead or sentinel pool slot leaves a
+        // NONE node the accept walk skips.
+        float local_second = -INFINITY;
+        uint second_slot = 0;
+        for (uint k = 0; k < Owned; ++k) {
+          const uint slot = lane + 32 * k;
+          if (slot != selected && biased[k] > local_second) {
+            local_second = biased[k];
+            second_slot = slot;
+          }
+        }
+        const float second = simd_max(local_second);
+        runner = simd_min(local_second == second ? second_slot : Pool);
+      }
+    }
+    if (lane == 0) {
+      const uint chain_row = position + 1;
+      const uint token = partial_ids[row * Pool + selected];
+      if (!tree || chain_row < ChainRows) {
+        tree_tokens[chain_row] = token;
+        tree_nodes[chain_row] =
+            (chain_row - 1) | (chain_row << 8) | (position << 16);
+      }
+      tokens[row] = token;
+      const uint leaf_row = ChainRows + position;
+      const uint leaf_token =
+          runner < Pool ? partial_ids[row * Pool + runner] : 0xffffffffu;
+      if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES &&
+          leaf_token < params.vocabulary) {
+        // The leaf's parent is the chain row that was this position's
+        // predecessor (row 0 for position 0, row p for position p).
+        tree_tokens[leaf_row] = leaf_token;
+        tree_nodes[leaf_row] = position | (chain_row << 8) | (position << 16);
+      } else if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES) {
+        tree_tokens[leaf_row] = 0;
+        tree_nodes[leaf_row] = RICHENGINE_TREE_NODE_NONE |
+                               (RICHENGINE_TREE_NODE_NONE << 8) |
+                               (RICHENGINE_TREE_NODE_NONE << 16);
+      }
+    }
+    predecessor_index = selected;
+  }
+  if (lane == 0) {
+    if (1 + Positions < RICHENGINE_TREE_VERIFY_NODES) {
+      tree_tokens[RICHENGINE_TREE_VERIFY_NODES - 1] = 0;
+      tree_nodes[RICHENGINE_TREE_VERIFY_NODES - 1] =
+          RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 8) |
+          (RICHENGINE_TREE_NODE_NONE << 16);
+    }
+    tree_counts[batch] = min(ulong(1) + Positions,
+                             ulong(RICHENGINE_TREE_VERIFY_NODES));
   }
 }
 
@@ -1730,6 +2038,8 @@ struct AcceptParams {
   uint stop_token_1;
   // The lane's proposal budget: the most draft tokens it may accept.
   uint limit;
+  // Draft ids/probabilities stride per position (candidate-table width).
+  uint candidate_stride;
 };
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
@@ -1765,9 +2075,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
   uint accepted = 0;
   while (accepted < params.limit) {
     uint token = draft_tokens[accepted];
-    float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
-                            draft_probs + accepted * kDraftCandidates,
-                            kDraftCandidates, token);
+    float q = sparse_lookup(draft_ids + accepted * params.candidate_stride,
+                            draft_probs + accepted * params.candidate_stride,
+                            params.candidate_stride, token);
     float p = target_rows[accepted].draft_probability;
     if (!(uniforms[RICHENGINE_UNIFORM_ACCEPTANCE + accepted] * q < p))
       break;
@@ -1898,7 +2208,8 @@ kernel void decode_accept_dflash(
                            params.proposals[batch]
                                ? min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
                                      params.proposals[batch])
-                               : uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS)};
+                               : uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
+                           params.candidate_stride};
   device const uint *lane_draft =
       draft_tokens + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =
@@ -1906,8 +2217,10 @@ kernel void decode_accept_dflash(
   if (params.sampling_mask & (1u << batch)) {
     accept_sampled_lane(
         lane_draft,
-        draft_ids + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
+        draft_ids + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS *
+                      params.candidate_stride,
+        draft_probs + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS *
+                          params.candidate_stride,
         target_rows + batch * RICHENGINE_TARGET_VERIFY_ROWS,
         uniforms + batch * RICHENGINE_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
@@ -1949,23 +2262,21 @@ kernel void decode_accept_tree(
   path[0] = 0;
   uint count = 1;
   uint cursor = 0;
-  // Only the chain rows 0..RICHENGINE_DRAFT_PROPOSAL_TOKENS - 1 have children:
-  // the chain successor at cursor + 1 and the sibling leaf at row Emitted +
-  // cursor. The last chain row and every leaf are the comb's teeth — a
-  // leaf's walk ends, and row 7's only would-be child row is the first leaf
-  // row, which is not its descendant. The path also stops at Emitted rows,
-  // the committed block's capacity.
-  while (count < Emitted && count <= remaining &&
-         cursor < RICHENGINE_DRAFT_PROPOSAL_TOKENS) {
+  // The comb's chain nodes lead the node block: a chain cursor's children are
+  // the chain successor at cursor + 1 while one exists, and the sibling leaf
+  // at row Nodes/2 + cursor. A leaf ends the walk — leaf rows have no
+  // children — and the path stops at Emitted rows, the committed block's
+  // capacity.
+  constexpr uint ChainRows = Nodes / 2;
+  while (count < Emitted && count <= remaining && cursor < ChainRows) {
     const uint selected = target_tokens[cursor];
     uint next = Nodes;
-    if (tree_tokens[cursor + 1] == selected) {
+    if (cursor + 1 < ChainRows && tree_tokens[cursor + 1] == selected) {
       next = cursor + 1;
     } else {
-      const uint leaf = Emitted + cursor;
+      const uint leaf = ChainRows + cursor;
       if (leaf < node_count &&
-          RICHENGINE_TREE_NODE_PARENT(tree_nodes[leaf]) !=
-              RICHENGINE_TREE_NODE_NONE &&
+          RICHENGINE_TREE_NODE_PARENT(tree_nodes[leaf]) == cursor &&
           tree_tokens[leaf] == selected) {
         next = leaf;
       }
@@ -1981,7 +2292,8 @@ kernel void decode_accept_tree(
     output_tokens[count - 1] = target_tokens[cursor];
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1,
-                           RICHENGINE_DRAFT_PROPOSAL_TOKENS};
+                           RICHENGINE_DRAFT_PROPOSAL_TOKENS,
+                           kDraftCandidates};
   finish_acceptance(output_tokens, count - 1, lane_params, retained[batch],
                     accepted_count[batch]);
   for (uint i = 0; i < retained[batch]; ++i)
@@ -2010,7 +2322,7 @@ kernel void tree_leaf_patch(
   const uint slot = index % Leaves;
   if (lane >= params.lanes)
     return;
-  const uint row = RICHENGINE_TARGET_VERIFY_ROWS + slot;
+  const uint row = RICHENGINE_TREE_VERIFY_NODES / 2 + slot;
   if (row >= tree_counts[lane])
     return;
   const uint token = medusa_tokens[index];
@@ -2139,4 +2451,19 @@ kernel void decode_head_argmax_reduce_tiles_gguf(
       simd_min(best == group_best ? best_index : 0xffffffffu);
   if (lane == 0)
     tokens[s] = group_index;
+}
+
+// Gemma 4's final logit softcap: logits <- cap * tanh(logits / cap), in
+// place, before argmax or sampling (cap 30). The map is strictly monotonic,
+// so the fused decode_head_argmax path needs no variant — its argmax is the
+// softcapped logits' argmax; only sampled rows and any path that reads the
+// logit values run this.
+kernel void decode_logit_softcap(
+    device float *logits [[buffer(0)]],
+    constant float &cap [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  for (uint element = index; element < count; element += grid_size)
+    logits[element] = cap * richengine_tanh(logits[element] / cap);
 }

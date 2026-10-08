@@ -6,6 +6,7 @@
 // Runtime::Impl (RuntimeImpl.hpp), which aliases the types under their
 // nested names.
 
+#include "model/NgramIndex.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -93,12 +94,18 @@ struct RuntimeRequest final {
   // Nonempty selects score-only mode: the final prefill chunk computes raw
   // logits at these token ids instead of selecting an anchor.
   std::vector<uint32_t> scoreTokens;
+  // DiffusionGemma: how many canvases the request has committed; each
+  // canvas's RNG seed is the request seed mixed by this counter.
+  uint32_t canvasIndex = 0;
   std::vector<uint32_t> maskWords;
   // Set only while the current scheduler-owned ticket overlaps grammar-mask
   // computation with target verification. This is model runtime state, not a
   // scheduler decode stage.
   bool verifyMaskInFlight = false;
   uint64_t rngCounter = 0;
+  // A bootstrap warmup request: the diffusion decode truncates its canvas
+  // schedule — warmup needs one compiled pass over every kernel, not 48.
+  bool warmup = false;
   DecodeStage decodeStage = DecodeStage::Regular;
   std::optional<DraftContextPlan> draftContextPlan;
   std::vector<RuntimeImageState> images;
@@ -106,10 +113,9 @@ struct RuntimeRequest final {
   // there were left out (ModelRequest::restoredTokens).
   uint32_t restoredTokens = 0;
   // Learning-free predraft state (RICHENGINE_NGRAM_PREDRAFT): the lane's
-  // token stream and each 3-gram's last two starts.
-  std::vector<uint32_t> ngramHistory;
-  // Each 3-gram key keeps its last four starts; the lookup walks them all.
-  std::unordered_map<uint64_t, std::array<uint32_t, 4>> ngramIndex;
+  // token stream and each 3-gram key's last four starts, which the lookup
+  // walks. NgramIndex.hpp owns the logic.
+  ngram::Table ngram;
   // Acceptance gating: EWMA of accepted tokens per n-gram round, set in
   // finalizeDecode for steps where this lane's proposals were used.
   uint32_t ngramRounds = 0;
@@ -122,6 +128,13 @@ struct RuntimeRequest final {
   // budget — the acceptance cap and live verify rows that step.
   double proposalAcceptedAvg = kDraftProposalTokens;
   uint32_t proposalBudget = kDraftProposalTokens;
+  // Adaptive draft bypass (RICHENGINE_DRAFT_BYPASS): while the acceptance
+  // EWMA sits below the draft's break-even cost the lane skips the draft
+  // pass entirely; this step's flag skips the EWMA update (a fake zero
+  // would poison it), and the probe counter schedules a drafted step every
+  // kDraftProbeTokens so a recovered lane re-enables.
+  uint32_t draftProbeAt = 0;
+  bool draftBypassed = false;
   // Prefill chunks submitted but not yet consumed (submit-ahead ring): the
   // count flips the parity binding an encode selects, and the rows relax the
   // packed-prefill length check by the unapplied advance.

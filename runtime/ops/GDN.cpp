@@ -1,5 +1,6 @@
 #include "ops/GDN.hpp"
-#include "Env.hpp"
+#include "Tuning.hpp"
+#include "ops/KernelNames.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
@@ -37,7 +38,7 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 
 // RICHENGINE_GDN_CHUNKED selects the WY/UT scan's chunk factor (32/64/128).
 [[nodiscard]] uint32_t gdnChunkFactor() {
-  const uint32_t parsed = envUint("RICHENGINE_GDN_CHUNKED", 0);
+  const uint32_t parsed = tuning().gdnChunked;
   return parsed == 32 || parsed == 64 || parsed == 128 ? parsed : 0;
 }
 
@@ -66,12 +67,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   const KernelLayout kernel = kernelShape(shape);
   const std::string gate =
       normKernel(kernelName(kernel,
-                            sums ? "prefill_gdn_gate_sums" : "prefill_gdn_gate",
-                            sums ? "prefill_gdn_gate_sums_vh32" : "prefill_gdn_gate_vh32"),
+                            (sums ? kPrefillGdnGateSums : kPrefillGdnGate).data(),
+                            (sums ? kPrefillGdnGateSumsVh32 : kPrefillGdnGateVh32).data()),
                  buffers.mixerNorm, shape.headDimension);
   const GDNPrefillParams params{tokens};
-  graph.add(kernelName(kernel, "prefill_gdn_prepare",
-                       "prefill_gdn_prepare_vh32"),
+  graph.add(kernelName(kernel, kPrefillGdnPrepare.data(),
+                       kPrefillGdnPrepareVh32.data()),
             {buffers.packed, buffers.convolutionWeights,
              buffers.convolutionIn, buffers.convolutionOut, buffers.queries,
              buffers.keys, buffers.values, buffers.decayWeights,
@@ -87,15 +88,15 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
         buffers.decay,        buffers.beta,       buffers.recurrentIn,
         buffers.recurrentOut, buffers.recurrentRows, buffers.chunkScratch};
     const std::string suffix = "_c" + std::to_string(chunk);
-    graph.add("gdn_chunked_prep" + suffix, bindings, chunked,
+    graph.add(std::string(kGdnChunkedPrep) + suffix, bindings, chunked,
               {uint64_t{shape.valueHeads} * chunked.chunks, 1, 1},
               {128, 1, 1});
-    graph.add("gdn_chunked_scan" + suffix, bindings, chunked,
+    graph.add(std::string(kGdnChunkedScan) + suffix, bindings, chunked,
               {uint64_t{shape.valueHeads} * (shape.headDimension / 16), 1, 1},
               {128, 1, 1});
   } else {
-    graph.add(kernelName(kernel, "prefill_gdn_scan",
-                         "prefill_gdn_scan_vh32"),
+    graph.add(kernelName(kernel, kPrefillGdnScan.data(),
+                         kPrefillGdnScanVh32.data()),
               {buffers.queries, buffers.keys, buffers.values, buffers.decay,
                buffers.beta, buffers.recurrentIn, buffers.recurrentOut,
                buffers.recurrentRows},
@@ -147,7 +148,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
             ? std::clamp(liveRows[lane], uint32_t{1},
                          uint32_t{RICHENGINE_TARGET_VERIFY_ROWS})
             : RICHENGINE_TARGET_VERIFY_ROWS;
-  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
+  const std::string name = std::string(kVerifyGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
@@ -187,7 +188,7 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                               {}};
   for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] = RICHENGINE_TARGET_VERIFY_ROWS;
-  const std::string name = std::string("verify_tree_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
+  const std::string name = std::string(kVerifyTreeGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
@@ -212,8 +213,8 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   // Static parameters and arena/state buffers: replayable. The current/next
   // state swap alternates between the span cache's two slots.
   graph.beginBakedSpan();
-  graph.add(kernelName(kernel, "verify_gdn_commit",
-                       "verify_gdn_commit_vh32"),
+  graph.add(kernelName(kernel, kVerifyGdnCommit.data(),
+                       kVerifyGdnCommitVh32.data()),
             std::move(bindings), params,
             {shape.valueHeads, layers, lanes});
   graph.endBakedSpan();
@@ -236,8 +237,8 @@ void GDN::addCommitTree(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
   graph.beginBakedSpan();
-  graph.add(kernelName(kernel, "verify_gdn_commit_tree",
-                       "verify_gdn_commit_tree_vh32"),
+  graph.add(kernelName(kernel, kVerifyGdnCommitTree.data(),
+                       kVerifyGdnCommitTreeVh32.data()),
             std::move(bindings), params,
             {shape.valueHeads, layers, lanes});
   graph.endBakedSpan();

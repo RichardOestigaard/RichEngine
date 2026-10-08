@@ -183,10 +183,14 @@ struct AcceptBatchParams {
   // this step (RICHENGINE_DRAFT_PROPOSAL_TOKENS when unadapted). A lane's
   // retained count stays within proposals + 1 live rows.
   uint32_t proposals[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // Candidate-table stride: the draft ids and proposal probabilities of one
+  // position (RICHENGINE_DRAFT_CANDIDATES for merged selectors, the
+  // shards-times-candidates pool for DSpark).
+  uint32_t candidate_stride;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 44,
-              "Batched acceptance parameters are 44 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 48,
+              "Batched acceptance parameters are 48 bytes on both sides");
 
 // verify_input_tree_tokens parameters: one thread per (lane, node) fills the
 // node's verify input token, its (t, h, w) rope position (the lane's base

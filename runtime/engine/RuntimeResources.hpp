@@ -107,6 +107,9 @@ struct RuntimeResourcesConfig {
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
   AneFfnSetting aneFfn;
+  // --moe-union: the decode step's routed-expert budget per MoE dispatch; 0
+  // keeps every selected route.
+  uint32_t moeUnionCap = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.

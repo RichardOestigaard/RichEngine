@@ -4,7 +4,7 @@
 #import "MetalBackend.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
-#include "Env.hpp"
+#include "Tuning.hpp"
 #include "Residency.hpp"
 #include "TestConfig.hpp"
 #ifdef RICHENGINE_BACKEND_INSTRUMENTATION
@@ -43,6 +43,49 @@
 #include "metal/MetalBackendImpl.hpp"
 
 namespace richengine::metal {
+
+namespace {
+
+// RICHENGINE_OP_TIMINGS=1 accumulates per-pipeline GPU seconds from the
+// encoder's timestamp samples; dumpOpTimings() prints the running table.
+struct OpTimingTable {
+  std::mutex mutex;
+  std::unordered_map<std::string, std::pair<double, uint64_t>> seconds;
+};
+
+OpTimingTable &opTimingTable() {
+  static OpTimingTable *table = new OpTimingTable;
+  return *table;
+}
+
+} // namespace
+
+void recordOpTiming(const std::string &name, double gpuSeconds) {
+  if (!std::isfinite(gpuSeconds) || gpuSeconds < 0.0) return;
+  std::lock_guard lock(opTimingTable().mutex);
+  opTimingTable().seconds[name].first += gpuSeconds;
+  opTimingTable().seconds[name].second += 1;
+}
+
+void dumpOpTimings() {
+  auto &table = opTimingTable();
+  std::vector<std::pair<std::string, double>> rows;
+  {
+    std::lock_guard lock(table.mutex);
+    rows.reserve(table.seconds.size());
+    for (const auto &[name, totals] : table.seconds)
+      rows.emplace_back(name + " x" + std::to_string(totals.second),
+                        totals.first);
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const auto &a, const auto &b) { return a.second > b.second; });
+  double total = 0.0;
+  for (const auto &[name, seconds] : rows) total += seconds;
+  fprintf(stderr, "op timings (cumulative %.1fms):\n", total * 1000.0);
+  for (size_t i = 0; i < rows.size() && i < 24; ++i)
+    fprintf(stderr, "  %8.3fms  %s\n", rows[i].second * 1000.0,
+            rows[i].first.c_str());
+}
 
 id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) {
         if (name.empty()) {
@@ -115,15 +158,13 @@ id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view nam
 
 // The escape hatch: baked indirect dispatch is off entirely.
     bool MetalBackend::Impl::icbDisabled() noexcept {
-        const bool disabled = envFlag("RICHENGINE_ICB_OFF");
-        return disabled;
+        return tuning().icbOff;
     }
 
 // The Metal 4 encoder is opt-in (RICHENGINE_MTL4=1) while it is benchmarked
     // against the Metal 3 path it mirrors.
     bool MetalBackend::Impl::mtl4Enabled() noexcept {
-        const bool enabled = envFlag("RICHENGINE_MTL4");
-        return enabled;
+        return tuning().mtl4;
     }
 
 bool MetalBackend::Impl::useMtl4() const noexcept {
@@ -613,8 +654,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
 
 // The escape hatch for the prepared-command cache only.
     bool MetalBackend::Impl::preparedCacheDisabled() noexcept {
-        const bool disabled = envFlag("RICHENGINE_PREPARED_CACHE_OFF");
-        return disabled;
+        return tuning().preparedCacheOff;
     }
 
 // prepare(), or its cached equivalent when the run is field-for-field
@@ -712,6 +752,16 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // The buffers before `command`, each ended by an event signal.
             std::vector<id<MTLCommandBuffer>> leading;
             id<MTLComputeCommandEncoder> encoder = nil;
+            // RICHENGINE_OP_TIMINGS: commit every dispatch as its own
+            // command buffer so its GPU span is readable on completion.
+            // Buffers serialize on the queue, so per-dispatch seconds are
+            // kernel-time only — wall time inflates by the inter-buffer
+            // gaps and adjacent-dispatch overlap disappears; a probe, not
+            // a benchmark. (Encoder counter sampling is unsupported on this
+            // GPU family.) Buffers commit eagerly: the queue caps
+            // outstanding uncommitted buffers well below a command's
+            // dispatch count.
+            const bool opTimings = tuning().opTimings;
             // Encodes the event steps that follow the first `encoded`
             // dispatches.
             auto step = events.begin();
@@ -739,7 +789,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         if (ended.status == MTLCommandBufferStatusError)
                             signaled.signal(value);
                     }];
-                    leading.push_back(command);
+                    if (opTimings) {
+                        [command commit];
+                    } else {
+                        leading.push_back(command);
+                    }
                     command = [queue commandBuffer];
                     if (!command) {
                         failBeforeCommit("unable to create Metal command buffer");
@@ -750,6 +804,19 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // keep the buffers alive.
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
+            const auto closeDispatch = [&](std::string_view name) {
+                if (!opTimings || !encoder) return;
+                [encoder endEncoding];
+                encoder = nil;
+                // The handler outlives this stack frame: copy the name.
+                const std::string nameCopy(name);
+                [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+                    recordOpTiming(nameCopy,
+                                   finished.GPUEndTime - finished.GPUStartTime);
+                }];
+                [command commit];
+                command = [queue commandBuffer];
+            };
             for (size_t index = 0; index < dispatches.size(); ++index) {
                 encodeSteps(index);
                 const PreparedDispatch &item = dispatches[index];
@@ -780,6 +847,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                            withRange:NSMakeRange(
                                                          0, item.span->dispatches.size())];
                     index += item.span->dispatches.size() - 1;
+                    closeDispatch(std::string(item.source->pipelineName));
                     continue;
                 }
                 const ComputeDispatch &dispatch = *item.source;
@@ -806,6 +874,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 }
                 [encoder dispatchThreadgroups:item.groups
                          threadsPerThreadgroup:item.threads];
+                closeDispatch(std::string(dispatch.pipelineName));
             }
             encodeSteps(dispatches.size());
             if (encoder) [encoder endEncoding];

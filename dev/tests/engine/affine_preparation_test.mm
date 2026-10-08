@@ -10,7 +10,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "model/WeightImages.hpp"
 #include <cstdint>
 #include <cstring>
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       if (kind == "draft") {
         const model::DFlashDraftLayout layout = tinyDraftLayout();
-        prepare<model::DraftCheckpointLoader>(backend, root, layout, [](auto &loader, const auto &check) {
+        prepare<model::DFlash2CheckpointLoader>(backend, root, layout, [](auto &loader, const auto &check) {
           check(loader.layer(0));
           check(loader.layer(1));
           check(loader.model());
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
         writeEveryByte(root, model::draftCheckpointImages(layout));
         // The draft reads the images as it reads a package's files.
         model::WeightImages images(backend);
-        model::DraftCheckpointLoader files(images, root, layout);
+        model::DFlash2CheckpointLoader files(images, root, layout);
         const model::DFlashDraftWeights draft = model::loadDFlashDraftWeights(backend, std::ref(files), layout);
         const auto affine = [](const ops::Projection &p, uint32_t n, uint32_t k) {
           return p.layout() == ops::WeightLayout::Affine64 && p.outputSize == n && p.inputSize == k;
@@ -190,11 +190,11 @@ int main(int argc, char **argv) {
         read = read && !layer.inputNorm.float32 && !layer.postAttentionNorm.float32 &&
                affine(layer.gateProjection, layout.intermediateSize, layout.hiddenSize) &&
                affine(layer.downProjection, layout.hiddenSize, layout.intermediateSize);
-        if (const auto *gdn = std::get_if<model::QwenGdnWeights>(&layer.mixer))
+        if (const auto *gdn = std::get_if<model::GdnMixerWeights>(&layer.mixer))
           read = read && affine(gdn->inputProjection, layout.packedGdnWidth, layout.hiddenSize) &&
                  gdn->outputHeadOrder == ops::GdnHeadOrder::Grouped && !gdn->mixerNorm.float32;
         else
-          read = read && affine(std::get<model::QwenAttentionWeights>(layer.mixer).inputProjection,
+          read = read && affine(std::get<model::AttentionMixerWeights>(layer.mixer).inputProjection,
                                 layout.packedFullWidth, layout.hiddenSize);
       }
       if (!read) throw std::runtime_error("the target loader misread the affine images");

@@ -1,5 +1,5 @@
 #include "model/Ornith9B.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 
 #include <cstring>
 #include <map>
@@ -35,7 +35,7 @@ void rotateInputs(metal::MetalBackend &backend, Ornith9BWeights &weights, const 
       rotate(mixer.inputProjection);
       rotate(mixer.outputProjection);
     }, layer.mixer);
-    if (auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
+    if (auto *gdn = std::get_if<GdnMixerWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
     rotate(layer.gateProjection);
     rotate(layer.upProjection);
     rotate(layer.downProjection);
@@ -49,9 +49,9 @@ void rotateInputs(metal::MetalBackend &backend, Ornith9BWeights &weights, const 
 } // namespace
 
 Ornith9BWeights loadOrnith9BWeights(metal::MetalBackend &backend, Ornith9BLayout layout,
-                                   const QwenTargetFiles<Ornith9BLayout> &files) {
+                                   const TargetFiles<Ornith9BLayout> &files) {
   // The dense FFN reads the same projections from either format.
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -59,7 +59,7 @@ Ornith9BWeights loadOrnith9BWeights(metal::MetalBackend &backend, Ornith9BLayout
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Ornith9BWeights weights = loadQwenTarget<Ornith9BWeights>(backend, layout, files, readFfn);
+  Ornith9BWeights weights = loadTargetWeights<Ornith9BWeights>(backend, layout, files, readFfn);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     if (const std::optional<GgufRotation> &rotation = gguf->get().rotation()) rotateInputs(backend, weights, *rotation);
   return weights;

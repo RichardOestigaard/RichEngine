@@ -1,4 +1,5 @@
 #include "RoPE.hpp"
+#include "ops/KernelNames.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -23,7 +24,7 @@ void RoPE::addTables(
   const uint64_t elements =
       std::max<uint64_t>(uint64_t{rows.target_rows} * rows.target_dims,
                          uint64_t{rows.draft_rows} * 64);
-  graph.add("rope_build_tables",
+  graph.add(std::string(kRopeBuildTables),
             {std::move(targetPositions), std::move(draftPositions),
              std::move(targetInverseFrequencies),
              std::move(draftInverseFrequencies), std::move(targetCosine),

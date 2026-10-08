@@ -325,7 +325,8 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_r, F, L, EpResidual, bfloat)                            \
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
 #define GGUF_SG_FORMAT(F, f) \
-  GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
+  GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4) \
+  GGUF_SG_EPILOGUES(F, f, 5) GGUF_SG_EPILOGUES(F, f, 6) GGUF_SG_EPILOGUES(F, f, 7) GGUF_SG_EPILOGUES(F, f, 8)
 QUANT_FORMATS(GGUF_SG_FORMAT)
 // The native MXFP4 decoders, dispatched on Apple GPU family 10 and up only.
 GGUF_SG_FORMAT(FmtMXFP4N, mxfp4n)
@@ -382,12 +383,20 @@ GGUF_SG_FUSED(1, , false)
 GGUF_SG_FUSED(2, , false)
 GGUF_SG_FUSED(3, , false)
 GGUF_SG_FUSED(4, , false)
+GGUF_SG_FUSED(5, , false)
+GGUF_SG_FUSED(6, , false)
+GGUF_SG_FUSED(7, , false)
+GGUF_SG_FUSED(8, , false)
 // The `_n` fused kernels an Apple GPU family 10 host dispatches, whose MXFP4
 // segments decode on the native FP4 path.
 GGUF_SG_FUSED(1, _n, true)
 GGUF_SG_FUSED(2, _n, true)
 GGUF_SG_FUSED(3, _n, true)
 GGUF_SG_FUSED(4, _n, true)
+GGUF_SG_FUSED(5, _n, true)
+GGUF_SG_FUSED(6, _n, true)
+GGUF_SG_FUSED(7, _n, true)
+GGUF_SG_FUSED(8, _n, true)
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_SEGMENT
 

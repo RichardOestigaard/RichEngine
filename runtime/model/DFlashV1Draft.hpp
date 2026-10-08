@@ -26,7 +26,7 @@ namespace richengine::model {
 // selector. Its context is the same fc + hidden_norm fusion of captured
 // target hidden states, injected as every layer's K/V; the token input is
 // the target embedding and the vocabulary head is the target's, shared.
-struct PlainDraftLayerWeights final {
+struct DFlashV1DraftLayerWeights final {
   ops::NormWeights inputNorm;
   ops::Projection qkvProjection;
   metal::MetalBuffer queryNorm;
@@ -38,9 +38,9 @@ struct PlainDraftLayerWeights final {
   ops::Projection downProjection;
 };
 
-struct PlainDraftWeights final {
+struct DFlashV1DraftWeights final {
   DFlashDraftLayout layout;
-  std::vector<PlainDraftLayerWeights> layers;
+  std::vector<DFlashV1DraftLayerWeights> layers;
   ops::Projection contextProjection;
   ops::NormWeights hiddenNorm;
   ops::NormWeights finalNorm;
@@ -48,11 +48,11 @@ struct PlainDraftWeights final {
   uint64_t actualAllocatedBytes = 0;
 };
 
-inline constexpr std::string_view kPlainDraftMagic = "MDFP0005";
+inline constexpr std::string_view kDFlashV1DraftMagic = "MDFP0005";
 
 // An RichEngine package's plain-draft files: layer-<N>.bin and model.bin, in the
-// section order PlainDraft.cpp reads.
-struct PackedPlainDraftFiles final {
+// section order DFlashV1Draft.cpp reads.
+struct PackedDFlashV1DraftFiles final {
   WeightImages &images;
   std::filesystem::path directory;
   const DFlashDraftLayout &layout;
@@ -60,24 +60,24 @@ struct PackedPlainDraftFiles final {
   [[nodiscard]] WeightFile model() const;
 };
 
-class PlainDraftCheckpointLoader;
+class DFlashV1DraftCheckpointLoader;
 
-using PlainDraftFiles =
-    std::variant<PackedPlainDraftFiles,
-                 std::reference_wrapper<PlainDraftCheckpointLoader>>;
+using DFlashV1DraftFiles =
+    std::variant<PackedDFlashV1DraftFiles,
+                 std::reference_wrapper<DFlashV1DraftCheckpointLoader>>;
 
-[[nodiscard]] PlainDraftWeights
-loadPlainDraftWeights(metal::MetalBackend &backend,
-                      const PlainDraftFiles &files,
+[[nodiscard]] DFlashV1DraftWeights
+loadDFlashV1DraftWeights(metal::MetalBackend &backend,
+                      const DFlashV1DraftFiles &files,
                       DFlashDraftLayout layout);
 
 // Builds the plain draft's layer graph and its proposal selection
 // (ops::DraftSelector::addPlain) from packed buffers and the same persistent
 // context ring DFlashDraft uses. The four entry points mirror
 // DFlashDraft's so the runtime dispatches either model identically.
-class PlainDraft final {
+class DFlashV1Draft final {
 public:
-  PlainDraft(const PlainDraftWeights &weights, metal::MetalBackend &backend,
+  DFlashV1Draft(const DFlashV1DraftWeights &weights, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators);
 
   void addContextPrefill(metal::CommandGraph &graph,
@@ -98,7 +98,7 @@ public:
                         std::span<const uint32_t> startPositions) const;
 
 private:
-  const PlainDraftWeights &weights_;
+  const DFlashV1DraftWeights &weights_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::DraftSelector selector_;

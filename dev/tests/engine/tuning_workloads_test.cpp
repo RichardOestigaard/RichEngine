@@ -46,12 +46,12 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
   for (uint32_t index = 0; index < layout.layers; ++index) {
     auto &layer = target.layers.emplace_back();
     if (layout.isFullAttentionLayer(index)) {
-      QwenAttentionWeights mixer;
+      AttentionMixerWeights mixer;
       mixer.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
       mixer.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = mixer;
     } else {
-      QwenGdnWeights mixer;
+      GdnMixerWeights mixer;
       mixer.inputProjection = projection(layout.packedGdnWidth, layout.hiddenSize);
       mixer.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = mixer;
@@ -128,7 +128,7 @@ std::set<LinearWorkload> expectedLinear(
     const ModelPackage &package, std::span<const uint32_t> prefill,
     std::span<const uint32_t> decode) {
   const auto target = std::visit([](const auto &weights) {
-    return qwenTargetGeometry(weights);
+    return targetModelGeometry(weights);
   }, package.target);
   const auto &draft = std::get<richengine::model::DFlashDraftWeights>(package.draft).layout;
   std::set<LinearWorkload> result;
@@ -144,11 +144,11 @@ std::set<LinearWorkload> expectedLinear(
                          LinearMatrix{draft.qkvSize, draft.hiddenSize}})
       add(matrix, phase, LinearEpilogue::None);
     add({target.hiddenSize, target.attentionWidth}, phase, LinearEpilogue::Residual);
-    if (target.ffnKind == QwenFfnKind::Dense)
+    if (target.ffnKind == FfnKind::Dense)
       add({target.hiddenSize, target.denseIntermediateSize}, phase,
            LinearEpilogue::Residual);
   }
-  if (target.ffnKind == QwenFfnKind::Dense) {
+  if (target.ffnKind == FfnKind::Dense) {
     const LinearMatrix up{target.denseIntermediateSize, target.hiddenSize};
     add(up, LinearPhase::Prefill, LinearEpilogue::None);
     add(up, LinearPhase::Prefill, LinearEpilogue::UpWithGate);

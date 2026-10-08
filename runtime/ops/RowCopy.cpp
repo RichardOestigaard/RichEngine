@@ -1,6 +1,7 @@
 #include "ops/RowCopy.hpp"
 
 #include "metal/abi/RowCopy.h"
+#include "ops/KernelNames.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -31,7 +32,7 @@ void RowCopy::add(metal::CommandGraph &graph, metal::MetalBuffer source,
                              from.stride, from.column, to.row,
                              to.stride,   to.column};
   // One thread per value.
-  graph.add("copy_rows_bf16", {std::move(source), std::move(destination)},
+  graph.add(std::string(kCopyRowsBf16), {std::move(source), std::move(destination)},
             params, {(uint64_t{rows} * width + kThreads - 1) / kThreads, 1, 1},
             {kThreads, 1, 1});
 }

@@ -3,9 +3,11 @@
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "DSparkDraft.hpp"
-#include "PlainDraft.hpp"
+#include "DFlashV1Draft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Dense.hpp"
+#include "DiffusionGemma.hpp"
+#include "Gemma4Moe.hpp"
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
 #include "Ornith9B.hpp"
@@ -36,9 +38,10 @@ class QwenStateStorage;
 
 using TargetWeights =
     std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
-                 DenseWeights, Lfm2Weights, Lfm2MoeWeights, GraniteWeights>;
+                 DenseWeights, Lfm2Weights, Lfm2MoeWeights, GraniteWeights,
+                 Gemma4MoeWeights, DiffusionGemmaWeights>;
 using DraftWeights =
-    std::variant<NullDraftWeights, DFlashDraftWeights, PlainDraftWeights,
+    std::variant<NullDraftWeights, DFlashDraftWeights, DFlashV1DraftWeights,
                  DSparkDraftWeights>;
 
 struct ModelPackage final {

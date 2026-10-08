@@ -309,3 +309,34 @@ NORM_RMS_PACKED(norm_rms_packed_decode_f32, float, kRmsEpsilon)
 NORM_RMS_PACKED(norm_rms_packed_decode_e5, bfloat, 1e-5f)
 NORM_RMS_PACKED(norm_rms_packed_decode_e5_f32, float, 1e-5f)
 #undef NORM_RMS_PACKED
+
+// Scaleless RMS norm (Gemma 4's router input and any weight-free norm): the
+// row times its inverse RMS only. `width` doubles as the column count; eps is
+// kRmsEpsilon.
+kernel void norm_rms_scaleless(device const bfloat *input [[buffer(0)]],
+                               device bfloat *output [[buffer(1)]],
+                               constant uint &width [[buffer(2)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+#pragma clang fp reassociate(off)
+  threadgroup float reductions[8];
+  device const bfloat *row_input = input + ulong(row) * width;
+  const float inverse =
+      rms_inverse(row_input, width, reductions, tid, lane, sg);
+  for (uint column = tid; column < width; column += kNormThreads)
+    output[ulong(row) * width + column] =
+        bfloat(float(row_input[column]) * inverse);
+}
+
+// A per-layer learned scalar on a flat tensor (Gemma 4's layer_scalar):
+// values[i] *= scale, in place.
+kernel void layer_scalar_scale(device bfloat *values [[buffer(0)]],
+                               constant float &scale [[buffer(1)]],
+                               constant uint &count [[buffer(2)]],
+                               uint index [[thread_position_in_grid]],
+                               uint grid_size [[threads_per_grid]]) {
+  for (uint element = index; element < count; element += grid_size)
+    values[element] = bfloat(float(values[element]) * scale);
+}

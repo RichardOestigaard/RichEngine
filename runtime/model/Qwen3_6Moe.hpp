@@ -1,8 +1,8 @@
 #pragma once
 
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 
@@ -14,7 +14,7 @@ namespace richengine::model {
 struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
   static constexpr std::string_view layerMagic = "MDFM0001";
   static constexpr std::string_view headMagic = "MDFM0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::SparseMoe;
+  static constexpr FfnKind ffnKind = FfnKind::SparseMoe;
 
   uint32_t experts = 256;
   uint32_t expertsPerToken = 8;
@@ -45,15 +45,15 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
 
 struct Qwen3_6MoeLayerWeights final {
   ops::NormWeights inputNorm;
-  QwenMixerWeights mixer;
+  MixerWeights mixer;
   ops::NormWeights postAttentionNorm;
   ops::MoeWeights ffn;
 };
 
-using Qwen3_6MoeWeights = QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights>;
+using Qwen3_6MoeWeights = TargetModelWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights>;
 
 [[nodiscard]] Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
-                      const QwenTargetFiles<Qwen3_6MoeLayout> &files);
+                      const TargetFiles<Qwen3_6MoeLayout> &files);
 
 } // namespace richengine::model

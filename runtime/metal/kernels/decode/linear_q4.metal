@@ -113,6 +113,28 @@ Q4_DECODE_AFFINE(decode_linear_q4_n128_m32,
                  (q4_mpp_tile<32, 128, false, false>), 256, 128)
 Q4_DECODE_AFFINE(decode_linear_q4_n256_m32,
                  (q4_mpp_tile<32, 256, false, false>), 256, 256)
+Q4_DECODE_AFFINE(decode_linear_q4_n128_m48,
+                 (q4_mpp_tile<48, 128, false, false>), 384, 128)
+Q4_DECODE_AFFINE(decode_linear_q4_n256_m48,
+                 (q4_mpp_tile<48, 256, false, false>), 384, 256)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m48, residual,
+                    (q4_mpp_tile<48, 128, false, true>), 384, 128)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m48, gate,
+                    (q4_mpp_tile<48, 256, false, false, true>), 384, 256)
+Q4_DECODE_AFFINE(decode_linear_q4_n128_m64,
+                 (q4_mpp_tile<64, 128, false, false>), 512, 128)
+Q4_DECODE_AFFINE(decode_linear_q4_n256_m64,
+                 (q4_mpp_tile<64, 256, false, false>), 512, 256)
+// Sixteen simdgroups halve the accumulator registers per thread of the
+// 64x256 tile: 8 groups spill its 64 fp32 columns to local memory.
+Q4_DECODE_AFFINE(decode_linear_q4_n256_m64_sg16,
+                 (q4_mpp_tile<64, 256, false, false, false, 16>), 512, 256)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m64_sg16, gate,
+                    (q4_mpp_tile<64, 256, false, false, true, 16>), 512, 256)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m64, residual,
+                    (q4_mpp_tile<64, 128, false, true>), 512, 128)
+Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m64, gate,
+                    (q4_mpp_tile<64, 256, false, false, true>), 512, 256)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m32, residual,
                     (q4_mpp_tile<32, 128, false, true>), 256, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m32, gate,

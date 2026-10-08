@@ -48,6 +48,14 @@ struct Table16 {
                     uint lane, bfloat a, bfloat b) {
     write_input(table, sums, width, span, row, lane, a, b);
   }
+  // A producer that owns a multi-tile row range writes absolute row `row`
+  // into its eight-row tile.
+  static void write_row(device bfloat *table, device float *sums, uint width,
+                        uint span, uint row, uint lane, bfloat a, bfloat b) {
+    write(table + (row / q4sg::kRows) * uint64_t{width} * q4sg::kRows,
+          sums + (row / q4sg::kRows) * sums_per_tile(width), width, span,
+          row % q4sg::kRows, lane, a, b);
+  }
 };
 
 // The mxfp4p A-operand (LinearInput::Packed): a producer drops in Packed for
@@ -85,6 +93,13 @@ struct Packed {
     const uint j1 = j | 1;
     dst[(j1 & 3) | ((j1 & 16) >> 2) | ((j1 & 12) << 1)] = half(y * scale);
     if ((lane & 15) == 0) exponents[ulong(row) * (width / 32) + group] = uchar(127 + e);
+  }
+  // Packed rows are absolute already: the plain row-major plane has no
+  // eight-row tiling to decompose.
+  static void write_row(device half *packed, device uchar *exponents,
+                        uint width, uint span, uint row, uint lane, bfloat a,
+                        bfloat b) {
+    write(packed, exponents, width, span, row, lane, a, b);
   }
 };
 

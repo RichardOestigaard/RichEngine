@@ -13,6 +13,7 @@
 #include "TestChecks.hpp"
 #include "ane/Handoff.hpp"
 #include "metal/MetalBackend.hpp"
+#include "ops/KernelNames.hpp"
 
 #import <Metal/Metal.h>
 
@@ -206,7 +207,7 @@ private:
 
 // A dispatch of test_add_u32 that adds `increment` to the first `count` words of `buffer`.
 ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count, const uint32_t &increment) {
-  return {"test_add_u32", {{0, buffer}}, {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+  return {std::string(ops::kTestAddU32), {{0, buffer}}, {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
           {1, 1, 1}, {1, 1, 1}};
 }
 

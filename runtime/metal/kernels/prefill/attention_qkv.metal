@@ -234,4 +234,66 @@ PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd128, 16, 2, 128)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd64, 32, 8, 64)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q5d64, 40, 8, 64)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q4d128, 32, 8, 128)
+// The no-gate gathers for Gemma's out-projections (same layouts as the other
+// targets' gathers).
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_gemma_h256, 16, 8, 256)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_gemma_hd512, 16, 2, 512)
 #undef PREFILL_ATTENTION_GATHER
+
+// Gemma 4 26B-A4B's two layer shapes, both without a query gate:
+// - the sliding-window layers: 16 query heads by KV8 (group 2) of 256,
+//   full rotary of 128 pairs (theta 1e4), per-head QK norms with a learned
+//   scale and a scaleless RMS norm on V before the KV write
+//   (NormalizeValues).
+// - the global layers (indices 5, 11, 17, 23, 29): 16 query heads by KV2
+//   (group 8) of 512, p-RoPE rotating only the first 64 pairs (128 of 512
+//   dims, theta 1e6), per-head QK norms and k_eq_v — the packed row carries
+//   no V; the value slot stores the scale-free RMS of the pre-norm K
+//   (KeyEqualsValue). The threadgroups are 512 threads; the rope tables are
+//   64 pairs wide per row.
+// The host binds each layer type's own rope tables: theta and the pair count
+// differ, so buffers 3/4 select them per dispatch.
+kernel void prefill_attention_qkv_gemma_h256(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]],
+    device bfloat *chunk_keys [[buffer(6)]],
+    device bfloat *chunk_values [[buffer(7)]],
+    constant FullPrefillParams &params [[buffer(8)]],
+    uint task [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[256];
+  full_qkv_storage_phase<16, 8, 256, 128, false, true, bfloat, false, true>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys,
+      chunk_values, params, reductions, normalized, task, thread_index, lane,
+      simd_group);
+}
+
+kernel void prefill_attention_qkv_gemma_hd512(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]],
+    device bfloat *chunk_keys [[buffer(6)]],
+    device bfloat *chunk_values [[buffer(7)]],
+    constant FullPrefillParams &params [[buffer(8)]],
+    uint task [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[16];
+  threadgroup bfloat normalized[512];
+  full_qkv_storage_phase<16, 2, 512, 64, false, true, bfloat, true, false,
+                         true>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys,
+      chunk_values, params, reductions, normalized, task, thread_index, lane,
+      simd_group);
+}

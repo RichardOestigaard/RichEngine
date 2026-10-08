@@ -4,6 +4,7 @@ import errno
 import fcntl
 import io
 import json
+import re
 import shutil
 import tempfile
 import unittest
@@ -80,6 +81,227 @@ class UpstreamTest(unittest.TestCase):
                 families.family_for({"text_config": text_config(family, **changes)})
         with self.assertRaises(models.ModelError):
             families.family_for({"hidden_size": 5120})
+
+    def test_a_stated_discriminator_beats_the_name_hint(self):
+        # Ornith-1.5-35B-A3B's config states router_aux_loss_coef 0.0; a
+        # repository named for Qwen3.6 does not make it one.
+        ornith = families.named("Ornith-1.5-35B-A3B")
+        config = {"text_config": text_config(ornith)}
+        self.assertIs(
+            families.family_for(config, name="someone/Qwen3.6-35B-A3B-GGUF"),
+            ornith,
+        )
+        self.assertIs(families.family_for(config, name="someone/Ornith-1.5-35B-A3B"), ornith)
+
+    def test_the_name_hint_supplies_the_fields_a_config_omits(self):
+        # A GGUF states no router_aux_loss_coef; the name resolves which of
+        # the MoE geometry's two families the model is.
+        ornith = families.named("Ornith-1.5-35B-A3B")
+        config = {"text_config": text_config(MOE)}
+        self.assertIs(families.family_for(config), MOE)
+        self.assertIs(
+            families.family_for(config, name="ornith-ai/Ornith-1.5-35B-A3B-GGUF f.gguf"),
+            ornith,
+        )
+        self.assertIs(
+            families.family_for(config, name="someone/Qwen3.6-35B-A3B"), MOE
+        )
+
+    def test_the_name_hint_matches_whole_tokens_only(self):
+        # A name embedding a family's name inside another word names no family.
+        config = {"text_config": text_config(DENSE)}
+        for name in ("someone/NotBonsai-2-27B", "someone/Qwen3.8-27BX"):
+            with self.subTest(name=name):
+                self.assertIs(families.family_for(config, name=name), DENSE)
+        bonsai = text_config(families.named("Bonsai-2-27B"))
+        del bonsai["partial_rotary_factor"]
+        self.assertIs(
+            families.family_for(
+                {"text_config": bonsai}, name="someone/NotBonsai-2-27B"
+            ),
+            DENSE,
+        )
+
+    def test_a_forbidden_field_beats_the_name_hint(self):
+        # A config declaring Qwen3.8-27B's MTP head is not Bonsai-2-27B,
+        # even when the repository's name says so and the signature's
+        # deciding field is omitted: Bonsai forbids the stated field.
+        config = {"text_config": text_config(DENSE, num_nextn_predict_layers=1)}
+        self.assertIs(
+            families.family_for(config, name="prism-ml/Ternary-Bonsai-2-27B"),
+            DENSE,
+        )
+
+    def test_a_forbidden_field_beats_a_strict_match(self):
+        # The same stated field disqualifies Bonsai's own signature; the
+        # shorter Qwen3.8 signature it extends resolves instead.
+        bonsai = families.named("Bonsai-2-27B")
+        config = {"text_config": text_config(bonsai, num_nextn_predict_layers=1)}
+        self.assertIs(families.family_for(config), DENSE)
+
+    def test_the_runtimes_family_table_matches_the_installers(self):
+        # ModelDescriptor.mm's kModelFamilies resolves model.json's family;
+        # a family one table names and the other does not fails at serve.
+        source = (
+            Path(__file__).resolve().parents[2] / "runtime/model/ModelDescriptor.mm"
+        ).read_text()
+        rows = re.findall(
+            r'\{"([^"]+)",\s*"([^"]+)",\s*(?:nullptr|"[^"]+"),',
+            source,
+        )
+        self.assertEqual(
+            {name: model_type for name, model_type in rows},
+            {
+                family.name: dict(family.signature)["model_type"]
+                for family in families.FAMILIES
+            },
+        )
+
+    def test_gemma4_family_matches_its_published_configurations(self):
+        # The text_config of google/gemma-4-26B-A4B-it's config.json, and
+        # z-lab/gemma-4-26B-A4B-it-DFlash's whole config.json, as published.
+        family = families.named("Gemma4-26B-A4B")
+        text = {
+            "model_type": "gemma4_text",
+            "hidden_size": 2816,
+            "num_hidden_layers": 30,
+            "vocab_size": 262144,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "num_global_key_value_heads": 2,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "intermediate_size": 2112,
+            "num_experts": 128,
+            "top_k_experts": 8,
+            "moe_intermediate_size": 704,
+            "enable_moe_block": True,
+            "sliding_window": 1024,
+            "num_kv_shared_layers": 0,
+            "attention_k_eq_v": True,
+            "attention_bias": False,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": True,
+            "max_position_embeddings": 262144,
+            "rms_norm_eps": 1e-06,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional",
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default",
+                },
+            },
+            "layer_types": [
+                "full_attention" if i % 6 == 5 else "sliding_attention"
+                for i in range(30)
+            ],
+        }
+        self.assertIs(
+            families.family_for({"model_type": "gemma4", "text_config": text}),
+            family,
+        )
+        draft = {
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "qwen3",
+            "block_size": 16,
+            "dflash_config": {
+                "mask_token_id": 4,
+                "target_layer_ids": [1, 6, 11, 17, 22, 27],
+            },
+            "final_logit_softcapping": 30.0,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 2816,
+            "intermediate_size": 5632,
+            "layer_types": ["sliding_attention"] * 4 + ["full_attention"],
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 5,
+            "num_key_value_heads": 8,
+            "num_target_layers": 30,
+            "rms_norm_eps": 1e-06,
+            "sliding_window": 2048,
+            "tie_word_embeddings": False,
+            "use_sliding_window": True,
+            "vocab_size": 262144,
+            "rope_theta": 1000000,
+            "attention_bias": False,
+        }
+        self.assertEqual(
+            [
+                key
+                for key, expected in family.draft.signature
+                if not upstream._same(upstream._config_value(draft, key), expected)
+            ],
+            [],
+        )
+        # The draft check runs end to end on the same configuration.
+        root = self.root / "draft-repo"
+        root.mkdir()
+        (root / "config.json").write_text(json.dumps(draft))
+        (root / "model.safetensors").write_bytes(b"draft")
+        repo = hub.Repository.local_directory(root)
+        self.assertEqual(
+            sorted(upstream._draft_files(repo, family)),
+            ["draft/config.json", "draft/model.safetensors"],
+        )
+
+    def test_diffusiongemma_family_matches_its_published_configuration(self):
+        # The text_config of google/diffusiongemma-26B-A4B-it's config.json,
+        # as published.
+        family = families.named("DiffusionGemma-26B-A4B")
+        text = {
+            "model_type": "diffusion_gemma_text",
+            "hidden_size": 2816,
+            "num_hidden_layers": 30,
+            "vocab_size": 262144,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "num_global_key_value_heads": 2,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "intermediate_size": 2112,
+            "num_experts": 128,
+            "top_k_experts": 8,
+            "moe_intermediate_size": 704,
+            "sliding_window": 1024,
+            "use_bidirectional_attention": "vision",
+            "attention_bias": False,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": True,
+            "max_position_embeddings": 262144,
+            "rms_norm_eps": 1e-06,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional",
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default",
+                },
+            },
+            "layer_types": [
+                "full_attention" if i % 6 == 5 else "sliding_attention"
+                for i in range(30)
+            ],
+        }
+        config = {
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+            "text_config": text,
+        }
+        self.assertIs(families.family_for(config), family)
+        # No GPU draft; the n-gram predraft proposes for it.
+        self.assertIsNone(family.draft)
+        self.assertFalse(family.vision)
 
     def test_gguf_selection_is_exact_and_ignores_subfolders(self):
         files = {

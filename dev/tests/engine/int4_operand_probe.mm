@@ -5,6 +5,8 @@
 // usage: int4_operand_probe METALLIB <qk|pv> bs0 bs1
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+
+#include "ops/KernelNames.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -44,7 +46,7 @@ int main(int argc, const char *argv[]) {
     id<MTLLibrary> lib = [dev newLibraryWithFile:@(argv[1]) error:&err];
     if (!lib) { fprintf(stderr, "library: %s\n", err.localizedDescription.UTF8String); return 70; }
     id<MTLFunction> fn =
-        [lib newFunctionWithName:qk ? @"probe_int4_qk" : @"probe_int4_pv_nn"];
+        [lib newFunctionWithName:qk ? @(richengine::ops::kProbeInt4Qk.data()) : @(richengine::ops::kProbeInt4PvNn.data())];
     if (!fn) { fprintf(stderr, "missing kernel\n"); return 71; }
     id<MTLComputePipelineState> pipe =
         [dev newComputePipelineStateWithFunction:fn error:&err];

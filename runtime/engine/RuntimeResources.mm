@@ -116,8 +116,8 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                            kStaleCache, cancelled);
     if (!files.directory) {
       if (!cancelled || !cancelled())
-        logStartup("Persistent cache ", (root / cacheNamespace).string(),
-                   " is in use by another process; this one keeps a temporary cache.");
+        logStartup(dim("Persistent cache "), dim((root / cacheNamespace).string()),
+                   " is in use by another process; ", dim("this one keeps a temporary cache."));
       return {};
     }
     const std::vector<std::byte> tag(reinterpret_cast<const std::byte *>(cacheNamespace.data()),
@@ -133,7 +133,8 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                      files.directory->stateRecords(), tag, sizeof(StateLabel)});
     return files;
   } catch (const std::exception &error) {
-    logStartup("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
+    logStartup(dim("Persistent cache disabled ("), error.what(),
+               dim("); this process keeps a temporary cache."));
     return {};
   }
 }
@@ -353,8 +354,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           model::SlotFile::slotBytesFor(stateBytes), diskBudget);
     } catch (const std::exception &error) {
       diskBudget.reset();
-      logStartup("Cache disk tier disabled (", error.what(),
-                 "); no state staging is set aside.");
+      logStartup(dim("Cache disk tier disabled ("), error.what(),
+                 dim("); no state staging is set aside."));
     }
   }
   // A state's write to the disk tier stages through one buffer of a state's
@@ -412,8 +413,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     package = model::loadModelPackage(*backend, config.modelRoot, config.model);
     requireLoadedModel(package);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
-    logStartup("Weights loaded in ", std::fixed, std::setprecision(2),
-               loading.count(), " s.");
+    logStartup(dim("Weights loaded in "), std::fixed, std::setprecision(2),
+               loading.count(), dim(" s."));
+    logStartup(dim("Draft · "), accent(model::draftKindName(package.descriptor.draft.kind)), dim("."));
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), deviceStatusJson(device), {},
@@ -425,7 +427,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, config.moeUnionCap);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
     modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);
@@ -484,8 +486,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
-    logStartup("Kernel policy for GPU family ", device.appleGpuFamily,
-               " with ", device.gpuCoreCount, " cores.");
+    logStartup(dim("Kernel policy for GPU family "), device.appleGpuFamily,
+               dim(" with "), device.gpuCoreCount, dim(" cores."));
     AneFfnStart aneFfn =
         startAneFfn(aneFfnModel(*backend, package, operators, config.kvFormat, config.buildId, config.cancelled),
                     config.aneFfn,
@@ -527,18 +529,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
             *kvPages, persistentCache.kv
                           ? persistentCache.kv
                           : std::make_shared<model::SlotFile>(slotBytes, diskBudget));
-        logStartup(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: ",
-                   config.maximumCacheDiskBytes / kMiB, " MiB for KV pages of ",
-                   slotBytes / 1024, " KiB and states of ", stateBytes / kMiB,
-                   " MiB; a state's write stages through ", stateStagingBytes / kMiB,
-                   " MiB of the memory plan.");
+        logStartup(dim(persistentCache.directory ? "Persistent cache tier: " : "Cache disk tier: "),
+                   config.maximumCacheDiskBytes / kMiB, dim(" MiB for KV pages of "),
+                   slotBytes / 1024, dim(" KiB and states of "), stateBytes / kMiB,
+                   dim(" MiB; a state's write stages through "), stateStagingBytes / kMiB,
+                   dim(" MiB of the memory plan."));
       } catch (const std::exception &error) {
         // The persistent files are open by now; without the tier nothing
         // would keep or replace their copies.
         if (persistentCache.directory)
           throw;
-        logStartup("Cache disk KV storage disabled; state storage remains enabled (",
-                   error.what(), ").");
+        logStartup(dim("Cache disk KV storage disabled; state storage remains enabled ("),
+                   error.what(), dim(")."));
       }
     }
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
@@ -591,7 +593,7 @@ void RuntimeResources::adoptPersistentCache() {
     return;
   CacheDirectory &directory = *persistentCache_.directory;
   if (!directory.coldReason().empty())
-    logStartup("Persistent cache emptied: ", directory.coldReason(), ".");
+    logStartup(dim("Persistent cache emptied: "), directory.coldReason(), dim("."));
   std::vector<PersistedKv> blocks;
   for (const model::SlotRecord &record : persistentCache_.kv->records())
     blocks.push_back({record.label, [this, record] { return kvTier_->adopt(record); }});
@@ -603,9 +605,10 @@ void RuntimeResources::adoptPersistentCache() {
   const CacheAdoption adoption = cache_->adopt(std::move(blocks), std::move(states));
   persistentCache_.kv->finishAdoption();
   persistentCache_.states->finishAdoption();
-  logStartup("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
-             " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
-             " MiB); left ", adoption.dropped, " copies behind.",
+  logStartup(dim("Persistent cache "), dim(directory.path().string()), dim(": took back "),
+             adoption.states, dim(" restore points over "), adoption.blocks,
+             dim(" KV blocks ("), adoption.bytes / kMiB, dim(" MiB); left "),
+             adoption.dropped, dim(" copies behind."),
              directory.uncleanExit()
                  ? " The last process did not stop cleanly: this one serves on probation for "
                    "its first minute."
@@ -620,8 +623,8 @@ void RuntimeResources::beginServing() {
   try {
     directory->beginServing(probation);
   } catch (const std::exception &error) {
-    logStartup("Persistent cache cannot mark this process serving (", error.what(),
-               "); the next start will not know how it ended.");
+    logStartup(dim("Persistent cache cannot mark this process serving ("), error.what(),
+               dim("); the next start will not know how it ended."));
     return;
   }
   if (!probation)
@@ -634,7 +637,7 @@ void RuntimeResources::beginServing() {
     try {
       directory->endProbation();
     } catch (const std::exception &error) {
-      logStartup("Persistent cache probation did not end (", error.what(), ").");
+      logStartup(dim("Persistent cache probation did not end ("), error.what(), dim(")."));
     }
   });
 }
@@ -756,7 +759,8 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::ModelPackage 
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName +
+                          " cores " + std::to_string(backend.capabilities().gpuCoreCount) + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
                           std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {

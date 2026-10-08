@@ -54,78 +54,73 @@ inline void gdn_decode_prologue(
   constexpr uint BOffset = ConvDim + ValueWidth;
   constexpr uint AOffset = BOffset + ValueHeads;
   constexpr uint Groups = HeadDim / 32;
-  static_assert(Tokens == kDecodeSimdgroups && HeadDim == 128,
-                "one simdgroup per verify row, four channels per lane");
+  static_assert(!(Tokens % kDecodeSimdgroups) && HeadDim == 128,
+                "rows stride over the simdgroups, four channels per lane");
   const uint key_head = value_head / HeadsPerKey;
   // The key head's q/k rows and conv carry are shared by HeadsPerKey value
   // heads; the first of them writes the shared copies.
   const bool shared_writer = value_head % HeadsPerKey == 0;
   const bool carrier = simd_group < 3;
-  const uint token = simd_group;
   const uint q_channel = key_head * HeadDim + lane;
   const uint k_channel = KeyWidth + q_channel;
   const uint v_channel = 2 * KeyWidth + value_head * HeadDim + lane;
 
-  float q[Groups], k[Groups];
-  bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
-  for (uint g = 0; g < Groups; ++g) {
-    q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               PackedWidth, ConvDim, token,
-                               q_channel + 32 * g));
-    k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               PackedWidth, ConvDim, token,
-                               k_channel + 32 * g));
-    v[g] = gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
-                         ConvDim, token, v_channel + 32 * g);
-    if (carrier) {
-      carry_v[g] = gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim,
-                                  Tokens, simd_group, v_channel + 32 * g);
-      carry_q[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
-                           simd_group, q_channel + 32 * g)
-          : bfloat(0.0f);
-      carry_k[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
-                           simd_group, k_channel + 32 * g)
-          : bfloat(0.0f);
+  for (uint token = simd_group; token < Tokens; token += kDecodeSimdgroups) {
+    float q[Groups], k[Groups];
+    bfloat v[Groups];
+    for (uint g = 0; g < Groups; ++g) {
+      q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                                 PackedWidth, ConvDim, token,
+                                 q_channel + 32 * g));
+      k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                                 PackedWidth, ConvDim, token,
+                                 k_channel + 32 * g));
+      v[g] = gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
+                           ConvDim, token, v_channel + 32 * g);
     }
-  }
-  GdnGates gates{};
-  if (lane == 0)
-    gates = gdn_gates(packed + token * PackedWidth, dt_bias, a_scale, BOffset,
-                      AOffset, value_head);
-  float q_sum = 0.0f, k_sum = 0.0f;
-  for (uint g = 0; g < Groups; ++g) {
-    q_sum += simd_sum(q[g] * q[g]);
-    k_sum += simd_sum(k[g] * k[g]);
-  }
-  const float q_scale = rsqrt(q_sum / HeadDim + kRmsEpsilon);
-  const float k_scale = rsqrt(k_sum / HeadDim + kRmsEpsilon);
-  for (uint g = 0; g < Groups; ++g) {
-    const uint dim = 32 * g + lane;
-    const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
-    const bfloat key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
-    shared.queries[token * HeadDim + dim] = query;
-    shared.keys[token * HeadDim + dim] = key;
-    shared.values[token * HeadDim + dim] = v[g];
-    if (shared_writer)
-      mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
-    mixed_qkv[token * ConvDim + v_channel + 32 * g] = v[g];
-  }
-  if (lane == 0) {
-    const uint gate_index = token * ValueHeads + value_head;
-    beta[gate_index] = gates.beta;
-    decay[gate_index] = gates.decay;
-    shared.beta[token] = gates.beta;
-    shared.decay[token] = gates.decay;
+    GdnGates gates{};
+    if (lane == 0)
+      gates = gdn_gates(packed + token * PackedWidth, dt_bias, a_scale,
+                        BOffset, AOffset, value_head);
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint g = 0; g < Groups; ++g) {
+      q_sum += simd_sum(q[g] * q[g]);
+      k_sum += simd_sum(k[g] * k[g]);
+    }
+    const float q_scale = rsqrt(q_sum / HeadDim + kRmsEpsilon);
+    const float k_scale = rsqrt(k_sum / HeadDim + kRmsEpsilon);
+    for (uint g = 0; g < Groups; ++g) {
+      const uint dim = 32 * g + lane;
+      const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
+      const bfloat key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
+      shared.queries[token * HeadDim + dim] = query;
+      shared.keys[token * HeadDim + dim] = key;
+      shared.values[token * HeadDim + dim] = v[g];
+      if (shared_writer)
+        mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
+      mixed_qkv[token * ConvDim + v_channel + 32 * g] = v[g];
+    }
+    if (lane == 0) {
+      const uint gate_index = token * ValueHeads + value_head;
+      beta[gate_index] = gates.beta;
+      decay[gate_index] = gates.decay;
+      shared.beta[token] = gates.beta;
+      shared.decay[token] = gates.decay;
+    }
   }
   if (carrier) {
     const uint row = simd_group;
     for (uint g = 0; g < Groups; ++g) {
-      conv_state_out[row * ConvDim + v_channel + 32 * g] = carry_v[g];
+      conv_state_out[row * ConvDim + v_channel + 32 * g] =
+          gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+                         row, v_channel + 32 * g);
       if (shared_writer) {
-        conv_state_out[row * ConvDim + q_channel + 32 * g] = carry_q[g];
-        conv_state_out[row * ConvDim + k_channel + 32 * g] = carry_k[g];
+        conv_state_out[row * ConvDim + q_channel + 32 * g] =
+            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+                           row, q_channel + 32 * g);
+        conv_state_out[row * ConvDim + k_channel + 32 * g] =
+            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+                           row, k_channel + 32 * g);
       }
     }
   }
@@ -603,20 +598,22 @@ inline void gdn_decode_batch_phase(
                                          lane, simd_group, tokens);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
-  gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
-      simd_group);
-  if (table) {
-    // Each group owns this head for all eight rows; each simdgroup writes
-    // the table of the row it just gated.
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
-    for (uint g = 0; g < HeadDim / 64; ++g) {
-      const uint column = head * HeadDim + g * 64 + 2 * lane;
-      const uint local = simd_group * HeadDim + g * 64 + 2 * lane;
-      Table::write(table + ulong(batch) * ValueWidth * Rows,
-                   sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
-                   column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
+  const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
+  for (uint token = simd_group; token < Rows; token += kDecodeSimdgroups) {
+    gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+        shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
+        token);
+    if (table) {
+      // Each group owns this head for every row; each simdgroup writes
+      // the table of the row it just gated.
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint g = 0; g < HeadDim / 64; ++g) {
+        const uint column = head * HeadDim + g * 64 + 2 * lane;
+        const uint local = token * HeadDim + g * 64 + 2 * lane;
+        Table::write_row(table + ulong(batch) * ValueWidth * Rows,
+                     sums + ulong(batch) * (Rows / q4sg::kRows) * Table::sums_per_tile(ValueWidth), ValueWidth,
+                     column / 64, token, lane, shared.rows[local], shared.rows[local + 1]);
+      }
     }
   }
 }
@@ -928,8 +925,8 @@ inline void gdn_decode_tree_batch_phase(
       for (uint g = 0; g < HeadDim / 64; ++g) {
         const uint column = head * HeadDim + g * 64 + 2 * lane;
         const uint local = token * HeadDim + g * 64 + 2 * lane;
-        Table::write(table + ulong(batch) * ValueWidth * Rows,
-                     sums + ulong(batch) * Table::sums_per_tile(ValueWidth),
+        Table::write_row(table + ulong(batch) * ValueWidth * Rows,
+                     sums + ulong(batch) * (Rows / q4sg::kRows) * Table::sums_per_tile(ValueWidth),
                      ValueWidth, column / 64, token, lane, shared.rows[local],
                      shared.rows[local + 1]);
       }

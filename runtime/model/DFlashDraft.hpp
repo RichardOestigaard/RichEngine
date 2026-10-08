@@ -10,6 +10,7 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <array>
@@ -58,7 +59,18 @@ private:
 // like DFlash2, plus a sequential Markov head that corrects each proposal
 // position's logits with a low-rank bias of the previously sampled token and
 // a confidence head the runtime loads but does not score).
-enum class DraftKind : uint8_t { DFlash2, Plain, DSpark, Null };
+enum class DraftKind : uint8_t { DFlash2, DFlashV1, DSpark, Null };
+
+// The kind's user-facing name; Null reads "none" since the n-gram predraft
+// still proposes for a draft-less family.
+inline constexpr std::string_view draftKindName(DraftKind kind) {
+  switch (kind) {
+  case DraftKind::DFlash2: return "DFlash2";
+  case DraftKind::DFlashV1: return "DFlash";
+  case DraftKind::DSpark: return "DSpark";
+  default: return "none";
+  }
+}
 
 // The dynamic convolutions of every DFlash2 draft layer, as the draft
 // kernels run them (decode/draft.metal): two taps, a row and the one before
@@ -98,6 +110,27 @@ struct DFlashDraftLayout final {
   // The norms' epsilon: 1e-6 unless the family declares another (LFM2's
   // 1e-5, which also selects the _e5 draft kernels).
   float rmsEpsilon = 1e-6F;
+  // The shared vocabulary head's logit softcap (Gemma's 30); 0 disables.
+  float logitSoftcap = 0.0F;
+  // DFlash2 only: the selector walks the whole 128-slot shard pool instead
+  // of the merged top-16 when the batch has no sampled lanes (the residual
+  // draw stages only kDraftCandidates). Off by default: the walk's argmax
+  // was never the rejected position's target pick on the 35B-A3B decode
+  // benchmark, and the wider edge table costs ~7% of decode throughput.
+  bool poolSelector = false;
+
+  // The trained block's usable proposal count. A plain or DFlash2
+  // block_size counts the block's query rows (the anchor among them);
+  // DSpark's counts the emitted proposals. The runtime always dispatches
+  // draftQueryRows, so a shorter block's tail rows are dead compute whose
+  // picks acceptance must never retain.
+  [[nodiscard]] constexpr uint32_t proposalLimit() const noexcept {
+    if (kind == DraftKind::Null || !blockSize)
+      return ExecutionLimits::draftProposalTokens;
+    const uint32_t trained =
+        kind == DraftKind::DSpark ? blockSize : blockSize - 1;
+    return std::min(trained, ExecutionLimits::draftProposalTokens);
+  }
 
   [[nodiscard]] constexpr uint32_t draftWindow() const noexcept {
     return slidingWindow < ExecutionLimits::draftRingCapacity
@@ -220,11 +253,11 @@ struct PackedDraftFiles final {
   [[nodiscard]] WeightFile model() const;
 };
 
-class DraftCheckpointLoader;
+class DFlash2CheckpointLoader;
 
 // The files a draft is read from: a package's packed files, or the images
-// DraftCheckpointLoader writes from a DFlash2 checkpoint.
-using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DraftCheckpointLoader>>;
+// DFlash2CheckpointLoader writes from a DFlash2 checkpoint.
+using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DFlash2CheckpointLoader>>;
 
 [[nodiscard]] DFlashDraftWeights
 loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
@@ -261,6 +294,9 @@ private:
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::DraftSelector selector_;
+  // The layout's pool-selector flag with RICHENGINE_DFLASH_POOL's override
+  // folded in ("0" forces the merged-16 walk, "1" forces the pool walk).
+  const bool poolSelector_;
   // Each layer's key and value rows of its QKV projection, views of its
   // planes, which the context writers project with.
   std::vector<ops::Projection> contextKvProjections_;

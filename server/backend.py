@@ -67,6 +67,11 @@ class NativeResult:
     cache: CacheInfo = field(default_factory=CacheInfo)
     stop_sequence: str | None = None
     first_token_batch_tokens: int = 0
+    # The last prompt-progress report's elapsed time inside the
+    # start→first-token window; 0 when none arrived.
+    prompt_progress_ms: float = 0.0
+    # Canvas-burst emission changes how request_latency derives throughput.
+    diffusion: bool = False
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
 
@@ -88,6 +93,10 @@ class Job:
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
     thinking_display: str = "summarized"
+    # The think block's spellings for the output splitter; the defaults are
+    # the standard tags.
+    think_open: str = "<think>"
+    think_end: str = "</think>"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
@@ -305,6 +314,9 @@ class _JobState:
     detached: bool = False
     shutdown_requested: bool = False
     first_token_batch_tokens: int = 0
+    # Last PromptProgressEvent's elapsed time within the start→first-token
+    # window: where prompt processing ended and generation began.
+    prompt_progress_ms: float = 0.0
 
     def detach(self):
         self.detached = True
@@ -327,11 +339,12 @@ class NativeBackend:
 
     def __init__(
         self, runtime, tokenizer, request_logger, think_end_id=None,
-        visible_token_ids=(), tool_call_open_id=None,
+        visible_token_ids=(), tool_call_open_id=None, diffusion=False,
     ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.think_end_id = think_end_id
+        self.diffusion = diffusion
         self.visible_token_ids = frozenset(visible_token_ids)
         self.tool_call_open_id = tool_call_open_id
         self.request_logger = request_logger
@@ -791,6 +804,7 @@ class NativeBackend:
                 job.cache = cache
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
+            state.prompt_progress_ms = event.elapsed_micros / 1000.0
             job.events.put(
                 (
                     "progress",
@@ -874,6 +888,8 @@ class NativeBackend:
                 cache=job.cache,
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                prompt_progress_ms=state.prompt_progress_ms,
+                diffusion=self.diffusion,
             )
             if job.latency is not None:
                 latency = result.metrics["request_latency"]

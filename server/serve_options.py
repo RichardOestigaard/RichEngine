@@ -354,6 +354,30 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--canvas-profile",
+        dict(
+            choices=("paper", "balanced", "fast"),
+            default="paper",
+            metavar="PROFILE",
+            help="DiffusionGemma canvas tuning bundle: 'paper' keeps the "
+            "published schedule (48 steps, strict exits); 'balanced' enables "
+            "drift exits at 75 percent settled and caps 32 steps; 'fast' "
+            "uses 60 percent and 24 steps (default: paper)",
+        ),
+    ),
+    ServeOption(
+        "--moe-union",
+        dict(
+            type=int,
+            default=0,
+            metavar="EXPERTS",
+            help="cap the routed experts one decode step may touch per MoE "
+            "layer; the step's verify rows share the budget and routes past "
+            "it are dropped (default: 0, every route kept; experimental, "
+            "changes outputs)",
+        ),
+    ),
+    ServeOption(
         "--allowed-host",
         dict(
             action="append",
@@ -439,6 +463,26 @@ SERVE_OPTIONS = (
             help="let the Mac sleep automatically while requests run (default: it "
             "stays awake until they finish; the display may still sleep)",
         ),
+    ),
+    ServeOption(
+        "--models-dir",
+        dict(
+            metavar="DIRECTORY",
+            default=None,
+            help="installed models directory for POST /v1/models/load "
+            "(default: the RichEngine models cache)",
+        ),
+    ),
+    ServeOption(
+        "--unload-idle",
+        dict(
+            type=parse_idle_release,
+            default=None,
+            metavar="DURATION",
+            help="unload the model after this long without a request, e.g. 30m "
+            "(default: never; 'off' also disables)",
+        ),
+        text=idle_release_text,
     ),
     ServeOption(
         "--shared-prefix-state",

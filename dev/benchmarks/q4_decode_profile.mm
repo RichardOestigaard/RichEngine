@@ -22,7 +22,7 @@ using richengine::metal::MetalBuffer;
 
 constexpr uint32_t kQuantGroup = 64;
 
-enum class Contract : uint8_t { Affine, Residual, GateUp, UpSilu, AffineSplit, ResidualSplit };
+enum class Contract : uint8_t { Affine, Residual, GateUp, UpSilu, AffineSplit, ResidualSplit, UpSiluSplit };
 
 struct Pipeline final {
   const char *name;
@@ -67,6 +67,13 @@ constexpr Pipeline kPipelines[] = {
     {"decode_linear_q4_n128_split_residual_m24", Contract::ResidualSplit, 24, 128},
     {"decode_linear_q4_n128_split_m32", Contract::AffineSplit, 32, 128},
     {"decode_linear_q4_n128_split_residual_m32", Contract::ResidualSplit, 32, 128},
+    // Split-K gate/up (the production two-pass pair) and the one-lane wide
+    // paired tile, neither covered by the fused/sequential sets above.
+    {"decode_linear_q4_n128_split_up_silu", Contract::UpSiluSplit, 8, 128},
+    {"decode_linear_q4_n128_split_up_silu_m16", Contract::UpSiluSplit, 16, 128},
+    {"decode_linear_q4_n128_split_up_silu_m24", Contract::UpSiluSplit, 24, 128},
+    {"decode_linear_q4_n128_split_up_silu_m32", Contract::UpSiluSplit, 32, 128},
+    {"decode_linear_q4_n256_paired_sg4", Contract::Affine, 8, 256},
 };
 
 struct WeightSet final {
@@ -118,7 +125,8 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
   if (tiles * pipeline.tileColumns != shape.outputSize)
     return;
   const bool splitsK = pipeline.contract == Contract::AffineSplit ||
-                       pipeline.contract == Contract::ResidualSplit;
+                       pipeline.contract == Contract::ResidualSplit ||
+                       pipeline.contract == Contract::UpSiluSplit;
   const std::string label = std::string(shape.label) + " " + pipeline.name;
   MetalBuffer input = backend.allocateBuffer(
       uint64_t{pipeline.rows} * shape.inputSize * sizeof(__bf16),
@@ -166,7 +174,8 @@ void sweep(MetalBackend &backend, const Shape &shape, const Pipeline &pipeline,
     MetalBuffer counters = backend.allocateBuffer(
         uint64_t{tiles} * sizeof(uint32_t), BufferStorage::Shared,
         label + " counters");
-    const bool residual = pipeline.contract == Contract::ResidualSplit;
+    const bool residual = pipeline.contract == Contract::ResidualSplit ||
+                          pipeline.contract == Contract::UpSiluSplit;
     dispatch.buffers = residual
         ? std::vector<richengine::metal::BufferBinding>{{0, input}, {1, first.weights}, {2, first.scales},
                       {3, first.biases}, {4, extra}, {5, output},
@@ -227,6 +236,7 @@ void run(const std::string &metallibPath) {
       {"dense_qkv", 2'560, 2'048, 12},
       {"dense_attn_out", 2'048, 2'048, 10},
       {"dense_ffn", 6'144, 2'048, 36},
+      {"dense_ffn_gate", 6'144, 2'048, 36},
       {"dense_down", 2'048, 6'144, 28},
       {"dense_head", 130'560, 2'048, 1'020},
       // LFM2.5-2.6B (2048): 3072-wide QKV, wider FFN, 128000-head.
@@ -253,7 +263,8 @@ void run(const std::string &metallibPath) {
                : WeightSet{};
     for (const Pipeline &pipeline : kPipelines) {
       const bool fused = pipeline.contract == Contract::GateUp ||
-                         pipeline.contract == Contract::UpSilu;
+                         pipeline.contract == Contract::UpSilu ||
+                         pipeline.contract == Contract::UpSiluSplit;
       if (fused != gateUp)
         continue;
       sweep(backend, shape, pipeline, first, second);

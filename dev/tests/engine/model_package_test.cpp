@@ -4,6 +4,7 @@
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "ops/Embedding.hpp"
+#include "ops/KernelNames.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,8 +33,8 @@ using richengine::model::ModelDescriptor;
 using richengine::model::WeightFile;
 using richengine::model::WeightFileRecord;
 using richengine::model::WeightStoreError;
-using richengine::model::QwenAttentionWeights;
-using richengine::model::QwenGdnWeights;
+using richengine::model::AttentionMixerWeights;
+using richengine::model::GdnMixerWeights;
 using richengine::model::Qwen3_8Layout;
 using richengine::model::Qwen3_8Weights;
 using richengine::ops::VisionLayout;
@@ -337,7 +338,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
     MetalBuffer retained;
     const auto readBack = [&] {
         richengine::metal::ComputeDispatch dispatch;
-        dispatch.pipelineName = "test_copy_u32";
+        dispatch.pipelineName = std::string(richengine::ops::kTestCopyU32);
         dispatch.buffers = {{0, retained}, {1, output}};
         dispatch.bytes = {{2, &elementCount, sizeof(elementCount)}};
         dispatch.threadgroups = {(elementCount + 31) / 32, 1, 1};
@@ -571,10 +572,10 @@ void testSyntheticPackage(MetalBackend &backend,
                 "target layer vector is incomplete");
         require(std::get<richengine::model::DFlashDraftWeights>(package.draft).layers.size() == draft.layers,
                 "draft layer vector is incomplete");
-        require(std::holds_alternative<QwenGdnWeights>(
+        require(std::holds_alternative<GdnMixerWeights>(
                     loadedTarget.layers[0].mixer),
                 "target GDN layer has the wrong typed layout");
-        require(std::holds_alternative<QwenAttentionWeights>(
+        require(std::holds_alternative<AttentionMixerWeights>(
                     loadedTarget.layers[3].mixer),
                 "target full-attention layer has the wrong typed layout");
         require(loadedTarget.files.size() == target.layers + 2,
@@ -776,7 +777,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         const std::filesystem::path package = root / "minicpm5";
         std::filesystem::create_directories(package / "draft");
         writeJson(package / "model.json",
-                  R"({"version":1,"model":"MiniCPM5-2B","target_format":"mlx-affine","vision_format":"none"})");
+                  R"({"version":1,"model":"MiniCPM5-2B","family":"MiniCPM5-2B","target_format":"mlx-affine","vision_format":"none"})");
         writeJson(package / "config.json",
                   R"({"model_type":"llama","hidden_size":2048,"num_hidden_layers":42,"vocab_size":130560,"max_position_embeddings":131072,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144})");
         writeJson(package / "draft" / "config.json",
@@ -798,7 +799,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                     !d.dynamicSize,
                 "MiniCPM5 DSpark layout differs from the config");
         require(descriptor.stateLayout.draft ==
-                    richengine::model::DraftStateLayout{5, 2, 128},
+                    richengine::model::DraftStateLayout{5, 2, 128, 2048},
                 "MiniCPM5 draft state layout mismatch");
         require(descriptor.valid(), "MiniCPM5 descriptor is invalid");
     }
@@ -806,7 +807,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         const std::filesystem::path package = root / "lfm25";
         std::filesystem::create_directories(package / "draft");
         writeJson(package / "model.json",
-                  R"({"version":1,"model":"LFM2.5-2.6B","target_format":"gguf","vision_format":"none"})");
+                  R"({"version":1,"model":"LFM2.5-2.6B","family":"LFM2.5-2.6B","target_format":"gguf","vision_format":"none"})");
         std::string layers = "[";
         for (uint32_t layer = 0; layer < 30; ++layer) {
             const bool attention =
@@ -840,7 +841,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                     d.rotaryTheta == 10'000'000.0F,
                 "LFM2.5 DSpark layout differs from the config");
         require(descriptor.stateLayout.draft ==
-                    richengine::model::DraftStateLayout{5, 8, 64},
+                    richengine::model::DraftStateLayout{5, 8, 64, 2048},
                 "LFM2.5 draft state layout mismatch");
         require(descriptor.valid(), "LFM2.5 descriptor is invalid");
     }
@@ -851,7 +852,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         const std::filesystem::path package = root / "lfm25moe";
         std::filesystem::create_directories(package / "draft");
         writeJson(package / "model.json",
-                  R"({"version":1,"model":"LFM2.5-8B-A1B","target_format":"gguf","vision_format":"none"})");
+                  R"({"version":1,"model":"LFM2.5-8B-A1B","family":"LFM2.5-8B-A1B","target_format":"gguf","vision_format":"none"})");
         std::string layers = "[";
         for (uint32_t layer = 0; layer < 24; ++layer) {
             const bool attention =

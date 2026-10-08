@@ -2,6 +2,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -273,7 +274,7 @@ void splitVisibility(metal::MetalBackend &backend,
     metal::CommandGraph graph;
     for (uint32_t i = 0; i < 2; ++i) {
       // A test kernel's copy poisons the partials in order.
-      graph.add("test_copy_u32", {poison, partials.view}, uint32_t(size.partials / 4),
+      graph.add(std::string(kTestCopyU32), {poison, partials.view}, uint32_t(size.partials / 4),
                 {uint32_t((size.partials / 4 + 255) / 256), 1, 1}, {256, 1, 1});
       add(graph, i, splits[i]);
     }
@@ -327,7 +328,7 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows, LinearIn
   metal::CommandGraph graph;
   require(Normalization::addRms(graph,c.input,c.weight,output,k,rows).layout==LinearInput::Plain,
           "plain norm claimed a table");
-  require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==(k<=RICHENGINE_STAGED_NORM_WIDTH),
+  require(graph.dispatches().back().pipelineName.starts_with(kNormRmsStaged)==(k<=RICHENGINE_STAGED_NORM_WIDTH),
           "plain norm staged the wrong widths");
   addReferencePreparation(graph,layout,output,a,sa,k,rows/8);
   const PreparedInput prepared=Normalization::addRms(graph,c.input,c.weight,fused,k,rows,{b,sb,{},{}},layout);
@@ -354,7 +355,7 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   require(refused && graph.empty(),"the Q4-sum norm took F32 weights");
   Normalization::addRmsWithQ4Sums(graph,c.input,c.weight,output,sums,k,rows);
   Normalization::addRms(graph,c.input,c.weight,plain,k,rows);
-  require(graph.dispatches().back().pipelineName.starts_with("norm_rms_staged")==
+  require(graph.dispatches().back().pipelineName.starts_with(kNormRmsStaged)==
               (rows<=RICHENGINE_STAGED_NORM_ROWS && k<=RICHENGINE_STAGED_NORM_WIDTH),
           "plain norm staged the wrong rows");
   (void)backend.submitCommand(graph.dispatches());
@@ -363,16 +364,17 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
 }
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
                         LinearInput layout) {
-  const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256, rows = lanes * 8;
+  const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256,
+                 rows = lanes * RICHENGINE_TARGET_VERIFY_ROWS;
   const uint64_t sumsBytes = tableSumsBytes(layout, width, rows);
-  auto packed = test::sharedBuffer(backend, uint64_t{packedWidth} * 16 * lanes);
+  auto packed = test::sharedBuffer(backend, uint64_t{packedWidth} * rows * 2);
   auto attention = test::sharedBuffer(backend, uint64_t{width} * 32 * 2 * lanes);
   for (auto buffer : {packed, attention}) {
     auto *data = static_cast<uint16_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
       data[i] = floatToBf16(float(int(hash(uint32_t(i)) % 257) - 128) / 16);
   }
-  Guarded output(backend, width * 16 * lanes), fused(backend, width * 16 * lanes);
+  Guarded output(backend, uint64_t{width} * rows * 2), fused(backend, uint64_t{width} * rows * 2);
   Guarded a(backend, tableBytes(width, rows)), b(backend, tableBytes(width, rows));
   Guarded sa(backend, sumsBytes), sb(backend, sumsBytes);
   metal::CommandGraph graph;
@@ -380,14 +382,15 @@ void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t k
                                         LinearInput::Plain)
                   .layout == LinearInput::Plain,
           "plain attention gate claimed a table");
-  addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, lanes);
+  addReferencePreparation(graph, layout, output.view, a.view, sa.view, width, rows / 8);
   const PreparedInput prepared =
       PagedAttention::addVerifyGate(graph, packed, attention, fused.view,
                                     heads, {1, kvHeads, 256}, lanes, {b.view, sb.view, {}, {}}, layout);
   require(prepared.layout == layout && prepared.source.sameView(fused.view),
           "fused attention gate did not report the table it wrote");
   (void)backend.submitCommand(graph.dispatches());
-  require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16 * lanes),
+  require(!std::memcmp(output.view.contents(), fused.view.contents(),
+                       uint64_t{width} * rows * 2),
           "fused attention gate output");
   require(!std::memcmp(a.view.contents(), b.view.contents(), tableBytes(width, rows)),
           "fused attention gate table");

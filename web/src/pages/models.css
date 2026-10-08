@@ -1,0 +1,133 @@
+/* Models page: dense ops-console extras on top of styles.css primitives. */
+
+.badge.err { color: var(--danger) }
+
+.card-value.model-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-value.modalities { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
+
+/* Full-width meter nested in a panel row. */
+.panel-row.meter-row { padding-top: 2px; padding-bottom: 14px }
+.panel-row.meter-row .meter { width: 100% }
+
+/* Warmup checklist rows use mono step names. */
+.panel-row.check .grow {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+/* Wrapping chip cluster for per-stage latency. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 70% }
+.chip {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bubble);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.panel-row .num { letter-spacing: -.01em }
+
+/* Page header with the pause control. */
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px }
+.page-head .btn { margin-top: 6px }
+.page-head .head-side { display: flex; align-items: center; gap: 12px; margin-top: 6px }
+.page-head .head-side .btn { margin-top: 0 }
+.freshness { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap }
+.freshness.stale { color: var(--warn) }
+
+/* Cross-link beside a section heading (Installed models → Disk). */
+.section-link {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-decoration: none;
+}
+.section-link:hover { color: var(--text); text-decoration: underline }
+
+/* Collapsible telemetry sections: summary stands in for the h2. */
+.collapse > summary {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -.01em;
+  cursor: pointer;
+  list-style: none;
+}
+.collapse > summary::-webkit-details-marker { display: none }
+.collapse > summary::before {
+  content: "▾";
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform .12s;
+}
+.collapse:not([open]) > summary { margin-bottom: 0 }
+.collapse:not([open]) > summary::before { transform: rotate(-90deg) }
+
+/* Bare button styled as its text, for copy-on-click ids. */
+.copy-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.copy-btn:hover { color: var(--accent) }
+
+/* Clickable suggested-model chip inside the install form. */
+.chip-btn { border: 0; font-family: inherit; cursor: pointer }
+.chip-btn:hover { color: var(--text) }
+
+/* Charts under throughput/memory/scheduler rows. */
+.panel-row.chart-row { padding-top: 2px; padding-bottom: 12px }
+.panel-row.chart-row > div { width: 100%; min-width: 0 }
+.chart-label { display: block; margin-bottom: 2px; color: var(--muted); font-size: 12.5px }
+
+/* Raw /metrics disclosure. */
+.metrics-raw summary { cursor: pointer; color: var(--muted); font-size: 13.5px; font-weight: 500 }
+.metrics-raw summary:hover { color: var(--text) }
+.metrics-pre { margin: 10px 0 0; padding: 12px 14px; overflow: auto; max-height: 420px; border: 1px solid var(--border); border-radius: 10px; background: var(--bubble); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre }
+
+/* Install form + job log. */
+.install-input {
+  width: 300px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+}
+.install-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.install-check input { accent-color: var(--accent); margin: 0 }
+.install-job { margin-top: 10px }
+.install-log {
+  margin: 0 14px 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  max-height: 220px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bubble);
+  font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

@@ -39,10 +39,33 @@ struct MoeGroupParams {
   // Whether every row's routes end in the shared expert (id `experts`),
   // whose tiles follow the routed ones. LFM2-MoE has none.
   uint32_t shared;
+  // RICHENGINE_MOE_STATS record generation; 0 disables stats. The kernel
+  // writes the dispatch's record into ring slot (stats - 1) %
+  // kMoeStatsLogSlots of the tile-count scratch.
+  uint32_t stats;
 };
 
-static_assert(sizeof(MoeGroupParams) == 20,
-              "MoE grouping parameters are 20 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 24,
+              "MoE grouping parameters are 24 bytes on both sides");
+
+// RICHENGINE_MOE_STATS (ops/MoE.cpp): the grouping kernel's per-dispatch
+// record, appended to a ring in the tile-count scratch at
+// kMoeStatsLogOffset. tile_count[1] holds the same dispatch's distinct
+// routed-expert count. The host reads the ring after the command and
+// prints one "moe-stats" line per record.
+enum {
+  kMoeStatsLogOffset = 16,
+  kMoeStatsLogSlots = 256,
+};
+struct MoeStatsRecord {
+  uint32_t generation;
+  uint32_t rows;
+  uint32_t routed_experts;
+  uint32_t tiles;
+};
+
+static_assert(sizeof(MoeStatsRecord) == 16,
+              "MoE stats records are 16 bytes on both sides");
 
 // The fused select-and-group dispatch (moe_route_group_sigmoid) takes the
 // routing and grouping parameters together.
@@ -51,8 +74,22 @@ struct MoeRouteGroupParams {
   MoeGroupParams group;
 };
 
-static_assert(sizeof(MoeRouteGroupParams) == 36,
-              "MoE route-group parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeRouteGroupParams) == 40,
+              "MoE route-group parameters are 40 bytes on both sides");
+
+// RICHENGINE_MOE_UNION (ops/MoE.cpp): the decode union cap keeps the
+// `budget` routed experts with the largest summed routing weight across the
+// dispatch's rows and dead-marks the rest (selected ~0u, weight 0), which
+// moe_group_routes skips and moe_combine multiplies by zero.
+struct MoeCapParams {
+  uint32_t rows;
+  uint32_t routes_per_row;
+  uint32_t experts;
+  uint32_t budget;
+};
+
+static_assert(sizeof(MoeCapParams) == 16,
+              "MoE union-cap parameters are 16 bytes on both sides");
 
 struct MoeGatherParams {
   uint32_t tile_rows;

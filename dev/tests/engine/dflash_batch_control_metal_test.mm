@@ -3,6 +3,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
 #include "model/Model.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/RowCopy.hpp"
 
 #import <Foundation/Foundation.h>
@@ -102,7 +103,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
   ComputeDispatch dispatch;
-  dispatch.pipelineName = "decode_accept_dflash";
+  dispatch.pipelineName = std::string(richengine::ops::kDecodeAcceptDflash);
   dispatch.buffers = {{0, draft},
                       {1, draftIds},
                       {2, draftProbabilities},

@@ -62,7 +62,7 @@ ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/richengine.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
-	platform-check model-selection preflight serve
+	platform-check model-selection preflight serve webui
 
 all: $(TARGET)
 
@@ -170,6 +170,10 @@ preflight: model-selection
 serve: preflight $(TARGET)
 	./richengine serve $(MODEL_ARGS)
 
+# The SolidJS app builds into server/webui/, which the server serves at /.
+webui:
+	cd web && npm ci && npm run build
+
 $(BUILD):
 	mkdir -p $(BUILD)
 
@@ -230,6 +234,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \
+	runtime/ops/Canvas.cpp \
+	runtime/ops/DeviceTuning.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
@@ -275,7 +281,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Dense.cpp \
+	runtime/model/Gemma4Moe.cpp \
 	runtime/model/Granite.cpp \
+	runtime/model/DiffusionGemma.cpp \
+	runtime/model/DiffusionSampler.cpp \
 	runtime/model/Lfm2.cpp \
 	runtime/model/Lfm2Moe.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
@@ -284,11 +293,12 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
-	runtime/model/QwenTarget.cpp \
-	runtime/model/QwenTargetLoader.cpp \
+	runtime/model/TargetModel.cpp \
+	runtime/model/TargetModelGemma.cpp \
+	runtime/model/TargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DSparkDraft.cpp \
-	runtime/model/PlainDraft.cpp \
+	runtime/model/DFlashV1Draft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/QwenState.cpp
@@ -298,7 +308,14 @@ ENGINE_MM_SOURCES := \
 	runtime/ane/Program.mm \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
+	runtime/model/families/Qwen.mm \
+	runtime/model/families/Ornith.mm \
+	runtime/model/families/MiniCpm.mm \
+	runtime/model/families/Lfm2.mm \
+	runtime/model/families/Granite.mm \
+	runtime/model/families/Gemma.mm \
 	runtime/model/Runtime.mm \
+	runtime/model/RuntimeDiffusion.mm \
 	runtime/model/RuntimeAne.mm \
 	runtime/model/RuntimeEncode.mm \
 	runtime/model/RuntimeNgram.mm \

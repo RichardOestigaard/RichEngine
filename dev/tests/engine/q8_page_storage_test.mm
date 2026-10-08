@@ -1,4 +1,5 @@
 #include "TestBuffers.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/PageStorage.hpp"
 #include "engine/memory/MemoryGovernor.hpp"
 #include "tests/engine/TestChecks.hpp"
@@ -104,7 +105,7 @@ void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStora
             "a released extent could not be allocated again");
     storage.writeEntries(std::array<uint32_t, 1>{128}, 0, table);
     const uint32_t words = 1024, seed = 0x5eed;
-    (void)backend.submit({"addressed_write_u32", {{0, table}},
+    (void)backend.submit({std::string(ops::kAddressedWriteU32), {{0, table}},
                           {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
                           {words / 256, 1, 1}, {256, 1, 1}});
     const auto *written =
@@ -199,7 +200,7 @@ void run(const std::string &metallib) {
     // A command reaches extents through its tables without retaining them:
     // none is released while one is in flight.
     {
-        const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+        const metal::ComputeDispatch kick{std::string(ops::kResidencyKick), {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
         auto ticket = backend.submitAsync(kick);
         requireThrows<std::logic_error>(
             [&] { storage.releaseExtent(1); },
@@ -245,7 +246,7 @@ void run(const std::string &metallib) {
     fill(201, 160);
     fill(255, 210);
     {
-        const metal::ComputeDispatch kick{"residency_kick", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+        const metal::ComputeDispatch kick{std::string(ops::kResidencyKick), {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
         auto ticket = backend.submitAsync(kick);
         requireThrows<std::logic_error>(
             [&] { storage.copyPages(std::array<kv::PageCopy, 1>{{{5, 200}}}); },

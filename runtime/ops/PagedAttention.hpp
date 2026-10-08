@@ -119,6 +119,9 @@ struct PrefillAttentionPlan final {
   const metal::DispatchSize reduceThreads;
   // The q*k softmax scale the kernels apply; zero selects 1/sqrt(d).
   const float scoreScale;
+  // The split kernel's trailing-context window in tokens (the _swa
+  // pipelines' buffer(5)); zero leaves the split windowless.
+  const uint32_t windowTokens;
 
 private:
   friend class PagedAttention;
@@ -126,13 +129,14 @@ private:
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        metal::DispatchSize reduceThreads, kv::Format format,
-                       float scoreScale = 0.0F)
+                       float scoreScale = 0.0F, uint32_t windowTokens = 0)
       : format(format), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
-        reduceThreads(reduceThreads), scoreScale(scoreScale) {}
+        reduceThreads(reduceThreads), scoreScale(scoreScale),
+        windowTokens(windowTokens) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -153,6 +157,9 @@ struct VerifyAttentionPlan final {
   const uint32_t rowCapacity;
   // The q*k softmax scale the kernels apply; zero selects 1/sqrt(d).
   const float scoreScale;
+  // The split kernel's trailing-context window in tokens (the _swa
+  // pipelines' buffer(8)); zero leaves the split windowless.
+  const uint32_t windowTokens;
 
 private:
   friend class PagedAttention;
@@ -169,13 +176,15 @@ private:
                       std::string storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads,
                       metal::DispatchSize reduceThreads, kv::Format format,
-                      uint32_t rowCapacity, float scoreScale = 0.0F)
+                      uint32_t rowCapacity, float scoreScale = 0.0F,
+                      uint32_t windowTokens = 0)
       : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
         rowCapacity(rowCapacity), scoreScale(scoreScale),
+        windowTokens(windowTokens),
         storePipeline_(std::move(storePipeline)), storeGroups_(storeGroups),
         storeThreads_(storeThreads), reduceThreads_(reduceThreads) {}
 };
@@ -202,12 +211,23 @@ public:
   // plan depends on the rows only.
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
+  // The DiffusionGemma canvas splits: same grids and workspace, but every
+  // row admits the whole visible range — the read-only encoder prefix (its
+  // pages) plus the canvas positions (scratch pages the host appended to
+  // the table). Every variant takes window_tokens as a trailing constant;
+  // only the sliding-window kernels apply it.
+  [[nodiscard]] static PrefillAttentionPlan
+  prefillCanvasPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane. A tree plan selects the RICHENGINE_TREE_VERIFY_NODES-row
-  // kernels and workspaces; fp8 KV has none and throws.
+  // kernels and workspaces; fp8 KV has none and throws. liveNodes bounds the
+  // tree's live node count per lane (the store kernel decodes lanes by a
+  // uniform row count, so callers pass the batch's maximum); 0 or a value
+  // over the capacity keeps the full RICHENGINE_TREE_VERIFY_NODES - 1.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, bool tree = false);
+             std::span<const uint32_t> historyTokens, bool tree = false,
+             uint32_t liveNodes = 0);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -273,9 +293,12 @@ public:
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams
   verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
-  // A tree lane's chunk: its emitted nodes' DFS rows.
+  // A tree lane's chunk: its emitted nodes' DFS rows. liveNodes is the
+  // batch-uniform live node count — a leafless comb's eight chain rows cost
+  // a chain's verify instead of the full tree's.
   [[nodiscard]] static kv::ChunkedPrefillParams
-  verifyTreeParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  verifyTreeParams(uint64_t logicalPosition, uint32_t pageTableEntries,
+                   uint32_t liveNodes = RICHENGINE_TREE_VERIFY_NODES - 1);
 
   static void addPrefillStore(metal::CommandGraph &graph, RichKvLayer layer,
                               metal::MetalBuffer chunkKeys,

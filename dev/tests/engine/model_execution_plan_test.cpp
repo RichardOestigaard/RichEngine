@@ -1,6 +1,6 @@
 #include "TestChecks.hpp"
 #include "model/ModelFactory.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/abi/QuantFormat.h"
@@ -39,12 +39,12 @@ model::ModelPackage package() {
   for (uint32_t i = 0; i < layout.layers; ++i) {
     auto &layer = target.layers[i];
     if (layout.isFullAttentionLayer(i)) {
-      model::QwenAttentionWeights attention;
+      model::AttentionMixerWeights attention;
       attention.inputProjection = projection(layout.packedFullWidth, layout.hiddenSize);
       attention.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = std::move(attention);
     } else {
-      model::QwenGdnWeights gdn;
+      model::GdnMixerWeights gdn;
       gdn.inputProjection = projection(layout.packedGdnWidth, layout.hiddenSize);
       gdn.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = std::move(gdn);
@@ -73,7 +73,7 @@ void checkMixedLayouts() {
                        ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize,
                                                                         up.inputSize, {}, {}, {})}});
   bool mismatchRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(target)); }
+  try { static_cast<void>(model::targetModelGeometry(target)); }
   catch (const model::WeightStoreError &) { mismatchRejected = true; }
   require(mismatchRejected, "incompatible fused gate/up layouts reached execution");
   target.layers.front().gateProjection = up;
@@ -116,15 +116,15 @@ void checkMixedLayouts() {
   // MoE shape records: no source mixes them.
   auto sparse = package<model::Qwen3_6MoeWeights>();
   auto &moe = std::get<model::Qwen3_6MoeWeights>(sparse.target);
-  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Affine64,
+  require(model::targetModelGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Affine64,
           "the MoE shape lost the blocks' layout");
   for (auto &layer : moe.layers) layer.ffn = ops::BlockMoeWeights{};
-  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Block32 &&
+  require(model::targetModelGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Block32 &&
               moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "the MoE shape must follow the expert layers, not the head");
   moe.layers.back().ffn = ops::AffineMoeWeights{};
   bool mixedRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(moe)); }
+  try { static_cast<void>(model::targetModelGeometry(moe)); }
   catch (const model::WeightStoreError &) { mixedRejected = true; }
   require(mixedRejected, "a target mixing MoE layouts reached execution");
 }

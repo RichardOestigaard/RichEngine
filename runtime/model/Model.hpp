@@ -364,6 +364,9 @@ namespace model {
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
+  // The largest token burst one decode step may report: the draft/verify
+  // contract's for AR targets, the canvas length for diffusion ones.
+  uint32_t maximumStepTokens = 0;
 };
 
 // A token mask row holds one bit per vocabulary token in 32-bit words.
@@ -385,16 +388,18 @@ struct ExecutionLimits final {
   // pool allocates when it is built.
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
-  static constexpr uint32_t draftQueryRows = 8;
-  static constexpr uint32_t draftProposalTokens = 7;
-  static constexpr uint32_t targetVerifyRows = 8;
+  static constexpr uint32_t draftQueryRows = 16;
+  static constexpr uint32_t draftProposalTokens = 15;
+  static constexpr uint32_t targetVerifyRows = 16;
   // The default trained draft window, and the contract DFlash2/DSpark
   // checkpoints are checked against. Plain drafts may declare a wider
   // sliding_window up to the ring's physical capacity.
   static constexpr uint32_t draftContextTokens = 2048;
   static constexpr uint32_t draftRingCapacity = 4096;
   static constexpr uint32_t speculativeScratchTokens =
-      RICHENGINE_TREE_VERIFY_NODES - 1;
+      RICHENGINE_TREE_VERIFY_NODES - 1 > targetVerifyRows
+          ? RICHENGINE_TREE_VERIFY_NODES - 1
+          : targetVerifyRows;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
   static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
@@ -546,6 +551,13 @@ public:
   // length bookkeeping.
   [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
     return ExecutionLimits::draftContextTokens;
+  }
+  // How far past a decode step's logical position the engine must admit KV
+  // pages: the ordinary verify's speculative tail, a diffusion target's
+  // whole canvas (its step writes the canvas KV into the uncommitted span
+  // ahead of the commit pass).
+  [[nodiscard]] virtual uint32_t decodeAdmissionTokens() const noexcept {
+    return ExecutionLimits::speculativeScratchTokens;
   }
   // Copies the request's committed state at its current page-aligned
   // boundary into the cached state's buffers. Returns nullptr when the pool

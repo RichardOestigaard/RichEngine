@@ -1,6 +1,7 @@
 #include "Normalization.hpp"
 
 #include "ops/BufferExtent.hpp"
+#include "ops/KernelNames.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <utility>
@@ -27,15 +28,15 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
     requireTableScratch(scratch, layout, width, rows);
     // Packed takes the same two scratch slots as a table: the fp16 plane and
     // the per-(row, 32) exponent bytes the mxfp4p decode kernels read.
-    graph.add(normKernel(std::string("norm_rms") + tableSuffix(layout) + "_decode", weight, width),
+    graph.add(normKernel(std::string(kNormRms) + tableSuffix(layout) + "_decode", weight, width),
               {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
     return {std::move(output), layout};
   }
   if (rows <= RICHENGINE_STAGED_NORM_ROWS && width <= RICHENGINE_STAGED_NORM_WIDTH && width % 4 == 0)
-    graph.add(normKernel("norm_rms_staged", weight, width), {std::move(input), weight.buffer, output},
+    graph.add(normKernel(kNormRmsStaged, weight, width), {std::move(input), weight.buffer, output},
               width, {rows, 1, 1}, {RICHENGINE_STAGED_NORM_THREADS, 1, 1});
   else
-    graph.add(normKernel("norm_rms", weight, width), {std::move(input), weight.buffer, output},
+    graph.add(normKernel(kNormRms, weight, width), {std::move(input), weight.buffer, output},
               width, {rows, 1, 1});
   return {};
 }
@@ -53,7 +54,7 @@ void Normalization::addRmsWithQ4Sums(
   // row's sum of the last group ends them.
   const uint64_t groups = width / 64, last = rows - 1;
   requireBytes(sums, ((last / 32 * groups + groups - 1) * 32 + last % 32 + 1) * sizeof(float), "norm sums");
-  graph.add(normKernel("prefill_norm_rms_sums32", weight, width),
+  graph.add(normKernel(kPrefillNormRmsSums32, weight, width),
             {std::move(input), weight.buffer, std::move(output),
              std::move(sums)},
             width, {rows, 1, 1});

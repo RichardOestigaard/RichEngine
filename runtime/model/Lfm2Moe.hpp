@@ -2,8 +2,8 @@
 
 #include "Qwen3_8.hpp"
 #include "QwenHybridLayout.hpp"
-#include "QwenTarget.hpp"
-#include "QwenTargetFiles.hpp"
+#include "TargetModel.hpp"
+#include "TargetFiles.hpp"
 #include "ops/MoE.hpp"
 
 #include <cstdint>
@@ -24,7 +24,7 @@ namespace richengine::model {
 struct Lfm2MoeLayout final {
   static constexpr std::string_view layerMagic = "MDFH0003";
   static constexpr std::string_view headMagic = "MDFH0004";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::SparseMoe;
+  static constexpr FfnKind ffnKind = FfnKind::SparseMoe;
   // The packed QKV rows hold the query heads alone (no interleaved gate).
   static constexpr uint32_t attentionQueryStride = 1;
   static constexpr bool attentionQkNorm = true;
@@ -114,17 +114,17 @@ struct Lfm2DenseFfn final {
 
 struct Lfm2MoeLayerWeights final {
   ops::NormWeights inputNorm;
-  QwenMixerWeights mixer;
+  MixerWeights mixer;
   ops::NormWeights postAttentionNorm;
   // Dense for the leading denseLayers, the sparse MoE block after them.
   std::variant<Lfm2DenseFfn, ops::MoeWeights> ffn;
 };
 
 using Lfm2MoeWeights =
-    QwenTargetWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights>;
+    TargetModelWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights>;
 
 [[nodiscard]] Lfm2MoeWeights
 loadLfm2MoeWeights(metal::MetalBackend &backend, Lfm2MoeLayout layout,
-                   const QwenTargetFiles<Lfm2MoeLayout> &files);
+                   const TargetFiles<Lfm2MoeLayout> &files);
 
 } // namespace richengine::model

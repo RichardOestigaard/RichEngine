@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 from . import families, hub, models
+from .layout import DRAFT, PACKAGE_MANIFEST, TARGET, TOKENIZER, VISION
 
 ALIGNMENT = 16384
 # The tokenizer/ files a package ships.
@@ -42,14 +43,14 @@ PACKAGE_FORMATS = {
         4,
         "MDFM0001",
         "Qwen3.6-35B-A3B",
-        {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
+        {TARGET: "qwen3_5_moe", DRAFT: "DFlash2DraftModel"},
     ),
     "richengine-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
     "richengine-packed-q4-moe": PackageFormat(
         4,
         "MDFM0001",
         "Qwen3.6-35B-A3B",
-        {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
+        {TARGET: "qwen3_5_moe", DRAFT: "DFlash2DraftModel"},
     ),
 }
 
@@ -67,7 +68,7 @@ def _validate_records(records, artifact_paths):
             not isinstance(record, dict)
             or set(record) != {"path", "size", "sha256"}
             or not models.is_safe_path(record["path"])
-            or record["path"] == "manifest.json"
+            or record["path"] == PACKAGE_MANIFEST
             or type(record["size"]) is not int
             or record["size"] <= 0
             or not models.is_hex_digest(record["sha256"], 64)
@@ -98,7 +99,9 @@ def validate_manifest(path: Path):
         or not manifest["model"].strip()
         or not isinstance(manifest.get("execution_geometry"), dict)
     ):
-        raise models.ModelError("repository is not a supported RichEngine runtime package")
+        raise models.ModelError(
+            "repository is not a supported RichEngine runtime package"
+        )
     expected_format = {
         "section_alignment_bytes": ALIGNMENT,
         "target_layer_magic": layout.target_layer_magic,
@@ -134,15 +137,20 @@ def validate_manifest(path: Path):
     ):
         raise models.ModelError("runtime package artifact paths overlap")
     family = families.named(layout.family)
+    if family is None or family.draft is None:
+        raise models.ModelError(
+            "runtime package names a family this release does not serve: "
+            + layout.family
+        )
     target_layers = dict(family.signature)["num_hidden_layers"]
     required_files = {
-        "target/embedding.bin",
-        "target/head.bin",
-        *(f"target/layer-{index}.bin" for index in range(target_layers)),
-        "draft/model.bin",
-        *(f"draft/layer-{index}.bin" for index in range(family.draft.layers)),
-        "vision/model.bin",
-        *(f"tokenizer/{name}" for name in PACKAGE_TOKENIZER_FILES),
+        f"{TARGET}/embedding.bin",
+        f"{TARGET}/head.bin",
+        *(f"{TARGET}/layer-{index}.bin" for index in range(target_layers)),
+        f"{DRAFT}/model.bin",
+        *(f"{DRAFT}/layer-{index}.bin" for index in range(family.draft.layers)),
+        f"{VISION}/model.bin",
+        *(f"{TOKENIZER}/{name}" for name in PACKAGE_TOKENIZER_FILES),
     }
     missing = required_files - artifact_paths
     if missing:
@@ -182,7 +190,7 @@ def verify(link: Path, repo_id: str, *, full: bool):
     """Check the package at a selection link: a snapshot of repo_id whose
     manifest validates and whose artifacts match it (with full, by hash)."""
     hub.snapshot_commit(installed_snapshot(link), repo_id)
-    verify_artifacts(link, validate_manifest(link / "manifest.json"), full=full)
+    verify_artifacts(link, validate_manifest(link / PACKAGE_MANIFEST), full=full)
 
 
 def _download_snapshot(repo_id: str, token):
@@ -202,7 +210,8 @@ def _download_snapshot(repo_id: str, token):
                 "Hub did not resolve the model to a snapshot commit"
             )
         manifest_file = next(
-            (item for item in info.siblings if item.rfilename == "manifest.json"), None
+            (item for item in info.siblings if item.rfilename == PACKAGE_MANIFEST),
+            None,
         )
         if manifest_file is None:
             raise models.ModelError(
@@ -217,7 +226,7 @@ def _download_snapshot(repo_id: str, token):
         # artifact. A branch update between metadata and download retries before
         # any weights are downloaded.
         manifest_path = Path(
-            hf_hub_download(filename="manifest.json", revision="main", **options)
+            hf_hub_download(filename=PACKAGE_MANIFEST, revision="main", **options)
         )
         revision = hub.snapshot_commit(manifest_path.parent, repo_id)
         if revision == info.sha:
@@ -233,7 +242,7 @@ def _download_snapshot(repo_id: str, token):
     except models.ModelError:
         manifest_path = Path(
             hf_hub_download(
-                filename="manifest.json",
+                filename=PACKAGE_MANIFEST,
                 force_download=True,
                 **options,
             )
@@ -255,11 +264,11 @@ def _download_snapshot(repo_id: str, token):
             )
     snapshot = Path(
         snapshot_download(
-            allow_patterns=["manifest.json", *(r["path"] for r in records)],
+            allow_patterns=[PACKAGE_MANIFEST, *(r["path"] for r in records)],
             **options,
         )
     )
-    if models.sha256(snapshot / "manifest.json") != manifest_sha:
+    if models.sha256(snapshot / PACKAGE_MANIFEST) != manifest_sha:
         raise models.ModelError("runtime package manifest changed during download")
     if hub.snapshot_commit(snapshot, repo_id) != revision:
         raise models.ModelError("Hub returned a different runtime package revision")
@@ -280,14 +289,16 @@ def _download_snapshot(repo_id: str, token):
 def _cached_snapshot(repo_id):
     from huggingface_hub import try_to_load_from_cache
 
-    path = try_to_load_from_cache(repo_id, "manifest.json", revision="main")
+    path = try_to_load_from_cache(repo_id, PACKAGE_MANIFEST, revision="main")
     if not isinstance(path, str):
         return None
     snapshot = Path(path).parent
     try:
         hub.snapshot_commit(snapshot, repo_id)
         verify_artifacts(
-            snapshot, validate_manifest(snapshot / "manifest.json"), full=True
+            snapshot,
+            validate_manifest(snapshot / PACKAGE_MANIFEST),
+            full=True,
         )
     except (models.ModelError, OSError):
         return None
@@ -312,7 +323,10 @@ def resolve_snapshot(repo_id: str):
     except Exception as error:
         if isinstance(error, (OfflineModeIsEnabled, httpx.TransportError)):
             if cached := _cached_snapshot(repo_id):
-                print("Using a verified cached model while offline.", flush=True)
+                print(
+                    models.dim("Using a verified cached model while offline."),
+                    flush=True,
+                )
                 return cached
         if isinstance(error, models.ModelError):
             raise
@@ -344,11 +358,15 @@ def prepare(selection):
                     f"cannot identify the local package at {link}; move it aside before installing"
                 ) from None
         else:
-            print(f"RichEngine model {selection.model} is already installed in {link}")
+            print(
+                f"RichEngine model {models.accent(selection.model)} is already "
+                f"installed in {models.dim(link)}"
+            )
             hub.repair_pins(link, [(installed_snapshot(link), selection.repo_id)])
             return
     print(
-        f"Installing {selection.model}; missing artifacts will be downloaded.",
+        f"Installing {models.accent(selection.model)}; "
+        f"{models.dim('missing artifacts will be downloaded.')}",
         flush=True,
     )
     snapshot = resolve_snapshot(selection.repo_id)
@@ -356,5 +374,8 @@ def prepare(selection):
         pin = hub.pin(snapshot, selection.repo_id, link)
         models.link_selection(link, snapshot)
         verify(link, selection.repo_id, full=False)
-        print(f"Installed verified RichEngine model {selection.model} in {link}")
+        print(
+            f"Installed verified RichEngine model {models.accent(selection.model)} "
+            f"in {models.dim(link)}"
+        )
         hub.retire_other_pins([pin])

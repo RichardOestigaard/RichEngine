@@ -127,10 +127,8 @@ void NativeRuntime::releaseIdleWeights() {
           1000.0 * config_.idleReleaseSeconds)
     return;
   config_.weights->release();
-  std::ostringstream message;
-  message << "Weights released after " << config_.idleReleaseSeconds
-          << " s without a request; the next request restores them";
-  writeStderrLine(message.str());
+  logLine(dim("Weights released after "), config_.idleReleaseSeconds,
+          dim(" s without a request; the next request restores them"));
 }
 
 void NativeRuntime::restoreWeights() {
@@ -139,11 +137,9 @@ void NativeRuntime::restoreWeights() {
   ++weightRestores_;
   const double now = clocks_.monotonicMilliseconds();
   idleSinceMilliseconds_ = now;
-  std::ostringstream message;
-  message << "Weights restored in " << std::fixed << std::setprecision(2)
-          << (now - *restoreStarted_) / 1000.0 << " s";
+  logLine(dim("Weights restored in "), std::fixed, std::setprecision(2),
+          (now - *restoreStarted_) / 1000.0, dim(" s"));
   restoreStarted_.reset();
-  writeStderrLine(message.str());
 }
 
 void NativeRuntime::executionFailed(std::exception_ptr failure) {

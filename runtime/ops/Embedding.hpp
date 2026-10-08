@@ -9,9 +9,11 @@ namespace richengine::ops {
 
 class Embedding final {
 public:
+  // `scale` selects the scaled gather (Gemma's sqrt(hidden) embedding
+  // scale); 0 is the unscaled table lookup.
   static void add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                   const EmbeddingWeights &table, metal::MetalBuffer output,
-                  uint32_t rows);
+                  uint32_t rows, float scale = 0.0F);
   // A verify step's input tokens, RICHENGINE_TARGET_VERIFY_ROWS per lane: the
   // lane's anchor, row 0 of its draft input rows, then the draft's
   // RICHENGINE_DRAFT_PROPOSAL_TOKENS proposals, each clamped into the

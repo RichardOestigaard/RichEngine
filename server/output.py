@@ -43,19 +43,28 @@ def hold_partial(text, *markers):
 
 
 class ReasoningSplitter:
-    def __init__(self, thinking, tool_calls=False, call_open=None):
+    def __init__(
+        self, thinking, tool_calls=False, call_open=None,
+        think_open=THINK_OPEN, think_end=THINK_END,
+    ):
         self.reasoning = thinking
         self.pending = ""
-        # Whether the newlines after </think>, which set the answer apart in
-        # the chat template's layout of a turn, are still to be dropped.
+        # The reasoning's open and close spellings: `<think>`/`</think>`
+        # unless the served dialect frames reasoning differently (gemma4's
+        # thought channel).
+        self.think_open = think_open
+        self.think_end = think_end
+        # Whether the newlines after the think close, which set the answer
+        # apart in the chat template's layout of a turn, are still to be
+        # dropped.
         self.separator = False
         # Where a call may follow, a call's opening also ends the reasoning
         # and begins the answer; call_open is the tool dialect's marker, the
         # default dialect's where the request keeps it.
         if call_open is None:
             call_open = CALL_OPEN
-        self.ends = (THINK_END, call_open) if tool_calls else (THINK_END,)
-        # While no text has arrived, a leading <think> may still open
+        self.ends = (think_end, call_open) if tool_calls else (think_end,)
+        # While no text has arrived, a leading think-open may still open
         # reasoning a template did not mark: a hybrid-thinking model whose
         # generation prompt ends at the role tag writes the tag itself
         # (minicpm5 without enable_thinking).
@@ -68,20 +77,20 @@ class ReasoningSplitter:
                 pending, self.pending = self.pending, ""
                 return self._content(pending)
             head = self.pending.lstrip(NAME_SPACE)
-            if not head.startswith(THINK_OPEN):
-                # Hold the output while it may still grow into <think>.
-                if THINK_OPEN.startswith(head):
+            if not head.startswith(self.think_open):
+                # Hold the output while it may still grow into think-open.
+                if self.think_open.startswith(head):
                     return []
                 self.undecided = False
                 pending, self.pending = self.pending, ""
                 return self._content(pending)
             self.reasoning = True
-            self.pending = head[len(THINK_OPEN) :]
+            self.pending = head[len(self.think_open) :]
         # A template that leaves reasoning open ends the prompt at the role
-        # tag, so the model writes <think> itself; it marks the reasoning
-        # rather than being part of it.
-        if self.pending.startswith(THINK_OPEN):
-            self.pending = self.pending[len(THINK_OPEN) :]
+        # tag, so the model writes the think-open itself; it marks the
+        # reasoning rather than being part of it.
+        if self.pending.startswith(self.think_open):
+            self.pending = self.pending[len(self.think_open) :]
         ends = [
             (index, marker)
             for marker in self.ends
@@ -91,15 +100,17 @@ class ReasoningSplitter:
             end, marker = min(ends)
             reasoning = self.pending[:end]
             content = self.pending[end:]
-            if marker == THINK_END:
-                content = content[len(THINK_END) :]
+            if marker == self.think_end:
+                content = content[len(self.think_end) :]
             self.pending = ""
             self.reasoning = False
             self.undecided = False
-            self.separator = marker == THINK_END
+            self.separator = marker == self.think_end
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
-        ready, self.pending = hold_partial(self.pending, *self.ends, THINK_OPEN)
+        ready, self.pending = hold_partial(
+            self.pending, *self.ends, self.think_open
+        )
         return [("reasoning_content", ready)] if ready else []
 
     def _content(self, text):
@@ -176,6 +187,8 @@ def StreamingToolCallProjector(policy, request_id, structured=False):
     dialect = getattr(policy, "dialect", None) or QWEN3_XML
     if dialect.kind == "python":
         return _PythonCallProjector(policy, request_id, structured, dialect)
+    if dialect.kind == "gemma4":
+        return _Gemma4CallProjector(policy, request_id, structured, dialect)
     return _XmlToolCallProjector(policy, request_id, structured, dialect)
 
 
@@ -203,10 +216,10 @@ class _ProjectorBase:
         # The text that opens a call and begins its name: the call's open
         # marker and the prefix its name follows.
         self.call_marker = dialect.call_open + dialect.name_prefix
-        # Text outside calls: a call's opening opens one, and a </think>,
+        # Text outside calls: a call's opening opens one, and a think-end,
         # which a model that called a tool from its reasoning may still
         # write, is dropped.
-        self.text_tags = (self.call_marker, THINK_END)
+        self.text_tags = (self.call_marker, dialect.think_end)
         self.request_id = request_id
         self.pending = ""
         self.state = "output" if structured else "content"
@@ -832,6 +845,284 @@ class _PythonCallProjector(_ProjectorBase):
                     continue
                 break
         return events
+
+
+
+_GEMMA4_QUOTE = '<|"|>'
+
+
+class _Gemma4CallProjector(_ProjectorBase):
+    """The projector of a gemma4 call: `call:NAME{key:value,...}` between
+    the call tokens, with `<|"|>`-delimited strings, bare scalars and
+    containers of the same. Calls run together; each ends at its `}` and
+    the call close follows it."""
+
+    _after_open = "name"
+    _after_call = "closing"
+
+    def _begin_parameter(self, name, events):
+        name = name.strip(NAME_SPACE)
+        kept = name and name not in self.parameter_names and self.call_id is not None
+        self.parameter_names.add(name)
+        self.parameter_name = name if kept else None
+        self.value_types = self.parameter_types.get(name, self.other_types)
+        self.value_streams = self.value_types == {"string"}
+        self.value_started = False
+        self.value_parts = []
+
+    def _end_parameter_value(self, value, events, raw=None):
+        """Emit the parameter's value as the JSON its declared types read it
+        as, as the python projector does: a string converts, any other kind
+        emits where declared and otherwise the raw token."""
+        if self.parameter_name is not None:
+            types = self.value_types
+            if isinstance(value, str):
+                value = convert_value(value, types)
+            elif (
+                types is not None
+                and JSON_TYPES[type(value)] not in types
+                and not (JSON_TYPES[type(value)] == "integer" and "number" in types)
+            ):
+                value = raw if raw is not None else str(value)
+            self._emit_argument(
+                self._key(self.parameter_name) + json_codec.dumps(value), events
+            )
+        self.parameter_name = None
+        self.value_parts = []
+
+    def _drain(self, events):
+        if self.state == "name":
+            name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
+            self.pending = ""
+            self._begin_call(name, events)
+            self.state = "arguments"
+        if self.state == "string":
+            # A string that never closed keeps the text it decoded; a
+            # streamed one closes on the text it already emitted.
+            if self.value_streams:
+                if self.parameter_name is not None:
+                    self._emit_argument('"', events)
+                    self.parameter_name = None
+            else:
+                self._end_parameter_value("".join(self.value_parts), events)
+            self.pending = ""
+        elif self.state == "scalar":
+            token, self.pending = self.pending.strip(), ""
+            self._end_parameter_value(_gemma4_value(token), events, raw=token)
+        if self.state in ("arguments", "key") and self.call_id is not None:
+            self.pending = ""
+            self._finish_call(events)
+        if self.state == "closing":
+            self.pending = ""
+            self.state = "content"
+
+    def _string(self, events):
+        """Read a `<|"|>`-delimited string's text to its close, emitting
+        a declared string's characters as it goes."""
+        if not self.value_started:
+            self.value_started = True
+            if self.value_streams and self.parameter_name is not None:
+                self._emit_argument(self._key(self.parameter_name) + '"', events)
+        end = self.pending.find(_GEMMA4_QUOTE)
+        if end < 0:
+            held = hold_partial(self.pending, _GEMMA4_QUOTE)[1]
+            body = self.pending[: len(self.pending) - len(held)]
+            self.pending = held
+            if self.value_streams:
+                if body:
+                    self._emit_argument(json_codec.dumps(body)[1:-1], events)
+            else:
+                self.value_parts.append(body)
+            return False
+        body = self.pending[:end]
+        self.pending = self.pending[end + len(_GEMMA4_QUOTE) :]
+        parts = self.value_parts + [body]
+        if self.value_streams:
+            if body:
+                self._emit_argument(json_codec.dumps(body)[1:-1], events)
+            self._emit_argument('"', events)
+            # The value has been emitted key and all; nothing converts.
+            self.parameter_name = None
+            self.value_parts = []
+        else:
+            self._end_parameter_value("".join(parts), events)
+        self.state = "arguments"
+        return True
+
+    def _scalar(self, events):
+        """Read a bare value to its `,` or `}` delimiter at container depth
+        zero, `<|"|>` strings inside it skipped, then emit it."""
+        depth = 0
+        index = 0
+        text = self.pending
+        while index < len(text):
+            if text.startswith(_GEMMA4_QUOTE, index):
+                close = text.find(_GEMMA4_QUOTE, index + len(_GEMMA4_QUOTE))
+                if close < 0:
+                    return False
+                index = close + len(_GEMMA4_QUOTE)
+                continue
+            character = text[index]
+            if character in "[{":
+                depth += 1
+            elif character in "]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif character == "," and depth == 0:
+                break
+            index += 1
+        else:
+            return False
+        token = text[:index].strip()
+        self.pending = text[index:]
+        self._end_parameter_value(_gemma4_value(token), events, raw=token)
+        self.state = "arguments"
+        return True
+
+    def put(self, text):
+        self.pending += text
+        events = []
+        while self.pending:
+            handled = self._output_state(events)
+            if handled is not None:
+                if not handled:
+                    break
+                continue
+            if self.state == "content":
+                if not self._content_state(events):
+                    break
+                continue
+            if self.state == "name":
+                if (name := self._name("{")) is None:
+                    break
+                self._begin_call(name, events)
+                self.state = "arguments"
+                continue
+            if self.state == "arguments":
+                stripped = self.pending.lstrip(NAME_SPACE)
+                if stripped != self.pending:
+                    self.pending = stripped
+                    continue
+                if self.pending.startswith(","):
+                    self.pending = self.pending[1:]
+                    continue
+                if self.pending.startswith("}"):
+                    self.pending = self.pending[1:]
+                    self._finish_call(events)
+                    continue
+                self.state = "key"
+                continue
+            if self.state == "key":
+                if (name := self._name(":")) is None:
+                    break
+                self._begin_parameter(name, events)
+                self.state = "value"
+                continue
+            if self.state == "value":
+                stripped = self.pending.lstrip(NAME_SPACE)
+                if stripped != self.pending:
+                    self.pending = stripped
+                    continue
+                if self.pending.startswith(_GEMMA4_QUOTE):
+                    self.pending = self.pending[len(_GEMMA4_QUOTE) :]
+                    self.state = "string"
+                    continue
+                if _GEMMA4_QUOTE.startswith(self.pending):
+                    break
+                self.state = "scalar"
+                continue
+            if self.state == "string":
+                if not self._string(events):
+                    break
+                continue
+            if self.state == "scalar":
+                if not self._scalar(events):
+                    break
+                continue
+            if self.state == "closing":
+                rest = self.pending.lstrip(NAME_SPACE)
+                close = self.dialect.call_close[1:]
+                if rest.startswith(close):
+                    self.pending = rest[len(close) :]
+                    self.state = "content"
+                    continue
+                if close.startswith(rest):
+                    break
+                self._malformed()
+        return events
+
+
+def _gemma4_value(token):
+    """A bare gemma4 argument value: `<|"|>` strings, the JSON scalars,
+    and containers of the same syntax, or the token itself where it spells
+    none."""
+    token = token.strip()
+    try:
+        value, end = _gemma4_read(token, 0)
+    except (ValueError, RecursionError):
+        return token
+    return value if end == len(token) else token
+
+
+def _gemma4_read(text, index):
+    """One value at `index`, as the template writes it, and where it ends;
+    ValueError where no value starts there."""
+    if index >= len(text):
+        raise ValueError("empty value")
+    if text.startswith(_GEMMA4_QUOTE, index):
+        close = text.find(_GEMMA4_QUOTE, index + len(_GEMMA4_QUOTE))
+        if close < 0:
+            return text[index + len(_GEMMA4_QUOTE) :], len(text)
+        return text[index + len(_GEMMA4_QUOTE) : close], close + len(_GEMMA4_QUOTE)
+    if text[index] == "{":
+        index += 1
+        result = {}
+        while index < len(text) and text[index] != "}":
+            colon = _gemma4_key_end(text, index)
+            key = text[index:colon]
+            value, index = _gemma4_read(text, colon + 1)
+            result[key] = value
+            if index < len(text) and text[index] == ",":
+                index += 1
+        if index >= len(text):
+            raise ValueError("unclosed object")
+        return result, index + 1
+    if text[index] == "[":
+        index += 1
+        result = []
+        while index < len(text) and text[index] != "]":
+            value, index = _gemma4_read(text, index)
+            result.append(value)
+            if index < len(text) and text[index] == ",":
+                index += 1
+        if index >= len(text):
+            raise ValueError("unclosed array")
+        return result, index + 1
+    end = index
+    while end < len(text) and text[end] not in ",}]":
+        end += 1
+    scalar = text[index:end].strip()
+    if not scalar:
+        raise ValueError("empty value")
+    try:
+        return json_codec.loads(scalar), end
+    except ValueError:
+        return scalar, end
+
+
+def _gemma4_key_end(text, index):
+    """Where the `:` that ends an object key sits; a `<|"|>` key ends
+    where its delimiter does."""
+    if text.startswith(_GEMMA4_QUOTE, index):
+        close = text.find(_GEMMA4_QUOTE, index + len(_GEMMA4_QUOTE))
+        if close < 0:
+            raise ValueError("unclosed key")
+        index = close + len(_GEMMA4_QUOTE)
+    colon = text.find(":", index)
+    if colon < 0:
+        raise ValueError("key without colon")
+    return colon
 
 
 def _python_call_value(token):

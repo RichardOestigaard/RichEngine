@@ -1,5 +1,6 @@
 #include "PagedAttention.hpp"
 
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -43,7 +44,11 @@ enum class KernelLayout : uint8_t {
   // Granite's KV8 layouts: 3B's 40 query heads of 64 (group 5) and 8B's
   // 32 of 128 (group 4).
   Kv8Group5D64,
-  Kv8Group4D128
+  Kv8Group4D128,
+  // Gemma 4's layouts: the sliding layers' KV8 group-2 pages of 256 and the
+  // k_eq_v global layers' KV2 group-8 pages of 512.
+  GemmaKv8H256,
+  GemmaKv2H512
 };
 
 [[nodiscard]] constexpr uint32_t kernelLayoutHeadDim(KernelLayout layout) noexcept {
@@ -51,6 +56,7 @@ enum class KernelLayout : uint8_t {
   case KernelLayout::Kv4Group6:
   case KernelLayout::Kv4Group4:
   case KernelLayout::Kv2Group8:
+  case KernelLayout::GemmaKv8H256:
     return 256;
   case KernelLayout::Kv2Group8D128:
     return 128;
@@ -59,6 +65,8 @@ enum class KernelLayout : uint8_t {
     return 64;
   case KernelLayout::Kv8Group4D128:
     return 128;
+  case KernelLayout::GemmaKv2H512:
+    return 512;
   }
   return 0;
 }
@@ -81,6 +89,10 @@ enum class KernelLayout : uint8_t {
     return "_k8q5d64";
   case KernelLayout::Kv8Group4D128:
     return "_k8q4d128";
+  case KernelLayout::GemmaKv8H256:
+    return "_gemma_h256";
+  case KernelLayout::GemmaKv2H512:
+    return "_gemma_hd512";
   }
   return {};
 }
@@ -92,8 +104,12 @@ enum class KernelLayout : uint8_t {
       return KernelLayout::Kv4Group6;
     case 2:
       return KernelLayout::Kv2Group8;
+    case 8:
+      return KernelLayout::GemmaKv8H256;
     }
-  } else if (layout.headDimension == 128 && layout.kvHeads == 2)
+  } else if (layout.headDimension == 512 && layout.kvHeads == 2)
+    return KernelLayout::GemmaKv2H512;
+  else if (layout.headDimension == 128 && layout.kvHeads == 2)
     return KernelLayout::Kv2Group8D128;
   else if (layout.headDimension == 64 && layout.kvHeads == 8)
     return KernelLayout::Kv8Group4D64;
@@ -105,9 +121,13 @@ enum class KernelLayout : uint8_t {
 // The stores' suffix: KV4/256 stores have no query-group variants, so the
 // tag derives from the page geometry alone.
 [[nodiscard]] std::string_view storageSuffix(const kv::Layout &layout) {
-  if (layout.headDimension == 256)
-    return layout.kvHeads == 4 ? ""
-         : layout.kvHeads == 2 ? "_kv2_g8" : throw std::invalid_argument("unsupported attention layout");
+  if (layout.headDimension == 256) {
+    if (layout.kvHeads == 4) return "";
+    if (layout.kvHeads == 2) return "_kv2_g8";
+    if (layout.kvHeads == 8) return "_gemma_h256";
+    throw std::invalid_argument("unsupported attention layout");
+  }
+  if (layout.headDimension == 512 && layout.kvHeads == 2) return "_gemma_hd512";
   if (layout.headDimension == 128 && layout.kvHeads == 2) return "_hd128";
   if (layout.headDimension == 64 && layout.kvHeads == 8) return "_hd64";
   if (layout.headDimension == 128 && layout.kvHeads == 8) return "_k8d128";
@@ -123,6 +143,14 @@ enum class KernelLayout : uint8_t {
     case 16:
       return KernelLayout::Kv4Group4;
     }
+  // Gemma 4's sliding layers: KV8 of 256 with 16 query heads (group 2); its
+  // k_eq_v globals: KV2 of 512 with 16 (group 8).
+  if (layout.headDimension == 256 && layout.kvHeads == 8 &&
+      queryHeads == 16)
+    return KernelLayout::GemmaKv8H256;
+  if (layout.headDimension == 512 && layout.kvHeads == 2 &&
+      queryHeads == 16)
+    return KernelLayout::GemmaKv2H512;
   const KernelLayout kernel = storageKernelLayout(layout);
   switch (kernel) {
   case KernelLayout::Kv2Group8:
@@ -166,6 +194,43 @@ enum class KernelLayout : uint8_t {
          std::string(kernelSuffix(layout));
 }
 
+// The Gemma splits name their window differently from the plain layouts:
+// prefill h256 exists only windowed (_split_swa_h256, window 0 = full
+// causal), hd512 windowless is _split_hd512; verify's windowless Gemma
+// splits carry the _gemma tag.
+[[nodiscard]] std::string gemmaSplitKernel(std::string_view stem,
+                                           kv::Format format,
+                                           KernelLayout layout,
+                                           uint32_t windowTokens) {
+  const bool prefill = stem.starts_with("prefill");
+  std::string kernel = std::string(stem) + "_" + formatTag(format) + "_split";
+  if (layout == KernelLayout::GemmaKv8H256) {
+    kernel += (windowTokens || prefill) ? "_swa_h256" : "_gemma_h256";
+  } else {
+    kernel += windowTokens ? "_swa_hd512_m2"
+                           : (prefill ? "_hd512_m2" : "_gemma_hd512_m2");
+  }
+  return kernel;
+}
+
+// The split a plan dispatches: the Gemma layouts route through
+// gemmaSplitKernel, every other layout through splitKernel. A tree lane's
+// scratch doubles the fused rows, so the Group-8 layouts' 128-row tile
+// overflows threadgroup memory and they take the two-pass _m2 variants.
+[[nodiscard]] std::string splitPipeline(std::string_view stem,
+                                        const kv::Layout &layout,
+                                        KernelLayout kernel) {
+  if (kernel == KernelLayout::GemmaKv8H256 ||
+      kernel == KernelLayout::GemmaKv2H512)
+    return gemmaSplitKernel(stem, layout.format, kernel, layout.windowTokens);
+  std::string name = splitKernel(stem, layout.format, kernel);
+  if (stem == kVerifyTreeAttention &&
+      (kernel == KernelLayout::Kv2Group8 ||
+       kernel == KernelLayout::Kv2Group8D128))
+    name += "_m2";
+  return name;
+}
+
 [[nodiscard]] std::string storeKernel(std::string_view stem, kv::Format format,
                                       const kv::Layout &layout) {
   return std::string(stem) + "_" + formatTag(format) + "_store" +
@@ -193,6 +258,33 @@ enum class KernelLayout : uint8_t {
     throw std::invalid_argument("query and key norms differ in type");
   if (queryNorm.float32) kernel += "_f32";
   return kernel;
+}
+
+// The canvas splits name their variant like the Gemma prefill splits with
+// "canvas_" inserted before the window tag: _split_canvas_swa_h256,
+// _split_canvas_hd512 and so on. Every canvas split takes the trailing
+// window_tokens constant; the windowless ones ignore it.
+[[nodiscard]] std::string canvasSplitKernel(kv::Format format,
+                                            KernelLayout layout,
+                                            uint32_t windowTokens) {
+  std::string kernel =
+      std::string(kPrefillAttention) + "_" + formatTag(format) + "_split_canvas";
+  if (windowTokens) kernel += "_swa";
+  if (layout == KernelLayout::GemmaKv8H256)
+    kernel += "_h256";
+  else if (layout == KernelLayout::GemmaKv2H512)
+    kernel += "_hd512_m2";
+  else
+    throw std::invalid_argument("no canvas attention kernel for layout");
+  return kernel;
+}
+
+[[nodiscard]] std::string canvasReduceKernel(KernelLayout layout) {
+  if (layout == KernelLayout::GemmaKv8H256)
+    return std::string(kPrefillAttentionReduceCanvasGemmaH256);
+  if (layout == KernelLayout::GemmaKv2H512)
+    return std::string(kPrefillAttentionReduceCanvasGemmaHd512);
+  throw std::invalid_argument("no canvas attention reducer for layout");
 }
 
 } // namespace
@@ -237,17 +329,41 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
           splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              kernelLayoutHeadDim(kernelLayout)),
-          splitKernel("prefill_attention", layout.format, kernelLayout),
-          reduceKernel("prefill_attention_reduce", kernelLayout),
+          splitPipeline(kPrefillAttention, layout, kernelLayout),
+          reduceKernel(kPrefillAttentionReduce, kernelLayout),
           {layout.kvHeads, tiles, splits},
           {layout.kvHeads, fusedRows, tiles},
           metal::DispatchSize{layout.headDimension, 1, 1},
-          layout.format, layout.scoreScale};
+          layout.format, layout.scoreScale, layout.windowTokens};
+}
+
+PrefillAttentionPlan
+PagedAttention::prefillCanvasPlan(uint32_t rows, uint32_t queryHeads,
+                                  kv::Layout layout) {
+  const KernelLayout kernelLayout =
+      attentionKernelLayout(layout, queryHeads);
+  if (kernelLayout != KernelLayout::GemmaKv8H256 &&
+      kernelLayout != KernelLayout::GemmaKv2H512)
+    throw std::invalid_argument("canvas attention requires a Gemma layout");
+  const PrefillAttentionPlan plan = prefillPlan(rows, queryHeads, layout);
+  // The canvas split covers every canvas page for each tile, so its reducer
+  // must use the same full-canvas page partition.
+  return {plan.rows,
+          plan.splits,
+          plan.workspace,
+          canvasSplitKernel(layout.format, kernelLayout, layout.windowTokens),
+          canvasReduceKernel(kernelLayout),
+          plan.splitGroups,
+          plan.reduceGroups,
+          plan.reduceThreads,
+          plan.format,
+          plan.scoreScale,
+          layout.windowTokens};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, bool tree) {
+    std::span<const uint32_t> historyTokens, bool tree, uint32_t liveNodes) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!kv::validFormat(layout.format))
     throw std::invalid_argument("paged attention requires a kv format");
@@ -258,8 +374,14 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     throw std::invalid_argument("verify lane count is out of range");
   const uint32_t rows =
       tree ? RICHENGINE_TREE_VERIFY_NODES : kv::kVerifyRows;
+  // A host-emitted comb knows its batch-maximum node count at encode time;
+  // a kernel-emitted table's counts are on the GPU, so it keeps the full
+  // scratch. A leafless comb then stores and attends a chain's eight rows.
   const uint32_t liveRows =
-      tree ? RICHENGINE_TREE_VERIFY_NODES - 1 : kv::kVerifyRows;
+      tree ? (liveNodes && liveNodes < RICHENGINE_TREE_VERIFY_NODES
+                  ? liveNodes
+                  : RICHENGINE_TREE_VERIFY_NODES)
+           : kv::kVerifyRows;
   std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -279,21 +401,21 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           laneSplits,
           splits,
           workspace,
-          splitKernel(tree ? "verify_tree_attention" : "verify_attention",
-                      layout.format, kernelLayout),
-          reduceKernel(tree ? "verify_tree_attention_reduce"
-                            : "verify_attention_reduce",
+          splitPipeline(tree ? kVerifyTreeAttention : kVerifyAttention,
+                        layout, kernelLayout),
+          reduceKernel(tree ? kVerifyTreeAttentionReduce
+                            : kVerifyAttentionReduce,
                        kernelLayout),
           {layout.kvHeads, splits, lanes},
           {layout.kvHeads, rows * (queryHeads / layout.kvHeads), lanes},
           // The verify stores are row-count generic; only the emitted rows
           // dispatch, not the tree tile's spare capacity row.
-          storeKernel("verify_attention", layout.format, layout),
+          storeKernel(kVerifyAttention, layout.format, layout),
           {uint64_t{lanes} * 2 * liveRows * layout.kvHeads, 1, 1},
           metal::DispatchSize{layout.headDimension, 1, 1},
           metal::DispatchSize{layout.headDimension, 1, 1},
           layout.format,
-          rows, layout.scoreScale};
+          rows, layout.scoreScale, layout.windowTokens};
 }
 
 void PagedAttention::addPrefillProjection(
@@ -305,7 +427,7 @@ void PagedAttention::addPrefillProjection(
     uint32_t queryHeads, kv::Layout layout) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   const bool hasNorms = queryNorm.buffer && keyNorm.buffer;
-  std::string kernel = std::string("prefill_attention_qkv") +
+  std::string kernel = std::string(kPrefillAttentionQkv) +
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
   FullPrefillParams params{.tokens = tokens, .stride = stride};
@@ -325,7 +447,7 @@ void PagedAttention::addPrefillGate(
     uint32_t stride, uint32_t queryHeads, kv::Layout layout, bool queryGate) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   FullPrefillParams params{.tokens = tokens, .stride = stride};
-  graph.add(gateKernel("prefill_attention", queryGate, kernelLayout),
+  graph.add(gateKernel(kPrefillAttention, queryGate, kernelLayout),
             {packed, attention, hidden}, params,
             {elementwiseGroups(uint64_t{tokens} * queryHeads *
                                layout.headDimension),
@@ -341,7 +463,7 @@ void PagedAttention::addPrefillGateSums(
   if (kernelLayoutHeadDim(kernelLayout) != RICHENGINE_KV_HEAD_DIMENSION)
     throw std::invalid_argument("no paged prefill gate sums kernel for layout");
   FullPrefillParams params{.tokens = tokens, .stride = stride};
-  graph.add(gateKernel("prefill_attention", true, kernelLayout, "_sums"),
+  graph.add(gateKernel(kPrefillAttention, true, kernelLayout, "_sums"),
             {packed, attention, hidden, sums}, params,
             {elementwiseGroups(uint64_t{tokens} * queryHeads *
                                layout.headDimension),
@@ -357,7 +479,7 @@ void PagedAttention::addVerifyProjection(
     kv::Layout layout, uint32_t lanes, uint32_t rows) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   const bool hasNorms = queryNorm.buffer && keyNorm.buffer;
-  std::string kernel = std::string("verify_attention_qkv") +
+  std::string kernel = std::string(kVerifyAttentionQkv) +
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
   FullDecodeBatchParams params{.lanes = lanes, .rows = rows};
@@ -378,7 +500,7 @@ PreparedInput PagedAttention::addVerifyGate(
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   FullDecodeBatchParams params{.lanes = lanes, .rows = rows};
   if (input == LinearInput::Plain) {
-    graph.addPatchable(gateKernel("verify_attention", queryGate, kernelLayout),
+    graph.addPatchable(gateKernel(kVerifyAttention, queryGate, kernelLayout),
               {packed, attention, hidden}, params,
               {elementwiseGroups(uint64_t{lanes} * rows * queryHeads *
                                  layout.headDimension),
@@ -388,11 +510,11 @@ PreparedInput PagedAttention::addVerifyGate(
   const uint32_t width = queryHeads * layout.headDimension;
   requireTableScratch(scratch, input, width, lanes * rows);
   const std::string kernel =
-      gateKernel("verify_attention", queryGate, kernelLayout, tableSuffix(input));
+      gateKernel(kVerifyAttention, queryGate, kernelLayout, tableSuffix(input));
   graph.add(kernel,
             {packed, attention, hidden, scratch.input, scratch.sums},
             params,
-            {uint64_t{width} / 64 * lanes * rows / kv::kVerifyRows, 1, 1}, {256, 1, 1});
+            {uint64_t{width} / 64 * lanes * rows / 8, 1, 1}, {256, 1, 1});
   return {hidden, input};
 }
 
@@ -416,9 +538,11 @@ kv::ChunkedPrefillParams PagedAttention::verifyParams(
 }
 
 kv::ChunkedPrefillParams PagedAttention::verifyTreeParams(
-    uint64_t logicalPosition, uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, RICHENGINE_TREE_VERIFY_NODES - 1,
-                       kv::kVerifyChunkStride, pageTableEntries);
+    uint64_t logicalPosition, uint32_t pageTableEntries, uint32_t liveNodes) {
+  return prefillParams(
+      logicalPosition,
+      std::min(liveNodes, RICHENGINE_TREE_VERIFY_NODES),
+      kv::kVerifyChunkStride, pageTableEntries);
 }
 
 void PagedAttention::addPrefillStore(
@@ -434,7 +558,7 @@ void PagedAttention::addPrefillStore(
   chunk.kv = layer;
   if (std::string_view error = kv::chunkedPrefillValidationError(chunk); !error.empty())
     throw std::invalid_argument(std::string(error));
-  graph.add(storeKernel("prefill_attention", layout.format, layout),
+  graph.add(storeKernel(kPrefillAttention, layout.format, layout),
             {chunkKeys, chunkValues, pageTable}, chunk,
             {2 * params.chunk_tokens * layout.kvHeads, 1, 1},
             {layout.headDimension, 1, 1});
@@ -456,9 +580,19 @@ void PagedAttention::addPrefill(
   const RichPrefillAttentionParams attention{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits, plan.scoreScale};
-  graph.addPatchable(plan.splitPipeline,
-            {queries, partials, statistics, pageTable}, attention,
-            plan.splitGroups);
+  // The _swa splits take the window as a constant after the parameters;
+  // every canvas split declares the same trailing constant and ignores it
+  // when its name is windowless.
+  if (plan.splitPipeline.find("_swa_") != std::string::npos ||
+      plan.splitPipeline.find("_canvas") != std::string::npos) {
+    graph.addPatchableTail(plan.splitPipeline,
+              {queries, partials, statistics, pageTable}, attention,
+              plan.windowTokens, plan.splitGroups);
+  } else {
+    graph.addPatchable(plan.splitPipeline,
+              {queries, partials, statistics, pageTable}, attention,
+              plan.splitGroups);
+  }
   graph.addPatchable(plan.reducePipeline,
             {partials, statistics, output}, attention, plan.reduceGroups,
             plan.reduceThreads);
@@ -499,30 +633,41 @@ void PagedAttention::addVerify(
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
   // A tree plan's split kernels bind each lane's ancestor bitmasks after the
-  // page tables; the chain kernels have no such binding.
-  const bool tree = plan.rowCapacity > kv::kVerifyRows;
+  // page tables; the chain kernels have no such binding. The stem names it —
+  // a tree tile's row capacity can equal the chain's row count.
+  const bool tree = plan.splitPipeline.starts_with(kVerifyTreeAttention);
   if (tree && !buffers.treeMasks)
     throw std::invalid_argument("tree verify requires its ancestor masks");
-  graph.addPatchable(plan.splitPipeline,
-            tree ? std::vector<metal::MetalBuffer>{buffers.queries,
-                     buffers.partials, buffers.statistics, tables[0],
-                     tables[1], tables[2], tables[3], buffers.treeMasks}
-                 : std::vector<metal::MetalBuffer>{buffers.queries,
-                     buffers.partials, buffers.statistics, tables[0],
-                     tables[1], tables[2], tables[3]},
-            attention, plan.splitGroups);
+  const auto splitBuffers =
+      tree ? std::vector<metal::MetalBuffer>{buffers.queries,
+               buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3], buffers.treeMasks}
+           : std::vector<metal::MetalBuffer>{buffers.queries,
+               buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3]};
+  // The _swa splits take the window as a constant after the lane parameters.
+  if (plan.splitPipeline.find("_swa_") != std::string::npos) {
+    graph.addPatchableTail(plan.splitPipeline, std::move(splitBuffers),
+                           attention, plan.windowTokens, plan.splitGroups);
+  } else {
+    graph.addPatchable(plan.splitPipeline, std::move(splitBuffers),
+                       attention, plan.splitGroups);
+  }
   // The fused reduce applies the query gate only when the out-projection
   // reads Plain input; a table or packed consumer keeps the separate gate
   // dispatch that writes its operand (addVerifyGate).
   if (gateHidden) {
-    const std::string_view reduceStem =
-        tree ? "verify_tree_attention_reduce" : "verify_attention_reduce";
-    const std::string suffix = std::string(
-        plan.reducePipeline.substr(reduceStem.size()));
+    // plan.reducePipeline's stem is the plan's own; the fused gate keeps
+    // its layout suffix and swaps the stem for the gate variant.
+    const std::string_view pipeline = plan.reducePipeline;
+    const std::string suffix = std::string(pipeline.substr(
+        pipeline.starts_with(kVerifyTreeAttentionReduce)
+            ? kVerifyTreeAttentionReduce.size()
+            : kVerifyAttentionReduce.size()));
     if (gatePacked) {
       const std::string gate =
-          std::string(tree ? "verify_tree_attention_reduce_gate"
-                           : "verify_attention_reduce_gate") +
+          std::string(tree ? kVerifyTreeAttentionReduceGate
+                           : kVerifyAttentionReduceGate) +
           suffix;
       graph.addPatchable(gate,
                 {buffers.partials, buffers.statistics, buffers.output,
@@ -533,7 +678,7 @@ void PagedAttention::addVerify(
       // is written, so the reduce threads bound is the head dimension.
       if (tree)
         throw std::invalid_argument("tree verify has no fused gather");
-      graph.addPatchable("verify_attention_reduce_gather" + suffix,
+      graph.addPatchable(std::string(kVerifyAttentionReduceGather) + suffix,
                 {buffers.partials, buffers.statistics, std::move(gateHidden)},
                 attention, plan.reduceGroups, plan.reduceThreads_);
     }
@@ -561,8 +706,8 @@ void PagedAttention::addVerifyTreeCompact(
     params[lane] = chunks[lane];
     params[lane].kv = layer;
   }
-  std::string kernel = "verify_tree_attention_" +
-                       std::string(formatTag(layout.format)) + "_compact" +
+  std::string kernel = std::string(kVerifyTreeAttention) + "_" +
+                       formatTag(layout.format) + "_compact" +
                        std::string(storageSuffix(layout));
   graph.add(kernel,
             {pageTables[0], pageTables[1], pageTables[2], pageTables[3],

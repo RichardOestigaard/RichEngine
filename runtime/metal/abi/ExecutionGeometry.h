@@ -2,9 +2,9 @@
 
 // C/Metal ABI constants shared by host and shader compilation. Startup
 // static assertions check the corresponding model and operator contracts.
-#define RICHENGINE_DRAFT_QUERY_ROWS 8u
-#define RICHENGINE_DRAFT_PROPOSAL_TOKENS 7u
-#define RICHENGINE_TARGET_VERIFY_ROWS 8u
+#define RICHENGINE_DRAFT_QUERY_ROWS 16u
+#define RICHENGINE_DRAFT_PROPOSAL_TOKENS 15u
+#define RICHENGINE_TARGET_VERIFY_ROWS 16u
 // Nodes of one lane's verify tree in tree-verify mode (docs/TREE_VERIFY_DESIGN.md):
 // the anchor plus the seven-node chain plus the seven second-best sibling
 // leaves emitted by draft_select_tree (rows 8..14, one per proposal
@@ -14,9 +14,12 @@
 #define RICHENGINE_TREE_VERIFY_NODES 16u
 #define RICHENGINE_MAXIMUM_CONTEXT_TOKENS 262144u
 // Verify rows are stored to page slots ahead of acceptance; a tree lane
-// occupies fifteen slots before its path is compacted, so the scratch
-// covers the larger of the chain (8) and tree (15) footprints.
-#define RICHENGINE_SPECULATIVE_SCRATCH_TOKENS (RICHENGINE_TREE_VERIFY_NODES - 1u)
+// occupies TREE_VERIFY_NODES - 1 slots before its path is compacted, so the
+// scratch covers the larger of the chain and tree footprints.
+#define RICHENGINE_SPECULATIVE_SCRATCH_TOKENS                                  \
+  (RICHENGINE_TREE_VERIFY_NODES - 1u > RICHENGINE_TARGET_VERIFY_ROWS           \
+       ? RICHENGINE_TREE_VERIFY_NODES - 1u                                     \
+       : RICHENGINE_TARGET_VERIFY_ROWS)
 #define RICHENGINE_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (RICHENGINE_MAXIMUM_CONTEXT_TOKENS + RICHENGINE_SPECULATIVE_SCRATCH_TOKENS)
 #define RICHENGINE_MAXIMUM_BATCH_WIDTH 4u
@@ -53,6 +56,10 @@
 // Candidates the draft selector keeps per proposal position; acceptance and
 // the sampled draw read them.
 #define RICHENGINE_DRAFT_CANDIDATES 16u
+// The DSpark candidate pool: every slot the shard partials emit, scored by
+// the Markov edge table rather than merged down to the top candidates.
+#define RICHENGINE_DSPARK_POOL                                               \
+  (RICHENGINE_DRAFT_SAMPLING_SHARDS * RICHENGINE_DRAFT_CANDIDATES)
 // The rank of the draft selector's codebooks.
 #define RICHENGINE_DRAFT_SELECTOR_RANK 256u
 // Rows of one value head's recurrent state a prefill GDN scan threadgroup

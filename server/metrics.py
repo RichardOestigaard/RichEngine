@@ -268,7 +268,22 @@ def metrics_dict(result):
             latency["queue_to_start_ms"] = (
                 latency["ttft_ms"] - latency["start_to_first_token_ms"]
             )
-    if (
+    if result.diffusion:
+        # Diffusion canvases emit bursts: the first TokensEvent carries a
+        # whole canvas, so decode_tokens/first_token_to_done would divide
+        # only the tail canvas's tokens by its full denoise. The decode
+        # window instead spans prompt end → done: the last progress
+        # report's timestamp, or generation start when no progress arrived.
+        decode_window = max(
+            0.0,
+            latency.get("start_to_first_token_ms", 0.0)
+            - result.prompt_progress_ms,
+        ) + latency.get("first_token_to_done_ms", 0.0)
+        if result.completion_tokens > 0 and decode_window > 0:
+            rate = result.completion_tokens * 1000.0 / decode_window
+            if math.isfinite(rate):
+                latency["stream_tokens_per_second"] = rate
+    elif (
         result.first_token_batch_tokens > 0
         and decode_tokens > 0
         and latency.get("first_token_to_done_ms", 0) > 0

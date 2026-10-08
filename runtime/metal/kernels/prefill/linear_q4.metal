@@ -169,17 +169,17 @@ inline void q4_prefill_write_output_sums(device const bfloat *output,
 // in and also write the output's Q4 input sums at buffer 7 (UpSiluSums).
 enum class PrefillQ4Epilogue { Plain, Residual, UpSiluSums };
 
-// The 32 x TileN tile of grid position (row tile, column tile). The kernels
+// The TileM x TileN tile of grid position (row tile, column tile). The kernels
 // inline it as their bodies: when prefill_linear_q4_n256_up_silu_sums only
 // calls it, shader validation on macOS 26.5 (an M5 Pro) gets its output wrong.
-template <ushort TileN, ushort Simdgroups, PrefillQ4Epilogue Epilogue>
+template <ushort TileM, ushort TileN, ushort Simdgroups,
+          PrefillQ4Epilogue Epilogue>
 __attribute__((always_inline)) inline void
 q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
            device bfloat *biases, device bfloat *auxiliary,
            device bfloat *output, device const float *sums,
            device float *output_sums, constant Q4Params &params, uint2 group,
            uint simd_lane, uint simd_group, threadgroup float *input_sums) {
-  constexpr ushort TileM = 32;
   constexpr bool UpSiluSums = Epilogue == PrefillQ4Epilogue::UpSiluSums;
   const ulong input_offset = ulong(group.x) * TileM * params.input_size;
   const ulong output_offset = ulong(group.x) * TileM * params.output_size;
@@ -219,7 +219,7 @@ q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
 // from device memory.
 #define PREFILL_Q4_INPUT_SUMS_8 threadgroup float input_sums[32 * PrefillSumBatch]
 #define PREFILL_Q4_INPUT_SUMS_4 threadgroup float *const input_sums = nullptr
-#define PREFILL_Q4(Name, TileN, Simdgroups, Epilogue)                          \
+#define PREFILL_Q4_M(Name, TileM, TileN, Simdgroups, Epilogue)                 \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
@@ -229,10 +229,12 @@ q4_prefill(device bfloat *input, device uchar *weights, device bfloat *scales,
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     PREFILL_Q4_INPUT_SUMS_##Simdgroups;                                        \
-    q4_prefill<TileN, Simdgroups, PrefillQ4Epilogue::Epilogue>(                \
+    q4_prefill<TileM, TileN, Simdgroups, PrefillQ4Epilogue::Epilogue>(         \
         input, weights, scales, biases, PREFILL_Q4_ARGUMENTS_##Epilogue,       \
         params, group, simd_lane, simd_group, input_sums);                     \
   }
+#define PREFILL_Q4(Name, TileN, Simdgroups, Epilogue)                          \
+  PREFILL_Q4_M(Name, 32, TileN, Simdgroups, Epilogue)
 PREFILL_Q4(prefill_linear_q4_n128, 128, 8, Plain)
 PREFILL_Q4(prefill_linear_q4_n256, 256, 8, Plain)
 PREFILL_Q4(prefill_linear_q4_n128_residual, 128, 8, Residual)
@@ -241,7 +243,6 @@ PREFILL_Q4(prefill_linear_q4_n256_up_silu_sums, 256, 8, UpSiluSums)
 PREFILL_Q4(prefill_linear_q4_n128_sg4, 128, 4, Plain)
 PREFILL_Q4(prefill_linear_q4_n128_residual_sg4, 128, 4, Residual)
 PREFILL_Q4(prefill_linear_q4_n128_up_silu_sums_sg4, 128, 4, UpSiluSums)
-
 // The parameters (a scale, a bias and 64 weights per column and group) that
 // a view of the leading input_size inputs of rows of plane_input_size leaves
 // unread in the 256-column tiles before the one holding `column`.
@@ -271,7 +272,7 @@ inline ulong q4_unread_parameters(constant Q4PrefillLeadingParams &params,
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     PREFILL_Q4_INPUT_SUMS_##Simdgroups;                                        \
     const ulong unread = q4_unread_parameters(params, group.y * TileN);        \
-    q4_prefill<TileN, Simdgroups, PrefillQ4Epilogue::Residual>(                \
+    q4_prefill<32, TileN, Simdgroups, PrefillQ4Epilogue::Residual>(            \
         input, weights + unread * 64 / 2, scales + unread, biases + unread,    \
         residual, output, sums, nullptr, params.matrix, group, simd_lane,      \
         simd_group, input_sums);                                               \

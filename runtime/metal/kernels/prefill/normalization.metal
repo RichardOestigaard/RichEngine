@@ -3,7 +3,7 @@
 
 // The norm for an affine prefill projection, which reads the Q4 input sums of
 // its rows: its weights are bf16, since F32 norms come only from GGUF targets,
-// whose block projections read no sums (QwenTarget::addPrefillNorm).
+// whose block projections read no sums (TargetModel::addPrefillNorm).
 inline void norm_rms_sums32(device const bfloat *input, device const bfloat *weight,
                             device bfloat *output, device float *sums,
                             uint width, uint row, uint thread_index, uint lane,

@@ -1,5 +1,5 @@
 #include "Qwen3_6Moe.hpp"
-#include "model/QwenTargetLoader.hpp"
+#include "model/TargetLoader.hpp"
 
 #include <utility>
 
@@ -44,8 +44,8 @@ void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLa
 
 Qwen3_6MoeWeights
 loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
-                      const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
-  return loadQwenTarget<Qwen3_6MoeWeights>(
+                      const TargetFiles<Qwen3_6MoeLayout> &files) {
+  return loadTargetWeights<Qwen3_6MoeWeights>(
       backend, layout, files, [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const auto &format) {
         readFfn(file, layer, layout, format);
       });

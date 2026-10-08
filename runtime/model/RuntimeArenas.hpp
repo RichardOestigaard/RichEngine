@@ -4,7 +4,7 @@
 
 #include "model/DFlashDraft.hpp"
 #include "model/ModelFactory.hpp"
-#include "model/QwenTarget.hpp"
+#include "model/TargetModel.hpp"
 
 #include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
@@ -36,14 +36,14 @@ inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
 struct RuntimeGeometry final {
-  QwenTargetGeometry target;
+  TargetModelGeometry target;
   DFlashDraftLayout draft;
 
   [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package,
                                             kv::Format format) {
     RuntimeGeometry result;
     result.target = std::visit(
-        [](const auto &weights) { return qwenTargetGeometry(weights); },
+        [](const auto &weights) { return targetModelGeometry(weights); },
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = std::visit(
@@ -119,6 +119,14 @@ enum class PrefillTensor : uint32_t {
   ContextKv,
   DraftRopeCos,
   DraftRopeSin,
+  // The alternate-geometry (Gemma global) layers' rope tables and inverse
+  // frequencies; zero-sized on single-geometry targets.
+  TargetInverseFrequencies2,
+  RopeCosAlt,
+  RopeSinAlt,
+  // The zeroed hidden-width rows Gemma's routed MoE combine adds to;
+  // memset once at arena creation.
+  ZeroResidual,
   ChunkKeys,
   ChunkValues,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
@@ -212,9 +220,23 @@ public:
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());
     }
+    // The dual-geometry target's alternate (Gemma global) frequencies.
+    // Proportional rope derives its inverse frequencies over the full head
+    // dimension, not the rotated-pair count: base^(-2i/headDim).
+    if (const metal::MetalBuffer alt =
+            get(PrefillTensor::TargetInverseFrequencies2)) {
+      auto *frequencies = static_cast<float *>(alt.contents());
+      for (uint32_t dim = 0; dim < geometry.target.altRotaryPairs; ++dim)
+        frequencies[dim] =
+            std::pow(geometry.target.altRotaryTheta,
+                     -2.0F * static_cast<float>(dim) /
+                         geometry.target.altHeadDimension);
+    }
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
+    if (const metal::MetalBuffer zero = get(PrefillTensor::ZeroResidual))
+      std::memset(zero.contents(), 0, zero.sizeBytes());
   }
 
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
@@ -321,6 +343,13 @@ enum class DecodeTensor : uint32_t {
   RetainedPath,
   TreeSelected,
   CapturedPath,
+  // The alternate-geometry layers' rope tables (Gemma's globals).
+  RopeCosAlt,
+  RopeSinAlt,
+  // Gemma's per-lane post-attention residual and the zeroed rows its routed
+  // MoE combine adds to (memset once at arena creation).
+  GemmaResidual,
+  ZeroResidual,
   PageTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
@@ -398,6 +427,10 @@ public:
     const metal::MetalBuffer arrivals =
         packed(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
+    // Gemma's MoE combine residual: zeroed once at arena creation.
+    if (const metal::MetalBuffer zero =
+            packed(DecodeTensor::ZeroResidual, kLaneCount))
+      std::memset(zero.contents(), 0, zero.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
     if (denseScratchBytes) {

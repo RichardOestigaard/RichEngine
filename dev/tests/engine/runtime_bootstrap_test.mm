@@ -212,7 +212,7 @@ void testSourceModelSelectsDenseFamilyByLayers() {
     std::filesystem::path path_;
   } root;
   root.write("model.json",
-             R"({"version":1,"model":"Ornith-1.5-9B","target_format":"mlx-affine","vision_format":"none"})");
+             R"({"version":1,"model":"Ornith-1.5-9B","family":"Ornith-1.5-9B","target_format":"mlx-affine","vision_format":"none"})");
   root.write("config.json",
              R"({"text_config":{"model_type":"qwen3_5_text","hidden_size":4096,"num_hidden_layers":32,"vocab_size":248320,"max_position_embeddings":262144,"num_attention_heads":16,"num_key_value_heads":4,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":32,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"full_attention_interval":4,"rms_norm_eps":1e-06,"intermediate_size":12288,"attention_bias":false,"attn_output_gate":true,"tie_word_embeddings":false,"hidden_act":"silu","rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"rope_type":"default"},"layer_types":["linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"]}})");
   root.write("draft/config.json",
@@ -232,7 +232,9 @@ void testSourceModelSelectsDenseFamilyByLayers() {
     throw std::runtime_error("a wrong capture layer was accepted");
   } catch (const std::invalid_argument &) {
   }
-  // The 27B's own layer count still selects its layout.
+  // The record's family names the model; the 27B's assembly records its own.
+  root.write("model.json",
+             R"({"version":1,"model":"Qwen3.8-27B","family":"Qwen3.8-27B","target_format":"mlx-affine","vision_format":"none"})");
   root.write("config.json",
              R"({"text_config":{"model_type":"qwen3_5_text","hidden_size":5120,"num_hidden_layers":64,"vocab_size":248320,"max_position_embeddings":262144,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"full_attention_interval":4,"rms_norm_eps":1e-06,"intermediate_size":17408,"attention_bias":false,"attn_output_gate":true,"tie_word_embeddings":false,"hidden_act":"silu","rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"rope_type":"default"},"layer_types":["linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"]}})");
   root.write("draft/config.json",
@@ -240,13 +242,29 @@ void testSourceModelSelectsDenseFamilyByLayers() {
   require(std::holds_alternative<model::Qwen3_8Layout>(
               model::inspectModelPackage(root.path()).target),
           "a 27B source assembly did not select the 27B layout");
+  // A family the installer never resolved, and a config contradicting its
+  // family's model type, are refused.
+  root.write("model.json",
+             R"({"version":1,"model":"x","family":"Future-9B","target_format":"mlx-affine","vision_format":"none"})");
+  try {
+    static_cast<void>(model::inspectModelPackage(root.path()));
+    throw std::runtime_error("an unrecorded family was accepted");
+  } catch (const std::invalid_argument &) {
+  }
+  root.write("model.json",
+             R"({"version":1,"model":"x","family":"MiniCPM5-2B","target_format":"mlx-affine","vision_format":"none"})");
+  try {
+    static_cast<void>(model::inspectModelPackage(root.path()));
+    throw std::runtime_error("a config contradicting its family was accepted");
+  } catch (const std::invalid_argument &) {
+  }
 }
 
 // What an installed Qwen3.8-27B assembly records: model.json, the MLX
 // target's config.json and the DFlash2 draft's config.json.
 struct SourceModel final {
   std::string record =
-      R"({"version":1,"model":"Qwen3.8-27B","target_format":"mlx-affine","vision_format":"none"})";
+      R"({"version":1,"model":"Qwen3.8-27B","family":"Qwen3.8-27B","target_format":"mlx-affine","vision_format":"none"})";
   std::string config =
       R"({"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":5120,)"
       R"("num_hidden_layers":64,"vocab_size":248320,"max_position_embeddings":262144,)"
