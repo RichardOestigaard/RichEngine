@@ -1656,7 +1656,7 @@ void Engine::apply(const BatchPlan &plan,
           [&](uint32_t token) { return token >= config_.vocabularySize; });
       if (outOfVocabulary != result.outputTokens.end()) {
         // A model that emits a token outside the vocabulary without reporting
-        // it fails this lane the same way (the Qwen runtime reports its
+        // it fails this lane the same way (the runtime reports its
         // non-finite rows itself).
         active.pendingEnd =
             LaneEnd{LaneOutcome::ModelResultInvalid,

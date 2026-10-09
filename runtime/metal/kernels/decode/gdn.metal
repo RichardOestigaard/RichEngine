@@ -483,9 +483,11 @@ inline void gdn_commit_tree_batch_phase(
                        : batch == 2 ? next_2
                                     : next_3;
   // The arena's GDN tensors hold RICHENGINE_TARGET_VERIFY_ROWS-row units per
-  // lane slot; a tree lane's Rows rows occupy the units 2*batch, 2*batch+1.
+  // lane slot; a tree lane's Rows rows occupy Nodes/Verify units from
+  // batch * Nodes/Verify.
   const ulong rows =
-      (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch * 2) *
+      (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH +
+       batch * (RICHENGINE_TREE_VERIFY_NODES / RICHENGINE_TARGET_VERIFY_ROWS)) *
       RICHENGINE_TARGET_VERIFY_ROWS;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
@@ -786,7 +788,7 @@ inline void gdn_decode_tree_scan(
     device const float *state_in, device float *state_out,
     threadgroup GdnDecodeShared<HeadDim, RICHENGINE_TREE_VERIFY_NODES> &shared,
     uint count, uint value_head, uint lane, uint simd_group) {
-  constexpr uint ChainRows = RICHENGINE_TARGET_VERIFY_ROWS;
+  constexpr uint ChainRows = RICHENGINE_TREE_VERIFY_NODES / 2;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -837,7 +839,7 @@ inline void gdn_decode_tree_scan(
     for (uint token = 0; token < ChainRows; ++token) {
       advance(state, token);
       const uint leaf = ChainRows + token;
-      if (token + 1 < ChainRows && leaf < count) {
+      if (leaf < count) {
         float branch[RowsInFlight][4];
         for (uint r = 0; r < RowsInFlight; ++r)
           for (uint i = 0; i < 4; ++i)

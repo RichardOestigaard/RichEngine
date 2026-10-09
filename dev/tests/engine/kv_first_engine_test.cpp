@@ -26,7 +26,7 @@ class State final : public CompositeState {
 public:
   State() = default;
   // A lane's snapshot: once the cache lets go of it, its buffers return to
-  // the model's pool, as QwenStateStorage's do.
+  // the model's pool, as CompositeStateStorage's do.
   explicit State(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
   ~State() override {
     if (pool_)

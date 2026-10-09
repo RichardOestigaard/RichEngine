@@ -12,7 +12,7 @@ namespace {
 // alone), no per-head norms, output projection.
 template <class Format>
 MixerWeights readGraniteAttention(WeightFile &file, const Format &format,
-                                      const QwenMixerGeometry &geometry) {
+                                      const MixerGeometry &geometry) {
   AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
@@ -58,7 +58,7 @@ void requireGraniteLayout(const GraniteLayout &layout) {
 template <class Format>
 MixerWeights readTargetMixer(const GraniteLayout &, WeightFile &file,
                                  const Format &format,
-                                 const QwenMixerGeometry &geometry, bool) {
+                                 const MixerGeometry &geometry, bool) {
   return readGraniteAttention(file, format, geometry);
 }
 

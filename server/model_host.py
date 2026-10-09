@@ -194,13 +194,45 @@ class ModelHost:
         native_fields["assembly_dir"] = str(assembly_dir)
         native_args = argparse.Namespace(**native_fields)
         # The canvas profile reaches the engine through the environment; an
-        # explicit RICHENGINE_CANVAS_PROFILE wins over the flag.
-        os.environ.setdefault("RICHENGINE_CANVAS_PROFILE", self.args.canvas_profile)
+        # explicit RICHENGINE_CANVAS_PROFILE wins over the flag, and both win
+        # over autotune below. Only a non-default choice is exported — the
+        # "paper" default would shadow a tuned profile forever.
+        if self.args.canvas_profile != "paper":
+            os.environ.setdefault(
+                "RICHENGINE_CANVAS_PROFILE", self.args.canvas_profile
+            )
+        # Autotune's per-chip knob winners (install/autotune.py's sweep) reach
+        # the engine as environment at spawn; any variable the user set wins.
+        # A record made on another engine build is stale and ignored.
+        from install import autotune
+
+        binary = Path(self.args.binary)
+        note = autotune.tuning_note(assembly_dir, binary=binary)
+        if note:
+            print_status(f"Autotune · {note}")
+        tuned = autotune.load_tuning(assembly_dir, binary=binary)
+        if tuned:
+            overridden = sorted(name for name in tuned if name in os.environ)
+            applied = sorted(
+                f"{name.removeprefix('RICHENGINE_')}={tuned[name]}"
+                for name in tuned
+                if name not in os.environ
+            )
+            print_status(
+                "Autotune · "
+                + (", ".join(applied) if applied else "all overridden")
+                + (
+                    f" · your env keeps {', '.join(overridden)}"
+                    if overridden
+                    else ""
+                )
+            )
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(native_args),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=self.args.queue_size,
             eager_start=False,
+            env=autotune.tuned_environment(assembly_dir, binary=binary),
         )
         # The packed manifest names diffusion targets (packed-only families
         # install as packages; an assembly has no manifest); their canvas

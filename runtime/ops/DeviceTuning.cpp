@@ -132,6 +132,13 @@ constexpr MeasuredLinear kMeasuredDecode[] = {
      {LinearTile::Paired256, 49, LinearSimdgroups::Four, 1}},  // +8.9%
     {kApple10Plus, {12544, 4096}, 16, LinearEpilogue::None,
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +6.7%
+    // The 16-simdgroup N256 tile wins on the narrow-N FFN shapes at 64 rows
+    // but wastes registers where the column count already fills the grid;
+    // the plain N128 tile measured better on both wide-N drafts heads.
+    {kApple10Plus, {12544, 4096}, 64, LinearEpilogue::None,
+     {LinearTile::N128, 98, LinearSimdgroups::Eight, 1}},      // +9.6%
+    {kApple10Plus, {248320, 4096}, 64, LinearEpilogue::None,
+     {LinearTile::N128, 1940, LinearSimdgroups::Eight, 1}},    // +4.6%
     // LFM2.5 shapes (the 2.6B target and both DSpark drafts).
     {kApple10Plus, {6144, 2048}, 32, LinearEpilogue::GateUp,
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +9.9%

@@ -6,6 +6,7 @@
 // can be judged by what it costs.
 #include "engine/memory/MemoryGovernor.hpp"
 #include "engine/memory/MemoryPlan.hpp"
+#include "engine/wire/Json.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "tuning/LinearTuning.hpp"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <csignal>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <algorithm>
@@ -37,11 +39,12 @@ using namespace richengine::ops::tuning;
 
 constexpr std::string_view kUsage =
     "usage: tune-kernels METALLIB MODEL_ROOT [--seconds PER_KEY] [--pairs N]\n"
-    "                    [--candidates]\n"
+    "                    [--candidates] [--json FILE]\n"
     "  --seconds  wall budget per operator key (default 10)\n"
     "  --pairs    paired samples per candidate, 12..64 (default 12)\n"
     "  --candidates  after each Linear key, list every timed candidate with its\n"
-    "             median GPU/wall gain over the default, best first\n";
+    "             median GPU/wall gain over the default, best first\n"
+    "  --json     write a machine-readable report of every key's outcome\n";
 
 volatile std::sig_atomic_t interrupted = 0;
 void stopSignal(int) { interrupted = 1; }
@@ -49,6 +52,7 @@ void stopSignal(int) { interrupted = 1; }
 struct Options final {
   MeasurementOptions measurement;
   bool candidates = false;
+  std::string jsonPath;
 };
 
 double positiveNumber(std::string_view value, std::string_view option) {
@@ -82,6 +86,8 @@ Options parse(int argc, char **argv) {
       options.measurement.samplePairs = pairCount(argv[++i], option);
     } else if (option == "--candidates") {
       options.candidates = true;
+    } else if (option == "--json" && hasValue) {
+      options.jsonPath = argv[++i];
     } else {
       throw std::invalid_argument("unknown option or missing value: " + std::string(option) +
                                   "\n" + std::string(kUsage));
@@ -131,6 +137,7 @@ std::string_view name(LinearSimdgroups groups) {
   switch (groups) {
     ENUMERATOR_NAME(LinearSimdgroups::Four);
     ENUMERATOR_NAME(LinearSimdgroups::Eight);
+    ENUMERATOR_NAME(LinearSimdgroups::Sixteen);
   }
   unnamed();
 }
@@ -192,6 +199,57 @@ void outcome(const std::string &workload, bool complete, bool changed,
     std::cout << "default kept";
   }
   std::cout << '\n';
+}
+
+// One key's outcome for the --json report: what ran, what won, and the
+// paired evidence behind it — the same facts the console line prints.
+struct KeyReport final {
+  std::string workload;
+  std::string baseline;
+  std::string winner;
+  bool complete = false;
+  bool changed = false;
+  double gpuGain = 0;
+  double wallGain = 0;
+  size_t pairs = 0;
+  std::string failure;
+};
+
+void writeJsonReport(const std::string &path, const Options &options,
+                     const std::string &deviceName, uint32_t gpuFamily,
+                     const std::string &modelName,
+                     const std::vector<KeyReport> &keys, bool wasInterrupted) {
+  std::ostringstream out;
+  out << "{\n  \"schema\": 1,\n  \"device\": " << json::quote(deviceName)
+      << ",\n  \"apple_gpu_family\": " << gpuFamily
+      << ",\n  \"build_id\": " << json::quote(RICHENGINE_BUILD_ID)
+      << ",\n  \"model\": " << json::quote(modelName)
+      << ",\n  \"pairs_per_candidate\": " << options.measurement.samplePairs
+      << ",\n  \"seconds_per_key\": " << options.measurement.maximumWallSeconds
+      << ",\n  \"interrupted\": " << (wasInterrupted ? "true" : "false")
+      << ",\n  \"keys\": [";
+  for (size_t index = 0; index < keys.size(); ++index) {
+    const KeyReport &key = keys[index];
+    out << (index ? ",\n   " : "\n   ")
+        << "{\"workload\": " << json::quote(key.workload)
+        << ", \"baseline\": " << json::quote(key.baseline)
+        << ", \"winner\": " << json::quote(key.winner)
+        << ", \"changed\": " << (key.changed ? "true" : "false")
+        << ", \"complete\": " << (key.complete ? "true" : "false");
+    if (key.complete) {
+      out << ", \"gpu_gain\": " << key.gpuGain
+          << ", \"wall_gain\": " << key.wallGain
+          << ", \"pairs\": " << key.pairs;
+    }
+    if (!key.failure.empty())
+      out << ", \"failure\": " << json::quote(key.failure);
+    out << "}";
+  }
+  out << "\n  ]\n}\n";
+  std::ofstream file(path, std::ios::trunc);
+  if (!file) throw std::runtime_error("cannot write " + path);
+  file << out.str();
+  if (!file) throw std::runtime_error("failed writing " + path);
 }
 
 } // namespace
@@ -256,6 +314,7 @@ int main(int argc, char **argv) {
                      "only the draft's projections are measured\n";
       std::cout << '\n';
 
+      std::vector<KeyReport> reports;
       for (const auto &input : workloads) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
@@ -266,6 +325,24 @@ int main(int argc, char **argv) {
                 describe(result.configuration),
                 evidence(result.measurements, candidateOf(plans, result.configuration)),
                 result.failure);
+        KeyReport &row = reports.emplace_back();
+        row.workload = describe(input.workload);
+        row.baseline = describe(baseline);
+        row.winner = describe(result.configuration);
+        row.complete = result.complete;
+        row.changed = didChange;
+        if (const auto winner = candidateOf(plans, result.configuration))
+          for (const auto &m : result.measurements)
+            if (m.candidate == *winner && m.status == MeasurementStatus::Completed) {
+              row.gpuGain = m.gpuAssessment.medianPairedGain;
+              row.wallGain = m.wallAssessment.medianPairedGain;
+              row.pairs = m.pairCount;
+            }
+        if (result.failure) {
+          try { std::rethrow_exception(result.failure); }
+          catch (const std::exception &error) { row.failure = error.what(); }
+          catch (...) { row.failure = "unknown"; }
+        }
         if (options.candidates) {
           // Every candidate's own paired evidence against the default, so a
           // policy rule can be judged by what it costs, not only by who won.
@@ -296,6 +373,10 @@ int main(int argc, char **argv) {
       std::cout << "\nmeasured " << measured << " keys: " << changed << " changed, "
                 << incomplete << " incomplete, " << failed << " failed"
                 << (interrupted ? ", interrupted" : "") << '\n';
+      if (!options.jsonPath.empty())
+        writeJsonReport(options.jsonPath, options, device.deviceName,
+                        device.appleGpuFamily, package->name(), reports,
+                        interrupted != 0);
       return failed || interrupted ? 1 : 0;
     } catch (const std::exception &error) {
       std::cerr << "tune-kernels: " << error.what() << '\n';

@@ -39,4 +39,6 @@ for value in 0 1x nan inf ''; do
 done
 reject "$sentinel" --seconds 0.25 --pairs 64 --candidates --sentinel
 reject "$sentinel" --seconds 1e2 --pairs 12 --sentinel
+reject "$sentinel" --json "$work/report.json" --sentinel
+reject 'unknown option or missing value: --json' --json
 echo 'tune-kernels CLI validation: PASS'

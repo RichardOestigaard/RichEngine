@@ -78,7 +78,7 @@ struct Lfm2Layout final {
     return {layers - attentionLayerCount(), convolutionTaps - 1,
             convolutionDimension, 0, 0, 0};
   }
-  [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
+  [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
             attentionWidth, attentionHeadDimension, convolutionTaps};

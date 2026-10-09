@@ -16,7 +16,7 @@ constexpr uint64_t kBfloat16 = kBFloat16Bytes;
 // the output projection.
 template <class Format>
 MixerWeights readLfmAttention(WeightFile &file, const Format &format,
-                                const QwenMixerGeometry &geometry) {
+                                const MixerGeometry &geometry) {
   AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
@@ -34,7 +34,7 @@ MixerWeights readLfmAttention(WeightFile &file, const Format &format,
 // tensor, packed and MLX images alike.
 template <class Format>
 MixerWeights readLfmConv(WeightFile &file, const Format &format,
-                             const QwenMixerGeometry &geometry) {
+                             const MixerGeometry &geometry) {
   LfmConvWeights conv;
   conv.inputProjection = format.projection(file, geometry.packedGdnWidth,
                                            geometry.hiddenSize, "conv-input");
@@ -141,7 +141,7 @@ void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
 template <class Format>
 MixerWeights readTargetMixer(const Lfm2MoeLayout &, WeightFile &file,
                                  const Format &format,
-                                 const QwenMixerGeometry &geometry,
+                                 const MixerGeometry &geometry,
                                  bool fullAttention) {
   if (fullAttention) return readLfmAttention(file, format, geometry);
   return readLfmConv(file, format, geometry);

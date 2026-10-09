@@ -1265,6 +1265,15 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
       target);
+  // Tree-verify default follows the draft kind a family picked: a Null
+  // draft's only proposer is the n-gram predraft, whose alternates rescue
+  // draft-free lanes cheaply, so its comb trees default on; the GPU drafts
+  // stay env opt-in — a measured DFlash/DSpark comb verify costs more than
+  // its leaves rescue under a 16-row stride. A maker that wants Off (or to
+  // force On) edits result.tuning after this call.
+  result.tuning.treeVerify = draft.kind == DraftKind::Null
+                                 ? ModelTuning::TreeVerify::On
+                                 : ModelTuning::TreeVerify::OptIn;
   return result;
 }
 

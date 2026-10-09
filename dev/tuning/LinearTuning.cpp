@@ -193,7 +193,9 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
     for (uint32_t splits = 2;
          splits <= LinearConfig::kMaximumSplits && splits <= w.matrix.inputSize / 256; splits *= 2)
       append({LinearTile::Split128, 0, LinearSimdgroups::Eight, splits});
-  if (w.rows == RICHENGINE_TARGET_VERIFY_ROWS && w.epilogue == LinearEpilogue::None)
+  // The paired N256 kernel covers one eight-row tile — no 16-row instance —
+  // so it is only a candidate on the synthetic single-tile workload.
+  if (w.rows == 8 && w.epilogue == LinearEpilogue::None)
     append({LinearTile::Paired256, columns / 256, LinearSimdgroups::Four});
   return result;
 }

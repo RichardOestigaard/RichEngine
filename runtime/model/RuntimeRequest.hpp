@@ -8,7 +8,7 @@
 
 #include "model/NgramIndex.hpp"
 #include "model/Runtime.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/MetalBackend.hpp"
@@ -192,7 +192,7 @@ inline StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult
 // Any unassigned lane works: its buffers come from the storage's pool, and
 // the governor is asked only for what the pool lacks.
 template <class Activate>
-inline StateAdmission admitIdleLane(const QwenStateStorage &states,
+inline StateAdmission admitIdleLane(const CompositeStateStorage &states,
                              Activate activate) {
   for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
     if (!states.metadata(lane).assigned())

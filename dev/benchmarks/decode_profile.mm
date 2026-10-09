@@ -16,7 +16,7 @@
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
 #include "engine/memory/MemoryGovernor.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
         if (!pages.allocateExtent(extent))
           throw std::runtime_error("could not allocate the KV extents");
       }
-      model::QwenStateStorage states(backend,
+      model::CompositeStateStorage states(backend,
                                       governor.allocationAdmission(),
                                       model.stateLayout(), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};

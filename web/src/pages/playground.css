@@ -49,6 +49,48 @@
   text-transform: uppercase;
 }
 
+/* One-line explanation at the top of each tab. */
+.pg-lede {
+  margin: -8px 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* Explanatory line under a field label. */
+.playground .hint {
+  margin: -4px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* Inline per-field validation. */
+.playground .field-error {
+  margin: 6px 0 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+.pg-input[aria-invalid="true"], .pg-area[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+.params-error { padding: 0 16px 8px }
+
+/* Params row: each control carries its own label above it. */
+.panel-row.params .param { display: flex; align-items: center; gap: 7px }
+.panel-row.params .param.grow { flex: 1; min-width: 120px }
+.panel-row.params .param.grow .pg-input { flex: 1; min-width: 0 }
+
+/* Brief highlight when a fresh result scrolls into view. */
+@keyframes pg-flash {
+  from { background: color-mix(in srgb, var(--accent) 10%, transparent) }
+  to { background: transparent }
+}
+.playground .flash { animation: pg-flash .9s ease-out }
+
+.meta-line { font-variant-numeric: tabular-nums }
+
 .pg-input {
   padding: 5px 10px;
   border: 1px solid var(--border);

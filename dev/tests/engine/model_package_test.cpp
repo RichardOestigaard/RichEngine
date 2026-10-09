@@ -564,7 +564,7 @@ void testSyntheticPackage(MetalBackend &backend,
     uint64_t actualTrackedBytes = 0;
     {
         ModelDescriptor descriptor =
-            makeModelDescriptor("Qwen dense loader oracle", target, draft, vision);
+            makeModelDescriptor("dense loader oracle", target, draft, vision);
         descriptor.sourceIdentity = "sources";
         auto package = loadModelPackage(backend, root, descriptor);
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);

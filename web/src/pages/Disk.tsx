@@ -1,6 +1,7 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api, apiPost, errorText } from "../api";
 import Confirm from "../Confirm";
+import { useCopied } from "../clipboard";
 import { fmtBytes, fmtInt } from "../format";
 import { poll } from "../poll";
 import { pushToast } from "../toast";
@@ -69,7 +70,10 @@ export default function Disk() {
   const [freeBytes, setFreeBytes] = createSignal<number | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [loadError, setLoadError] = createSignal<string | null>(null);
-  const [busy, setBusy] = createSignal(false);
+  /* Which long action is running — scan, wipe or apply. Only that control
+     shows a busy label; the rest just disable. */
+  const [busy, setBusy] = createSignal<null | "scan" | "wipe" | "apply">(null);
+  const { copied, copy } = useCopied();
   const [diskStatus, setDiskStatus] = createSignal<StatusDisk | null>(null);
   const [variants, setVariants] = createSignal(false);
   const [dedupe, setDedupe] = createSignal<DedupePreview | null>(null);
@@ -114,6 +118,9 @@ export default function Disk() {
   };
   const modelCount = () =>
     stores()?.reduce((sum, store) => sum + (store.models?.length ?? 0), 0) ?? 0;
+  /* Models surviving the search filter, across all stores. */
+  const matchCount = () =>
+    (stores() ?? []).reduce((sum, store) => sum + viewModels(store).length, 0);
 
   /* Models shown inside a store after the search filter and sort apply. */
   const viewModels = (store: Store) => {
@@ -138,7 +145,7 @@ export default function Disk() {
 
   async function runWipe(body: Record<string, unknown>, done: (bytes: number | null) => string) {
     if (busy()) return;
-    setBusy(true);
+    setBusy("wipe");
     try {
       const result = await apiPost<WipeResult>("/v1/disk/wipe", { ...body, confirm: true });
       pushToast("ok", done(result.bytes ?? null));
@@ -148,7 +155,7 @@ export default function Disk() {
     } catch (error) {
       pushToast("error", errorText(error));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
@@ -160,12 +167,12 @@ export default function Disk() {
     if (target.kind === "store") {
       void runWipe(
         { store: target.store.name },
-        (bytes) => `Wiped ${target.store.title}: freed ${fmtBytes(bytes)}.`
+        (bytes) => `Deleted ${target.store.title}: freed ${fmtBytes(bytes)}.`
       );
     } else if (target.kind === "model") {
       void runWipe(
         { store: target.store.name, model: target.model.name },
-        (bytes) => `Wiped ${target.model.name} from ${target.store.title}: freed ${fmtBytes(bytes)}.`
+        (bytes) => `Deleted ${target.model.name} from ${target.store.title}: freed ${fmtBytes(bytes)}.`
       );
     } else {
       void applyDedupe(target.preview);
@@ -175,16 +182,16 @@ export default function Disk() {
   const confirmTitle = () => {
     const target = confirm();
     if (!target) return "";
-    if (target.kind === "store") return `Wipe ${target.store.title}?`;
-    if (target.kind === "model") return `Wipe ${target.model.name}?`;
+    if (target.kind === "store") return `Delete ${target.store.title}?`;
+    if (target.kind === "model") return `Delete ${target.model.name}?`;
     return "Remove duplicates?";
   };
 
   const confirmLabel = () => {
     const target = confirm();
     if (!target) return "Confirm";
-    if (target.kind === "store") return "Wipe store";
-    if (target.kind === "model") return "Wipe";
+    if (target.kind === "store") return "Delete store";
+    if (target.kind === "model") return "Delete";
     return `Reclaim ${fmtBytes(target.preview.reclaimable ?? null)}`;
   };
 
@@ -195,8 +202,12 @@ export default function Disk() {
       return `This permanently deletes every model file in ${target.store.title} — ${fmtBytes(target.store.bytes)} reclaimed. This cannot be undone.`;
     if (target.kind === "model")
       return `This permanently deletes ${target.model.name} from ${target.store.title} — ${fmtBytes(target.model.bytes)} reclaimed. This cannot be undone.`;
+    /* Weak matches are skipped by apply — don't count them as deletions. */
     const dupes =
-      target.preview.groups?.reduce((n, g) => n + (g.remove?.length ?? 0), 0) ?? 0;
+      target.preview.groups?.reduce(
+        (n, g) => n + (g.remove?.filter((e) => !e.weak).length ?? 0),
+        0
+      ) ?? 0;
     return `This permanently deletes ${fmtInt(dupes)} duplicate ${
       dupes === 1 ? "copy" : "copies"
     } marked "remove" across the stores — one copy of each model is kept. ${fmtBytes(
@@ -206,7 +217,7 @@ export default function Disk() {
 
   async function scanDedupe() {
     if (busy()) return;
-    setBusy(true);
+    setBusy("scan");
     setDedupe(null);
     try {
       const data = await apiPost<DedupePreview>("/v1/disk/dedupe", {
@@ -217,13 +228,13 @@ export default function Disk() {
     } catch (error) {
       pushToast("error", errorText(error));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
   async function applyDedupe(preview: DedupePreview) {
     if (busy()) return;
-    setBusy(true);
+    setBusy("apply");
     try {
       const result = await apiPost<DedupeApply>("/v1/disk/dedupe", {
         variants: variants(),
@@ -241,7 +252,7 @@ export default function Disk() {
     } catch (error) {
       pushToast("error", errorText(error));
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
@@ -273,12 +284,12 @@ export default function Disk() {
           <div class="card-value">
             {stores() === null ? "—" : `${existingCount()} / ${totalCount()}`}
           </div>
-          <div class="card-sub">with model files</div>
+          <div class="card-sub">found / configured</div>
         </div>
         <div class="card">
           <div class="card-label">Models</div>
           <div class="card-value">{stores() === null ? "—" : fmtInt(modelCount())}</div>
-          <div class="card-sub">entries across stores</div>
+          <div class="card-sub">cached across stores</div>
         </div>
       </div>
 
@@ -291,7 +302,14 @@ export default function Disk() {
       </Show>
 
       <Show when={loadError()} keyed>
-        {(text: string) => <p class="notice error">{text}</p>}
+        {(text: string) => (
+          <p class="notice error">
+            {text}{" "}
+            <button class="btn small" onClick={() => void loadDisk()}>
+              Retry
+            </button>
+          </p>
+        )}
       </Show>
 
       <Show when={diskStatus()}>
@@ -321,14 +339,15 @@ export default function Disk() {
                 <div class="panel-row">
                   <span class="grow">SSD cache</span>
                   <span class="num">
-                    {fmtBytes(disk().used_bytes)} of {fmtBytes(disk().capacity_bytes)}
+                    {fmtBytes(disk().used_bytes)} of {fmtBytes(disk().capacity_bytes)} ·{" "}
+                    {Math.round(meterPercent())}%
                     <Show when={disk().persistent}>
                       {" "}
                       <span class="badge ok">persistent</span>
                     </Show>
                   </span>
                 </div>
-                <div class="panel-row">
+                <div class="panel-row" title="KV blocks currently stored on SSD; pending pages are queued writes">
                   <span class="grow">Cached KV</span>
                   <span class="num">
                     {fmtBytes(disk().kv_bytes)} in {fmtInt(disk().kv_blocks)} blocks
@@ -337,7 +356,7 @@ export default function Disk() {
                     </Show>
                   </span>
                 </div>
-                <div class="panel-row">
+                <div class="panel-row" title="KV blocks moved from RAM to SSD under memory pressure; refused = skipped because pressure resolved first">
                   <span class="grow">Demotions (RAM → SSD)</span>
                   <span class="num">
                     {fmtInt(disk().kv_demotions)}
@@ -349,7 +368,7 @@ export default function Disk() {
                     </Show>
                   </span>
                 </div>
-                <div class="panel-row">
+                <div class="panel-row" title="KV blocks read back from SSD into RAM">
                   <span class="grow">Restores (SSD → RAM)</span>
                   <span class="num">
                     {fmtInt(disk().kv_restores)}
@@ -358,7 +377,7 @@ export default function Disk() {
                     </Show>
                   </span>
                 </div>
-                <div class="panel-row">
+                <div class="panel-row" title="Writes buffered before reaching disk — waiting = queued, durable = flushed; refused = skipped">
                   <span class="grow">Write-behind</span>
                   <span class="num">
                     {fmtInt(disk().write_behind?.waiting)} waiting · {fmtInt(disk().write_behind?.durable)} durable
@@ -367,7 +386,7 @@ export default function Disk() {
                     </Show>
                   </span>
                 </div>
-                <div class="panel-row">
+                <div class="panel-row" title="Total bytes read from and written to the SSD cache since start">
                   <span class="grow">SSD read / written</span>
                   <span class="num">
                     {fmtBytes(disk().read_bytes)} / {fmtBytes(disk().written_bytes)}
@@ -385,17 +404,17 @@ export default function Disk() {
           <button
             class="btn"
             title="Find the same model stored in more than one place"
-            disabled={busy() || loading()}
+            disabled={!!busy() || loading()}
             onClick={scanDedupe}
           >
-            {busy() && !dedupe() ? "Working…" : "Scan for duplicates"}
+            {busy() === "scan" ? "Scanning…" : "Scan for duplicates"}
           </button>
           <label class="dedupe-variants muted">
             <input
               type="checkbox"
               title="Also group format variants (e.g. MLX vs GGUF) of the same model"
               checked={variants()}
-              disabled={busy()}
+              disabled={!!busy()}
               onChange={(event) => {
                 setVariants(event.currentTarget.checked);
                 setDedupe(null);
@@ -439,7 +458,17 @@ export default function Disk() {
                     <For each={group.remove ?? []}>
                       {(entry) => (
                         <div class="panel-row" classList={{ weak: !!entry.weak }}>
-                          <span class="badge">remove</span>
+                          <Show
+                            when={entry.weak}
+                            fallback={<span class="badge">remove</span>}
+                          >
+                            <span
+                              class="badge warn"
+                              title="Only a weak match — this copy is kept"
+                            >
+                              skip
+                            </span>
+                          </Show>
                           <span class="grow">
                             {entry.title} — {entry.name}
                             <Show when={entry.weak}>
@@ -459,12 +488,13 @@ export default function Disk() {
                   <div class="panel-row">
                     <span class="grow muted">
                       {fmtInt(preview.groups?.length)} duplicate{preview.groups?.length === 1 ? "" : "s"} ·{" "}
-                      {fmtBytes(preview.reclaimable)} reclaimable
+                      {fmtBytes(preview.reclaimable)} reclaimable — one copy kept
+                      per model
                     </span>
                     <button
                       class="btn danger"
                       title="Delete the copies marked remove — keeps one per model"
-                      disabled={busy()}
+                      disabled={!!busy()}
                       onClick={() => setConfirm({ kind: "dedupe", preview })}
                     >
                       {`Reclaim ${fmtBytes(preview.reclaimable)}`}
@@ -499,8 +529,19 @@ export default function Disk() {
               <option value="name">By name</option>
             </select>
           </Show>
+          <Show when={query().trim()}>
+            <span class="muted">{fmtInt(matchCount())} matches</span>
+          </Show>
+          <button
+            class="btn small"
+            title="Rescan the stores"
+            disabled={loading()}
+            onClick={() => void loadDisk()}
+          >
+            {loading() ? "Scanning…" : "Refresh"}
+          </button>
         </div>
-        <Show when={busy()}>
+        <Show when={busy() === "wipe" || busy() === "apply"}>
           <p class="muted">Working…</p>
         </Show>
         <Show when={noStores()}>
@@ -517,8 +558,18 @@ export default function Disk() {
               fallback={
                 <div class="panel store-panel store-missing">
                   <div class="panel-row">
-                    <span class="grow muted">{store.title} —</span>
+                    <span class="grow muted">{store.title}</span>
+                    <span class="badge" title="The configured path does not exist">
+                      not found
+                    </span>
                   </div>
+                  <For each={store.paths ?? []}>
+                    {(path) => (
+                      <div class="panel-row store-path">
+                        <span class="mono muted grow">{path}</span>
+                      </div>
+                    )}
+                  </For>
                 </div>
               }
             >
@@ -533,15 +584,15 @@ export default function Disk() {
                   <span class="badge">{fmtBytes(store.bytes)}</span>
                   <button
                     class="btn small danger"
-                    disabled={busy() || store.locked}
+                    disabled={!!busy() || store.locked}
                     title={
                       store.locked
-                        ? "Stop the server before wiping the store it serves from"
-                        : `Wipe all of ${store.title}`
+                        ? "Stop the server before deleting the store it serves from"
+                        : `Delete all of ${store.title}`
                     }
                     onClick={() => setConfirm({ kind: "store", store })}
                   >
-                    Wipe store
+                    Delete store
                   </button>
                 </div>
                 <For each={store.paths ?? []}>
@@ -554,26 +605,48 @@ export default function Disk() {
                 <For each={viewModels(store)}>
                   {(model) => (
                     <div class="panel-row">
-                      <span class="grow">{model.name}</span>
+                      <button
+                        type="button"
+                        class="model-name grow"
+                        title="Copy model name"
+                        onClick={() =>
+                          void copy(`${store.name}/${model.name}`, model.name)
+                        }
+                      >
+                        {model.name}
+                        <Show when={copied() === `${store.name}/${model.name}`}>
+                          {" "}
+                          <span class="muted">✓</span>
+                        </Show>
+                      </button>
                       <span class="num">{fmtBytes(model.bytes)}</span>
                       <button
                         class="btn small danger"
-                        disabled={busy() || store.locked}
+                        disabled={!!busy() || store.locked}
                         title={
                           store.locked
                             ? "Store is in use by this server"
-                            : `Wipe ${model.name}`
+                            : `Delete ${model.name}`
                         }
                         onClick={() => setConfirm({ kind: "model", store, model })}
                       >
-                        Wipe
+                        Delete
                       </button>
                     </div>
                   )}
                 </For>
-                <Show when={(store.models?.length ?? 0) === 0}>
+                <Show
+                  when={
+                    (store.models?.length ?? 0) === 0 ||
+                    (query().trim() !== "" && viewModels(store).length === 0)
+                  }
+                >
                   <div class="panel-row">
-                    <span class="grow muted">No model entries</span>
+                    <span class="grow muted">
+                      {(store.models?.length ?? 0) === 0
+                        ? "No model entries"
+                        : `No matches for "${query().trim()}"`}
+                    </span>
                   </div>
                 </Show>
               </div>
@@ -586,7 +659,7 @@ export default function Disk() {
         open={confirm() !== null}
         title={confirmTitle()}
         confirmLabel={confirmLabel()}
-        busy={busy()}
+        busy={busy() !== null}
         onConfirm={runConfirmed}
         onClose={() => setConfirm(null)}
       >

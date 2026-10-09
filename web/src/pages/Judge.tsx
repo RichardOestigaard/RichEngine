@@ -144,6 +144,79 @@ const QUESTIONS_PLACEHOLDER = `{
   "quality": { "type": "score", "criteria": ["poor", "ok", "great"] }
 }`;
 
+const SINGLE_STATE_EXAMPLE = `{"claim": "The server rebooted at 03:12", "evidence": "syslog shows a kernel restart at 03:12:04"}`;
+const BATCH_STATE_EXAMPLE = `{"ticket": "Invoice #1042 was charged twice and the card on file was declined."}`;
+
+const newJudgmentId = () => `j-${Date.now().toString(36)}`;
+
+/* ---- creator guide: an LLM that edits the forms ---- */
+
+interface ChatReply {
+  choices?: { message?: { content?: string } }[];
+}
+
+interface GuideMsg {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/* Partial form state the model may return. Unknown keys are ignored. */
+interface GuidePatch {
+  note?: string;
+  single?: {
+    id?: string;
+    model?: string;
+    question?: string;
+    state?: unknown;
+    options?: { id?: unknown; description?: unknown }[];
+  };
+  batch?: {
+    model?: string;
+    state?: unknown;
+    questions?: unknown;
+  };
+}
+
+const GUIDE_SYSTEM = `You configure a "judge" page that scores options against evidence.
+It has two forms:
+
+single — POST /v1/judgments: { id: string (auto, only set if asked),
+  model: string (optional served model id), question: string (the criterion),
+  state: string (the evidence — JSON text or plain text),
+  options: [{id, description}] — 2 to 16 entries, unique short ids }
+
+batch — POST /v1/systemone: { model: string (required served model id),
+  state: string (shared evidence), questions: object keyed by question id;
+  each value is one of:
+    {"type":"noul","instructions":"..."}        — scores P(true)
+    {"type":"choice","criteria":{id:"desc"...}} — picks one criterion
+    {"type":"score","criteria":["poor",...]}    — rates on the listed scale }
+
+The user describes what they want judged; you emit form updates.
+Reply with ONLY a JSON object, no prose, no code fences:
+{"note":"one short sentence to the user — what you changed, or a clarifying question",
+ "single":{...fields to set...}, "batch":{...fields to set...}}
+Include a form key only when you want to change that form; include a field only
+when you want to change it. For batch.questions emit the full object. Never emit
+field values you did not intend to set.`;
+
+/* Pull the first JSON object out of a model reply (fences tolerated). */
+function parseGuideReply(raw: string): GuidePatch | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw.slice(start, end + 1));
+    if (parsed && typeof parsed === "object") return parsed as GuidePatch;
+  } catch {
+    /* Not JSON: show the text as a plain assistant note. */
+  }
+  return null;
+}
+
+const asText = (value: unknown) =>
+  typeof value === "string" ? value : JSON.stringify(value, null, 2);
+
 interface OptionRow {
   id: string;
   description: string;
@@ -159,31 +232,38 @@ export default function Judge() {
   const tab = () => (params.tab === "batch" ? "batch" : "single");
   const setTab = (id: string) => setParams({ tab: id }, { replace: true });
 
-  /* Single judgment form. */
-  const [jId, setJId] = createSignal("j1");
+  /* Single judgment form — prefilled so the first submit succeeds. */
+  const [jId, setJId] = createSignal(newJudgmentId());
   const [jModel, setJModel] = createSignal("");
-  const [question, setQuestion] = createSignal("");
-  const [jState, setJState] = createSignal("");
+  const [question, setQuestion] = createSignal(
+    "Does the evidence support the claim?"
+  );
+  const [jState, setJState] = createSignal(SINGLE_STATE_EXAMPLE);
   const [optionRows, setOptionRows] = createSignal<OptionRow[]>([
-    { id: "yes", description: "" },
-    { id: "no", description: "" },
+    { id: "yes", description: "the evidence supports the claim" },
+    { id: "no", description: "the evidence does not support the claim" },
   ]);
   const [jBusy, setJBusy] = createSignal(false);
-  const [jError, setJError] = createSignal<string | null>(null);
   const [jResult, setJResult] = createSignal<JudgmentResponse | null>(null);
   const [jController, setJController] = createSignal<AbortController>();
   const [jCancelled, setJCancelled] = createSignal(false);
 
   /* Batch (systemone) form. */
   const [sModel, setSModel] = createSignal("");
-  const [sState, setSState] = createSignal("");
-  const [questionsText, setQuestionsText] = createSignal("");
+  const [sState, setSState] = createSignal(BATCH_STATE_EXAMPLE);
+  const [questionsText, setQuestionsText] = createSignal(QUESTIONS_PLACEHOLDER);
   const [sBusy, setSBusy] = createSignal(false);
-  const [sError, setSError] = createSignal<string | null>(null);
   const [sDetails, setSDetails] = createSignal<DetailItem[]>([]);
   const [sResult, setSResult] = createSignal<SystemOneResponse | null>(null);
   const [sController, setSController] = createSignal<AbortController>();
   const [sCancelled, setSCancelled] = createSignal(false);
+
+  /* Creator guide: a small LLM chat that patches either form. */
+  const [guideOpen, setGuideOpen] = createSignal(true);
+  const [guideLog, setGuideLog] = createSignal<GuideMsg[]>([]);
+  const [guideInput, setGuideInput] = createSignal("");
+  const [guideBusy, setGuideBusy] = createSignal(false);
+  const [guideError, setGuideError] = createSignal<string | null>(null);
 
   onMount(() => {
     api<{ data?: { id?: string }[] }>("/v1/models")
@@ -214,7 +294,11 @@ export default function Judge() {
     );
   }
 
-  function judgmentBody(): { body: Record<string, unknown>; error?: string } {
+  /* errors is keyed by field so each bad input can be marked inline. */
+  function judgmentBody(): {
+    body: Record<string, unknown>;
+    errors: Record<string, string>;
+  } {
     const body: Record<string, unknown> = {
       id: jId().trim(),
       question: question().trim(),
@@ -227,27 +311,33 @@ export default function Judge() {
     const model = jModel().trim();
     if (model) body.model = model;
     const options = body.options as { id: string; description: string }[];
-    let error: string | undefined;
-    if (!body.id) error = "id must be nonempty";
-    else if (!body.question) error = "question must be nonempty";
-    else if (body.state === undefined)
-      error = "state must be nonempty — JSON value or plain text";
-    else if (options.length < 2 || options.length > 16)
-      error = "options need 2–16 entries";
-    else if (options.some((o) => !o.id)) error = "every option needs an id";
+    const errors: Record<string, string> = {};
+    if (!body.id) errors.id = "id must be nonempty";
+    if (!body.question) errors.question = "question must be nonempty";
+    if (body.state === undefined)
+      errors.state = "state must be nonempty — JSON value or plain text";
+    if (options.length < 2 || options.length > 16)
+      errors.options = "options need 2–16 entries";
+    else if (options.some((o) => !o.id))
+      errors.options = "every option needs an id";
     else if (new Set(options.map((o) => o.id)).size !== options.length)
-      error = "option ids must be unique";
+      errors.options = "option ids must be unique";
     else if (options.some((o) => !o.description))
-      error = "every option needs a description";
-    return { body, error };
+      errors.options = "every option needs a description";
+    return { body, errors };
   }
+
+  const jErrors = () => judgmentBody().errors;
+  const jFirstError = () => Object.values(jErrors())[0];
+  const jInvalid = (field: string) =>
+    jErrors()[field] ? { "aria-invalid": true } : {};
+
+  let jResultEl: HTMLDivElement | undefined;
 
   async function submitJudgment(event: SubmitEvent) {
     event.preventDefault();
-    if (jBusy()) return;
-    const { body, error } = judgmentBody();
-    setJError(error ?? null);
-    if (error) return;
+    if (jBusy() || jFirstError()) return;
+    const { body } = judgmentBody();
     setJBusy(true);
     setJCancelled(false);
     const ctrl = new AbortController();
@@ -260,6 +350,10 @@ export default function Judge() {
           body: JSON.stringify(body),
           signal: ctrl.signal,
         })
+      );
+      setJId(newJudgmentId());
+      requestAnimationFrame(() =>
+        jResultEl?.scrollIntoView({ behavior: "smooth", block: "nearest" })
       );
     } catch (e) {
       /* A deliberate cancel is a note, not an error. */
@@ -283,44 +377,58 @@ export default function Judge() {
 
   /* ---- batch (systemone) ---- */
 
-  function systemoneBody(): { body: Record<string, unknown>; error?: string } {
+  /* errors is keyed by field so each bad input can be marked inline. */
+  function systemoneBody(): {
+    body: Record<string, unknown>;
+    errors: Record<string, string>;
+  } {
     const model = sModel().trim();
     const body: Record<string, unknown> = {
       model,
       state: parseState(sState()),
     };
+    const errors: Record<string, string> = {};
     let questions: unknown;
     try {
       questions = JSON.parse(questionsText().trim() || "null");
     } catch {
-      return { body, error: "questions must be a JSON object" };
+      errors.questions = "questions must be valid JSON";
+      return { body, errors };
     }
     body.questions = questions;
-    let error: string | undefined;
-    if (!model) error = "model is required — the served model id";
-    else if (body.state === undefined)
-      error = "state must be nonempty — JSON value or plain text";
-    else if (!questions || typeof questions !== "object" || Array.isArray(questions))
-      error = "questions must be a JSON object keyed by question id";
-    else if (!Object.keys(questions).length) error = "questions must be nonempty";
+    if (!model) errors.model = "model is required — the served model id";
+    if (body.state === undefined)
+      errors.state = "state must be nonempty — JSON value or plain text";
+    if (!questions || typeof questions !== "object" || Array.isArray(questions))
+      errors.questions = "questions must be a JSON object keyed by question id";
+    else if (!Object.keys(questions).length)
+      errors.questions = "questions must be nonempty";
     else if (Object.keys(questions).length > 64)
-      error = "at most 64 questions per batch";
-    return { body, error };
+      errors.questions = "at most 64 questions per batch";
+    return { body, errors };
   }
+
+  const sErrors = () => systemoneBody().errors;
+  const sFirstError = () => Object.values(sErrors())[0];
+  const sInvalid = (field: string) =>
+    sErrors()[field] ? { "aria-invalid": true } : {};
+
+  let sResultEl: HTMLDivElement | undefined;
 
   async function submitSystemone(event: SubmitEvent) {
     event.preventDefault();
-    if (sBusy()) return;
-    const { body, error } = systemoneBody();
-    setSError(error ?? null);
+    if (sBusy() || sFirstError()) return;
+    const { body } = systemoneBody();
     setSDetails([]);
-    if (error) return;
     setSBusy(true);
     setSCancelled(false);
     const ctrl = new AbortController();
     setSController(ctrl);
     try {
       setSResult(await postSystemone(body, ctrl.signal));
+      requestAnimationFrame(() =>
+        sResultEl?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+      );
     } catch (e) {
       if (isAbort(e)) setSCancelled(true);
       else if (e instanceof DetailError) setSDetails(e.details);
@@ -333,6 +441,91 @@ export default function Judge() {
 
   const answerEntries = () => Object.entries(sResult()?.answers ?? {});
 
+  /* ---- creator guide ---- */
+
+  /* The guide sees the live form so follow-ups modify rather than rebuild. */
+  const guideSnapshot = () => ({
+    active_tab: tab(),
+    single: {
+      id: jId(),
+      model: jModel(),
+      question: question(),
+      state: jState(),
+      options: optionRows(),
+    },
+    batch: { model: sModel(), state: sState(), questions: questionsText() },
+  });
+
+  function applyGuide(patch: GuidePatch) {
+    const s = patch.single;
+    if (s && typeof s === "object") {
+      if (typeof s.id === "string" && s.id) setJId(s.id);
+      if (typeof s.model === "string") setJModel(s.model);
+      if (typeof s.question === "string") setQuestion(s.question);
+      if (s.state !== undefined) setJState(asText(s.state));
+      if (Array.isArray(s.options)) {
+        const rows = s.options
+          .filter((o) => o && typeof o.id === "string" && o.id)
+          .slice(0, 16)
+          .map((o) => ({
+            id: String(o.id),
+            description: typeof o.description === "string" ? o.description : "",
+          }));
+        if (rows.length >= 2) setOptionRows(rows);
+      }
+    }
+    const b = patch.batch;
+    if (b && typeof b === "object") {
+      if (typeof b.model === "string") setSModel(b.model);
+      if (b.state !== undefined) setSState(asText(b.state));
+      if (b.questions !== undefined) setQuestionsText(asText(b.questions));
+    }
+  }
+
+  async function sendGuide(event: SubmitEvent) {
+    event.preventDefault();
+    const text = guideInput().trim();
+    if (!text || guideBusy()) return;
+    setGuideInput("");
+    setGuideError(null);
+    const history = guideLog();
+    setGuideLog([...history, { role: "user", text }]);
+    setGuideBusy(true);
+    try {
+      const res = await api<ChatReply>("/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: sModel() || jModel() || modelIds()[0],
+          stream: false,
+          messages: [
+            { role: "system", content: GUIDE_SYSTEM },
+            ...history.map((m) => ({ role: m.role, content: m.text })),
+            {
+              role: "user",
+              content: `Current form state:\n${JSON.stringify(guideSnapshot(), null, 2)}\n\nRequest: ${text}`,
+            },
+          ],
+        }),
+      });
+      const raw = res?.choices?.[0]?.message?.content ?? "";
+      const patch = parseGuideReply(raw);
+      let note = raw.trim();
+      if (patch) {
+        applyGuide(patch);
+        note = patch.note ?? "Form updated.";
+      }
+      setGuideLog((log) => [
+        ...log,
+        { role: "assistant", text: note || "Done." },
+      ]);
+    } catch (e) {
+      setGuideError(errorText(e));
+    } finally {
+      setGuideBusy(false);
+    }
+  }
+
   return (
     <main class="page judge">
       <h1>Judge</h1>
@@ -340,6 +533,60 @@ export default function Judge() {
         Score finite options against evidence — one judgment, or a batch of
         questions over a shared state.
       </p>
+
+      <div class="panel guide">
+        <button
+          type="button"
+          class="guide-head"
+          aria-expanded={guideOpen()}
+          onClick={() => setGuideOpen(!guideOpen())}
+        >
+          <span class="grow">
+            Creator guide{" "}
+            <span class="hint">
+              — describe what to judge; it fills the form below. Or edit
+              manually.
+            </span>
+          </span>
+          <span class="muted">{guideOpen() ? "▾" : "▸"}</span>
+        </button>
+        <Show when={guideOpen()}>
+          <Show when={guideLog().length > 0 || guideBusy()}>
+            <div class="guide-log">
+              <For each={guideLog()}>
+                {(m) => <div class={`guide-msg ${m.role}`}>{m.text}</div>}
+              </For>
+              <Show when={guideBusy()}>
+                <div class="guide-msg assistant muted">thinking…</div>
+              </Show>
+            </div>
+          </Show>
+          <form class="guide-row" onSubmit={sendGuide}>
+            <input
+              class="judge-input grow"
+              placeholder={
+                tab() === "batch"
+                  ? "e.g. add a question rating tone from rude to warm"
+                  : "e.g. judge whether this refund request should be approved"
+              }
+              aria-label="Describe the judgment to create"
+              value={guideInput()}
+              onInput={(e) => setGuideInput(e.currentTarget.value)}
+            />
+            <button
+              type="submit"
+              class="btn small primary"
+              disabled={guideBusy() || !guideInput().trim()}
+              title="Send to the served model; the reply edits the form"
+            >
+              {guideBusy() ? "…" : "Ask"}
+            </button>
+          </form>
+          <Show when={guideError()}>
+            <p class="field-error">{guideError()}</p>
+          </Show>
+        </Show>
+      </div>
 
       <TabGroup
         class="judge-tabs"
@@ -349,10 +596,10 @@ export default function Judge() {
       >
         <TabList class="tab-list">
           <Tab class="tab" value="single" as="button" type="button">
-            Single judgment
+            One judgment
           </Tab>
           <Tab class="tab" value="batch" as="button" type="button">
-            Batch (systemone)
+            Batch of questions
           </Tab>
         </TabList>
 
@@ -360,28 +607,40 @@ export default function Judge() {
         <TabPanel value="single">
           <form class="panel" onSubmit={submitJudgment}>
             <fieldset disabled={jBusy()}>
-              <div class="panel-row">
-                <span class="grow">ID</span>
-                <input
-                  class="judge-input mono w-160"
-                  aria-label="Judgment id"
-                  spellcheck={false}
-                  value={jId()}
-                  onInput={(e) => setJId(e.currentTarget.value)}
-                />
-                <span class="grow">Model <span class="muted">— optional</span></span>
-                <input
-                  class="judge-input mono w-220"
-                  list="judge-models"
-                  placeholder="served model id"
-                  aria-label="Model"
-                  spellcheck={false}
-                  value={jModel()}
-                  onInput={(e) => setJModel(e.currentTarget.value)}
-                />
+              <div class="field field-split">
+                <label>
+                  <span class="field-label">
+                    ID <span class="hint">— auto-generated, echoed in the result</span>
+                  </span>
+                  <input
+                    class="judge-input mono"
+                    aria-label="Judgment id"
+                    spellcheck={false}
+                    value={jId()}
+                    onInput={(e) => setJId(e.currentTarget.value)}
+                    {...jInvalid("id")}
+                  />
+                  <Show when={jErrors().id}>
+                    {(msg) => <p class="field-error">{msg()}</p>}
+                  </Show>
+                </label>
+                <label>
+                  <span class="field-label">
+                    Model <span class="hint">— optional, defaults to the served model</span>
+                  </span>
+                  <input
+                    class="judge-input mono"
+                    list="judge-models"
+                    placeholder="served model id"
+                    aria-label="Model"
+                    spellcheck={false}
+                    value={jModel()}
+                    onInput={(e) => setJModel(e.currentTarget.value)}
+                  />
+                </label>
               </div>
               <label class="field">
-                <span class="field-label">Question — the criterion</span>
+                <span class="field-label">Question — the criterion to score against</span>
                 <input
                   class="judge-input"
                   placeholder="Does the evidence support the claim?"
@@ -389,10 +648,16 @@ export default function Judge() {
                   spellcheck={false}
                   value={question()}
                   onInput={(e) => setQuestion(e.currentTarget.value)}
+                  {...jInvalid("question")}
                 />
+                <Show when={jErrors().question}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
               </label>
               <label class="field">
-                <span class="field-label">State — the evidence (JSON or text)</span>
+                <span class="field-label">
+                  State — the evidence the model reads (JSON or text)
+                </span>
                 <textarea
                   class="judge-area"
                   rows={4}
@@ -401,10 +666,19 @@ export default function Judge() {
                   spellcheck={false}
                   value={jState()}
                   onInput={(e) => setJState(e.currentTarget.value)}
+                  {...jInvalid("state")}
                 />
+                <Show when={jErrors().state}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
               </label>
               <div class="field">
-                <span class="field-label">Options — 2–16, unique ids</span>
+                <span class="field-label">
+                  Options — the answers the model scores (2–16, unique ids)
+                </span>
+                <Show when={jErrors().options}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
                 <For each={optionRows()}>
                   {(row, i) => (
                     <div class="option-row">
@@ -480,9 +754,13 @@ export default function Judge() {
                   <button
                     type="submit"
                     class="btn small primary"
-                    title="Score each option against the criterion from logits"
+                    disabled={!!jFirstError()}
+                    title={
+                      jFirstError() ??
+                      "Submit the judgment — the model scores every option"
+                    }
                   >
-                    Score
+                    Judge
                   </button>
                 }
               >
@@ -498,16 +776,13 @@ export default function Judge() {
             </div>
           </form>
 
-          <Show when={jError()}>
-            <p class="notice error">{jError()}</p>
-          </Show>
           <Show when={jCancelled()}>
             <p class="notice muted">cancelled</p>
           </Show>
 
           <Show when={jResult()}>
             {(res) => (
-              <div class="panel judge-result">
+              <div class="panel judge-result flash" ref={jResultEl}>
                 <div class="panel-row">
                   <span class="grow">
                     Result <span class="mono">{res().id ?? ""}</span>
@@ -557,10 +832,7 @@ export default function Judge() {
                         <span class="num">{pct(row.probability)}</span>
                       </div>
                       <div class="panel-row meter-row">
-                        <div
-                          class="meter"
-                          title="Normalized-entropy concentration — not calibrated confidence"
-                        >
+                        <div class="meter" title="Probability">
                           <i
                             style={{
                               width: `${Math.max(
@@ -593,24 +865,28 @@ export default function Judge() {
         <TabPanel value="batch">
           <form class="panel" onSubmit={submitSystemone}>
             <fieldset disabled={sBusy()}>
-              <div class="panel-row">
-                <span class="grow">Model — the served id</span>
-                <select
-                  class="judge-input mono w-220"
-                  aria-label="Model"
-                  value={sModel()}
-                  onChange={(e) => setSModel(e.currentTarget.value)}
-                >
-                  <Show when={!modelIds().includes(sModel())}>
-                    <option value={sModel()}>{sModel() || "—"}</option>
-                  </Show>
-                  <For each={modelIds()}>
-                    {(id) => <option value={id}>{id}</option>}
-                  </For>
-                </select>
-              </div>
               <label class="field">
-                <span class="field-label">State — shared evidence (JSON or text)</span>
+                <span class="field-label">
+                  Model <span class="hint">— the served model id, required</span>
+                </span>
+                <input
+                  class="judge-input mono"
+                  list="judge-models"
+                  placeholder="served model id"
+                  aria-label="Model"
+                  spellcheck={false}
+                  value={sModel()}
+                  onInput={(e) => setSModel(e.currentTarget.value)}
+                  {...sInvalid("model")}
+                />
+                <Show when={sErrors().model}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  State — the evidence shared by every question (JSON or text)
+                </span>
                 <textarea
                   class="judge-area"
                   rows={4}
@@ -619,12 +895,21 @@ export default function Judge() {
                   spellcheck={false}
                   value={sState()}
                   onInput={(e) => setSState(e.currentTarget.value)}
+                  {...sInvalid("state")}
                 />
+                <Show when={sErrors().state}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
               </label>
-              <label class="field">
+              <div class="field">
                 <span class="field-label">
-                  Questions — JSON object keyed by qid, ≤64
+                  Questions — JSON object keyed by question id, ≤64
                 </span>
+                <p class="hint">
+                  types: <code>"noul"</code> scores true/false,{" "}
+                  <code>"choice"</code> picks from criteria, <code>"score"</code>{" "}
+                  rates on a scale
+                </p>
                 <textarea
                   class="judge-area tall"
                   rows={9}
@@ -633,8 +918,20 @@ export default function Judge() {
                   spellcheck={false}
                   value={questionsText()}
                   onInput={(e) => setQuestionsText(e.currentTarget.value)}
+                  {...sInvalid("questions")}
                 />
-              </label>
+                <Show when={sErrors().questions}>
+                  {(msg) => <p class="field-error">{msg()}</p>}
+                </Show>
+                <button
+                  type="button"
+                  class="btn small"
+                  title="Restore the example questions"
+                  onClick={() => setQuestionsText(QUESTIONS_PLACEHOLDER)}
+                >
+                  Insert example
+                </button>
+              </div>
             </fieldset>
             {/* Outside the disabled fieldset so Cancel stays clickable. */}
             <div class="panel-row">
@@ -652,9 +949,13 @@ export default function Judge() {
                   <button
                     type="submit"
                     class="btn small primary"
-                    title="Score each option against the criterion from logits"
+                    disabled={!!sFirstError()}
+                    title={
+                      sFirstError() ??
+                      "Submit the batch — the model answers every question"
+                    }
                   >
-                    Score
+                    Judge all
                   </button>
                 }
               >
@@ -670,9 +971,6 @@ export default function Judge() {
             </div>
           </form>
 
-          <Show when={sError()}>
-            <p class="notice error">{sError()}</p>
-          </Show>
           <Show when={sCancelled()}>
             <p class="notice muted">cancelled</p>
           </Show>
@@ -692,7 +990,7 @@ export default function Judge() {
           <Show when={sResult()}>
             {(res) => (
               <>
-                <div class="panel judge-result">
+                <div class="panel judge-result flash" ref={sResultEl}>
                   <div class="panel-row">
                     <span class="grow">
                       {fmtInt(answerEntries().length)} answers ·{" "}
@@ -731,10 +1029,7 @@ export default function Judge() {
                         {([label, p]) => (
                           <div class="panel-row mini">
                             <span class="mini-label mono">{label}</span>
-                            <div
-                              class="meter"
-                              title="Normalized-entropy concentration — not calibrated confidence"
-                            >
+                            <div class="meter" title="Probability">
                               <i
                                 style={{
                                   width: `${Math.max(0, Math.min(1, p)) * 100}%`,

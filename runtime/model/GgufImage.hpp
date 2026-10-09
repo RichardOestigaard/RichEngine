@@ -54,8 +54,9 @@ struct TargetGeometry {
   // The q*k softmax scale (Granite's attention.scale); zero selects the
   // head dimension's default.
   float attentionScale = 0.0F;
-  // Whether the packed query rows interleave a gate row each (Qwen) and
-  // whether the q/k heads carry RMS norms (absent in the dense target).
+  // Whether the packed query rows interleave a gate row each (the hybrid
+  // families) and whether the q/k heads carry RMS norms (absent in the
+  // dense target).
   bool attentionQueryGate = true;
   bool attentionQkNorm = true;
   // Whether the LM head shares the token embedding (LFM2 ties them).

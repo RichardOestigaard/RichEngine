@@ -34,7 +34,7 @@ class AneFfn;
 
 namespace richengine::model {
 
-class QwenStateStorage;
+class CompositeStateStorage;
 
 using TargetWeights =
     std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
@@ -96,7 +96,7 @@ struct RuntimeContext final {
   metal::MetalBackend &backend;
   const ModelPackage &package;
   kv::PageStorage &kvPages;
-  QwenStateStorage &stateStorage;
+  CompositeStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;

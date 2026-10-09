@@ -1,7 +1,7 @@
 #include "Checked.hpp"
 #include "engine/memory/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 #include "tests/engine/TestChecks.hpp"
 
 #include <unistd.h>
@@ -77,7 +77,7 @@ bool sameBytes(const metal::MetalBuffer &buffer, const std::vector<uint8_t> &ima
 
 // Every byte of a lane's current state, in the order its disk copy holds
 // them.
-std::vector<std::vector<uint8_t>> stateImage(const model::QwenStateStorage &storage,
+std::vector<std::vector<uint8_t>> stateImage(const model::CompositeStateStorage &storage,
                                              uint32_t lane) {
   std::vector<std::vector<uint8_t>> image{bytesOf(storage.current(lane).stateBase)};
   for (const auto &layer : storage.draft(lane)) {
@@ -89,7 +89,7 @@ std::vector<std::vector<uint8_t>> stateImage(const model::QwenStateStorage &stor
 
 // Every pooled buffer the storage returns to macOS, one reclaim step at a
 // time, as the engine releases them.
-uint64_t releaseAllIdle(model::QwenStateStorage &storage, bool keepLane) {
+uint64_t releaseAllIdle(model::CompositeStateStorage &storage, bool keepLane) {
   uint64_t released = 0;
   while (const uint64_t buffer = storage.releaseOneIdle(keepLane))
     released += buffer;
@@ -132,7 +132,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
   auto budget = std::make_shared<model::DiskBudget>(3 * slotBytes);
   auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
-  model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, file);
+  model::CompositeStateStorage storage(backend, governor.allocationAdmission(), layout, file);
   require(static_cast<bool>(storage.tryActivateLane(0, 1)), "fault source activation failed");
   storage.updateLengths(0, {4096, 2048, 2048});
   auto source = storage.snapshot(0);
@@ -186,7 +186,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
-  model::QwenStateStorage storage(
+  model::CompositeStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
@@ -274,7 +274,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
-  model::QwenStateStorage storage(
+  model::CompositeStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
@@ -333,20 +333,18 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 }
 
 // A state need not fill its slot: the write zeros the slot past it and the
-// read leaves the rest, in a slot one host page larger than an aligned state
-// and in the rounded-up slot of a state that is not aligned.
+// read leaves the rest, in a slot one host page larger than the state. Every
+// layout's cachedBytes is itself a host-page multiple: each part of a state
+// aligns to one.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
-  constexpr model::CompositeStateLayout aligned{target, {1, 1, 4}};
-  constexpr model::CompositeStateLayout unaligned{target, {1, 1, 1}};
-  static_assert(aligned.cachedBytes() % kHostPageBytes == 0 &&
-                unaligned.cachedBytes() % kHostPageBytes != 0);
+  constexpr model::CompositeStateLayout layout{target, {1, 1, 4}};
+  static_assert(layout.cachedBytes() % kHostPageBytes == 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
-  for (const auto &[layout, slotBytes] :
-       {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
-        std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
-    model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout,
+  for (const auto &[testLayout, slotBytes] :
+       {std::pair{layout, layout.cachedBytes() + kHostPageBytes}}) {
+    model::CompositeStateStorage storage(backend, governor.allocationAdmission(), testLayout,
                                     std::make_shared<model::SlotFile>(
                                         slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
     require(static_cast<bool>(storage.tryActivateLane(0, 77)), "lane activation failed");
@@ -397,7 +395,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
   {
     auto file = std::make_shared<model::SlotFile>(kStateSlotBytes, budget, persistence);
     file->finishAdoption();
-    model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
+    model::CompositeStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
     require(static_cast<bool>(storage.tryActivateLane(0, 5)), "lane activation failed");
     std::vector<std::shared_ptr<const CompositeState>> kept;
     for (uint64_t seed : {40, 50}) {
@@ -426,7 +424,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
     slots.put('\x7f');
   }
   auto file = std::make_shared<model::SlotFile>(kStateSlotBytes, budget, persistence);
-  model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
+  model::CompositeStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, file);
   const std::vector<model::SlotRecord> records = file->records();
   require(records.size() == 2 && records[0].label == std::vector<std::byte>(8, std::byte{40}),
           "the next process did not find both labelled states");
@@ -441,7 +439,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
   fill(storage.current(0).stateBase, 99);
   auto read = storage.beginRestore(0, *intact, true, {}, [] {});
   require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&
-              storage.metadata(0).lengths == model::QwenLogicalLengths{4096, 2048, 2048},
+              storage.metadata(0).lengths == model::LogicalLengths{4096, 2048, 2048},
           "a state taken back did not restore every byte and its lengths");
   read = storage.beginRestore(0, *changed, true, {}, [] {});
   require(read && !finishWhenReady(*read), "a state whose slot changed was restored");
@@ -457,7 +455,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
 void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
-  model::QwenStateStorage storage(
+  model::CompositeStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
                                         std::make_shared<model::DiskBudget>(kStateSlotBytes)));
@@ -481,16 +479,16 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   fill(storage.current(0).stateBase, 99);
   auto read = storage.beginRestore(0, *write->state(), true, {}, [] {});
   require(read && finishWhenReady(*read) && stateImage(storage, 0) == images &&
-              storage.metadata(0).lengths == model::QwenLogicalLengths{4096, 2048, 2048},
+              storage.metadata(0).lengths == model::LogicalLengths{4096, 2048, 2048},
           "the persisted copy did not restore every byte and its lengths");
   read.reset();
   storage.releaseLane(0, 7);
 }
 
 void run(const std::string &metallib) {
-  using model::QwenCompositeState;
-  using model::QwenLogicalLengths;
-  using model::QwenStateStorage;
+  using model::CompositeStateImpl;
+  using model::LogicalLengths;
+  using model::CompositeStateStorage;
 
   testLayoutFormulas();
   metal::MetalBackend backend(metallib);
@@ -523,7 +521,7 @@ void run(const std::string &metallib) {
   uint64_t observedPrefixActual = 0;
 
   {
-    QwenStateStorage storage(backend, admitState, kStateLayout, nullptr);
+    CompositeStateStorage storage(backend, admitState, kStateLayout, nullptr);
     require(storage.actualAllocatedBytes() == 0 &&
                 backend.memoryStats().allocatedBytes == beforeStorage,
             "lane state was allocated eagerly");
@@ -581,7 +579,7 @@ void run(const std::string &metallib) {
     word(storage.draft(0)[0].keys) = 0x41414141;
     word(storage.draft(0)[4].values,
          kDraftState.tensorBytes() - sizeof(uint32_t)) = 0x51515151;
-    QwenLogicalLengths lengths{2'048, 0, 2'048};
+    LogicalLengths lengths{2'048, 0, 2'048};
     storage.updateLengths(0, lengths);
     require(storage.metadata(0).lengths.draftLength == 2'048,
             "draft resident length is wrong");
@@ -601,7 +599,7 @@ void run(const std::string &metallib) {
     const uint64_t beforePrefix = backend.memoryStats().allocatedBytes;
     const uint64_t storageBeforePrefix = storage.actualAllocatedBytes();
     void *laneActiveGdnBase = storage.current(0).stateBase.contents();
-    std::shared_ptr<const QwenCompositeState> prefix = storage.snapshot(0);
+    std::shared_ptr<const CompositeStateImpl> prefix = storage.snapshot(0);
     require(prefix != nullptr, "snapshot could not obtain a cache slot");
     observedPrefixActual = backend.memoryStats().allocatedBytes - beforePrefix;
     require(prefix->bytes() == kStateLayout.cachedBytes(),
@@ -693,7 +691,7 @@ void run(const std::string &metallib) {
             "lane reuse changed stable buffer addresses");
     require(storage.metadata(0).requestId == 303 &&
                 storage.metadata(0).activeParity == 0 &&
-                storage.metadata(0).lengths == QwenLogicalLengths{},
+                storage.metadata(0).lengths == LogicalLengths{},
             "lane reuse did not reset logical state");
     require(word(storage.current(0).convolutionLayers[0]) == 0xc1c1c1c1 &&
                 word(storage.current(0).recurrentLayers[0]) == 0xc2c2c2c2 &&
@@ -733,7 +731,7 @@ void run(const std::string &metallib) {
             "preempted GDN or draft bytes remain outside the cache");
     require(storage.tryActivateLane(0, 303) &&
                 storage.metadata(0).assigned() &&
-                storage.metadata(0).lengths == QwenLogicalLengths{},
+                storage.metadata(0).lengths == LogicalLengths{},
             "recomputation did not start from a fresh empty state");
 
     // Dropping a cached state returns its buffers to the storage's pool rather
@@ -751,7 +749,7 @@ void run(const std::string &metallib) {
     word(storage.current(0).recurrentLayers[0]) = 0xe2e2e2e2;
     word(storage.draft(0)[0].keys) = 0xe3e3e3e3;
     admitNewAllocations = false;
-    std::shared_ptr<const QwenCompositeState> pooled = storage.snapshot(0);
+    std::shared_ptr<const CompositeStateImpl> pooled = storage.snapshot(0);
     require(pooled != nullptr, "snapshot did not reuse the pooled cache slot");
     require(pooled->bytes() == kStateLayout.cachedBytes() &&
                 storage.actualAllocatedBytes() == beforeDrop &&
@@ -785,7 +783,7 @@ void run(const std::string &metallib) {
 
     // A live cached state survives its lane's release and reclaim; only its
     // drop plus a later reclaim frees the slot together with idle cells.
-    std::shared_ptr<const QwenCompositeState> retained = storage.snapshot(1);
+    std::shared_ptr<const CompositeStateImpl> retained = storage.snapshot(1);
     require(retained != nullptr, "retained snapshot could not admit a slot");
     require(storage.actualAllocatedBytes() ==
                 2 * observedLaneActual + observedPrefixActual,
@@ -867,7 +865,7 @@ void run(const std::string &metallib) {
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "destroyed state lanes remained in actual allocation count");
 
-  std::cout << "qwen state storage tests passed: lane_declared="
+  std::cout << "composite state storage tests passed: lane_declared="
             << kStateLayout.laneBytes()
             << " lane_actual=" << observedLaneActual << " four_lanes_declared="
             << uint64_t{model::ExecutionLimits::maximumBatchWidth} *
@@ -881,7 +879,7 @@ void run(const std::string &metallib) {
 
 int main(int argc, const char **argv) {
   if (argc != 2) {
-    std::cerr << "usage: qwen_state_storage_test METALLIB\n";
+    std::cerr << "usage: composite_state_storage_test METALLIB\n";
     return EXIT_FAILURE;
   }
   @autoreleasepool {
@@ -889,7 +887,7 @@ int main(int argc, const char **argv) {
       run(argv[1]);
       return EXIT_SUCCESS;
     } catch (const std::exception &error) {
-      std::cerr << "qwen state storage test failed: " << error.what() << '\n';
+      std::cerr << "composite state storage test failed: " << error.what() << '\n';
       return EXIT_FAILURE;
     }
   }

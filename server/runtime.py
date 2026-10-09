@@ -435,6 +435,8 @@ class MultiplexedRuntime:
         startup_timeout: float = 30.0,
         pending_limit: int = 64,
         eager_start: bool = True,
+        # The spawned engine's environment; None inherits this process's.
+        env: dict | None = None,
     ):
         if process_factory is None and not command:
             raise ValueError("command or process_factory is required")
@@ -444,6 +446,7 @@ class MultiplexedRuntime:
             raise ValueError("pending_limit must be positive")
 
         self._command = tuple(command) if command else None
+        self._env = env
         self._process_factory = process_factory or self._default_process_factory
         self._startup_timeout = startup_timeout
         self._pending_limit = pending_limit
@@ -497,6 +500,7 @@ class MultiplexedRuntime:
             stdout=subprocess.PIPE,
             stderr=None,
             bufsize=0,
+            env=self._env,
         )
 
     @property

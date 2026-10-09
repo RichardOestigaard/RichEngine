@@ -93,9 +93,10 @@ const [tokResult, setTokResult] = createSignal<{
 /* Chip ↔ source-span hover sync, by token index. */
 const [hoverTok, setHoverTok] = createSignal<number | null>(null);
 
-/* Template form + result. */
+/* Template form + result — prefilled so the first render explains itself. */
 const [messages, setMessages] = createSignal<MessageRow[]>([
-  { role: "user", content: "" },
+  { role: "system", content: "You are a concise assistant." },
+  { role: "user", content: "Explain tokenization in one sentence." },
 ]);
 const [genPrompt, setGenPrompt] = createSignal(true);
 const [tplModel, setTplModel] = createSignal("");
@@ -115,7 +116,6 @@ const [stopText, setStopText] = createSignal("");
 const [compModel, setCompModel] = createSignal("");
 const [compStream, setCompStream] = createSignal(true);
 const [compBusy, setCompBusy] = createSignal(false);
-const [compError, setCompError] = createSignal<string | null>(null);
 const [compController, setCompController] = createSignal<AbortController>();
 const [compCancelled, setCompCancelled] = createSignal(false);
 /* Text streamed so far, while a streaming completion is in flight. */
@@ -141,6 +141,13 @@ export default function Playground() {
   const setTab = (id: string) => setParams({ tab: id }, { replace: true });
 
   let sourceRef: HTMLDivElement | undefined;
+  let tokResultEl: HTMLDivElement | undefined;
+  let tplResultEl: HTMLDivElement | undefined;
+  let compResultEl: HTMLDivElement | undefined;
+  const scrollTo = (el?: HTMLDivElement) =>
+    requestAnimationFrame(() =>
+      el?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    );
 
   onMount(() => {
     api<{ data?: { id?: string }[] }>("/v1/models")
@@ -203,6 +210,7 @@ export default function Playground() {
         text: content(),
         offsets: res.offsets ?? null,
       });
+      scrollTo(tokResultEl);
     } catch (e) {
       /* A deliberate cancel is a note, not an error. */
       if (isAbort(e)) setTokCancelled(true);
@@ -302,6 +310,7 @@ export default function Playground() {
         signal: ctrl.signal,
       });
       setTplResult(res.prompt ?? "");
+      scrollTo(tplResultEl);
     } catch (e) {
       if (isAbort(e)) setTplCancelled(true);
       else pushToast("error", errorText(e));
@@ -319,30 +328,33 @@ export default function Playground() {
 
   /* ---- POST /v1/completions ---- */
 
-  function completionBody(): { body: Record<string, unknown>; error?: string } {
+  /* errors is keyed by field so each bad input can be marked inline. */
+  function completionBody(): {
+    body: Record<string, unknown>;
+    errors: Record<string, string>;
+  } {
     const body: Record<string, unknown> = {};
+    const errors: Record<string, string> = {};
     if (compMode() === "text") {
-      if (!promptText().trim())
-        return { body, error: "prompt must be nonempty" };
-      body.prompt = promptText();
+      if (!promptText().trim()) errors.prompt = "prompt must be nonempty";
+      else body.prompt = promptText();
     } else {
       const { ids, error } = parseTokenIds(idsText());
-      if (error) return { body, error };
-      body.prompt = ids;
+      if (error) errors.ids = error;
+      else body.prompt = ids;
     }
     const max = maxTokens().trim();
     if (max) {
       const n = Number(max);
       if (!Number.isInteger(n) || n <= 0)
-        return { body, error: "max_tokens must be a positive integer" };
-      body.max_tokens = n;
+        errors.maxTokens = "max_tokens must be a positive integer";
+      else body.max_tokens = n;
     }
     const temp = temperature().trim();
     if (temp) {
       const t = Number(temp);
-      if (!Number.isFinite(t))
-        return { body, error: "temperature must be a number" };
-      body.temperature = t;
+      if (!Number.isFinite(t)) errors.temperature = "must be a number";
+      else body.temperature = t;
     }
     const stops = stopText()
       .split(",")
@@ -351,8 +363,13 @@ export default function Playground() {
     if (stops.length) body.stop = stops;
     const model = compModel().trim();
     if (model) body.model = model;
-    return { body };
+    return { body, errors };
   }
+
+  const compErrors = () => completionBody().errors;
+  const compFirstError = () => Object.values(compErrors())[0];
+  const compInvalid = (field: string) =>
+    compErrors()[field] ? { "aria-invalid": true } : {};
 
   /* text_completion chunks: choices[].text deltas; usage arrives on a
      choices-empty chunk when stream_options.include_usage is set. */
@@ -435,16 +452,16 @@ export default function Playground() {
 
   async function submitCompletion(event: SubmitEvent) {
     event.preventDefault();
-    if (compBusy()) return;
-    const { body, error } = completionBody();
-    setCompError(error ?? null);
-    if (error) return;
+    if (compBusy() || compFirstError()) return;
+    const { body } = completionBody();
     setCompBusy(true);
     setCompCancelled(false);
     setCompLive("");
+    setCompResult(null);
     const ctrl = new AbortController();
     setCompController(ctrl);
     const started = performance.now();
+    if (compStream()) scrollTo(compResultEl);
     try {
       const res = compStream()
         ? await streamCompletion(body, ctrl.signal)
@@ -455,6 +472,7 @@ export default function Playground() {
             signal: ctrl.signal,
           });
       setCompResult({ res, ms: performance.now() - started });
+      scrollTo(compResultEl);
     } catch (e) {
       if (isAbort(e)) {
         setCompCancelled(true);
@@ -498,10 +516,14 @@ export default function Playground() {
 
         {/* ---- POST /tokenize ---- */}
         <TabPanel value="tokenize">
+          <p class="pg-lede">
+            See how the tokenizer splits text into token ids — hover a span or
+            chip to match both ends.
+          </p>
           <form class="panel" onSubmit={submitTokenize}>
             <fieldset disabled={tokBusy()}>
               <label class="field">
-                <span class="field-label">Content</span>
+                <span class="field-label">Content — the text to encode</span>
                 <textarea
                   class="pg-area"
                   rows={6}
@@ -516,14 +538,14 @@ export default function Playground() {
             <div class="panel-row">
               <label
                 class="pg-check grow muted"
-                title="Prepend the tokenizer's special tokens (BOS etc.)"
+                title="Prepend the tokenizer's special tokens (add_special)"
               >
                 <input
                   type="checkbox"
                   checked={addSpecial()}
                   onChange={(e) => setAddSpecial(e.currentTarget.checked)}
                 />
-                add_special — prepend the tokenizer's specials
+                Include special tokens (BOS/EOS)
               </label>
               <Show
                 when={tokBusy()}
@@ -558,7 +580,7 @@ export default function Playground() {
 
           <Show when={tokResult()}>
             {(res) => (
-              <div class="panel pg-result">
+              <div class="panel pg-result flash" ref={tokResultEl}>
                 <div class="panel-row">
                   <span class="grow">
                     Ids <span class="badge">{fmtInt(res().ids.length)} tokens</span>
@@ -650,10 +672,17 @@ export default function Playground() {
 
         {/* ---- POST /apply-template ---- */}
         <TabPanel value="template">
+          <p class="pg-lede">
+            Preview the prompt the model actually sees — your messages rendered
+            through the chat template.
+          </p>
           <form class="panel" onSubmit={submitTemplate}>
             <fieldset disabled={tplBusy()}>
               <div class="field">
-                <span class="field-label">Messages</span>
+                <span class="field-label">Messages — the chat turns</span>
+                <p class="hint">
+                  system sets behavior, user asks, assistant is a prior reply
+                </p>
                 <For each={messages()}>
                   {(row, i) => (
                     <div class="msg-row">
@@ -720,14 +749,14 @@ export default function Playground() {
               <div class="panel-row">
                 <label
                   class="pg-check grow muted"
-                  title="Append the assistant turn opener the model expects"
+                  title="Append the assistant turn opener (add_generation_prompt)"
                 >
                   <input
                     type="checkbox"
                     checked={genPrompt()}
                     onChange={(e) => setGenPrompt(e.currentTarget.checked)}
                   />
-                  add_generation_prompt
+                  Append the assistant turn header
                 </label>
                 <span class="muted">Model</span>
                 <input
@@ -789,7 +818,7 @@ export default function Playground() {
 
           <Show when={tplResult()}>
             {(prompt) => (
-              <div class="panel pg-result">
+              <div class="panel pg-result flash" ref={tplResultEl}>
                 <div class="panel-row">
                   <span class="grow">Rendered prompt</span>
                   <span class="num">
@@ -823,6 +852,10 @@ export default function Playground() {
 
         {/* ---- POST /v1/completions ---- */}
         <TabPanel value="completions">
+          <p class="pg-lede">
+            Continue raw text — no chat template is applied. For conversations
+            use the Chat page.
+          </p>
           <form class="panel" onSubmit={submitCompletion}>
             <fieldset disabled={compBusy()}>
               <div class="panel-row">
@@ -853,6 +886,10 @@ export default function Playground() {
                     <span class="field-label">
                       Token ids — "1234, 5678" or a JSON array
                     </span>
+                    <p class="hint">
+                      advanced — or use "Send to completions →" from the
+                      Tokenize tab
+                    </p>
                     <input
                       class="pg-input mono"
                       placeholder="128000, 128001"
@@ -860,13 +897,17 @@ export default function Playground() {
                       spellcheck={false}
                       value={idsText()}
                       onInput={(e) => setIdsText(e.currentTarget.value)}
+                      {...compInvalid("ids")}
                     />
+                    <Show when={compErrors().ids}>
+                      {(msg) => <p class="field-error">{msg()}</p>}
+                    </Show>
                   </label>
                 }
               >
                 <label class="field">
                   <span class="field-label">
-                    Text — encoded with the tokenizer's specials
+                    Text — continues from here, verbatim
                   </span>
                   <textarea
                     class="pg-area"
@@ -876,39 +917,54 @@ export default function Playground() {
                     spellcheck={false}
                     value={promptText()}
                     onInput={(e) => setPromptText(e.currentTarget.value)}
+                    {...compInvalid("prompt")}
                   />
+                  <Show when={compErrors().prompt}>
+                    {(msg) => <p class="field-error">{msg()}</p>}
+                  </Show>
                 </label>
               </Show>
               <div class="panel-row params">
-                <span class="muted">max_tokens</span>
-                <input
-                  class="pg-input mono w-80"
-                  type="number"
-                  min={1}
-                  step={1}
-                  aria-label="Max tokens"
-                  value={maxTokens()}
-                  onInput={(e) => setMaxTokens(e.currentTarget.value)}
-                />
-                <span class="muted">temperature</span>
-                <input
-                  class="pg-input mono w-80"
-                  type="number"
-                  step={0.1}
-                  placeholder="—"
-                  aria-label="Temperature"
-                  value={temperature()}
-                  onInput={(e) => setTemperature(e.currentTarget.value)}
-                />
-                <span class="muted">stop</span>
-                <input
-                  class="pg-input mono grow"
-                  placeholder="comma-separated"
-                  aria-label="Stop sequences"
-                  spellcheck={false}
-                  value={stopText()}
-                  onInput={(e) => setStopText(e.currentTarget.value)}
-                />
+                <label class="param">
+                  <span class="muted">max tokens</span>
+                  <input
+                    class="pg-input mono w-80"
+                    type="number"
+                    min={1}
+                    step={1}
+                    aria-label="Max tokens"
+                    title="How many tokens to generate (max_tokens)"
+                    value={maxTokens()}
+                    onInput={(e) => setMaxTokens(e.currentTarget.value)}
+                    {...compInvalid("maxTokens")}
+                  />
+                </label>
+                <label class="param">
+                  <span class="muted">temperature</span>
+                  <input
+                    class="pg-input mono w-80"
+                    type="number"
+                    step={0.1}
+                    placeholder="—"
+                    aria-label="Temperature"
+                    title="Sampling randomness — blank uses the server default"
+                    value={temperature()}
+                    onInput={(e) => setTemperature(e.currentTarget.value)}
+                    {...compInvalid("temperature")}
+                  />
+                </label>
+                <label class="param grow">
+                  <span class="muted">stop</span>
+                  <input
+                    class="pg-input mono"
+                    placeholder="comma-separated"
+                    aria-label="Stop sequences"
+                    title="Generation ends when any of these appears"
+                    spellcheck={false}
+                    value={stopText()}
+                    onInput={(e) => setStopText(e.currentTarget.value)}
+                  />
+                </label>
                 <label
                   class="pg-check muted"
                   title="Render the response token by token as it arrives"
@@ -921,6 +977,11 @@ export default function Playground() {
                   stream
                 </label>
               </div>
+              <Show when={compErrors().maxTokens || compErrors().temperature}>
+                <p class="field-error params-error">
+                  {compErrors().maxTokens ?? compErrors().temperature}
+                </p>
+              </Show>
               <div class="panel-row">
                 <span class="grow">
                   Model <span class="muted">— optional</span>
@@ -957,10 +1018,12 @@ export default function Playground() {
                   <button
                     type="submit"
                     class="btn small primary"
+                    disabled={!!compFirstError()}
                     title={
-                      compStream()
+                      compFirstError() ??
+                      (compStream()
                         ? "Generate a streaming completion"
-                        : "Generate a completion (non-streaming)"
+                        : "Generate a completion (non-streaming)")
                     }
                   >
                     Run
@@ -979,15 +1042,12 @@ export default function Playground() {
             </div>
           </form>
 
-          <Show when={compError()}>
-            <p class="notice error">{compError()}</p>
-          </Show>
           <Show when={compCancelled()}>
             <p class="notice muted">cancelled</p>
           </Show>
 
           <Show when={compBusy() && compStream()}>
-            <div class="panel pg-result">
+            <div class="panel pg-result" ref={compResultEl}>
               <div class="panel-row">
                 <span class="grow muted">Streaming…</span>
                 <span class="num">{fmtInt(compLive().length)} chars</span>
@@ -998,7 +1058,7 @@ export default function Playground() {
 
           <Show when={compResult()}>
             {(out) => (
-              <div class="panel pg-result">
+              <div class="panel pg-result flash" ref={compResultEl}>
                 <div class="panel-row">
                   <span class="grow mono">{out().res.id ?? "completion"}</span>
                   <Show when={out().res.choices?.[0]?.finish_reason}>
@@ -1010,16 +1070,10 @@ export default function Playground() {
                 </div>
                 <pre class="pg-output">{out().res.choices?.[0]?.text ?? ""}</pre>
                 <div class="panel-row">
-                  <span class="grow">
-                    <span class="badge">
-                      in {fmtInt(out().res.usage?.prompt_tokens)}
-                    </span>{" "}
-                    <span class="badge">
-                      out {fmtInt(out().res.usage?.completion_tokens)}
-                    </span>{" "}
-                    <span class="badge">
-                      total {fmtInt(out().res.usage?.total_tokens)}
-                    </span>
+                  <span class="grow muted meta-line">
+                    {fmtInt(out().res.usage?.prompt_tokens)} in ·{" "}
+                    {fmtInt(out().res.usage?.completion_tokens)} out ·{" "}
+                    {fmtInt(out().res.usage?.total_tokens)} tokens
                   </span>
                   <button
                     type="button"

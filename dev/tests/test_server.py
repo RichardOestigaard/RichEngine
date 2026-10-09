@@ -3850,6 +3850,7 @@ class ServerTest(unittest.TestCase):
             startup_timeout=hosting.NATIVE_START_TIMEOUT,
             pending_limit=1,
             eager_start=False,
+            env=None,
         )
         backend_type.assert_called_once_with(
             runtime,

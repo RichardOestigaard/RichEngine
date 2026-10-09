@@ -31,10 +31,22 @@ INSTALL_FILES = (
     "assembly.py",
     "legacy.py",
     "pack.py",
+    "pack_layouts.py",
     "upstream.py",
     "gguf.py",
     "catalog.py",
+    "autotune.py",
     "requirements.txt",
+)
+TUNING_FILES = (
+    "__init__.py",
+    "base.py",
+    "qwen.py",
+    "ornith.py",
+    "minicpm.py",
+    "lfm2.py",
+    "granite.py",
+    "gemma.py",
 )
 COMPLETION_FILES = (
     "models",
@@ -87,6 +99,7 @@ def digest(path):
 def stage_runtime(destination, version):
     for folder, names in (
         ("install", INSTALL_FILES),
+        ("install/tuning", TUNING_FILES),
         ("install/completions", COMPLETION_FILES),
         ("server", SERVER_FILES),
         ("engine", ("richengine", "richengine.metallib")),

@@ -6,6 +6,8 @@ import { Chart } from "../Chart";
 import { fmtBytes, fmtInt, fmtMs, fmtTokens, pct, rate } from "../format";
 import { installJob, onInstallDone, pollInstall, setInstallJob } from "../install";
 import type { InstallJob } from "../install";
+import { onTuneDone, pollTune, setTuneJob, tuneJob } from "../tune";
+import type { TuneJob } from "../tune";
 import { useCopied } from "../clipboard";
 import { useFreshness } from "../fresh";
 import { poll } from "../poll";
@@ -187,6 +189,15 @@ interface AvailableModel {
   vision_format?: string | null;
   bytes?: number | null;
   serving?: boolean;
+  /* The link's name under the models root — ".selections/<hash>" for
+     installs made with options; POST /v1/models/tune addresses by it. */
+  selection?: string;
+  /* Auto Tune state on this chip: "untuned" | "partial" | "tuned" |
+     "stale", and the knob count the record applies. */
+  tuned_knobs?: number | null;
+  tuning?: string | null;
+  /* False when the family's knob table is unknown — Tune would only fail. */
+  tunable?: boolean;
 }
 
 /* ---- /v1/models/available + /v1/models/install payload shapes ---- */
@@ -294,6 +305,13 @@ export default function Models() {
   const [suggested, setSuggested] = createSignal<string[]>([]);
   const [modelBusy, setModelBusy] = createSignal(false);
   const [confirmUnload, setConfirmUnload] = createSignal<AvailableModel | null>(null);
+  const [confirmTune, setConfirmTune] = createSignal<AvailableModel | null>(null);
+  const [tuneBusy, setTuneBusy] = createSignal(false);
+  /* Heartbeat for the silent gaps between sweep log lines: each candidate
+     is an engine launch, so minutes of quiet are normal — the counter
+     shows the sweep is alive. */
+  const [tick, setTick] = createSignal(0);
+  const [lastTailAt, setLastTailAt] = createSignal(Date.now());
   const [installBusy, setInstallBusy] = createSignal(false);
   const [installModel, setInstallModel] = createSignal("");
   const [installRevision, setInstallRevision] = createSignal("");
@@ -302,8 +320,10 @@ export default function Models() {
   const { markOk, updatedAgo, stale } = useFreshness();
   const { copied, copy } = useCopied();
   let logEl: HTMLPreElement | undefined;
+  let tuneLogEl: HTMLPreElement | undefined;
   /* Follow the install tail only while the reader stays at the bottom. */
   let logPinned = true;
+  let tuneLogPinned = true;
 
   async function pollStatus() {
     try {
@@ -420,6 +440,60 @@ export default function Models() {
     }
   }
 
+  /* Auto Tune: a server-side sweep job, polled in ../tune. The row's Tune
+     button opens a dialog that picks the mode — and warns when a model is
+     loaded, since its engine shares the GPU and contaminates every
+     measurement; the choice the user confirms carries allow_loaded. */
+  async function startTune(entry: AvailableModel, mode: "quick" | "complete") {
+    const model = entry.model ?? "";
+    if (!model || tuneBusy() || tuneJob()?.running) return;
+    const state = s().model_state;
+    setConfirmTune(null);
+    setTuneBusy(true);
+    try {
+      tuneLogPinned = true;
+      setLastTailAt(Date.now());
+      const body: Record<string, unknown> = {
+        model,
+        mode,
+        allow_loaded: state === "loaded" || state === "loading",
+      };
+      /* Optioned installs (.selections/<hash> links) aren't reachable by
+         model id — the server resolves the link directly. */
+      if (entry.selection) body.selection = entry.selection;
+      setTuneJob(await apiPost<TuneJob>("/v1/models/tune", body));
+    } catch (e) {
+      pushToast("error", errorText(e));
+    } finally {
+      setTuneBusy(false);
+    }
+  }
+
+  async function cancelTune() {
+    try {
+      await apiPost("/v1/models/tune/cancel", {});
+      void pollTune();
+    } catch (e) {
+      pushToast("error", errorText(e));
+    }
+  }
+
+  const tuneElapsed = () => {
+    const started = tuneJob()?.started;
+    if (!started) return "";
+    const seconds = Math.max(0, Math.round(Date.now() / 1000 - started));
+    return seconds < 60
+      ? `${seconds}s`
+      : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  };
+
+  /* Seconds since the sweep last printed — the proof of life between the
+     minutes-long engine launches. */
+  const tailQuiet = () => {
+    tick();
+    return Math.max(0, Math.round((Date.now() - lastTailAt()) / 1000));
+  };
+
   const installElapsed = () => {
     const started = installJob()?.started;
     if (!started) return "";
@@ -434,16 +508,30 @@ export default function Models() {
     installJob()?.tail?.join("\n");
     if (logPinned && logEl) logEl.scrollTop = logEl.scrollHeight;
   });
+  createEffect(() => {
+    tuneJob()?.tail?.join("\n");
+    if (tuneLogPinned && tuneLogEl) tuneLogEl.scrollTop = tuneLogEl.scrollHeight;
+  });
+  /* The quiet-gap counter: lastTailAt moves whenever the tail grows. */
+  createEffect(() => {
+    if (tuneJob()?.tail?.length) setLastTailAt(Date.now());
+  });
 
   onMount(() => {
     loadModelsList();
     loadAvailable();
     void pollInstall();
+    void pollTune();
+    /* Drives the tune panel's quiet-gap counter. */
+    const ticker = setInterval(() => setTick((t) => t + 1), 1000);
+    onCleanup(() => clearInterval(ticker));
     /* A persisted-open raw section skips the lazy-load toggle. */
     if (collapseOpen("raw-metrics", false)) void loadMetrics();
   });
-  /* Refresh the installed list when a module-polled install finishes. */
+  /* Refresh the installed list when a module-polled install or tune
+     finishes — either changes a row's state. */
   onCleanup(onInstallDone(loadAvailable));
+  onCleanup(onTuneDone(loadAvailable));
   onCleanup(poll(() => (paused() ? Promise.resolve() : pollStatus()), 2000));
 
   const s = () => status() ?? {};
@@ -728,7 +816,67 @@ export default function Models() {
                     <Show when={entry.vision_format}>
                       <span class="badge">{entry.vision_format}</span>
                     </Show>
+                    <Show
+                      when={
+                        (entry.tuned_knobs ?? 0) > 0 && entry.tuning === "tuned"
+                      }
+                    >
+                      <span
+                        class="badge ok"
+                        title={`${entry.tuned_knobs} engine knobs measured on this chip, applied on every load`}
+                      >
+                        tuned·{entry.tuned_knobs}
+                      </span>
+                    </Show>
+                    <Show when={entry.tuning === "partial"}>
+                      <span
+                        class="badge warn"
+                        title="A sweep kept these knobs but never finished — Tune again to resume"
+                      >
+                        partial{(entry.tuned_knobs ?? 0) > 0
+                          ? `·${entry.tuned_knobs}`
+                          : ""}
+                      </span>
+                    </Show>
+                    <Show when={entry.tuning === "stale"}>
+                      <span
+                        class="badge warn"
+                        title="A tune exists but no longer applies — recorded by an older sweep or engine build"
+                      >
+                        tuning stale
+                      </span>
+                    </Show>
+                    <Show when={entry.tuning === "untuned" && entry.tunable}>
+                      <span
+                        class="badge"
+                        title="Never tuned on this chip — Auto Tune measures and keeps its fastest engine settings"
+                      >
+                        not tuned
+                      </span>
+                    </Show>
                     <span class="num">{fmtBytes(entry.bytes)}</span>
+                    <button
+                      class="btn small"
+                      disabled={
+                        tuneBusy() ||
+                        !!tuneJob()?.running ||
+                        entry.tunable === false
+                      }
+                      title={
+                        entry.tunable === false
+                          ? "No tunable knobs for this model's family"
+                          : tuneJob()?.running
+                            ? `A tune of ${tuneJob()?.model} is running`
+                            : entry.tuning === "stale"
+                              ? "Re-measure this chip's fastest engine knobs — the record went stale"
+                              : "Measure this chip's fastest engine knobs for this model"
+                      }
+                      onClick={() => setConfirmTune(entry)}
+                    >
+                      {tuneJob()?.running && tuneJob()?.model === entry.model
+                        ? "Tuning…"
+                        : "Tune"}
+                    </button>
                     <Show
                       when={entry.serving}
                       fallback={
@@ -758,6 +906,102 @@ export default function Models() {
             </Show>
           </Show>
         </div>
+        <Show when={tuneJob()?.model}>
+          <div class="panel install-job">
+            <div class="panel-row">
+              <span class="grow">
+                <Show
+                  when={tuneJob()?.done}
+                  fallback={
+                    <>
+                      Tuning <span class="mono">{tuneJob()?.model}</span>…{" "}
+                      <span
+                        class="muted"
+                        title="Mode, progress, and seconds since the sweep last printed — engine launches are minutes of quiet, not a hang"
+                      >
+                        {tuneJob()?.mode ?? "quick"}
+                        <Show when={(tuneJob()?.candidates_total ?? 0) > 0}>
+                          {` · candidate ${tuneJob()?.candidates_done ?? 0}/${tuneJob()?.candidates_total}`}
+                        </Show>
+                        {` · ${tailQuiet()}s quiet`}
+                      </span>
+                    </>
+                  }
+                >
+                  <Show
+                    when={tuneJob()?.ok}
+                    fallback={
+                      <>
+                        Tune of <span class="mono">{tuneJob()?.model}</span>{" "}
+                        {tuneJob()?.cancelled
+                          ? "cancelled"
+                          : `failed${tuneJob()?.error ? ` — ${tuneJob()?.error}` : ""}`}
+                        <Show when={(tuneJob()?.kept?.length ?? 0) > 0}>
+                          {` — kept ${tuneJob()?.kept?.join(", ")} so far; a retry resumes`}
+                        </Show>
+                      </>
+                    }
+                  >
+                    Tuned <span class="mono">{tuneJob()?.model}</span>
+                    <Show when={tuneJob()?.headline}>
+                      {` — ${tuneJob()?.headline}`}
+                    </Show>
+                    <Show
+                      when={(tuneJob()?.kept?.length ?? 0) > 0}
+                      fallback={" — defaults already won"}
+                    >
+                      {` · kept ${tuneJob()?.kept?.join(", ")}`}
+                    </Show>
+                  </Show>
+                </Show>
+              </span>
+              <span class="num">{tuneElapsed()}</span>
+              <Show
+                when={tuneJob()?.running}
+                fallback={
+                  <Show when={tuneJob()?.done && tuneJob()?.ok}>
+                    <button
+                      class="btn small"
+                      title="Load this model now"
+                      disabled={modelWorking()}
+                      onClick={() => void loadModel(tuneJob()?.model ?? "")}
+                    >
+                      Load it
+                    </button>
+                  </Show>
+                }
+              >
+                <button
+                  class="btn small danger"
+                  title="Stop the sweep — its partial record resumes on retry"
+                  onClick={() => void cancelTune()}
+                >
+                  Cancel
+                </button>
+              </Show>
+            </div>
+            <Show when={tuneJob()?.done && (tuneJob()?.results?.length ?? 0) > 0}>
+              <div class="panel-row">
+                <span class="grow muted mono" style="white-space: normal">
+                  {tuneJob()?.results?.join("  ·  ")}
+                </span>
+              </div>
+            </Show>
+            <Show when={(tuneJob()?.tail?.length ?? 0) > 0}>
+              <pre
+                class="install-log"
+                ref={tuneLogEl}
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  tuneLogPinned =
+                    el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+                }}
+              >
+                {tuneJob()?.tail?.join("\n")}
+              </pre>
+            </Show>
+          </div>
+        </Show>
       </section>
 
       {/* 1c. Install a model */}
@@ -1332,6 +1576,42 @@ export default function Models() {
       >
         The served model is freed and requests fail until another one is
         loaded. In-flight requests may be interrupted.
+      </Confirm>
+
+      <Confirm
+        open={confirmTune() !== null}
+        title={`Tune ${confirmTune()?.model ?? "model"}?`}
+        confirmLabel="Complete"
+        confirmClass="btn primary"
+        secondaryLabel="Quick"
+        secondaryClass="btn"
+        busy={tuneBusy()}
+        onSecondary={() => {
+          const entry = confirmTune();
+          if (entry) void startTune(entry, "quick");
+        }}
+        onConfirm={() => {
+          const entry = confirmTune();
+          if (entry) void startTune(entry, "complete");
+        }}
+        onClose={() => setConfirmTune(null)}
+      >
+        <p>
+          <b>Quick</b> sweeps this chip's performance knobs — kernel and
+          draft paths. <b>Complete</b> adds quality-trading knobs (faster
+          output, lower quality) and a knob-interaction recheck — roughly
+          double the time.
+        </p>
+        <Show
+          when={
+            s().model_state === "loaded" || s().model_state === "loading"
+          }
+        >
+          <p>
+            A model is loaded — its engine shares the GPU and skews every
+            measurement. Unload it first for a clean record, or tune anyway.
+          </p>
+        </Show>
       </Confirm>
 
       {/* 10. Raw /metrics, fetched on expand */}

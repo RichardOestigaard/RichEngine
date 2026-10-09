@@ -180,7 +180,7 @@ void checkUnsizedProjection() {
 void checkGdnWidths() {
   const auto sparse = package<model::Qwen3_6MoeWeights>();
   const auto layoutRejected = [](const model::Qwen3_6MoeLayout &layout) {
-    try { model::requireQwenLayout(layout); }
+    try { model::requireTargetLayout(layout); }
     catch (const model::WeightStoreError &) { return true; }
     return false;
   };

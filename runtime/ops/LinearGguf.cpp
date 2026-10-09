@@ -99,7 +99,7 @@ bool nativeDecodeFormat(uint32_t formatId) noexcept {
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
-  const uint32_t lanes = w.rows / 8;
+  const uint32_t lanes = w.rows / RICHENGINE_TARGET_VERIFY_ROWS;
   bool quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;

@@ -83,18 +83,18 @@ struct BlockTargetFormat final {
 // Reads the mixer sections that follow a layer's input norm, in file order
 // (instantiated for both formats).
 template <class Format>
-[[nodiscard]] MixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                                             const QwenMixerGeometry &geometry,
+[[nodiscard]] MixerWeights readMixer(WeightFile &file, const Format &format,
+                                             const MixerGeometry &geometry,
                                              bool fullAttention);
 
-// The family's mixer reader; the default reads a Qwen GDN/full-attention
+// The family's mixer reader; the default reads the hybrid GDN/full-attention
 // mixer, Dense.hpp and Lfm2.hpp overload it for their mixers.
 template <class Layout, class Format>
 [[nodiscard]] MixerWeights readTargetMixer(const Layout &, WeightFile &file,
                                                const Format &format,
-                                               const QwenMixerGeometry &geometry,
+                                               const MixerGeometry &geometry,
                                                bool fullAttention) {
-  return readQwenMixer(file, format, geometry, fullAttention);
+  return readMixer(file, format, geometry, fullAttention);
 }
 
 // Loads the packed files of a target directory: one per hybrid layer,
@@ -172,7 +172,7 @@ readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files
 
 // Throws unless every dimension of a family's layout is set, the dimensions
 // agree with each other and every projection fits the Q4 storage tiles.
-template <class Layout> void requireQwenLayout(const Layout &layout) {
+template <class Layout> void requireTargetLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   uint32_t ffnWidth = 0;
   bool ffnZero = false;
@@ -191,7 +191,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
            layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
            layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
            layout.fullAttentionPeriod))
-    throw WeightStoreError("Qwen target layout contains a zero dimension");
+    throw WeightStoreError("target layout contains a zero dimension");
   if (routingInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
       layout.convolutionDimension != (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
@@ -202,7 +202,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
               2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
       std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
-    throw WeightStoreError("Qwen target layout is inconsistent");
+    throw WeightStoreError("target layout is inconsistent");
   validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
   validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
@@ -218,7 +218,7 @@ template <class Weights, class Layout, class ReadFfn>
 [[nodiscard]] Weights
 loadTargetWeights(metal::MetalBackend &backend, const Layout &layout, const TargetFiles<Layout> &files,
                ReadFfn readFfn) {
-  requireQwenLayout(layout);
+  requireTargetLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readTargetModelWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))

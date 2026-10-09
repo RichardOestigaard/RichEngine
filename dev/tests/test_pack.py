@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from install import pack
+from install import pack, pack_layouts
 
 
 def bf16(values):
@@ -41,7 +41,7 @@ def f32_bytes(values):
     return np.asarray(values, np.float32).tobytes()
 
 
-LAYOUT = pack.Layout(
+LAYOUT = pack_layouts.Layout(
     layers=2,
     hidden=256,
     vocabulary=512,
@@ -60,7 +60,7 @@ LAYOUT = pack.Layout(
 )
 
 
-DRAFT_LAYOUT = pack.DraftLayout(
+DRAFT_LAYOUT = pack_layouts.DraftLayout(
     layers=1,
     hidden=256,
     kv_heads=2,
@@ -338,7 +338,7 @@ class PackTests(unittest.TestCase):
         shard = synthetic_checkpoint(self.root)
         checkpoint = pack.Checkpoint([shard])
         sections = pack._layer_sections(checkpoint, LAYOUT, 0)
-        self.assertEqual(len(sections), len(pack.LAYER_SECTIONS))
+        self.assertEqual(len(sections), len(pack_layouts.LAYER_SECTIONS))
         hidden, width, e, packed = 256, LAYOUT.packed_width_at(0), 4, 256
         sizes = [
             hidden * 2,  # input-norm

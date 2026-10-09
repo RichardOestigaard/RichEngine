@@ -2,7 +2,7 @@
 #include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 #include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
 
@@ -83,7 +83,7 @@ StateAdmission Runtime::begin(const ModelRequest &request) {
 void Runtime::suspend(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || entry.verifyMaskInFlight) {
-    throw std::logic_error("Qwen request cannot be suspended");
+    throw std::logic_error("request cannot be suspended");
   }
   impl_->states.releaseLane(entry.stateLane, requestId);
   impl_->pageTableBindings[entry.stateLane] = {};
@@ -97,7 +97,7 @@ void Runtime::suspend(uint64_t requestId) {
 StateAdmission Runtime::resume(const ModelRequest &request) {
   Impl::Request &entry = impl_->request(request.id);
   if (entry.resident) {
-    throw std::logic_error("Qwen request is not suspended");
+    throw std::logic_error("request is not suspended");
   }
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
@@ -174,7 +174,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
     throw std::invalid_argument("restore stops before images its activation left out");
   if (!restoreDraftState)
     ++impl_->counters.draftStateRestoreSkipped;
-  const QwenLogicalLengths &lengths =
+  const LogicalLengths &lengths =
       impl_->states.metadata(entry.stateLane).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
       (restoreDraftState &&
@@ -239,7 +239,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
                       std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Prefill);
   if (plan.decodeStage != DecodeStage::Regular) {
-    throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
+    throw std::invalid_argument("prefill cannot resume a mask plan");
   }
 
   std::array<Impl::Request *, kLaneCount> entries{};
@@ -362,7 +362,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
         }
       }
       impl->states.swapParity(entry.stateLane);
-      QwenLogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
+      LogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
       lengths.targetTokens = nextLength;
       for (const DispatchDraftCaptureSpan &capture : captures[lane]) {
         lengths = Impl::advanceDraftContext(lengths, nextLength,
@@ -543,7 +543,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // anchors and positions match every lane — the chain path consumes its
   // proposals; there is no tree table, so it stays a chain. The n-gram
   // predraft does emit comb tables for a tree-eligible Null draft batch.
-  impl_->predraftedTree_ = false;
+  impl_->ngram_.predraftedTree_ = false;
   const bool predrafted =
       (!constrained || nullDraft) &&
       (impl_->applyAnePredraft(entries, items, width) ||
@@ -588,13 +588,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
   }
   const bool tree = !draftBypassed && treeBatch &&
-                    (predrafted ? impl_->predraftedTree_ : true);
-  if (impl_->treeDebug_)
-    fprintf(stderr,
-            "tree-gate width=%u treeBatch=%d drafted=%d predrafted=%d "
-            "predraftedTree=%d constrained=%d bypassed=%d\n",
-            width, treeBatch, !draftBypassed, predrafted,
-            impl_->predraftedTree_, constrained, draftBypassed);
+                    (predrafted ? impl_->ngram_.predraftedTree_ : true);
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   if (tree) {

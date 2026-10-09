@@ -246,7 +246,7 @@ public:
                        metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                        metal::MetalBuffer chunkValues, uint32_t tokens,
                        uint32_t stride, uint32_t queryHeads, kv::Layout layout);
-  // `queryGate` selects the sigmoid gate of the Qwen rows or the plain
+  // `queryGate` selects the sigmoid gate of the gated rows or the plain
   // gather of the no-gate targets (dense, LFM2).
   static void addPrefillGate(metal::CommandGraph &graph,
                              metal::MetalBuffer packed,

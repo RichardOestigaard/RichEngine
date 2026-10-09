@@ -5,7 +5,7 @@ namespace richengine::model {
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
   // tokens then append through commitSelected.
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
-    if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
+    if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::seed(entry.ngram, prompt);
     entry.ngramRounds = 0;
@@ -15,7 +15,7 @@ namespace richengine::model {
   }
 
   void Runtime::Impl::appendNgramTokens(Request &entry, std::span<const uint32_t> tokens) {
-    if (!ngramPredraft_ && !std::holds_alternative<NullDraft>(draftModel))
+    if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::append(entry.ngram, tokens);
   }
@@ -27,9 +27,9 @@ namespace richengine::model {
   double Runtime::Impl::ngramLaneScore(const Request &entry, bool found) const {
     if (!found)
       return 0;
-    if (entry.ngramRounds < ngramWarmup_ ||
+    if (entry.ngramRounds < ngram_.ngramWarmup_ ||
         entry.generatedTokens >= entry.ngramProbeAt)
-      return ngramDraftExpect_;
+      return ngram_.ngramDraftExpect_;
     return entry.ngramAcceptedAvg;
   }
 
@@ -44,10 +44,10 @@ namespace richengine::model {
     // A NullDraft model (Granite) has no GPU draft: the n-gram predraft is
     // its only proposer, so the gates below do not veto it.
     const bool nullDraft = std::holds_alternative<NullDraft>(draftModel);
-    if (!ngramPredraft_ && !nullDraft)
+    if (!ngramPredraftEnabled() && !nullDraft)
       return false;
-    predraftedTree_ = false;
-    predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
+    ngram_.predraftedTree_ = false;
+    ngram_.predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
     std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
         proposals{};
     std::array<uint32_t, kLaneCount> foundCounts{};
@@ -74,7 +74,7 @@ namespace richengine::model {
         fprintf(stderr, "ngram-predraft lane=%u match=%u score=%.2f\n", lane,
                 found, ngramLaneScore(entry, found != 0));
     }
-    if (score < width * ngramDraftExpect_ && !nullDraft)
+    if (score < width * ngram_.ngramDraftExpect_ && !nullDraft)
       return false;
     // The comb costs a wider verify per step; emit it only while some lane's
     // acceptance EWMA says the proposer is landing often enough for sibling
@@ -82,7 +82,7 @@ namespace richengine::model {
     if (emitTree) {
       bool hot = false;
       for (uint32_t lane = 0; lane < width; ++lane)
-        hot |= entries[lane]->ngramAcceptedAvg >= ngramTreeMin_;
+        hot |= entries[lane]->ngramAcceptedAvg >= ngram_.ngramTreeMin_;
       if (!hot)
         emitTree = false;
     }
@@ -119,8 +119,8 @@ namespace richengine::model {
           decodeArena->get(lane, DecodeTensor::TreeCounts),
           "ngram tree counts") = count;
     }
-    predraftedTreeNodes_ = liveNodes;
-    predraftedTree_ = true;
+    ngram_.predraftedTreeNodes_ = liveNodes;
+    ngram_.predraftedTree_ = true;
     return true;
   }
 

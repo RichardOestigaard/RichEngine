@@ -7,8 +7,9 @@
 // formats, float for a GGUF's F32 norms. HeadDim is the per-head dimension,
 // RotaryPairs the rotated dimension pairs of each head (headDim/2 for the
 // full-rotary variants), QueryGate whether every query head is stored as
-// [query | gate] pairs (Qwen) or plain rows, Norms whether the per-head RMS
-// norms run at all (the dense target has none), eps their epsilon.
+// [query | gate] pairs (the hybrid families) or plain rows, Norms whether
+// the per-head RMS norms run at all (the dense target has none), eps their
+// epsilon.
 // KeyEqualsValue (Gemma 4's k_eq_v global layers): the packed row carries no
 // V region, and the V slot of chunk_values instead receives the scale-free
 // RMS norm of the head's pre-norm K — element * inverse, the value before the

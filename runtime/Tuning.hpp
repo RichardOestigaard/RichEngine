@@ -67,6 +67,12 @@ struct Tuning {
   double ngramDraftExpect = 4.0;    // RICHENGINE_NGRAM_DRAFT_EXPECT
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;        // RICHENGINE_NGRAM_TREE_MIN
+  // Presence flags for the threshold knobs above: a family's ModelTuning
+  // value is the default and an explicitly set variable overrides it.
+  bool draftBypassExpectSet = false;
+  bool ngramDraftExpectSet = false;
+  bool ngramWarmupSet = false;
+  bool ngramTreeMinSet = false;
   // model/RuntimeImpl.hpp debug gates
   bool treeDebug = false;           // RICHENGINE_TREE_DEBUG (presence)
   bool draftDebug = false;          // RICHENGINE_DRAFT_DEBUG (presence)
@@ -158,9 +164,13 @@ inline Tuning makeTuning() {
   t.adaptiveProposals = unlessZero("RICHENGINE_ADAPTIVE_PROPOSALS");
   t.ngramPredraft = unlessZero("RICHENGINE_NGRAM_PREDRAFT");
   t.draftBypass = unlessZero("RICHENGINE_DRAFT_BYPASS");
+  t.draftBypassExpectSet = envFlag("RICHENGINE_DRAFT_BYPASS_EXPECT");
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
+  t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");
   t.ngramDraftExpect = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
+  t.ngramWarmupSet = envFlag("RICHENGINE_NGRAM_WARMUP");
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
+  t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
   t.ngramTreeMin = envDouble("RICHENGINE_NGRAM_TREE_MIN", 1.0);
   t.treeDebug = envFlag("RICHENGINE_TREE_DEBUG");
   t.draftDebug = envFlag("RICHENGINE_DRAFT_DEBUG");

@@ -12,11 +12,11 @@ namespace richengine::model {
 
 enum class FfnKind : uint8_t { Dense, SparseMoe };
 
-// The magic of a Qwen target's packed embedding file, whatever its family.
+// The magic of a hybrid target's packed embedding file, whatever its family.
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
 // Sizes of the mixer sections in a packed layer file.
-struct QwenMixerGeometry final {
+struct MixerGeometry final {
   uint32_t hiddenSize = 0;
   uint32_t packedGdnWidth = 0;
   uint32_t packedFullWidth = 0;
@@ -28,7 +28,7 @@ struct QwenMixerGeometry final {
   uint32_t convolutionTaps = 0;
 };
 
-// The dimensions and tokens of a Qwen hybrid target: GDN layers, every
+// The dimensions and tokens of a hybrid target: GDN layers, every
 // fullAttentionPeriod-th layer full attention instead, each followed by the
 // family's FFN, and the CaptureLayers layers whose hidden states the draft
 // reads. A family sets every value and adds its FFN sizes, its file magics
@@ -78,7 +78,7 @@ template <size_t CaptureLayers> struct QwenHybridLayout {
             convolutionDimension,
             gdnValueHeads, gdnHeadDimension, gdnHeadDimension};
   }
-  [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
+  [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
             attentionWidth, attentionHeadDimension, kGdnConvolutionTaps};

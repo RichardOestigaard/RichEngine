@@ -22,7 +22,7 @@ from urllib.parse import unquote
 
 from huggingface_hub.utils import validate_repo_id
 
-from . import disk, installer, json_codec, judgments, serve_options
+from . import disk, installer, json_codec, judgments, serve_options, tuner
 from . import runtime as engine_runtime
 from .api_shapes import (
     anthropic_response,
@@ -540,7 +540,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             from install import launcher
 
             try:
-                installed = launcher._installed_details()
+                installed = launcher._installed_details(self._models_root())
             except launcher.LauncherError as error:
                 self._safe_error(APIError(500, str(error)))
                 return
@@ -558,6 +558,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/models/install":
             self._json(200, self._installer().status())
+            return
+        if path == "/v1/models/tune":
+            self._json(200, self._tuner().status())
             return
         if path == "/v1/models" or path.startswith("/v1/models/"):
             app = self.app
@@ -669,6 +672,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/models/unload",
             "/v1/models/install",
             "/v1/models/install/cancel",
+            "/v1/models/tune",
+            "/v1/models/tune/cancel",
             "/v1/tools/fetch",
             "/v1/tools/search",
         ):
@@ -965,6 +970,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     raise APIError(400, '"draft_model" must be a string or null')
                 if not isinstance(language_only, bool):
                     raise APIError(400, '"language_only" must be a boolean')
+                if self._tuner().status().get("running"):
+                    # The sweep's measurements would bake the install's
+                    # engine noise into the tuning record — and the install
+                    # could move the model out from under it.
+                    raise APIError(
+                        409,
+                        "a tune is running; wait for it to finish",
+                        "engine_busy",
+                    )
                 self._json(
                     200,
                     self._installer().start(
@@ -978,6 +992,74 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/models/install/cancel":
                 cancelled = self._installer().cancel()
+                self._json(200, {"status": "cancelled" if cancelled else "idle"})
+                return
+            if path == "/v1/models/tune":
+                model = body.get("model")
+                if not isinstance(model, str) or not model:
+                    raise APIError(400, '"model" must be a model ID string')
+                revision = body.get("revision")
+                draft_model = body.get("draft_model")
+                language_only = body.get("language_only", False)
+                include_quality = body.get("include_quality", False)
+                no_interaction = body.get("no_interaction_pass", False)
+                allow_loaded = body.get("allow_loaded", False)
+                mode = body.get("mode", "quick")
+                selection = body.get("selection")
+                interaction_pass = body.get("interaction_pass")
+                if revision is not None and not isinstance(revision, str):
+                    raise APIError(400, '"revision" must be a string or null')
+                if draft_model is not None and not isinstance(draft_model, str):
+                    raise APIError(400, '"draft_model" must be a string or null')
+                if not isinstance(language_only, bool):
+                    raise APIError(400, '"language_only" must be a boolean')
+                if not isinstance(include_quality, bool):
+                    raise APIError(400, '"include_quality" must be a boolean')
+                if not isinstance(no_interaction, bool):
+                    raise APIError(400, '"no_interaction_pass" must be a boolean')
+                if not isinstance(allow_loaded, bool):
+                    raise APIError(400, '"allow_loaded" must be a boolean')
+                if not isinstance(mode, str) or mode not in ("quick", "complete"):
+                    raise APIError(400, '"mode" must be "quick" or "complete"')
+                if selection is not None and not isinstance(selection, str):
+                    raise APIError(400, '"selection" must be a string or null')
+                if interaction_pass is not None and not isinstance(
+                    interaction_pass, bool
+                ):
+                    raise APIError(
+                        400, '"interaction_pass" must be a boolean or null'
+                    )
+                if interaction_pass is None and no_interaction:
+                    interaction_pass = False
+                if self._installer().status().get("running"):
+                    # An install launches engines too; its noise would bake
+                    # into the tuning record.
+                    raise APIError(
+                        409,
+                        "an install is running; wait for it to finish",
+                        "engine_busy",
+                    )
+                host = getattr(self.server, "host", None)
+                self._json(
+                    200,
+                    self._tuner().start(
+                        self._models_root(),
+                        model,
+                        revision=revision,
+                        draft_model=draft_model,
+                        language_only=language_only,
+                        mode=mode,
+                        selection=selection,
+                        include_quality=include_quality,
+                        interaction_pass=interaction_pass,
+                        allow_loaded=allow_loaded,
+                        serving=self.app is not None
+                        or getattr(host, "state", None) == "loading",
+                    ),
+                )
+                return
+            if path == "/v1/models/tune/cancel":
+                cancelled = self._tuner().cancel()
                 self._json(200, {"status": "cancelled" if cancelled else "idle"})
                 return
             variants = body.get("variants", False)
@@ -1014,6 +1096,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if instance is None:
             instance = installer.Installer()
             self.server.installer = instance
+        return instance
+
+    def _tuner(self):
+        """The server's one tune job runner, created on first use."""
+        instance = getattr(self.server, "tuner", None)
+        if instance is None:
+            instance = tuner.Tuner()
+            self.server.tuner = instance
         return instance
 
     def _models_root(self):

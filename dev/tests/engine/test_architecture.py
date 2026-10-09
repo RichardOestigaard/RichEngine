@@ -260,7 +260,7 @@ class ArchitectureTests(unittest.TestCase):
             "model/Qwen3_6Moe.hpp",
             "model/Qwen3_8.hpp",
             "model/QwenHybridLayout.hpp",
-            "model/QwenState.hpp",
+            "model/CompositeStateStorage.hpp",
             "model/TargetModel.hpp",
             "model/TargetFiles.hpp",
             "model/TargetLoader.hpp",

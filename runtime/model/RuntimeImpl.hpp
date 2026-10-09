@@ -13,7 +13,7 @@
 #include "Tuning.hpp"
 #include "model/AnePredictor.hpp"
 #include "model/NullDraft.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 #include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
 
@@ -209,7 +209,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   const RuntimeGeometry geometry;
   const ops::ExecutionPlans &operators;
   kv::PageStorage &kvPages;
-  QwenStateStorage &states;
+  CompositeStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
   // Submit-ahead input banks (PrefillArena::get(tensor, bank)): one bit per
   // bank an unconsumed prefill command wrote. At most one submit-ahead
@@ -266,10 +266,60 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // decodes run the canvas denoising loop (RuntimeDiffusion.mm) instead of
   // draft/verify, single-lane and synchronous.
   const bool diffusion;
-  // shared_ptr, not unique_ptr: the pointer's deleter binds when the arena
-  // is made, so the constructor's unwind path needs no complete type.
   struct DiffusionCanvasArena;
-  std::shared_ptr<DiffusionCanvasArena> canvasArena_;
+  // The canvas decode's state (RuntimeDiffusion.mm), read only when
+  // `diffusion` is set: the step-chunking and exit-policy knobs, captured
+  // once from tuning, and the shared canvas arena built lazily on the first
+  // canvas decode.
+  struct DiffusionState final {
+    // Canvas step chunking and exit policy:
+    // RICHENGINE_CANVAS_STEPS_PER_CMD (default 2, clamped to 1..4): denoise
+    // steps encoded per command buffer; the stats and argmax rings carry one
+    // slot per step so a mid-chunk early exit still drains in order — the
+    // extra steps past it were dead compute only. 1 restores the old
+    // encode/wait-per-step loop.
+    const uint32_t canvasStepsPerCmd_ = tuning().canvasStepsPerCmd;
+    // RICHENGINE_CANVAS_PREFIX_EXIT (default 1; "0" disables): early exit
+    // judges argmax stability over the prefix bounded by the first stop
+    // token, so churn past it does not hold the canvas alive.
+    const bool canvasPrefixExit_ = tuning().canvasPrefixExit;
+    // RICHENGINE_CANVAS_COMMIT_TAIL (default 1; "0" disables): the last
+    // scheduled step encodes without canvas_entropy_accept — the commit
+    // reads the row-stats argmax directly.
+    const bool canvasCommitTail_ = tuning().canvasCommitTail;
+    // RICHENGINE_CANVAS_SPECULATIVE_PREFILL (default on; "0" disables): once
+    // a drained step leaves the whole-canvas argmax unchanged, the encoder
+    // commit prefill is encoded ahead of the formal exit on dedicated
+    // buffers and skipped later if the commit mismatches.
+    const bool canvasSpecPrefill_ = tuning().canvasSpeculativePrefill;
+    // RICHENGINE_CANVAS_PROFILE ("paper"|"balanced"|"fast"): bundles the
+    // speed/quality knobs below for serve's --canvas-profile. Each knob's own
+    // RICHENGINE_* variable wins over the profile when set.
+    const std::string_view canvasProfile_ = tuning().canvasProfile;
+    // RICHENGINE_CANVAS_EXIT_STABLE (default 0.9; "0" disables): the
+    // fraction-settled exit — at least this share of argmax-stable rows whose
+    // mean entropy is under the confidence threshold commits early. Renoised
+    // rows never settle on open-ended prompts, so the paper's strict
+    // whole-canvas mean is otherwise unreachable.
+    const float canvasExitStable_ = tuning().canvasExitStable;
+    // RICHENGINE_CANVAS_EXIT_DRIFT (default 0; "1" enables): fraction-settled
+    // exit without the confidence check — commits a mostly-stable canvas's
+    // argmax, freezing its churning minority early.
+    const bool canvasDriftExit_ = tuning().canvasDriftExit;
+    // RICHENGINE_CANVAS_MAX_STEPS (default 0 = the manifest's 48): caps the
+    // denoising schedule. Prose canvases never settle inside 48 steps, so
+    // the cap is the speed/quality dial — 24 roughly doubles throughput.
+    const uint32_t canvasMaxSteps_ = tuning().canvasMaxSteps;
+    // RICHENGINE_CANVAS_PROBE ("notrunk"|"notail"|"nosc"): a timing probe
+    // that skips the named stage of every canvas step — the trunk pass, the
+    // head+row-stats+accept tail, or the self-conditioning chain. Output is
+    // garbage; use with CANVAS_TIMING to attribute the per-step cost.
+    const std::string_view canvasProbe_ = tuning().canvasProbe;
+    // shared_ptr, not unique_ptr: the pointer's deleter binds when the arena
+    // is made, so the constructor's unwind path needs no complete type.
+    std::shared_ptr<DiffusionCanvasArena> canvasArena_;
+  };
+  DiffusionState diffusion_;
   [[nodiscard]] DiffusionCanvasArena &canvasArena();
   [[nodiscard]] const DiffusionGemmaWeights &diffusionWeights() const;
   // The encoder pass's per-layer scalars: nonempty only for a diffusion
@@ -280,49 +330,6 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   decodeDiffusion(const BatchPlan &plan,
                   std::span<const ModelBatchItem> items,
                   std::function<void()> completion);
-  // Canvas step chunking and exit policy (RuntimeDiffusion.mm):
-  // RICHENGINE_CANVAS_STEPS_PER_CMD (default 2, clamped to 1..4): denoise
-  // steps encoded per command buffer; the stats and argmax rings carry one
-  // slot per step so a mid-chunk early exit still drains in order — the
-  // extra steps past it were dead compute only. 1 restores the old
-  // encode/wait-per-step loop.
-  const uint32_t canvasStepsPerCmd_ = tuning().canvasStepsPerCmd;
-  // RICHENGINE_CANVAS_PREFIX_EXIT (default 1; "0" disables): early exit
-  // judges argmax stability over the prefix bounded by the first stop
-  // token, so churn past it does not hold the canvas alive.
-  const bool canvasPrefixExit_ = tuning().canvasPrefixExit;
-  // RICHENGINE_CANVAS_COMMIT_TAIL (default 1; "0" disables): the last
-  // scheduled step encodes without canvas_entropy_accept — the commit
-  // reads the row-stats argmax directly.
-  const bool canvasCommitTail_ = tuning().canvasCommitTail;
-  // RICHENGINE_CANVAS_SPECULATIVE_PREFILL (default on; "0" disables): once
-  // a drained step leaves the whole-canvas argmax unchanged, the encoder
-  // commit prefill is encoded ahead of the formal exit on dedicated
-  // buffers and skipped later if the commit mismatches.
-  const bool canvasSpecPrefill_ = tuning().canvasSpeculativePrefill;
-  // RICHENGINE_CANVAS_PROFILE ("paper"|"balanced"|"fast"): bundles the
-  // speed/quality knobs below for serve's --canvas-profile. Each knob's own
-  // RICHENGINE_* variable wins over the profile when set.
-  const std::string_view canvasProfile_ = tuning().canvasProfile;
-  // RICHENGINE_CANVAS_EXIT_STABLE (default 0.9; "0" disables): the
-  // fraction-settled exit — at least this share of argmax-stable rows whose
-  // mean entropy is under the confidence threshold commits early. Renoised
-  // rows never settle on open-ended prompts, so the paper's strict
-  // whole-canvas mean is otherwise unreachable.
-  const float canvasExitStable_ = tuning().canvasExitStable;
-  // RICHENGINE_CANVAS_EXIT_DRIFT (default 0; "1" enables): fraction-settled
-  // exit without the confidence check — commits a mostly-stable canvas's
-  // argmax, freezing its churning minority early.
-  const bool canvasDriftExit_ = tuning().canvasDriftExit;
-  // RICHENGINE_CANVAS_MAX_STEPS (default 0 = the manifest's 48): caps the
-  // denoising schedule. Prose canvases never settle inside 48 steps, so
-  // the cap is the speed/quality dial — 24 roughly doubles throughput.
-  const uint32_t canvasMaxSteps_ = tuning().canvasMaxSteps;
-  // RICHENGINE_CANVAS_PROBE ("notrunk"|"notail"|"nosc"): a timing probe
-  // that skips the named stage of every canvas step — the trunk pass, the
-  // head+row-stats+accept tail, or the self-conditioning chain. Output is
-  // garbage; use with CANVAS_TIMING to attribute the per-step cost.
-  const std::string_view canvasProbe_ = tuning().canvasProbe;
   // Canvas batching (RuntimeDiffusion.mm): every decode item is a lane
   // with its own tokens/argmax/entropy scratch; each denoising step runs
   // one trunk pass over the concatenated lane rows.
@@ -378,7 +385,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // keeps rejecting pays for fewer live verify rows — GDN scan depth and
   // the per-row vocabulary/argmax sweeps — instead of the fixed eight.
   // On by default; RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
-  const bool adaptiveProposals_ = tuning().adaptiveProposals;
+  const bool adaptiveProposals_ =
+      tuning().adaptiveProposals && geometry.tuning.adaptiveProposals;
   // Per-step debug gates, read once: getenv scans environ linearly and these
   // ran inside the decode/finalize paths on every command.
   const bool treeDebug_ = tuning().treeDebug;
@@ -413,30 +421,56 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // disables): an n-gram table over each lane's prompt+generated stream
   // feeds the same ProposedTokens injection the ANE artifact uses — a wrong
   // candidate only wastes verify rows.
-  const bool ngramPredraft_ = tuning().ngramPredraft;
+  struct NgramPredraft final {
+    explicit NgramPredraft(const ModelTuning &modelTuning)
+        : ngramDraftExpect_(tuning().ngramDraftExpectSet
+                                ? tuning().ngramDraftExpect
+                                : modelTuning.ngramDraftExpect),
+          ngramWarmup_(tuning().ngramWarmupSet ? tuning().ngramWarmup
+                                               : modelTuning.ngramWarmup),
+          ngramTreeMin_(tuning().ngramTreeMinSet ? tuning().ngramTreeMin
+                                                 : modelTuning.ngramTreeMin) {}
+    const bool ngramPredraft_ = tuning().ngramPredraft;
+    // Acceptance gate (SSSD-style): a batch goes n-gram-predrafted when the
+    // lanes' expected accepted-token scores total at least what the GPU draft
+    // would have delivered. A lane with a weak EWMA or no match drags the
+    // total down and can veto; a cold lane re-probes each kNgramProbeTokens.
+    // The thresholds take the family's ModelTuning default, an explicitly
+    // set RICHENGINE_* variable overriding it.
+    const double ngramDraftExpect_;
+    const uint32_t ngramWarmup_;
+    // The comb tree's admission: a lane's acceptance EWMA must reach this
+    // before its table emits sibling leaves — a proposer that rarely lands
+    // rescues nothing, and the tree's wider verify would cost for free rows.
+    const double ngramTreeMin_;
+    static constexpr uint32_t kNgramProbeTokens = 256;
+    // Whether the batch left applyNgramPredraft as a comb tree.
+    bool predraftedTree_ = false;
+    // The batch-maximum live node count of the emitted comb, known at encode
+    // time because the host wrote the table — the verify plan and its KV
+    // stores size for it instead of the scratch's full capacity.
+    uint32_t predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
+  };
+  NgramPredraft ngram_{geometry.tuning};
+  // The env switch AND the family's default (ModelDescriptor.tuning).
+  [[nodiscard]] bool ngramPredraftEnabled() const noexcept {
+    return ngram_.ngramPredraft_ && geometry.tuning.ngramPredraft;
+  }
   // Adaptive draft bypass (default on): when every lane's acceptance EWMA
   // falls below the draft's break-even cost — the draft's per-step weight
   // traffic as a share of the whole step — the batch decodes anchor-only
   // and skips the draft forward, its vocabulary head read and the selector.
   // A lane probes again each kDraftProbeTokens so a recovered EWMA
   // re-enables it. RICHENGINE_DRAFT_BYPASS=0 disables.
-  const bool draftBypass_ = tuning().draftBypass;
+  const bool draftBypass_ =
+      tuning().draftBypass && geometry.tuning.draftBypass;
   // Break-even measured on the M5 Pro's MiniCPM5-2B-MLX: the draft pass is
   // ~14% of a drafted step, so anchor-only wins once the accepted-token EWMA
   // sits under ~0.16. 0.15 keeps a hair of margin below it.
-  const double draftBypassExpect_ = tuning().draftBypassExpect;
+  const double draftBypassExpect_ =
+      tuning().draftBypassExpectSet ? tuning().draftBypassExpect
+                                    : geometry.tuning.draftBypassExpect;
   static constexpr uint32_t kDraftProbeTokens = 256;
-  // Acceptance gate (SSSD-style): a batch goes n-gram-predrafted when the
-  // lanes' expected accepted-token scores total at least what the GPU draft
-  // would have delivered. A lane with a weak EWMA or no match drags the
-  // total down and can veto; a cold lane re-probes each kNgramProbeTokens.
-  const double ngramDraftExpect_ = tuning().ngramDraftExpect;
-  const uint32_t ngramWarmup_ = tuning().ngramWarmup;
-  // The comb tree's admission: a lane's acceptance EWMA must reach this
-  // before its table emits sibling leaves — a proposer that rarely lands
-  // rescues nothing, and the tree's wider verify would cost for free rows.
-  const double ngramTreeMin_ = tuning().ngramTreeMin;
-  static constexpr uint32_t kNgramProbeTokens = 256;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         package(value.package),
@@ -532,7 +566,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   static bool samplingEnabled(const Request &entry) noexcept {
     return entry.sampling.temperature > 0.0F;
   }
-  // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
+  // M-RoPE: text rows advance one counter shared by all three axes;
   // an image's rows spread over (t, h, w) from the counter at the image start
   // and the counter then advances by max(merged height, merged width).
   static std::array<uint32_t, 3> ropePosition(const Request &entry,
@@ -721,14 +755,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // The lengths after the draft ring takes rows [begin, end) at target
   // length targetTokens. Unless `reset` starts a new window there, the rows
   // continue the ring, which must hold rows ending at `begin`.
-  static QwenLogicalLengths
-  advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
+  static LogicalLengths
+  advanceDraftContext(const LogicalLengths &previous, uint64_t targetTokens,
                       uint64_t begin, uint64_t end, bool reset,
                       uint32_t draftWindow) {
     if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
       throw std::logic_error("draft capture does not continue the draft ring");
     const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
-    QwenLogicalLengths next = previous;
+    LogicalLengths next = previous;
     next.targetTokens = targetTokens;
     next.draftLength =
         static_cast<uint32_t>(std::min<uint64_t>(combined, draftWindow));
@@ -771,12 +805,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             (entry.flags & RequestIgnoreEndOfSequence) != 0,
             samplingPenalties(entry), entry.sampling.minP};
   }
-  // A draft kind emits tree tables when trees are on for it: the env's
-  // opt-in covers DFlash2, DSpark and NullDraft; unset, DSpark and
-  // NullDraft default on — DSpark's comb leaves rescue a measured share of
-  // chain rejections and the n-gram predraft's alternates rescue draft-free
-  // lanes the same way, where DFlash2's high-acceptance benchmark found
-  // none worth the extra rows.
+  // Whether the model's draft emits comb-tree tables, per its descriptor's
+  // tuning (makeModelDescriptor defaults Null drafts On and the GPU drafts
+  // to opt-in; a family maker can override): the env's RICHENGINE_VERIFY_TREE
+  // wins whenever it is set.
   bool treeDraftCapable() const {
     // The comb layout halves the node block: the chain's front rows anchor
     // it and each leading position's runner-up becomes a sibling leaf in
@@ -784,13 +816,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     static_assert(RICHENGINE_TREE_VERIFY_NODES >= 2 &&
                       RICHENGINE_TREE_VERIFY_NODES % 2 == 0,
                   "the comb splits the verify nodes into equal halves");
-    const bool defaultsOn = std::holds_alternative<DSparkDraft>(draftModel) ||
-                            std::holds_alternative<NullDraft>(draftModel);
-    if (!defaultsOn &&
-        !std::holds_alternative<DFlashDraft>(draftModel) &&
-        !std::holds_alternative<DFlashV1Draft>(draftModel))
+    const auto policy = geometry.tuning.treeVerify;
+    if (policy == ModelTuning::TreeVerify::Off)
       return false;
-    return verifyTreeEnvSet_ ? verifyTreeEnabled : defaultsOn;
+    return verifyTreeEnvSet_ ? verifyTreeEnabled
+                             : policy == ModelTuning::TreeVerify::On;
   }
   // A batch verifies the selector's comb trees only when every lane can:
   // greedy, unconstrained and unpenalized tree-capable lanes, at most two
@@ -1001,9 +1031,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           item.logicalPosition > entry.promptTokens ||
           item.tokenCount > entry.promptTokens - item.logicalPosition ||
           !entry.resident) {
-        throw std::invalid_argument("invalid packed Qwen prefill item");
+        throw std::invalid_argument("invalid packed prefill item");
       }
-      const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
+      const LaneMetadata &metadata = states.metadata(entry.stateLane);
       // A chunk submitted ahead of its predecessor's consumption still has
       // the predecessor's rows unapplied: lengths advance only at consume.
       if (metadata.requestId != entry.id ||
@@ -1308,14 +1338,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // Greedy lanes only: injected proposals carry no probabilities. When
   // emitTree is set the lane also writes a comb tree table — chain rows,
   // one sibling leaf per proposal position that has a distinct alternate —
-  // and predraftedTree_ reports whether the batch left as a tree.
+  // and ngram_.predraftedTree_ reports whether the batch left as a tree.
   bool applyNgramPredraft(std::span<Request *const> entries,
                           uint32_t width, bool emitTree);
-  bool predraftedTree_ = false;
-  // The batch-maximum live node count of the emitted comb, known at encode
-  // time because the host wrote the table — the verify plan and its KV
-  // stores size for it instead of the scratch's full capacity.
-  uint32_t predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
@@ -1734,7 +1759,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                      : observed;
         ++entry.ngramRounds;
         entry.ngramProbeAt =
-            entry.generatedTokens + Impl::kNgramProbeTokens;
+            entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
       }
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();

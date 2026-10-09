@@ -161,13 +161,13 @@ struct Runtime::Impl::DiffusionCanvasArena final {
 };
 
 Runtime::Impl::DiffusionCanvasArena &Runtime::Impl::canvasArena() {
-  if (!canvasArena_) {
+  if (!diffusion_.canvasArena_) {
     const DiffusionSchedule &schedule =
         std::get<DiffusionGemmaLayout>(package.descriptor.target).diffusion;
-    canvasArena_ = std::make_shared<DiffusionCanvasArena>(
+    diffusion_.canvasArena_ = std::make_shared<DiffusionCanvasArena>(
         backend, geometry, schedule.canvasLength);
   }
-  return *canvasArena_;
+  return *diffusion_.canvasArena_;
 }
 
 const DiffusionGemmaWeights &Runtime::Impl::diffusionWeights() const {
@@ -219,7 +219,7 @@ void Runtime::Impl::encodeCanvasLaneFront(
   const float softcap = geometry.target.logitSoftcap;
   const MetalBuffer sc =
       step == schedule.maxDenoisingSteps ? a.scZero : lane.scDown;
-  if (step != schedule.maxDenoisingSteps && canvasProbe_ != "nosc") {
+  if (step != schedule.maxDenoisingSteps && diffusion_.canvasProbe_ != "nosc") {
     const float embedScale = geometry.target.embeddingScale
                                  ? geometry.target.embeddingScale
                                  : std::sqrt(static_cast<float>(hidden));
@@ -255,7 +255,7 @@ void Runtime::Impl::encodeCanvasLaneFront(
                       lane.scDown, buffers.projectionSums, rows,
                       buffers.linearScratch, {}, true);
   }
-  if (canvasProbe_ != "nosc")
+  if (diffusion_.canvasProbe_ != "nosc")
     ops::Canvas::addSelfCondition(graph, hiddenSlice, sc, hiddenSlice, hidden,
                                   rows);
 
@@ -385,9 +385,9 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
   validatePlan(plan, items, WorkKind::Decode);
   const DiffusionGemmaWeights &weights = diffusionWeights();
   DiffusionSchedule schedule = weights.layout.diffusion;
-  if (canvasMaxSteps_)
+  if (diffusion_.canvasMaxSteps_)
     schedule.maxDenoisingSteps =
-        std::min(schedule.maxDenoisingSteps, canvasMaxSteps_);
+        std::min(schedule.maxDenoisingSteps, diffusion_.canvasMaxSteps_);
   DiffusionCanvasArena &a = canvasArena();
   a.ensureLanes(static_cast<uint32_t>(items.size()));
 
@@ -476,8 +476,8 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   const CanvasStepDriver::Config driverConfig{
-      canvasStepsPerCmd_, canvasPrefixExit_, canvasCommitTail_,
-      canvasExitStable_, canvasDriftExit_};
+      diffusion_.canvasStepsPerCmd_, diffusion_.canvasPrefixExit_, diffusion_.canvasCommitTail_,
+      diffusion_.canvasExitStable_, diffusion_.canvasDriftExit_};
   uint32_t rowOffset = 0;
   for (const ModelBatchItem &item : items) {
     Request &entry = request(item.requestId);
@@ -563,14 +563,14 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
         // every lane.
         const MetalBuffer headSums = buffers.projectionSums;
         MetalBuffer finalHidden = buffers.hidden[0];
-        if (canvasProbe_ != "notrunk")
+        if (diffusion_.canvasProbe_ != "notrunk")
           finalHidden =
               targetModel.addPrefill(graph, std::move(buffers), sequences,
                                      spanRows, kvPages.layers());
         ops::Normalization::addRmsWithQ4Sums(
             graph, finalHidden, weights.finalNorm, a.headHidden, headSums,
             hidden, spanRows);
-        if (canvasProbe_ != "notail")
+        if (diffusion_.canvasProbe_ != "notail")
         {
           TargetModelPrefillBuffers head =
               detail::prefillBuffers(*prefillArena);
@@ -580,7 +580,7 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
         }
         // Per-lane tails: row stats and the entropy accept on the lane's
         // own logits slice and ring buffers.
-        for (size_t i = 0; i < lanes.size() && canvasProbe_ != "notail";
+        for (size_t i = 0; i < lanes.size() && diffusion_.canvasProbe_ != "notail";
              ++i) {
           CanvasLane &lane = lanes[i];
           if (lane.canvasDone || slot >= lane.chunk.count)
@@ -648,7 +648,7 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
           break;
         }
       }
-      if (canvasSpecPrefill_ && !lane.specPrefill && !lane.canvasDone &&
+      if (diffusion_.canvasSpecPrefill_ && !lane.specPrefill && !lane.canvasDone &&
           lane.driver.speculationArmed()) {
         lane.specSnapshot =
             lane.sampler.commit(lane.committed, kCanvasStopTokens).tokens;
@@ -727,7 +727,7 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
         continue;
       lane.stateApplied = true;
       states.swapParity(lane.entry->stateLane);
-      QwenLogicalLengths lengths =
+      LogicalLengths lengths =
           states.metadata(lane.entry->stateLane).lengths;
       lengths.targetTokens = static_cast<uint32_t>(lane.position) +
                              lane.sampler.schedule().canvasLength;

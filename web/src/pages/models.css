@@ -90,6 +90,8 @@
 /* Clickable suggested-model chip inside the install form. */
 .chip-btn { border: 0; font-family: inherit; cursor: pointer }
 .chip-btn:hover { color: var(--text) }
+/* The selected option of a chip toggle (Tune mode Quick/Complete). */
+.chip-btn.active { color: var(--text); background: color-mix(in srgb, var(--accent) 18%, var(--bubble)) }
 
 /* Charts under throughput/memory/scheduler rows. */
 .panel-row.chart-row { padding-top: 2px; padding-bottom: 12px }

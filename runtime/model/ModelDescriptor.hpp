@@ -8,6 +8,7 @@
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
 #include "Model.hpp"
+#include "ModelTuning.hpp"
 #include "Ornith9B.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -41,6 +42,9 @@ struct ModelDescriptor final {
   ModelCapabilities capabilities;
   kv::Layout targetKvLayout;
   CompositeStateLayout stateLayout;
+  // Runtime policy the family maker chose; makeModelDescriptor derives the
+  // tree-verify default from the draft kind, a maker may override it.
+  ModelTuning tuning;
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource = TargetSource::Packed;
   VisionSource visionSource = VisionSource::Packed;

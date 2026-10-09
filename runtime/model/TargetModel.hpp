@@ -77,7 +77,7 @@ struct LfmConvWeights final {
 using MixerWeights =
     std::variant<GdnMixerWeights, AttentionMixerWeights, LfmConvWeights>;
 
-// A Qwen target's weights outside its layers and the record of every file
+// A target's weights outside its layers and the record of every file
 // its weights were read from.
 struct TargetModelWeightsBase {
   ops::NormWeights finalNorm;
@@ -96,7 +96,7 @@ template <class Layout, class Layer> struct TargetModelWeights : TargetModelWeig
   std::vector<Layer> layers;
 };
 
-// Runtime-visible tensor geometry shared by the supported Qwen hybrid
+// Runtime-visible tensor geometry shared by the supported hybrid
 // targets. It describes semantics only; operators remain responsible for
 // choosing device-specific Metal pipelines and compute tiles.
 struct TargetModelGeometry final {
@@ -117,8 +117,8 @@ struct TargetModelGeometry final {
   uint32_t attentionHeadDimension = 0;
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
-  // The position axes a target row carries: 3 for the Qwen3.5 M-RoPE
-  // families (dim % 3 chooses the axis), 1 for the dense and LFM2 targets.
+  // The position axes a target row carries: 3 for the M-RoPE families
+  // (dim % 3 chooses the axis), 1 for the dense and LFM2 targets.
   uint32_t ropeAxes = 3;
   uint32_t denseIntermediateSize = 0;
   uint32_t experts = 0;
@@ -133,8 +133,8 @@ struct TargetModelGeometry final {
   // LFM2 conv_L_cache for conv layers).
   uint32_t convolutionTaps = 0;
   // The attention rows' [query|gate] packing and the per-head RMS norms:
-  // both are Qwen features; the dense target has neither, LFM2 keeps only
-  // the norms.
+  // the GDN hybrids keep both, the dense target neither, LFM2 only the
+  // norms.
   bool attentionQueryGate = true;
   bool attentionQkNorm = true;
   // The weight layout every sparse MoE block of the target shares, and in a
@@ -276,7 +276,7 @@ struct TargetModelGeometry final {
     return std::max(attentionKvHeads * attentionHeadDimension,
                     altAttentionMask ? altKvHeads * altHeadDimension : 0u);
   }
-  // The layout itself was checked by requireQwenLayout when the target
+  // The layout itself was checked by requireTargetLayout when the target
   // loaded. The projection lists hold every projection the weights dispatch,
   // which each have sizes.
   [[nodiscard]] bool valid() const noexcept {
@@ -460,7 +460,7 @@ template <class Layout, class Layer>
 [[nodiscard]] TargetModelGeometry
 targetModelGeometry(const TargetModelWeights<Layout, Layer> &weights);
 
-// Builds the shared Qwen GDN/attention layer graph with the target's dense
+// Builds the shared GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class TargetModel final {
 public:

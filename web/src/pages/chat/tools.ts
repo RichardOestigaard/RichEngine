@@ -349,7 +349,8 @@ function memoryDelete(args: Record<string, unknown>): string {
    failures return text too: a call that errored keeps the turn alive. */
 export async function runTool(
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<string> {
   switch (name) {
     case "get_current_time": {
@@ -369,7 +370,7 @@ export async function runTool(
         return "Error: url is required";
       try {
         return JSON.stringify(
-          await apiPost("/v1/tools/fetch", { url: args.url.trim() })
+          await apiPost("/v1/tools/fetch", { url: args.url.trim() }, signal)
         );
       } catch (error) {
         return `Error: ${error instanceof Error ? error.message : String(error)}`;
@@ -385,15 +386,19 @@ export async function runTool(
         return "Error: searxng needs an instance URL — set it in Settings → Web search";
       try {
         return JSON.stringify(
-          await apiPost("/v1/tools/search", {
-            query: args.query.trim(),
-            provider,
-            api_key: searchApiKey().trim(),
-            instance: searchInstance().trim(),
-            ...(typeof args.count === "number" && Number.isFinite(args.count)
-              ? { count: Math.round(args.count) }
-              : {}),
-          })
+          await apiPost(
+            "/v1/tools/search",
+            {
+              query: args.query.trim(),
+              provider,
+              api_key: searchApiKey().trim(),
+              instance: searchInstance().trim(),
+              ...(typeof args.count === "number" && Number.isFinite(args.count)
+                ? { count: Math.round(args.count) }
+                : {}),
+            },
+            signal
+          )
         );
       } catch (error) {
         return `Error: ${error instanceof Error ? error.message : String(error)}`;

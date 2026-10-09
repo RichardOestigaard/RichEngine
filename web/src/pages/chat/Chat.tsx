@@ -496,9 +496,21 @@ export default function Chat() {
 
   /* Ask the served model for a short title, once per new chat, in the
      background; a failure or a same-time rename simply keeps the prompt
-     title. */
+     title. The title shares the one generation slot, so it waits for a
+     quiet moment rather than queue a fast follow-up turn behind a
+     24-token rename. */
   async function autoTitle(id: string, firstPrompt: string) {
     try {
+      for (let attempt = 0; ; attempt++) {
+        const status = await api<{ transport?: { pending?: number } }>(
+          "/status"
+        ).catch(() => null);
+        const pending = status?.transport?.pending;
+        // An unreadable status means try now anyway; a busy engine waits.
+        if (pending === undefined || pending === 0) break;
+        if (attempt >= 12) return;
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
       const response = await fetch("/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authorization() },
@@ -584,13 +596,16 @@ export default function Chat() {
 
   /* Run the calls a tool_calls finish produced and append the transcript —
      the round's own text, then each call and its result — to the wire
-     history the next round resends. */
+     history the next round resends. Calls execute in parallel (a search
+     and a fetch should not wait on each other); results append to wire in
+     call order once every call lands. */
   async function runToolCalls(
     wire: Record<string, unknown>[],
     assistant: Message,
     roundText: { content: string; reasoning: string },
     calls: ToolCallDraft[],
-    round: number
+    round: number,
+    signal: AbortSignal
   ) {
     wire.push({
       role: "assistant",
@@ -604,7 +619,7 @@ export default function Chat() {
         function: { name: call.name, arguments: call.arguments },
       })),
     });
-    for (const [index, call] of calls.entries()) {
+    const jobs = calls.map((call) => {
       const run: ToolRun = { name: call.name || "tool", detail: "", status: "running" };
       let args: Record<string, unknown> | null = null;
       try {
@@ -618,30 +633,37 @@ export default function Chat() {
       }
       if (args) run.detail = toolDetail(call.name, args);
       (assistant.tool_runs ??= []).push(run);
-      paintToolRuns(assistant);
-      const started = performance.now();
-      let result: string;
-      if (args === null) {
-        run.status = "error";
-        result = "Error: tool call arguments were not valid JSON";
-      } else {
-        try {
-          result = await runTool(call.name, args);
-          run.status = "done";
-        } catch (error) {
+      return { call, run, args };
+    });
+    paintToolRuns(assistant);
+    const results = await Promise.all(
+      jobs.map(async ({ call, run, args }) => {
+        const started = performance.now();
+        let result: string;
+        if (args === null) {
           run.status = "error";
-          result = `Error: ${errorText(error)}`;
+          result = "Error: tool call arguments were not valid JSON";
+        } else {
+          try {
+            result = await runTool(call.name, args, signal);
+            run.status = "done";
+          } catch (error) {
+            run.status = "error";
+            result = `Error: ${errorText(error)}`;
+          }
         }
-      }
-      run.elapsed = Math.round((performance.now() - started) / 100) / 10;
-      run.result = result.length > 8000 ? `${result.slice(0, 8000)}…` : result;
-      paintToolRuns(assistant);
+        run.elapsed = Math.round((performance.now() - started) / 100) / 10;
+        run.result = result.length > 8000 ? `${result.slice(0, 8000)}…` : result;
+        paintToolRuns(assistant);
+        return result;
+      })
+    );
+    for (const [index, { call }] of jobs.entries())
       wire.push({
         role: "tool",
         tool_call_id: call.id || `call_${round}_${index}`,
-        content: result,
+        content: results[index],
       });
-    }
   }
 
   // Streams the assistant reply for the user message already at the tail.
@@ -738,8 +760,24 @@ export default function Chat() {
           state.finish !== "tool_calls" ||
           !calls.length ||
           round >= MAX_TOOL_ROUNDS
-        )
+        ) {
+          // The round cap leaves unanswered calls; say so instead of
+          // dropping them silently.
+          if (calls.length && round >= MAX_TOOL_ROUNDS) {
+            (assistant.tool_runs ??= []).push({
+              name: `stopped after ${MAX_TOOL_ROUNDS} tool rounds`,
+              detail: "",
+              status: "error",
+              result:
+                `The model kept calling tools: ${calls
+                  .map((call) => call.name)
+                  .join(", ")} ` +
+                "went unanswered so the turn could end.",
+            });
+            paintToolRuns(assistant);
+          }
           break;
+        }
         round += 1;
         await runToolCalls(
           wire,
@@ -749,7 +787,8 @@ export default function Chat() {
             reasoning: (assistant.reasoning_content ?? "").slice(reasoningStart),
           },
           calls,
-          round
+          round,
+          ctrl.signal
         );
         if (ctrl.signal.aborted)
           throw new DOMException("The operation was aborted.", "AbortError");
@@ -888,7 +927,10 @@ export default function Chat() {
   }
 
   function openChat(id: string) {
-    if (controller()) return;
+    if (controller()) {
+      pushToast("error", "Stop the response before switching chats");
+      return;
+    }
     const conversation = conversations().find((item) => item.id === id);
     if (!conversation) return;
     saveDraft();

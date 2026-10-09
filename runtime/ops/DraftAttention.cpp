@@ -3,6 +3,7 @@
 #include "metal/abi/DraftAttention.h"
 #include "ops/KernelNames.hpp"
 #include "ops/LaneBindings.hpp"
+#include "ops/draft_cores/DraftCores.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -97,54 +98,15 @@ enum class HeadKernel : uint8_t { Q32K8D128, Q16K2D128, Q32K8D64Interleaved };
 [[nodiscard]] const char *headKernelName(HeadKernel kernel,
                                          std::string_view base) {
   // The kernels of each geometry carry their shape's suffix; the original
-  // 32x8x128 instantiations keep the unsuffixed names.
-  if (base == kDraftAttentionQkv) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kDraftAttentionQkv.data();
-    case HeadKernel::Q16K2D128: return kDraftAttentionQkvQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kDraftAttentionQkvQ32k8d64i.data();
-    }
-  }
-  if (base == kDraftAttentionBf16Split) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kDraftAttentionBf16Split.data();
-    case HeadKernel::Q16K2D128: return kDraftAttentionBf16SplitQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kDraftAttentionBf16SplitQ32k8d64i.data();
-    }
-  }
-  if (base == kDraftAttentionBf16Reduce) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kDraftAttentionBf16Reduce.data();
-    case HeadKernel::Q16K2D128: return kDraftAttentionBf16ReduceQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kDraftAttentionBf16ReduceQ32k8d64i.data();
-    }
-  }
-  if (base == kDraftAttentionReorder) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kDraftAttentionReorder.data();
-    case HeadKernel::Q16K2D128: return kDraftAttentionReorderQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kDraftAttentionReorderQ32k8d64i.data();
-    }
-  }
-  if (base == kDraftContextKvCommit) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kDraftContextKvCommit.data();
-    case HeadKernel::Q16K2D128: return kDraftContextKvCommitQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kDraftContextKvCommitQ32k8d64i.data();
-    }
-  }
-  if (base == kPrefillDraftContextKv) {
-    switch (kernel) {
-    case HeadKernel::Q32K8D128: return kPrefillDraftContextKv.data();
-    case HeadKernel::Q16K2D128: return kPrefillDraftContextKvQ16k2.data();
-    case HeadKernel::Q32K8D64Interleaved:
-      return kPrefillDraftContextKvQ32k8d64i.data();
-    }
+  // 32x8x128 instantiations keep the unsuffixed names. Each geometry's
+  // base-name table lives with it in ops/draft_cores/.
+  switch (kernel) {
+  case HeadKernel::Q32K8D128:
+    return draftCore32x8x128(base);
+  case HeadKernel::Q16K2D128:
+    return draftCore16x2x128(base);
+  case HeadKernel::Q32K8D64Interleaved:
+    return draftCore32x8x64Interleaved(base);
   }
   throw std::invalid_argument("unknown draft attention kernel");
 }

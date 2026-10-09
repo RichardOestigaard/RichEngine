@@ -20,8 +20,8 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
 }
 
 template <class Format>
-MixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                               const QwenMixerGeometry &geometry, bool fullAttention) {
+MixerWeights readMixer(WeightFile &file, const Format &format,
+                               const MixerGeometry &geometry, bool fullAttention) {
   constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
     AttentionMixerWeights attention;
@@ -59,9 +59,9 @@ MixerWeights readQwenMixer(WeightFile &file, const Format &format,
   return gdn;
 }
 
-template MixerWeights readQwenMixer(WeightFile &, const AffineTargetFormat &,
-                                        const QwenMixerGeometry &, bool);
-template MixerWeights readQwenMixer(WeightFile &, const BlockTargetFormat &,
-                                        const QwenMixerGeometry &, bool);
+template MixerWeights readMixer(WeightFile &, const AffineTargetFormat &,
+                                        const MixerGeometry &, bool);
+template MixerWeights readMixer(WeightFile &, const BlockTargetFormat &,
+                                        const MixerGeometry &, bool);
 
 } // namespace richengine::model

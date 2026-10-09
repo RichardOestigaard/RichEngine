@@ -164,6 +164,13 @@ export default function Palette() {
     { id: "go-settings", title: "Go to Settings", kbd: "⌘7", run: () => { navigate("/settings"); closePalette(); } },
     { id: "switch-model", title: "Switch model…", hint: currentModelLabel(), run: enterModels },
     {
+      id: "tune-model",
+      title: "Tune a model…",
+      hint: "Models",
+      // The sweep's per-model buttons live on the Models page.
+      run: () => { navigate("/models"); closePalette(); },
+    },
+    {
       id: "shortcuts",
       title: "Keyboard shortcuts",
       kbd: "?",

@@ -7,7 +7,7 @@
 #include "engine/wire/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
-#include "model/QwenState.hpp"
+#include "model/CompositeStateStorage.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
@@ -154,7 +154,7 @@ Similarity compareFloat(const metal::MetalBuffer &left,
 // Budgeted greedy decoding and masked verification of the same prefix must
 // commit identical state. Both use the same target arithmetic; compare bytes.
 // The GDN kernel tests independently check each retained count against FP64.
-void requireCommittedStateIdentical(const model::QwenStateStorage &states,
+void requireCommittedStateIdentical(const model::CompositeStateStorage &states,
                                     uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
   const auto &budget = states.metadata(budgetLane);
@@ -380,7 +380,7 @@ metal::MetalBuffer recurrentHalf(const metal::MetalBackend &backend,
 using StateSamples = std::vector<std::pair<std::string, std::vector<float>>>;
 
 StateSamples sampleCommittedState(const metal::MetalBackend &backend,
-                                  const model::QwenStateStorage &states,
+                                  const model::CompositeStateStorage &states,
                                   uint32_t lane) {
   StateSamples result;
   const auto add = [&](std::string name, const metal::MetalBuffer &buffer,
@@ -599,7 +599,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
 // the embedding cache stay held by their request when the cache is dropped.
 void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   metal::MetalBackend &backend,
-                                  model::QwenStateStorage &states,
+                                  model::CompositeStateStorage &states,
                                   const model::ModelPackage &model,
                                   AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
@@ -710,7 +710,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
 
 void requireRepeatedImagePlacements(model::Runtime &executor,
                                      metal::MetalBackend &backend,
-                                     model::QwenStateStorage &states,
+                                     model::CompositeStateStorage &states,
                                      AllocationFault &fault) {
   while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
   }
@@ -793,7 +793,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // every row the lane computes. Non-finite KV would not do: the paged-attention
 // tile of some GPU families gives non-finite keys and values zero weight.
 void poisonRecurrentState(const metal::MetalBackend &backend,
-                          const model::QwenStateStorage &states, uint32_t lane) {
+                          const model::CompositeStateStorage &states, uint32_t lane) {
   const metal::MetalBuffer recurrent =
       recurrentHalf(backend, states.current(lane), states.layout().target);
   std::memset(recurrent.contents(), 0xFF, recurrent.sizeBytes());
@@ -816,7 +816,7 @@ void clearPages(const kv::PageStorage &pages, std::span<const uint32_t> ids) {
 // reads them again.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                                          const kv::PageStorage &pages,
-                                         const model::QwenStateStorage &states,
+                                         const model::CompositeStateStorage &states,
                                          const metal::MetalBackend &backend,
                                          std::span<const uint32_t> chat,
                                          std::span<const uint32_t> prompt) {
@@ -1401,7 +1401,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
     weights.layout = std::get<Layout>(originalTarget);
   }, package.target);
   package.descriptor.target = originalTarget;
-  const model::QwenStateStorage &states = context.stateStorage;
+  const model::CompositeStateStorage &states = context.stateStorage;
   for (uint32_t lane = 0; lane < 4; ++lane)
     require(!states.metadata(lane).assigned(),
             "EOS warmup left an active state lane");
@@ -1583,7 +1583,7 @@ int main(int argc, char **argv) {
     for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
       require(static_cast<bool>(pages.allocateExtent(extent)),
               "oracle KV extent is unavailable");
-    model::QwenStateStorage states(backend,
+    model::CompositeStateStorage states(backend,
                                     admission,
                                     model.stateLayout(), nullptr);
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
@@ -1797,8 +1797,8 @@ int main(int argc, char **argv) {
                      std::span<const uint32_t>(prompt16).subspan(8, 8),
                      partitionedPages);
 
-    const model::QwenLaneMetadata &baselineMetadata = states.metadata(2);
-    const model::QwenLaneMetadata &partitionedMetadata = states.metadata(3);
+    const model::LaneMetadata &baselineMetadata = states.metadata(2);
+    const model::LaneMetadata &partitionedMetadata = states.metadata(3);
     require(baselineMetadata.lengths == partitionedMetadata.lengths &&
                 baselineMetadata.lengths.targetTokens == prompt16.size(),
             "partitioned prefill logical state diverged");

@@ -203,21 +203,39 @@ def _ensure_installed(selection):
         )
 
 
-def _installed_details():
+def _installed_details(models_root=None):
     """Each servable selection under the models root, as the record its
     assembly carries: model ID, family, formats and linked bytes. A
     .selections/<hash> link is named by the target repository its record
     states; a legacy package without a record reports its link name alone."""
+    from install import autotune
+    from install.tuning import knobs_for
+
+    if models_root is None:
+        models_root = paths.MODELS
     installed = []
-    for link in model_artifacts.selection_links(paths.MODELS):
+    chip, _, _ = autotune.detect_chip()
+    binary = paths.BINARY if paths.BINARY.is_file() else None
+
+    def tune_state(link):
+        # tuning.json sits in the link's target; the link reads through it.
+        # A partial record's winners already apply, so the knob count is
+        # real even while the sweep still runs.
+        return autotune.tuning_state(link, chip=chip, binary=binary), len(
+            autotune.load_tuning(link, chip=chip, binary=binary)
+        )
+
+    for link in model_artifacts.selection_links(models_root):
         if model_artifacts.installation_kind(link) is None:
             continue
-        name = str(link.relative_to(paths.MODELS))
-        entry = {"model": name, "family": None, "target_format": None,
-                 "vision_format": None, "bytes": None}
+        name = str(link.relative_to(models_root))
+        entry = {"model": name, "selection": name, "family": None,
+                 "target_format": None, "vision_format": None, "bytes": None}
         try:
             record = model_artifacts.read_json(link / "model.json")
         except model_artifacts.ModelError:
+            entry["tuning"], entry["tuned_knobs"] = tune_state(link)
+            entry["tunable"] = knobs_for(entry["family"]) is not None
             installed.append(entry)
             continue
         try:
@@ -235,6 +253,8 @@ def _installed_details():
                 )
         except (KeyError, TypeError):
             pass
+        entry["tuning"], entry["tuned_knobs"] = tune_state(link)
+        entry["tunable"] = knobs_for(entry["family"]) is not None
         installed.append(entry)
     installed.sort(key=lambda entry: entry["model"])
     return installed
@@ -329,6 +349,90 @@ def _check_port(host, port):
         client.settimeout(1)
         if client.connect_ex((address, port)) == 0:
             raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
+
+
+def tune(args):
+    """Run the autotune sweep against an installed model and record the
+    winning engine knobs in its tuning.json (install/autotune.py)."""
+    from install import assembly, autotune
+
+    models_root = Path(args.models).resolve() if args.models else paths.MODELS
+    if args.selection is not None:
+        # The link's name under the models root, taken verbatim — installs
+        # made with options live under .selections/<hash>, unreachable by
+        # model ID. Membership in selection_links blocks path escapes.
+        link = models_root / args.selection
+        if link not in model_artifacts.selection_links(models_root):
+            raise LauncherError(
+                f"{args.selection} is not a selection under {models_root}"
+            )
+    elif args.model is not None:
+        link = model_artifacts.Selection.of(
+            models_root,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+        ).link
+    else:
+        raise LauncherError(
+            "tune needs a model: --model OWNER/REPO or --selection NAME"
+        )
+    if model_artifacts.installation_kind(link) is None:
+        raise LauncherError(
+            f"{args.selection or args.model} is not installed; install it with "
+            f"'richengine serve --model {args.model or '<MODEL>'}' first"
+        )
+    if not paths.BINARY.is_file():
+        raise LauncherError(f"no engine binary at {paths.BINARY}; run make all")
+    # A running serve shares the GPU with the sweep's engines; every number
+    # it measures is then contaminated. Warn rather than fail — servers on
+    # different ports coexist deliberately.
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    for lock in RUNTIME_DIR.glob("serve-*.lock"):
+        with lock.open("a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except BlockingIOError:
+                print(
+                    _styled("warn:", "33;1", stream=sys.stderr)
+                    + " a serve is running; its engine shares this GPU "
+                    "and skews every measurement",
+                    file=sys.stderr,
+                )
+                break
+    # One sweep at a time across CLI and UI — the server spawns this same
+    # command, so the lock excludes both directions. Two sweeps would
+    # contend for the GPU and corrupt each other's measurements.
+    with (RUNTIME_DIR / "tune.lock").open("a+") as tune_lock:
+        try:
+            fcntl.flock(tune_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LauncherError("a tune is already running") from None
+        directory, record = assembly.hold(link, models_root)
+        try:
+            env = autotune.tune(
+                paths.BINARY,
+                directory,
+                include_quality=args.complete or args.include_quality_knobs,
+                interactions=(args.complete or args.interaction_pass)
+                and not args.no_interaction_pass,
+                priors_path=models_root / autotune.PRIORS_NAME,
+            )
+        except model_artifacts.ModelError as error:
+            raise LauncherError(str(error)) from error
+        finally:
+            if record is not None:
+                record.close()
+        if env:
+            print(f"\n{_styled('Tuned', '32;1')} · {len(env)} knobs kept:")
+            for name, value in sorted(env.items()):
+                print(f"  {name}={value}")
+        else:
+            print(f"\n{_styled('Tuned', '32;1')} · the defaults already won every knob")
+        print(f"  written to {autotune.tuning_path(directory)}")
+    return 0
 
 
 def serve(args):
@@ -1574,6 +1678,79 @@ def _build_parser():
         action="store_true",
         help="add family, format, vision and installed size columns",
     )
+    tune_command = commands.add_parser(
+        "tune",
+        help="measure and keep this chip's fastest engine knobs for a model",
+        description=(
+            "Sweep the model's tunable engine paths — the subset its family "
+            "offers that this chip and memory bandwidth can run — measuring "
+            "decode throughput single-lane and at the full batch width, and "
+            "write the winners to the model's tuning.json, applied on every "
+            "serve.\n\n"
+            "Quick is the default: quality-trading knobs stay out and the "
+            "interaction recheck pass is skipped. --complete runs both. "
+            "--include-quality-knobs and --interaction-pass enable each "
+            "half on its own."
+        ),
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    tune_command.add_argument(
+        "--model",
+        type=model_artifacts.parse_model_id,
+        metavar="OWNER/REPO[:VARIANT]",
+        help="the installed model to tune",
+    )
+    tune_command.add_argument(
+        "--selection",
+        metavar="NAME",
+        help="an installed selection link named relative to the models "
+        "directory (e.g. .selections/<hash>), for installs whose options "
+        "the model ID alone does not reproduce; skips --model resolution",
+    )
+    tune_command.add_argument(
+        "--models",
+        metavar="DIR",
+        help="models directory holding the install (default: the install root's)",
+    )
+    tune_command.add_argument(
+        "--revision",
+        help="optional model branch, tag or commit (default: repository default)",
+    )
+    tune_command.add_argument(
+        "--draft-model",
+        type=model_artifacts.parse_draft_model,
+        help="the draft override the installation was made with, if any",
+    )
+    tune_command.add_argument(
+        "--language-only",
+        action="store_true",
+        help="the language-only installation, if that is what was installed",
+    )
+    tune_command.add_argument(
+        "--complete",
+        action="store_true",
+        help="the complete sweep: quality-trading knobs plus the "
+        "interaction recheck pass (Quick, the default, runs neither)",
+    )
+    tune_command.add_argument(
+        "--include-quality-knobs",
+        action="store_true",
+        help="also sweep knobs that trade output quality for speed "
+        "(DiffusionGemma's step cap and exit thresholds); off by default "
+        "and implied by --complete",
+    )
+    tune_command.add_argument(
+        "--interaction-pass",
+        action="store_true",
+        help="run the recheck that re-measures losing knobs against the "
+        "final env; implied by --complete",
+    )
+    tune_command.add_argument(
+        "--no-interaction-pass",
+        action="store_true",
+        help="skip the recheck pass even under --complete",
+    )
     status_command = commands.add_parser(
         "status",
         help="report the running server",
@@ -1716,6 +1893,8 @@ def main(argv=None):
             return serve(args)
         if args.command == "models":
             return list_models(args)
+        if args.command == "tune":
+            return tune(args)
         if args.command == "status":
             return status(args)
         if args.command == "flags":

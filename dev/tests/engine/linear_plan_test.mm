@@ -649,7 +649,7 @@ void planContracts(uint32_t family, uint32_t cores) {
            LinearWorkload{{384, 256}, 8}, LinearWorkload{{512, 64}, 8},
            LinearWorkload{{512, 320}, 8}, LinearWorkload{{512, 0}, 8},
            LinearWorkload{{512, 256}, 0}, LinearWorkload{{512, 256}, 7},
-           LinearWorkload{{512, 256}, 40},
+           LinearWorkload{{512, 256}, 72},
            LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
            LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
            LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
@@ -736,8 +736,7 @@ void planContracts(uint32_t family, uint32_t cores) {
   });
   for (const uint32_t splits : {0U, 1U, 3U, 8U, 16U})
     rejects([&] {
-      (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits},
-                         FloatOutput::BFloat16);
+      (void)Linear::plan(splitWorkload, {LinearTile::Split128, 0, LinearSimdgroups::Eight, splits}, FloatOutput::BFloat16);
     });
   rejects([&] {
     (void)Linear::plan(splitWorkload, {LinearTile::Paired256, 2, LinearSimdgroups::Eight}, FloatOutput::BFloat16);
@@ -1191,7 +1190,7 @@ void scratchBoundsRotated() {
   const Linear linear = gpu(10, 16);
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, WeightLayout::Block32, rotated};
-    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * RICHENGINE_MAXIMUM_BATCH_WIDTH * RICHENGINE_TARGET_VERIFY_ROWS * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }
@@ -1996,7 +1995,7 @@ void bufferContracts(metal::MetalBackend &backend, Linear &linear,
 void registerTileExtents(metal::MetalBackend &backend) {
   Linear m3 = gpu(9, 40);
   constexpr uint32_t n = 512, k = 2048, lanes = 2;
-  constexpr uint64_t rows = lanes * 8;
+  constexpr uint64_t rows = lanes * RICHENGINE_TARGET_VERIFY_ROWS;
   const auto tableAndSplits = [](const LinearScratchSize &s) {
     return s.input && s.sums && s.partials && s.counters;
   };

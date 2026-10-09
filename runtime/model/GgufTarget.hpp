@@ -1,6 +1,6 @@
 #pragma once
 
-// Source adapter for a Qwen GGUF: its images are written into memory and
+// Source adapter for a target GGUF: its images are written into memory and
 // read like packaged weights.
 
 #include <filesystem>
@@ -76,7 +76,7 @@ ggufTargetGeometry(const DiffusionGemmaLayout &) {
   throw std::invalid_argument("Gemma 4 targets load from packed files only");
 }
 
-// The GGUF geometry of a Qwen layout with its family's dense or sparse MoE
+// The GGUF geometry of a hybrid layout with its family's dense or sparse MoE
 // FFN.
 template <class Layout>
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Layout &layout) {

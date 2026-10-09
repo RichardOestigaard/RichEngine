@@ -1,0 +1,48 @@
+"""Tunable knobs of MiniCPM5-2B: the dense target on a DSpark draft,
+installed from GGUF."""
+
+from .base import (
+    ADAPTIVE_PROPOSALS,
+    DRAFT_BYPASS,
+    DRAFT_BYPASS_EXPECT,
+    GGUF_PACKED,
+    HEAD_FUSED,
+    ICB_OFF,
+    MTL4,
+    NGRAM_DRAFT_EXPECT,
+    NGRAM_TREE_MIN,
+    NGRAM_WARMUP,
+    NO_FUSED_GATE,
+    PATCHABLE_OFF,
+    PREFILL_FAST_INT8,
+    PREPARED_CACHE_OFF,
+    PROPOSAL_CAP,
+    SUBMIT_AHEAD,
+    VERIFY_TREE,
+    TunableKnobs,
+)
+
+TUNABLE = (
+    TunableKnobs(
+        "MiniCPM5-2B",
+        (
+            VERIFY_TREE,
+            GGUF_PACKED,
+            PREFILL_FAST_INT8,
+            ADAPTIVE_PROPOSALS,
+            DRAFT_BYPASS,
+            DRAFT_BYPASS_EXPECT,
+            PROPOSAL_CAP,
+            HEAD_FUSED,
+            MTL4,
+            SUBMIT_AHEAD,
+            ICB_OFF,
+            PREPARED_CACHE_OFF,
+            PATCHABLE_OFF,
+            NO_FUSED_GATE,
+            NGRAM_DRAFT_EXPECT,
+            NGRAM_WARMUP,
+            NGRAM_TREE_MIN,
+        ),
+    ),
+)

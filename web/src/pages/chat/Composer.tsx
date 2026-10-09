@@ -38,13 +38,25 @@ export default function Composer(props: {
   const anyToolOn = () => TOOL_IDS.some((id) => toolsEnabled()[id]);
 
   // A pointerdown outside the open menu closes it; clicks inside do not.
+  // Escape closes it too, in the capture phase: the chat's own Escape
+  // handler aborts a generation, which a menu dismissal must not reach.
   createEffect(() => {
     if (!toolsOpen()) return;
     const onDown = (event: PointerEvent) => {
       if (!toolsEl?.contains(event.target as Node)) setToolsOpen(false);
     };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setToolsOpen(false);
+      }
+    };
     document.addEventListener("pointerdown", onDown);
-    onCleanup(() => document.removeEventListener("pointerdown", onDown));
+    document.addEventListener("keydown", onKey, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("keydown", onKey, true);
+    });
   });
 
   function resize() {
@@ -233,6 +245,7 @@ export default function Composer(props: {
             aria-label="Built-in tools"
             aria-expanded={toolsOpen()}
             title="Built-in tools"
+            disabled={props.running}
             classList={{ on: anyToolOn() }}
             onClick={() => setToolsOpen(!toolsOpen())}
           >

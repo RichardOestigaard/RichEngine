@@ -72,7 +72,7 @@ struct GraniteLayout final {
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     return {};
   }
-  [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
+  [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize, packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads, gdnHeadDimension,
             attentionWidth, attentionHeadDimension};

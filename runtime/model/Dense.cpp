@@ -11,7 +11,7 @@ namespace {
 // per-head norms, and the output projection.
 template <class Format>
 MixerWeights readDenseAttention(WeightFile &file, const Format &format,
-                                    const QwenMixerGeometry &geometry) {
+                                    const MixerGeometry &geometry) {
   AttentionMixerWeights attention;
   attention.inputProjection =
       format.fused(file, geometry.packedFullWidth, geometry.hiddenSize,
@@ -53,7 +53,7 @@ void requireDenseLayout(const DenseLayout &layout) {
 template <class Format>
 MixerWeights readTargetMixer(const DenseLayout &, WeightFile &file,
                                  const Format &format,
-                                 const QwenMixerGeometry &geometry, bool) {
+                                 const MixerGeometry &geometry, bool) {
   return readDenseAttention(file, format, geometry);
 }
 

@@ -30,3 +30,19 @@
 .kv-meter { padding: 14px 16px 8px }
 .kv-meter .meter > i { transition: width .4s ease }
 .panel-row .num .badge { margin-left: 6px }
+
+/* Model names are click-to-copy buttons styled as plain text. */
+.model-name {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: 13.5px;
+  text-align: left;
+  cursor: copy;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-name:hover { color: var(--accent) }

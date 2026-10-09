@@ -238,6 +238,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/DeviceTuning.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
+	runtime/ops/draft_cores/Draft16x2x128.cpp \
+	runtime/ops/draft_cores/Draft32x8x128.cpp \
+	runtime/ops/draft_cores/Draft32x8x64Interleaved.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -295,13 +298,14 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/VisionLoader.cpp \
 	runtime/model/TargetModel.cpp \
 	runtime/model/TargetModelGemma.cpp \
+	runtime/model/TargetModelHybrid.cpp \
 	runtime/model/TargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DSparkDraft.cpp \
 	runtime/model/DFlashV1Draft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
-	runtime/model/QwenState.cpp
+	runtime/model/CompositeStateStorage.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/AnePredictor.mm \
 	runtime/ane/Handoff.mm \
@@ -318,8 +322,11 @@ ENGINE_MM_SOURCES := \
 	runtime/model/RuntimeDiffusion.mm \
 	runtime/model/RuntimeAne.mm \
 	runtime/model/RuntimeEncode.mm \
+	runtime/model/RuntimeEncodeDraft.mm \
+	runtime/model/RuntimeEncodeVerify.mm \
 	runtime/model/RuntimeNgram.mm \
-	runtime/model/RuntimeArenas.mm \
+	runtime/model/PrefillArena.mm \
+	runtime/model/DecodeArena.mm \
 	runtime/metal/MetalArena.mm \
 	runtime/metal/MetalEncode.mm \
 	runtime/ops/Vision.mm \

@@ -833,13 +833,7 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
                           position + 1 &&
                       RICHENGINE_TREE_NODE_POSITION(treeNodes[row]) ==
                           position,
-                  (fprintf(stderr,
-                           "pool chain fail lane=%u pos=%u row_tok=%u "
-                           "tok=%u node=%x\n",
-                           lane, position, treeTokens[row],
-                           tokens[lane * kPositions + position],
-                           treeNodes[row]),
-                   "dflash pool tree chain node is malformed"));
+                  "dflash pool tree chain node is malformed");
         // The comb's back half holds one leaf slot per leading position; a
         // chain lane's block carries chain rows there instead.
         if (!treeLane ||

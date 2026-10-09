@@ -263,7 +263,7 @@ RuntimeResources::RuntimeResources(
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
-    std::unique_ptr<model::QwenStateStorage> stateStorage,
+    std::unique_ptr<model::CompositeStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
@@ -518,7 +518,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       if (persistentCache.directory)
         stateFile = persistentCache.states;
     }
-    auto stateStorage = std::make_unique<model::QwenStateStorage>(
+    auto stateStorage = std::make_unique<model::CompositeStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), package.stateLayout(),
         stateFile);
     std::unique_ptr<KvPageTier> kvTier;

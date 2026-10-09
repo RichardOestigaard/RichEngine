@@ -173,7 +173,7 @@ def check() -> list[str]:
         "model/Qwen3_6Moe.hpp",
         "model/Qwen3_8.hpp",
         "model/QwenHybridLayout.hpp",
-        "model/QwenState.hpp",
+        "model/CompositeStateStorage.hpp",
         "model/TargetModel.hpp",
         "model/TargetFiles.hpp",
         "model/TargetLoader.hpp",
@@ -182,6 +182,8 @@ def check() -> list[str]:
     )
     concrete_model_symbols = re.compile(
         r"\bmodel::(?:Qwen\w*|DFlash\w*|TargetModel\w*|TargetFiles|"
+        r"CompositeStateStorage|CompositeStateImpl|GdnCell|StateBufferPool|"
+        r"CachedStateBuffers|LogicalLengths|LaneMetadata|"
         r"DenseLayerWeights|Runtime)\b"
     )
     client_names = re.compile(r"\b(?:Claude Code|OpenCode|Codex|Hermes)\b", re.I)
