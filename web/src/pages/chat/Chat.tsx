@@ -387,6 +387,18 @@ export default function Chat() {
     });
   }
 
+  // Reasoning-only chunks never reach schedulePaint; coalesce their
+  // follow-scroll the same way instead of scrolling per chunk.
+  let scrollQueued = false;
+  function queueScroll() {
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      maybeScroll();
+    });
+  }
+
   function consume(
     event: string,
     assistant: Message,
@@ -462,7 +474,9 @@ export default function Chat() {
         }
       }
     }
-    maybeScroll();
+    // schedulePaint already scrolls for text chunks; reasoning-only chunks
+    // go through the same rAF gate.
+    if (!delta.content) queueScroll();
     return false;
   }
 

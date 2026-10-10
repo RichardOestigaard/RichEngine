@@ -52,7 +52,12 @@ class Installer:
         self._job = None
 
     def start(
-        self, models_root, model, *, revision=None, draft_model=None,
+        self,
+        models_root,
+        model,
+        *,
+        revision=None,
+        draft_model=None,
         language_only=False,
     ):
         """Validate the selection and spawn the installer; the job outlives
@@ -72,7 +77,7 @@ class Installer:
             if self._job is not None and not self._job["done"]:
                 raise APIError(
                     409,
-                    f'an install of {self._job["model"]} is already running',
+                    f"an install of {self._job['model']} is already running",
                     "engine_busy",
                 )
             command, cwd = _command(
@@ -95,9 +100,7 @@ class Installer:
                     start_new_session=True,
                 )
             except OSError as error:
-                raise APIError(
-                    500, f"could not start the installer: {error}"
-                ) from None
+                raise APIError(500, f"could not start the installer: {error}") from None
             self._job = {
                 "model": model,
                 "started": time.time(),
@@ -138,9 +141,7 @@ class Installer:
                 "model": job["model"],
                 "started": job["started"],
                 "done": job["done"],
-                "ok": job["done"]
-                and job["returncode"] == 0
-                and not job["cancelled"],
+                "ok": job["done"] and job["returncode"] == 0 and not job["cancelled"],
                 "cancelled": job["cancelled"],
                 "returncode": job["returncode"],
                 "tail": list(job["lines"])[-STATUS_LINES:],

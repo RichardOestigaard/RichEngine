@@ -17,15 +17,29 @@ export interface TuneJob {
   cancelled?: boolean;
   returncode?: number | null;
   kept?: string[] | null;
-  /* "KNOB=value +4.1%" lines — every measured candidate's swing vs the
-     baseline, biggest first. */
+  /* "KNOB=value decode +4.1% @b4" lines — every measured candidate's
+     biggest swing vs the baseline, the moved metric named, biggest first. */
   results?: string[] | null;
-  /* The payoff number — "decode +9.8% @b4" — when the record shows one. */
+  /* The payoff number — "decode +9.8% @b4" or "prefill +22% @b1" — when
+     the record shows one. */
   headline?: string | null;
   /* The sweep's own error line on failure. */
   error?: string | null;
   candidates_done?: number;
   candidates_total?: number;
+  /* Sweep phase: starting | baseline | kernels | sweep | recheck | prune. */
+  phase?: string;
+  /* The active phase's own progress — each phase announces its workload
+     separately, so a new phase resets this instead of dragging the
+     cumulative ratio backwards. */
+  phase_done?: number;
+  phase_total?: number;
+  /* The last measured candidate — "MTL4=1" plus its verdict; the sweep
+     only prints a candidate when the measurement finishes, so this is
+     the most recent completed step, not the one in flight. */
+  current?: { name: string; outcome: string } | null;
+  /* Candidates skipped by chip priors — never launched. */
+  saved?: number;
   tail?: string[];
 }
 

@@ -20,9 +20,11 @@ namespace {
 }
 
 // Each query tile's history splits: the maximum shared out over the chunk's
-// tiles, at least one.
-[[nodiscard]] constexpr uint32_t prefillSplits(uint32_t tiles) {
-  constexpr uint32_t maximum = RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS;
+// tiles, at least one. RICHENGINE_PREFILL_SPLITS_MAX lowers the maximum —
+// the workspace sizes to the same count, and the shader contract's baked
+// bound still admits it.
+[[nodiscard]] inline uint32_t prefillSplits(uint32_t tiles) {
+  const uint32_t maximum = tuning().prefillSplitsMax;
   return std::clamp(maximum / tiles, 1u, maximum);
 }
 

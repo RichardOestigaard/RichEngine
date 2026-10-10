@@ -2,9 +2,13 @@
 // the scope that says which devices each choice names.
 #include "ops/DeviceTuning.hpp"
 
+#include "Tuning.hpp"
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
+#include <charconv>
+#include <string_view>
+#include <vector>
 
 namespace richengine::ops {
 namespace {
@@ -303,6 +307,121 @@ std::span<const SplitTier> stagedTiers(const DevicePolicy &device) noexcept {
 
 std::span<const SplitTier> mxfp4Tiers() noexcept { return kMxfp4Tiers; }
 
+namespace {
+
+// RICHENGINE_LINEAR_PLANS: the install's measured affine plans, written into
+// tuning.json by the autotune's kernel pass (install/autotune.py) as
+// "{{output, input}, rows, LinearPhase::X, LinearEpilogue::Y}="
+// "{LinearTile::Z, groups, LinearSimdgroups::W, splits}" entries separated
+// by ';' — the workload and configuration text the tune tool's report
+// already prints, copied verbatim. Entries that do not parse
+// or whose configuration is invalid are skipped; an entry only steers a
+// workload that matches its key exactly.
+struct InstalledPlan final {
+  LinearMatrix matrix;
+  uint32_t rows;
+  LinearPhase phase;
+  LinearEpilogue epilogue;
+  LinearConfig config;
+};
+
+struct PlanParser final {
+  std::string_view text;
+
+  void space() noexcept {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+      text.remove_prefix(1);
+  }
+  bool literal(char c) noexcept {
+    space();
+    if (text.empty() || text.front() != c) return false;
+    text.remove_prefix(1);
+    return true;
+  }
+  bool number(uint32_t &out) noexcept {
+    space();
+    const char *const begin = text.data();
+    const auto parsed =
+        std::from_chars(begin, begin + text.size(), out);
+    if (parsed.ec != std::errc{} || parsed.ptr == begin) return false;
+    text.remove_prefix(size_t(parsed.ptr - begin));
+    return true;
+  }
+  template <typename Enum, size_t N>
+  bool choice(Enum &out, const std::pair<std::string_view, Enum> (&names)[N]) noexcept {
+    space();
+    for (const auto &[name, value] : names) {
+      if (text.starts_with(name) &&
+          (text.size() == name.size() || text[name.size()] < 'A' || text[name.size()] > 'z' ||
+           (text[name.size()] > 'Z' && text[name.size()] < 'a'))) {
+        out = value;
+        text.remove_prefix(name.size());
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+constexpr std::pair<std::string_view, LinearPhase> kPhaseNames[] = {
+    {"LinearPhase::Prefill", LinearPhase::Prefill},
+    {"LinearPhase::Decode", LinearPhase::Decode}};
+constexpr std::pair<std::string_view, LinearEpilogue> kEpilogueNames[] = {
+    {"LinearEpilogue::None", LinearEpilogue::None},
+    {"LinearEpilogue::Residual", LinearEpilogue::Residual},
+    {"LinearEpilogue::GateUp", LinearEpilogue::GateUp},
+    {"LinearEpilogue::UpWithGate", LinearEpilogue::UpWithGate}};
+constexpr std::pair<std::string_view, LinearTile> kTileNames[] = {
+    {"LinearTile::N128", LinearTile::N128},
+    {"LinearTile::N256", LinearTile::N256},
+    {"LinearTile::Paired128", LinearTile::Paired128},
+    {"LinearTile::Split128", LinearTile::Split128},
+    {"LinearTile::Paired256", LinearTile::Paired256},
+    {"LinearTile::Simdgroup", LinearTile::Simdgroup},
+    {"LinearTile::GgufStaged", LinearTile::GgufStaged},
+    {"LinearTile::GgufPrefill", LinearTile::GgufPrefill},
+    {"LinearTile::GgufRegister", LinearTile::GgufRegister}};
+constexpr std::pair<std::string_view, LinearSimdgroups> kSimdgroupNames[] = {
+    {"LinearSimdgroups::Four", LinearSimdgroups::Four},
+    {"LinearSimdgroups::Eight", LinearSimdgroups::Eight},
+    {"LinearSimdgroups::Sixteen", LinearSimdgroups::Sixteen}};
+
+bool parseInstalledPlan(std::string_view entry, InstalledPlan &plan) noexcept {
+  PlanParser p{entry};
+  LinearConfig config{};
+  return p.literal('{') && p.literal('{') && p.number(plan.matrix.outputSize) &&
+         p.literal(',') && p.number(plan.matrix.inputSize) && p.literal('}') &&
+         p.literal(',') && p.number(plan.rows) && p.literal(',') &&
+         p.choice(plan.phase, kPhaseNames) && p.literal(',') &&
+         p.choice(plan.epilogue, kEpilogueNames) && p.literal('}') &&
+         p.literal('=') && p.literal('{') && p.choice(config.tile, kTileNames) &&
+         p.literal(',') && p.number(config.groups) && p.literal(',') &&
+         p.choice(config.simdgroups, kSimdgroupNames) && p.literal(',') &&
+         p.number(config.splits) && p.literal('}') && (plan.config = config, p.space(), p.text.empty());
+}
+
+// The parsed overrides, built once like every other tuning() read. A
+// workload match requires Affine64 weights and no canvas flag — the only
+// plans the kernel pass measures.
+const std::vector<InstalledPlan> &installedPlans() noexcept {
+  static const std::vector<InstalledPlan> plans = [] {
+    std::vector<InstalledPlan> parsed;
+    const char *env = tuning().linearPlans;
+    for (std::string_view rest = env ? env : ""; !rest.empty();) {
+      const size_t end = rest.find(';');
+      const std::string_view entry = rest.substr(0, end);
+      InstalledPlan plan;
+      if (parseInstalledPlan(entry, plan) && plan.config.validSplits())
+        parsed.push_back(plan);
+      rest.remove_prefix(end == std::string_view::npos ? rest.size() : end + 1);
+    }
+    return parsed;
+  }();
+  return plans;
+}
+
+} // namespace
+
 LinearConfig registerDecode(const DevicePolicy &device, uint32_t n, uint32_t k) {
   return {.tile = LinearTile::GgufRegister, .splits = decodeSplits(device, n, k, kRegisterTiers)};
 }
@@ -311,6 +430,13 @@ LinearConfig stagedDecode(const DevicePolicy &device, uint32_t n, uint32_t k) {
 }
 
 std::optional<LinearConfig> measuredLinearPlan(const DevicePolicy &device, LinearWorkload w) noexcept {
+  // The install's own measurement outranks the shipped tables: the kernel
+  // pass fitted the config on this machine and this model.
+  if (w.weightLayout == WeightLayout::Affine64 && !w.canvas)
+    for (const InstalledPlan &plan : installedPlans())
+      if (plan.matrix == w.matrix && plan.rows == w.rows && plan.phase == w.phase &&
+          plan.epilogue == w.epilogue)
+        return plan.config;
   const std::span<const MeasuredLinear> table =
       w.phase == LinearPhase::Prefill ? std::span<const MeasuredLinear>(kMeasuredPrefill)
                                       : std::span<const MeasuredLinear>(kMeasuredDecode);

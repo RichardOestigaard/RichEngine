@@ -10,6 +10,7 @@ import random
 import signal
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -759,7 +760,9 @@ class ServerTest(unittest.TestCase):
                 side_effect=lambda matcher, executor, _contract: (matcher, executor),
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
+            factory = generation_constraints.ConstraintFactory(
+                object(), generation_constraints.TokenizerContract(0, (), "", 0)
+            )
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -809,7 +812,9 @@ class ServerTest(unittest.TestCase):
                 side_effect=lambda matcher, _, _contract: matcher,
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
+            factory = generation_constraints.ConstraintFactory(
+                object(), generation_constraints.TokenizerContract(0, (), "", 0)
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(factory.create, ["shared"] * 4))
 
@@ -850,7 +855,9 @@ class ServerTest(unittest.TestCase):
                 side_effect=lambda matcher, _, _contract: matcher,
             ),
         ):
-            factory = generation_constraints.ConstraintFactory(object(), generation_constraints.TokenizerContract(0, (), '', 0))
+            factory = generation_constraints.ConstraintFactory(
+                object(), generation_constraints.TokenizerContract(0, (), "", 0)
+            )
             for _ in range(2):
                 with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
                     factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))
@@ -1260,7 +1267,9 @@ class ServerTest(unittest.TestCase):
         self.assertIn("richengine_scheduler_decode_b3_total 3", metrics)
         self.assertIn("richengine_kv_pages_allocated 8", metrics)
         self.assertIn("richengine_kv_free_allocated_pages 2", metrics)
-        self.assertFalse([line for line in metrics if "richengine_kv_pages_free" in line])
+        self.assertFalse(
+            [line for line in metrics if "richengine_kv_pages_free" in line]
+        )
         self.assertIn("richengine_kv_allocated_bytes 8192", metrics)
         self.assertIn("richengine_kv_extent_allocate_max_milliseconds 2.5", metrics)
         self.assertIn("richengine_kv_extent_release_max_milliseconds 0.75", metrics)
@@ -1284,7 +1293,9 @@ class ServerTest(unittest.TestCase):
         self.assertIn(
             "richengine_constraint_mask_target_forward_gpu_milliseconds 72.5", metrics
         )
-        self.assertIn("richengine_constraint_mask_residual_wait_milliseconds 1.5", metrics)
+        self.assertIn(
+            "richengine_constraint_mask_residual_wait_milliseconds 1.5", metrics
+        )
         self.assertIn("richengine_prefill_input_tokens_total 2048", metrics)
         self.assertIn("richengine_prefill_tokens_per_second 4096.0", metrics)
         self.assertIn("richengine_decode_output_tokens_total 32", metrics)
@@ -3452,6 +3463,22 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("request_id", line)
         self.assertNotIn("hello", line)
 
+    def test_a_failing_request_logger_is_reported_without_failing_the_request(self):
+        logged = []
+        harness = self.harness(
+            FakeRuntime(),
+            request_logger=lambda _record: 1 / 0,
+        )
+        with mock.patch.object(
+            backend_api, "log_unexpected", side_effect=logged.append
+        ):
+            status, _, _ = harness.request(
+                "POST", "/v1/chat/completions", self.body(reasoning_effort="none")
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(logged), 1)
+        self.assertIsInstance(logged[0], ZeroDivisionError)
+
     def test_latency_histograms_cover_http_preparation_and_token_batches(self):
         harness = self.harness(FakeRuntime(Plan([[4, 4], [4]], delay=0.01)))
         status, _, payload = harness.request(
@@ -3647,9 +3674,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(args.kv_format, "int4")
         self.assertNotIn("--kv-format", hosting._native_command(args))
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
-        self.assertEqual(hosting._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        self.assertEqual(
+            hosting._native_command(bf16_args)[-2:], ["--kv-format", "bf16"]
+        )
         fp8_args = api.parse_args([*required, "--kv-format", "fp8e4m3"])
-        self.assertEqual(hosting._native_command(fp8_args)[-2:], ["--kv-format", "fp8e4m3"])
+        self.assertEqual(
+            hosting._native_command(fp8_args)[-2:], ["--kv-format", "fp8e4m3"]
+        )
         disk_bf16_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--kv-format", "bf16"]
         )
@@ -3680,7 +3711,8 @@ class ServerTest(unittest.TestCase):
         for pixels, patches in (("1048576", "4096"), ("1000000", "3904")):
             pixel_args = api.parse_args([*required, "--max-image-pixels", pixels])
             self.assertEqual(
-                hosting._native_command(pixel_args)[-2:], ["--max-image-patches", patches]
+                hosting._native_command(pixel_args)[-2:],
+                ["--max-image-patches", patches],
             )
         self.assertNotIn("--idle-sleep", hosting._native_command(args))
         sleep_args = api.parse_args([*required, "--allow-idle-sleep"])
@@ -3834,7 +3866,9 @@ class ServerTest(unittest.TestCase):
                 hosting, "NativeBackend", return_value=backend
             ) as backend_type,
             mock.patch.object(hosting, "ConstraintFactory", return_value=object()),
-            mock.patch.object(hosting, "Frontend", return_value=mock.Mock()) as app_type,
+            mock.patch.object(
+                hosting, "Frontend", return_value=mock.Mock()
+            ) as app_type,
             mock.patch.object(hosting, "print_status"),
         ):
             host = hosting.ModelHost(args)
@@ -3910,9 +3944,7 @@ class ServerTest(unittest.TestCase):
                 runtime = mock.Mock()
                 runtime.readiness = native_wire.ReadyEvent(4, 131072, vision)
                 with (
-                    mock.patch.object(
-                        hosting, "load_thinking_key", return_value=None
-                    ),
+                    mock.patch.object(hosting, "load_thinking_key", return_value=None),
                     mock.patch.object(
                         hosting.AutoTokenizer,
                         "from_pretrained",
@@ -4011,9 +4043,7 @@ class ServerTest(unittest.TestCase):
                 return_value=SimpleNamespace(chat_template=None),
             ),
             mock.patch.object(hosting, "validate_tokenizer"),
-            mock.patch.object(
-                hosting.engine_runtime, "MultiplexedRuntime"
-            ) as runtime,
+            mock.patch.object(hosting.engine_runtime, "MultiplexedRuntime") as runtime,
             self.assertRaises(ChatTemplateError),
         ):
             hosting.ModelHost(main_args()).load_initial()
@@ -4065,9 +4095,51 @@ class ServerTest(unittest.TestCase):
             "POST", "/v1/chat/completions", self.body()
         )
         self.assertEqual(status, 503)
-        self.assertEqual(
-            json.loads(payload)["error"]["code"], "model_not_loaded"
-        )
+        self.assertEqual(json.loads(payload)["error"]["code"], "model_not_loaded")
+
+    def test_tuning_requires_reload_flags_unapplied_winners(self):
+        # The engine keeps the env it spawned with: a tune finishing while
+        # the model stayed loaded changes tuning.json but not the running
+        # process — the flag marks the gap until the next load.
+        from install import autotune
+
+        harness = self.harness(FakeRuntime())
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "richengine"
+            binary.write_bytes(b"engine")
+            with mock.patch.object(hosting, "load_thinking_key", return_value=None):
+                host = hosting.ModelHost(main_args(binary=str(binary)))
+            host.app = harness.app
+            host.backend = harness.backend
+            host.state = "loaded"
+            host.tuned_env = {}
+            directory = Path(td) / "model"
+            directory.mkdir()
+            host.assembly_dir = directory
+            harness.server.host = host
+            self.assertFalse(host.tuning_requires_reload())
+            chip, _, _ = autotune.detect_chip()
+            autotune.tuning_path(directory).write_text(
+                json.dumps(
+                    {
+                        chip: {
+                            "schema": autotune.TUNING_SCHEMA,
+                            "engine": autotune.engine_fingerprint(binary),
+                            "env": {"RICHENGINE_MTL4": "1"},
+                        }
+                    }
+                )
+            )
+            self.assertTrue(host.tuning_requires_reload())
+            status, _, payload = harness.request("GET", "/status")
+            self.assertTrue(json.loads(payload)["model_requires_reload"])
+            # The env the engine spawned with matching the record means
+            # nothing is pending — and an unloaded host never flags.
+            host.tuned_env = {"RICHENGINE_MTL4": "1"}
+            self.assertFalse(host.tuning_requires_reload())
+            host.tuned_env = {}
+            host.state = "unloaded"
+            self.assertFalse(host.tuning_requires_reload())
 
     def test_unload_refuses_while_requests_run_unless_forced(self):
         harness = self.harness(FakeRuntime())
@@ -4120,9 +4192,7 @@ class ServerTest(unittest.TestCase):
     def test_load_refuses_a_model_that_is_not_installed(self):
         harness = self.harness(FakeRuntime())
         with tempfile.TemporaryDirectory() as models:
-            with mock.patch.object(
-                hosting, "load_thinking_key", return_value=None
-            ):
+            with mock.patch.object(hosting, "load_thinking_key", return_value=None):
                 host = hosting.ModelHost(main_args(models_dir=models))
             host.app = harness.app
             host.backend = harness.backend
@@ -4433,7 +4503,9 @@ class ServerTest(unittest.TestCase):
                     try:
                         # A comment until the request starts, then a chunk
                         # that adds nothing.
-                        self.assertEqual(response.readline(), b": richengine-keepalive\n")
+                        self.assertEqual(
+                            response.readline(), b": richengine-keepalive\n"
+                        )
                         plan.start_release.set()
                         chunk = json.loads(self.next_sse_data(response))
                         if path == "/v1/chat/completions":
@@ -9520,9 +9592,7 @@ class WebSearchEndpointTest(unittest.TestCase):
             "provider": "bing",
             "results": [{"title": "T", "url": "u", "snippet": "s"}],
         }
-        with mock.patch.object(
-            websearch, "search", return_value=result
-        ) as search:
+        with mock.patch.object(websearch, "search", return_value=result) as search:
             status, _, payload = self.harness.request(
                 "POST",
                 "/v1/tools/search",
@@ -9544,6 +9614,35 @@ class WebSearchEndpointTest(unittest.TestCase):
             "POST", "/v1/tools/search", {"query": "q", "provider": "altavista"}
         )
         self.assertEqual(status, 400)
+
+
+class DiagnosticsTests(unittest.TestCase):
+    def test_log_unexpected_names_the_error_and_server_line_not_the_message(self):
+        def boom():
+            raise RuntimeError("prompt content must not appear")
+
+        try:
+            boom()
+        except RuntimeError:
+            error = sys.exc_info()[1]
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stream:
+            diagnostics.log_unexpected(error)
+        line = stream.getvalue()
+        self.assertIn("internal_server_error", line)
+        self.assertIn("RuntimeError", line)
+        self.assertNotIn("prompt content must not appear", line)
+
+        # The innermost frame inside the server package locates the error.
+        filename = str(Path(diagnostics.__file__).with_name("errors.py").resolve())
+        frame = SimpleNamespace(f_code=SimpleNamespace(co_filename=filename))
+        with (
+            mock.patch.object(
+                diagnostics.traceback, "walk_tb", return_value=[(frame, 42)]
+            ),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stream,
+        ):
+            diagnostics.log_unexpected(error)
+        self.assertIn("server/errors.py:42", stream.getvalue())
 
 
 if __name__ == "__main__":

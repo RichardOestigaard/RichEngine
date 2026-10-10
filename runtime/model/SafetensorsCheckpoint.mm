@@ -167,7 +167,12 @@ const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const 
 void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
   @autoreleasepool {
     NSString *key = [[NSString alloc] initWithBytes:projection.data() length:projection.size() encoding:NSUTF8StringEncoding];
-    NSDictionary *entry = impl_->quantization[key] ?: impl_->quantization;
+    NSDictionary *entry = impl_->quantization[key];
+    // Match find(): per-tensor overrides name tensors flat, without the
+    // "language_model." prefix the target image asks about.
+    if (!entry && [key hasPrefix:@"language_model."])
+      entry = impl_->quantization[[key substringFromIndex:@"language_model.".length]];
+    entry = entry ?: impl_->quantization;
     id mode = [entry isKindOfClass:[NSDictionary class]] ? entry[@"mode"] ?: impl_->quantization[@"mode"] : nil;
     if (![entry isKindOfClass:[NSDictionary class]] || number(entry[@"bits"] ?: impl_->quantization[@"bits"]) != bits ||
         number(entry[@"group_size"] ?: impl_->quantization[@"group_size"]) != 64 ||

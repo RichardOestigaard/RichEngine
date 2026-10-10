@@ -18,7 +18,7 @@ from PIL import Image
 from dev.tests import test_server as fixtures
 from server import frontend, json_codec, serve_options
 from server import server as api
-from server.errors import RequestValidationError
+from server.errors import APIError
 
 
 class HttpBodyBudgetTests(unittest.TestCase):
@@ -104,6 +104,9 @@ class HttpBodyBudgetTests(unittest.TestCase):
             handler.rfile = io.BytesIO(payload)
             try:
                 return handler._read_json_body(time.monotonic() + 1)
+            except (ValueError, RecursionError):
+                # Callers answer an unreadable body with this 400.
+                raise APIError(400, "invalid JSON request body") from None
             finally:
                 handler._body_reservation.release()
                 self.assertEqual(handler.server.request_bodies.active, 0)
@@ -138,7 +141,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     json_codec.loads(payload)
                 # The body reader answers each with its own 400.
-                with self.assertRaises(RequestValidationError) as raised:
+                with self.assertRaises(APIError) as raised:
                     parse(payload)
                 self.assertEqual(
                     (raised.exception.status, raised.exception.message),

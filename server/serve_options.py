@@ -136,7 +136,6 @@ def idle_release_text(seconds):
     return "off" if math.isinf(seconds) else str(seconds)
 
 
-
 def parse_queue_size(value):
     try:
         size = int(value)

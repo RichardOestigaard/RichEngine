@@ -28,11 +28,13 @@ def scalar_quant(x, bits):
 
 def recency(fn, window):
     """Apply fn to all but the last `window` tokens (axis 2 = T)."""
+
     def wrapped(x):
         out = x.copy()
         if window < x.shape[2]:
             out[:, :, :-window, :] = fn(x[:, :, :-window, :])
         return out
+
     return wrapped
 
 
@@ -40,7 +42,9 @@ def mlx_quant(x, mode, group_size):
     """Round-trip through MLX mxfp4/nvfp4 quantize->dequantize."""
     a = mx.array(x)
     q = mx.quantize(a, group_size=group_size, mode=mode)
-    return np.array(mx.dequantize(*q, group_size=group_size, mode=mode).astype(mx.float32))
+    return np.array(
+        mx.dequantize(*q, group_size=group_size, mode=mode).astype(mx.float32)
+    )
 
 
 def tq_quant(x, bit_width, mode, seed):
@@ -71,12 +75,22 @@ def main():
 
     cache = make_prompt_cache(model)
     logits = model(mx.array(prompt)[None], cache=cache)
-    mx.eval(logits, *[s for c in cache for s in (c.state if isinstance(c.state, (list, tuple)) else [c.state]) if s is not None])
+    mx.eval(
+        logits,
+        *[
+            s
+            for c in cache
+            for s in (c.state if isinstance(c.state, (list, tuple)) else [c.state])
+            if s is not None
+        ],
+    )
     print(f"prefilled {PROMPT_TOKENS} tokens {time.time() - t0:.0f}s", flush=True)
 
     saved = [c.state for c in cache]
     kv_idx = [i for i, c in enumerate(cache) if isinstance(c, KVCache)]
-    k0 = np.array(cache[kv_idx[0]].keys[..., : cache[kv_idx[0]].offset, :].astype(mx.float32))
+    k0 = np.array(
+        cache[kv_idx[0]].keys[..., : cache[kv_idx[0]].offset, :].astype(mx.float32)
+    )
     n_layers, n_heads, T, D = len(kv_idx), k0.shape[1], k0.shape[2], k0.shape[3]
     print(f"KV: {n_layers} attn layers x {n_heads} heads x {T} x {D}", flush=True)
 
@@ -95,7 +109,11 @@ def main():
                 keys, values, offset = saved[i]
                 k = np.array(keys[..., :offset, :].astype(mx.float32))
                 v = np.array(values[..., :offset, :].astype(mx.float32))
-                c.state = (mx.array(kq(k) if kq else k).astype(keys.dtype), mx.array(vq(v) if vq else v).astype(values.dtype), offset)
+                c.state = (
+                    mx.array(kq(k) if kq else k).astype(keys.dtype),
+                    mx.array(vq(v) if vq else v).astype(values.dtype),
+                    offset,
+                )
             else:
                 c.state = saved[i]
 
@@ -108,17 +126,24 @@ def main():
         if name == "bf16 (ref)":
             REF["pred"] = pred
             m = pred == np.array(draft[1:])
-            print(f"{name:26s} self-match {m.mean()*100:.1f}%", flush=True)
+            print(f"{name:26s} self-match {m.mean() * 100:.1f}%", flush=True)
             return
         ref = REF["pred"]
         match = pred == ref
         # 4-token verify windows fully matching = spec-decode block accepted
         w = match[: len(match) // 4 * 4].reshape(-1, 4).all(axis=1)
-        print(f"{name:26s} token-match {match.mean()*100:.1f}%  clean-4win {w.mean()*100:.0f}% ({int(w.sum())}/{len(w)})", flush=True)
+        print(
+            f"{name:26s} token-match {match.mean() * 100:.1f}%  clean-4win {w.mean() * 100:.0f}% ({int(w.sum())}/{len(w)})",
+            flush=True,
+        )
 
     trial("bf16 (ref)")
     for b in (8, 4):
-        trial(f"richengine int{b} K+V", lambda x, b=b: scalar_quant(x, b), lambda x, b=b: scalar_quant(x, b))
+        trial(
+            f"richengine int{b} K+V",
+            lambda x, b=b: scalar_quant(x, b),
+            lambda x, b=b: scalar_quant(x, b),
+        )
     for kb, vb in ((4, 8), (6, 8), (4, 6), (8, 4), (8, 2), (4, 2)):
         trial(
             f"scalar K{kb} V{vb}",
@@ -126,27 +151,37 @@ def main():
             lambda x, b=vb: scalar_quant(x, b),
         )
     for mode, g in (("mxfp4", 32), ("nvfp4", 16), ("mxfp8", 32)):
-        trial(f"{mode} K+V g{g}",
-              lambda x, m=mode, g=g: mlx_quant(x, m, g),
-              lambda x, m=mode, g=g: mlx_quant(x, m, g))
-    trial("K int8 / V mxfp4",
-          lambda x: scalar_quant(x, 8),
-          lambda x: mlx_quant(x, "mxfp4", 32))
-    trial("K mxfp4 / V int8",
-          lambda x: mlx_quant(x, "mxfp4", 32),
-          lambda x: scalar_quant(x, 8))
+        trial(
+            f"{mode} K+V g{g}",
+            lambda x, m=mode, g=g: mlx_quant(x, m, g),
+            lambda x, m=mode, g=g: mlx_quant(x, m, g),
+        )
+    trial(
+        "K int8 / V mxfp4",
+        lambda x: scalar_quant(x, 8),
+        lambda x: mlx_quant(x, "mxfp4", 32),
+    )
+    trial(
+        "K mxfp4 / V int8",
+        lambda x: mlx_quant(x, "mxfp4", 32),
+        lambda x: scalar_quant(x, 8),
+    )
     for w in (128, 512, 2048):
         trial(
             f"int4 + bf16 last {w}",
             recency(lambda x: scalar_quant(x, 4), w),
             recency(lambda x: scalar_quant(x, 4), w),
         )
-    trial("int2 + bf16 last 512",
-          recency(lambda x: scalar_quant(x, 2), 512),
-          recency(lambda x: scalar_quant(x, 2), 512))
-    trial("K4V4 old + bf16 last 512 / V2",
-          recency(lambda x: scalar_quant(x, 4), 512),
-          recency(lambda x: scalar_quant(x, 2), 512))
+    trial(
+        "int2 + bf16 last 512",
+        recency(lambda x: scalar_quant(x, 2), 512),
+        recency(lambda x: scalar_quant(x, 2), 512),
+    )
+    trial(
+        "K4V4 old + bf16 last 512 / V2",
+        recency(lambda x: scalar_quant(x, 4), 512),
+        recency(lambda x: scalar_quant(x, 2), 512),
+    )
     for kb, vb in ((3, 3), (3, 2), (2, 2), (4, 3)):
         trial(
             f"tq K{kb}(prod) V{vb}(mse)",

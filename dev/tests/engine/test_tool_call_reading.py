@@ -8,14 +8,13 @@ read as they do.
 import json
 import unittest
 
-from server import tool_schema
-
 from dev.tests.tool_output import (
     project,
     streamed_arguments,
     streamed_text,
     tool_policy,
 )
+from server import tool_schema
 
 SCHEMAS = {
     "roll_cut": {

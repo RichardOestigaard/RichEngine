@@ -903,6 +903,81 @@ void tokenGather(MetalBackend &backend) {
   section("token gather: " + std::to_string(formats) + " embedding formats, each value bf16 of GGML's fp32 value");
 }
 
+// ---------------------------------------------------------------- fused head
+// The fused greedy head (Linear::addGgufHeadArgmax, gguf_decode_*_m*_amax) on
+// one and two lanes: every live row's argmax against the fp64 dots, every row
+// past its lane's live count the empty sentinel. The per-lane liveness
+// follows RICHENGINE_TARGET_VERIFY_ROWS — a literal row count here once left
+// every lane past the first dead (the draft-verify warmup's out-of-vocabulary
+// token on every GGUF model).
+void headArgmax(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 256, tiles = N / GGUF_TILE_COLUMNS;
+  for (const Fmt f : {Q4K, Q6K, MXFP4}) {
+    const Tensor w = tensor(backend, f, N, K);
+    const Projection head = projection({&w}, N);
+    for (const uint32_t lanes : {1u, 2u}) {
+      const std::string what = std::string(fmtName(f)) + " L=" + std::to_string(lanes);
+      const LinearPlan plan = linear.decodePlan(head, lanes);
+      const uint32_t rows = plan.workload().rows, storage = plan.storageRows();
+      const std::vector<float> x = activations(Inputs::Dense, rows, K);
+      const std::vector<Dot> dots = products({&w}, N, x, rows);
+      const Guarded input = bfloats(backend, storageRows(x, K, rows, storage));
+      const Guarded values(backend, uint64_t{storage} * tiles * 4, 0xFF),
+                   indices(backend, uint64_t{storage} * tiles * 4, 0xFF);
+      const Scratch scratch(backend, plan.scratchSize());
+      HeadArgmaxParams headArgs{};
+      headArgs.output_size = N;
+      headArgs.input_size = K;
+      headArgs.rows = RICHENGINE_TARGET_VERIFY_ROWS;
+      headArgs.live_rows[0] = headArgs.rows;
+      if (lanes > 1) headArgs.live_rows[1] = 5;
+      CommandGraph graph;
+      if (!linear.addGgufHeadArgmax(graph, input.view, head, lanes, values.view, indices.view, headArgs,
+                                    scratch.bindings()))
+        fail(what + ": the fused head refused a single-segment projection");
+      static_cast<void>(backend.submitCommand(graph.dispatches()));
+      if (!input.intact() || !scratch.intact()) fail(what + ": a write past a buffer or a counter left set");
+      const auto *pv = static_cast<const float *>(values.view.contents());
+      const auto *pi = static_cast<const uint32_t *>(indices.view.contents());
+      for (uint32_t r = 0; r < storage; ++r) {
+        const uint32_t lane = r / headArgs.rows;
+        const bool live = lane < lanes && r % headArgs.rows < headArgs.live_rows[lane];
+        float best = -INFINITY;
+        uint32_t index = 0xffffffffu;
+        for (uint32_t t = 0; t < tiles; ++t) {
+          const float v = pv[r * tiles + t];
+          const uint32_t i = pi[r * tiles + t];
+          if (v > best || (v == best && i < index)) {
+            best = v;
+            index = i;
+          }
+        }
+        const std::string label = what + " row " + std::to_string(r);
+        if (!live) {
+          if (index != 0xffffffffu) fail(label + ": a dead row resolved a token");
+          continue;
+        }
+        if (index == 0xffffffffu) {
+          fail(label + ": a live row resolved no token");
+          continue;
+        }
+        // A winner is provable only when its fp64 dot clears every other by
+        // the kernels' error bound; a near tie may resolve to either side, so
+        // the check is that the selection's interval still reaches the
+        // largest possible value.
+        uint32_t first = 0;
+        for (uint32_t c = 1; c < N; ++c)
+          if (dots[r * N + c].value > dots[r * N + first].value) first = c;
+        const Interval hi = projected(dots[r * N + first], true);
+        if (index >= N || projected(dots[r * N + index], true).hi < hi.lo)
+          fail(label + ": argmax " + std::to_string(index) + " cannot reach the fp64 winner " +
+               std::to_string(first));
+      }
+    }
+  }
+  section("fused head: q4_k/q6_k/mxfp4 over one and two lanes, every live row the fp64 argmax, dead rows sentinel");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -933,6 +1008,7 @@ int main(int argc, char **argv) {
               "independent of poisoned partials and within fp64");
       packedInput(backend, linear);
       tokenGather(backend);
+      headArgmax(backend, linear);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';
       return 1;

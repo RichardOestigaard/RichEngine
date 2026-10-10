@@ -259,7 +259,19 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 ["richengine", ""],
-                ["serve", "models", "status", "flags", "doctor", "disk", "claude", "codex", "opencode", "hermes", "pi"],
+                [
+                    "serve",
+                    "models",
+                    "status",
+                    "flags",
+                    "doctor",
+                    "disk",
+                    "claude",
+                    "codex",
+                    "opencode",
+                    "hermes",
+                    "pi",
+                ],
             ),
             (["richengine", "co"], ["codex"]),
             (
@@ -277,7 +289,10 @@ class CompletionTests(unittest.TestCase):
             (["richengine", "serve", "--max-context", ""], []),
             # Bash 3.2 keeps owner/repo:VARIANT in one word, and readline
             # replaces only the text after its ':'.
-            (["richengine", "serve", "--model", "unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
+            (
+                ["richengine", "serve", "--model", "unsloth/Model-GGUF:UD"],
+                ["UD-Q4_K_M"],
+            ),
             (["richengine", "serve", "--model=unsloth/Model-GGUF:UD"], ["UD-Q4_K_M"]),
             # Bash 4 and later also split the word at the ':'.
             (
@@ -289,18 +304,37 @@ class CompletionTests(unittest.TestCase):
                 ["Q8_0", "UD-Q4_K_M"],
             ),
             (
-                ["richengine", "serve", "--model", "=", "unsloth/Model-GGUF", ":", "UD"],
+                [
+                    "richengine",
+                    "serve",
+                    "--model",
+                    "=",
+                    "unsloth/Model-GGUF",
+                    ":",
+                    "UD",
+                ],
                 ["UD-Q4_K_M"],
             ),
             (
-                ["richengine", "serve", "--max-context", "unsloth/Model-GGUF", ":", "UD"],
+                [
+                    "richengine",
+                    "serve",
+                    "--max-context",
+                    "unsloth/Model-GGUF",
+                    ":",
+                    "UD",
+                ],
                 [],
             ),
             (["richengine", "serve", "unsloth/Model-GGUF", ":"], []),
         )
         # Words as they are split once these characters leave COMP_WORDBREAKS.
         unbroken_cases = (
-            (["richengine", "serve", "--model=community/l"], "=", [f"--model={LOCAL[1]}"]),
+            (
+                ["richengine", "serve", "--model=community/l"],
+                "=",
+                [f"--model={LOCAL[1]}"],
+            ),
             (
                 ["richengine", "serve", "--model=unsloth/Model-GGUF", ":", "UD"],
                 "=",
@@ -328,7 +362,10 @@ class CompletionTests(unittest.TestCase):
                 with self.subTest(shell=shell, words=words, unbroken=unbroken):
                     self.assertEqual(
                         self.bash_complete(
-                            shell, directory / "richengine.bash", words, unbroken=unbroken
+                            shell,
+                            directory / "richengine.bash",
+                            words,
+                            unbroken=unbroken,
                         ),
                         expected,
                     )
@@ -469,17 +506,28 @@ class CompletionTests(unittest.TestCase):
         for line, expected in (
             ("richengine se", "richengine serve "),
             ("richengine p", "richengine pi "),
-            ("richengine serve --model community/l", f"richengine serve --model {LOCAL[1]} "),
-            ("richengine serve --model=community/l", f"richengine serve --model={LOCAL[1]} "),
+            (
+                "richengine serve --model community/l",
+                f"richengine serve --model {LOCAL[1]} ",
+            ),
+            (
+                "richengine serve --model=community/l",
+                f"richengine serve --model={LOCAL[1]} ",
+            ),
             (
                 "richengine serve --model unsloth/Model-GGUF:UD",
                 f"richengine serve --model {GGUF[1]} ",
             ),
-            ("richengine claude --model community/l", "richengine claude --model community/l"),
+            (
+                "richengine claude --model community/l",
+                "richengine claude --model community/l",
+            ),
             ("richengine pi --model community/l", "richengine pi --model community/l"),
         ):
             with self.subTest(line=line):
-                self.assertEqual(self.shell_tab(directory / "_richengine", line), expected)
+                self.assertEqual(
+                    self.shell_tab(directory / "_richengine", line), expected
+                )
 
     def test_actual_bash_tab_wordbreaks(self):
         _, directory = self.layout()
@@ -558,7 +606,21 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 "richengine ",
-                sorted(("serve", "models", "status", "flags", "doctor", "disk", "claude", "codex", "opencode", "hermes", "pi")),
+                sorted(
+                    (
+                        "serve",
+                        "models",
+                        "status",
+                        "flags",
+                        "doctor",
+                        "disk",
+                        "claude",
+                        "codex",
+                        "opencode",
+                        "hermes",
+                        "pi",
+                    )
+                ),
             ),
             ("richengine co", ["codex"]),
             ("richengine serve --model ", models),

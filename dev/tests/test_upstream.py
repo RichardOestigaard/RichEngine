@@ -91,7 +91,9 @@ class UpstreamTest(unittest.TestCase):
             families.family_for(config, name="someone/Qwen3.6-35B-A3B-GGUF"),
             ornith,
         )
-        self.assertIs(families.family_for(config, name="someone/Ornith-1.5-35B-A3B"), ornith)
+        self.assertIs(
+            families.family_for(config, name="someone/Ornith-1.5-35B-A3B"), ornith
+        )
 
     def test_the_name_hint_supplies_the_fields_a_config_omits(self):
         # A GGUF states no router_aux_loss_coef; the name resolves which of
@@ -100,12 +102,12 @@ class UpstreamTest(unittest.TestCase):
         config = {"text_config": text_config(MOE)}
         self.assertIs(families.family_for(config), MOE)
         self.assertIs(
-            families.family_for(config, name="ornith-ai/Ornith-1.5-35B-A3B-GGUF f.gguf"),
+            families.family_for(
+                config, name="ornith-ai/Ornith-1.5-35B-A3B-GGUF f.gguf"
+            ),
             ornith,
         )
-        self.assertIs(
-            families.family_for(config, name="someone/Qwen3.6-35B-A3B"), MOE
-        )
+        self.assertIs(families.family_for(config, name="someone/Qwen3.6-35B-A3B"), MOE)
 
     def test_the_name_hint_matches_whole_tokens_only(self):
         # A name embedding a family's name inside another word names no family.
@@ -468,6 +470,38 @@ class UpstreamTest(unittest.TestCase):
                     models.ModelError, "requires an MLX affine 4-bit/group-64"
                 ):
                     self.prepare(selection(self.root, f"someone/{name}"))
+        # A per-tensor override quantizing differently — the LFM2.5 exports'
+        # 6-bit model.embed_tokens — refuses early rather than failing to
+        # assemble with a shape error the runtime cannot explain.
+        fake.publish(
+            "someone/q6-embed",
+            "d" * 40,
+            target(
+                {
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "mode": "affine",
+                        "model.embed_tokens": {"bits": 6, "group_size": 64},
+                    }
+                }
+            ),
+        )
+        with self.assertRaisesRegex(
+            models.ModelError, "quantizes model.embed_tokens at 6"
+        ):
+            self.prepare(selection(self.root, "someone/q6-embed"))
+        # An override stating the supported quantization is no obstacle.
+        compatible = {
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "model.lm_head": {"bits": 4, "group_size": 64},
+        }
+        fake.publish(
+            "someone/q4-override", "e" * 40, target({"quantization": compatible})
+        )
+        self.prepare(selection(self.root, "someone/q4-override"))
         # MLX writes both keys, and states the mode only in newer versions.
         affine = {"bits": 4, "group_size": 64, "mode": "affine"}
         fake.publish(
@@ -1042,14 +1076,15 @@ class UpstreamTest(unittest.TestCase):
             self.prepare(chosen)
             refs = sorted(
                 (
-                    self.cache / "models--mlx-community--Qwen3.8-27B-4bit/refs/richengine"
+                    self.cache
+                    / "models--mlx-community--Qwen3.8-27B-4bit/refs/richengine"
                 ).glob("*/*")
             )
             self.assertEqual([ref.name for ref in refs], [commit])
             draft_refs = sorted(
-                (self.cache / hub.folder_name(DENSE.draft.repo) / "refs/richengine").glob(
-                    "*/*"
-                )
+                (
+                    self.cache / hub.folder_name(DENSE.draft.repo) / "refs/richengine"
+                ).glob("*/*")
             )
             self.assertEqual([ref.name for ref in draft_refs], [DRAFT_COMMIT])
         self.assertEqual(refs[0].parent.name, draft_refs[0].parent.name)

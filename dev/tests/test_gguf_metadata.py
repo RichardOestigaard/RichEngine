@@ -520,10 +520,13 @@ class GgufMetadataTests(unittest.TestCase):
             (text["num_key_value_heads"], text["num_global_key_value_heads"]),
             (8, 2),
         )
-        self.assertEqual(text["layer_types"], [
-            "full_attention" if i % 6 == 5 else "sliding_attention"
-            for i in range(30)
-        ])
+        self.assertEqual(
+            text["layer_types"],
+            [
+                "full_attention" if i % 6 == 5 else "sliding_attention"
+                for i in range(30)
+            ],
+        )
         self.assertEqual(
             (
                 text["num_experts"],
@@ -592,7 +595,10 @@ class GgufMetadataTests(unittest.TestCase):
                 del values[key]
             else:
                 values[key] = value
-            if key == "gemma4.attention.sliding_window_pattern" and value == [True] * 30:
+            if (
+                key == "gemma4.attention.sliding_window_pattern"
+                and value == [True] * 30
+            ):
                 values["gemma4.attention.head_count_kv"] = [8] * 30
             with (
                 self.subTest(key=key, value=value),

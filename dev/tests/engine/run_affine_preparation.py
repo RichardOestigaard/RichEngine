@@ -368,7 +368,9 @@ def main():
     parser.add_argument("goldens", type=Path)
     args = parser.parse_args()
     goldens = json.loads(args.goldens.read_text())["affine_images"]
-    with tempfile.TemporaryDirectory(prefix="richengine-affine-preparation-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="richengine-affine-preparation-"
+    ) as directory:
         root = Path(directory) / "draft"
         root.mkdir()
         draft_fixture(root)

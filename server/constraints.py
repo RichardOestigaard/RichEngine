@@ -24,7 +24,6 @@ from .tool_schema import (
     TOOL_CALL_OPEN_ALT,
 )
 
-
 # The think-block spellings the served families use, in preference order:
 # (close text, open text, leading special token of the open, system-turn
 # flag that marks a thinking-enabled prompt).
@@ -32,7 +31,6 @@ THINK_FRAMINGS = (
     (THINK_END, THINK_OPEN, THINK_OPEN, None),
     ("<channel|>", "<|channel>thought\n", "<|channel>", "<|think|>"),
 )
-
 
 
 @dataclass(frozen=True)
@@ -169,9 +167,7 @@ def validate_tokenizer(tokenizer, config):
                 f"model configuration is unreadable: {error}"
             ) from None
         if not isinstance(config, dict):
-            raise engine_runtime.EngineUnhealthy(
-                "model configuration is not an object"
-            )
+            raise engine_runtime.EngineUnhealthy("model configuration is not an object")
         # The generation configuration's own stop ids — a family whose
         # serving configuration stops on more than the model card's, as
         # Gemma 4 does on its tool-response token — count too.
@@ -222,20 +218,14 @@ def validate_tokenizer(tokenizer, config):
     # The think framing is the family's whose close token the vocabulary
     # has; the open's leading special token decodes for the output parser.
     framing = next(
-        (
-            item
-            for item in THINK_FRAMINGS
-            if vocabulary.get(item[0]) is not None
-        ),
+        (item for item in THINK_FRAMINGS if vocabulary.get(item[0]) is not None),
         None,
     )
     think_end, think_open, open_token, think_flag = (
         framing if framing is not None else (THINK_END, THINK_OPEN, None, None)
     )
     think_end_id = vocabulary.get(think_end)
-    think_open_id = (
-        vocabulary.get(open_token) if open_token is not None else None
-    )
+    think_open_id = vocabulary.get(open_token) if open_token is not None else None
     # The call-open token is the default framing's or the family's.
     tool_call_open_id = next(
         (
@@ -251,7 +241,12 @@ def validate_tokenizer(tokenizer, config):
         expected.append((open_token, think_open_id))
     if tool_call_open_id is not None:
         expected.append(
-            (TOOL_CALL_OPEN if vocabulary.get(TOOL_CALL_OPEN) is not None else TOOL_CALL_OPEN_ALT, tool_call_open_id)
+            (
+                TOOL_CALL_OPEN
+                if vocabulary.get(TOOL_CALL_OPEN) is not None
+                else TOOL_CALL_OPEN_ALT,
+                tool_call_open_id,
+            )
         )
     for token, token_id in expected:
         if token is None or token_id is None:

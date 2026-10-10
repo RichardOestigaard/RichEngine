@@ -672,12 +672,13 @@ class ServerRecoveryTests(unittest.TestCase):
         )
         with (
             mock.patch.object(api, "parse_args", return_value=main_args()),
-            mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+            mock.patch("server.model_host.load_thinking_key", return_value=None),
+            mock.patch(
+                "server.model_host.AutoTokenizer.from_pretrained",
+                return_value=object(),
             ),
-            mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
+            mock.patch("server.model_host.validate_tokenizer"),
+            mock.patch("server.model_host.ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime,
                 "MultiplexedRuntime",

@@ -84,6 +84,9 @@ class ModelHost:
         # assembly.hold's record fd: while open, collection keeps the
         # assembly this model serves from.
         self.record = None
+        # The tuned env the running engine spawned with; a tune finished
+        # since only reaches it through a reload.
+        self.tuned_env = None
         # A HostState: unloaded | loading | loaded | failed.
         self.state: HostState = "unloaded"
         self.error = None
@@ -198,9 +201,7 @@ class ModelHost:
         # over autotune below. Only a non-default choice is exported — the
         # "paper" default would shadow a tuned profile forever.
         if self.args.canvas_profile != "paper":
-            os.environ.setdefault(
-                "RICHENGINE_CANVAS_PROFILE", self.args.canvas_profile
-            )
+            os.environ.setdefault("RICHENGINE_CANVAS_PROFILE", self.args.canvas_profile)
         # Autotune's per-chip knob winners (install/autotune.py's sweep) reach
         # the engine as environment at spawn; any variable the user set wins.
         # A record made on another engine build is stale and ignored.
@@ -221,11 +222,7 @@ class ModelHost:
             print_status(
                 "Autotune · "
                 + (", ".join(applied) if applied else "all overridden")
-                + (
-                    f" · your env keeps {', '.join(overridden)}"
-                    if overridden
-                    else ""
-                )
+                + (f" · your env keeps {', '.join(overridden)}" if overridden else "")
             )
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(native_args),
@@ -312,9 +309,26 @@ class ModelHost:
         self.app = app
         self.assembly_dir = assembly_dir
         self.record = record
+        from install import autotune
+
+        self.tuned_env = autotune.load_tuning(
+            assembly_dir, binary=Path(self.args.binary)
+        )
         self.state = "loaded"
         self.error = None
         self.last_request_at = time.monotonic()
+
+    def tuning_requires_reload(self):
+        """True when tuning.json now states winners this engine never saw:
+        the runtime keeps the env it spawned with, so a tune finished while
+        the model stayed loaded applies only on the next load."""
+        if self.state != "loaded" or self.assembly_dir is None:
+            return False
+        from install import autotune
+
+        return autotune.load_tuning(
+            self.assembly_dir, binary=Path(self.args.binary)
+        ) != (self.tuned_env or {})
 
     def _unload_locked(self):
         """Release the stack. Active requests end as server-shutdown errors."""
@@ -325,6 +339,7 @@ class ModelHost:
         self.runtime = None
         self.assembly_dir = None
         self.record = None
+        self.tuned_env = None
         self.state = "unloaded"
         if backend is not None:
             backend.close()

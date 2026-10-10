@@ -39,7 +39,7 @@ def tokenizer():
             for text in ("<|im_start|>", "<|im_end|>")
         ]
     )
-    return PreTrainedTokenizerFast(tokenizer_object=backend, eos_token='<|im_end|>')
+    return PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<|im_end|>")
 
 
 class PromptTokenizationTests(unittest.TestCase):
@@ -260,7 +260,7 @@ class PromptTokenizationTests(unittest.TestCase):
             trainers.BpeTrainer(vocab_size=50, show_progress=False),
         )
         backend.add_special_tokens([AddedToken("<|im_end|>", normalized=False)])
-        t = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token='<|im_end|>')
+        t = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<|im_end|>")
         cache = PromptTokenizer(t)
         self.assertFalse(cache.enabled)
         prefix, tail = "hello world " * 500 + "<|im_end|>", "tail"

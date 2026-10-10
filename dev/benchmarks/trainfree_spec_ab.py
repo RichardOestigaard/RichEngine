@@ -14,7 +14,6 @@ self-draft rows). Self-draft rows cost the same per token as target rows
 """
 
 import time
-from dataclasses import dataclass, field
 
 import mlx.core as mx
 from mlx_lm import load
@@ -26,6 +25,7 @@ GEN_TOKENS = 96
 
 
 # ---------- cache snapshot / restore ----------
+
 
 def snapshot(cache):
     snap = []
@@ -52,6 +52,7 @@ def restore(cache, snap, dropped):
 
 
 # ---------- model helpers ----------
+
 
 class Target:
     def __init__(self, model):
@@ -81,7 +82,8 @@ class LayerSkipDraft:
         return ArraysCache(size=2) if self.layers[i].is_linear else KVCache()
 
     def propose(self, pending, ctx, k):
-        from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+        from mlx_lm.models.base import create_attention_mask
+
         drafts, tok = [], pending
         for _ in range(k):
             x = self.lm.embed_tokens(mx.array([[tok]]))
@@ -126,7 +128,7 @@ class SparseKVDraft:
                     c.keys = mx.zeros((1, h, pad + 512, d))
                     c.values = mx.zeros((1, h, pad + 512, d))
                     c.offset = pad
-        ids = ctx[-self.W:] + [pending]
+        ids = ctx[-self.W :] + [pending]
         logits = self.m(mx.array(ids)[None], cache=cache)
         self.rows += len(ids)
         drafts = []
@@ -181,6 +183,7 @@ class RecycleDraft:
 
 
 # ---------- decoders ----------
+
 
 def baseline_decode(target, prompt_ids, n):
     t0 = time.perf_counter()
@@ -252,24 +255,36 @@ named and tracked by conservation rangers on predator-free islands."""
 
 SCENARIOS = {
     "code_edit": [
-        {"role": "user", "content": f"Here is my code:\n{CODE}\n"
-         "Repeat it exactly but rename bubble_sort to sort_array everywhere."}
+        {
+            "role": "user",
+            "content": f"Here is my code:\n{CODE}\n"
+            "Repeat it exactly but rename bubble_sort to sort_array everywhere.",
+        }
     ],
     "rag_qa": [
-        {"role": "user", "content": f"Document:\n{DOC}\n\n"
-         "Summarize the document's key facts, quoting phrases from it verbatim."}
+        {
+            "role": "user",
+            "content": f"Document:\n{DOC}\n\n"
+            "Summarize the document's key facts, quoting phrases from it verbatim.",
+        }
     ],
     "json_fmt": [
-        {"role": "user", "content": "Reformat this data as a JSON list of objects:\n"
-         "name: Ada Lovelace, born 1815, field: computing\n"
-         "name: Alan Turing, born 1912, field: computing\n"
-         "name: Grace Hopper, born 1906, field: computing\n"
-         "name: Edsger Dijkstra, born 1930, field: computing\n"
-         "Keep every field, output only JSON."}
+        {
+            "role": "user",
+            "content": "Reformat this data as a JSON list of objects:\n"
+            "name: Ada Lovelace, born 1815, field: computing\n"
+            "name: Alan Turing, born 1912, field: computing\n"
+            "name: Grace Hopper, born 1906, field: computing\n"
+            "name: Edsger Dijkstra, born 1930, field: computing\n"
+            "Keep every field, output only JSON.",
+        }
     ],
     "open_chat": [
-        {"role": "user", "content": "Write a short story about a lighthouse keeper "
-         "who discovers something unusual in the fog."}
+        {
+            "role": "user",
+            "content": "Write a short story about a lighthouse keeper "
+            "who discovers something unusual in the fog.",
+        }
     ],
 }
 
@@ -287,7 +302,9 @@ def main():
     }
 
     for scen, msgs in SCENARIOS.items():
-        prompt = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+        prompt = tok.apply_chat_template(
+            msgs, tokenize=True, add_generation_prompt=True
+        )
         print(f"\n=== {scen} (prompt {len(prompt)} tok) ===")
         ref_out = None
         for name, mk in methods.items():
@@ -304,9 +321,11 @@ def main():
             ok = out == ref_out
             tps = len(out) / dt
             avg_acc = sum(acc) / max(len(acc), 1)
-            print(f"{name:10s} {tps:6.1f} tok/s | rows/token {target.rows/len(out):5.2f} "
-                  f"| draft_rows {draft_rows:4d} | avg_accept {avg_acc:4.2f} "
-                  f"| rounds {rnds:3d} | lossless={ok}")
+            print(
+                f"{name:10s} {tps:6.1f} tok/s | rows/token {target.rows / len(out):5.2f} "
+                f"| draft_rows {draft_rows:4d} | avg_accept {avg_acc:4.2f} "
+                f"| rounds {rnds:3d} | lossless={ok}"
+            )
 
 
 if __name__ == "__main__":

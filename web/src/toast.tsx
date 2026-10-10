@@ -10,11 +10,21 @@ interface ToastItem {
 
 /* Shared queue — pushToast works from anywhere, no context needed. */
 const store = new ToasterStore<ToastItem>();
+const timers = new Map<string, number>();
+
+function dismiss(id: string): void {
+  const timer = timers.get(id);
+  if (timer !== undefined) {
+    window.clearTimeout(timer);
+    timers.delete(id);
+  }
+  store.remove(id);
+}
 
 export function pushToast(kind: "ok" | "error", text: string, timeoutMs?: number): void {
   const id = store.create({ kind, text });
   const ms = timeoutMs ?? (kind === "error" ? 6000 : 4000);
-  if (ms > 0) window.setTimeout(() => store.remove(id), ms);
+  if (ms > 0) timers.set(id, window.setTimeout(() => dismiss(id), ms));
 }
 
 export default function Toasts(): JSX.Element {
@@ -29,7 +39,7 @@ export default function Toasts(): JSX.Element {
               class="toast-close"
               type="button"
               aria-label="Dismiss"
-              onClick={() => store.remove(toast.id)}
+              onClick={() => dismiss(toast.id)}
             >
               ×
             </button>

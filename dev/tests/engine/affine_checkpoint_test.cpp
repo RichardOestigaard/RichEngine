@@ -31,7 +31,8 @@ int main() {
   try {
     const richengine::test::TemporaryDirectory directory("richengine-affine-checkpoint");
     const std::filesystem::path &root = directory.path();
-    richengine::test::writeFile(root / "config.json", R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8}}})");
+    richengine::test::writeFile(root / "config.json",
+                                R"({"quantization":{"bits":4,"group_size":64,"router":{"bits":8},"model.embed_tokens":{"bits":6}}})");
     shard(root / "model.safetensors", valid);
     SafetensorsCheckpoint source(root);
     source.requireQuantization("projection", 4);
@@ -45,6 +46,12 @@ int main() {
     rejects([&] { (void)source.require("missing"); }, "missing source tensor: missing", "missing tensor accepted");
     rejects([&] { source.requireQuantization("router", 4); }, "unsupported affine quantization for router",
             "wrong quantization accepted");
+    // Overrides name their tensors flat even when the image asks with a
+    // "language_model." prefix — the LFM2.5 MLX exports do exactly this.
+    source.requireQuantization("language_model.router", 8);
+    rejects([&] { source.requireQuantization("language_model.model.embed_tokens", 4); },
+            "unsupported affine quantization for language_model.model.embed_tokens",
+            "prefixed quantization override accepted");
     // Rewriting a shard in place, even with the same content, writes the
     // file the checkpoint holds.
     shard(root / "model.safetensors", valid);

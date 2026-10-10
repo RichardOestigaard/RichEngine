@@ -84,6 +84,8 @@ PACKABLE = {
     "gemma4_text": (FORMAT_NAME, TARGET_FORMAT),
     "diffusion_gemma_text": (DIFFUSION_FORMAT_NAME, DIFFUSION_TARGET_FORMAT),
 }
+
+
 def _header(magic: bytes, layer: int, kind: int) -> bytes:
     if len(magic) != 8:
         raise models.ModelError("a weight file magic is eight bytes")

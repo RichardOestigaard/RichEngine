@@ -214,7 +214,9 @@ def _opencode(path, server, environment, arguments, version):
         agents[agent] = {**_opencode_object(agents, agent), "model": served}
     provider = config["provider"] = _opencode_object(config, "provider")
     variants = {effort: {"reasoningEffort": effort} for effort in OPENCODE_EFFORTS}
-    variants |= _opencode_object(provider, "richengine", "models", server.model, "variants")
+    variants |= _opencode_object(
+        provider, "richengine", "models", server.model, "variants"
+    )
     output = server.response_tokens
     provider["richengine"] = {
         "npm": "@ai-sdk/openai-compatible",
@@ -449,7 +451,9 @@ def _write_pi_provider(path, provider, server, environment):
         raise ClientError(invalid)
     # Pi expands the variable for each request. The server's key is never
     # saved, nor run as a command when it begins with "!".
-    api_key = "$RICHENGINE_API_KEY" if environment.get("RICHENGINE_API_KEY") else "local"
+    api_key = (
+        "$RICHENGINE_API_KEY" if environment.get("RICHENGINE_API_KEY") else "local"
+    )
     # Pi accepts only text and image input; any other entry invalidates the
     # user's whole models.json.
     vision = "image" in server.input_modalities

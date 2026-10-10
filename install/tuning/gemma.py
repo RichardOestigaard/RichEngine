@@ -3,8 +3,10 @@ DFlash draft, and DiffusionGemma, whose canvas loop has its own sweep."""
 
 from .base import (
     ADAPTIVE_PROPOSALS,
+    ANE_WAIT,
     DRAFT_BYPASS,
     DRAFT_BYPASS_EXPECT,
+    DRAFT_SPLITS,
     HEAD_FUSED,
     ICB_OFF,
     MOE_PACKED_OFF,
@@ -33,6 +35,7 @@ _AUTOREGRESSIVE = (
         DRAFT_BYPASS,
         DRAFT_BYPASS_EXPECT,
         PROPOSAL_CAP,
+        DRAFT_SPLITS,
         HEAD_FUSED,
         MOE_UNION,
         MOE_PACKED_OFF,
@@ -45,6 +48,7 @@ _AUTOREGRESSIVE = (
         NGRAM_DRAFT_EXPECT,
         NGRAM_WARMUP,
         NGRAM_TREE_MIN,
+        ANE_WAIT,
     ),
 )
 

@@ -44,8 +44,12 @@ def hold_partial(text, *markers):
 
 class ReasoningSplitter:
     def __init__(
-        self, thinking, tool_calls=False, call_open=None,
-        think_open=THINK_OPEN, think_end=THINK_END,
+        self,
+        thinking,
+        tool_calls=False,
+        call_open=None,
+        think_open=THINK_OPEN,
+        think_end=THINK_END,
     ):
         self.reasoning = thinking
         self.pending = ""
@@ -89,8 +93,7 @@ class ReasoningSplitter:
         # A template that leaves reasoning open ends the prompt at the role
         # tag, so the model writes the think-open itself; it marks the
         # reasoning rather than being part of it.
-        if self.pending.startswith(self.think_open):
-            self.pending = self.pending[len(self.think_open) :]
+        self.pending = self.pending.removeprefix(self.think_open)
         ends = [
             (index, marker)
             for marker in self.ends
@@ -108,9 +111,7 @@ class ReasoningSplitter:
             self.separator = marker == self.think_end
             output = [("reasoning_content", reasoning)] if reasoning else []
             return output + self._content(content)
-        ready, self.pending = hold_partial(
-            self.pending, *self.ends, self.think_open
-        )
+        ready, self.pending = hold_partial(self.pending, *self.ends, self.think_open)
         return [("reasoning_content", ready)] if ready else []
 
     def _content(self, text):
@@ -574,10 +575,7 @@ class _XmlToolCallProjector(_ProjectorBase):
                     self.state = "parameter"
                 else:
                     self._finish_call(events)
-                    if (
-                        not self.dialect.block_close
-                        or tag == self.dialect.block_close
-                    ):
+                    if not self.dialect.block_close or tag == self.dialect.block_close:
                         self.state = "content"
                 continue
             if self.state == "parameter":
@@ -685,9 +683,7 @@ class _PythonCallProjector(_ProjectorBase):
         # The name ends at "="; "(", ")" or "," first is malformed.
         equals = self.pending.find("=")
         earlier = [
-            found
-            for character in "(),"
-            if (found := self.pending.find(character)) >= 0
+            found for character in "()," if (found := self.pending.find(character)) >= 0
         ]
         if equals < 0:
             if earlier:
@@ -845,7 +841,6 @@ class _PythonCallProjector(_ProjectorBase):
                     continue
                 break
         return events
-
 
 
 _GEMMA4_QUOTE = '<|"|>'

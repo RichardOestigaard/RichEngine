@@ -1,5 +1,7 @@
 #include "ops/DraftAttention.hpp"
 
+#include "Tuning.hpp"
+
 #include "metal/abi/DraftAttention.h"
 #include "ops/KernelNames.hpp"
 #include "ops/LaneBindings.hpp"
@@ -23,8 +25,10 @@ constexpr uint32_t kRowTiles = kRows / 8;
 constexpr uint32_t kWindow = RICHENGINE_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 // Each split leaves an (queries-per-KV-head x Rows) x (headDim + max + sum)
-// fp32 partial behind the grouped queries.
-constexpr uint32_t kSplits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
+// fp32 partial behind the grouped queries. The count is the env's draft
+// split override (Tuning.hpp) — the kernels read the same snapshot's value
+// through their function constant, so workspace, dispatch and shader agree.
+inline uint32_t splits() { return tuning().draftAttentionSplits; }
 
 // The split partial block of one (lane, KV head, split): M = grouped query
 // rows (the head's query heads times the block rows), D = head dimension.
@@ -143,7 +147,8 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
   const uint64_t rows = uint64_t{lanes_} * kRows;
   const uint64_t kvBytes = rows * shape_.kvHeads * shape_.headDimension * 2;
   const uint64_t partialBytes =
-      uint64_t{lanes_} * shape_.kvHeads * kSplits * partialFloats(shape_) * 4;
+      uint64_t{lanes_} * shape_.kvHeads * splits() * partialFloats(shape_) *
+          4;
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
 }
@@ -263,7 +268,7 @@ void DraftAttention::addDecode(
   const HeadKernel kernel = headKernel(shape);
   graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Split),
                      std::move(bindings), params,
-                     {shape.kvHeads * kRowTiles, lanes, kSplits});
+                     {shape.kvHeads * kRowTiles, lanes, splits()});
   graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Reduce),
                      {buffers.groupedQueries}, params,
                      {shape.kvHeads * kRowTiles, lanes, 1});

@@ -36,7 +36,9 @@ class ConstraintCacheTests(unittest.TestCase):
                 constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
             )
         )
-        return constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
+        return constraints.ConstraintFactory(
+            object(), constraints.TokenizerContract(0, (), "", 0)
+        )
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -168,7 +170,9 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=StructuredToolGrammarTest.guidance,
         ):
-            factory = constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
+            factory = constraints.ConstraintFactory(
+                object(), constraints.TokenizerContract(0, (), "", 0)
+            )
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
         # More grammar symbols than the compiler can index make it panic.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
@@ -196,7 +200,9 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=StructuredToolGrammarTest.guidance,
         ):
-            factory = constraints.ConstraintFactory(object(), constraints.TokenizerContract(0, (), '', 0))
+            factory = constraints.ConstraintFactory(
+                object(), constraints.TokenizerContract(0, (), "", 0)
+            )
         barrier = threading.Barrier(8)
 
         def generate(index):

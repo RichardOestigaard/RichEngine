@@ -1160,7 +1160,11 @@ class LauncherTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary, python, prepared = root / "richengine", root / "python", root / "ran"
+            binary, python, prepared = (
+                root / "richengine",
+                root / "python",
+                root / "ran",
+            )
             python.write_text(f"#!/bin/sh\ntouch '{prepared}'\n")
             python.chmod(0o755)
             # The binary's own line is the error, without its error: prefix;

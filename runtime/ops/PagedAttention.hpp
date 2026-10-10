@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Tuning.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
@@ -51,15 +52,20 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // depends only on the lane's own history, so batching never changes a
 // lane's arithmetic. `rows` is the lane's live row count: kVerifyRows for
 // a chain, RICHENGINE_TREE_VERIFY_NODES - 1 for a tree lane.
-[[nodiscard]] constexpr uint32_t
+[[nodiscard]] inline uint32_t
 verifyAttentionSplits(uint32_t committedTokens,
                       uint32_t rows = kVerifyRows) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + rows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
       (pages + kVerifyPagesPerSplit - 1) / kVerifyPagesPerSplit;
+  // RICHENGINE_VERIFY_SPLITS_MAX lowers the ceiling — the partial
+  // workspace stays sized for kVerifyMaximumSplits and the shader
+  // contract's baked bound still admits the smaller count.
+  const uint64_t maximum =
+      std::min<uint64_t>(kVerifyMaximumSplits, tuning().verifySplitsMax);
   return static_cast<uint32_t>(std::min<uint64_t>(
-      std::max<uint64_t>(kVerifySplits, scaled), kVerifyMaximumSplits));
+      std::max<uint64_t>(kVerifySplits, scaled), maximum));
 }
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows =

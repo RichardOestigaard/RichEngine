@@ -10,8 +10,8 @@ the reasoning splitter reads its thought channel.
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 from transformers import PreTrainedTokenizerFast
 
@@ -20,9 +20,7 @@ from dev.tests.tool_output import project, streamed_arguments
 from server import chat_templates, constraints, output, tool_schema
 from server import frontend as request_frontend
 
-FIXTURE = (
-    Path(__file__).resolve().parents[1] / "fixtures/chat_templates/gemma4.jinja"
-)
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/chat_templates/gemma4.jinja"
 TEMPLATE = FIXTURE.read_text()
 
 Q = '<|"|>'
@@ -96,9 +94,7 @@ class Gemma4ChatTemplateTests(unittest.TestCase):
         # Thinking disabled: the generation prompt carries an empty closed
         # thought channel.
         self.assertTrue(
-            rendered.endswith(
-                "<|turn>model\n" + CHANNEL_OPEN + CHANNEL_CLOSE
-            ),
+            rendered.endswith("<|turn>model\n" + CHANNEL_OPEN + CHANNEL_CLOSE),
             rendered,
         )
         # enable_thinking opens the system turn with the think token and
@@ -122,7 +118,10 @@ class Gemma4ChatTemplateTests(unittest.TestCase):
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "lookup", "arguments": {"key": "alpha", "n": 42}},
+                    "function": {
+                        "name": "lookup",
+                        "arguments": {"key": "alpha", "n": 42},
+                    },
                 }
             ],
         }
@@ -149,12 +148,15 @@ class Gemma4ChatTemplateTests(unittest.TestCase):
         )
         # ...and kept where preserve_thinking asks, gated to tool calls.
         self.assertIn(
-            CHANNEL_OPEN + "Look it up\n" + CHANNEL_CLOSE
+            CHANNEL_OPEN
+            + "Look it up\n"
+            + CHANNEL_CLOSE
             + gcall("lookup", "key:" + gstr("alpha") + ",n:42"),
             preserved,
         )
         self.assertIn(
-            "<|tool_response>response:lookup{value:" + gstr("beta")
+            "<|tool_response>response:lookup{value:"
+            + gstr("beta")
             + "}<tool_response|>",
             rendered,
         )
@@ -245,20 +247,15 @@ class Gemma4ToolCallReadingTests(unittest.TestCase):
                 )
 
     def test_strings_hold_commas_braces_and_markup(self):
-        content, calls, _ = self.read(
-            gcall("f", "text:" + gstr("a,b} {c:1} ,x"))
-        )
+        content, calls, _ = self.read(gcall("f", "text:" + gstr("a,b} {c:1} ,x")))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]),
             {"text": "a,b} {c:1} ,x"},
         )
 
     def test_call_cut_at_the_limit_keeps_its_arguments(self):
-        cut = CALL_OPEN + "lookup{key:" + gstr("alp"
-        )
-        _, calls, events = project(
-            cut, policy(), incomplete=True
-        )
+        cut = CALL_OPEN + "lookup{key:" + gstr("alp")
+        _, calls, events = project(cut, policy(), incomplete=True)
         self.assertEqual(
             [(c["function"]["name"], c["function"]["arguments"]) for c in calls],
             [("lookup", '{"key":"alp"')],
@@ -266,15 +263,15 @@ class Gemma4ToolCallReadingTests(unittest.TestCase):
         self.assertEqual(streamed_arguments(events), '{"key":"alp"')
 
     def test_unclosed_call_still_reads(self):
-        _, calls, _ = self.read(
-            CALL_OPEN + "lookup{key:" + gstr("alpha")
-        )
+        _, calls, _ = self.read(CALL_OPEN + "lookup{key:" + gstr("alpha"))
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"key": "alpha"}
         )
 
     def test_declared_string_streams_its_characters(self):
-        schemas = {"lookup": {"type": "object", "properties": {"key": {"type": "string"}}}}
+        schemas = {
+            "lookup": {"type": "object", "properties": {"key": {"type": "string"}}}
+        }
         _, calls, events = project(
             gcall("lookup", "key:" + gstr("alpha")),
             policy(schemas),
@@ -386,8 +383,7 @@ class Gemma4ContractTests(unittest.TestCase):
     def test_generation_prompt_detects_thinking_by_flag(self):
         text = "<|turn>model\n"
         rendered = (
-            "<|turn>system\n<|think|>\nLeading<turn|>\n"
-            "<|turn>user\nHi<turn|>\n" + text
+            "<|turn>system\n<|think|>\nLeading<turn|>\n<|turn>user\nHi<turn|>\n" + text
         )
         thinking, count = request_frontend._generation_prompt(
             (text, (105,)), rendered, [1, 105], think_flag="<|think|>"

@@ -13,7 +13,7 @@ from . import json_codec
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .constraints import TokenConstraint
-from .diagnostics import print_status
+from .diagnostics import log_unexpected, print_status
 from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
@@ -155,9 +155,7 @@ class CallbackStreamer:
         call_open=None,
     ):
         self.tokenizer = tokenizer
-        self.think_end_id = (
-            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
-        )
+        self.think_end_id = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         # Special tokens whose text the output parser needs, such as a tool
         # dialect's call markup, decoded despite skip_special_tokens.
         self.visible_token_ids = frozenset(visible_token_ids)
@@ -229,9 +227,7 @@ class CallbackStreamer:
                 self.decode_stream = None
                 continue
             if not text and token_id in self.visible_token_ids:
-                text = self.tokenizer.decode(
-                    [token_id], skip_special_tokens=False
-                )
+                text = self.tokenizer.decode([token_id], skip_special_tokens=False)
             if text:
                 self._emit(text)
                 if self.stop_sequence is not None:
@@ -251,9 +247,7 @@ class CallbackStreamer:
         for token_id in self.token_ids:
             if token_id in keep:
                 if run:
-                    parts.append(
-                        self.tokenizer.decode(run, skip_special_tokens=True)
-                    )
+                    parts.append(self.tokenizer.decode(run, skip_special_tokens=True))
                     run = []
                 parts.append(
                     self.tokenizer.decode([token_id], skip_special_tokens=False)
@@ -338,8 +332,14 @@ class NativeBackend:
     }
 
     def __init__(
-        self, runtime, tokenizer, request_logger, think_end_id=None,
-        visible_token_ids=(), tool_call_open_id=None, diffusion=False,
+        self,
+        runtime,
+        tokenizer,
+        request_logger,
+        think_end_id=None,
+        visible_token_ids=(),
+        tool_call_open_id=None,
+        diffusion=False,
     ):
         self.runtime = runtime
         self.tokenizer = tokenizer
@@ -704,9 +704,7 @@ class NativeBackend:
         call_open_id = self.tool_call_open_id
         dialect = getattr(job.tool_policy, "dialect", None)
         if dialect is not None and dialect.structural:
-            ids = self.tokenizer.encode(
-                dialect.structural[0], add_special_tokens=False
-            )
+            ids = self.tokenizer.encode(dialect.structural[0], add_special_tokens=False)
             if len(ids) == 1:
                 call_open_id = ids[0]
                 call_open = dialect.call_open + dialect.name_prefix
@@ -996,8 +994,8 @@ class NativeBackend:
             record["error_code"] = error.code
         try:
             self.request_logger(record)
-        except Exception:
-            pass
+        except Exception as logging_error:
+            log_unexpected(logging_error)
 
     def close(self):
         with self.lock:

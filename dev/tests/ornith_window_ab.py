@@ -10,11 +10,12 @@ decode ms/token and draft acceptance from /status metric deltas.
 
 from __future__ import annotations
 
+import random as _random
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import smoke_real  # noqa: E402
+import smoke_real
 
 MODEL = "ornith-ai/Ornith-1.5-9B-MLX-4bit"
 PACKAGE = (
@@ -26,8 +27,6 @@ ROOT = Path(__file__).resolve().parents[2]
 # ~6K tokens of varied natural text so the decode position sits well past a
 # 2048-slot ring. Sentences are distinct (repeated blocks would make every
 # n-gram match ambiguous and confound draft quality).
-import random as _random
-
 _words = (
     "river market committee engine harvest signal border orchard pilot "
     "ledger fabric signal canvas harbor meadow beacon cellar diagram "
@@ -67,9 +66,7 @@ def sample(port: int) -> dict:
         port,
         "POST",
         "/v1/chat/completions",
-        smoke_real.chat_body(
-            MODEL, PROMPT, max_completion_tokens=192
-        ),
+        smoke_real.chat_body(MODEL, PROMPT, max_completion_tokens=192),
         timeout=300,
     )
     assert status == 200, body
@@ -105,9 +102,9 @@ def report(label: str, rows: list[dict]) -> None:
             f"({1000 / ms_per_tok:.1f} tok/s) acceptance={acc:.3f}",
             flush=True,
         )
-    med = sorted(
-        r["decode_wall_ms"] / max(r["decode_output_tokens"], 1) for r in rows
-    )[len(rows) // 2]
+    med = sorted(r["decode_wall_ms"] / max(r["decode_output_tokens"], 1) for r in rows)[
+        len(rows) // 2
+    ]
     print(f"{label} median: {1000 / med:.1f} tok/s", flush=True)
 
 

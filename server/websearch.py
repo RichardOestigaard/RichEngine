@@ -6,6 +6,7 @@ searxng queries the caller's self-hosted instance, which is the one provider
 a private address is fine for — a local instance is the point.
 """
 
+import contextlib
 import json
 import re
 import time
@@ -36,10 +37,8 @@ def _open(request, deadline):
         return urllib.request.urlopen(request, timeout=remaining)
     except urllib.error.HTTPError as error:
         detail = ""
-        try:
+        with contextlib.suppress(Exception):
             detail = error.read(4096).decode("utf-8", "replace")
-        except Exception:
-            pass
         raise APIError(
             502, f"search provider answered HTTP {error.code}: {detail[:200]}"
         ) from error
@@ -204,7 +203,7 @@ def search(query, provider="bing", api_key="", instance="", count=8):
             raise APIError(
                 400, f'"{provider}" search requires an API key', "missing_key"
             )
-        results = (
-            _brave if provider == "brave" else _tavily
-        )(query, count, api_key.strip(), deadline)
+        results = (_brave if provider == "brave" else _tavily)(
+            query, count, api_key.strip(), deadline
+        )
     return {"provider": provider, "results": results[:count]}

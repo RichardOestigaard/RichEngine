@@ -101,7 +101,8 @@ class ClientTests(unittest.TestCase):
                     self.assertNotIn("test-server-key", self.pi_models.read_text())
                     config = json.loads(self.pi_models.read_text())
                     self.assertEqual(
-                        config["providers"]["richengine"]["apiKey"], "$RICHENGINE_API_KEY"
+                        config["providers"]["richengine"]["apiKey"],
+                        "$RICHENGINE_API_KEY",
                     )
                 else:
                     self.assertEqual(env["OPENAI_API_KEY"], "test-server-key")
@@ -452,7 +453,9 @@ class ClientTests(unittest.TestCase):
 
     def test_pi_launch_adds_the_served_model_to_the_users_pi_models(self):
         argv, env = self.command("pi", env={"PATH": "/bin"})
-        self.assertEqual(argv, ["/bin/pi", "--provider", "richengine", "--model", MODEL])
+        self.assertEqual(
+            argv, ["/bin/pi", "--provider", "richengine", "--model", MODEL]
+        )
         self.assertEqual(env, {"PATH": "/bin"})
         self.assertEqual(
             json.loads(self.pi_models.read_text()),
@@ -533,7 +536,10 @@ class ClientTests(unittest.TestCase):
         richengine = config["providers"]["richengine"]
         self.assertEqual(richengine["baseUrl"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
-            [(m["id"], m["contextWindow"], m["maxTokens"]) for m in richengine["models"]],
+            [
+                (m["id"], m["contextWindow"], m["maxTokens"])
+                for m in richengine["models"]
+            ],
             [("incoai/Qwen3.8-27B-RichEngine", 262144, 32768)],
         )
         for name in ("settings.json", "auth.json"):

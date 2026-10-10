@@ -191,7 +191,11 @@ class ServeOptionsTests(unittest.TestCase):
 
     def test_both_parsers_check_defaults_from_the_environment(self):
         for name, value, flag in (
-            ("RICHENGINE_DEFAULT_REASONING_EFFORT", "low", "--default-reasoning-effort"),
+            (
+                "RICHENGINE_DEFAULT_REASONING_EFFORT",
+                "low",
+                "--default-reasoning-effort",
+            ),
             ("RICHENGINE_API_KEY", "environment-key", "--api-key"),
         ):
             for parse, required in PARSERS:

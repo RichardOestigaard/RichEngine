@@ -500,7 +500,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "status": (
                         "ready"
                         if ready
-                        else host_state if host_state in ("loading", "unloaded")
+                        else host_state
+                        if host_state in ("loading", "unloaded")
                         else "unavailable"
                     )
                 },
@@ -545,8 +546,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._safe_error(APIError(500, str(error)))
                 return
             current = None if self.app is None else self.app.model
+            host = self.server.host
+            reload_pending = (
+                host is not None
+                and host.assembly_dir is not None
+                and host.tuning_requires_reload()
+            )
             for entry in installed:
                 entry["serving"] = entry["model"] == current
+                if reload_pending and entry["serving"]:
+                    # A finished tune changed the env after this engine
+                    # spawned; the winners sit unapplied until a reload.
+                    entry["requires_reload"] = True
             self._json(
                 200,
                 {
@@ -564,24 +575,28 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/models" or path.startswith("/v1/models/"):
             app = self.app
-            models = [] if app is None else [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "richengine",
-                    "max_model_len": app.max_context,
-                    "context_length": app.max_context,
-                    "vision": app.vision,
-                    "input_modalities": app.input_modalities,
-                    **(
-                        {"root": app.response_model}
-                        if name != app.response_model
-                        else {}
-                    ),
-                }
-                for name in app.model_names
-            ]
+            models = (
+                []
+                if app is None
+                else [
+                    {
+                        "id": name,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "richengine",
+                        "max_model_len": app.max_context,
+                        "context_length": app.max_context,
+                        "vision": app.vision,
+                        "input_modalities": app.input_modalities,
+                        **(
+                            {"root": app.response_model}
+                            if name != app.response_model
+                            else {}
+                        ),
+                    }
+                    for name in app.model_names
+                ]
+            )
             if path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
                 typed = [
@@ -931,9 +946,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/models/load":
                 if self.server.host is None:
-                    raise APIError(
-                        503, "this server cannot load models", "unsupported"
-                    )
+                    raise APIError(503, "this server cannot load models", "unsupported")
                 self._model_load(body)
                 return
             if path == "/v1/models/unload":
@@ -1026,9 +1039,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if interaction_pass is not None and not isinstance(
                     interaction_pass, bool
                 ):
-                    raise APIError(
-                        400, '"interaction_pass" must be a boolean or null'
-                    )
+                    raise APIError(400, '"interaction_pass" must be a boolean or null')
                 if interaction_pass is None and no_interaction:
                     interaction_pass = False
                 if self._installer().status().get("running"):
@@ -1086,9 +1097,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._body_reservation.release()
                 self._body_reservation = None
             app = self.app
-            (
-                app.latencies if app is not None else self.server.latencies
-            ).observe("http_request", time.monotonic() - started_at)
+            (app.latencies if app is not None else self.server.latencies).observe(
+                "http_request", time.monotonic() - started_at
+            )
 
     def _installer(self):
         """The server's one install job runner, created on first use."""
@@ -2101,6 +2112,53 @@ class ConnectionSlots:
             return {"active": len(self.holders), "capacity": self.capacity}
 
 
+class ConnectionWorkers:
+    """The fixed set of threads serving admitted connections.
+
+    Accepting a connection enqueues it rather than creating a thread, so a
+    burst costs queue entries while the pool stays at `workers` threads. The
+    pool is sized to the connection capacity: every connection holding a
+    slot has a worker to take it, and one still awaiting its request frees
+    its slot — and so the pool — as ConnectionSlots.admit evicts it.
+    """
+
+    def __init__(self, workers, serve):
+        self.jobs = queue.Queue()
+        # The lock keeps a submit from landing behind the stop sentinels.
+        self.lock = threading.Lock()
+        self.stopped = False
+        self.threads = [
+            threading.Thread(
+                target=self._run,
+                args=(serve,),
+                name=f"connection worker {index}",
+                daemon=True,
+            )
+            for index in range(workers)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, request, client_address):
+        """Queue `request` for a worker; False once the pool has stopped."""
+        with self.lock:
+            if self.stopped:
+                return False
+            self.jobs.put((request, client_address))
+            return True
+
+    def _run(self, serve):
+        while (job := self.jobs.get()) is not None:
+            serve(*job)
+
+    def stop(self):
+        """End the workers once their queued connections are served."""
+        with self.lock:
+            self.stopped = True
+            for _ in self.threads:
+                self.jobs.put(None)
+
+
 class RequestBodyReservation:
     """Account input bytes until preparation and any retained input are released."""
 
@@ -2183,7 +2241,6 @@ class RefusedOriginLog:
 
 
 class FrontendServer(ThreadingHTTPServer):
-    daemon_threads = True
     allow_reuse_address = True
     # Connections the kernel holds until the accept loop takes them. A burst
     # beyond this queue is reset by the kernel, unseen by the server, so ask
@@ -2239,6 +2296,11 @@ class FrontendServer(ThreadingHTTPServer):
         self.refused = LingeringCloser(
             self.refused_connection_capacity, REFUSED_LINGER_SECONDS
         )
+        # The pool covers every slot: an admitted connection never waits on
+        # a worker held by another.
+        self.workers = ConnectionWorkers(
+            self.connections.capacity, self.process_request_thread
+        )
         # Latency accounting for control requests when no model is loaded;
         # while one is, they land on the app's own metrics as before.
         self.latencies = LatencyMetrics()
@@ -2266,6 +2328,8 @@ class FrontendServer(ThreadingHTTPServer):
             status["model_state"] = self.host.state
             if self.host.error:
                 status["model_error"] = self.host.error
+            if self.host.tuning_requires_reload():
+                status["model_requires_reload"] = True
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
@@ -2295,7 +2359,11 @@ class FrontendServer(ThreadingHTTPServer):
             _refuse_connection(request)
             self.refused.close(request)
             return
-        super().process_request(request, client_address)
+        # A fixed worker serves the connection; the accept loop spawns no
+        # thread for it.
+        if not self.workers.submit(request, client_address):
+            self.connections.release(request)
+            request.close()
 
     def shutdown_request(self, request):
         self.connections.release(request)
@@ -2305,6 +2373,7 @@ class FrontendServer(ThreadingHTTPServer):
         super().server_close()
         self.refused.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
+        self.workers.stop()
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]
@@ -2340,9 +2409,7 @@ def parse_args(argv=None):
         "start unloaded and load a model over the API",
     )
     parser.add_argument("--tokenizer")
-    parser.add_argument(
-        "--model", type=_parse_model_id, metavar="OWNER/REPO"
-    )
+    parser.add_argument("--model", type=_parse_model_id, metavar="OWNER/REPO")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "richengine"))
     serve_options.add_serve_arguments(parser)

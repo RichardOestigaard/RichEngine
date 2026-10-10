@@ -407,9 +407,7 @@ class PackTests(unittest.TestCase):
         self.assertEqual(declared["hidden_size"], DRAFT_LAYOUT.hidden)
         self.assertEqual(declared["block_size"], DRAFT_LAYOUT.block_size)
         self.assertTrue((stage / "draft" / "model.bin").is_file())
-        self.assertTrue(
-            (stage / "draft" / "layer-0.bin").is_file()
-        )
+        self.assertTrue((stage / "draft" / "layer-0.bin").is_file())
         # No declared draft: the Null magic and no draft object.
         bare = pack.build_package(
             self.root / "pkg2",

@@ -17,32 +17,26 @@ thought-channel markers may land mid-canvas) and the SSE stream.
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
-from transformers import PreTrainedTokenizerFast
+from unittest import mock
 
 from dev.tests import test_server as fixtures
-from dev.tests.test_server import ByteLevelTestTokenizer
-from server import backend as backend_api
-from server import chat_templates, constraints, output, tool_schema
-
-FIXTURE = (
-    Path(__file__).resolve().parents[1]
-    / "fixtures/chat_templates/diffusiongemma.jinja"
-)
-TEMPLATE = FIXTURE.read_text()
-GEMMA4_TEMPLATE = (FIXTURE.parent / "gemma4.jinja").read_text()
-
 from dev.tests.engine.test_gemma4 import (
-    CALL_CLOSE,
-    CALL_OPEN,
     CHANNEL_CLOSE,
     CHANNEL_OPEN,
     gcall,
     gstr,
     tokenizer,
 )
+from dev.tests.test_server import ByteLevelTestTokenizer
+from server import backend as backend_api
+from server import chat_templates, constraints, output, tool_schema
+
+FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures/chat_templates/diffusiongemma.jinja"
+)
+TEMPLATE = FIXTURE.read_text()
+GEMMA4_TEMPLATE = (FIXTURE.parent / "gemma4.jinja").read_text()
 
 USER = {"role": "user", "content": "Hi"}
 NL = chr(10)
@@ -53,16 +47,12 @@ AGAIN_TURN = "<|turn>user\nAgain<turn|>"
 
 
 def render(messages, template=TEMPLATE, **kwargs):
-    return tokenizer(template).apply_chat_template(
-        messages, tokenize=False, **kwargs
-    )
+    return tokenizer(template).apply_chat_template(messages, tokenize=False, **kwargs)
 
 
 class DiffusionGemmaTemplateTests(unittest.TestCase):
     def test_dialect_and_later_system_detect(self):
-        chosen = chat_templates.ChatTemplates(
-            tokenizer(TEMPLATE)
-        ).select(None)
+        chosen = chat_templates.ChatTemplates(tokenizer(TEMPLATE)).select(None)
         self.assertEqual(chosen.later_system, chat_templates.NATIVE)
         self.assertIs(chosen.dialect, tool_schema.GEMMA4)
 
@@ -72,18 +62,14 @@ class DiffusionGemmaTemplateTests(unittest.TestCase):
         self.assertNotIn(CHANNEL_OPEN + CHANNEL_CLOSE, rendered[-64:])
         # google/gemma-4-26B-A4B-it still closes an empty thought channel
         # here: both generation-prompt spellings are in the wild.
-        other = render(
-            [USER], template=GEMMA4_TEMPLATE, add_generation_prompt=True
-        )
+        other = render([USER], template=GEMMA4_TEMPLATE, add_generation_prompt=True)
         self.assertTrue(
             other.endswith(TURN_MODEL + CHANNEL_OPEN + CHANNEL_CLOSE),
             other,
         )
 
     def test_enable_thinking_flag_opens_the_system_turn(self):
-        rendered = render(
-            [USER], add_generation_prompt=True, enable_thinking=True
-        )
+        rendered = render([USER], add_generation_prompt=True, enable_thinking=True)
         self.assertIn(SYSTEM_THINK, rendered)
         self.assertTrue(rendered.endswith(TURN_MODEL), rendered)
 
@@ -122,9 +108,7 @@ class DiffusionGemmaTemplateTests(unittest.TestCase):
         # out unless preserve_thinking keeps it with the calls.
         stripped = render(messages, add_generation_prompt=True)
         self.assertNotIn("Look it up", stripped)
-        kept = render(
-            messages, add_generation_prompt=True, preserve_thinking=True
-        )
+        kept = render(messages, add_generation_prompt=True, preserve_thinking=True)
         self.assertIn(
             CHANNEL_OPEN
             + "Look it up\n"
@@ -136,12 +120,8 @@ class DiffusionGemmaTemplateTests(unittest.TestCase):
     def test_ongoing_turn_keeps_its_thinking(self):
         # Reasoning after the last user message is the live thought: the
         # thinking_gate keeps it without preserve_thinking.
-        rendered = render(
-            self._call_conversation()[:3], add_generation_prompt=True
-        )
-        self.assertIn(
-            CHANNEL_OPEN + "Look it up\n" + CHANNEL_CLOSE, rendered
-        )
+        rendered = render(self._call_conversation()[:3], add_generation_prompt=True)
+        self.assertIn(CHANNEL_OPEN + "Look it up\n" + CHANNEL_CLOSE, rendered)
 
     def test_tool_call_arguments_must_be_a_mapping(self):
         bad = {
@@ -236,19 +216,21 @@ class DiffusionGemmaContractTests(unittest.TestCase):
         # generation_config.json states eos_token_id [1, 106, 50].
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "config.json").write_text(json.dumps({
-        "eos_token_id": [1, 106],
-        "text_config": {
-                    "vocab_size": 262144,
-                    "eos_token_id": 1,
-                },
-            }))
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "eos_token_id": [1, 106],
+                        "text_config": {
+                            "vocab_size": 262144,
+                            "eos_token_id": 1,
+                        },
+                    }
+                )
+            )
             (root / "generation_config.json").write_text(
                 json.dumps({"eos_token_id": [1, 106, 50]})
             )
-            contract = constraints.validate_tokenizer(
-                self.tokenizer(), root
-            )
+            contract = constraints.validate_tokenizer(self.tokenizer(), root)
         self.assertEqual(contract.eos_tokens, (1, 50, 106))
         self.assertEqual(contract.think_flag, THINK_FLAG)
         self.assertEqual(
@@ -329,9 +311,7 @@ class CanvasBurstTests(unittest.TestCase):
         for kind, text in splitter.finish():
             merged[kind] = merged.get(kind, "") + text
         self.assertEqual(merged["reasoning_content"], "plan it\n")
-        self.assertEqual(
-            merged["content"], "The answer is 42." * 62 + "tail" * 3
-        )
+        self.assertEqual(merged["content"], "The answer is 42." * 62 + "tail" * 3)
 
     def test_canvas_burst_streams_over_sse(self):
         batch = [1, 2, 3] + [14] * 126 + [15] * 127
@@ -340,8 +320,8 @@ class CanvasBurstTests(unittest.TestCase):
         harness = fixtures.Harness(runtime)
         try:
             status, _, payload = harness.request(
-        "POST",
-        "/v1/chat/completions",
+                "POST",
+                "/v1/chat/completions",
                 fixtures.ServerTest.body(stream=True),
             )
             self.assertEqual(status, 200, payload)
@@ -353,20 +333,14 @@ class CanvasBurstTests(unittest.TestCase):
             self.assertEqual(events[-1], "[DONE]")
             chunks = [json.loads(event) for event in events[:-1]]
             deltas = [
-                chunk["choices"][0]["delta"]
-                for chunk in chunks
-                if chunk["choices"]
+                chunk["choices"][0]["delta"] for chunk in chunks if chunk["choices"]
             ]
-            reasoning = "".join(
-                delta.get("reasoning_content", "") for delta in deltas
-            )
-            content = "".join(
-                delta.get("content", "") for delta in deltas
-            )
+            reasoning = "".join(delta.get("reasoning_content", "") for delta in deltas)
+            content = "".join(delta.get("content", "") for delta in deltas)
             self.assertEqual(reasoning, "because ")
             self.assertEqual(
                 content,
-        "answer\n" + "first " * 126 + "second\n" * 127,
+                "answer\n" + "first " * 126 + "second\n" * 127,
             )
         finally:
             harness.close()

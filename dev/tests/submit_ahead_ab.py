@@ -56,9 +56,7 @@ def ttft(port: int, seed: int) -> float:
         port,
         "POST",
         "/v1/chat/completions",
-        smoke_real.chat_body(
-            MODEL, prompt(seed), max_completion_tokens=8
-        ),
+        smoke_real.chat_body(MODEL, prompt(seed), max_completion_tokens=8),
         timeout=300,
     )
     assert status == 200, body
@@ -89,8 +87,8 @@ def main() -> int:
         first = sorted(t[0] for t in times)
         second = sorted(max(t) for t in times)
         print(
-            f"{label}: lead ttft median {first[len(first)//2]:.0f} ms, "
-            f"queued ttft median {second[len(second)//2]:.0f} ms "
+            f"{label}: lead ttft median {first[len(first) // 2]:.0f} ms, "
+            f"queued ttft median {second[len(second) // 2]:.0f} ms "
             f"({[f'{max(t):.0f}' for t in times]})",
             flush=True,
         )

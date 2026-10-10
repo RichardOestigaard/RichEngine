@@ -92,9 +92,8 @@ def tensor_data(raw, info, data_start):
     if info["type"] == F32:
         return np.frombuffer(raw, dtype="<f4", count=count, offset=begin).copy()
     if info["type"] == F16:
-        return (
-            np.frombuffer(raw, dtype="<f2", count=count, offset=begin)
-            .astype(np.float32)
+        return np.frombuffer(raw, dtype="<f2", count=count, offset=begin).astype(
+            np.float32
         )
     if info["type"] == BF16:
         u = np.frombuffer(raw, dtype="<u2", count=count, offset=begin)
@@ -120,7 +119,10 @@ def quantize_mxfp4(w):
             best_e, best_err = e, err
         else:
             better = err < best_err
-            best_e, best_err = np.where(better, e, best_e), np.where(better, err, best_err)
+            best_e, best_err = (
+                np.where(better, e, best_e),
+                np.where(better, err, best_err),
+            )
     e8m0 = np.where(amax == 0, 0, (best_e + 127).astype(np.int64)).astype(np.uint8)
     d = np.exp2(best_e)[:, None]
     code = np.searchsorted(E2M1_MID, np.abs(w) / d).astype(np.uint8)
@@ -162,7 +164,10 @@ def convert(source, dest):
         elif name in quantized and len(dims) >= 2 and dims[0] % 32 == 0:
             new_type, data = MXFP4, quantize_mxfp4(tensor_data(raw, info, data_start))
         elif info["type"] in (F16, BF16):
-            new_type, data = F32, tensor_data(raw, info, data_start).astype("<f4").tobytes()
+            new_type, data = (
+                F32,
+                tensor_data(raw, info, data_start).astype("<f4").tobytes(),
+            )
         elif info["type"] == F32:
             begin = data_start + info["offset"]
             new_type, data = F32, raw[begin : begin + count * 4].tobytes()
@@ -179,11 +184,14 @@ def convert(source, dest):
     head = [struct.pack("<4sIQQ", b"GGUF", 3, len(out_infos), len(kvs))]
     for key, vtype, value in kvs:
         head.append(
-            struct.pack("<Q", len(key)) + key.encode()
-            + struct.pack("<I", vtype) + value
+            struct.pack("<Q", len(key))
+            + key.encode()
+            + struct.pack("<I", vtype)
+            + value
         )
     info_bytes = [
-        struct.pack("<Q", len(name)) + name.encode()
+        struct.pack("<Q", len(name))
+        + name.encode()
         + struct.pack("<I", len(dims))
         + struct.pack(f"<{len(dims)}Q", *dims)
         + struct.pack("<IQ", ttype, offset)

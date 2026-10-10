@@ -359,10 +359,15 @@ FAMILIES = (
             # Eight full-attention layers (2, 5, 9, 13, 17, 21, 24, 27)
             # among the shortconv layers, as config.json's layer_types
             # states them and the GGUF's per-layer KV head count implies.
-            ("layer_types", tuple(
-                "full_attention" if index in {2, 5, 9, 13, 17, 21, 24, 27} else "conv"
-                for index in range(30)
-            )),
+            (
+                "layer_types",
+                tuple(
+                    "full_attention"
+                    if index in {2, 5, 9, 13, 17, 21, 24, 27}
+                    else "conv"
+                    for index in range(30)
+                ),
+            ),
         ),
         Draft(
             "LiquidAI/LFM2.5-2.6B-DSpark",
@@ -404,10 +409,13 @@ FAMILIES = (
             # Six full-attention layers (2, 6, 10, 14, 18, 21) among the
             # shortconv layers, as config.json's layer_types states them
             # and the GGUF's per-layer KV head count implies.
-            ("layer_types", tuple(
-                "full_attention" if index in {2, 6, 10, 14, 18, 21} else "conv"
-                for index in range(24)
-            )),
+            (
+                "layer_types",
+                tuple(
+                    "full_attention" if index in {2, 6, 10, 14, 18, 21} else "conv"
+                    for index in range(24)
+                ),
+            ),
         ),
         Draft(
             "LiquidAI/LFM2.5-8B-A1B-DSpark",
@@ -496,10 +504,13 @@ FAMILIES = (
             # A global layer every sixth (5, 11, 17, 23, 29), as
             # config.json's layer_types states them and the GGUF's
             # sliding_window_pattern implies.
-            ("layer_types", tuple(
-                "full_attention" if index % 6 == 5 else "sliding_attention"
-                for index in range(30)
-            )),
+            (
+                "layer_types",
+                tuple(
+                    "full_attention" if index % 6 == 5 else "sliding_attention"
+                    for index in range(30)
+                ),
+            ),
         ),
         Draft(
             "z-lab/gemma-4-26B-A4B-it-DFlash",
@@ -549,10 +560,13 @@ FAMILIES = (
             ("tie_word_embeddings", True),
             # A global layer every sixth (5, 11, 17, 23, 29), as
             # config.json's layer_types states them.
-            ("layer_types", tuple(
-                "full_attention" if index % 6 == 5 else "sliding_attention"
-                for index in range(30)
-            )),
+            (
+                "layer_types",
+                tuple(
+                    "full_attention" if index % 6 == 5 else "sliding_attention"
+                    for index in range(30)
+                ),
+            ),
         ),
         # DiffusionGemma has no draft; the packed manifest keeps the Null
         # predraft's magic.
@@ -606,8 +620,7 @@ def family_for(config, name=None):
         # A stated field the family forbids is a contradiction whichever
         # path found it; a field the config omits contradicts nothing.
         return any(
-            key in text and stated(key, value, False)
-            for key, value in family.forbids
+            key in text and stated(key, value, False) for key, value in family.forbids
         )
 
     matches = [

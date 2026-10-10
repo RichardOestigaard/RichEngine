@@ -3,6 +3,7 @@ n-gram predraft is their only proposer and its gates are the sweep. Tree
 verify defaults on for them — the sweep measures whether it pays."""
 
 from .base import (
+    ANE_WAIT,
     HEAD_FUSED,
     ICB_OFF,
     MTL4,
@@ -32,6 +33,7 @@ _COMMON = (
     NGRAM_DRAFT_EXPECT,
     NGRAM_WARMUP,
     NGRAM_TREE_MIN,
+    ANE_WAIT,
     PREFILL_FAST_INT8,
     HEAD_FUSED,
     MTL4,

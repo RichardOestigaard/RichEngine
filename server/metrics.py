@@ -44,9 +44,18 @@ def prometheus_metrics(status):
         "richengine_scheduler_queued": ("scheduler", "queued"),
         "richengine_scheduler_waiting_resources": ("scheduler", "waiting_resources"),
         "richengine_scheduler_waiting_prefix": ("scheduler", "waiting_prefix"),
-        "richengine_cache_resource_suspensions_total": ("cache", "resource_suspensions"),
-        "richengine_cache_priority_suspensions_total": ("cache", "priority_suspensions"),
-        "richengine_cache_resource_resumptions_total": ("cache", "resource_resumptions"),
+        "richengine_cache_resource_suspensions_total": (
+            "cache",
+            "resource_suspensions",
+        ),
+        "richengine_cache_priority_suspensions_total": (
+            "cache",
+            "priority_suspensions",
+        ),
+        "richengine_cache_resource_resumptions_total": (
+            "cache",
+            "resource_resumptions",
+        ),
         "richengine_cache_resource_replay_tokens_total": (
             "cache",
             "resource_replay_tokens",
@@ -161,11 +170,20 @@ def prometheus_metrics(status):
         "richengine_memory_limit_bytes": ("memory_governor", "limit_bytes"),
         "richengine_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
         "richengine_admission_waiting_memory": ("admission", "waiting_memory"),
-        "richengine_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
-        "richengine_admission_held_behind_refusal": ("admission", "held_behind_refusal"),
+        "richengine_admission_waiting_concurrency": (
+            "admission",
+            "waiting_concurrency",
+        ),
+        "richengine_admission_held_behind_refusal": (
+            "admission",
+            "held_behind_refusal",
+        ),
         "richengine_admission_restoring": ("admission", "restoring"),
         "richengine_admission_suspended": ("admission", "suspended"),
-        "richengine_admission_oldest_wait_milliseconds": ("admission", "oldest_wait_ms"),
+        "richengine_admission_oldest_wait_milliseconds": (
+            "admission",
+            "oldest_wait_ms",
+        ),
         "richengine_ttft_p50_milliseconds": ("metrics", "ttft_ms", "p50"),
         "richengine_ttft_p95_milliseconds": ("metrics", "ttft_ms", "p95"),
         "richengine_itl_p50_milliseconds": ("metrics", "itl_ms", "p50"),
@@ -276,8 +294,7 @@ def metrics_dict(result):
         # report's timestamp, or generation start when no progress arrived.
         decode_window = max(
             0.0,
-            latency.get("start_to_first_token_ms", 0.0)
-            - result.prompt_progress_ms,
+            latency.get("start_to_first_token_ms", 0.0) - result.prompt_progress_ms,
         ) + latency.get("first_token_to_done_ms", 0.0)
         if result.completion_tokens > 0 and decode_window > 0:
             rate = result.completion_tokens * 1000.0 / decode_window

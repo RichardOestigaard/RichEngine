@@ -84,9 +84,9 @@ test-models: install-development
 check-python-engine: install-development test-python test-models
 	$(PYTHON) -m compileall -q server install/*.py \
 		dev/tools dev/tests dev/benchmarks
-	$(PYTHON) -m ruff check --config dev/ruff.toml server \
+	$(PYTHON) -m ruff check --config ruff.toml server \
 		install/*.py dev/tools dev/tests dev/benchmarks
-	$(PYTHON) -m ruff format --check --config dev/ruff.toml server \
+	$(PYTHON) -m ruff format --check --config ruff.toml server \
 		install/*.py dev/tools dev/tests dev/benchmarks
 
 # It parses the server's sources, which need the environment's Python

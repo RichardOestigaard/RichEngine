@@ -46,9 +46,7 @@ class SearchValidationTest(unittest.TestCase):
 
 class BingSearchTest(unittest.TestCase):
     def test_parses_rss_items(self):
-        with mock.patch.object(
-            websearch, "_get", return_value=BING_RSS
-        ) as get:
+        with mock.patch.object(websearch, "_get", return_value=BING_RSS) as get:
             result = websearch.search("apple silicon", provider="bing")
         url = get.call_args[0][0]
         self.assertTrue(url.startswith("https://www.bing.com/search?"))
@@ -92,9 +90,7 @@ class KeyedSearchTest(unittest.TestCase):
             result = websearch.search("q", provider="brave", api_key="k")
         request_url = get.call_args[0][0]
         self.assertTrue(request_url.startswith("https://api.search.brave.com/"))
-        self.assertEqual(
-            get.call_args[1]["headers"]["X-Subscription-Token"], "k"
-        )
+        self.assertEqual(get.call_args[1]["headers"]["X-Subscription-Token"], "k")
         self.assertEqual(
             result["results"],
             [{"title": "T", "url": "https://x.example/", "snippet": "D"}],

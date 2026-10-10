@@ -423,7 +423,9 @@ class ModelArtifactTest(unittest.TestCase):
                         snapshot / "target/embedding.bin"
                     )
                 )
-                self.assertEqual(len(list((repository / "refs/richengine").glob("*/*"))), 1)
+                self.assertEqual(
+                    len(list((repository / "refs/richengine").glob("*/*"))), 1
+                )
 
     def test_missing_or_oversize_remote_manifest_fails_before_any_download(self):
         snapshot, _ = self.package_fixture()

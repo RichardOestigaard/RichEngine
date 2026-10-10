@@ -12,6 +12,7 @@ to win by trying than to reason about, and the sweep settles each on
 measurement.
 """
 
+import os
 from dataclasses import dataclass
 
 
@@ -56,6 +57,10 @@ class Knob:
     min_bandwidth_gbps holds the knob back on chips whose unified-memory
     bandwidth cannot feed the path — an unknown bandwidth (0) is unproven,
     not excluded, and measurement settles it.
+    requires_env lists variables that must already be set in the sweep's
+    own environment for the knob's path to exist — the ANE wait only moves
+    when an ANE predraft artifact is loaded, so the knob stays out unless
+    the user armed one.
     quality_sensitive knobs trade output quality for speed (canvas step
     caps, exit thresholds); the sweep leaves them out unless asked.
     ordered knobs list their candidates closest-to-default first; when the
@@ -73,12 +78,14 @@ class Knob:
     min_gpu_family: int = 0
     min_bandwidth_gbps: int = 0
     diffusion: bool | None = None
+    requires_env: tuple[str, ...] = ()
     quality_sensitive: bool = False
     ordered: bool = False
 
     def applies(self, context: TuneContext) -> bool:
         return (
-            (not self.model_types or context.model_type in self.model_types)
+            all(name in os.environ for name in self.requires_env)
+            and (not self.model_types or context.model_type in self.model_types)
             and (not self.draft_kinds or context.draft_kind in self.draft_kinds)
             and (not self.formats or context.target_format in self.formats)
             and self.min_gpu_family <= context.gpu_family
@@ -223,13 +230,30 @@ MOE_PACKED_OFF = Knob(
     ("1",),
     "the unpacked expert path vs the packed one; packed on by default",
 )
-# Draft geometry in the proposal budget, not the kernels: a cap below the
+# Draft geometry in the proposal budget and the kernels: a cap below the
 # smallest trained block (7 proposals — the 27B's DFlash2 and MiniCPM5's
-# DSpark ship 8- and 7-row blocks) cuts live verify rows, and the bypass
-# EWMA moves the anchor-only break-even. The kernel-geometry constants of
-# metal/abi/ExecutionGeometry.h — attention splits, tile rows, shard counts —
-# are compile-time defines baked into the metallib; no environment variable
-# reaches them, so the sweep cannot offer them.
+# DSpark ship 8- and 7-row blocks) cuts live verify rows, the bypass EWMA
+# moves the anchor-only break-even, and DRAFT_SPLITS reshapes the draft
+# attention's tile splits — it reaches the kernels as a Metal function
+# constant on engine builds that carry it (ExecutionGeometry.h's table;
+# builds without it just read the compiled 4 and the knob is a no-op the
+# keep rule rejects). Most of that header stays compile-time — tile rows,
+# shard counts, the KV block — with no function-constant path yet, so the
+# sweep cannot offer them.
+DRAFT_SPLITS = Knob(
+    "RICHENGINE_DRAFT_SPLITS",
+    ("2", "8"),
+    "draft attention tile splits vs the compiled 4; off-table values ride "
+    "the draft kernel's function constant",
+    draft_kinds=("dflash2", "dflash", "dspark"),
+)
+ANE_WAIT = Knob(
+    "RICHENGINE_ANE_WAIT_MS",
+    ("1", "0", "8"),
+    "milliseconds a decode step waits on the ANE predraft before running "
+    "the GPU draft; inert unless an ANE predraft artifact is loaded",
+    requires_env=("RICHENGINE_ANE_PREDRAFT",),
+)
 # Candidates closest to the trained limit first: 6 deviates less than 4,
 # so a deep loss on 6 means 4 — further from the default — loses worse.
 PROPOSAL_CAP = Knob(

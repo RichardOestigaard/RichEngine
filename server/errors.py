@@ -13,7 +13,7 @@ class APIError(Exception):
         """Whether the same request may succeed when retried shortly: the
         server is overloaded, restarting its engine or shutting down. It
         reports each with 503, whatever status an API answers it with."""
-        return self.status == 503
+        return self.status in (503, 529)
 
     def protocol_type(self, anthropic=False):
         if not anthropic:

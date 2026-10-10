@@ -28,7 +28,9 @@ PARSERS = (
 class ServerAccessTests(unittest.TestCase):
     def test_wildcard_listener_keeps_host_and_api_key_validation(self):
         harness = self.harness(
-            host="0.0.0.0", allowed_hosts=("richengine.local",), api_key="test-server-key"
+            host="0.0.0.0",
+            allowed_hosts=("richengine.local",),
+            api_key="test-server-key",
         )
         self.assertEqual(harness.server.server_address[0], "0.0.0.0")
         port = harness.server.server_address[1]

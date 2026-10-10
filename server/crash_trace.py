@@ -23,11 +23,11 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
 
 from . import protocol as wire
 
@@ -300,7 +300,9 @@ def replay(path: Path) -> int:
                 suffix = "" if returncode is None else f" (exit status {returncode})"
                 raise RuntimeError(eof_message + suffix)
 
-        reader = threading.Thread(target=drain, name="richengine-trace-replay", daemon=True)
+        reader = threading.Thread(
+            target=drain, name="richengine-trace-replay", daemon=True
+        )
         reader.start()
         with changed:
             if not changed.wait_for(
@@ -380,7 +382,9 @@ def replay(path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay a RichEngine native crash trace")
+    parser = argparse.ArgumentParser(
+        description="Replay a RichEngine native crash trace"
+    )
     parser.add_argument("trace", type=Path)
     args = parser.parse_args()
     return replay(args.trace)

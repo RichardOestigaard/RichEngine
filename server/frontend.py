@@ -126,7 +126,12 @@ IMAGE_RENDER_MARKER = f"__richengine_image_{secrets.token_hex(16)}__"
 
 
 def _generation_prompt(
-    probed, rendered, tokens, *, think_open="<think>", think_end=THINK_END,
+    probed,
+    rendered,
+    tokens,
+    *,
+    think_open="<think>",
+    think_end=THINK_END,
     think_flag=None,
 ):
     """Whether generation opens a think block, and how many of the prompt's
@@ -630,11 +635,7 @@ class Frontend:
                 encoded = self._tokenize(
                     content,
                     add_special_tokens=add_special,
-                    **(
-                        {"return_offsets_mapping": True}
-                        if with_pieces
-                        else {}
-                    ),
+                    **({"return_offsets_mapping": True} if with_pieces else {}),
                 )
             except NotImplementedError as error:
                 raise APIError(
@@ -647,9 +648,7 @@ class Frontend:
             if with_pieces:
                 # Char spans into `content` for each id; specials report (0, 0).
                 offsets = encoded.get("offset_mapping") or []
-                response["offsets"] = [
-                    [int(start), int(end)] for start, end in offsets
-                ]
+                response["offsets"] = [[int(start), int(end)] for start, end in offsets]
             return response
 
     def _priority(self, body):
@@ -1066,7 +1065,6 @@ class Frontend:
         ids = tokens[count:] if tokens[:count] == history_tokens else ()
         return suffix, tuple(ids)
 
-
     def _prepare(
         self,
         body,
@@ -1209,9 +1207,9 @@ class Frontend:
         return [
             (
                 reasoning
-                + self._tokenize(
-                    dialect.call_opening(name), add_special_tokens=False
-                )["input_ids"],
+                + self._tokenize(dialect.call_opening(name), add_special_tokens=False)[
+                    "input_ids"
+                ],
                 f"tool {name} has too many parameters to constrain",
             )
             for name in policy.schemas

@@ -31,8 +31,10 @@ from pathlib import Path
 from . import layout, models
 from .tuning import TuneContext, eligible, knobs_for
 
-# The tuned result, beside the assembly's model.json or the package's
-# manifest.json: {chip: {schema, engine, env, best, measured, ...}}.
+# The tuned result: beside the assembly's model.json, or beside the
+# selection link for packages — a package's directory can sit inside the
+# shared Hugging Face cache, where eviction would silently delete the
+# record: {chip: {schema, engine, env, best, measured, verdicts, ...}}.
 # Schema 2 added the engine fingerprint, the knob-table signature,
 # per-width prefill metrics and resumable state; schema-1 entries measured
 # a different workload and are ignored.
@@ -68,13 +70,26 @@ PRESSURE_POLL_SECONDS = 5.0
 PRUNE_DEPTH = 0.08
 RECHECK_DEPTH = 0.08
 
-# Cross-model priors, shared under the models root: {chip: {"KNOB=value":
-# {"wins": n, "losses": n}}}. A Quick sweep skips candidates whose
-# Beta(1+wins, 1+losses) win rate cannot reach the bound even at its
-# optimistic edge after enough observations; Complete measures them anyway.
+# Cross-model priors, shared under the models root:
+# {chip: {family: {"KNOB=value": {"wins": n, "losses": n}}}} — a knob's
+# history pools only within its model family, since one family's loser
+# says little about another's. Records written by older sweeps pool the
+# stats flat under the chip; reads still fold them in so nothing learned
+# is lost. A Quick sweep skips candidates whose Beta(1+wins, 1+losses)
+# win rate cannot reach the bound even at its optimistic edge after
+# enough observations; Complete measures them anyway.
 PRIORS_NAME = ".tuning-priors.json"
 PRIORS_MIN_OBSERVATIONS = 5
 PRIORS_SKIP_BOUND = 0.15
+
+# The kernel pass: one run of the engine's kernel tuner (paths.TUNE_BINARY),
+# whose paired in-process measurement fits each affine Linear plan to this
+# machine — seconds per workload where an env knob costs a whole engine
+# launch. Its winners reach every later measurement through this env var,
+# which ops/DeviceTuning.cpp parses and lets outrank the shipped tables.
+# Seconds bound each workload's measurement; Quick spends less per key.
+KERNEL_PLANS_ENV = "RICHENGINE_LINEAR_PLANS"
+KERNEL_PASS_SECONDS = {"quick": 5, "complete": 10}
 
 # machdep.cpu.brand_string's chip → the Metal GPU family generation (Apple7
 # is M1 … Apple10+ is M4 and newer) and its unified-memory bandwidth in GB/s.
@@ -204,7 +219,9 @@ def context_for(assembly_dir: Path) -> TuneContext:
         diffusion = False
     elif kind == models.PACKAGE:
         manifest = models.read_json(assembly_dir / layout.PACKAGE_MANIFEST)
-        family_name = manifest["family"]
+        # Locally packed manifests type their family; Hub snapshots record
+        # only the model name, which for these packages is the family.
+        family_name = manifest.get("family") or manifest["model"]
         target_format = manifest["format"]["name"]
         diffusion = isinstance(manifest.get("diffusion"), dict)
     else:
@@ -251,36 +268,34 @@ def _knobs_signature(knobs) -> str:
     return hashlib.sha1(json.dumps(ordered).encode()).hexdigest()[:16]
 
 
-def _prompts(assembly_dir: Path, windows: int) -> list[tuple[int, ...]]:
+def _prompts(assembly_dir: Path, windows: int) -> tuple[list[tuple[int, ...]], bool]:
     """`windows` distinct prompt windows of PROMPT_TOKENS each, cut from the
     corpus by the model's own tokenizer so decode runs on text the draft
     model can actually predict. Distinct windows keep any timed batch off
     the prefix cache a warm-up or earlier repetition primed. Arbitrary ids
-    remain the fallback when the install has no readable tokenizer."""
+    remain the fallback when the install has no readable tokenizer — then
+    the second element reports False, since near-zero draft acceptance on
+    synthetic ids makes every draft knob's verdict a different workload's."""
     try:
         from tokenizers import Tokenizer
 
         path = assembly_dir / layout.TOKENIZER / "tokenizer.json"
         ids = list(
-            Tokenizer.from_file(str(path)).encode(
-                _CORPUS, add_special_tokens=False
-            ).ids
+            Tokenizer.from_file(str(path)).encode(_CORPUS, add_special_tokens=False).ids
         )
     except Exception:
         ids = []
     needed = windows * PROMPT_TOKENS
     if not ids:
         return [
-            tuple(
-                (lane * 977 + i) % 65536 + 1 for i in range(PROMPT_TOKENS)
-            )
+            tuple((lane * 977 + i) % 65536 + 1 for i in range(PROMPT_TOKENS))
             for lane in range(windows)
-        ]
+        ], False
     ids = (ids * math.ceil(needed / len(ids)))[:needed]
     return [
         tuple(ids[lane * PROMPT_TOKENS : (lane + 1) * PROMPT_TOKENS])
         for lane in range(windows)
-    ]
+    ], True
 
 
 def _cpu_speed_limit():
@@ -396,18 +411,14 @@ def _run_batch(runtime, prompts, output_tokens: int) -> dict:
         completion_tokens += event.completion_tokens
         decode_micros = max(decode_micros, event.decode_micros)
         if event.prefill_micros:
-            prefill_rates.append(
-                event.prompt_tokens / (event.prefill_micros / 1e6)
-            )
+            prefill_rates.append(event.prompt_tokens / (event.prefill_micros / 1e6))
     seconds = decode_micros / 1e6 if decode_micros else 0.0
     return {
         "width": len(prompts),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "decode_micros": decode_micros,
-        "tokens_per_second": round(completion_tokens / seconds, 2)
-        if seconds
-        else 0.0,
+        "tokens_per_second": round(completion_tokens / seconds, 2) if seconds else 0.0,
         # Mean per-lane prefill rate; at width 1 the same single rate.
         "prefill_tokens_per_second": (
             round(statistics.fmean(prefill_rates), 2) if prefill_rates else 0.0
@@ -500,8 +511,7 @@ def measure(
                     doomed = True
             merged[str(width)] = _median_samples(reps)
             samples[str(width)] = {
-                metric: [rep.get(metric, 0.0) for rep in reps]
-                for metric in _METRICS
+                metric: [rep.get(metric, 0.0) for rep in reps] for metric in _METRICS
             }
             if doomed:
                 break
@@ -584,6 +594,34 @@ def _read_priors(path: Path) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+def _family_stats(doc: dict, chip: str, family: str) -> dict:
+    """The (chip, family) candidate stats, merged with the chip's legacy
+    flat pool — records written before priors keyed by family."""
+    chip_doc = doc.get(chip)
+    if not isinstance(chip_doc, dict):
+        return {}
+    stats = {key: value for key, value in chip_doc.items() if "=" in key}
+    bucket = chip_doc.get(family)
+    if isinstance(bucket, dict):
+        stats.update(bucket)
+    return stats
+
+
+def _prior_stats(doc: dict, chip: str, family: str, *, engine: str, knobs: str) -> dict:
+    """The family stats a sweep may trust: the file's fingerprint must
+    match this engine and knob table — a rebuilt binary or a changed
+    table expires every prior at once. Files without a fingerprint
+    (written before priors were stamped) still read, matching how
+    tuning.json's own resume check treats legacy records here: stats
+    older than stamping carry no way to know their engine."""
+    meta = doc.get("_meta")
+    if isinstance(meta, dict) and (
+        meta.get("engine") != engine or meta.get("knobs") != knobs
+    ):
+        return {}
+    return _family_stats(doc, chip, family)
+
+
 def _prior_skips(stats: dict, knob, value: str) -> bool:
     """Whether Quick skips this candidate: with enough observations, the
     Beta(1+wins, 1+losses) posterior's optimistic edge — mean + 2σ — still
@@ -601,15 +639,30 @@ def _prior_skips(stats: dict, knob, value: str) -> bool:
     return mean + 2 * spread < PRIORS_SKIP_BOUND
 
 
-def _update_priors(path: Path, chip: str, results: dict, best_env: dict):
-    """Fold a finished sweep's verdicts into the chip's priors: a candidate
-    that made the final env counts as a win, every other clean measurement
-    a loss. Pressured entries teach nothing and stay out."""
+def _update_priors(
+    path: Path,
+    chip: str,
+    family: str,
+    results: dict,
+    best_env: dict,
+    *,
+    engine: str,
+    knobs: str,
+):
+    """Fold a finished sweep's verdicts into the (chip, family) priors: a
+    candidate that made the final env counts as a win, every other clean
+    measurement a loss. Pressured entries teach nothing and stay out;
+    elimination measurements are the absence of a knob, not a candidate,
+    and stay out too. The file stamps the engine and knob-table
+    fingerprints its wins were measured under — a rebuilt engine or a
+    changed table expiries every prior, like tuning.json's own check."""
     doc = _read_priors(path)
-    stats = doc.setdefault(chip, {})
+    doc["_meta"] = {"engine": engine, "knobs": knobs}
+    stats = doc.setdefault(chip, {}).setdefault(family, {})
     for key, entry in results.items():
         if (
             key == "baseline"
+            or key.startswith("eliminate:")
             or not isinstance(entry, dict)
             or entry.get("pressured")
         ):
@@ -625,17 +678,29 @@ def _update_priors(path: Path, chip: str, results: dict, best_env: dict):
 
 
 def tuning_path(assembly_dir: Path) -> Path:
-    """The model's tuning record, beside its model.json/manifest.json."""
+    """The model's tuning record. Assemblies keep it beside model.json.
+    Packages — whose directory can live inside the shared Hugging Face
+    cache — keep it beside the selection link under models_root instead,
+    so cache eviction cannot delete it."""
+    if models.installation_kind(assembly_dir) == models.PACKAGE:
+        return assembly_dir.parent / (assembly_dir.name + ".tuning.json")
     return assembly_dir / TUNING_RECORD
 
 
 def _read_record(assembly_dir: Path) -> dict:
-    """The whole tuning.json document, {} when absent or unreadable."""
-    try:
-        document = json.loads(tuning_path(assembly_dir).read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return document if isinstance(document, dict) else {}
+    """The whole tuning.json document, {} when absent or unreadable. A
+    package's record may still sit at the legacy path inside its
+    directory — written before records moved beside the link."""
+    for path in dict.fromkeys(
+        (tuning_path(assembly_dir), assembly_dir / TUNING_RECORD)
+    ):
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(document, dict):
+            return document
+    return {}
 
 
 def _write_record(assembly_dir: Path, record: dict):
@@ -665,11 +730,7 @@ def load_tuning(
     if entry is None or entry.get("schema") != TUNING_SCHEMA:
         return {}
     recorded = entry.get("engine")
-    if (
-        binary is not None
-        and recorded
-        and recorded != engine_fingerprint(binary)
-    ):
+    if binary is not None and recorded and recorded != engine_fingerprint(binary):
         return {}
     env = entry.get("env")
     return dict(env) if isinstance(env, dict) else {}
@@ -688,11 +749,7 @@ def tuning_note(
     if entry.get("schema") != TUNING_SCHEMA:
         return "recorded by an older sweep; re-run 'richengine tune'"
     recorded = entry.get("engine")
-    if (
-        binary is not None
-        and recorded
-        and recorded != engine_fingerprint(binary)
-    ):
+    if binary is not None and recorded and recorded != engine_fingerprint(binary):
         return "measured on another engine build; re-run 'richengine tune'"
     return None
 
@@ -731,65 +788,164 @@ def tuned_environment(
     return env
 
 
+def _kernel_pass(
+    binary: Path, assembly_dir: Path, *, seconds: float, log=print
+) -> dict | None:
+    """The engine's kernel tuner over this model's projection plans: one
+    process, every candidate measured paired against its policy default
+    through the production encoders. Returns the record fragment —
+    {"measured", "changed", "spec", "keys"} where spec is the
+    RICHENGINE_LINEAR_PLANS value engine plan selection reads — an
+    {"error"} marker when the pass ran and failed, or None when there is
+    no tuner to run, which a resume retries rather than remembers."""
+    from . import paths
+
+    tool = paths.TUNE_BINARY
+    if not tool.is_file():
+        log(f"kernels · no kernel tuner at {tool} — pass skipped")
+        return None
+    report_path = tuning_path(assembly_dir).with_suffix(".kernel-report.json")
+    command = [
+        str(tool),
+        str(binary.parent / "richengine.metallib"),
+        str(assembly_dir),
+        "--seconds",
+        str(seconds),
+        "--json",
+        str(report_path),
+    ]
+    log(f"kernels · fitting the model's Linear plans ({seconds:g} s per key)")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            # The launcher's own process group — the API's killpg takes the
+            # tuner down with a cancelled sweep.
+        )
+    except OSError as error:
+        log(f"kernels · could not start the kernel tuner: {error}")
+        return {"error": str(error)}
+    for line in process.stdout or ():
+        log(line.rstrip("\n"))
+    returncode = process.wait()
+    if returncode != 0:
+        return {"error": f"the kernel tuner exited {returncode}"}
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": "the kernel tuner wrote no report"}
+    keys = {
+        key["workload"]: key["winner"]
+        for key in report.get("keys", [])
+        if isinstance(key, dict) and key.get("changed") and key.get("complete")
+    }
+    measured = sum(isinstance(key, dict) for key in report.get("keys", []))
+    return {
+        "measured": measured,
+        "changed": len(keys),
+        "spec": ";".join(f"{workload}={winner}" for workload, winner in keys.items()),
+        "keys": keys,
+    }
+
+
 def tune(
     binary: Path,
     assembly_dir: Path,
     *,
     include_quality: bool = False,
     interactions: bool = True,
+    kernel_pass: bool = True,
     priors_path: Path | None = None,
+    mode: str | None = None,
+    contaminated: str | None = None,
     log=print,
 ) -> dict:
     """Sweep this model's eligible knobs on this chip: baseline, then each
     knob's candidates against the running-best env, keeping improvements,
-    then one recheck pass for knobs that won nothing. Writes tuning.json
-    after every measurement — an interrupted sweep resumes where it
-    stopped — and returns the tuned env. With `priors_path`, a finished
-    sweep folds its verdicts into the chip's shared priors; a flagless
-    (Quick) sweep also consults them and skips candidates that have never
-    won on this chip."""
+    then one recheck pass for knobs that won nothing, then a backward-
+    elimination pass dropping winners the final env no longer needs.
+    Writes tuning.json after every measurement — an interrupted sweep
+    resumes where it stopped — and returns the tuned env. With
+    `priors_path`, a finished sweep folds its verdicts into the chip's
+    shared priors; a flagless (Quick) sweep also consults them and skips
+    candidates that have never won on this chip. `contaminated` names a
+    condition that invalidates every measurement for keeping purposes — a
+    loaded engine sharing the GPU; entries still record what ran, flagged,
+    but nothing can win and nothing reaches the priors."""
     context = context_for(assembly_dir)
     tuning = knobs_for(context.family)
     if tuning is None:
         raise models.ModelError("no tunable-knob table for this model's family")
     all_eligible = eligible(tuning, context)
+    quality_skipped = sum(1 for knob in all_eligible if knob.quality_sensitive)
+    # A variable the user exported reaches every measurement, and at serve
+    # time model_host's setdefault keeps it over any tuned winner — a kept
+    # value could never apply, so the knob is not swept at all.
+    user_set = {knob.env for knob in all_eligible if knob.env in os.environ}
     knobs = tuple(
         knob
         for knob in all_eligible
-        if include_quality or not knob.quality_sensitive
+        if (include_quality or not knob.quality_sensitive) and knob.env not in user_set
     )
-    skipped = len(all_eligible) - len(knobs)
     log(
         f"chip {context.chip} · family {context.gpu_family} · "
         f"{context.bandwidth_gbps} GB/s · {len(knobs)} of "
         f"{len(tuning.knobs)} knobs eligible"
     )
-    if skipped:
+    if quality_skipped:
         log(
-            f"{skipped} quality-trading knobs stay out; "
+            f"{quality_skipped} quality-trading knobs stay out; "
             "--include-quality-knobs sweeps them too"
         )
+    if user_set:
+        log(
+            f"{', '.join(sorted(user_set))} already set in the "
+            "environment — excluded; the value always wins at serve"
+        )
     inherited = sorted(
-        name for name in os.environ if name.startswith("RICHENGINE_")
+        name
+        for name in os.environ
+        if name.startswith("RICHENGINE_") and name not in user_set
     )
     if inherited:
         log(
             f"inherited {', '.join(inherited)} reach every candidate and "
             "shift the baseline; they are not measured"
         )
+    if contaminated:
+        log(
+            f"measuring under {contaminated} — results are recorded but "
+            "cannot win and never reach the priors"
+        )
 
     widths = (1, BATCH_WIDTH)
-    prompts = _prompts(
+    prompts, real_prompts = _prompts(
         assembly_dir, max(widths) + REPETITIONS * sum(widths)
     )
+    if not real_prompts and any(knob.draft_kinds for knob in knobs):
+        # Synthetic ids decode to text no draft predicts: acceptance sits
+        # near zero and every draft knob's verdict measures a workload
+        # real traffic never sees. Drop them like the user-set ones.
+        knobs = tuple(knob for knob in knobs if not knob.draft_kinds)
+        log(
+            "synthetic prompts — no readable tokenizer.json; draft knobs "
+            "stay out, they would measure near-zero acceptance"
+        )
     fingerprint = engine_fingerprint(binary)
     signature = _knobs_signature(knobs)
 
     record = _read_record(assembly_dir)
     prior = record.get(context.chip)
     results: dict = {}
+    verdicts: dict = {}
     best_env: dict[str, str] = {}
     best_metrics: dict | None = None
+    # The kernel pass's record fragment: the measured Linear plan winners,
+    # or an {"error"} marker that keeps a resume from re-running a pass
+    # that already failed. A resumable entry carries its own.
+    plans: dict | None = None
     if (
         isinstance(prior, dict)
         and prior.get("schema") == TUNING_SCHEMA
@@ -810,47 +966,89 @@ def tune(
             for key, entry in prior["measured"].items()
             if not (isinstance(entry, dict) and entry.get("pressured"))
         }
+        if isinstance(prior.get("verdicts"), dict):
+            verdicts = dict(prior["verdicts"])
         best_env = dict(prior["env"])
         best_metrics = prior["best"]
+        if isinstance(prior.get("plans"), dict):
+            plans = prior["plans"]
         log(f"resuming · {len(results) - 1} candidates already measured")
 
-    sigma = _baseline_sigma(
-        (results.get("baseline") or {}).get("samples") or {}
-    )
+    sigma = _baseline_sigma((results.get("baseline") or {}).get("samples") or {})
 
     def write():
         record[context.chip] = {
             "schema": TUNING_SCHEMA,
             "engine": fingerprint,
             "knobs": signature,
+            "mode": mode
+            or ("complete" if include_quality and interactions else "quick"),
             "gpu_family": context.gpu_family,
             "bandwidth_gbps": context.bandwidth_gbps,
             "env": best_env,
             "best": best_metrics,
             "measured": results,
+            "verdicts": verdicts,
+            "plans": plans,
             "complete": False,
             "updated_unix": int(time.time()),
         }
         _write_record(assembly_dir, record)
 
+    # The kernel pass fits the model's affine Linear plans to this machine
+    # once, before the env sweep: its winners ride every later measurement
+    # through RICHENGINE_LINEAR_PLANS in best_env — both modes run it, Quick
+    # with the smaller per-key budget. A user-set value always wins at
+    # serve, so the pass is skipped then; a contaminated sweep cannot keep
+    # anything and skips the pass too. Its record is written before any
+    # measurement so an interrupted sweep resumes past it.
+    if plans is None and kernel_pass and not contaminated:
+        if KERNEL_PLANS_ENV in os.environ:
+            log(
+                f"kernels · {KERNEL_PLANS_ENV} already set in the "
+                "environment — pass skipped; the value always wins at serve"
+            )
+            plans = {}
+        else:
+            plans = (
+                _kernel_pass(
+                    binary,
+                    assembly_dir,
+                    seconds=KERNEL_PASS_SECONDS[
+                        mode
+                        or (
+                            "complete" if include_quality and interactions else "quick"
+                        )
+                    ],
+                    log=log,
+                )
+                or {}
+            )
+        write()
+
     def sweep(candidates, prefix=""):
         """Measure each (knob, value) against the running best; keep the
         winners. `prefix` namespaces recheck keys from first-pass ones.
         Candidates are contiguous per knob, so an ordered knob whose first
-        value deep-loses prunes the rest of its values unmeasured."""
+        value deep-loses prunes the rest of its values unmeasured — the
+        verdict remembers them so no later pass re-asks the question."""
         nonlocal best_env, best_metrics
+        baseline_metrics = (results.get("baseline") or {}).get("metrics") or {}
         dead: set[str] = set()
         for knob, value in candidates:
+            candidate_key = f"{knob.env}={value}"
             if knob.env in dead:
+                verdicts.setdefault(candidate_key, "pruned")
                 continue
             if best_env.get(knob.env) == value:
                 continue
-            key = prefix + f"{knob.env}={value}"
+            key = prefix + candidate_key
             if key in results:
                 continue
             env = dict(best_env)
             env[knob.env] = value
-            pressured = _wait_for_pressure(log)
+            pressured = contaminated or _wait_for_pressure(log)
+            log(f"trying {knob.env}={value}")
             try:
                 measured, _ = measure(
                     binary,
@@ -861,27 +1059,31 @@ def tune(
                 )
             except (OSError, RuntimeError) as error:
                 log(f"{knob.env}={value} · failed ({error})")
+                verdicts[candidate_key] = "failed"
                 continue
             log(f"{knob.env}={value} · {measured}")
             results[key] = {"env": env, "metrics": measured}
             if pressured:
                 results[key]["pressured"] = pressured
+                verdicts[candidate_key] = "pressured"
             elif _keeps(measured, best_metrics, sigma):
                 best_env[knob.env] = value
                 best_metrics = measured
+                verdicts[candidate_key] = "kept"
                 log("  kept")
-            elif knob.ordered and _deep_loss(
-                measured, best_metrics, PRUNE_DEPTH
-            ):
+            elif knob.ordered and _deep_loss(measured, baseline_metrics, PRUNE_DEPTH):
                 dead.add(knob.env)
+                verdicts[candidate_key] = "rejected"
                 log(
                     f"  rest of {knob.env} skipped — ordered knob's "
                     "first value lost beyond prune depth"
                 )
+            else:
+                verdicts[candidate_key] = "rejected"
             write()
 
     if best_metrics is None:
-        pressured = _wait_for_pressure(log)
+        pressured = contaminated or _wait_for_pressure(log)
         best_metrics, baseline_samples = measure(
             binary, assembly_dir, {}, prompts=prompts
         )
@@ -896,25 +1098,70 @@ def tune(
             results["baseline"]["pressured"] = pressured
         write()
 
-    first_pass_candidates = [
-        (knob, value)
-        for knob in knobs
-        for value in knob.values
-    ]
+    # The kernel pass's winners as candidate zero: measured once
+    # whole-model against the baseline, kept only when the keep rule says
+    # the fitted plans pay end to end — the same A/B gate the shipped
+    # DeviceTuning tables took before a policy change. On a resume the
+    # entry already sits in results and in best_env when it kept.
+    if plans and plans.get("spec") and "kernels" not in results:
+        pressured = contaminated or _wait_for_pressure(log)
+        log(
+            f"kernels · {plans['changed']} of {plans['measured']} plans "
+            "changed — measuring the fitted env"
+        )
+        try:
+            kernel_metrics, _ = measure(
+                binary,
+                assembly_dir,
+                {KERNEL_PLANS_ENV: plans["spec"]},
+                prompts=prompts,
+                incumbent=best_metrics,
+            )
+        except (OSError, RuntimeError) as error:
+            log(f"kernels · fitted env failed ({error})")
+        else:
+            log(f"kernels · {kernel_metrics}")
+            results["kernels"] = {
+                "env": {KERNEL_PLANS_ENV: plans["spec"]},
+                "metrics": kernel_metrics,
+            }
+            if pressured:
+                results["kernels"]["pressured"] = pressured
+                verdicts["kernels"] = "pressured"
+            elif _keeps(kernel_metrics, best_metrics, sigma):
+                best_env[KERNEL_PLANS_ENV] = plans["spec"]
+                best_metrics = kernel_metrics
+                verdicts["kernels"] = "kept"
+                log("  kept")
+            else:
+                verdicts["kernels"] = "rejected"
+            write()
+
+    first_pass_candidates = [(knob, value) for knob in knobs for value in knob.values]
     if priors_path is not None and not include_quality and not interactions:
         # A Quick sweep trusts the chip's priors; any flag widens the scope
         # past Quick and every candidate is measured regardless of history.
-        stats = _read_priors(priors_path).get(context.chip) or {}
+        stats = _prior_stats(
+            _read_priors(priors_path),
+            context.chip,
+            context.family,
+            engine=fingerprint,
+            knobs=signature,
+        )
         measured_once = [
             (knob, value)
             for knob, value in first_pass_candidates
             if not _prior_skips(stats, knob, value)
         ]
+        for knob, value in first_pass_candidates:
+            if (knob, value) not in measured_once:
+                verdicts[f"{knob.env}={value}"] = "prior-skipped"
         pruned = len(first_pass_candidates) - len(measured_once)
         if pruned:
             log(
-                f"priors · {pruned} candidates never won on this chip — "
-                "skipped in Quick; --complete measures everything"
+                f"priors · {pruned} candidates never won for this family "
+                "on this chip — skipped in Quick; --complete measures "
+                "everything"
             )
         first_pass_candidates = measured_once
     # The count feeds the job's progress; on a resume, only what the sweep
@@ -922,8 +1169,7 @@ def tune(
     remaining = [
         (knob, value)
         for knob, value in first_pass_candidates
-        if best_env.get(knob.env) != value
-        and f"{knob.env}={value}" not in results
+        if best_env.get(knob.env) != value and f"{knob.env}={value}" not in results
     ]
     log(f"sweep · {len(remaining)} candidates")
     sweep(first_pass_candidates)
@@ -938,17 +1184,19 @@ def tune(
             for value in knob.values
         ]
         # A candidate that already lost beyond the depth at every width
-        # owes nothing to a recheck — no plausible interaction rescues it.
-        # Unmeasured (failed) and pressured entries still get the pass.
+        # owes nothing to a recheck — no plausible interaction rescues it;
+        # an ordered-pruned value was never measured at all and owes the
+        # same nothing. Unmeasured (failed) and pressured entries still
+        # get the pass.
         base = (results.get("baseline") or {}).get("metrics") or {}
         owed, deep = [], []
         for knob, value in recheck:
-            entry = results.get(f"{knob.env}={value}")
-            metrics = (
-                (entry or {}).get("metrics")
-                if isinstance(entry, dict)
-                else None
-            )
+            candidate_key = f"{knob.env}={value}"
+            if verdicts.get(candidate_key) == "pruned":
+                deep.append((knob, value))
+                continue
+            entry = results.get(candidate_key)
+            metrics = (entry or {}).get("metrics") if isinstance(entry, dict) else None
             if not isinstance(metrics, dict) or not _deep_loss(
                 metrics, base, RECHECK_DEPTH
             ):
@@ -958,19 +1206,60 @@ def tune(
         if recheck:
             log(
                 f"recheck · {len(owed)} candidates against the final env"
-                + (
-                    f" · {len(deep)} deep losses already out"
-                    if deep
-                    else ""
-                )
+                + (f" · {len(deep)} deep losses already out" if deep else "")
             )
         sweep(owed, prefix="recheck:")
+
+    # Backward elimination: a knob kept early may no longer pay beside the
+    # winners that followed it. Re-measure the final env with each winner
+    # removed; drop the knob when its removal costs nothing within the
+    # noise floor — or gains. Bounded: one engine per retained winner.
+    winners = sorted(best_env)
+    if winners:
+        log(f"prune · {len(winners)} winners against the final env")
+    for name in winners:
+        value = best_env[name]
+        trial = {key: val for key, val in best_env.items() if key != name}
+        pressured = contaminated or _wait_for_pressure(log)
+        log(f"trying -{name}={value}")
+        try:
+            measured, _ = measure(
+                binary,
+                assembly_dir,
+                trial,
+                prompts=prompts,
+            )
+        except (OSError, RuntimeError) as error:
+            log(f"-{name}={value} · failed ({error}) — kept")
+            continue
+        log(f"-{name}={value} · {measured}")
+        results[f"eliminate:{name}={value}"] = {
+            "env": trial,
+            "metrics": measured,
+        }
+        # The env without the knob must lose to it for the knob to stay:
+        # no meaningful win means the knob contributes nothing.
+        if pressured or _keeps(best_metrics, measured, sigma):
+            continue
+        del best_env[name]
+        best_metrics = measured
+        verdicts[f"{name}={value}"] = "eliminated"
+        log("  removed — the final env pays without it")
+        write()
 
     record[context.chip]["complete"] = True
     _write_record(assembly_dir, record)
     if priors_path is not None:
         try:
-            _update_priors(priors_path, context.chip, results, best_env)
+            _update_priors(
+                priors_path,
+                context.chip,
+                context.family,
+                results,
+                best_env,
+                engine=fingerprint,
+                knobs=signature,
+            )
         except OSError:
             pass
     return best_env

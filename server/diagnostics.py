@@ -1,5 +1,6 @@
 """Concise console diagnostics without request-body logging."""
 
+import contextlib
 import os
 import re
 import sys
@@ -15,7 +16,7 @@ def log_unexpected(error):
     """Print the type of an unexpected error and the innermost line of the
     server it passed through, never its message, which may carry request
     data."""
-    try:
+    with contextlib.suppress(Exception):
         location = ""
         for frame, line in traceback.walk_tb(error.__traceback__):
             path = Path(frame.f_code.co_filename).resolve()
@@ -25,8 +26,6 @@ def log_unexpected(error):
             f"Error · internal_server_error · {type(error).__name__}{location}",
             error=True,
         )
-    except Exception:
-        pass
 
 
 def _ansi(stream):
@@ -86,9 +85,7 @@ def print_status(message, *, error=False):
         word, separator, rest = message.partition(" · ")
         if word in _STATUS_COLORS:
             message = (
-                _styled(word, _STATUS_COLORS[word], stream=stream)
-                + separator
-                + rest
+                _styled(word, _STATUS_COLORS[word], stream=stream) + separator + rest
             )
         stamp = _styled(stamp, "2", stream=stream)
     else:

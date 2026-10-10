@@ -196,6 +196,13 @@ interface AvailableModel {
      "stale", and the knob count the record applies. */
   tuned_knobs?: number | null;
   tuning?: string | null;
+  /* The finished sweep's mode ("quick" | "complete") and a count of each
+     candidate verdict — kept, rejected, eliminated, pruned, pressured. */
+  tune_mode?: string | null;
+  tune_verdicts?: Record<string, number> | null;
+  /* A tune finished after this model's engine spawned; its winners apply
+     only on the next load. */
+  requires_reload?: boolean;
   /* False when the family's knob table is unknown — Tune would only fail. */
   tunable?: boolean;
 }
@@ -492,6 +499,27 @@ export default function Models() {
   const tailQuiet = () => {
     tick();
     return Math.max(0, Math.round((Date.now() - lastTailAt()) / 1000));
+  };
+
+  /* The sweep's phase as a readable label, with the phase-scoped
+     candidate count when the workload is known. */
+  const tunePhase = () => {
+    const job = tuneJob();
+    const total = job?.phase_total ?? 0;
+    const done = job?.phase_done ?? 0;
+    const counted = total ? ` — ${done}/${total}` : "";
+    switch (job?.phase) {
+      case "baseline":
+        return "measuring the baseline";
+      case "sweep":
+        return `sweep${counted}`;
+      case "recheck":
+        return `recheck${counted}`;
+      case "prune":
+        return `pruning winners${counted}`;
+      default:
+        return "starting the engine";
+    }
   };
 
   const installElapsed = () => {
@@ -823,9 +851,24 @@ export default function Models() {
                     >
                       <span
                         class="badge ok"
-                        title={`${entry.tuned_knobs} engine knobs measured on this chip, applied on every load`}
+                        title={`${entry.tune_mode ? `${entry.tune_mode} sweep · ` : ""}${entry.tuned_knobs} engine knobs measured on this chip, applied on every load${
+                          entry.tune_verdicts
+                            ? ` · ${Object.entries(entry.tune_verdicts)
+                                .map(([v, n]) => `${n} ${v}`)
+                                .join(", ")}`
+                            : ""
+                        }`}
                       >
                         tuned·{entry.tuned_knobs}
+                        {entry.tune_mode === "quick" ? "·quick" : ""}
+                      </span>
+                    </Show>
+                    <Show when={entry.serving && entry.requires_reload}>
+                      <span
+                        class="badge warn"
+                        title="A tune finished while this model was loaded — its new knobs apply on the next load"
+                      >
+                        reload to apply
                       </span>
                     </Show>
                     <Show when={entry.tuning === "partial"}>
@@ -915,16 +958,7 @@ export default function Models() {
                   fallback={
                     <>
                       Tuning <span class="mono">{tuneJob()?.model}</span>…{" "}
-                      <span
-                        class="muted"
-                        title="Mode, progress, and seconds since the sweep last printed — engine launches are minutes of quiet, not a hang"
-                      >
-                        {tuneJob()?.mode ?? "quick"}
-                        <Show when={(tuneJob()?.candidates_total ?? 0) > 0}>
-                          {` · candidate ${tuneJob()?.candidates_done ?? 0}/${tuneJob()?.candidates_total}`}
-                        </Show>
-                        {` · ${tailQuiet()}s quiet`}
-                      </span>
+                      <span class="muted">{tuneJob()?.mode ?? "quick"}</span>
                     </>
                   }
                 >
@@ -980,6 +1014,59 @@ export default function Models() {
                 </button>
               </Show>
             </div>
+            <Show when={tuneJob()?.running}>
+              <div class="panel-row meter-row tune-progress-row">
+                <div class="tune-progress">
+                  <div
+                    class="meter"
+                    role="progressbar"
+                    aria-label="Sweep progress"
+                    aria-valuemin={0}
+                    aria-valuemax={tuneJob()?.phase_total || 1}
+                    aria-valuenow={tuneJob()?.phase_done ?? 0}
+                  >
+                    <i
+                      classList={{ pending: !(tuneJob()?.phase_total ?? 0) }}
+                      style={{
+                        width: `${
+                          (tuneJob()?.phase_total ?? 0) > 0
+                            ? Math.min(
+                                100,
+                                ((tuneJob()?.phase_done ?? 0) /
+                                  (tuneJob()?.phase_total || 1)) *
+                                  100
+                              )
+                            : 100
+                        }%`,
+                      }}
+                    />
+                  </div>
+                  <div class="tune-sub">
+                    <span>{tunePhase()}</span>
+                    <Show when={(tuneJob()?.saved ?? 0) > 0}>
+                      <span class="chip">{tuneJob()?.saved} skipped by priors</span>
+                    </Show>
+                    <span class="num">{tailQuiet()}s quiet</span>
+                  </div>
+                  <Show when={tuneJob()?.current}>
+                    {(current) => (
+                      <div class="tune-sub">
+                        <span class="mono">{current().name}</span>
+                        {current().outcome === "kept" ? (
+                          <span class="badge ok">kept</span>
+                        ) : current().outcome === "failed" ? (
+                          <span class="badge err">failed</span>
+                        ) : current().outcome === "measuring" ? (
+                          <span class="muted">measuring…</span>
+                        ) : (
+                          <span class="muted">measured</span>
+                        )}
+                      </div>
+                    )}
+                  </Show>
+                </div>
+              </div>
+            </Show>
             <Show when={tuneJob()?.done && (tuneJob()?.results?.length ?? 0) > 0}>
               <div class="panel-row">
                 <span class="grow muted mono" style="white-space: normal">
@@ -988,17 +1075,23 @@ export default function Models() {
               </div>
             </Show>
             <Show when={(tuneJob()?.tail?.length ?? 0) > 0}>
-              <pre
-                class="install-log"
-                ref={tuneLogEl}
-                onScroll={(event) => {
-                  const el = event.currentTarget;
-                  tuneLogPinned =
-                    el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
-                }}
+              <details
+                class="tune-log"
+                open={Boolean(tuneJob()?.done && !tuneJob()?.ok)}
               >
-                {tuneJob()?.tail?.join("\n")}
-              </pre>
+                <summary>Sweep log</summary>
+                <pre
+                  class="install-log"
+                  ref={tuneLogEl}
+                  onScroll={(event) => {
+                    const el = event.currentTarget;
+                    tuneLogPinned =
+                      el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+                  }}
+                >
+                  {tuneJob()?.tail?.join("\n")}
+                </pre>
+              </details>
             </Show>
           </div>
         </Show>

@@ -159,8 +159,7 @@ class ToolDialect:
         its arguments coming from the side grammar `arguments`."""
         if self.kind == "python":
             return (
-                f'call_{index}: {json.dumps(name + "(")} '
-                f"@{arguments} {json.dumps(')')}"
+                f"call_{index}: {json.dumps(name + '(')} @{arguments} {json.dumps(')')}"
             )
         separator = (
             f"{json.dumps(self.call_separator)}? " if self.call_separator else ""
@@ -177,7 +176,7 @@ class ToolDialect:
         choice = "(" + " | ".join(f"call_{index}" for index in range(count)) + ")"
         if self.kind != "python":
             return choice
-        inner = choice + (f' ({json.dumps(", ")} {choice})*' if parallel else "")
+        inner = choice + (f" ({json.dumps(', ')} {choice})*" if parallel else "")
         return f"({self.spelling(self.call_open)} {inner} {self.spelling(self.call_close)})"
 
     def free_arguments(self):
@@ -249,7 +248,9 @@ def _python_value_rules(rule, value_schema):
         return rules
     kind = schema.get("type") if isinstance(schema, dict) else None
     kinds = kind if isinstance(kind, list) else [kind]
-    union = schema.get("anyOf", schema.get("oneOf")) if isinstance(schema, dict) else None
+    union = (
+        schema.get("anyOf", schema.get("oneOf")) if isinstance(schema, dict) else None
+    )
     if union:
         options = []
         for option_index, option_schema in enumerate(union):
@@ -276,9 +277,7 @@ def _python_value_rules(rule, value_schema):
     if kinds and all(k in ("integer", "number") for k in kinds):
         rules.append(f"{rule}: {_PYTHON_NUMBER}")
         return rules
-    rules.append(
-        f"{rule}: %json {json.dumps(schema, separators=(',', ':'))}"
-    )
+    rules.append(f"{rule}: %json {json.dumps(schema, separators=(',', ':'))}")
     return rules
 
 
@@ -319,12 +318,8 @@ def _python_argument_grammar(schema):
             rules.append(f"chain_{index}: {call} seq_{index + 1}")
             rules.append(f'seq_{index}: ", " {call} seq_{index + 1}')
         else:
-            rules.append(
-                f"chain_{index}: ({call} seq_{index + 1})? chain_{index + 1}"
-            )
-            rules.append(
-                f'seq_{index}: (", " {call} seq_{index + 1})? seq_{index + 1}'
-            )
+            rules.append(f"chain_{index}: ({call} seq_{index + 1})? chain_{index + 1}")
+            rules.append(f'seq_{index}: (", " {call} seq_{index + 1})? seq_{index + 1}')
     additional = schema["additionalProperties"]
     if additional is False:
         rules.append(f"chain_{n}:")
@@ -335,8 +330,8 @@ def _python_argument_grammar(schema):
             "EXTRA_NAME: /[A-Za-z0-9_-]+/" + (f" & ~({declared})" if declared else "")
         )
         rules.extend(_python_value_rules("extra_value", additional))
-        rules.append(f"chain_{n}: (EXTRA_NAME \"=\" extra_value tail)?")
-        rules.append(f'seq_{n}: (", " EXTRA_NAME \"=\" extra_value tail)?')
+        rules.append(f'chain_{n}: (EXTRA_NAME "=" extra_value tail)?')
+        rules.append(f'seq_{n}: (", " EXTRA_NAME "=" extra_value tail)?')
         rules.append('tail: (", " EXTRA_NAME "=" extra_value tail)?')
     return "%llguidance {}\nstart: chain_0\n" + "\n".join(rules) + "\n"
 
@@ -352,13 +347,10 @@ _PYTHON_FREE_ARGUMENTS = (
 )
 
 
-
 # A string in a gemma4 call: `<|"|>` opens it and closes it, with no
 # escapes, so its text is anything that does not spell the delimiter.
 _GEMMA4_QUOTE = json.dumps('<|"|>')
-_GEMMA4_STRING_BODY = (
-    r"/(?s:.*)/ & ~/(?s:.*)" + re.escape('<|"|>') + r"(?s:.*)/"
-)
+_GEMMA4_STRING_BODY = r"/(?s:.*)/ & ~/(?s:.*)" + re.escape('<|"|>') + r"(?s:.*)/"
 
 # The arguments of an unconstrained gemma4 call: `key:value` pairs joined
 # by "," inside the call's braces, values as the template writes them.
@@ -389,9 +381,11 @@ def _gemma4_literal(value):
     if value is None:
         return "null"
     if isinstance(value, dict):
-        return "{" + ",".join(
-            f"{key}:{_gemma4_literal(item)}" for key, item in value.items()
-        ) + "}"
+        return (
+            "{"
+            + ",".join(f"{key}:{_gemma4_literal(item)}" for key, item in value.items())
+            + "}"
+        )
     if isinstance(value, list):
         return "[" + ",".join(_gemma4_literal(item) for item in value) + "]"
     return json.dumps(value, allow_nan=False)
@@ -424,7 +418,7 @@ def _gemma4_pairs(rule, schema, ancestors):
                 return None
             continue
         rules.extend(parameter_rules)
-        call = f'{json.dumps(name + ":")} {parameter_rule}'
+        call = f"{json.dumps(name + ':')} {parameter_rule}"
         sequence.append((call, name in required))
     additional = schema["additionalProperties"]
     if additional is not False:
@@ -441,7 +435,6 @@ def _gemma4_pairs(rule, schema, ancestors):
             sequence.append((f'EXTRA_NAME ":" {rule}_extra', None))
             tail = f'("," EXTRA_NAME ":" {rule}_extra {rule}_tail)?'
             rules.append(f"{rule}_tail: {tail}")
-            many = True
     # chain_i reads parameter i on, seq_i the same once a comma preceded it.
     n = len(sequence)
     chains = []
@@ -452,20 +445,12 @@ def _gemma4_pairs(rule, schema, ancestors):
             chains.append(f"{rule}_chain_{index}: {body}")
             chains.append(f'{rule}_seq_{index}: "," {body}')
         elif required_flag is False:
-            chains.append(
-                f"{rule}_chain_{index}: ({body})? {rule}_chain_{index + 1}"
-            )
-            chains.append(
-                f'{rule}_seq_{index}: ("," {body})? {rule}_seq_{index + 1}'
-            )
+            chains.append(f"{rule}_chain_{index}: ({body})? {rule}_chain_{index + 1}")
+            chains.append(f'{rule}_seq_{index}: ("," {body})? {rule}_seq_{index + 1}')
         else:
             # The trailing extras rule: any number of further pairs.
-            chains.append(
-                f"{rule}_chain_{index}: ({call} {rule}_tail)?"
-            )
-            chains.append(
-                f'{rule}_seq_{index}: ("," {call} {rule}_tail)?'
-            )
+            chains.append(f"{rule}_chain_{index}: ({call} {rule}_tail)?")
+            chains.append(f'{rule}_seq_{index}: ("," {call} {rule}_tail)?')
     chains.append(f"{rule}_chain_{n}:")
     chains.append(f"{rule}_seq_{n}:")
     return rules + chains, f"{rule}_chain_0"
@@ -483,7 +468,9 @@ def _gemma4_value_rules(rule, value_schema, root, ancestors):
         # A recursive reference spells as any gemma4 value.
         return [f"{rule}: free_value"]
     ancestors = ancestors | {id(schema)}
-    union = schema.get("anyOf", schema.get("oneOf")) if isinstance(schema, dict) else None
+    union = (
+        schema.get("anyOf", schema.get("oneOf")) if isinstance(schema, dict) else None
+    )
     if union:
         options = []
         for option_index, option_schema in enumerate(union):
@@ -501,24 +488,22 @@ def _gemma4_value_rules(rule, value_schema, root, ancestors):
         return rules
     values = _enumeration(schema) if isinstance(schema, dict) else None
     if values is not None and all(
-        value is None or isinstance(value, (str, bool, int, float))
-        for value in values
+        value is None or isinstance(value, (str, bool, int, float)) for value in values
     ):
         if any(isinstance(value, str) and '<|"|>' in value for value in values):
             raise APIError(400, "string tool parameter enum contains framing")
-        return [f"{rule}: (" + " | ".join(
-            json.dumps(_gemma4_literal(value)) for value in values
-        ) + ")"]
+        return [
+            f"{rule}: ("
+            + " | ".join(json.dumps(_gemma4_literal(value)) for value in values)
+            + ")"
+        ]
     kind = schema.get("type") if isinstance(schema, dict) else None
     kinds = kind if isinstance(kind, list) else [kind]
     string_schema = raw_string_schema(schema, '<|"|>')
     if string_schema is not None and (kind is None or "string" in (kinds or ())):
         if string_schema[0] == "raw":
             return [
-                f"{rule}: "
-                + _GEMMA4_QUOTE
-                + f" {rule}_body "
-                + _GEMMA4_QUOTE,
+                f"{rule}: " + _GEMMA4_QUOTE + f" {rule}_body " + _GEMMA4_QUOTE,
                 f"{rule}_body: " + _GEMMA4_STRING_BODY,
             ]
         return [
@@ -534,10 +519,7 @@ def _gemma4_value_rules(rule, value_schema, root, ancestors):
         return [f'{rule}: "null"']
     if kinds and all(k in ("integer", "number") for k in kinds):
         return [f"{rule}: " + _PYTHON_NUMBER]
-    if (
-        isinstance(schema, dict)
-        and (kind == "object" or "properties" in schema)
-    ):
+    if isinstance(schema, dict) and (kind == "object" or "properties" in schema):
         pairs = _gemma4_pairs(
             rule,
             {
@@ -553,14 +535,10 @@ def _gemma4_value_rules(rule, value_schema, root, ancestors):
         return pair_rules + [f'{rule}: "{{" ({start})? "}}"']
     if kind == "array" or (isinstance(schema, dict) and "items" in schema):
         items = schema.get("items", True) if isinstance(schema, dict) else True
-        item_rules = _gemma4_value_rules(
-            f"{rule}_item", items, root, ancestors
-        )
+        item_rules = _gemma4_value_rules(f"{rule}_item", items, root, ancestors)
         if item_rules is None:
             return None
-        return item_rules + [
-            f'{rule}: "[" ({rule}_item ("," {rule}_item)*)? "]"'
-        ]
+        return item_rules + [f'{rule}: "[" ({rule}_item ("," {rule}_item)*)? "]"']
     return [f"{rule}: free_value"]
 
 
@@ -575,10 +553,7 @@ def _gemma4_argument_grammar(schema):
     rules, start = pairs
     return (
         "%llguidance {}\n"
-        f"start: {start}\n"
-        + "\n".join(rules)
-        + "\n"
-        + _GEMMA4_FREE_VALUE_RULES
+        f"start: {start}\n" + "\n".join(rules) + "\n" + _GEMMA4_FREE_VALUE_RULES
     )
 
 
@@ -599,9 +574,7 @@ _GEMMA4_FREE_VALUE_RULES = (
 
 # The framing each supported chat template writes its calls in, detected at
 # startup from a rendered canary call.
-QWEN3_XML = ToolDialect(
-    name="qwen3-xml", structural=("<tool_call>", "</tool_call>")
-)
+QWEN3_XML = ToolDialect(name="qwen3-xml", structural=("<tool_call>", "</tool_call>"))
 
 MINICPM5_XML = ToolDialect(
     name="minicpm5-xml",
@@ -1617,13 +1590,10 @@ def json_grammar(schema, thinking, *, think_end_id=None, think_end_text=THINK_EN
         start + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
     if thinking:
-        think_end = (
-            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
-        )
+        think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         grammar.append(f"think: TEXT <[{think_end}]>")
         grammar.append(
-            r"TEXT: /(?s:.*)/ & ~/(?s:.*)" + _regex_text(think_end_text)
-            + r"(?s:.*)/"
+            r"TEXT: /(?s:.*)/ & ~/(?s:.*)" + _regex_text(think_end_text) + r"(?s:.*)/"
         )
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
@@ -1808,9 +1778,7 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
             + " WS"
         )
     if thinking:
-        think_end = (
-            THINK_END_TOKEN_ID if think_end_id is None else think_end_id
-        )
+        think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         main.append(f"think: TEXT <[{think_end}]>")
     main.extend(
         [
@@ -1818,7 +1786,9 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
             WHITESPACE_RULE,
             "TEXT: /(?s:.*)/ & ~/(?s:.*)("
             + dialect.barrier
-            + "|" + _regex_text(dialect.think_end) + ")(?s:.*)/",
+            + "|"
+            + _regex_text(dialect.think_end)
+            + ")(?s:.*)/",
         ]
     )
     side_grammars.insert(

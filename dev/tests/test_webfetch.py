@@ -51,9 +51,7 @@ class CheckedUrlTest(unittest.TestCase):
             self.assertEqual(caught.exception.status, 502)
 
     def test_accepts_a_public_url(self):
-        with mock.patch.object(
-            webfetch, "_resolve", side_effect=public_addrinfo
-        ):
+        with mock.patch.object(webfetch, "_resolve", side_effect=public_addrinfo):
             self.assertEqual(
                 webfetch._checked_url("https://example.com/path?q=1"),
                 "https://example.com/path?q=1",
@@ -131,9 +129,7 @@ class FetchTest(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.thread.join)
         self.addCleanup(self.httpd.shutdown)
-        patch = mock.patch.object(
-            webfetch, "_resolve", side_effect=public_addrinfo
-        )
+        patch = mock.patch.object(webfetch, "_resolve", side_effect=public_addrinfo)
         patch.start()
         self.addCleanup(patch.stop)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -152,6 +148,16 @@ class FetchTest(unittest.TestCase):
     def test_http_error_returns_as_result(self):
         result = webfetch.fetch(f"{self.base}/gone")
         self.assertEqual(result["status"], 404)
+
+    def test_a_parser_failure_keeps_the_raw_text(self):
+        def boom(*args, **kwargs):
+            raise ValueError("unparseable")
+
+        with mock.patch.object(webfetch._TextExtractor, "feed", boom):
+            result = webfetch.fetch(f"{self.base}/landing")
+        self.assertEqual(result["status"], 200)
+        self.assertIn("hello fixture", result["text"])
+        self.assertNotIn("title", result)
 
     def test_binary_answers_metadata_only(self):
         result = webfetch.fetch(f"{self.base}/binary")

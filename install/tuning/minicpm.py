@@ -3,8 +3,10 @@ installed from GGUF."""
 
 from .base import (
     ADAPTIVE_PROPOSALS,
+    ANE_WAIT,
     DRAFT_BYPASS,
     DRAFT_BYPASS_EXPECT,
+    DRAFT_SPLITS,
     GGUF_PACKED,
     HEAD_FUSED,
     ICB_OFF,
@@ -33,6 +35,7 @@ TUNABLE = (
             DRAFT_BYPASS,
             DRAFT_BYPASS_EXPECT,
             PROPOSAL_CAP,
+            DRAFT_SPLITS,
             HEAD_FUSED,
             MTL4,
             SUBMIT_AHEAD,
@@ -43,6 +46,7 @@ TUNABLE = (
             NGRAM_DRAFT_EXPECT,
             NGRAM_WARMUP,
             NGRAM_TREE_MIN,
+            ANE_WAIT,
         ),
     ),
 )

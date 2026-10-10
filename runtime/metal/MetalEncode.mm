@@ -5,6 +5,7 @@
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Tuning.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "Residency.hpp"
 #include "TestConfig.hpp"
 #ifdef RICHENGINE_BACKEND_INSTRUMENTATION
@@ -87,6 +88,22 @@ void dumpOpTimings() {
             rows[i].first.c_str());
 }
 
+// The env-tuned kernel geometry (Tuning.hpp, ExecutionGeometry.h's
+// function-constant table): built once like the tuning snapshot and
+// supplied to every function — indices a kernel does not declare are
+// ignored, so kernels without the constants compile unchanged.
+static MTLFunctionConstantValues *functionConstantValues() {
+    static MTLFunctionConstantValues *values = [] {
+        MTLFunctionConstantValues *result = [MTLFunctionConstantValues new];
+        uint32_t splits = tuning().draftAttentionSplits;
+        [result setConstantValue:&splits
+                            type:MTLDataTypeUInt
+                         atIndex:RICHENGINE_DRAFT_SPLITS_FUNCTION_CONSTANT];
+        return result;
+    }();
+    return values;
+}
+
 id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) {
         if (name.empty()) {
             throw MetalBackendError("Metal pipeline name must not be empty");
@@ -101,7 +118,10 @@ id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) 
 
 id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
-        id<MTLFunction> function = [library newFunctionWithName:key];
+        id<MTLFunction> function =
+            [library newFunctionWithName:key
+                          constantValues:functionConstantValues()
+                                   error:nil];
         if (!function) {
             throw MetalBackendError(
                 "missing Metal function: " + std::string(name));
@@ -125,7 +145,10 @@ id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view nam
             cached != icbPipelines.end())
             return cached->second;
         NSString *key = checkedNSString(name, "pipeline name");
-        id<MTLFunction> function = [library newFunctionWithName:key];
+        id<MTLFunction> function =
+            [library newFunctionWithName:key
+                          constantValues:functionConstantValues()
+                                   error:nil];
         if (!function) {
             throw MetalBackendError(
                 "missing Metal function: " + std::string(name));

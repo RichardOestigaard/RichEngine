@@ -16,3 +16,6 @@ install/download-token
 .venv-tq/
 .pytest_cache/
 /.playwright-mcp
+
+# The SolidJS build output the server serves; `make webui` regenerates it.
+server/webui/

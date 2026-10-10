@@ -666,7 +666,9 @@ class InstallerTests(unittest.TestCase):
             contextlib.redirect_stdout(printed),
         ):
             api.return_value.upload_file.side_effect = upload
-            publish_test.main(["--version", "1.0", "--repo", "owner/richengine-releases"])
+            publish_test.main(
+                ["--version", "1.0", "--repo", "owner/richengine-releases"]
+            )
         # This curl serves the uploaded files only to requests that carry the
         # token, as the private repo does.
         commands = self.root / "commands"

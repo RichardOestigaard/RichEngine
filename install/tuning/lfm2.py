@@ -4,8 +4,10 @@ are the double-gated short convolutions."""
 
 from .base import (
     ADAPTIVE_PROPOSALS,
+    ANE_WAIT,
     DRAFT_BYPASS,
     DRAFT_BYPASS_EXPECT,
+    DRAFT_SPLITS,
     GGUF_PACKED,
     HEAD_FUSED,
     ICB_OFF,
@@ -32,6 +34,7 @@ _COMMON = (
     DRAFT_BYPASS,
     DRAFT_BYPASS_EXPECT,
     PROPOSAL_CAP,
+    DRAFT_SPLITS,
     HEAD_FUSED,
     MTL4,
     GGUF_PACKED,
@@ -43,6 +46,7 @@ _COMMON = (
     NGRAM_DRAFT_EXPECT,
     NGRAM_WARMUP,
     NGRAM_TREE_MIN,
+    ANE_WAIT,
 )
 
 TUNABLE = (

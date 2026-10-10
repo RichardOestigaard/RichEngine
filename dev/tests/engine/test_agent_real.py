@@ -549,7 +549,9 @@ class AgentRunnerTests(unittest.TestCase):
                     10,
                     ["text"],
                 )
-                self.assertRegex(runner.hermes_profile, r"^richengine-test-[0-9a-f]{8}$")
+                self.assertRegex(
+                    runner.hermes_profile, r"^richengine-test-[0-9a-f]{8}$"
+                )
                 self.assertEqual(runner.hermes_home, profiles / runner.hermes_profile)
                 runner.hermes_home.mkdir(parents=True)
                 (runner.hermes_home / "state.db").write_bytes(b"sessions")
@@ -563,7 +565,9 @@ class AgentRunnerTests(unittest.TestCase):
                     ["profiles"] if existed else [],
                 )
                 if existed:
-                    self.assertEqual([p.name for p in profiles.iterdir()], ["richengine"])
+                    self.assertEqual(
+                        [p.name for p in profiles.iterdir()], ["richengine"]
+                    )
 
     def test_hermes_phase_without_a_session_record_reports_the_exit(self):
         # Hermes creates state.db with its first session; its absence is not

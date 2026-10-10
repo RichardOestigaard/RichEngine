@@ -6,6 +6,7 @@ resent in chat history.
 """
 
 import base64
+import contextlib
 import hashlib
 import io
 import math
@@ -112,12 +113,11 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
             height, width = smart_resize(decoded.height, decoded.width, max_pixels)
-            try:
-                # Cameras store the sensor's orientation and an EXIF tag that
-                # turns it upright for display; show the model the upright one.
+            # Cameras store the sensor's orientation and an EXIF tag that
+            # turns it upright for display; show the model the upright one.
+            # A malformed tag leaves the stored orientation.
+            with contextlib.suppress(Exception):
                 ImageOps.exif_transpose(decoded, in_place=True)
-            except Exception:
-                pass  # A malformed tag leaves the stored orientation.
             if decoded.size != stored:
                 height, width = width, height
             if decoded.has_transparency_data:

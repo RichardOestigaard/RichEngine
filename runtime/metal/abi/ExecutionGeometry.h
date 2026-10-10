@@ -36,9 +36,14 @@
 #define RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
 // Draft attention deals the live ring tiles of one (lane, KV head)
 // round-robin to this many groups, the last of which also attends the eight
-// current rows. Fixed rather than derived from the GPU so the combine order,
-// and with it the rounding, is the same on every machine and lane count.
+// current rows. RICHENGINE_DRAFT_SPLITS overrides the count at process
+// start (Tuning.hpp): the kernels read it through the Metal function
+// constant at this index, the host through the same once-read snapshot —
+// the workspace, the dispatch's z extent and the kernel loop bounds can
+// never disagree. The override clamps to DRAFT_SPLITS_MAXIMUM.
 #define RICHENGINE_DRAFT_ATTENTION_SPLITS 4u
+#define RICHENGINE_DRAFT_SPLITS_FUNCTION_CONSTANT 0u
+#define RICHENGINE_DRAFT_SPLITS_MAXIMUM 16u
 #define RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define RICHENGINE_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole

@@ -457,7 +457,10 @@ class PartialToolOutputTests(unittest.TestCase):
         # tag writes <think> itself (minicpm5 without enable_thinking); text
         # before any tag stays content.
         for text, expected in (
-            ("why\n<think>\nwhy</think>\n\nHi", ["", "why\n<think>\nwhy</think>\n\nHi"]),
+            (
+                "why\n<think>\nwhy</think>\n\nHi",
+                ["", "why\n<think>\nwhy</think>\n\nHi"],
+            ),
             ("<think>\nwhy</think>\n\nHi", ["\nwhy", "Hi"]),
             ("\n<think>\nwhy</think>\n\nHi", ["\nwhy", "Hi"]),
             ("Hi, no thinking", ["", "Hi, no thinking"]),

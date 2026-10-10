@@ -32,16 +32,17 @@ class Args:
         self.model = model
 
 
-def measure(port: int, model: str, seed: int, prompt_sentences: int,
-            output_tokens: int) -> dict:
+def measure(
+    port: int, model: str, seed: int, prompt_sentences: int, output_tokens: int
+) -> dict:
     _, before = smoke_real.request(port, "GET", "/status")
     status, body = smoke_real.request(
         port,
         "POST",
         "/v1/chat/completions",
         smoke_real.chat_body(
-            model, prompt(seed, prompt_sentences),
-            max_completion_tokens=output_tokens),
+            model, prompt(seed, prompt_sentences), max_completion_tokens=output_tokens
+        ),
         timeout=300,
     )
     assert status == 200, body
@@ -62,19 +63,22 @@ def leg(package: Path, model: str, env: dict, samples: int) -> list[dict]:
     server = smoke_real.RealServer(Args(package, model), environment=env)
     try:
         smoke_real.validate_status(server.wait_ready(600), "int8")
-        return [measure(server.port, model, seed, 120, 64)
-                for seed in range(samples)]
+        return [measure(server.port, model, seed, 120, 64) for seed in range(samples)]
     finally:
         server.close()
 
 
 def report(label: str, rows: list[dict]) -> None:
-    decode = sorted(r["decode_wall_ms"] / max(r["decode_output_tokens"], 1)
-                    for r in rows)
+    decode = sorted(
+        r["decode_wall_ms"] / max(r["decode_output_tokens"], 1) for r in rows
+    )
     ttft = sorted(r["ttft_ms"] for r in rows)
-    print(f"{label}: decode {1000 / decode[len(decode)//2]:.1f} tok/s, "
-          f"ttft {ttft[len(ttft)//2]:.0f} ms "
-          f"(prompt {rows[0]['prompt_tokens']})", flush=True)
+    print(
+        f"{label}: decode {1000 / decode[len(decode) // 2]:.1f} tok/s, "
+        f"ttft {ttft[len(ttft) // 2]:.0f} ms "
+        f"(prompt {rows[0]['prompt_tokens']})",
+        flush=True,
+    )
 
 
 def main() -> int:
@@ -82,8 +86,12 @@ def main() -> int:
     model = sys.argv[2]
     flag = sys.argv[3]
     samples = int(sys.argv[4]) if len(sys.argv) > 4 else 3
-    for label, env in [("off", {}), ("on", {flag: "1"}),
-                       ("on", {flag: "1"}), ("off", {})]:
+    for label, env in [
+        ("off", {}),
+        ("on", {flag: "1"}),
+        ("on", {flag: "1"}),
+        ("off", {}),
+    ]:
         rows = leg(package, model, env, samples)
         report(label, rows)
     return 0

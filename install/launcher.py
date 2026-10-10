@@ -114,9 +114,7 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
         # Python 3.14's formatter colors the invocation with its own theme
         # even when the parser's color is off; strip it and re-color in the
         # shared palette.
-        text = re.sub(
-            r"\x1b\[[0-9;]*m", "", super()._format_action_invocation(action)
-        )
+        text = re.sub(r"\x1b\[[0-9;]*m", "", super()._format_action_invocation(action))
         if not _ansi(sys.stdout):
             return text
         return "".join(
@@ -213,6 +211,8 @@ def _installed_details(models_root=None):
 
     if models_root is None:
         models_root = paths.MODELS
+    from install import layout
+
     installed = []
     chip, _, _ = autotune.detect_chip()
     binary = paths.BINARY if paths.BINARY.is_file() else None
@@ -221,20 +221,49 @@ def _installed_details(models_root=None):
         # tuning.json sits in the link's target; the link reads through it.
         # A partial record's winners already apply, so the knob count is
         # real even while the sweep still runs.
-        return autotune.tuning_state(link, chip=chip, binary=binary), len(
-            autotune.load_tuning(link, chip=chip, binary=binary)
-        )
+        state = autotune.tuning_state(link, chip=chip, binary=binary)
+        knobs = len(autotune.load_tuning(link, chip=chip, binary=binary))
+        entry = autotune._entry(link, chip) or {}
+        details = {"tuning": state, "tuned_knobs": knobs}
+        if entry.get("mode"):
+            details["tune_mode"] = entry["mode"]
+        verdicts = entry.get("verdicts")
+        if isinstance(verdicts, dict):
+            # One count per outcome — kept/rejected/eliminated/… — so the
+            # UI can say not just what won but why the rest lost.
+            counts = {}
+            for verdict in verdicts.values():
+                counts[verdict] = counts.get(verdict, 0) + 1
+            details["tune_verdicts"] = counts
+        return details
 
     for link in model_artifacts.selection_links(models_root):
         if model_artifacts.installation_kind(link) is None:
             continue
         name = str(link.relative_to(models_root))
-        entry = {"model": name, "selection": name, "family": None,
-                 "target_format": None, "vision_format": None, "bytes": None}
+        entry = {
+            "model": name,
+            "selection": name,
+            "family": None,
+            "target_format": None,
+            "vision_format": None,
+            "bytes": None,
+        }
         try:
             record = model_artifacts.read_json(link / "model.json")
         except model_artifacts.ModelError:
-            entry["tuning"], entry["tuned_knobs"] = tune_state(link)
+            # A legacy package's record is its manifest.json: locally packed
+            # ones type the family; Hub snapshots record the model name,
+            # which for these packages is the family.
+            try:
+                manifest = model_artifacts.read_json(link / layout.PACKAGE_MANIFEST)
+                entry["family"] = manifest.get("family") or manifest.get("model")
+                package_format = manifest.get("format")
+                if isinstance(package_format, dict):
+                    entry["target_format"] = package_format.get("name")
+            except model_artifacts.ModelError:
+                pass
+            entry.update(tune_state(link))
             entry["tunable"] = knobs_for(entry["family"]) is not None
             installed.append(entry)
             continue
@@ -253,7 +282,7 @@ def _installed_details(models_root=None):
                 )
         except (KeyError, TypeError):
             pass
-        entry["tuning"], entry["tuned_knobs"] = tune_state(link)
+        entry.update(tune_state(link))
         entry["tunable"] = knobs_for(entry["family"]) is not None
         installed.append(entry)
     installed.sort(key=lambda entry: entry["model"])
@@ -301,7 +330,10 @@ def _model_suggestion(model_id):
     if not close and "/" in model_id:
         # An owner typo hides a right repository name; match the name alone.
         name = model_id.split("/", 1)[1].split(":")[0]
-        by_name = {candidate.split("/", 1)[-1].split(":")[0]: candidate for candidate in candidates}
+        by_name = {
+            candidate.split("/", 1)[-1].split(":")[0]: candidate
+            for candidate in candidates
+        }
         names = difflib.get_close_matches(name, list(by_name), n=3, cutoff=0.7)
         close = [by_name[match] for match in names]
     return f"did you mean {', '.join(close)}?" if close else None
@@ -387,21 +419,40 @@ def tune(args):
         raise LauncherError(f"no engine binary at {paths.BINARY}; run make all")
     # A running serve shares the GPU with the sweep's engines; every number
     # it measures is then contaminated. Warn rather than fail — servers on
-    # different ports coexist deliberately.
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for lock in RUNTIME_DIR.glob("serve-*.lock"):
-        with lock.open("a+") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            except BlockingIOError:
-                print(
-                    _styled("warn:", "33;1", stream=sys.stderr)
-                    + " a serve is running; its engine shares this GPU "
-                    "and skews every measurement",
-                    file=sys.stderr,
-                )
-                break
+    # different ports coexist deliberately — but a detected (or allowed)
+    # loaded engine marks the whole sweep contaminated: entries record
+    # what ran, nothing can win, nothing reaches the priors.
+    contaminated = None
+    if args.allow_loaded:
+        contaminated = "a loaded engine shares the GPU"
+    else:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        for lock in RUNTIME_DIR.glob("serve-*.lock"):
+            with lock.open("a+") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    # A held lock only proves a serve process exists; one
+                    # that loaded nothing runs no engine and contaminates
+                    # nothing — ask it before warning.
+                    try:
+                        port = int(
+                            lock.name.removeprefix("serve-").removesuffix(".lock")
+                        )
+                    except ValueError:
+                        port = None
+                    owner = _serve_owner(port) if port is not None else None
+                    if owner is not None and _serve_idle(owner):
+                        continue
+                    print(
+                        _styled("warn:", "33;1", stream=sys.stderr)
+                        + " a serve is running; its engine shares this GPU "
+                        "and skews every measurement",
+                        file=sys.stderr,
+                    )
+                    contaminated = "a loaded engine shares the GPU"
+                    break
     # One sweep at a time across CLI and UI — the server spawns this same
     # command, so the lock excludes both directions. Two sweeps would
     # contend for the GPU and corrupt each other's measurements.
@@ -418,7 +469,10 @@ def tune(args):
                 include_quality=args.complete or args.include_quality_knobs,
                 interactions=(args.complete or args.interaction_pass)
                 and not args.no_interaction_pass,
+                kernel_pass=not args.no_kernel_pass,
                 priors_path=models_root / autotune.PRIORS_NAME,
+                mode="complete" if args.complete else "quick",
+                contaminated=contaminated,
             )
         except model_artifacts.ModelError as error:
             raise LauncherError(str(error)) from error
@@ -503,9 +557,7 @@ def serve(args):
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump(
-            {"pid": os.getpid(), "model": args.model, "port": args.port}, lock
-        )
+        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
         lock.flush()
         # Fail before downloads/builds if another service owns the selected port.
         # The HTTP server also binds before loading weights, closing the race.
@@ -662,16 +714,12 @@ def list_models(args):
             for entry in installed
         ]
         rows += [
-            (model, "", "", "", "", "")
-            for model in known
-            if model not in installed_ids
+            (model, "", "", "", "", "") for model in known if model not in installed_ids
         ]
         header = ("MODEL", "STATUS", "FAMILY", "FORMAT", "VISION", "SIZE")
     else:
         rows = [(entry["model"], "installed") for entry in installed]
-        rows += [
-            (model, "") for model in known if model not in installed_ids
-        ]
+        rows += [(model, "") for model in known if model not in installed_ids]
         header = ("MODEL", "STATUS")
     widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header))]
     print(_styled("  ".join(h.ljust(w) for h, w in zip(header, widths)).rstrip(), "1"))
@@ -705,7 +753,11 @@ def list_flags(args):
         (
             f"richengine {name}",
             [
-                (plain._format_action_invocation(a), styled._format_action_invocation(a), a.help)
+                (
+                    plain._format_action_invocation(a),
+                    styled._format_action_invocation(a),
+                    a.help,
+                )
                 for a in subcommands.choices[name]._actions
                 if a.option_strings
             ],
@@ -770,6 +822,23 @@ def _serve_owner(port):
     return {"pid": pid, "model": model, "port": port}
 
 
+def _serve_idle(owner):
+    """Whether a live serve lock holder provably runs no engine and none is
+    on its way: /v1/models empty and the host itself reports it is not
+    loading. An empty models list alone cannot tell idle from mid-load —
+    the window a tune starting then would race the incoming engine. A serve
+    too old or bare to answer /status is judged by the model its lock
+    recorded — None means it was started to sit idle."""
+    listing = _request_json("/v1/models", port=owner["port"])
+    if not isinstance(listing, dict) or listing.get("data"):
+        return False
+    status = _request_json("/status", port=owner["port"])
+    model_state = status.get("model_state") if isinstance(status, dict) else None
+    if model_state in ("unloaded", "failed"):
+        return True
+    return model_state is None and owner["model"] is None
+
+
 def _pid_running(pid):
     try:
         os.kill(pid, 0)
@@ -811,9 +880,8 @@ def status(args):
                 pending = transport.get("pending")
                 limit = transport.get("pending_limit")
                 if type(pending) is int:
-                    fields["requests"] = (
-                        f"{pending} in flight"
-                        + (f" of {limit} admitted" if type(limit) is int else "")
+                    fields["requests"] = f"{pending} in flight" + (
+                        f" of {limit} admitted" if type(limit) is int else ""
                     )
                 if type(transport.get("restarts")) is int and transport["restarts"]:
                     fields["restarts"] = transport["restarts"]
@@ -881,7 +949,10 @@ def doctor(args):
     warn = _styled("warn", "33")
     fail = _styled("fail", "31")
     info = _styled("info", "2")
-    report = lambda mark, name, detail: print(f"  {mark} {name:<10}{detail}")
+
+    def report(mark, name, detail):
+        print(f"  {mark} {name:<10}{detail}")
+
     failed = False
 
     # The engine binary and its own device check, which refuses an
@@ -894,8 +965,13 @@ def doctor(args):
             [str(paths.BINARY), "device-check"], capture_output=True, text=True
         )
         if check.returncode:
-            report(fail, "engine", check.stderr.strip().splitlines()[-1]
-                   if check.stderr.strip() else f"device check exited {check.returncode}")
+            report(
+                fail,
+                "engine",
+                check.stderr.strip().splitlines()[-1]
+                if check.stderr.strip()
+                else f"device check exited {check.returncode}",
+            )
             failed = True
         else:
             report(ok, "engine", "device check passed")
@@ -914,7 +990,12 @@ def doctor(args):
     try:
         gb = int(memory.stdout.strip()) / 1024**3
         mark = ok if gb >= 36 else warn
-        report(mark, "memory", f"{gb:.0f} GB unified" + ("" if gb >= 36 else "; the 4-bit examples need 36 GB"))
+        report(
+            mark,
+            "memory",
+            f"{gb:.0f} GB unified"
+            + ("" if gb >= 36 else "; the 4-bit examples need 36 GB"),
+        )
     except ValueError:
         report(info, "memory", "could not read hw.memsize")
 
@@ -927,7 +1008,12 @@ def doctor(args):
     try:
         free_gb = int(usage.stdout.splitlines()[-1].split()[3])
         mark = ok if free_gb >= 36 else warn
-        report(mark, "disk", f"{free_gb} GB free" + ("" if free_gb >= 36 else "; the 4-bit examples need ~36 GB"))
+        report(
+            mark,
+            "disk",
+            f"{free_gb} GB free"
+            + ("" if free_gb >= 36 else "; the 4-bit examples need ~36 GB"),
+        )
     except (IndexError, ValueError):
         report(info, "disk", "could not read free space")
 
@@ -936,13 +1022,19 @@ def doctor(args):
     report(
         info if stale else ok,
         "catalog",
-        "cache is stale or missing; refreshes on next serve" if stale else "cache is fresh",
+        "cache is stale or missing; refreshes on next serve"
+        if stale
+        else "cache is fresh",
     )
 
     # Whatever the selected port serves.
     served = _request_json("/v1/models", timeout=1)
     entries = served.get("data", []) if isinstance(served, dict) else []
-    if entries and isinstance(entries[0], dict) and entries[0].get("owned_by") == "richengine":
+    if (
+        entries
+        and isinstance(entries[0], dict)
+        and entries[0].get("owned_by") == "richengine"
+    ):
         report(ok, "server", f"{entries[0].get('id')} at {_base_url(PORT)}")
     else:
         report(info, "server", f"none at {_base_url(PORT)}")
@@ -1007,11 +1099,9 @@ MODEL_STORES = {
     "huggingface": (
         "Hugging Face cache",
         lambda: [
-            Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
-            / "hub",
+            Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub",
             # Xet's deduplicating blob store sits beside hub/.
-            Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
-            / "xet",
+            Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "xet",
         ],
         1,
     ),
@@ -1086,9 +1176,7 @@ def _store_rows(calc=True):
                 bytes_ += _dir_bytes(path)
             try:
                 children = [
-                    child
-                    for child in path.iterdir()
-                    if not child.name.startswith(".")
+                    child for child in path.iterdir() if not child.name.startswith(".")
                 ]
             except OSError:
                 continue
@@ -1109,8 +1197,7 @@ def _store_rows(calc=True):
                             grandchildren = []
                         if grandchildren:
                             expanded += [
-                                child / grandchild.name
-                                for grandchild in grandchildren
+                                child / grandchild.name for grandchild in grandchildren
                             ]
                             continue
                     expanded.append(child)
@@ -1163,9 +1250,7 @@ def disk(args):
     width = max(len(row["title"]) for row in rows)
     for row in rows:
         if not row["exists"]:
-            print(
-                f"{row['title']:<{width}}  {_styled('—', '2')}"
-            )
+            print(f"{row['title']:<{width}}  {_styled('—', '2')}")
             continue
         where = ", ".join(row["paths"])
         size = (
@@ -1173,9 +1258,7 @@ def disk(args):
             if args.calc
             else _styled("(skipped)", "2")
         )
-        print(
-            f"{row['title']:<{width}}  {size}  {_styled(where, '2')}"
-        )
+        print(f"{row['title']:<{width}}  {size}  {_styled(where, '2')}")
         for entry in row["models"][:10]:
             if entry["bytes"] is None:
                 print(f"{'':<{width}}    {_styled(entry['name'], '2')}")
@@ -1187,10 +1270,7 @@ def disk(args):
         if len(row["models"]) > 10:
             more = f"… {len(row['models']) - 10} more"
             print(f"{'':<{width}}    {_styled(more, '2')}")
-    print(
-        f"\nWipe a store with: richengine disk wipe "
-        f"<{'|'.join(MODEL_STORES)}> --yes"
-    )
+    print(f"\nWipe a store with: richengine disk wipe <{'|'.join(MODEL_STORES)}> --yes")
     return 0
 
 
@@ -1267,9 +1347,7 @@ def _dedupe_groups(variants=False):
         key = _dedupe_key("", occurrence["name"], variants)
         if key in ("models", "model", "cache", "blobs", "snapshots"):
             continue
-        match = next(
-            (k for k in occurrences if k.rsplit("/", 1)[-1] == key), None
-        )
+        match = next((k for k in occurrences if k.rsplit("/", 1)[-1] == key), None)
         if match is None:
             occurrences.setdefault(key, []).append(occurrence)
         else:
@@ -1295,8 +1373,7 @@ def _dedupe_groups(variants=False):
             continue
         kept_stores = [f for f in found if f["store"] in DEDUPE_KEEPS]
         covered = any(
-            f["store"] == "huggingface" and f["bytes"] >= REAL_BYTES
-            for f in found
+            f["store"] == "huggingface" and f["bytes"] >= REAL_BYTES for f in found
         )
         others = [f for f in found if f["store"] not in DEDUPE_KEEPS]
         if covered:
@@ -1360,7 +1437,11 @@ def dedupe(args):
                         f"{entry['name']}  {_styled(_size(entry['bytes']), '2')}{weak}"
                     )
                 for entry in group["remove"]:
-                    weak = _styled(" (unverified — kept)", "33") if entry.get("weak") else ""
+                    weak = (
+                        _styled(" (unverified — kept)", "33")
+                        if entry.get("weak")
+                        else ""
+                    )
                     print(
                         f"    {_styled('remove' if not entry.get('weak') else 'skip  ', '31' if not entry.get('weak') else '33')} "
                         f"{entry['title']}  "
@@ -1528,7 +1609,12 @@ def _disk_wipe_model(args, row):
     if args.json:
         print(
             json.dumps(
-                {"wiped": args.store, "model": args.model, "paths": wiped, "bytes": bytes_},
+                {
+                    "wiped": args.store,
+                    "model": args.model,
+                    "paths": wiped,
+                    "bytes": bytes_,
+                },
                 indent=2,
             )
         )
@@ -1559,8 +1645,13 @@ def _version():
 
 def _print_help():
     """The top-level help: grouped commands, with color only on a terminal."""
-    bold = lambda text: _styled(text, "1")
-    command = lambda name: _styled(f"{name:<11}", "36")
+
+    def bold(text):
+        return _styled(text, "1")
+
+    def command(name):
+        return _styled(f"{name:<11}", "36")
+
     print(
         f"{bold('RichEngine')} — serve a local model, connect an installed agent\n"
         f"\n{_styled('Usage:', '2')} richengine {_styled('<command>', '36')} [options]\n"
@@ -1606,9 +1697,7 @@ def _build_parser():
         ),
     )
     parser.add_argument("--version", action="version", version=_version())
-    commands = parser.add_subparsers(
-        dest="command", required=True, metavar="command"
-    )
+    commands = parser.add_subparsers(dest="command", required=True, metavar="command")
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
@@ -1686,7 +1775,9 @@ def _build_parser():
             "offers that this chip and memory bandwidth can run — measuring "
             "decode throughput single-lane and at the full batch width, and "
             "write the winners to the model's tuning.json, applied on every "
-            "serve.\n\n"
+            "serve. A kernel pass first fits the model's Linear plans to "
+            "this chip (the kernel tuner's paired in-process measurement); "
+            "--no-kernel-pass skips it.\n\n"
             "Quick is the default: quality-trading knobs stay out and the "
             "interaction recheck pass is skipped. --complete runs both. "
             "--include-quality-knobs and --interaction-pass enable each "
@@ -1747,9 +1838,23 @@ def _build_parser():
         "final env; implied by --complete",
     )
     tune_command.add_argument(
+        "--no-kernel-pass",
+        action="store_true",
+        help="skip the kernel pass that fits the model's Linear plans to "
+        "this chip before the env sweep; both Quick and Complete run it "
+        "by default",
+    )
+    tune_command.add_argument(
         "--no-interaction-pass",
         action="store_true",
         help="skip the recheck pass even under --complete",
+    )
+    tune_command.add_argument(
+        "--allow-loaded",
+        action="store_true",
+        help="tune while a serve holds a model on this GPU; every "
+        "measurement is recorded but flagged contaminated — nothing can "
+        "win and nothing reaches the shared priors",
     )
     status_command = commands.add_parser(
         "status",
@@ -1907,7 +2012,9 @@ def main(argv=None):
     except (LauncherError, clients.ClientError, OSError) as error:
         print(_styled("error:", "31;1", stream=sys.stderr), error, file=sys.stderr)
         if getattr(error, "hint", None):
-            print(_styled("hint:", "36", stream=sys.stderr), error.hint, file=sys.stderr)
+            print(
+                _styled("hint:", "36", stream=sys.stderr), error.hint, file=sys.stderr
+            )
         return 1
     except StopSignal as stop:
         # The status a shell gives a program the signal ends: 130 for

@@ -1,5 +1,9 @@
 # Unpushed Changes
 
+> Note: written against an earlier tree. It says 125 modified
+> files; the actual count has since changed. Treat counts as stale.
+
+
 Analysis of the uncommitted working tree: 125 modified files, ~40 new files,
 ~8,473 additions. The change set adds the Gemma 4 model family end-to-end, a
 diffusion-decoding mode for DiffusionGemma, a SolidJS web UI with model

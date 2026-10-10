@@ -391,7 +391,9 @@ class BackendRegressionTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(smoke.model_artifacts, "MODELS", models),
-            mock.patch.dict(os.environ, {"RICHENGINE_WEIGHT_CACHE": str(root / "cache")}),
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_WEIGHT_CACHE": str(root / "cache")}
+            ),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):

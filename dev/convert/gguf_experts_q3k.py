@@ -45,7 +45,8 @@ def dequant_q4k(raw, count):
             m = (sc[:, j + 4] >> 4) | ((sc[:, j] >> 6) << 4)
         q = qs[:, 32 * (j // 2) : 32 * (j // 2) + 32]
         out[:, 32 * j : 32 * j + 32] = (
-            d[:, None] * s[:, None] * ((q >> (4 * (j % 2))) & 15) - dmin[:, None] * m[:, None]
+            d[:, None] * s[:, None] * ((q >> (4 * (j % 2))) & 15)
+            - dmin[:, None] * m[:, None]
         )
     return out.reshape(-1)[:count]
 
@@ -53,11 +54,18 @@ def dequant_q4k(raw, count):
 def dequant_q6k(raw, count):
     """rows of 210-byte Q6_K blocks -> count float32."""
     b = raw.reshape(-1, 210)
-    ql, qh, scales, d = b[:, :128], b[:, 128:192], b[:, 192:208].view(np.int8), f16(b[:, 208:])
+    ql, qh, scales, d = (
+        b[:, :128],
+        b[:, 128:192],
+        b[:, 192:208].view(np.int8),
+        f16(b[:, 208:]),
+    )
     out = np.empty((b.shape[0], 256), np.float32)
     for j in range(8):
         n, r = j // 4, j % 4
-        l4 = (ql[:, 64 * n + 32 * (r & 1) : 64 * n + 32 * (r & 1) + 32] >> (4 * (r >> 1))) & 15
+        l4 = (
+            ql[:, 64 * n + 32 * (r & 1) : 64 * n + 32 * (r & 1) + 32] >> (4 * (r >> 1))
+        ) & 15
         h2 = (qh[:, 32 * n : 32 * n + 32] >> (2 * r)) & 3
         q6 = (l4 | (h2 << 4)).astype(np.int32) - 32
         sc = scales[:, 8 * n + 2 * r : 8 * n + 2 * r + 2]
@@ -106,7 +114,7 @@ def quantize_q3k(w):
 
     hmask = np.zeros((nb, 32), np.uint8)
     for j in range(8):
-        hmask |= (hb1[:, j, :].astype(np.uint8) << j)
+        hmask |= hb1[:, j, :].astype(np.uint8) << j
     qs = np.zeros((nb, 64), np.uint8)
     for j in range(8):
         n, jj = j // 4, j % 4
@@ -116,8 +124,10 @@ def quantize_q3k(w):
         scales[:, b] = (u[:, b] & 15) | ((u[:, b + 8] & 15) << 4)
         scales[:, b + 4] = (u[:, b + 4] & 15) | ((u[:, b + 12] & 15) << 4)
         scales[:, b + 8] = (
-            ((u[:, b] >> 4) & 3) | (((u[:, b + 4] >> 4) & 3) << 2)
-            | (((u[:, b + 8] >> 4) & 3) << 4) | (((u[:, b + 12] >> 4) & 3) << 6)
+            ((u[:, b] >> 4) & 3)
+            | (((u[:, b + 4] >> 4) & 3) << 2)
+            | (((u[:, b + 8] >> 4) & 3) << 4)
+            | (((u[:, b + 12] >> 4) & 3) << 6)
         )
     block = np.empty((nb, 110), np.uint8)
     block[:, :32], block[:, 32:96], block[:, 96:108] = hmask, qs, scales
@@ -137,7 +147,9 @@ def convert(source, dest):
         if name.endswith("_exps.weight") and count % 256 == 0:
             new_type, data = Q3_K, quantize_q3k(tensor_floats(raw, info, data_start))
         else:
-            size = {F32: 4, F16: 2, BF16: 2, Q8_0: 34, Q4_K: 144, Q6_K: 210}.get(info["type"])
+            size = {F32: 4, F16: 2, BF16: 2, Q8_0: 34, Q4_K: 144, Q6_K: 210}.get(
+                info["type"]
+            )
             if size is None:
                 raise ValueError(f"cannot copy type {info['type']} of {name}")
             n = count // 256 * size if size > 8 else count * size
@@ -152,9 +164,15 @@ def convert(source, dest):
 
     head = [struct.pack("<4sIQQ", b"GGUF", 3, len(out_infos), len(kvs))]
     for key, vtype, value in kvs:
-        head.append(struct.pack("<Q", len(key)) + key.encode() + struct.pack("<I", vtype) + value)
+        head.append(
+            struct.pack("<Q", len(key))
+            + key.encode()
+            + struct.pack("<I", vtype)
+            + value
+        )
     info_bytes = [
-        struct.pack("<Q", len(name)) + name.encode()
+        struct.pack("<Q", len(name))
+        + name.encode()
         + struct.pack("<I", len(dims))
         + struct.pack(f"<{len(dims)}Q", *dims)
         + struct.pack("<IQ", ttype, offset)

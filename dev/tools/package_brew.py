@@ -58,7 +58,8 @@ def main(argv=None):
     brew("tap-new", "--no-git", tap)
     try:
         tap_formula = (
-            Path(brew("--repository", tap, capture=True).strip()) / "Formula/richengine.rb"
+            Path(brew("--repository", tap, capture=True).strip())
+            / "Formula/richengine.rb"
         )
         shutil.copyfile(formula_file, tap_formula)
         info = json.loads(brew("info", "--json=v2", name, capture=True))["formulae"][0]

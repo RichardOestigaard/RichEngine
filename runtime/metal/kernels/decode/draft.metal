@@ -2,6 +2,13 @@
 #include "metal/kernels/common/draft_context_kv.h"
 #include "metal/kernels/common/rms_inverse.h"
 
+// The process's draft split count: RICHENGINE_DRAFT_SPLITS overrides the
+// compiled default at pipeline creation (ExecutionGeometry.h's table), the
+// host dispatching this many split groups and sizing their partials to
+// match.
+constant uint kDraftAttentionSplits
+    [[function_constant(RICHENGINE_DRAFT_SPLITS_FUNCTION_CONSTANT)]];
+
 template <uint Hidden>
 inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *dynamic,
@@ -188,8 +195,8 @@ inline void draft_attention_split_phase(
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort TileK = 64;
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS, Window = RICHENGINE_DRAFT_SLIDING_WINDOW,
-                 Splits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS, Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
+  const uint Splits = kDraftAttentionSplits;
   constexpr float InvSqrtD = D == 64 ? 0.125f : 0.08838834765f;
   static_assert(D == 128 || D == 64, "uncompiled draft head dimension");
   static_assert(M % 8 == 0 && N % TileK == 0, "draft attention tile alignment");
@@ -439,8 +446,8 @@ template <uint M, uint D>
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
                                          uint thread_index) {
-  constexpr uint Stride = M * D + 2 * M,
-                 Splits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Stride = M * D + 2 * M;
+  const uint Splits = kDraftAttentionSplits;
   constexpr uint Chunk = D / 8;
   for (uint row = thread_index / 8; row < M; row += 32) {
     uint dim = (thread_index % 8) * Chunk;
@@ -610,7 +617,7 @@ inline void draft_attention_split_impl(
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
-      ((batch * KVHeads * RowTiles + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS + group.z) *
+      ((batch * KVHeads * RowTiles + group.x) * kDraftAttentionSplits + group.z) *
           PartialFloats;
   draft_attention_split_phase<M, N, HeadDim>(
       queries + batch * Rows * Attention + group.x * M * HeadDim,
@@ -702,7 +709,7 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
-      (batch * KVHeads * RowTiles + group.x) * RICHENGINE_DRAFT_ATTENTION_SPLITS *
+      (batch * KVHeads * RowTiles + group.x) * kDraftAttentionSplits *
           PartialFloats;
   draft_attention_reduce_phase<M, HeadDim>(
       partials,

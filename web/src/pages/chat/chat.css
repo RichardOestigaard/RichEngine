@@ -52,7 +52,13 @@
 .chat-shell .tool-chip.error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)) }
 .chat-shell .tool-out { flex-basis: 100%; max-height: 220px; margin: 2px 0 4px; padding: 8px 12px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--side); color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere }
 .chat-shell .tool-out[hidden] { display: none }
-.chat-shell .assistant { padding: 0 2px }
+/* content-visibility lets the browser skip layout and paint for offscreen
+   replies — the cheap half of list virtualization, no library. The intrinsic
+   size keeps the scrollbar sane before a message has rendered once, and
+   `auto` remembers its real height after. Only applied to .assistant: its
+   children stay in-flow, while .user's hover actions sit outside the border
+   box and would be clipped by paint containment. */
+.chat-shell .assistant { padding: 0 2px; content-visibility: auto; contain-intrinsic-size: auto 200px }
 .chat-shell .waiting { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
 @keyframes spin { to { transform: rotate(360deg) } }
 .chat-shell details { margin-bottom: 14px; color: var(--muted); font-size: 13.5px }

@@ -362,6 +362,17 @@ def collect_garbage(models_root: Path):
     resolved = models_root / layout.RESOLVED
     derived = models_root / layout.METADATA
     linked = {link.resolve() for link in models.selection_links(models_root)}
+    # A package's tuning record lives beside its link (autotune.tuning_path);
+    # a sidecar whose link is gone has nothing left to tune. The second glob
+    # reaches the .selections links — "*" skips dot-directories.
+    for sidecar in (
+        *models_root.glob("*/*.tuning.json"),
+        *(models_root / layout.SELECTIONS).glob("*.tuning.json"),
+    ):
+        if not (
+            sidecar.parent / sidecar.name.removesuffix(".tuning.json")
+        ).is_symlink():
+            sidecar.unlink(missing_ok=True)
     # Locally packed packages (install/pack.py) are collected like
     # assemblies: a package no selection links is deleted, its staging too.
     packed = models_root / layout.PACKED

@@ -64,7 +64,7 @@ LIB := $(BUILD)/richengine.metallib
 	install-environment _install-environment \
 	platform-check model-selection preflight serve webui
 
-all: $(TARGET)
+all: $(TARGET) $(TUNE_TOOL)
 
 install: model-selection platform-check
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
@@ -221,6 +221,18 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
 	--constant 'production_metalflags=$(PROD_METALFLAGS)'
+# The autotune's kernel pass: the dev/tuning measurement harness in its own
+# shipped binary, still outside librichengine.a. install/paths.py's
+# TUNE_BINARY names the same path; install/autotune.py runs it once per
+# sweep and applies its winners through RICHENGINE_LINEAR_PLANS.
+TUNE_TOOL := $(BUILD)/richengine-tune
+TUNE_SOURCES := \
+	dev/tuning/Tuning.cpp \
+	dev/tuning/Measurement.cpp \
+	dev/tuning/LinearTuning.cpp \
+	dev/tuning/TuningWorkloads.cpp
+TUNE_OBJECTS := $(patsubst dev/tuning/%.cpp,$(ENGINE_BUILD)/tuning/%.o,$(TUNE_SOURCES))
+TUNE_MAIN_OBJECT := $(ENGINE_BUILD)/tuning/tune_kernels.o
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 # MetalBackend with the test seam metal/BackendInstrumentation.hpp declares.
@@ -339,9 +351,11 @@ ENGINE_OBJECTS := \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
+	$(TUNE_OBJECTS) $(TUNE_MAIN_OBJECT) \
+	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET) $(TUNE_TOOL)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
-	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
+	$(TUNE_OBJECTS:.o=.d) $(TUNE_MAIN_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -389,6 +403,20 @@ $(ENGINE_LIBRARY): $(ENGINE_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(RM) $@
 	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
+
+$(ENGINE_BUILD)/tuning/%.o: dev/tuning/%.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -Idev $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(TUNE_MAIN_OBJECT): dev/tuning/tune_kernels.mm $(BUILD_ID_HEADER)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -Idev $(ENGINE_DEPFLAGS) \
+		-include $(BUILD_ID_HEADER) -c $< -o $@
+
+$(TUNE_TOOL): $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) $(ENGINE_LIBRARY) $(LIB) \
+		| $(BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
 		| $(BUILD)

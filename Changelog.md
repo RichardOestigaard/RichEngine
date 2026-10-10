@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — fixed connection worker pool
+
+- `server/server.py`: `ConnectionWorkers` serves admitted connections from a
+  fixed pool sized to the connection capacity instead of a thread per
+  connection. `FrontendServer.process_request` queues each admitted
+  connection; refused connections still get the retryable 503 through
+  `LingeringCloser`. `server_close` drains and stops the pool.
+
+## Unreleased — lint, test and server robustness fixes
+
+- Root `ruff.toml` pins the CI rule set (`E4`, `E7`, `E9`, `F`, `I`) so a bare
+  `ruff check` on `server/` and `install/` matches what
+  `check-python-engine` enforces instead of ruff 0.16's all-rules default.
+- `server/backend.py`: a `request_logger` that raises is reported through
+  `log_unexpected` instead of being dropped silently.
+- `server/runtime.py`: a failing engine-failure listener is reported through
+  `log_unexpected`; the failure still reaches the calls and the engine.
+- `server/webfetch.py`: title/text extraction failures fall back to raw text
+  only for parse errors; the suppress scope no longer covers extraction.
+- `server/websearch.py`, `server/images.py`, `server/diagnostics.py`:
+  intentional exception swallows now read as `contextlib.suppress`.
+- `server/tool_schema.py`: dropped an unused `many` local.
+- Tests: `test_http_body_budget.py` follows the post-`11357d8` contract
+  (`_read_json_body` raises `ValueError`; callers answer the 400). New
+  coverage for a failing `request_logger`, `log_unexpected`, and the
+  webfetch parse-failure fallback.
+- `server/webui/` build output is no longer tracked; `make webui`
+  regenerates it. Root stray notes moved under `docs/`.
+
 ## Unreleased — working tree
 
 - New families: Ornith-1.5-9B, Ornith-1.5-35B-A3B, MiniCPM5-2B, LFM2.5-2.6B, LFM2.5-8B-A1B (`install/families.py`, `install/completions/suggested-models.txt`)

@@ -133,3 +133,43 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* Tune progress: meter + status lines replace the raw log while running. */
+.tune-progress { width: 100%; min-width: 0 }
+.tune-progress .meter { width: 100% }
+.tune-sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 7px;
+  font-size: 12.5px;
+}
+.tune-sub .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.meter > i.pending { animation: tune-pending 1.4s ease-in-out infinite alternate }
+@keyframes tune-pending {
+  from { opacity: .3 }
+  to { opacity: .65 }
+}
+
+/* The raw sweep output stays reachable, collapsed by default. */
+.tune-log { border-top: 1px solid var(--border); padding: 8px 16px 4px }
+.tune-log > summary {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  list-style: none;
+}
+.tune-log > summary::-webkit-details-marker { display: none }
+.tune-log > summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+}
+.tune-log[open] > summary::before { content: "▾" }
+.tune-log > summary:hover { color: var(--text) }
+.tune-log .install-log { margin: 8px 0 12px }

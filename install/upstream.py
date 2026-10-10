@@ -223,6 +223,20 @@ def _mlx_target(repo, language_only):
         raise models.ModelError(
             "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
         )
+    # Per-tensor overrides quantize no differently: the runtime's affine
+    # kernels read 4-bit/64 everywhere the image declares them. The LFM2.5
+    # exports' 6-bit model.embed_tokens is the shape this refuses early.
+    for name, override in quant.items():
+        if isinstance(override, dict) and (
+            override.get("mode", quant.get("mode", "affine")) != "affine"
+            or override.get("bits", quant["bits"]) != 4
+            or override.get("group_size", quant["group_size"]) != 64
+        ):
+            raise models.ModelError(
+                f"this checkpoint quantizes {name} at "
+                f"{override.get('bits')} bits/group-{override.get('group_size')}, "
+                "which the runtime cannot load"
+            )
     # A family the runtime serves text-only takes no tower, whether or not
     # the repository describes one; _install resolves the family again.
     language_only = (

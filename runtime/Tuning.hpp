@@ -8,6 +8,7 @@
 // envFlag, "=1" means envFlagOn, a bare name means envUint parse-or-default.
 
 #include "Env.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -96,6 +97,26 @@ struct Tuning {
   bool proposalCapSet = false;      // RICHENGINE_PROPOSAL_CAP (presence) — model/Runtime.mm
   uint32_t proposalCap = 0;         // RICHENGINE_PROPOSAL_CAP — model/Runtime.mm
   bool denyDebug = false;           // RICHENGINE_DENY_DEBUG — engine/
+  // Kernel geometry the registry can reshape at process start
+  // (ExecutionGeometry.h's table). The draft split count reaches
+  // draft.metal as the Metal function constant
+  // RICHENGINE_DRAFT_SPLITS_FUNCTION_CONSTANT (MetalEncode.mm) — workspace,
+  // dispatch and kernel read the same snapshot. The verify/prefill maxima
+  // only cap downward: workspaces stay sized for the compile-time maximum
+  // and the shaders' contract bounds stay the baked ones.
+  uint32_t draftAttentionSplits =
+      RICHENGINE_DRAFT_ATTENTION_SPLITS;  // RICHENGINE_DRAFT_SPLITS
+  uint32_t verifySplitsMax =
+      RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS;  // RICHENGINE_VERIFY_SPLITS_MAX
+  uint32_t prefillSplitsMax =
+      RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS;  // RICHENGINE_PREFILL_SPLITS_MAX
+  // The install's measured affine Linear plans, written into tuning.json by
+  // the autotune's kernel pass (install/autotune.py) as
+  // "{{output, input}, rows, LinearPhase::X, LinearEpilogue::Y}="
+  // "{LinearTile::Z, groups, LinearSimdgroups::W, splits}" entries separated
+  // by ';' — tune-kernels' report text verbatim. ops/DeviceTuning.cpp
+  // parses it once and lets an entry outrank the shipped measured tables.
+  const char *linearPlans = nullptr;  // RICHENGINE_LINEAR_PLANS
 };
 
 namespace detail {
@@ -191,6 +212,18 @@ inline Tuning makeTuning() {
   t.proposalCapSet = envFlag("RICHENGINE_PROPOSAL_CAP");
   t.proposalCap = envUint("RICHENGINE_PROPOSAL_CAP", 0);
   t.denyDebug = envFlag("RICHENGINE_DENY_DEBUG");
+  t.draftAttentionSplits = std::clamp(
+      envUint("RICHENGINE_DRAFT_SPLITS", RICHENGINE_DRAFT_ATTENTION_SPLITS),
+      1u, RICHENGINE_DRAFT_SPLITS_MAXIMUM);
+  t.verifySplitsMax = std::clamp(
+      envUint("RICHENGINE_VERIFY_SPLITS_MAX",
+              RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS),
+      1u, RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS);
+  t.prefillSplitsMax = std::clamp(
+      envUint("RICHENGINE_PREFILL_SPLITS_MAX",
+              RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS),
+      1u, RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS);
+  t.linearPlans = std::getenv("RICHENGINE_LINEAR_PLANS");
   return t;
 }
 

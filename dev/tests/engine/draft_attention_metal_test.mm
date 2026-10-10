@@ -9,6 +9,7 @@
 #include "TestChecks.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "Tuning.hpp"
 #include "ops/DraftAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
@@ -41,7 +42,12 @@ constexpr uint32_t kRing = RICHENGINE_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
-constexpr uint32_t kSplits = RICHENGINE_DRAFT_ATTENTION_SPLITS;
+// The draft split count follows RICHENGINE_DRAFT_SPLITS at process start
+// (Tuning.hpp) — the workspace formula and the dispatch check read the
+// same snapshot the ops layer does.
+inline uint32_t kSplits() {
+  return richengine::tuning().draftAttentionSplits;
+}
 constexpr uint64_t kPartialBytes =
     uint64_t{kQueryHeadsPerKv} * kRows * (kHeadDim + 2) * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
@@ -193,7 +199,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[0].threadgroups.y == lanes &&
-              dispatches[0].threadgroups.z == kSplits &&
+              dispatches[0].threadgroups.z == kSplits() &&
               dispatches[1].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
@@ -383,7 +389,7 @@ void planGeometry() {
                   workspace.qkvBytes == rows * 6144 * 2 &&
                   workspace.groupedQueriesBytes ==
                       rows * 4096 * 2 +
-                          uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
+                          uint64_t{lanes} * kKvHeads * kSplits() * kPartialBytes &&
                   workspace.queryKeysBytes == rows * kKvHeads * kHeadDim * 2 &&
                   workspace.queryValuesBytes == rows * kKvHeads * kHeadDim * 2,
               "draft plan padded lanes or changed tensor storage");

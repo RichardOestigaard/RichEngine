@@ -15,8 +15,8 @@ class TokenizerContractTests(unittest.TestCase):
     def tokenizer(self):
         vocabulary = {
             "text": 0,
-            '<|endoftext|>': 248044,
-            '<|im_end|>': 248046,
+            "<|endoftext|>": 248044,
+            "<|im_end|>": 248046,
             "</think>": 248069,
             "<tool_call>": 248058,
         }
@@ -27,12 +27,10 @@ class TokenizerContractTests(unittest.TestCase):
         )
 
     def test_padded_model_vocabulary_need_not_have_a_token_at_every_index(self):
-        contract = generation_constraints.validate_tokenizer(
-            self.tokenizer(), CONFIG
-        )
+        contract = generation_constraints.validate_tokenizer(self.tokenizer(), CONFIG)
         self.assertEqual(contract.vocabulary, 248320)
         self.assertEqual(contract.eos_tokens, (248044, 248046))
-        self.assertEqual(contract.marker, '<|im_end|>')
+        self.assertEqual(contract.marker, "<|im_end|>")
         self.assertEqual(contract.think_end_id, 248069)
 
     def test_mismatched_stop_or_thinking_tokens_are_rejected(self):

@@ -241,7 +241,10 @@ class ArchitectureTests(unittest.TestCase):
                         "wake.wait_for(lock, kProbation, stopped);\n",
                     ),
                     ("runtime/engine/cache/Cache.cpp", "mutex.try_lock_for(kWait);\n"),
-                    ("runtime/engine/cache/KvPool.cpp", "slots.try_acquire_for(kWait);\n"),
+                    (
+                        "runtime/engine/cache/KvPool.cpp",
+                        "slots.try_acquire_for(kWait);\n",
+                    ),
                 ):
                     with self.subTest(source=relative):
                         source = root / relative

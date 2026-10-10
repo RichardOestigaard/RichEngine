@@ -18,15 +18,11 @@ import smoke_real  # noqa: E402
 
 MODEL = "incoai/Qwen3.8-27B-RichEngine"
 PACKAGE = (
-    Path(__file__).resolve().parents[2]
-    / "install/models/incoai/Qwen3.8-27B-RichEngine"
+    Path(__file__).resolve().parents[2] / "install/models/incoai/Qwen3.8-27B-RichEngine"
 )
 BINARY = Path(__file__).resolve().parents[2] / "build/richengine"
 
-BLOCK = (
-    "The quick brown fox jumps over the lazy dog near the river bank. "
-    * 8
-)
+BLOCK = "The quick brown fox jumps over the lazy dog near the river bank. " * 8
 PROMPT = (
     "Repeat the following text verbatim, exactly once, and output nothing "
     "else:\n\n" + BLOCK
@@ -74,9 +70,7 @@ def run(env):
     args = Args()
     server = smoke_real.RealServer(args, environment=env)
     try:
-        smoke_real.validate_status(
-            server.wait_ready(600), args.kv_format
-        )
+        smoke_real.validate_status(server.wait_ready(600), args.kv_format)
         text = complete(server.port)
         log = server.tail()
         hits = sum(1 for line in log.splitlines() if "ngram-predraft" in line)

@@ -9,6 +9,7 @@ callers should use ``RuntimeCall.result`` on their own thread.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import math
 import os
@@ -16,10 +17,12 @@ import selectors
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import BinaryIO, Callable, Protocol, Sequence, TypeAlias
+from typing import BinaryIO, Protocol, TypeAlias
 
+from . import diagnostics
 from . import protocol as wire
 from .crash_trace import CrashTraceRing
 
@@ -1334,25 +1337,25 @@ class MultiplexedRuntime:
 
         def finish() -> None:
             if not isinstance(failure, RuntimeClosed):
-                try:
+                # A diagnostic: one not written must not keep the failure
+                # from reaching the listener, the calls and the engine.
+                with contextlib.suppress(Exception):
                     self._crash_trace.dump(
                         generation,
                         failure,
                         process_returncode=returncode,
                         last_status=last_status,
                     )
-                except Exception:
-                    # A diagnostic: one not written must not keep the failure
-                    # from reaching the listener, the calls and the engine.
-                    pass
                 listener = self.on_engine_failure
                 if served_seconds is not None and listener:
                     # Before the calls end, so their terminals can follow
-                    # what the listener decided about the engine.
+                    # what the listener decided about the engine. A failing
+                    # listener must not keep the failure from reaching the
+                    # calls.
                     try:
                         listener(failure, served_seconds)
-                    except Exception:
-                        pass
+                    except Exception as listener_error:
+                        diagnostics.log_unexpected(listener_error)
             if attempt is not None and attempt.generation == generation:
                 # After the crash trace, so a startup's waiter that learns of
                 # this failure finds its trace written.

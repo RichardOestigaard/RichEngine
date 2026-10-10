@@ -9,6 +9,7 @@ local address between the check and the connect is a residual risk a local
 tool accepts.
 """
 
+import contextlib
 import ipaddress
 import re
 import socket
@@ -36,10 +37,43 @@ _TEXT_TYPE = re.compile(
 
 _SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "canvas", "iframe"}
 _BLOCK_TAGS = {
-    "address", "article", "aside", "blockquote", "br", "dd", "details", "div",
-    "dl", "dt", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
-    "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
-    "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "ul",
 }
 
 
@@ -155,13 +189,11 @@ def _result(url, response):
         text = raw[:MAX_RESPONSE_BYTES].decode("utf-8", "replace")
     if content_type in ("text/html", "application/xhtml+xml"):
         extractor = _TextExtractor()
-        try:
+        # A page too malformed to parse keeps its raw text.
+        with contextlib.suppress(Exception):
             extractor.feed(text)
             extractor.close()
-        except Exception:
-            # A page too malformed to parse keeps its raw text.
-            pass
-        else:
+        if extractor.parts:
             title = " ".join(extractor.title.split())
             if title:
                 result["title"] = title
