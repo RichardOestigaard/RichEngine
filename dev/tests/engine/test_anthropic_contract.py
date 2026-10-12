@@ -90,6 +90,64 @@ class AnthropicAdapterTest(unittest.TestCase):
         self.assertNotIn("opaque-provider-data", json.dumps(messages))
         self.assertEqual(body, original)
 
+    def test_tool_result_accepts_tool_reference_blocks(self):
+        # Claude Code tool search returns tool_reference blocks in a result.
+        body = request_body(
+            messages=[
+                {"role": "user", "content": "Check Paris."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call1",
+                            "name": "tool_search",
+                            "input": {"query": "weather"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call1",
+                            "content": [
+                                {
+                                    "type": "tool_reference",
+                                    "tool_name": "get_weather",
+                                },
+                                {"type": "text", "text": "matched 1 tool"},
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+        messages = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )["messages"]
+        result = messages[2]["content"]
+        self.assertIn("get_weather", result)
+        self.assertIn("matched 1 tool", result)
+
+    def test_tool_reference_outside_tool_result_is_rejected(self):
+        with self.assertRaises(APIError) as caught:
+            anthropic_to_chat_prompt(
+                request_body(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "x"}
+                            ],
+                        }
+                    ]
+                ),
+                thinking_resolver=no_signed_thinking,
+            )
+        self.assertEqual(caught.exception.status, 400)
+
     def test_redacted_history_requires_assistant_and_nonempty_data(self):
         for role, data in (
             ("user", "opaque"),

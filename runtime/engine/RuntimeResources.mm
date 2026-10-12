@@ -209,7 +209,8 @@ RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout) {
+                         kv::Layout targetKvLayout,
+                         ops::WeightLayout weightLayout) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -223,6 +224,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   result.buildId = buildId;
   result.kvLayout = targetKvLayout;
   result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
+  result.weightLayout = weightLayout;
   return result;
 }
 
@@ -373,7 +375,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     kvLayout.format = config.kvFormat;
     uint64_t fixedBytes = 0;
     for (const uint64_t bytes :
-         {model::modelWeightBytes(config.modelRoot, config.model),
+         {model::modelWeightBytes(config.modelRoot, config.model, config.preferBlockWeights),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           stateStagingBytes}) {
       if (!checkedAdd(fixedBytes, bytes, fixedBytes))
@@ -410,12 +412,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::ModelPackage package;
   try {
     const auto started = AwakeClock::now();
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model);
+    package = model::loadModelPackage(*backend, config.modelRoot, config.model, config.preferBlockWeights);
     requireLoadedModel(package);
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logStartup(dim("Weights loaded in "), std::fixed, std::setprecision(2),
                loading.count(), dim(" s."));
     logStartup(dim("Draft · "), accent(model::draftKindName(package.descriptor.draft.kind)), dim("."));
+    if (config.preferBlockWeights &&
+        package.weightLayout != ops::WeightLayout::Block32)
+      logStartup(dim("Weight layout · "), accent("affine"),
+                 dim(" (this model has no block kernel form)."));
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), deviceStatusJson(device), {},
@@ -467,7 +473,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     cacheIdentity = makeRuntimeCacheIdentity(
         package.manifestFingerprintSha256,
         package.targetManifestFingerprint(), config.buildId,
-        package.targetKvLayout(config.kvFormat));
+        package.targetKvLayout(config.kvFormat), package.weightLayout);
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(), memoryPlan.toStatusJson(),

@@ -1474,7 +1474,7 @@ int main(int argc, char **argv) {
     const auto planMemory = [&](uint64_t aneFfnBytes) {
       ModelMemoryFootprint footprint{
           model.targetActualAllocatedBytes(),
-          model.draft.actualAllocatedBytes,
+          model.draftActualAllocatedBytes(),
           model.vision.actualAllocatedBytes,
           executorPlan, 0, 0, aneFfnBytes};
       ModelMemoryProfile profile{

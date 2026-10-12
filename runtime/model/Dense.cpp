@@ -58,7 +58,8 @@ MixerWeights readTargetMixer(const DenseLayout &, WeightFile &file,
 }
 
 DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
-                              const TargetFiles<DenseLayout> &files) {
+                              const TargetFiles<DenseLayout> &files,
+                              bool preferBlockWeights) {
   requireDenseLayout(layout);
   const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
     layer.gateProjection =
@@ -71,9 +72,13 @@ DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return readTargetModelWeights<DenseWeights>(backend, layout, gguf->get(),
                                                BlockTargetFormat{}, readFfn);
-  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
+  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files)) {
+    if (preferBlockWeights)
+      return readTargetModelWeights<DenseWeights>(backend, layout, mlx->get(),
+                                                 AffineBlockTargetFormat{}, readFfn);
     return readTargetModelWeights<DenseWeights>(backend, layout, mlx->get(),
                                                AffineTargetFormat{}, readFfn);
+  }
   const auto &packed = std::get<PackedTargetFiles<DenseLayout>>(files);
   return readTargetModelWeights<DenseWeights>(backend, layout, packed,
                                              AffineTargetFormat{packed.tiledEmbedding}, readFfn);

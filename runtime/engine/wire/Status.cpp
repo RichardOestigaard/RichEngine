@@ -16,14 +16,18 @@ namespace {
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
 // idle_release_seconds is null while the engine keeps them (--idle-release off).
-void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
+void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights,
+                   ops::WeightLayout layout) {
   out << "{\"idle_release_seconds\":";
   if (std::isinf(weights.idleReleaseSeconds))
     out << "null";
   else
     out << weights.idleReleaseSeconds;
   out << ",\"released\":" << boolean(weights.released)
-      << ",\"restores\":" << weights.restores << '}';
+      << ",\"restores\":" << weights.restores
+      << ",\"layout\":"
+      << json::quote(layout == ops::WeightLayout::Block32 ? "block" : "affine")
+      << '}';
 }
 
 // reruns: the chunks the GPU ran again alone once the split's work for them
@@ -136,7 +140,7 @@ std::string runtimeStatusJson(
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
-  appendWeights(out, weights);
+  appendWeights(out, weights, cacheIdentity.weightLayout);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

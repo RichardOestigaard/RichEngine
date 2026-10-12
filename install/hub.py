@@ -135,16 +135,18 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
             raise models.ModelError(f"invalid installed snapshot reference: {ref}")
         return ref
     ref.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=ref.parent) as temporary:
+    # Rename publishes atomically; filesystems such as ExFAT without hard
+    # links support it where os.link fails.
+    temporary = tempfile.NamedTemporaryFile(dir=ref.parent, delete=False)
+    try:
         temporary.write(commit.encode())
-        temporary.flush()
-        try:
-            os.link(temporary.name, ref)
-        except FileExistsError:
-            if ref.read_text() != commit:
-                raise models.ModelError(
-                    f"invalid installed snapshot reference: {ref}"
-                ) from None
+        temporary.close()
+        os.replace(temporary.name, ref)
+    except BaseException:
+        Path(temporary.name).unlink(missing_ok=True)
+        raise
+    if ref.read_text() != commit:
+        raise models.ModelError(f"invalid installed snapshot reference: {ref}")
     return ref
 
 

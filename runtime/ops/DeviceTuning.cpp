@@ -322,6 +322,9 @@ struct InstalledPlan final {
   uint32_t rows;
   LinearPhase phase;
   LinearEpilogue epilogue;
+  // Entries written before block plans existed carry no marker and match
+  // affine workloads; "block" marks an entry for Block32 weights.
+  WeightLayout layout = WeightLayout::Affine64;
   LinearConfig config;
 };
 
@@ -393,7 +396,10 @@ bool parseInstalledPlan(std::string_view entry, InstalledPlan &plan) noexcept {
          p.literal(',') && p.number(plan.matrix.inputSize) && p.literal('}') &&
          p.literal(',') && p.number(plan.rows) && p.literal(',') &&
          p.choice(plan.phase, kPhaseNames) && p.literal(',') &&
-         p.choice(plan.epilogue, kEpilogueNames) && p.literal('}') &&
+         p.choice(plan.epilogue, kEpilogueNames) &&
+         (p.literal('}') || (p.literal(',') && p.literal('b') && p.literal('l') &&
+                            p.literal('o') && p.literal('c') && p.literal('k') &&
+                           (plan.layout = WeightLayout::Block32, p.literal('}')))) &&
          p.literal('=') && p.literal('{') && p.choice(config.tile, kTileNames) &&
          p.literal(',') && p.number(config.groups) && p.literal(',') &&
          p.choice(config.simdgroups, kSimdgroupNames) && p.literal(',') &&
@@ -432,11 +438,12 @@ LinearConfig stagedDecode(const DevicePolicy &device, uint32_t n, uint32_t k) {
 std::optional<LinearConfig> measuredLinearPlan(const DevicePolicy &device, LinearWorkload w) noexcept {
   // The install's own measurement outranks the shipped tables: the kernel
   // pass fitted the config on this machine and this model.
-  if (w.weightLayout == WeightLayout::Affine64 && !w.canvas)
+  if (!w.canvas)
     for (const InstalledPlan &plan : installedPlans())
       if (plan.matrix == w.matrix && plan.rows == w.rows && plan.phase == w.phase &&
-          plan.epilogue == w.epilogue)
+          plan.epilogue == w.epilogue && plan.layout == w.weightLayout)
         return plan.config;
+  if (w.weightLayout != WeightLayout::Affine64) return std::nullopt;
   const std::span<const MeasuredLinear> table =
       w.phase == LinearPhase::Prefill ? std::span<const MeasuredLinear>(kMeasuredPrefill)
                                       : std::span<const MeasuredLinear>(kMeasuredDecode);

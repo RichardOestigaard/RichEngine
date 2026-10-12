@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased — blocked weight restore, test repairs
+
+- `runtime/engine/wire/NativeRuntime.cpp`: a weight restore refused on an
+  allocation (`metal::MetalAllocationError` other than `DriverRejected`) no
+  longer stops the engine — it waits for memory, logging once, and retried
+  each tick. A request blocked thirty seconds fails with a retryable
+  `resource_timeout` (HTTP 503 + `Retry-After`), and the engine stays up
+  for the next request. New `testRestoreRefusalWaitsAndRetries` in
+  `native_engine_loop_test.cpp`.
+- `dev/tests/engine/execution_plans_test.cc`: constants stale after the
+  verify-rows 8→16 and draft ring 2048→4096 geometry changes — decode
+  workloads now use `RICHENGINE_TARGET_VERIFY_ROWS`, and the MoE/draft/gate
+  workspace bounds doubled to match.
+- `dev/tests/engine/model_runtime_oracle_test.mm`: `model.draft` became a
+  weights-variant — use `model.draftActualAllocatedBytes()`.
+- `runtime/model/ModelDescriptor.mm`: a package whose recorded execution
+  geometry predates the runtime (e.g. draft proposals 7 vs 15) now fails
+  with an actionable message pointing at MLX/GGUF checkpoints.
+- `runtime/metal/kernels/shared/gguf_repack.metal`: the AF4 repack read the
+  MLX source's nibbles pair-interleaved instead of adjacent
+  (`qs[e/2]` nibble `e&1`); every AF4 preparation produced wrong plane0.
+- `runtime/model/WeightStore.*`: block images carry the
+  `kBlockWeightsImageType` flag and `readProjection` dispatches on it —
+  draft readers (DFlash/DSpark/DFlashV1) consume either layout. Draft
+  images stay affine for now: draft attention reads the fused QKV tile
+  directly, so block drafts need block-aware attention kernels.
+- Verified on hardware (Apple M5 Pro, MiniCPM5-2B-MLX): `--weight-layout
+  block` loads, serves and produces token-identical output to the affine
+  layout; `/status` reports `weights.layout: "block"`.
+- Kernel tuning covers block workloads: `tune-kernels`/`collectTuningWorkloads`
+  include Block32 projections (Q4_K and AF4 segments — `blockFormatTuned` is
+  the opt-in table), candidates are the staged/register tiles at every
+  split, and `RICHENGINE_LINEAR_PLANS` entries may carry a `block` marker
+  (`runtime/ops/DeviceTuning.cpp`, `dev/tuning/`). `richengine tune` now
+  vetoes a fitted spec that changes the emitted tokens (`_token_parity`
+  via `decode-profile --dump-tokens`) — the rule DeviceTuning's measured
+  tables apply.
+- `dev/tests/engine/q8_flash_attention_metal_test.mm`: the prefill tile
+  eight-row view no longer asserts equality with the verify rows (16).
+- `dev/benchmarks/gguf_decode_sweep.mm`: AF4 rows for the dense MLX shapes
+  measure the repacked decode against the affine kernels'.
+- Default KV format is now `int8` (`runtime/engine/RuntimeResources.hpp`,
+  `runtime/main.mm`): it matches int4's page-fetch shape but scores higher
+  draft acceptance, and the fp8 kv4/g6 verify tile overflows the 32 KB
+  threadgroup budget at 16 rows so only int8 is usable of the 8-bit tier.
+- The kv4/g6 chain verify splits its 16-row tile's two fused-row passes
+  across two threadgroups (`_r2` for q8/int4/bf16): the M=96 tile sat one
+  group per core at ~25 KB scratch; two groups per core streams −17% to
+  −33% faster on every history/lane ([Qwen 3.8 27B Findings.md](dev/benchmarks/Qwen%203.8%2027B%20Findings.md)).
+
+## Unreleased — block weight layout for MLX targets
+
+- `server/serve_options.py`: `--weight-layout {auto,block,affine}` chooses the
+  kernel layout MLX and draft weights load as; `auto` keeps the engine's
+  default and GGUF targets always load the `block` layout
+  (`server/model_host.py`, `runtime/main.mm`). A `block` request falls back
+  to `affine` on sections without a block form, with a log line
+  (`runtime/model/ModelFactory.cpp`, `runtime/engine/RuntimeResources.mm`).
+- `/status` reports the loaded model's effective weight layout
+  (`weights.layout`, status schema 7; mirrored as top-level
+  `weight_layout`) and `/metrics` exports `richengine_weight_layout_info`
+  (`runtime/engine/wire/Status.cpp`, `server/server.py`,
+  `server/metrics.py`).
+- MLX dense Q4 targets can load their weights in the GGUF `block` kernel
+  layout instead of the `affine` layout
+  (`runtime/model/AffineToBlock.*`, `GGUF_FMT_AF4`).
+
+## Unreleased — thermal state, tool_reference blocks, atomic pins
+
+- `server/thermal.py`: `/status` reports `instance.thermal_state`
+  (`nominal`/`fair`/`serious`/`critical` from NSProcessInfo), `/metrics`
+  exports `richengine_thermal_state{state=...}`, and a monitor thread logs
+  each change (`server/server.py`, `server/metrics.py`).
+- `server/api_shapes.py`: `tool_result` content accepts `tool_reference`
+  blocks (Claude Code tool search), rendered as a text marker naming the
+  tool. `/v1/messages` and `/v1/messages/count_tokens` share the path.
+- `install/hub.py`: snapshot pins publish by atomic rename (`os.replace`)
+  instead of `os.link`, fixing installs onto filesystems such as ExFAT that
+  lack hard links.
+
 ## Unreleased — fixed connection worker pool
 
 - `server/server.py`: `ConnectionWorkers` serves admitted connections from a
@@ -122,6 +202,8 @@ Draft acceptance unchanged at ~0.87 across all batch widths.
 |---|---|---|
 | One-lane plain projections switch to Paired256 at 3 tiles/core (was 8) | `runtime/ops/Linear.cpp` | `{16640,5120}` B1 ~+17% operator-level; B1 cycle 83.36 → 80.34 |
 | Gate/up lanes ≤2 use full N256 grid up to 4 tiles/core | `runtime/ops/Linear.cpp` | `decode_linear_q4_n256_gate_up` 33.4 → 28.0 ms at B1; B1 cycle → 74.84 |
+| kv4/g6 chain verify splits the 16-row tile's two fused-row passes across two threadgroups (`_r2`) | `runtime/ops/PagedAttention.cpp`, `runtime/metal/kernels/decode/paged_attention.metal` | attention-sweep verify −17% to −33% fused at every history and lane count; 131k/lane4 20.46 → 16.69 ms ([Qwen 3.8 27B Findings.md](dev/benchmarks/Qwen%203.8%2027B%20Findings.md)) |
+| Dense-FFN gate/up emits its output as the down projection's Table64 plus paired half sums (`decode_linear_q4_sg_gate_up_t64` / `_residual_psum`) | `runtime/metal/kernels/decode/linear_q4_sgmatrix.metal`, `runtime/ops/Linear.cpp`, `runtime/model/TargetModel.cpp` | removes the `decode_linear_q4_prepare` pass + intermediate bf16 round trip per dense-FFN down projection |
 
 ### Changes identified, not yet applied
 
@@ -149,7 +231,7 @@ Draft acceptance unchanged at ~0.87 across all batch widths.
 
 | Area | Evidence |
 |---|---|
-| Long-context verify attention | ~155 GB/s vs ~285 GB/s peak at 131k history; fp32 split partials scale linearly |
+| Long-context verify attention | `_r2` recovered the M=96 residency loss (−17% to −33%); the tile still streams below the ~285 GB/s peak, tree verify keeps the single-group passes |
 | m16/m24/m32 decode tiles | 100–170 GB/s vs 220–285 GB/s for m8; epilogue vectorization is the next lever |
 | `norm_rms` dispatch batching | 141 dispatches ≈ 1.5 ms/cycle (~1%) |
 | Constrained decode host round-trip | per-step ~170 KB mask fill + extra submissions; grammar workloads only |

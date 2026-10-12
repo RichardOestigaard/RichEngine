@@ -18,7 +18,11 @@
 
 namespace richengine::model::affine {
 
-enum class SectionKind { Copy, Decay, Projection, Quantize };
+// Block is a Projection planned into the block image layout instead of the
+// affine tiles (model/AffineToBlock.cpp): a GgufTensorDescriptor, the AF4
+// plane0 tiles and the meta plane, each at a 16 KiB boundary within the
+// section.
+enum class SectionKind { Copy, Decay, Projection, Quantize, Block };
 
 // A checkpoint tensor a section reads: its name, the dtypes it is read in and
 // its shape, planned from the layout; tensor is bound once the checkpoint is
@@ -56,6 +60,10 @@ struct Image {
   std::vector<Section> sections;
   std::vector<std::pair<std::string, uint32_t>> quantized;
 };
+
+// Quantizes one group of 64 BF16 weights to the codes, scale and bias the
+// affine (and AF4 block) stores keep, as mlx.core.quantize rounds them.
+void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint16_t &bias);
 
 // Writes every byte of a bound image into destination, which is its size.
 void writeAffineImage(std::span<uint8_t> destination, const Image &image);

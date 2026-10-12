@@ -53,6 +53,11 @@ OPTIONS = {
         ("", "turbo", "XHIGH"),
     ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
+    "--weight-layout": values(
+        "--weight-layout",
+        {"auto": "auto", "block": "block", "affine": "affine"},
+        ("", "dense", "int4", "BLOCK"),
+    ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--max-memory": values(
         "--max-memory",
@@ -105,6 +110,12 @@ OPTIONS = {
         {"0": 0.0, "0.25": 0.25, "2": 2.0},
         ("-0.5", "inf", "nan", "half"),
     ),
+    "--canvas-profile": values(
+        "--canvas-profile",
+        {"paper": "paper", "balanced": "balanced", "fast": "fast"},
+        ("", "draft", "PAPER"),
+    ),
+    "--moe-union": values("--moe-union", {"0": 0, "8": 8}, ("half", "0.5", "")),
     "--allowed-host": values(
         "--allowed-host", {"proxy.example": "proxy.example"}, (), repeatable=True
     ),
@@ -142,6 +153,16 @@ OPTIONS = {
         ("", "two words", "key\n", "非ASCII"),
     ),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
+    "--models-dir": values("--models-dir", {"/srv/models": "/srv/models"}, ()),
+    "--unload-idle": values(
+        "--unload-idle",
+        {"600": 600.0, "30m": 1800.0, "off": math.inf},
+        ("0", "-1m", "inf", "nan", "10x", "never"),
+    ),
+    "--shared-prefix-state": (
+        [(["--shared-prefix-state"], True), (["--no-shared-prefix-state"], False)],
+        [],
+    ),
     "--no-webui": ([(["--no-webui"], True)], []),
 }
 
@@ -242,9 +263,17 @@ class ServeOptionsTests(unittest.TestCase):
         argv = serve_options.serve_argv(args)
         environment = serve_options.serve_environment(args)
         # Every option but the key travels on the command line; the key only
-        # in the environment.
+        # in the environment. A BooleanOptionalAction's off spelling is its
+        # flag's.
+        negated = {
+            f"--no-{option.flag[2:]}": option.flag
+            for option in serve_options.SERVE_OPTIONS
+        }
         self.assertEqual(
-            {argument.partition("=")[0] for argument in argv},
+            {
+                negated.get(flag, flag)
+                for flag in (argument.partition("=")[0] for argument in argv)
+            },
             {
                 option.flag
                 for option in serve_options.SERVE_OPTIONS

@@ -850,6 +850,51 @@ def _kernel_pass(
     }
 
 
+def _token_parity(
+    binary: Path, assembly_dir: Path, spec: str, log=print
+) -> bool | None:
+    """Emit decode-profile's token stream with and without the fitted
+    plans and compare bytes: True on identical output, False when the spec
+    changed what the model emits, None when the check cannot run (no
+    profile binary, or a run failed)."""
+    from . import paths
+
+    profile = paths.PROFILE_BINARY
+    if not profile.is_file():
+        log("kernels · no decode-profile binary — token parity unchecked")
+        return None
+    dumps = []
+    try:
+        for tag, extra in (("baseline", {}), ("fitted", {KERNEL_PLANS_ENV: spec})):
+            dump = tuning_path(assembly_dir).with_name(
+                f"tuning.{tag}-tokens"
+            )
+            process = subprocess.run(
+                [
+                    str(profile),
+                    str(binary.parent / "richengine.metallib"),
+                    str(assembly_dir),
+                    "--dump-tokens",
+                    str(dump),
+                ],
+                env=dict(os.environ, **extra),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                timeout=900,
+            )
+            if process.returncode != 0 or not dump.is_file():
+                log(f"kernels · token parity run failed ({tag})")
+                return None
+            dumps.append(dump)
+        return dumps[0].read_bytes() == dumps[1].read_bytes()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(f"kernels · token parity run failed ({error})")
+        return None
+    finally:
+        for dump in dumps:
+            dump.unlink(missing_ok=True)
+
+
 def tune(
     binary: Path,
     assembly_dir: Path,
@@ -995,7 +1040,7 @@ def tune(
         }
         _write_record(assembly_dir, record)
 
-    # The kernel pass fits the model's affine Linear plans to this machine
+    # The kernel pass fits the model's Linear plans to this machine
     # once, before the env sweep: its winners ride every later measurement
     # through RICHENGINE_LINEAR_PLANS in best_env — both modes run it, Quick
     # with the smaller per-key budget. A user-set value always wins at
@@ -1129,10 +1174,18 @@ def tune(
                 results["kernels"]["pressured"] = pressured
                 verdicts["kernels"] = "pressured"
             elif _keeps(kernel_metrics, best_metrics, sigma):
-                best_env[KERNEL_PLANS_ENV] = plans["spec"]
-                best_metrics = kernel_metrics
-                verdicts["kernels"] = "kept"
-                log("  kept")
+                if _token_parity(binary, assembly_dir, plans["spec"], log) is False:
+                    # A faster plan that reassociates the reductions can
+                    # flip draft-accepted tokens (DeviceTuning.cpp rejects
+                    # such splits for the same reason) — the throughput
+                    # keep gate cannot see that, so token parity vetoes.
+                    verdicts["kernels"] = "rejected"
+                    log("  rejected — fitted plans changed the emitted tokens")
+                else:
+                    best_env[KERNEL_PLANS_ENV] = plans["spec"]
+                    best_metrics = kernel_metrics
+                    verdicts["kernels"] = "kept"
+                    log("  kept")
             else:
                 verdicts["kernels"] = "rejected"
             write()

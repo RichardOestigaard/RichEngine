@@ -14,8 +14,13 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace richengine::engine {
+
+// A weight restore refused for memory waits; a request blocked on it this
+// long gets a retryable error while the engine keeps retrying.
+inline constexpr double kRestoreBlockedMilliseconds = 30'000;
 
 NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                              model::Model &model, ByteSink output,
@@ -90,6 +95,24 @@ bool NativeRuntime::tick() {
     // part per tick so that frames are answered between them.
     if (restoreStarted_) {
       restoreWeights();
+      // A restore refused for memory keeps retrying; a request whose wait
+      // passes the blocked limit fails retryably while the engine stays up.
+      if (restoreStarted_) {
+        const double now = clocks_.monotonicMilliseconds();
+        std::vector<uint64_t> overdue;
+        for (const auto &[requestId, telemetry] : telemetry_)
+          if (now - telemetry.arrivedMilliseconds >= kRestoreBlockedMilliseconds)
+            overdue.push_back(requestId);
+        for (uint64_t requestId : overdue) {
+          // A request that finished between the scan and this call is done
+          // already; it must not take the engine down.
+          try {
+            core_.failRequest(requestId, LaneOutcome::ResourceTimeout,
+                              "weight restore is waiting for memory");
+          } catch (const std::exception &) {
+          }
+        }
+      }
       return true;
     }
     return core_.tick(clocks_.monotonicMilliseconds());
@@ -132,9 +155,23 @@ void NativeRuntime::releaseIdleWeights() {
 }
 
 void NativeRuntime::restoreWeights() {
-  if (!config_.weights->restore())
+  try {
+    if (!config_.weights->restore())
+      return;
+  } catch (const metal::MetalAllocationError &error) {
+    // An allocation refusal waits: the engine retries the failed part next
+    // tick. A driver fault remains fatal.
+    if (error.failure() == metal::AllocationFailure::DriverRejected)
+      throw;
+    if (!restoreWaitingLogged_) {
+      restoreWaitingLogged_ = true;
+      logLine(dim("Weight restore is waiting for memory ("),
+              metal::allocationFailureName(error.failure()), dim(")"));
+    }
     return;
+  }
   ++weightRestores_;
+  restoreWaitingLogged_ = false;
   const double now = clocks_.monotonicMilliseconds();
   idleSinceMilliseconds_ = now;
   logLine(dim("Weights restored in "), std::fixed, std::setprecision(2),

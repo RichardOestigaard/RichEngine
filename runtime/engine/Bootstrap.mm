@@ -258,6 +258,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     NativeRuntime::StatusProvider statusProvider) {
   std::unique_ptr<RuntimeResources> resources;
   try {
+    config.resources.preferBlockWeights = config.preferBlockWeights;
     resources = RuntimeResources::create(config.resources, config.nativeLoop.engine.maxContext);
   } catch (const RuntimeResourcesError &error) {
     throw RuntimeBootstrapError(error);

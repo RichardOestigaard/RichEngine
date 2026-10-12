@@ -12,3 +12,6 @@ BINARY = ROOT / ("engine/richengine" if PACKAGED else "build/richengine")
 # The autotune's kernel pass: the dev/tuning measurement harness shipped
 # beside the engine (Makefile's TUNE_TOOL).
 TUNE_BINARY = ROOT / ("engine/richengine-tune" if PACKAGED else "build/richengine-tune")
+# The plan-parity checker's token dump driver (dev/benchmarks/decode_profile.mm);
+# packaged installs ship no benchmarks, so checks must degrade when absent.
+PROFILE_BINARY = ROOT / ("engine/decode-profile" if PACKAGED else "build/engine-tests/decode-profile")

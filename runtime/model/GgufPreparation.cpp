@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -166,6 +169,15 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
   return chunk;
 }
 
+// RICHENGINE_REPACK_TIMING=1 logs the read/kernel split of each writeRepack.
+using Clock = std::chrono::steady_clock;
+
+bool timingEnabled() { return std::getenv("RICHENGINE_REPACK_TIMING") != nullptr; }
+
+double elapsed(Clock::time_point begin) {
+  return std::chrono::duration<double>(Clock::now() - begin).count();
+}
+
 // A repack's plan within an image of imageBytes: its format, tile-aligned
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
@@ -186,68 +198,108 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   for (size_t plane = 0; plane < sizes.size(); ++plane) requireRange(offsets[plane], sizes[plane], imageBytes);
 }
 
-// Repacks a repack's rows chunk by chunk: threads read the rows into the
-// input staging, and the GPU writes their planes in place into image.
+// One repack step: the tile-aligned band of rows and columns whose source
+// rows one staging buffer holds.
+struct RepackStep {
+  uint64_t firstRow = 0, rows = 0, firstColumn = 0, columns = 0;
+};
+
+// Reads a step's source rows into `host` in image order and zeroes the
+// rows the sources do not cover.
+void loadRepackStep(const WeightSource &source, const gguf::Repack &repack,
+                    const QuantFormat &format, const RepackStep &step, uint8_t *host) {
+  const uint64_t chunkRowBytes = ggufRowBytes(format, step.columns);
+  const uint64_t column = ggufRowBytes(format, step.firstColumn);
+  // The sources' rows in image order, then zero rows, a task for each
+  // run of rows within kLoadStepBytes.
+  struct Read {
+    const gguf::TensorRows *tensor;
+    uint64_t first, count;
+    uint8_t *to;
+  };
+  std::vector<Read> reads;
+  const uint64_t batch = std::max<uint64_t>(1, kLoadStepBytes / chunkRowBytes);
+  uint64_t start = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) {
+    const uint64_t begin = std::max(step.firstRow, start),
+                  end = std::min(step.firstRow + step.rows, start + tensor.rows);
+    for (uint64_t row = begin; row < end; row += batch)
+      reads.push_back({&tensor, row - start, std::min(batch, end - row),
+                       host + (row - step.firstRow) * chunkRowBytes});
+    start += tensor.rows;
+  }
+  parallelFor(reads.size(), [&](size_t index, unsigned) {
+    const Read &read = reads[index];
+    readRows(source, *read.tensor, read.first, read.count, column, chunkRowBytes, read.to);
+  });
+  if (start < step.firstRow + step.rows) {
+    const uint64_t zero = std::max(start, step.firstRow);
+    std::memset(host + (zero - step.firstRow) * chunkRowBytes, 0,
+                (step.firstRow + step.rows - zero) * chunkRowBytes);
+  }
+}
+
+// Repacks a repack's rows step by step: one staging buffer's reads overlap
+// the kernel repacking the other, and the GPU writes their planes in place
+// into image.
 void writeRepack(metal::MetalBackend &backend, const WeightSource &source, const metal::MetalBuffer &image,
-                 const gguf::Repack &repack, const RepackChunk &chunk, const metal::MetalBuffer &input) {
+                 const gguf::Repack &repack, const RepackChunk &chunk,
+                 const metal::MetalBuffer &input0, const metal::MetalBuffer &input1) {
+  double readSeconds = 0, kernelSeconds = 0;
+  const bool timing = timingEnabled();
   const QuantFormat &format = kQuantFormats[repack.format];
   const auto offsets = planeOffsets(repack);
-  auto *host = static_cast<uint8_t *>(input.contents());
+  std::vector<RepackStep> steps;
   for (uint64_t firstRow = 0; firstRow < repack.rows; firstRow += chunk.rows) {
     const uint64_t rows = std::min(chunk.rows, repack.rows - firstRow);
-    for (uint64_t firstColumn = 0; firstColumn < repack.columns; firstColumn += chunk.columns) {
-      const uint64_t columns = std::min(chunk.columns, repack.columns - firstColumn);
-      const uint64_t chunkRowBytes = ggufRowBytes(format, columns);
-      const uint64_t column = ggufRowBytes(format, firstColumn);
-      // The sources' rows in image order, then zero rows, a task for each
-      // run of rows within kLoadStepBytes.
-      struct Read {
-        const gguf::TensorRows *tensor;
-        uint64_t first, count;
-        uint8_t *to;
-      };
-      std::vector<Read> reads;
-      const uint64_t batch = std::max<uint64_t>(1, kLoadStepBytes / chunkRowBytes);
-      uint64_t start = 0;
-      for (const gguf::TensorRows &tensor : repack.sources) {
-        const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + tensor.rows);
-        for (uint64_t row = begin; row < end; row += batch)
-          reads.push_back({&tensor, row - start, std::min(batch, end - row), host + (row - firstRow) * chunkRowBytes});
-        start += tensor.rows;
-      }
-      parallelFor(reads.size(), [&](size_t index, unsigned) {
-        const Read &read = reads[index];
-        readRows(source, *read.tensor, read.first, read.count, column, chunkRowBytes, read.to);
-      });
-      if (start < firstRow + rows) {
-        const uint64_t zero = std::max(start, firstRow);
-        std::memset(host + (zero - firstRow) * chunkRowBytes, 0, (firstRow + rows - zero) * chunkRowBytes);
-      }
-      // A plane is [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS] tiles and
-      // a chunk starts on a tile: after the planes of the rows above it and,
-      // in its tile rows, of the columns before it. The kernel writes plane1
-      // and meta at their distances from plane0, which the planner placed
-      // after it; a format without plane1 writes none.
-      const auto lengths = planeBytes(format, rows, columns);
-      const auto above = planeBytes(format, firstRow, repack.columns);
-      const auto before = planeBytes(format, QUANT_TILE_ROWS, firstColumn);
-      std::array<uint64_t, 3> at;
-      for (size_t plane = 0; plane < at.size(); ++plane) at[plane] = offsets[plane] + above[plane] + before[plane];
-      const uint64_t extent = at[2] + lengths[2] - at[0];
-      if ((lengths[1] && at[1] < at[0]) || at[2] < at[0] || extent > std::numeric_limits<uint32_t>::max())
-        throw GgufError("a repack's planes do not follow its plane0 within 4 GiB");
-      GgufRepackParams params{};
-      params.rows = static_cast<uint32_t>(rows);
-      params.input_size = static_cast<uint32_t>(columns);
-      params.fmt = repack.format;
-      params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
-      params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
-      params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
-      static_cast<void>(backend.submit({"gguf_repack", {{0, input}, {1, backend.view(image, at[0], extent)}},
-                                        {{2, &params, sizeof(params)}}, {rows * (columns / 32) / 256, 1, 1},
-                                        {256, 1, 1}}));
-    }
+    for (uint64_t firstColumn = 0; firstColumn < repack.columns; firstColumn += chunk.columns)
+      steps.push_back({firstRow, rows, firstColumn, std::min(chunk.columns, repack.columns - firstColumn)});
   }
+  const metal::MetalBuffer *inputs[] = {&input0, &input1};
+  auto load = [&](size_t index) {
+    const auto begin = timing ? Clock::now() : Clock::time_point{};
+    loadRepackStep(source, repack, format, steps[index],
+                   static_cast<uint8_t *>(inputs[index % 2]->contents()));
+    if (timing) readSeconds += elapsed(begin);
+  };
+  load(0);
+  for (size_t index = 0; index < steps.size(); ++index) {
+    const RepackStep &step = steps[index];
+    const metal::MetalBuffer &input = *inputs[index % 2];
+    // A plane is [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS] tiles and
+    // a chunk starts on a tile: after the planes of the rows above it and,
+    // in its tile rows, of the columns before it. The kernel writes plane1
+    // and meta at their distances from plane0, which the planner placed
+    // after it; a format without plane1 writes none.
+    const auto lengths = planeBytes(format, step.rows, step.columns);
+    const auto above = planeBytes(format, step.firstRow, repack.columns);
+    const auto before = planeBytes(format, QUANT_TILE_ROWS, step.firstColumn);
+    std::array<uint64_t, 3> at;
+    for (size_t plane = 0; plane < at.size(); ++plane) at[plane] = offsets[plane] + above[plane] + before[plane];
+    const uint64_t extent = at[2] + lengths[2] - at[0];
+    if ((lengths[1] && at[1] < at[0]) || at[2] < at[0] || extent > std::numeric_limits<uint32_t>::max())
+      throw GgufError("a repack's planes do not follow its plane0 within 4 GiB");
+    GgufRepackParams params{};
+    params.rows = static_cast<uint32_t>(step.rows);
+    params.input_size = static_cast<uint32_t>(step.columns);
+    params.fmt = repack.format;
+    params.src_row_bytes = static_cast<uint32_t>(ggufRowBytes(format, step.columns));
+    params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
+    params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
+    const auto kernelBegin = timing ? Clock::now() : Clock::time_point{};
+    metal::CommandTicket ticket =
+        backend.submitAsync({"gguf_repack", {{0, input}, {1, backend.view(image, at[0], extent)}},
+                             {{2, &params, sizeof(params)}},
+                             {step.rows * (step.columns / 32) / 256, 1, 1}, {256, 1, 1}});
+    // The next step's reads overlap this kernel; it is the only in-flight
+    // command the backend admits, and waiting on it frees this staging
+    // buffer before the step after next reuses it.
+    if (index + 1 < steps.size()) load(index + 1);
+    static_cast<void>(ticket.wait());
+    if (timing) kernelSeconds += elapsed(kernelBegin);
+  }
+  if (timing)
+    std::fprintf(stderr, "writeRepack: read %.3fs kernel %.3fs\n", readSeconds, kernelSeconds);
 }
 
 } // namespace
@@ -283,11 +335,13 @@ void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, co
   for (const gguf::Copy &copy : plan.copies) addCopyTasks(source, destination.data(), copy, tasks);
   std::vector<std::vector<uint8_t>> copyStaging(loadThreads());
   parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](copyStaging[thread]); });
-  // One staging buffer serves every repack of the image.
+  // Two staging buffers serve every repack of the image: while the kernel
+  // repacks one, the host threads read the next step into the other.
   if (!plan.repacks.empty()) {
-    const auto input = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
+    const auto input0 = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
+    const auto input1 = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows/1");
     for (size_t i = 0; i < plan.repacks.size(); ++i)
-      writeRepack(backend, source, image, plan.repacks[i], chunks[i], input);
+      writeRepack(backend, source, image, plan.repacks[i], chunks[i], input0, input1);
   }
 }
 

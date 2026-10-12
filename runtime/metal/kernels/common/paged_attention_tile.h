@@ -228,7 +228,10 @@ inline void richengine_attention_page_softmax(
 // per-core pool; MP=32 halves that). Row-halving is exact — every fused row
 // attends independently, so each pass accumulates and stores its own rows of
 // the shared [slot][M][D] partials and [slot][M]{max,sum} statistics layout.
-// The reduce kernels and the workspace sizes are unchanged.
+// The reduce kernels and the workspace sizes are unchanged. A caller may
+// bound the pass loop with pass_begin/pass_end: the _r2 verify splits give
+// each pass its own threadgroup, so the loop runs one pass and partial
+// slots still carry every fused row.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           typename CacheElement,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint MPasses = 1>
@@ -240,7 +243,8 @@ inline void richengine_paged_attention_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    uint thread_index, uint window_tokens = 0) {
+    uint thread_index, uint window_tokens = 0, uint pass_begin = 0,
+    uint pass_end = MPasses) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort MP = M / MPasses;
   static_assert(M % MPasses == 0, "row passes split the fused tile evenly");
@@ -280,7 +284,7 @@ inline void richengine_paged_attention_tile(
   typedef tensor<device int4b_format, dextents<int, 2>, tensor_inline>
       Packed4Tensor;
 
-  for (ushort pass = 0; pass < MPasses; ++pass) {
+  for (uint pass = pass_begin; pass < pass_end; ++pass) {
     const uint row_offset = uint(pass) * MP;
     if (thread_index < MP) {
       row_max[thread_index] = -INFINITY;

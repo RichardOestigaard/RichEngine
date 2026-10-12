@@ -228,7 +228,8 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--prompt-file PATH] [--dump-tokens PATH]\n";
+                     "[--prompt-file PATH] [--dump-tokens PATH] "
+                     "[--weight-layout auto|affine|block]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
@@ -236,6 +237,7 @@ int main(int argc, char **argv) {
       const char *promptFile = nullptr;
       const char *dumpTokens = nullptr;
       kv::Format format = kv::Format::Int8;
+      bool blockWeights = false;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -253,6 +255,11 @@ int main(int argc, char **argv) {
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
           format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+        } else if (option == "--weight-layout") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "auto" && value != "affine" && value != "block")
+            throw std::invalid_argument("--weight-layout takes auto, affine or block");
+          blockWeights = value == "block";
         } else
           throw std::invalid_argument("unknown option");
       }
@@ -260,7 +267,7 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
       model::ModelPackage model =
-          model::loadModelPackage(backend, root, model::inspectModelPackage(root));
+          model::loadModelPackage(backend, root, model::inspectModelPackage(root), blockWeights);
       ops::ExecutionPlans operators(backend.capabilities());
 
       const std::vector<uint32_t> prompt =

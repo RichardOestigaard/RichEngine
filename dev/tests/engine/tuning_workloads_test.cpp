@@ -134,7 +134,9 @@ std::set<LinearWorkload> expectedLinear(
   std::set<LinearWorkload> result;
   auto add = [&](LinearMatrix matrix, LinearPhase phase, LinearEpilogue epilogue) {
     for (uint32_t size : phase == LinearPhase::Prefill ? prefill : decode)
-      result.insert({matrix, phase == LinearPhase::Prefill ? size : size * 8,
+      result.insert({matrix, phase == LinearPhase::Prefill
+                                ? size
+                                : size * ExecutionLimits::targetVerifyRows,
                       phase, epilogue});
   };
   for (auto phase : {LinearPhase::Prefill, LinearPhase::Decode}) {
@@ -210,17 +212,20 @@ void checkPair(ModelPackage package) {
   rejects([&] { (void)collectTuningWorkloads(package, prefill, decode); });
 }
 
-// A GGUF target is not tuned: the collector takes none of its projections,
-// only the affine draft's.
+// A GGUF target's projections tune when their format has measured
+// candidates: Q4_K enters the inventory as Block32 workloads; a segment of
+// an untuned format (IQ1_S here) stays out.
 void blockTarget() {
   ModelPackage package;
   const Qwen3_6MoeLayout layout;
   auto target = targetWeights<Qwen3_6MoeWeights>(layout);
-  const auto block = [](const Projection &p) {
+  const auto block = [](const Projection &p, uint32_t format = GGUF_FMT_Q4K) {
     return Projection(p.outputSize, p.inputSize,
-                      BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, p.outputSize, p.inputSize, {}, {}, {})}});
+                      BlockWeights{{QuantizedSegment::planes(format, p.outputSize, p.inputSize, {}, {}, {})}});
   };
-  target.logitsProjection = block(target.logitsProjection);
+  // The logits projection is untuned (IQ1_S): the vocabulary matrix must be
+  // absent while the tuned Q4_K mixers appear.
+  target.logitsProjection = block(target.logitsProjection, GGUF_FMT_IQ1S);
   for (auto &layer : target.layers) {
     std::visit([&](auto &mixer) {
       mixer.inputProjection = block(mixer.inputProjection);
@@ -238,12 +243,13 @@ void blockTarget() {
   package.draft = draftWeights(draft);
   const auto inventory = collectTuningWorkloads(package, tuning::kPrefillProbeRows,
                                                 tuning::kDecodeProbeWidths);
-  for (const auto &input : linearKeys(inventory))
-    require(input.epilogue != LinearEpilogue::Residual &&
-                input.matrix != LinearMatrix{layout.vocabularySize, layout.hiddenSize} &&
-                input.matrix != LinearMatrix{layout.packedGdnWidth, layout.hiddenSize} &&
-                input.matrix != LinearMatrix{layout.packedFullWidth, layout.hiddenSize},
-            "a GGUF target's projections were collected for tuning");
+  bool sawBlock = false;
+  for (const auto &input : linearKeys(inventory)) {
+    if (input.weightLayout == WeightLayout::Block32) sawBlock = true;
+    require(input.matrix != LinearMatrix{layout.vocabularySize, layout.hiddenSize},
+            "an untuned-format projection was collected for tuning");
+  }
+  require(sawBlock, "a GGUF target's tuned-format projections were not collected");
 }
 
 void run() {
@@ -314,7 +320,7 @@ void metadataViews(const char *metallib) {
   package.draft = draftWeights(DFlashDraftLayout{});
   auto &target = std::get<Qwen3_8Weights>(package.target);
   const LinearWorkload key{{target.layout.intermediateSize, target.layout.hiddenSize},
-                           8, LinearPhase::Decode, LinearEpilogue::GateUp};
+                           ExecutionLimits::targetVerifyRows, LinearPhase::Decode, LinearEpilogue::GateUp};
   auto view = [&](uint32_t index, bool gate) {
     const uint64_t offset = uint64_t{index * 6 + (gate ? 3U : 0U)} * 128;
     return Projection(key.matrix.outputSize, key.matrix.inputSize,

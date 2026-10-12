@@ -73,7 +73,7 @@ void baselinePlans() {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::GateUp}) {
-          const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{matrix, lanes * RICHENGINE_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
                   "the plans' decode Linear departed from the device policy");
@@ -82,7 +82,7 @@ void baselinePlans() {
         }
       }
       require(plans.gateUpWorkspace(affineGateUp(matrix)) == gateBound &&
-                  gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
+                  gateBound == (family == 9 ? 0 : uint64_t{4 * RICHENGINE_TARGET_VERIFY_ROWS} * matrix.outputSize * 2),
               "gate/up workspace disagrees with fused or decomposed baseline");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
@@ -326,7 +326,7 @@ void unknownCoreCount() {
       for (auto layout : {WeightLayout::Affine64, WeightLayout::Block32})
         for (uint32_t lanes = 1; lanes <= 4; ++lanes)
           for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
-            const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue, layout};
+            const LinearWorkload w{matrix, lanes * RICHENGINE_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue, layout};
             require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
                     "an unknown core count planned a decode projection for other than the assumed cores");
           }
@@ -357,19 +357,19 @@ void workspaceBounds() {
           "verify workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
-  require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
-              moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
-              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
+  require(moe.groupedInputBytes == 4259840 && moe.expertOutputBytes == 4259840 &&
+              moe.expertIntermediateBytes == 1064960 && moe.groupedRoutesBytes == 4160 &&
+              moe.tileDescriptorsBytes == 1040 && moe.tileCountBytes == 4,
           "MoE decode workspace per lane changed");
-  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
-              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
+  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 2228224 &&
+              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 786432,
           "gate/up workspace omitted the B3/B4 gate pass");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
   // attention partials behind them.
-  require(draft.convolutionBytes == 81920 && draft.qkvBytes == 98304 &&
-              draft.groupedQueriesBytes == 65536 + 8 * 4 * 16640 &&
-              draft.queryKeysBytes == 16384 && draft.queryValuesBytes == 16384,
+  require(draft.convolutionBytes == 163840 && draft.qkvBytes == 196608 &&
+              draft.groupedQueriesBytes == 131072 + 8 * 4 * 33280 &&
+              draft.queryKeysBytes == 32768 && draft.queryValuesBytes == 32768,
           "draft workspace ABI changed");
 }
 
@@ -389,7 +389,7 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
   rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
-  std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
+  std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - kv::kVerifyRows};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
   require(finalVerify.splits == kv::kVerifyMaximumSplits,
           "valid final physical verify rows were rejected");

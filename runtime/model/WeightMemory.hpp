@@ -14,8 +14,10 @@ public:
   // Gives the memory back while no command is in flight.
   virtual void release() = 0;
   // Takes back the next part released, such as an image it allocates and
-  // writes again; true once none is left. On failure the weights are
-  // unusable: the engine stops.
+  // writes again; true once none is left. An allocation refusal
+  // (metal::MetalAllocationError without DriverRejected) waits: the caller
+  // retries it next tick. Any other failure leaves the weights unusable:
+  // the engine stops.
   [[nodiscard]] virtual bool restore() = 0;
 };
 

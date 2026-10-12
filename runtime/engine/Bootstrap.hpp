@@ -102,6 +102,9 @@ protocolLimitsFor(const model::ModelCapabilities &capabilities,
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
+    // Passed to resources as preferBlockWeights: a dense MLX target loads its
+    // projections in the GGUF block layout.
+    bool preferBlockWeights = false;
     // A zero engine maxContext is what the memory plan holds, as serve's
     // default; a larger one than that fails the bootstrap.
     NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};

@@ -56,7 +56,7 @@ void testContract() {
               verifyAttentionSplits(131072) == kVerifyMaximumSplits,
           "verify split scaling departed from one split per 16 visible pages");
   // The scratch runway is a tree verify's RICHENGINE_TREE_VERIFY_NODES - 1
-  // emitted rows, not a chain's seven.
+  // emitted rows, not a chain's fifteen.
   finalCycle.committed_tokens = richengine::kv::kMaximumPhysicalTokens - kRows + 1;
   require(chunkedPrefillValidationError(finalCycle) == "context_out_of_range",
           "physical KV scratch exceeded its speculative row allowance");
@@ -140,7 +140,7 @@ float queryPattern(uint32_t row, uint32_t head, uint32_t dimension) {
 // starts past the first one's in every extent.
 constexpr uint32_t kLayer = 1;
 
-// One lane's rows after its history. All eight rows run the verify
+// One lane's rows after its history. All kRows rows run the verify
 // entries; fewer run the prefill entries, which share the page loop and the
 // reduction, as one query tile of the parameters held here.
 struct Case {
@@ -404,7 +404,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, 8, 8, 0});
+               data.params.kv, splits, splits, kRows, kRows, 0});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -610,7 +610,7 @@ void requireIdentical(const std::string &pipeline, const Case &data,
 
 // Keep the CPU reference gates and verify that a second independent
 // submission, and the same pages in one extent, produce identical output and
-// scratch. Eight rows run a verify step of `width` lanes; fewer run one
+// scratch. kRows rows run a verify step of `width` lanes; fewer run one
 // prefill tile.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              const Pipelines &pipelines, Shape shape,
@@ -643,7 +643,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
 // ragged split counts and inactive rows exercise the reduction both entries
-// share. Eight active rows run the verify entry and, up to its split
+// share. kRows active rows run the verify entry and, up to its split
 // maximum, the prefill entry, whose parameters must lead to the same bits;
 // fewer rows run the prefill entry alone.
 void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
@@ -685,7 +685,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     return output;
   };
   // The fp64 merge of each active row, the inactive rows' zeros and the
-  // poison kept past the eight-row view.
+  // poison kept past the verify-row view.
   const auto check = [&](id<MTLBuffer> output) {
     const auto *out = static_cast<const BFloat16Bits *>(output.contents);
     for (uint32_t head = 0; head < shape.kvHeads; ++head)
@@ -722,14 +722,15 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         for (uint32_t dim = 0; dim < d; ++dim)
           require(out[(uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d + dim] ==
                       0xa5a5,
-                  "attention merge wrote beyond its eight-row view");
+                  "attention merge wrote beyond its verify-row view");
   };
-  // The prefill tile holds as many rows as a verify lane.
-  static_assert(RICHENGINE_PREFILL_ATTENTION_TILE_ROWS == RICHENGINE_TARGET_VERIFY_ROWS);
+  // The prefill tile stages eight rows; verify lanes stage a KV block's
+  // worth (RICHENGINE_VERIFY_CHUNK_STRIDE), so this test keeps its own
+  // stride-scaled view of the fused rows.
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, 8, 8, 0};
+    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, kRows, kRows, 0};
     verify = reduce(std::string(richengine::ops::kVerifyAttentionReduce), params);
     check(verify);
     // The fused reduce/gate of a Plain-input out-projection: its attention
@@ -767,7 +768,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     id<MTLBuffer> referenceHidden = makeBuffer(device, fusedHidden.length);
     std::memset(referenceHidden.contents, 0xa5, referenceHidden.length);
     const uint32_t elements = kRows * qHeads * d;
-    FullDecodeBatchParams gateParams{1, 8};
+    FullDecodeBatchParams gateParams{1, kRows};
     command = [queue commandBuffer];
     encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(
@@ -814,27 +815,27 @@ void run(const char *libraryPath) {
     }
     const Pipelines pipelines = makePipelines(device, library, shape);
     for (uint32_t width = 1; width <= 4; ++width)
-      runCase(device, queue, pipelines, shape, 127, 8, width);
-    runCase(device, queue, pipelines, shape, 0, 8, 4);
+      runCase(device, queue, pipelines, shape, 127, kRows, width);
+    runCase(device, queue, pipelines, shape, 0, kRows, 4);
     for (uint32_t activeRows = 1; activeRows < kRows; ++activeRows)
       runCase(device, queue, pipelines, shape, 127, activeRows, 1);
-    runCase(device, queue, pipelines, shape, 129, 8, 4);
+    runCase(device, queue, pipelines, shape, 129, kRows, 4);
     runCase(device, queue, pipelines, shape, 421, 3, 1);
     // Several pages per split, a partially filled last page, and a history
     // that leaves some splits empty.
-    runCase(device, queue, pipelines, shape, 1'100, 8, 2, false);
+    runCase(device, queue, pipelines, shape, 1'100, kRows, 2, false);
     runCase(device, queue, pipelines, shape, 4'093, 5, 1, false);
     // History-scaled partitions: every split count the plan can produce must
     // agree with the reference through the same store/split/reduce path,
     // including counts that leave a ragged last split.
-    runCase(device, queue, pipelines, shape, 4'093, 8, 1, false, 64);
-    runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65);
-    runCase(device, queue, pipelines, shape, 4'093, 8, 2, false,
+    runCase(device, queue, pipelines, shape, 4'093, kRows, 1, false, 64);
+    runCase(device, queue, pipelines, shape, 4'093, kRows, 3, false, 65);
+    runCase(device, queue, pipelines, shape, 4'093, kRows, 2, false,
             kVerifyMaximumSplits);
-    runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1);
+    runCase(device, queue, pipelines, shape, 1'100, kRows, 1, false, 1);
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
-    runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+    runCase(device, queue, pipelines, shape, 32'768, kRows, 2, false, 65);
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";
 }

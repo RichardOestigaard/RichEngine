@@ -96,10 +96,7 @@ multimodal upstream but no vision layout is wired. Image requests will fail.
 
 ## Build/test environment drift (in-flight at session end)
 
-- `runtime-bootstrap` fails at `invalid_device_capabilities: macos_27_required`
-  — its fixture declares macOS 26.4 while in-flight changes raised the floor.
-- `linear-plan` test doesn't compile (`TuningWorkloads.cpp` references
-  removed draft-layout field names).
-- `model_runtime_oracle_test.mm` doesn't compile (`admit` undeclared).
-- `execution-plans` fails at "GGUF register plan sums its Table16 tiles" —
-  `groupedSumsBytes != 0` now that the MoE workspace carries the packed plane.
+Resolved since: `runtime-bootstrap` and `linear-plan` pass; `execution-plans`
+constants were updated for the verify-rows 8→16 / draft ring 2048→4096
+geometry; `model-runtime-oracle` was fixed for the `model.draft` weights
+variant.

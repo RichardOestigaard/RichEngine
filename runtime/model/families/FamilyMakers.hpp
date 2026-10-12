@@ -27,6 +27,9 @@ namespace richengine::model {
 // MiniCPM5-2B.
 [[nodiscard]] ModelDescriptor denseDescriptor(std::string name);
 [[nodiscard]] DFlashDraftLayout denseDraftLayout();
+// The dense family's DFlash2 layout, swapped in when an assembly's draft
+// declares DFlash2DraftModel instead of the DSpark default.
+[[nodiscard]] DFlashDraftLayout denseDFlash2DraftLayout();
 
 // LFM2.5-2.6B and LFM2.5-8B-A1B.
 [[nodiscard]] ModelDescriptor lfm2Descriptor(std::string name);

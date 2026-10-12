@@ -232,7 +232,7 @@ void testCleanRuntimeStatus() {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
-  require(json.find("\"schema_version\":6") != std::string::npos &&
+  require(json.find("\"schema_version\":7") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
   require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
@@ -503,7 +503,7 @@ void testResourceWaitDiagnostics() {
       memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
       NativeLoopTiming{1843.25}, {}, {});
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25}") != std::string::npos &&
-              ticked.find("\"schema_version\":6") != std::string::npos,
+              ticked.find("\"schema_version\":7") != std::string::npos,
           "the loop's longest tick is missing, or changed the status schema");
 }
 
@@ -517,15 +517,22 @@ void testWeightsStatus() {
   };
   require(status({600.0, true, 2})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
-                        "\"restores\":2}") != std::string::npos,
+                        "\"restores\":2,\"layout\":\"affine\"}") != std::string::npos,
           "the weights' status is missing or inaccurate");
   require(status({1234567.5, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
               std::string::npos,
           "the idle release lost precision");
   require(status({std::numeric_limits<double>::infinity(), false, 0})
                   .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
-                        "\"restores\":0}") != std::string::npos,
+                        "\"restores\":0,\"layout\":\"affine\"}") != std::string::npos,
           "an idle release that is off is not null");
+  // The kernel layout comes from the loaded model, not the weights snapshot.
+  engine::RuntimeCacheIdentity blockIdentity;
+  blockIdentity.weightLayout = ops::WeightLayout::Block32;
+  require(runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, blockIdentity, {}, true, {},
+                            {}, {}, {600.0, true, 0}, {})
+                  .find("\"layout\":\"block\"") != std::string::npos,
+          "a block-loaded target reports the block weight layout");
 }
 
 // The prefill FFN's Neural Engine split: off with the start's reason and no

@@ -1,4 +1,5 @@
 #include "model/AffineTarget.hpp"
+#include "model/AffineToBlock.hpp"
 #include "model/Granite.hpp"
 #include "Checked.hpp"
 #include "model/AffinePlan.hpp"
@@ -411,8 +412,11 @@ AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesyst
                                        const Qwen3_6MoeLayout &layout)
     : images_(images), planned_(plan(directory, layout)) {}
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                                       const DenseLayout &layout)
-    : images_(images), planned_(planImages(directory, layout)) {}
+                                       const DenseLayout &layout, bool preferBlockWeights)
+    : images_(images), planned_(planImages(directory, layout)) {
+  // The sections keep their bound inputs; only their bytes and writer change.
+  if (preferBlockWeights) planned_->images = affine::blockImages(std::move(planned_->images));
+}
 AffineTargetLoader::AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory,
                                        const Lfm2Layout &layout)
     : images_(images), planned_(planImages(directory, layout)) {}

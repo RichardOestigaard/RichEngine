@@ -1,4 +1,5 @@
 #include "model/AffinePreparation.hpp"
+#include "model/AffineToBlock.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -147,37 +148,6 @@ uint16_t nearestBfloat16(float value) {
 // The loops have no early exit, so they vectorize; the sign of a zero
 // minimum or maximum, which the order of a vector reduction may change, does
 // not reach any output.
-void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint16_t &bias) {
-  std::array<float, kQ4GroupElements> w;
-  bool finite = true;
-  for (size_t i = 0; i < w.size(); ++i) {
-    w[i] = bfloat16Value(weights + i * kBFloat16Bytes);
-    finite &= std::isfinite(w[i]);
-  }
-  if (!finite) throw std::runtime_error("non-finite weight in a BF16 projection");
-  float minimum = w[0], maximum = w[0];
-  for (float value : w) {
-    minimum = std::min(minimum, value);
-    maximum = std::max(maximum, value);
-  }
-  maximum = std::max(0.0F, maximum);
-  const bool minimumEdge = std::fabs(minimum) > std::fabs(maximum);
-  float step = std::max((maximum - minimum) / 15.0F, 1e-7F);
-  if (!minimumEdge) step = -step;
-  const float edge = minimumEdge ? minimum : maximum;
-  const float q0 = std::round(edge / step);
-  float offset = 0.0F;
-  if (q0 != 0.0F) {
-    step = edge / q0;
-    offset = edge;
-  }
-  std::array<uint8_t, kQ4GroupElements> code;
-  for (size_t i = 0; i < w.size(); ++i)
-    code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, 15.0F));
-  for (size_t i = 0; i < w.size(); i += 2) codes[i / 2] = static_cast<uint8_t>(code[i] | code[i + 1] << 4);
-  scale = nearestBfloat16(step);
-  bias = nearestBfloat16(offset);
-}
 
 // Quantizes a step of a BF16 projection into its codes, scales and biases at
 // fields, each in [rows / 256][groups][256] tiles of its group bytes.
@@ -219,6 +189,38 @@ void writeDecay(const Section &section, uint8_t *destination, std::vector<uint8_
 
 } // namespace
 
+void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint16_t &bias) {
+  std::array<float, kQ4GroupElements> w;
+  bool finite = true;
+  for (size_t i = 0; i < w.size(); ++i) {
+    w[i] = bfloat16Value(weights + i * kBFloat16Bytes);
+    finite &= std::isfinite(w[i]);
+  }
+  if (!finite) throw std::runtime_error("non-finite weight in a BF16 projection");
+  float minimum = w[0], maximum = w[0];
+  for (float value : w) {
+    minimum = std::min(minimum, value);
+    maximum = std::max(maximum, value);
+  }
+  maximum = std::max(0.0F, maximum);
+  const bool minimumEdge = std::fabs(minimum) > std::fabs(maximum);
+  float step = std::max((maximum - minimum) / 15.0F, 1e-7F);
+  if (!minimumEdge) step = -step;
+  const float edge = minimumEdge ? minimum : maximum;
+  const float q0 = std::round(edge / step);
+  float offset = 0.0F;
+  if (q0 != 0.0F) {
+    step = edge / q0;
+    offset = edge;
+  }
+  std::array<uint8_t, kQ4GroupElements> code;
+  for (size_t i = 0; i < w.size(); ++i)
+    code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, 15.0F));
+  for (size_t i = 0; i < w.size(); i += 2) codes[i / 2] = static_cast<uint8_t>(code[i] | code[i + 1] << 4);
+  scale = nearestBfloat16(step);
+  bias = nearestBfloat16(offset);
+}
+
 void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
   if (destination.size() != image.bytes) throw std::invalid_argument("affine image destination size differs");
   const auto header = weightFileHeader(image.magic, image.layer, image.type);
@@ -256,6 +258,9 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
       }
       break;
     }
+    case SectionKind::Block:
+      addBlockTasks(section, at, tasks);
+      break;
     case SectionKind::Quantize: {
       const auto unit = groupBytes(section);
       const std::array<uint8_t *, 3> fields{at, at + fieldRows * unit[0], at + fieldRows * (unit[0] + unit[1])};

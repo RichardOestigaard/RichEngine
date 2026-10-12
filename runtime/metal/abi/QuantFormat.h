@@ -63,7 +63,15 @@
 #define GGUF_FMT_Q41 16u
 #define GGUF_FMT_MXFP4 17u
 #define GGUF_FMT_PQ20 18u
-#define GGUF_FMT_COUNT 19u
+#define GGUF_FMT_AF4 19u
+#define GGUF_FMT_COUNT 20u
+
+// The tensor type AF4 sections carry in a GgufTensorDescriptor (and
+// kQuantFormats' ggml_type column): a private id no GGUF file may use, not
+// one of ggml's. It is written in hexadecimal so the metadata parity check
+// (dev/tests/test_gguf_metadata.py), which reads each row's leading decimal
+// type, does not mistake it for a loadable GGML type.
+#define GGUF_PRIVATE_TYPE_AF4 0x80000af4u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type
@@ -96,6 +104,11 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {3, 32, 20, 16, 0, 4, 1, "q41"},      // meta: d, m
     {39, 32, 17, 16, 0, 1, 1, "mxfp4"},   // meta: e
     {142, 128, 34, 8, 0, 2, 4, "pq20"},   // Prism's block_pq2_0, one d per 128 elements; meta: d
+    // AF4: MLX affine Q4 group-64 repacked for the block kernels
+    // (model/AffineToBlock.cpp). The native block is 64 elements {qs[32],
+    // scale, bias}: one bf16 scale and bias per meta unit, so the unit's two
+    // groups of 32 share them (value = scale * code + bias, no zero point).
+    {GGUF_PRIVATE_TYPE_AF4, 64, 36, 16, 0, 4, 2, "af4"},
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.

@@ -20,7 +20,7 @@ namespace richengine::protocol {
 
 inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
-inline constexpr uint32_t kStatusSchemaVersion = 6;
+inline constexpr uint32_t kStatusSchemaVersion = 7;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =

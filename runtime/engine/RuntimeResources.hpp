@@ -52,13 +52,16 @@ struct RuntimeCacheIdentity {
   kv::Layout kvLayout;
   // The target model's manifest.
   std::string targetModelSha256;
+  // The kernel layout the target's weights loaded in, for /status.
+  ops::WeightLayout weightLayout = ops::WeightLayout::Affine64;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout);
+                         kv::Layout targetKvLayout,
+                         ops::WeightLayout weightLayout = ops::WeightLayout::Affine64);
 
 // The name of the directory a persistent cache tier keeps its files in:
 // what its copies hold, from the models that computed them, the KV and
@@ -81,7 +84,7 @@ struct PersistentCacheFiles final {
 void requireLoadedModel(const model::ModelPackage &package);
 
 struct RuntimeResourcesConfig {
-  kv::Format kvFormat = kv::Format::Int4;
+  kv::Format kvFormat = kv::Format::Int8;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
@@ -110,6 +113,9 @@ struct RuntimeResourcesConfig {
   // --moe-union: the decode step's routed-expert budget per MoE dispatch; 0
   // keeps every selected route.
   uint32_t moeUnionCap = 0;
+  // Loads a dense target from an MLX source with its projections in the GGUF
+  // block layout (model::loadModelPackage).
+  bool preferBlockWeights = false;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.

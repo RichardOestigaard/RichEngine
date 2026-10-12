@@ -215,6 +215,13 @@ ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint3
     return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 
+ops::Projection readProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                               std::string_view label) {
+    return file.record().type & kBlockWeightsImageType
+               ? readBlockProjection(file, outputSize, inputSize, label)
+               : readAffineProjection(file, outputSize, inputSize, label);
+}
+
 ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                          std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);

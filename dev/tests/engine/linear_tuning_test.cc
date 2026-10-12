@@ -67,7 +67,7 @@ void cpuContracts() {
   for (const LinearWorkload workload : {
        LinearWorkload{{0, 256}, 8}, LinearWorkload{{128, 256}, 8},
        LinearWorkload{{512, 64}, 8}, LinearWorkload{{512, 256}, 7},
-       LinearWorkload{{512, 256}, 40},
+       LinearWorkload{{512, 256}, 72},
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
        LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
        LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill},
@@ -92,12 +92,13 @@ uint64_t fingerprint(const Projection &projection) {
   return hash;
 }
 
-// Block-quantized workloads are not tuned, and a block projection never
-// reaches the tuner's reads of affine planes (which would throw
-// std::bad_variant_access instead).
+// Block-quantized workloads tune only formats with measured candidates
+// (LinearTuning's table): an IQ1_S segment's workload must be rejected
+// before admission, and a block projection under an affine workload key is
+// a mismatch the tuner rejects outright.
 void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
   const Projection block(projection.outputSize, projection.inputSize,
-                         BlockWeights{{QuantizedSegment::planes(GGUF_FMT_Q4K, projection.outputSize,
+                         BlockWeights{{QuantizedSegment::planes(GGUF_FMT_IQ1S, projection.outputSize,
                                                                 projection.inputSize, {}, {}, {})}});
   const LinearWorkload affine{{projection.outputSize, projection.inputSize}, 8};
   LinearWorkload blocks = affine;
@@ -110,10 +111,10 @@ void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
                                          LinearTuningInput{affine, {{block, std::nullopt}}}}) {
     const auto result = tuneLinear(backend, admit, input);
     require(!result.complete && result.failure && result.measurements.empty(),
-            "a block tuning input was accepted");
+            "an untuned or mismatched tuning input was accepted");
     rejects([&] { std::rethrow_exception(result.failure); });
   }
-  require(BackendInstrumentation::submittedCommands(backend) == before, "a block tuning input submitted GPU work");
+  require(BackendInstrumentation::submittedCommands(backend) == before, "an untuned tuning input submitted GPU work");
 }
 
 void gpuControls(metal::MetalBackend &backend, const Projection &projection) {

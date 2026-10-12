@@ -180,6 +180,8 @@ private:
   double idleSinceMilliseconds_;
   // When the weights began to be written back for a request, until they are.
   std::optional<double> restoreStarted_;
+  // A restore refused for memory keeps retrying and logs its wait once.
+  bool restoreWaitingLogged_ = false;
   // The times the weights were written back, each for a request.
   uint64_t weightRestores_ = 0;
   bool ready_ = false;

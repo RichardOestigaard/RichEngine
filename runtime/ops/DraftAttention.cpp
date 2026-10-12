@@ -123,9 +123,11 @@ enum class HeadKernel : uint8_t { Q32K8D128, Q16K2D128, Q32K8D64Interleaved };
       shape.qkvSize == 6144 && shape.attentionSize == 4096 &&
       shape.kvHeads == 8 && shape.headDimension == 128)
     return KernelLayout::Hidden5120;
-  if (shape.hiddenSize == 2048 && shape.dynamicSize == 512 &&
-      shape.qkvSize == 6144 && shape.attentionSize == 4096 &&
-      shape.kvHeads == 8 && shape.headDimension == 128)
+  // draft_conv_h2048 covers every hidden-2048/dynamic-512 DFlash2 draft:
+  // the conv kernel derives its dynamic width from the hidden size alone
+  // (Hidden/4), and headKernel() above already dispatched the attention
+  // geometry (32x8x128 for Qwen3.6's draft, 16x2x128 for MiniCPM5's).
+  if (shape.hiddenSize == 2048 && shape.dynamicSize == 512)
     return KernelLayout::Hidden2048;
   // The plain transformer and DSpark drafts carry no dynamic-conv width.
   if (shape.dynamicSize == 0 && shape.hiddenSize == 5120)

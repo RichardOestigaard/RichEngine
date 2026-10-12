@@ -12,9 +12,20 @@ using ops::tuning::LinearTuningWeights;
 using ops::tuning::kMaximumLinearTuningRepresentatives;
 
 bool sameProjection(const ops::Projection &left, const ops::Projection &right) {
-  const auto &l = left.affine(), &r = right.affine();
-  return left.inputSize == right.inputSize && left.outputSize == right.outputSize &&
-         l.weights.sameView(r.weights) && l.scales.sameView(r.scales) && l.biases.sameView(r.biases);
+  if (left.inputSize != right.inputSize || left.outputSize != right.outputSize ||
+      left.layout() != right.layout())
+    return false;
+  if (left.layout() == ops::WeightLayout::Affine64) {
+    const auto &l = left.affine(), &r = right.affine();
+    return l.weights.sameView(r.weights) && l.scales.sameView(r.scales) && l.biases.sameView(r.biases);
+  }
+  const auto &ls = left.blocks().segments, &rs = right.blocks().segments;
+  return ls.size() == rs.size() &&
+         std::equal(ls.begin(), ls.end(), rs.begin(), [](const auto &l, const auto &r) {
+           return l.formatId == r.formatId && l.columnOffset == r.columnOffset &&
+                  l.plane0.sameView(r.plane0) && l.plane1.sameView(r.plane1) &&
+                  l.meta.sameView(r.meta);
+         });
 }
 
 bool sameWeights(const LinearTuningWeights &left, const LinearTuningWeights &right) {
@@ -64,15 +75,17 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
                          const ops::Projection *gate = nullptr) {
     if (!weight.inputSize || !weight.outputSize)
       throw std::invalid_argument("operator probe projection has no geometry");
-    // Block projections are not tuned: they run the device policy's tiles.
-    if (weight.layout() != ops::WeightLayout::Affine64 ||
-        (gate && gate->layout() != ops::WeightLayout::Affine64)) return;
+    // A block projection tunes when every segment uses a format with
+    // measured candidates (LinearTuning's table); the rest keep the device
+    // policy's tiles.
+    if (!ops::tuning::tuningSupports(weight) || (gate && !ops::tuning::tuningSupports(*gate)))
+      return;
     const auto sizes = phase == LinearPhase::Prefill ? prefillRows : decodeWidths;
     for (uint32_t size : sizes) {
       const uint32_t rows = phase == LinearPhase::Prefill
           ? size : size * ExecutionLimits::targetVerifyRows;
       ops::LinearWorkload workload{{weight.outputSize, weight.inputSize},
-                                    rows, phase, epilogue};
+                                    rows, phase, epilogue, weight.layout()};
       const LinearTuningWeights representative{
           weight, gate ? std::optional{*gate} : std::nullopt};
       appendDistinct(linear, workload, representative);

@@ -219,6 +219,16 @@ def prometheus_metrics(status):
         lines.append(
             f'richengine_memory_pressure{{state="{state}"}} {1 if pressure == state else 0}'
         )
+    thermal = (status.get("instance") or {}).get("thermal_state")
+    for state in ("nominal", "fair", "serious", "critical"):
+        lines.append(
+            f'richengine_thermal_state{{state="{state}"}} {1 if thermal == state else 0}'
+        )
+    layout = status.get("weight_layout")
+    for kind in ("block", "affine"):
+        lines.append(
+            f'richengine_weight_layout_info{{layout="{kind}"}} {1 if layout == kind else 0}'
+        )
     for name, path in metrics.items():
         metric_value = value(path)
         if metric_value is not None:

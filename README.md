@@ -103,7 +103,7 @@ window. To set your own limits or cache options, add these to `richengine serve`
 | `--idle-release off` | Keep the model in memory while idle. Default: freed after 10 minutes without a request; a duration such as `2h` sets another time. |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision; serve text only. |
-| `--kv-format int8` | KV cache format: `int4` (default), `int8`, `bf16`, `fp8e4m3`. |
+| `--kv-format int8` | KV cache format: `int8` (default), `int4`, `bf16`, `fp8e4m3`. |
 | `--disable-ane` | Prefill on the GPU alone. Default: a dense model's long prompts also use the Neural Engine when that is faster. |
 | `--max-cache-disk 16G` | Offload KV cache and GDN states to SSD as needed. Off by default. |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
@@ -123,8 +123,8 @@ scale per token and KV head under quantization. Four formats:
 
 | Format | Bytes per element | Notes |
 | --- | ---: | --- |
-| `int4` (default) | 0.5 | Symmetric 4-bit, native packed INT4 matrix ops. Halves KV traffic. |
-| `int8` | 1 | Symmetric 8-bit. The original format. |
+| `int8` (default) | 1 | Symmetric 8-bit. Best verify acceptance and speed. |
+| `int4` | 0.5 | Symmetric 4-bit, native packed INT4 matrix ops. Halves KV traffic for capacity. |
 | `bf16` | 2 | Unquantized. Reference quality, twice the memory. |
 | `fp8e4m3` | 1 | E4M3 with fp16 query staging. Experimental; lowest precision tier. |
 

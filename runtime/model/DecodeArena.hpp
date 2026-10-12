@@ -200,6 +200,8 @@ public:
     linearScratch_.counters =
         allocate(linearSize.counters, metal::BufferStorage::Shared, "q4-counters");
     linearScratch_.rotated = allocate(linearSize.rotated, metal::BufferStorage::Private, "linear-rotated");
+    linearScratch_.intermediate =
+        allocate(linearSize.intermediate, metal::BufferStorage::Private, "q4-intermediate");
     if (linearSize.counters)
       std::memset(linearScratch_.counters.contents(), 0, linearSize.counters);
     bytes_ = plannedDecodeBytes(geometry_, operators);

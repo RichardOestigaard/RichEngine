@@ -52,6 +52,9 @@ struct ModelPackage final {
   DraftWeights draft;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
+  // The kernel layout the target's weights actually loaded in (a requested
+  // block layout falls back to affine on sections without a block form).
+  ops::WeightLayout weightLayout = ops::WeightLayout::Affine64;
 
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
@@ -106,8 +109,10 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModelPackage(const ModelPackage &package);
 
-// The bytes of every image the model's weights load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The bytes of every image the model's weights load into. preferBlockWeights
+// sizes a dense MLX target's images in the block layout (loadModelPackage).
+[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                        bool preferBlockWeights = false);
 
 // The vision role's upstream source, planned; null for a packed vision file
 // or a model without vision.
@@ -121,10 +126,14 @@ loadVisionWeights(metal::MetalBackend &backend, WeightImages &images, const std:
 
 // Production loading is selected by the validated package descriptor. There
 // is one shared engine and DFlash controller; only model execution differs.
+// preferBlockWeights loads a dense target from an MLX source with its
+// projections in the GGUF block layout (GGUF_FMT_AF4 planes, the block
+// kernels); every other source and architecture is unaffected.
 [[nodiscard]] ModelPackage
 loadModelPackage(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 bool preferBlockWeights = false);
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.

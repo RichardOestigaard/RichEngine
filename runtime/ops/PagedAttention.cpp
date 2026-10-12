@@ -230,6 +230,10 @@ enum class KernelLayout : uint8_t {
       (kernel == KernelLayout::Kv2Group8 ||
        kernel == KernelLayout::Kv2Group8D128))
     name += "_m2";
+  // The kv4/g6 chain tile's 96 fused rows at 16 verify rows halve core
+  // residency; its _r2 splits run the two fused-row passes on two groups.
+  if (stem == kVerifyAttention && kernel == KernelLayout::Kv4Group6)
+    name += "_r2";
   return name;
 }
 
@@ -399,16 +403,21 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       attentionWorkspace(uint64_t{lanes} * rows * kv::kVerifyMaximumSplits *
                              queryHeads,
                          kernelLayoutHeadDim(kernelLayout));
+  // The _rP splits fold P fused-row passes into group.x with the KV heads.
+  const std::string split = splitPipeline(
+      tree ? kVerifyTreeAttention : kVerifyAttention, layout, kernelLayout);
+  uint32_t splitGroupX = layout.kvHeads;
+  if (split.size() >= 3 && split.compare(split.size() - 3, 2, "_r") == 0)
+    splitGroupX *= split.back() - '0';
   return {lanes,
           laneSplits,
           splits,
           workspace,
-          splitPipeline(tree ? kVerifyTreeAttention : kVerifyAttention,
-                        layout, kernelLayout),
+          split,
           reduceKernel(tree ? kVerifyTreeAttentionReduce
                             : kVerifyAttentionReduce,
                        kernelLayout),
-          {layout.kvHeads, splits, lanes},
+          {splitGroupX, splits, lanes},
           {layout.kvHeads, rows * (queryHeads / layout.kvHeads), lanes},
           // The verify stores are row-count generic; only the emitted rows
           // dispatch, not the tree tile's spare capacity row.

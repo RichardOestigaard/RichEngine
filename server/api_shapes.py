@@ -648,6 +648,13 @@ def _anthropic_content(value, label):
             )
         elif kind == "document":
             parts.extend(document_parts(block))
+        elif kind == "tool_reference" and label == "tool_result":
+            # Claude Code tool search marks a tool discovered in the result.
+            if not isinstance(block.get("tool_name"), str):
+                raise APIError(400, "tool_reference blocks need a tool_name")
+            parts.append(
+                {"type": "text", "text": f"[tool reference: {block['tool_name']}]\n"}
+            )
         else:
             raise APIError(400, f"{label} contains unsupported content")
     return _media_content(parts)

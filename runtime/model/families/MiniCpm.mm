@@ -26,6 +26,19 @@ DFlashDraftLayout denseDraftLayout() {
   return layout;
 }
 
+// A DFlash2 draft for the dense target (Draftfit's MiniCPM5-2B port,
+// jayyun98/MiniCPM5-2B-SFT-Draftfit-DFlash2): the DSpark geometry's five
+// layers over hidden 2048 with 512-wide dynamic convolutions and the
+// 256-rank candidate selector, declared as DFlash2DraftModel.
+DFlashDraftLayout denseDFlash2DraftLayout() {
+  DFlashDraftLayout layout = denseDraftLayout();
+  layout.kind = DraftKind::DFlash2;
+  layout.dynamicSize = 512;
+  layout.selectorRank = 256;
+  layout.markovRank = 0;
+  return layout;
+}
+
 // The dense target is text-only: no vision layout, no vision weights.
 ModelDescriptor denseDescriptor(std::string name) {
   ops::VisionLayout vision;

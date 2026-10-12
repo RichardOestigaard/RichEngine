@@ -147,6 +147,7 @@ interface Status {
   };
   warmup?: Record<string, unknown>;
   ane_ffn?: { state?: string; share?: number; reruns?: number; reason?: string };
+  weight_layout?: string;
   model_timing?: {
     prefill?: { last_gpu_ms?: number; last_wall_ms?: number };
     decode?: { last_gpu_ms?: number; last_wall_ms?: number };
@@ -1638,6 +1639,9 @@ export default function Models() {
                 )} reruns`}
                 sub={s().ane_ffn?.reason}
               />
+            </Show>
+            <Show when={s().weight_layout}>
+              <Row label="Kernels" value={s().weight_layout ?? "—"} />
             </Show>
             <Show when={s().identity}>
               <Row

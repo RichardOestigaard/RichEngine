@@ -179,6 +179,35 @@ PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_kv2_g8, 2, 8, RichKvPacked4, 2
 PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, 256)
 #undef PAGED_VERIFY_SPLIT_M2
 
+// At 16 verify rows the kv4/g6 chain tile's M = 96 fused rows halve core
+// residency on scratch and accumulator footprint. The _r2 variants run the
+// tile's two fused-row passes on two threadgroups instead: group.x packs
+// the KV head and the pass, each group keeps the _m2 scratch footprint and
+// writes its own half of the unchanged [lane][head][split] partial slots.
+// The two groups of a pair stream the same pages.
+#define PAGED_VERIFY_SPLIT_R2(Name, Heads, Group, CacheElement, HeadDim)     \
+  PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                       \
+    PAGED_VERIFY_SCRATCH_M2(Group)                                           \
+    const RichVerifyTile tile =                                              \
+        richengine_verify_attention_tile_at<Heads, Group, HeadDim>(          \
+            queries, page_table0, page_table1, page_table2, page_table3,     \
+            params, uint3(group.x >> 1, group.y, group.z));                  \
+    if (!tile.active)                                                        \
+      return;                                                                \
+    richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,   \
+                                CacheElement, HeadDim, 2>(                   \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,     \
+        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.split, partials, statistics, tile.slot, nullptr,                \
+        params[group.z].score_scale, scores,                                 \
+        probabilities, row_max, row_sum, previous_scale, &rescale,             \
+        thread_index, 0, group.x & 1, (group.x & 1) + 1);                    \
+  }
+PAGED_VERIFY_SPLIT_R2(verify_attention_q8_split_r2, 4, 6, int8_t, 256)
+PAGED_VERIFY_SPLIT_R2(verify_attention_int4_split_r2, 4, 6, RichKvPacked4, 256)
+PAGED_VERIFY_SPLIT_R2(verify_attention_bf16_split_r2, 4, 6, bfloat, 256)
+#undef PAGED_VERIFY_SPLIT_R2
+
 // Sliding-window variants of the two Gemma shapes: the same verify split
 // plus buffer(8), the per-dispatch window in tokens (0 = full causal). The
 // reduce pass needs no window; a fully masked page's statistics carry zero

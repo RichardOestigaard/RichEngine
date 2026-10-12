@@ -32,7 +32,12 @@ public:
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_8Layout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Ornith9BLayout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_6MoeLayout &layout);
-  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const DenseLayout &layout);
+  // preferBlockWeights plans the images' projections as AF4 block sections
+  // (model/AffineToBlock.hpp) instead of affine tiles: the reader must be
+  // AffineBlockTargetFormat (model/TargetLoader.hpp), which loadDenseWeights
+  // picks under the same flag.
+  AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const DenseLayout &layout,
+                     bool preferBlockWeights = false);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2Layout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2MoeLayout &layout);
   AffineTargetLoader(WeightImages &images, const std::filesystem::path &directory, const GraniteLayout &layout);

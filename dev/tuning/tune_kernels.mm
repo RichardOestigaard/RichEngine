@@ -152,7 +152,9 @@ std::string describe(const LinearConfig &c) {
 std::string describe(const LinearWorkload &w) {
   std::ostringstream out;
   out << "{{" << w.matrix.outputSize << ", " << w.matrix.inputSize << "}, " << w.rows << ", "
-      << name(w.phase) << ", " << name(w.epilogue) << "}";
+      << name(w.phase) << ", " << name(w.epilogue);
+  if (w.weightLayout == WeightLayout::Block32) out << ", block";
+  out << "}";
   return out.str();
 }
 

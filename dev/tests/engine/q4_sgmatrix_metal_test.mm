@@ -362,6 +362,89 @@ void prefillNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   requireNorm(c,output,k,rows,"prefill norm differs from the fp64 reference");
   require(!std::memcmp(output.contents(),plain.contents(),k*rows*2),"prefill norm rows differ from the plain norm's");
 }
+// A table-emitting gate/up plus the paired-sums residual down must land on
+// the same values the prepare-then-decode chain produces: the emitted table
+// and the paired halves describe the same intermediate.
+void emitTableChain(metal::MetalBackend &backend, uint32_t inter, uint32_t hidden, uint32_t out,
+                    uint32_t rows, uint32_t splits) {
+  const LinearWorkload gw{{inter, hidden}, rows, LinearPhase::Decode, LinearEpilogue::GateUp};
+  const LinearWorkload dw{{out, inter}, rows, LinearPhase::Decode, LinearEpilogue::Residual};
+  const auto gplan = Linear::plan(gw, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits},
+                                  FloatOutput::BFloat16);
+  const auto dplan = Linear::plan(dw, {LinearTile::Simdgroup, 0, LinearSimdgroups::Four, splits},
+                                  FloatOutput::BFloat16);
+  LinearScratchSize size;
+  size.include(gplan.scratchSize());
+  size.include(dplan.scratchSize());
+  size.intermediate =
+      std::max(size.intermediate, tableSumsBytes(LinearInput::Table64Paired, inter, rows));
+  Guarded input(backend, 2ULL * rows * hidden), mid(backend, 2ULL * rows * inter),
+      fused(backend, 2ULL * rows * inter), res(backend, 2ULL * rows * out),
+      outA(backend, 2ULL * rows * out), outB(backend, 2ULL * rows * out);
+  Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials),
+      counters(backend, size.counters), psums(backend, size.intermediate);
+  std::memset(counters.view.contents(), 0, size.counters);
+  auto *x = static_cast<uint16_t *>(input.view.contents());
+  auto *r = static_cast<uint16_t *>(res.view.contents());
+  for (uint32_t i = 0; i < rows * hidden; ++i) x[i] = floatToBf16(float(int(hash(i + 37) % 257) - 128) / 32);
+  for (uint32_t i = 0; i < rows * out; ++i) r[i] = floatToBf16(float(int(i % 31) - 15) / 8);
+  const auto up = weights(backend, {inter, hidden}, 31, false);
+  const auto gate = weights(backend, {inter, hidden}, 177, false);
+  const auto down = weights(backend, {out, inter}, 91, false);
+  const Linear linear(backend.capabilities());
+  const LinearScratch scratch{table.view, sums.view, partials.view, counters.view,
+                              {}, {}, {}, {}, {}, psums.view};
+  // Reference chain: plain gate/up output, prepare, plain residual down.
+  metal::CommandGraph plain;
+  linear.add(plain, {input.view, mid.view, {}, {}, {}, {}, scratch}, up, gplan, &gate);
+  linear.add(plain, {mid.view, outA.view, {}, res.view, {}, {}, scratch}, down, dplan);
+  // Fused chain: the gate/up emits the table into `fused` and the paired
+  // halves into `psums`; the residual reads both through the scratch.
+  metal::CommandGraph fusedg;
+  linear.add(fusedg, {input.view, fused.view, {}, {}, {}, {}, scratch, {}, true}, up, gplan, &gate);
+  LinearScratch downScratch = scratch;
+  downScratch.input = fused.view;
+  linear.add(fusedg, {fused.view, outB.view, {}, res.view, {}, {}, downScratch,
+                      {fused.view, LinearInput::Table64Paired}},
+             down, dplan);
+  (void)backend.submitCommand(plain.dispatches());
+  (void)backend.submitCommand(fusedg.dispatches());
+  // The emitted table must carry exactly the bf16 rows the plain gate/up
+  // wrote, permuted as decode_linear_q4_prepare would lay them out.
+  metal::CommandGraph check;
+  Guarded prepared(backend, 2ULL * rows * inter), preparedSums(backend, uint64_t{inter} * rows / 16);
+  check.add(std::string(kDecodeLinearQ4Prepare),
+            {mid.view, prepared.view, preparedSums.view}, inter,
+            {inter / 32, rows / 8, 1}, {128, 1, 1});
+  (void)backend.submitCommand(check.dispatches());
+  require(!std::memcmp(fused.view.contents(), prepared.view.contents(), 2ULL * rows * inter),
+          "emitted table differs from the prepare pass layout");
+  // Each row's group sum is the two written halves; the prepare's sum may
+  // differ only by reduction order.
+  const auto *ps = static_cast<const float *>(psums.view.contents());
+  const auto *rs = static_cast<const float *>(preparedSums.view.contents());
+  for (uint32_t z = 0; z < rows / 8; ++z)
+    for (uint32_t g = 0; g < inter / 64; ++g)
+      for (uint32_t row = 0; row < 8; ++row) {
+        const float pair = ps[z * inter / 4 + g * 16 + row] + ps[z * inter / 4 + g * 16 + 8 + row];
+        const float want = rs[z * inter / 8 + g * 8 + row];
+        require(std::fabs(pair - want) <= 1e-3f * std::fabs(want) + 1e-6f,
+                "paired sums differ from the prepare's row sums");
+      }
+  const auto *a = static_cast<const uint16_t *>(outA.view.contents());
+  const auto *b = static_cast<const uint16_t *>(outB.view.contents());
+  const auto *m = static_cast<const uint16_t *>(mid.view.contents());
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t col : {0U, 1U, 7U, 63U, 64U, 255U, out / 2, out - 1}) {
+      const Reference ref = withEpilogue(
+          reference(exact(down, m + uint64_t{row} * inter, 0, col), inter / 64, splits),
+          LinearEpilogue::Residual, bf16ToFloat(r[row * out + col]), {});
+      require(within(ref, a[row * out + col]), "plain chain exceeds the fp64 bound");
+      require(within(ref, b[row * out + col]), "fused chain exceeds the fp64 bound");
+    }
+  for (auto *guard : {&input, &mid, &fused, &res, &outA, &outB, &table, &sums, &partials, &counters, &psums})
+    guard->check();
+}
 void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads, uint32_t lanes,
                         LinearInput layout) {
   const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256,
@@ -432,6 +515,8 @@ int main(int argc,char **argv) {
       splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
       splitVisibility(backend, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
     }
+    for (uint32_t rows : {8U, 16U, 32U})
+      for (uint32_t splits : {1U, 2U, 4U}) emitTableChain(backend, 512, 5120, 5120, rows, splits);
     std::cout << "Q4 simdgroup: PASS cases=" << cases
               << " (fp64, range, cancellation, guards, repeated dispatch, fused norm and attention gate in both"
                  " table layouts, norms with bf16 and F32 weights, shared split scratch)\n";

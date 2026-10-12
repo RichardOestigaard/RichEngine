@@ -254,6 +254,8 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   const auto [n, k] = w.matrix;
+  // The install's own kernel-pass measurement outranks every rule below.
+  if (const auto measured = measuredLinearPlan(policy_, w)) return *measured;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
   // the same half stage and matmul rows, so its outputs equal the prefill

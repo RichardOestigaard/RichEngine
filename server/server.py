@@ -55,6 +55,8 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .thermal import start as start_thermal_monitor
+from .thermal import state as thermal_state
 from .thinking import ThinkingKeyError
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -2301,6 +2303,7 @@ class FrontendServer(ThreadingHTTPServer):
         self.workers = ConnectionWorkers(
             self.connections.capacity, self.process_request_thread
         )
+        start_thermal_monitor()
         # Latency accounting for control requests when no model is loaded;
         # while one is, they land on the app's own metrics as before.
         self.latencies = LatencyMetrics()
@@ -2342,7 +2345,14 @@ class FrontendServer(ThreadingHTTPServer):
             "host": self.server_address[0],
             "port": self.server_address[1],
             "started_at": self.started_at,
+            "thermal_state": thermal_state(),
         }
+        weights = status.get("weights")
+        weight_layout = (weights or {}).get("layout") or getattr(
+            self.host, "weight_layout", None
+        )
+        if weight_layout is not None:
+            status["weight_layout"] = weight_layout
         status["http"] = {
             "requests": self.requests.stats(),
             "request_body_bytes": self.request_bodies.stats(),

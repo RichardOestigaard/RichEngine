@@ -59,7 +59,7 @@ struct NativeArguments final {
   // --cache-dir: where the cache tier keeps its files for the next process;
   // empty for temporary ones.
   std::filesystem::path persistentCacheRoot;
-  kv::Format kvFormat = kv::Format::Int4;
+  kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // --idle-release SECONDS|off, infinite for off.
@@ -75,6 +75,10 @@ struct NativeArguments final {
   // dispatch — a verify pass's rows share that many experts, the rest of
   // their routes dropped. 0 keeps every route.
   uint32_t moeUnionCap = 0;
+  // --weight-layout auto|block|affine: the weight layout the engine
+  // prefers; block forces block-packed kernels, affine keeps the MLX
+  // affine layout (richengine serve --weight-layout).
+  std::string weightLayout = "auto";
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -188,7 +192,7 @@ void printUsage(std::string_view executable) {
       " [--kv-format int8|int4|bf16|fp8e4m3] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--cache-dir DIRECTORY]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--moe-union EXPERTS]");
+      " [--moe-union EXPERTS] [--weight-layout auto|block|affine]");
 }
 
 template <typename T>
@@ -308,6 +312,10 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--weight-layout") {
+      if (value != "auto" && value != "block" && value != "affine")
+        throw UsageError("--weight-layout requires auto, block or affine");
+      result.weightLayout = std::string(value);
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -355,6 +363,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
   config.resources.moeUnionCap = arguments.moeUnionCap;
+  config.preferBlockWeights = arguments.weightLayout == "block";
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

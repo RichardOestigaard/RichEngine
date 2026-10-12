@@ -140,6 +140,9 @@ struct LinearScratch final {
   metal::MetalBuffer i8codesLo{};
   metal::MetalBuffer i8params{};
   metal::MetalBuffer i8paramsLo{};
+  // Paired per-threadgroup half sums a table-emitting gate/up tile writes
+  // and its down projection reads (LinearInput::Table64Paired).
+  metal::MetalBuffer intermediate{};
 };
 // One layer's SwiGLU projections, affine Q4 or quantized GGUF tensors:
 // down(silu(gate x) * up x).
@@ -156,8 +159,8 @@ struct PrefillFfnBuffers final {
   LinearScratch scratch;
 };
 struct LinearScratchSize final {
-  uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
-  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
+  uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0, intermediate = 0;
+  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated + intermediate; }
   // Grows each field to hold `other`'s too.
   LinearScratchSize &include(const LinearScratchSize &other) noexcept {
     input = std::max(input, other.input);
@@ -165,6 +168,7 @@ struct LinearScratchSize final {
     partials = std::max(partials, other.partials);
     counters = std::max(counters, other.counters);
     rotated = std::max(rotated, other.rotated);
+    intermediate = std::max(intermediate, other.intermediate);
     return *this;
   }
 };
@@ -181,6 +185,10 @@ enum class LinearInput : uint8_t {
   // exponent bytes in ::sums, which a producer can emit beside its bf16 rows
   // instead of a gguf_pack_half dispatch.
   Packed,
+  // The Table64 layout plus paired per-threadgroup half sums in
+  // LinearScratch::intermediate: what a gate/up tile emits for the dense
+  // FFN's down projection, sparing it decode_linear_q4_prepare.
+  Table64Paired,
   // LinearScratch::rotated holds H (D source): no producer emits it — a
   // rotated projection's own gguf_rotate dispatch writes it, and a second
   // rotated projection of the same source and signs reuses it.
@@ -276,6 +284,9 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // A gate/up plan emits its output as the consumer's Table64 (into `output`)
+  // plus paired half sums (into scratch.intermediate) instead of plain rows.
+  bool emitTable64 = false;
 };
 
 // Owns projection pipeline selection and dispatch for both weight layouts.

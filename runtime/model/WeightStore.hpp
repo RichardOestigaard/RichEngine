@@ -96,6 +96,14 @@ readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
 // A single-tensor projection; its descriptor must hold the layout's sizes.
 [[nodiscard]] ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize,
                                                   uint32_t inputSize, std::string_view label);
+// The flag bit in a weight file's declared type whose projection sections
+// hold the AF4 block layout (a descriptor and planes) instead of affine
+// tiles (model/AffineToBlock.cpp sets it).
+inline constexpr uint32_t kBlockWeightsImageType = 1u << 31;
+// The projection the file's next section holds, whichever of the two layouts
+// the file is in.
+[[nodiscard]] ops::Projection readProjection(WeightFile &file, uint32_t outputSize,
+                                             uint32_t inputSize, std::string_view label);
 // Native block_q4_K, block_q6_K or block_q8_0 rows for the token table
 // (gathered, never multiplied).
 [[nodiscard]] ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize,

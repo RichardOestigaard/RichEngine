@@ -17,10 +17,20 @@ inline constexpr size_t kMaximumLinearTuningRepresentatives = 8;
 // decode N128 and N256 on their full grids, Split128 at each K split up to
 // eight on Apple10 and later, and the paired N256 tile on its full grid for
 // one-lane plain projections, each once and only where a kernel runs it for
-// the workload. A block-quantized workload throws: block plans are not
-// tuned.
+// the workload. A block-quantized workload gets the staged and register
+// tiles at each split count (prefill: staged splits or the prefill tile).
 [[nodiscard]] std::vector<LinearPlan> linearCandidates(
     const DeviceCapabilities &device, LinearWorkload workload);
+
+// The GGUF formats whose block projections tune: dense Q4_K and the
+// MLX-derived AF4 first. A block workload with any other format throws —
+// its projections keep the device policy's plan. New formats opt in here.
+[[nodiscard]] bool blockFormatTuned(uint32_t formatId) noexcept;
+
+// Whether a projection enters the measured plan space: every affine Q4
+// projection, and block projections whose segments all use tuned formats
+// (float segments always qualify — they bind no quantized kernel).
+[[nodiscard]] bool tuningSupports(const Projection &projection) noexcept;
 
 struct LinearTuningWeights final {
   Projection projection;

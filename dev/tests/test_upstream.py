@@ -1134,7 +1134,7 @@ class UpstreamTest(unittest.TestCase):
         for ref in self.cache.glob("*/refs/richengine/*/*"):
             ref.unlink()
         with mock.patch.object(
-            hub.os, "link", side_effect=OSError(errno.EROFS, "read only")
+            hub.os, "replace", side_effect=OSError(errno.EROFS, "read only")
         ):
             output, warnings = self.prepare(chosen)
         self.assertIn("is already installed", output)

@@ -1,5 +1,6 @@
 #include "ModelFactory.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/AffineToBlock.hpp"
 #include "model/Granite.hpp"
 #include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
@@ -51,9 +52,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
+// Packed and GGUF files fix the layout they store, so the flag only reaches
+// the MLX case below, which calls loadDenseWeights itself.
 TargetWeights readTarget(metal::MetalBackend &backend, const DenseLayout &layout,
                          const TargetFiles<DenseLayout> &files) {
-  return loadDenseWeights(backend, layout, files);
+  return loadDenseWeights(backend, layout, files, false);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2Layout &layout,
@@ -98,7 +101,8 @@ template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
 
 ModelPackage loadModelPackage(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              bool preferBlockWeights) {
   ModelPackage result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
@@ -122,6 +126,8 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
     else
       draft.emplace(images, root / "draft", result.descriptor.draft);
   }
+  // The kernel layout the target's weights loaded in, for /status.
+  bool targetBlock = false;
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         using Layout = std::remove_cvref_t<decltype(layout)>;
@@ -137,7 +143,21 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
           if constexpr (PackedOnlyLayout<Layout>)
             throw std::invalid_argument(
                 "this target loads from packed files only");
-          else {
+          else if constexpr (std::is_same_v<Layout, DenseLayout>) {
+            // preferBlockWeights plans and reads the images' projections in
+            // the block layout; every other layout stays affine this
+            // milestone. Sections without a block form load affine instead.
+            if (preferBlockWeights) {
+              try {
+                AffineTargetLoader loader(images, directory, layout, true);
+                targetBlock = true;
+                return loadDenseWeights(backend, layout, std::ref(loader), true);
+              } catch (const WeightStoreError &) {
+              }
+            }
+            AffineTargetLoader loader(images, directory, layout);
+            return loadDenseWeights(backend, layout, std::ref(loader), false);
+          } else {
             AffineTargetLoader loader(images, directory, layout);
             return readTarget(backend, layout, std::ref(loader));
           }
@@ -148,6 +168,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
                 "this target loads from packed files only");
           else {
             GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
+            targetBlock = true;
             return readTarget(backend, layout, std::ref(loader));
           }
         }
@@ -155,6 +176,8 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
+  result.weightLayout =
+      targetBlock ? ops::WeightLayout::Block32 : ops::WeightLayout::Affine64;
   if (nullDraft) {
     result.draft = NullDraftWeights{result.descriptor.draft, {}, 0};
   } else if (dflashV1Draft) {
@@ -208,7 +231,8 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &
   return {};
 }
 
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                          bool preferBlockWeights) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
@@ -217,15 +241,43 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
         [&](const auto &layout) { return imageBytes(gguf::planImages(file, ggufTargetGeometry(layout))); },
         descriptor.target);
   } else if (descriptor.targetSource == TargetSource::Mlx) {
-    bytes = std::visit([](const auto &layout) { return imageBytes(affineTargetImages(layout)); }, descriptor.target);
+    bytes = std::visit(
+        [preferBlockWeights](const auto &layout) {
+          if constexpr (std::is_same_v<std::remove_cvref_t<decltype(layout)>, DenseLayout>) {
+            if (preferBlockWeights) {
+              // Sections without a block form budget for the affine load the
+              // fallback below performs.
+              try {
+                return imageBytes(affine::blockImages(affineTargetImages(layout)));
+              } catch (const WeightStoreError &) {
+              }
+            }
+          }
+          return imageBytes(affineTargetImages(layout));
+        },
+        descriptor.target);
   }
   if (descriptor.draftFromCheckpoint() &&
-      descriptor.draft.kind != DraftKind::Null)
-    bytes += descriptor.draft.kind == DraftKind::DFlashV1
-                 ? imageBytes(dflashV1DraftCheckpointImages(descriptor.draft))
+      descriptor.draft.kind != DraftKind::Null) {
+    auto draftImagesFor = [&descriptor] {
+      return descriptor.draft.kind == DraftKind::DFlashV1
+                 ? dflashV1DraftCheckpointImages(descriptor.draft)
                  : descriptor.draft.kind == DraftKind::DSpark
-                       ? imageBytes(dsparkDraftCheckpointImages(descriptor.draft))
-                       : imageBytes(draftCheckpointImages(descriptor.draft));
+                       ? dsparkDraftCheckpointImages(descriptor.draft)
+                       : draftCheckpointImages(descriptor.draft);
+    };
+    if (preferBlockWeights) {
+      // Sections without a block form budget for the affine load the
+      // loader's fallback performs.
+      try {
+        bytes += imageBytes(affine::blockImages(draftImagesFor()));
+      } catch (const WeightStoreError &) {
+        bytes += imageBytes(draftImagesFor());
+      }
+    } else {
+      bytes += imageBytes(draftImagesFor());
+    }
+  }
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += visionImageBytes(descriptor.vision);
   for (std::string_view directory : {"target", "draft", "vision"}) {

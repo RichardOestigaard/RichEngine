@@ -160,6 +160,15 @@ void run(const std::string &metallibPath) {
       {"g8_up", 12'800, 4'096, GGUF_FMT_Q4K},
       {"g8_down", 4'096, 12'800, GGUF_FMT_Q6K},
       {"g8_head", 100'352, 4'096, GGUF_FMT_Q6K},
+      // MLX Q4 dense targets under --weight-layout block (the 27B shapes):
+      // the AF4 repack rides the staged tile; these rows read its decode
+      // beside the same shapes' affine kernels.
+      {"af4_17408x5120", 17'408, 5'120, GGUF_FMT_AF4},
+      {"af4_6144x5120", 6'144, 5'120, GGUF_FMT_AF4},
+      {"af4_5120x17408", 5'120, 17'408, GGUF_FMT_AF4},
+      {"af4_6144x2048", 6'144, 2'048, GGUF_FMT_AF4},
+      {"af4_512x2048", 512, 2'048, GGUF_FMT_AF4},
+      {"af4_768x768", 768, 768, GGUF_FMT_AF4},
   };
   const FusedShape fused[] = {
       // MiniCPM5-2B: q + kv + kv (16 query heads, 2 KV heads x 128).

@@ -3,6 +3,7 @@
 #include "tuning/LinearNumerics.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
 #include <array>
@@ -32,14 +33,17 @@ struct Layout final {
 };
 
 // Plans of one K partition outside the Simdgroup tile store
-// bitwise-identical outputs for a workload. Any other pair may round
-// differently even with as many K splits on both sides, so it is held to the
-// derived bound.
+// bitwise-identical outputs for a workload — on one tile: a staged plan
+// rounds its weights to half where a register plan's stay exact, so only
+// same-tile sequential plans compare bitwise. Any other pair may round
+// differently even with as many K splits on both sides, so it is held to
+// the derived bound.
 bool sequential(const LinearPlan &plan) {
   return plan.configuration().splits == 1 && !plan.usesSimdgroup();
 }
 bool bitwiseComparable(const LinearPlan &baseline, const LinearPlan &candidate) {
-  return sequential(baseline) && sequential(candidate);
+  return sequential(baseline) && sequential(candidate) &&
+         baseline.configuration().tile == candidate.configuration().tile;
 }
 
 uint64_t align(uint64_t value, uint64_t alignment) {
@@ -90,6 +94,33 @@ Layout layout(const DeviceCapabilities &device,
   if (device.maxBufferLengthBytes && result.bytes > device.maxBufferLengthBytes)
     throw std::invalid_argument("Linear tuning fixture exceeds device buffer limit");
   return result;
+}
+
+// A block candidate differs from the baseline only by its tile and its
+// fp32 split-K association — every tile is fp64-exact over the same
+// operands (the projection tests), so an element may drift to roughly the
+// row's own magnitude's accumulation error. The bound is per-row: a
+// cancellation element near zero still passes beside large neighbours,
+// while a miswired plan diverges on the row's own scale and fails.
+void requireWithinBlockTolerance(LinearWorkload workload, const metal::MetalBuffer &a,
+                                 const metal::MetalBuffer &b) {
+  const auto *lhs = static_cast<const uint16_t *>(a.contents());
+  const auto *rhs = static_cast<const uint16_t *>(b.contents());
+  const uint64_t columns = workload.matrix.outputSize;
+  for (uint64_t row = 0; row < workload.rows; ++row) {
+    const auto *expected = lhs + row * columns, *actual = rhs + row * columns;
+    float rowMax = 0;
+    for (uint64_t i = 0; i < columns; ++i)
+      rowMax = std::max(rowMax, std::fabs(bf16ToFloat(expected[i])));
+    const double bound = double(rowMax) * 0.012 + 0.000004;
+    for (uint64_t i = 0; i < columns; ++i) {
+      const float e = bf16ToFloat(expected[i]), v = bf16ToFloat(actual[i]);
+      if (!std::isfinite(v))
+        throw std::runtime_error("Linear tuning produced nonfinite BF16 output");
+      if (std::fabs(v - e) > bound)
+        throw std::runtime_error("Linear tuning block candidate output exceeds its tolerance");
+    }
+  }
 }
 
 uint32_t mix(uint32_t value) {
@@ -166,10 +197,19 @@ void requireFinite(metal::MetalBuffer buffer, bool floats) {
 
 } // namespace
 
+bool blockFormatTuned(uint32_t formatId) noexcept {
+  return formatId == GGUF_FMT_Q4K || formatId == GGUF_FMT_AF4;
+}
+
+bool tuningSupports(const Projection &projection) noexcept {
+  if (projection.layout() == WeightLayout::Affine64) return true;
+  for (const QuantizedSegment &segment : projection.blocks().segments)
+    if (!segment.isFloat() && !blockFormatTuned(segment.formatId)) return false;
+  return true;
+}
+
 std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
                                          LinearWorkload w) {
-  if (w.weightLayout != WeightLayout::Affine64)
-    throw std::invalid_argument("Linear tuning takes affine workloads");
   std::vector<LinearPlan> result{Linear(device).plan(w)};
   const auto append = [&](LinearConfig config) {
     if (std::none_of(result.begin(), result.end(), [&](const LinearPlan &plan) {
@@ -177,6 +217,26 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
         }))
       result.push_back(Linear::plan(w, config, ops::FloatOutput::BFloat16));
   };
+  // Block workloads measure the GGUF tiles: staged and register at each
+  // legal split count, and the prefill tile for whole chunks.
+  if (w.weightLayout == WeightLayout::Block32) {
+    if (w.phase == LinearPhase::Prefill) {
+      if (w.rows <= 32)
+        for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2)
+          append({LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, splits});
+      append({LinearTile::GgufPrefill, 0});
+      return result;
+    }
+    // The staged tile covers a decode step of at most its 32-row tile;
+    // wider batches measure register splits alone.
+    const bool staged = w.rows <= 32;
+    for (const LinearTile tile : {LinearTile::GgufStaged, LinearTile::GgufRegister}) {
+      if (tile == LinearTile::GgufStaged && !staged) continue;
+      for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2)
+        append({tile, 0, LinearSimdgroups::Eight, splits});
+    }
+    return result;
+  }
   const uint32_t columns = w.matrix.outputSize;
   if (w.phase == LinearPhase::Prefill) {
     // The fused up projection has no eight-simdgroup N128 kernel.
@@ -226,10 +286,18 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       throw std::invalid_argument("Linear tuning requires 1..8 representative weight views");
     result.representativeCount = static_cast<uint32_t>(input.weights.size());
     for (const auto &weights : input.weights) {
-      requireAffineProjection(weights.projection, input.workload.matrix);
+      if (weights.projection.layout() != input.workload.weightLayout)
+        throw std::invalid_argument("Linear tuning projection layout does not match the workload");
+      if (!tuningSupports(weights.projection))
+        throw std::invalid_argument("Linear tuning projection has no tuned form");
+      if (weights.projection.layout() == WeightLayout::Affine64)
+        requireAffineProjection(weights.projection, input.workload.matrix);
       if ((input.workload.epilogue == LinearEpilogue::GateUp) != weights.gate.has_value())
         throw std::invalid_argument("Linear tuning gate projection is required only for GateUp");
-      if (weights.gate) requireAffineProjection(*weights.gate, input.workload.matrix);
+      if (weights.gate && !tuningSupports(*weights.gate))
+        throw std::invalid_argument("Linear tuning gate has no tuned form");
+      if (weights.gate && weights.gate->layout() == WeightLayout::Affine64)
+        requireAffineProjection(*weights.gate, input.workload.matrix);
     }
     const auto fixture = layout(backend.capabilities(), plans);
     auto control = [&] {
@@ -261,9 +329,12 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
                           {fields[PreparedInput], fields[PreparedSums], fields[Partials], fields[Counters]}};
     if (fields[Counters]) std::memset(fields[Counters].contents(), 0, fields[Counters].sizeBytes());
     const auto workload = input.workload;
-    initialize(buffers.input, uint64_t{workload.rows} * workload.matrix.inputSize, 1949);
+    // Fill the storage the tile reads — padded rows included: a block
+    // prefill tile stages whole 128-row chunks and unwritten tail rows
+    // would hold garbage.
+    initialize(buffers.input, buffers.input.sizeBytes() / 2, 1949);
     if (buffers.residual)
-      initialize(buffers.residual, uint64_t{workload.rows} * workload.matrix.outputSize, 7919);
+      initialize(buffers.residual, buffers.residual.sizeBytes() / 2, 7919);
     auto restore = [&] {
       poisonBf16(buffers.output);
       poisonFloat(buffers.sums);
@@ -284,7 +355,10 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       metal::CommandGraph graph;
       for (uint32_t repetition = 0; repetition < repetitions; ++repetition) {
         const auto &weights = input.weights[(first + repetition) % input.weights.size()];
-        if (workload.phase == LinearPhase::Prefill)
+        // Input sums feed the affine Q4 prefill kernels; the block tiles
+        // read the plain bf16 input directly.
+        if (workload.phase == LinearPhase::Prefill &&
+            workload.weightLayout == WeightLayout::Affine64)
           linear.addPrefillSums(graph, buffers.input, buffers.sums, weights.projection, workload.rows);
         linear.add(graph, buffers, weights.projection, plans.at(candidate.value),
                    weights.gate ? &*weights.gate : nullptr);
@@ -304,15 +378,21 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     // untimed submission per representative, before its candidates run.
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
         ? std::optional{Linear::plan(
-              {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
-              {LinearTile::N128, workload.matrix.outputSize / 128}, ops::FloatOutput::BFloat16)}
+              {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None,
+               workload.weightLayout},
+              workload.weightLayout == WeightLayout::Affine64
+                  ? LinearConfig{LinearTile::N128, workload.matrix.outputSize / 128}
+                  : LinearConfig{LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 1},
+              ops::FloatOutput::BFloat16)}
         : std::nullopt;
     float operandSlack = 0;
     auto referenceGateUp = [&](uint32_t representative) {
       if (fields[PreparedInput]) {
-        operandSlack = simdgroupSlack(workload, buffers.input, input.weights[representative].projection);
-        if (input.weights[representative].gate)
-          operandSlack = std::max(operandSlack, simdgroupSlack(workload, buffers.input, *input.weights[representative].gate));
+        if (input.weights[representative].projection.layout() == WeightLayout::Affine64) {
+          operandSlack = simdgroupSlack(workload, buffers.input, input.weights[representative].projection);
+          if (input.weights[representative].gate)
+            operandSlack = std::max(operandSlack, simdgroupSlack(workload, buffers.input, *input.weights[representative].gate));
+        }
       }
       if (!exactPlain) return;
       const auto &weights = input.weights[representative];
@@ -324,7 +404,14 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       (void)backend.submitCommand(graph.dispatches());
     };
     auto qualify = [&](size_t candidate, bool baseline) {
-      requireFinite(buffers.output, false);
+      // The written region is the workload's rows; a tile's padding rows
+      // hold the fixture's poison by design.
+      if (buffers.output) {
+        const auto *out = static_cast<const uint16_t *>(buffers.output.contents());
+        for (uint64_t i = 0; i < uint64_t{workload.rows} * workload.matrix.outputSize; ++i)
+          if ((out[i] & 0x7f80) == 0x7f80)
+            throw std::runtime_error("Linear tuning produced nonfinite BF16 output");
+      }
       requireFinite(buffers.downSums, true);
       const bool bitwise = bitwiseComparable(plans[0], plans[candidate]);
       for (const auto pair : {std::pair{Output, ReferenceOutput},
@@ -334,11 +421,16 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
         else if (!bitwise && pair.first == Output) {
-          const bool baselineExact = sequential(plans[0]);
-          requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
-                                      baselineExact ? actual : reference, buffers.residual,
-                                      fields[ReferenceGate], fields[ReferenceUp],
-                                      baselineExact || sequential(plans[candidate]) ? 1 : 2, operandSlack);
+          if (workload.weightLayout == WeightLayout::Block32) {
+            requireWithinBlockTolerance(workload, reference, actual);
+          }
+          else {
+            const bool baselineExact = sequential(plans[0]);
+            requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
+                                        baselineExact ? actual : reference, buffers.residual,
+                                        fields[ReferenceGate], fields[ReferenceUp],
+                                        baselineExact || sequential(plans[candidate]) ? 1 : 2, operandSlack);
+          }
         } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }

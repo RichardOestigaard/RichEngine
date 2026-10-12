@@ -67,10 +67,11 @@ void testStartupCapabilities() {
     using richengine::model::ExecutionLimits;
     require(ExecutionLimits::maximumBatchWidth == 4 &&
                 ExecutionLimits::prefillTokenBudget == 2048 &&
-                ExecutionLimits::draftQueryRows == 8 &&
-                ExecutionLimits::draftProposalTokens == 7 &&
-                ExecutionLimits::targetVerifyRows == 8 &&
-                ExecutionLimits::draftContextTokens == 2048,
+                ExecutionLimits::draftQueryRows == 16 &&
+                ExecutionLimits::draftProposalTokens == 15 &&
+                ExecutionLimits::targetVerifyRows == 16 &&
+                ExecutionLimits::draftContextTokens == 2048 &&
+                ExecutionLimits::draftRingCapacity == 4096,
             "DFlash execution contract changed");
 }
 

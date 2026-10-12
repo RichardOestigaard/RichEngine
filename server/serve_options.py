@@ -288,6 +288,17 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--weight-layout",
+        dict(
+            choices=("auto", "block", "affine"),
+            default="auto",
+            help="weight layout the engine prefers (default: auto, the "
+            "engine's own choice — affine for MLX targets today); block asks "
+            "for block-packed kernels and falls back to affine where a model "
+            "has no block form; GGUF weights are always block",
+        ),
+    ),
+    ServeOption(
         "--max-memory",
         dict(
             type=parse_max_memory,

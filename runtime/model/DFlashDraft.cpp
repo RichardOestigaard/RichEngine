@@ -351,26 +351,26 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
-    layer.attentionDynamic = readAffineProjection(
+    layer.attentionDynamic = readProjection(
         file, layout.dynamicSize, layout.hiddenSize,
         "attention-dynamic");
-    layer.qkvProjection = readAffineProjection(
+    layer.qkvProjection = readProjection(
         file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
-    layer.outputProjection = readAffineProjection(
+    layer.outputProjection = readProjection(
         file, layout.hiddenSize, layout.attentionSize,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
     layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
-    layer.mlpDynamic = readAffineProjection(
+    layer.mlpDynamic = readProjection(
         file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
-    layer.gateProjection = readAffineProjection(
+    layer.gateProjection = readProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-    layer.upProjection = readAffineProjection(
+    layer.upProjection = readProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-    layer.downProjection = readAffineProjection(
+    layer.downProjection = readProjection(
         file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
     file.finish();
     result.files.push_back(file.record());
@@ -379,12 +379,12 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
   {
     WeightFile file = files.model();
-    result.contextProjection = readAffineProjection(
+    result.contextProjection = readProjection(
         file, layout.hiddenSize, layout.targetHiddenSize,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
-    result.selectorProjection = readAffineProjection(
+    result.selectorProjection = readProjection(
         file, layout.selectorRank, layout.hiddenSize, "selector");
     const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
         checkedMultiply<WeightStoreError>(layout.vocabularySize,

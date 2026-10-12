@@ -189,7 +189,10 @@ inline constexpr std::string_view kPrefillLinearQ4N128UpSiluSumsSg4 = "prefill_l
 inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSums = "prefill_linear_q4_n256_up_silu_sums";
 inline constexpr std::string_view kDecodeLinearQ4Sg = "decode_linear_q4_sg";
 inline constexpr std::string_view kDecodeLinearQ4SgGateUp = "decode_linear_q4_sg_gate_up";
+inline constexpr std::string_view kDecodeLinearQ4SgGateUpT64 = "decode_linear_q4_sg_gate_up_t64";
 inline constexpr std::string_view kDecodeLinearQ4SgResidual = "decode_linear_q4_sg_residual";
+inline constexpr std::string_view kDecodeLinearQ4SgResidualPsum =
+    "decode_linear_q4_sg_residual_psum";
 inline constexpr std::string_view kDecodeLinearQ4N128 = "decode_linear_q4_n128";
 inline constexpr std::string_view kDecodeLinearQ4N128M16 = "decode_linear_q4_n128_m16";
 inline constexpr std::string_view kDecodeLinearQ4N128M24 = "decode_linear_q4_n128_m24";

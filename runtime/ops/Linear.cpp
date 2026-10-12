@@ -189,10 +189,18 @@ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexc
   return layout == LinearInput::Table16
              ? rows / kDecodeActivationRows * table16_sums_per_tile(width) * sizeof(float)
        : layout == LinearInput::Table64 ? uint64_t{width} * rows / 16
+       : layout == LinearInput::Table64Paired ? uint64_t{width} * rows / 8
        : layout == LinearInput::Packed ? rows * (width / 32) : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
+  if (layout == LinearInput::Table64Paired) {
+    if (!rows || rows % kDecodeActivationRows || width % 64 ||
+        scratch.input.sizeBytes() < tableBytes(width, rows) ||
+        scratch.intermediate.sizeBytes() < tableSumsBytes(layout, width, rows))
+      throw std::invalid_argument("linear paired scratch is below requirement");
+    return;
+  }
   if (layout == LinearInput::Plain || !rows || rows % kDecodeActivationRows || width % 64 ||
       scratch.input.sizeBytes() < tableBytes(width, rows) ||
       scratch.sums.sizeBytes() < tableSumsBytes(layout, width, rows))
@@ -277,9 +285,14 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const uint64_t lanes = rows / kDecodeActivationRows;
   // Each row tile owns two fp32 fragment streams per K partition and one
   // completion counter per column tile. Single-partition kernels use neither.
+  // A gate/up plan can emit its output's paired half sums; keep the room.
+  const uint64_t paired = workload_.epilogue == LinearEpilogue::GateUp
+                              ? lanes * (n / 64) * 16 * sizeof(float)
+                              : 0;
   return {tableBytes(k, workload_.rows), tableSumsBytes(LinearInput::Table64, k, workload_.rows),
           config_.splits > 1 ? config_.splits * 2 * rows * n * sizeof(float) : sizeof(float),
-          config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : sizeof(uint32_t)};
+          config_.splits > 1 ? lanes * (n / tileColumns()) * sizeof(uint32_t) : sizeof(uint32_t),
+          0, paired};
 }
 
 uint64_t LinearPlan::sumsBytes() const noexcept {
@@ -879,15 +892,34 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     return b.prepared;
   }
   if (selected.usesSimdgroup()) {
-    if (b.prepared.layout != LinearInput::Table64 || !b.prepared.source.sameView(b.input))
+    const bool paired = b.prepared.layout == LinearInput::Table64Paired &&
+                        b.prepared.source.sameView(b.input);
+    const bool emit = b.emitTable64 && w.epilogue == LinearEpilogue::GateUp;
+    if (b.emitTable64 && !emit)
+      throw std::invalid_argument("only a gate/up plan emits a Table64 output");
+    if (!(paired || (b.prepared.layout == LinearInput::Table64 &&
+                     b.prepared.source.sameView(b.input))))
       graph.add(std::string(kDecodeLinearQ4Prepare), {b.input, b.scratch.input, b.scratch.sums},
                 k, {k / 32, w.rows / kDecodeActivationRows, 1}, {128, 1, 1});
+    if (emit) {
+      requireBytes(b.output, tableBytes(n, rows), "intermediate table");
+      requireBytes(b.scratch.intermediate, tableSumsBytes(LinearInput::Table64Paired, n, rows),
+                   "paired sums");
+    }
     const AffineWeights &first = gate ? gate->affine() : weights;
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, first.weights, first.scales, first.biases,
-                                             b.output, b.scratch.sums, b.scratch.partials, b.scratch.counters};
+                                             b.output,
+                                             paired ? b.scratch.intermediate : b.scratch.sums,
+                                             b.scratch.partials, b.scratch.counters};
     if (gate) bindings.insert(bindings.end(), {weights.weights, weights.scales, weights.biases});
     else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
-    graph.add(kernelInstance(selected.pipeline(), selected.destination()), std::move(bindings),
+    if (emit) bindings.push_back(b.scratch.intermediate);
+    const std::string kernel = kernelInstance(
+        emit    ? kDecodeLinearQ4SgGateUpT64
+        : paired ? kDecodeLinearQ4SgResidualPsum
+                 : selected.pipeline(),
+        selected.destination());
+    graph.add(kernel, std::move(bindings),
         Q4Params{n, k},
         {selected.groups(), selected.configuration().splits, w.rows / kDecodeActivationRows},
         {128, 1, 1});

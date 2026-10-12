@@ -68,6 +68,9 @@ def _native_command(args):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    weight_layout = getattr(args, "weight_layout", "auto")
+    if weight_layout != "auto":
+        command.extend(("--weight-layout", weight_layout))
     return command
 
 
@@ -93,6 +96,8 @@ class ModelHost:
         self.closed = False
         self.last_request_at = time.monotonic()
         self.thinking_codec = ThinkingCodec(load_thinking_key())
+        # The effective weight layout of the loaded model, for /status.
+        self.weight_layout = None
         self._wakeup = threading.Event()
         self._watchdog = None
         if args.unload_idle is not None and math.isfinite(args.unload_idle):
@@ -308,6 +313,7 @@ class ModelHost:
         self.backend = backend
         self.app = app
         self.assembly_dir = assembly_dir
+        self.weight_layout = self._weight_layout(assembly_dir)
         self.record = record
         from install import autotune
 
@@ -317,6 +323,29 @@ class ModelHost:
         self.state = "loaded"
         self.error = None
         self.last_request_at = time.monotonic()
+
+    def _weight_layout(self, assembly_dir):
+        """Fallback weight layout for an engine that reports no
+        weights.layout in /status: it predates block MLX weights, so an
+        mlx-affine target ran affine; GGUF targets always ran block and a
+        pack.py target its own packed form."""
+        from install import layout
+        from install import models as model_artifacts
+
+        try:
+            record = model_artifacts.read_json(assembly_dir / layout.ASSEMBLY_RECORD)
+            target_format = record.get("target_format")
+        except (model_artifacts.ModelError, OSError):
+            target_format = (
+                "gguf"
+                if any((assembly_dir / layout.TARGET).glob("*.gguf"))
+                else None
+            )
+        if target_format == "gguf":
+            return "block"
+        if target_format == "mlx-affine":
+            return "affine"
+        return "packed"
 
     def tuning_requires_reload(self):
         """True when tuning.json now states winners this engine never saw:
@@ -338,6 +367,7 @@ class ModelHost:
         self.backend = None
         self.runtime = None
         self.assembly_dir = None
+        self.weight_layout = None
         self.record = None
         self.tuned_env = None
         self.state = "unloaded"

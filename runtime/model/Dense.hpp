@@ -76,8 +76,13 @@ struct DenseLayout final {
 
 using DenseWeights = TargetModelWeights<DenseLayout, DenseLayerWeights>;
 
+// preferBlockWeights reads an MLX source's images as AF4 block sections
+// (AffineBlockTargetFormat); it must match the flag the AffineTargetLoader
+// the files came from was built with, and leaves packed and GGUF files
+// unchanged.
 [[nodiscard]] DenseWeights
 loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
-                 const TargetFiles<DenseLayout> &files);
+                 const TargetFiles<DenseLayout> &files,
+                 bool preferBlockWeights = false);
 
 } // namespace richengine::model

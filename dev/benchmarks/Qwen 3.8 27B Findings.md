@@ -82,3 +82,50 @@ attention layer of the model's store + attention graph:
 - **Tile epilogue: worth one attempt, modest expectations.** Reimplement the
   staged scale/bias epilogue (the register-cached form is known to lose);
   target m24/m32 at B3/B4, where the 30–40% operator gap lives.
+
+## Follow-up: `_r2` chain verify, 2026-10-12
+
+Since this pass, `RICHENGINE_TARGET_VERIFY_ROWS` went 8→16 for tree verify,
+so the chain tile is M = 96 fused rows: ~25 KB of threadgroup scratch and a
+96-fp32 PV accumulator per thread drop core residency to one group, and the
+measured verify kernel slowed to ~54 GB/s at 131k (from the 149–161 above).
+The bottleneck is per-group serial cost, not fetch latency: warming the next
+page's lines through plain loads costs 5–8% at every tile size, so the fix
+had to shrink per-group footprint, not overlap fetches.
+
+The `_r2` splits run the tile's two fused-row passes on two threadgroups
+(group.x packs KV head and pass), keeping the `_m2` halved scratch and the
+unchanged partial slots. A four-way `_r4` variant loses: per-page fixed
+costs (three barriers, two tensorop issues per 16 KB) dominate below
+MP = 48. attention-sweep, 27b int8 Page32, fused ms:
+
+| history | lanes | `_split` | `_split_r2` |
+| ---: | ---: | ---: | ---: |
+| 0 | 1 | 0.028 | 0.023 |
+| 0 | 4 | 0.064 | 0.050 |
+| 8192 | 1 | 0.522 | 0.353 |
+| 8192 | 4 | 1.726 | 1.301 |
+| 16384 | 1 | 0.835 | 0.591 |
+| 16384 | 4 | 2.867 | 2.339 |
+| 65536 | 1 | 2.957 | 2.318 |
+| 65536 | 4 | 11.25 | 8.96 |
+| 131072 | 1 | 5.26 | 4.25 |
+| 131072 | 4 | 20.46 | 16.69 |
+
+−17% to −33% at every history and lane count, larger than this pass's
+predicted ceiling because it also recovers the M=96 regression. Outputs are
+bit-identical to the `_m2` two-pass tile on every measured case and differ
+from the single-pass tile only by MPP accumulation order; the paged plan
+test's CPU-oracle runs pass for all three KV formats. Tree verify is
+unchanged and is the same shape's next candidate.
+
+Rejected on measurement: a 512-thread (16-simdgroup) single-pass tile
+(`_w512`, `execution_simdgroups<16>` in both matmuls). It halves the PV
+accumulator per thread and keeps 1x KV traffic, but loses to the plain
+256-thread tile on every measured case — +5% to +29% fused time at
+8192/65536/131072 and both lane counts — because threadgroup scratch, not
+registers, bounds residency (one group per core either way) while the wider
+dispatch only adds sync and issue cost. Its outputs are bit-identical to
+the plain tile's on every measured case. Per-group resources only pay when
+they also shrink scratch and raise resident groups, which is the `_r2`
+mechanism.

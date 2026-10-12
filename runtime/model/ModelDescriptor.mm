@@ -957,9 +957,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (!dflashV1Draft && !dsparkDraft && draftArch != "DFlash2DraftModel")
     throw std::invalid_argument("draft is not a DFlash, DFlash2 or DSpark model");
   DFlashDraftLayout d = result.draft;
-  if (!dflashV1Draft && !dsparkDraft && d.kind == DraftKind::DFlashV1) {
-    // The descriptor's default draft for this target is plain, but the
-    // assembly declares a DFlash2 draft: swap in its DFlash2 layout.
+  if (!dflashV1Draft && !dsparkDraft && d.kind != DraftKind::DFlash2) {
+    // The descriptor's default draft for this target is not DFlash2, but
+    // the assembly declares a DFlash2 draft: swap in its DFlash2 layout.
     std::visit(
         [&](const auto &layout) {
           using Layout = std::decay_t<decltype(layout)>;
@@ -967,6 +967,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
             d = ornith9DFlash2DraftLayout();
           else if constexpr (std::is_same_v<Layout, Qwen3_6MoeLayout>)
             d = qwen36DraftLayout();
+          else if constexpr (std::is_same_v<Layout, DenseLayout>)
+            d = denseDFlash2DraftLayout();
           else
             d = DFlashDraftLayout{};
         },
@@ -1073,19 +1075,28 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.attentionHeadDimension = static_cast<uint32_t>(headDim);
     d.attentionSize = static_cast<uint32_t>(heads * headDim);
     d.qkvSize = static_cast<uint32_t>((heads + 2 * kvHeads) * headDim);
+    // Draftfit's DSpark dialect nests the head fields under dflash_config
+    // where the released drafts state them flat; the merge lets either
+    // spelling read, with the nested key winning when both state one.
+    NSMutableDictionary *dsparkFields =
+        [NSMutableDictionary dictionaryWithDictionary:draft];
+    if (id nested = draft[@"dflash_config"];
+        [nested isKindOfClass:[NSDictionary class]])
+      [dsparkFields
+          addEntriesFromDictionary:static_cast<NSDictionary *>(nested)];
     d.markovRank = static_cast<uint32_t>(
-        requireUnsigned(draft, @"markov_rank", "draft markov_rank"));
+        requireUnsigned(dsparkFields, @"markov_rank", "draft markov_rank"));
     requireEqual(d.markovRank, RICHENGINE_DRAFT_SELECTOR_RANK,
                  "draft markov_rank");
-    if (id markovType = draft[@"markov_head_type"])
+    if (id markovType = dsparkFields[@"markov_head_type"])
       requireEqual(
           std::string(static_cast<NSString *>(markovType).UTF8String),
           "vanilla", "draft markov_head_type");
     // rope_is_neox_style = false (LFM2.5) selects the interleaved pairing;
     // the field's absence means the half-split default.
     d.ropeInterleaved = [draft[@"rope_is_neox_style"] isEqual:@NO] ? 1 : 0;
-    if (draft[@"enable_confidence_head"] &&
-        ![draft[@"enable_confidence_head"] isEqual:@YES])
+    if (dsparkFields[@"enable_confidence_head"] &&
+        ![dsparkFields[@"enable_confidence_head"] isEqual:@YES])
       throw std::invalid_argument("unsupported DSpark confidence head");
     NSArray *types = requireArray(draft, @"layer_types", "draft layer_types");
     requireEqual(types.count, d.layers, "draft layer_types count");
@@ -1131,8 +1142,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     throw std::invalid_argument("unsupported draft attention or normalization configuration");
   }
   // MiniCPM5's DSpark config states rope_parameters.rope_theta; LFM2.5's a
-  // flat rope_theta. A plain draft's RoPE base is its own (the dense
-  // target's draft shares its 5e6); a DFlash2 draft's is fixed at 1e7.
+  // flat rope_theta. Every draft's RoPE base is its own: the dense target's
+  // DSpark and Draftfit's MiniCPM5 DFlash2 keep the target's 5e6 where
+  // incoai's DFlash2 drafts state 1e7.
   uint64_t ropeTheta;
   if (id rope = draft[@"rope_parameters"];
       [rope isKindOfClass:[NSDictionary class]]) {
@@ -1142,10 +1154,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   } else {
     ropeTheta = requireUnsigned(draft, @"rope_theta", "draft rotary theta");
   }
-  if (dsparkDraft || dflashV1Draft)
-    d.rotaryTheta = static_cast<float>(ropeTheta);
-  else
-    requireEqual(ropeTheta, 10000000, "draft rotary theta");
+  d.rotaryTheta = static_cast<float>(ropeTheta);
   // The dflash fields sit nested under dflash_config in DFlash/DFLASH2 and
   // LFM2.5 DSpark configs; MiniCPM5's DSpark states them at the root.
   NSDictionary *flash = draft[@"dflash_config"];
@@ -1303,7 +1312,15 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (std::filesystem::exists(root / "model.json")) return inspectSourceModel(root);
     std::string sourceIdentity;
     NSDictionary *manifest = readObject(root / "manifest.json", "model manifest", &sourceIdentity);
-    validateExecutionGeometry(manifest);
+    try {
+      validateExecutionGeometry(manifest);
+    } catch (const std::invalid_argument &error) {
+      throw std::invalid_argument(
+          std::string(error.what()) +
+          "; this package was built for an older engine and cannot load. "
+          "Install an MLX or GGUF checkpoint instead (serve --model "
+          "owner/repo).");
+    }
     const std::string model = requireString(manifest, @"model", "model name");
     const std::string format = requireString(
         requireObject(manifest, @"format", "model weight format"),

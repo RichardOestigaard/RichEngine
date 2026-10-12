@@ -17,7 +17,7 @@ from typing import TypeAlias
 
 PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
-STATUS_SCHEMA_VERSION = 6
+STATUS_SCHEMA_VERSION = 7
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.

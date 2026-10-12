@@ -269,20 +269,20 @@ DFlashV1DraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     WeightFile file = files.layer(layerIndex);
     DFlashV1DraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
-    layer.qkvProjection = readAffineProjection(
+    layer.qkvProjection = readProjection(
         file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
-    layer.outputProjection = readAffineProjection(
+    layer.outputProjection = readProjection(
         file, layout.hiddenSize, layout.attentionSize,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
-    layer.gateProjection = readAffineProjection(
+    layer.gateProjection = readProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-    layer.upProjection = readAffineProjection(
+    layer.upProjection = readProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-    layer.downProjection = readAffineProjection(
+    layer.downProjection = readProjection(
         file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
     file.finish();
     result.files.push_back(file.record());
@@ -291,7 +291,7 @@ DFlashV1DraftWeights readDraft(metal::MetalBackend &backend, Files &files,
 
   {
     WeightFile file = files.model();
-    result.contextProjection = readAffineProjection(
+    result.contextProjection = readProjection(
         file, layout.hiddenSize, layout.targetHiddenSize,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");

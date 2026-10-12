@@ -1396,11 +1396,15 @@ public:
   bool restore() override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
+    if (failRestoreRefused)
+      throw metal::MetalAllocationError("test refusal",
+                                        metal::AllocationFailure::HostPressure);
     require(released(), "held weights were restored");
     ++restores;
     return ++restored_ == kImages;
   }
   bool failRestore = false;
+  bool failRestoreRefused = false;
   // The images written back.
   uint32_t restores = 0;
 
@@ -1504,6 +1508,58 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
                       }) &&
               !loop.engineHealthy() && loop.connectionMustClose(),
           "a failed restore did not stop the engine");
+}
+
+// A restore refused for memory waits instead of stopping the engine: each
+// tick retries the part refused, a request blocked thirty seconds fails
+// retryably, and a restore that then succeeds serves the next request.
+void testRestoreRefusalWaitsAndRetries() {
+  Weights weights;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &weights;
+  config.idleReleaseSeconds = 1.0;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+
+  weights.release();
+  weights.failRestoreRefused = true;
+  // The request's own deadline outlasts the restore's blocked limit.
+  protocol::RequestFrame first = request(1);
+  first.remainingDeadlineMicros = 300'000'000;
+  require(loop.receive(protocol::peer::serialize(first)) && weights.released(),
+          "a request while the weights were released was not accepted");
+  for (uint32_t step = 0; step < Weights::kImages + 2; ++step)
+    require(loop.tick() && loop.engineHealthy(),
+            "a refused restore stopped the engine");
+  require(weights.restores == 0 && weights.released(),
+          "a refused restore counted images restored");
+  fixture.monotonic += 31'000;
+  require(loop.tick(), "a refused restore stopped the engine");
+  {
+    const auto events = fixture.events();
+    require(std::any_of(events.begin(), events.end(), [](const auto &message) {
+              const auto *error = std::get_if<protocol::ErrorEvent>(&message);
+              return error && error->failureClass == protocol::FailureClass::RequestError &&
+                     error->requestId == 1 && error->retryable &&
+                     error->code == "resource_timeout";
+            }),
+            "a request blocked on a refused restore did not fail retryably");
+  }
+  // The refusal lifting writes the weights back; the next request serves.
+  weights.failRestoreRefused = false;
+  protocol::RequestFrame second = request(2);
+  second.remainingDeadlineMicros = 300'000'000;
+  require(loop.receive(protocol::peer::serialize(second)),
+          "a request after a refused restore was not accepted");
+  while (weights.released())
+    require(loop.tick(), "a tick after the refusal did not write back an image");
+  require(weights.restores == Weights::kImages,
+          "the restore did not finish once memory was available");
+  runUntilIdle(loop);
+  require(loop.engineHealthy() && !loop.connectionMustClose(),
+          "the engine stayed up through a refused restore");
 }
 
 // With the Neural Engine split, the idle release gives back the images, then
@@ -1724,6 +1780,7 @@ int main() {
     testControlPassReclaimsUnderHostPressure();
     testIdleWeightsAreReleasedAndRestored(false);
     testIdleWeightsAreReleasedAndRestored(true);
+    testRestoreRefusalWaitsAndRetries();
     testIdleReleaseRestoresTheSplitLast();
     testIdleReleaseOffKeepsTheWeights();
     testHoldingRequestsSpansFirstToLastRequest();

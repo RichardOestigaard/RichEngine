@@ -30,7 +30,7 @@ using namespace richengine::engine;
 namespace {
 
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
-constexpr model::DraftStateLayout kDraftState{5, 8, 128};
+constexpr model::DraftStateLayout kDraftState{5, 8, 128, 2048};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
 constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
 
@@ -110,17 +110,17 @@ void testLayoutFormulas() {
           "GDN recurrent layer formula is wrong");
   require(kTargetState.recurrentBytes() == 150'994'944,
           "GDN recurrent parity formula is wrong");
-  require(kDraftState.tensorBytes() == 4'194'304,
+  require(kDraftState.tensorBytes() == 8'388'608,
           "draft tensor formula is wrong");
-  require(kDraftState.ringBytes() == 41'943'040,
+  require(kDraftState.ringBytes() == 83'886'080,
           "draft state formula is wrong");
-  require(kStateLayout.laneBytes() == 350'224'384,
+  require(kStateLayout.laneBytes() == 392'167'424,
           "per-lane byte formula is wrong");
   require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
                   kStateLayout.laneBytes() ==
-              1'400'897'536,
+              1'568'669'696,
           "four-lane byte formula is wrong");
-  require(kStateLayout.cachedBytes() == 196'083'712,
+  require(kStateLayout.cachedBytes() == 238'026'752,
           "prefix byte formula is wrong");
 }
 
@@ -128,7 +128,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
-                                               {1, 1, 4}};
+                                               {1, 1, 4, 2048}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
   auto budget = std::make_shared<model::DiskBudget>(3 * slotBytes);
   auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
@@ -338,7 +338,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 // aligns to one.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
-  constexpr model::CompositeStateLayout layout{target, {1, 1, 4}};
+  constexpr model::CompositeStateLayout layout{target, {1, 1, 4, 2048}};
   static_assert(layout.cachedBytes() % kHostPageBytes == 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);

@@ -192,6 +192,7 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
       const auto matches = [&](uint64_t offset, const std::vector<uint8_t> &bytes) {
         return slice(prepared[0], offset, bytes.size()) == bytes;
       };
+
       check(pair->format == format && matches(pair->plane0, expected.w0) &&
                 (!kQuantFormats[format].plane1_bytes || matches(pair->plane1, expected.w1)) &&
                 matches(pair->meta, expected.meta),

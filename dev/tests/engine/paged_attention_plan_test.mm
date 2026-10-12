@@ -124,11 +124,13 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 bound.statisticsBytes >= plan.workspace.statisticsBytes,
             "prefill arena omitted a valid shorter plan");
   }
+  // The plain-suffix kv4/g6 chain verify dispatches its two row passes as
+  // the _r2 pair of groups; the suffixed layouts keep their own splits.
   const std::string verifySplit = std::string(
       layout.format == kv::Format::Int8      ? ops::kVerifyAttentionQ8Split
       : layout.format == kv::Format::Int4    ? ops::kVerifyAttentionInt4Split
                                              : ops::kVerifyAttentionBf16Split) +
-      geometrySuffix;
+      geometrySuffix + (geometrySuffix.empty() ? "_r2" : "");
   const std::string verifyReduce = std::string(ops::kVerifyAttentionReduce) + geometrySuffix;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};

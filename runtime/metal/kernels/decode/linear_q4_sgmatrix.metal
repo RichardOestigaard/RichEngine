@@ -18,7 +18,11 @@ enum class Epilogue { Affine, Residual, GateUp };
 
 // The destination's type Out is bf16, or fp32 for a plain projection's
 // logits (ops::Projection::destination), which keeps the sum unrounded.
-template <Epilogue E, class Out>
+// EmitTable: the gate/up epilogue stores its output as the next tile's
+// X^T table plus paired per-threadgroup half sums, so the consumer skips
+// decode_linear_q4_prepare. PairedSums: the input sums come in that
+// [group][two halves][row] form.
+template <Epilogue E, class Out, bool EmitTable = false, bool PairedSums = false>
 __attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
                    device const bfloat *sc0, device const bfloat *bi0,
                    device Out *out, device const float *sums,
@@ -26,7 +30,9 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
                    device const bfloat *residual, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
                    constant Q4Params &p, uint3 tg, uint3 grid, uint tid, uint sg,
-                   uint lane, threadgroup uint *arrival) {
+                   uint lane, threadgroup uint *arrival,
+                   device bfloat *otable = nullptr, device float *osums = nullptr,
+                   threadgroup float *pbuf = nullptr) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, groups = p.input_size / 64;
@@ -35,9 +41,13 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   // Independent eight-row tiles share the weight layout and dispatch.
   // Each tile owns its activation workspace and split completion counters.
   table += ulong(tg.z) * p.input_size * 8;
-  sums += ulong(tg.z) * p.input_size / 8;
+  sums += ulong(tg.z) * p.input_size / (PairedSums ? 4 : 8);
   out += ulong(tg.z) * 8 * N;
   residual += ulong(tg.z) * 8 * N;
+  if (EmitTable) {
+    otable += ulong(tg.z) * N * 8;
+    osums += ulong(tg.z) * N / 4;
+  }
   if (splits > 1) {
     partials += ulong(tg.z) * splits * 16 * N;
     counters += ulong(tg.z) * N / tileN;
@@ -63,7 +73,10 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   float2 dot[2][2] = {{float2(0), float2(0)}, {float2(0), float2(0)}};
   uint2 words[2];
   auto run_group = [&](uint g, thread uint2 (&words)[2]) __attribute__((always_inline)) {
-    const float2 sum = float2(sums[g * 8 + fn], sums[g * 8 + fn + 1]);
+    const float2 sum = PairedSums
+        ? float2(sums[g * 16 + fn] + sums[g * 16 + 8 + fn],
+                 sums[g * 16 + fn + 1] + sums[g * 16 + 8 + fn + 1])
+        : float2(sums[g * 8 + fn], sums[g * 8 + fn + 1]);
     device const vec<bfloat, 8> *xt =
         reinterpret_cast<device const vec<bfloat, 8> *>(table + ulong(g) * kXtPerGroup);
     vec<bfloat, 8> bq[2];
@@ -117,8 +130,31 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
     const uint n = base + fm;
     const float2 gate = float2(bfloat2(acc[0])), up = float2(bfloat2(acc[1]));
     const float2 value = richengine_silu(gate) * up;
-    out[fn * N + n] = bfloat(value.x);
-    out[(fn + 1) * N + n] = bfloat(value.y);
+    if (EmitTable) {
+      // The X^T table row pair the consumer reads: this lane's elements are
+      // rows fn and fn + 1 of column n.
+      const uint2 kl = q4sg::klogical(n & 63);
+      otable[(n >> 6) * q4sg::kXtPerGroup + q4sg::xt_offset(kl.x, kl.y, fn)] = bfloat(value.x);
+      otable[(n >> 6) * q4sg::kXtPerGroup + q4sg::xt_offset(kl.x, kl.y, fn + 1)] = bfloat(value.y);
+      // This threadgroup's 32-column partial of each row sum; the two
+      // groups covering one 64-column group write disjoint halves that the
+      // consumer's paired read adds. The table rounds to bf16 — the sums
+      // must match it or the consumer's offset correction drifts.
+      pbuf[(sg * 8 + fn) * 8 + fm] = float(bfloat(value.x));
+      pbuf[(sg * 8 + fn + 1) * 8 + fm] = float(bfloat(value.y));
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Row r's partial is the sum of pbuf[sg][r][fm] over all 32 lanes.
+      if (lane < 8) {
+        float s = 0;
+        for (uint sgi = 0; sgi < 4; ++sgi)
+          for (uint fmi = 0; fmi < 8; ++fmi)
+            s += pbuf[(sgi * 8 + lane) * 8 + fmi];
+        osums[(tg.x >> 1) * 16 + (tg.x & 1) * 8 + lane] = s;
+      }
+    } else {
+      out[fn * N + n] = bfloat(value.x);
+      out[(fn + 1) * N + n] = bfloat(value.y);
+    }
   } else {
 #pragma unroll
     for (uint nf = 0; nf < 2; ++nf) {
@@ -175,12 +211,33 @@ kernel void decode_linear_q4_sg_residual(Q4_SG_INPUTS(bfloat),
   q4sg::decode<q4sg::Epilogue::Residual>(table, weights, scales, biases, output, sums,
       partials, counters, residual, weights, scales, biases, p, tg, grid, tid, sg, lane, &arrival);
 }
+// _psum: the input sums come paired — [group][two threadgroup halves][row] —
+// the layout a table-emitting gate/up produced for this input.
+kernel void decode_linear_q4_sg_residual_psum(Q4_SG_INPUTS(bfloat),
+    device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q4_SG_THREADS) {
+  threadgroup uint arrival;
+  q4sg::decode<q4sg::Epilogue::Residual, bfloat, false, true>(table, weights, scales, biases, output,
+      sums, partials, counters, residual, weights, scales, biases, p, tg, grid, tid, sg, lane,
+      &arrival);
+}
 kernel void decode_linear_q4_sg_gate_up(Q4_SG_INPUTS(bfloat), device const uchar *up [[buffer(8)]],
     device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],
     constant Q4Params &p [[buffer(11)]], Q4_SG_THREADS) {
   threadgroup uint arrival;
   q4sg::decode<q4sg::Epilogue::GateUp>(table, weights, scales, biases, output, sums,
       partials, counters, output, up, upScales, upBiases, p, tg, grid, tid, sg, lane, &arrival);
+}
+// _t64: the gate/up epilogue writes its output as the consumer's X^T table
+// into `output` itself plus the paired half sums into `osums`, so the next
+// projection skips decode_linear_q4_prepare.
+kernel void decode_linear_q4_sg_gate_up_t64(Q4_SG_INPUTS(bfloat), device const uchar *up [[buffer(8)]],
+    device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],
+    device float *osums [[buffer(11)]], constant Q4Params &p [[buffer(12)]], Q4_SG_THREADS) {
+  threadgroup uint arrival;
+  threadgroup float pbuf[256];
+  q4sg::decode<q4sg::Epilogue::GateUp, bfloat, true>(table, weights, scales, biases, output, sums,
+      partials, counters, output, up, upScales, upBiases, p, tg, grid, tid, sg, lane, &arrival,
+      output, osums, pbuf);
 }
 #undef Q4_SG_INPUTS
 #undef Q4_SG_THREADS

@@ -553,6 +553,7 @@ def main_args(**overrides):
             "port": 0,
             "binary": "richengine",
             "kv_format": "int4",
+            "weight_layout": "auto",
             "models_dir": None,
             "unload_idle": None,
             **overrides,
@@ -1142,6 +1143,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(snapshot["schema_version"], native_wire.STATUS_SCHEMA_VERSION)
         self.assertIs(snapshot["ready"], True)
         self.assertEqual(snapshot["memory_pressure"], "normal")
+        self.assertNotIn("weight_layout", snapshot)
         self.assertIs(snapshot["metal"]["healthy"], True)
         self.assertEqual(
             snapshot["transport"],
@@ -1254,6 +1256,8 @@ class ServerTest(unittest.TestCase):
         metrics = payload.decode().splitlines()
         self.assertIn("richengine_ready 1", metrics)
         self.assertIn('richengine_memory_pressure{state="normal"} 1', metrics)
+        self.assertIn('richengine_weight_layout_info{layout="block"} 0', metrics)
+        self.assertIn('richengine_weight_layout_info{layout="affine"} 0', metrics)
         self.assertIn("richengine_requests_submitted_total 7", metrics)
         self.assertIn("richengine_scheduler_waiting_resources 3", metrics)
         self.assertIn("richengine_scheduler_waiting_prefix 2", metrics)
@@ -1355,6 +1359,28 @@ class ServerTest(unittest.TestCase):
         )
         self.assertNotIn("queue_ms", response["metrics"])
         self.assertEqual(runtime.requests[0].frame.seed, 7)
+
+    def test_status_reports_the_loaded_models_weight_layout(self):
+        """/status names the host's effective weight layout and /metrics
+        exports it; without a loaded model neither does."""
+        harness = self.harness(FakeRuntime())
+        host = SimpleNamespace(
+            state="loaded",
+            error=None,
+            weight_layout="block",
+            assembly_dir=None,
+            app=harness.app,
+            tuning_requires_reload=lambda: False,
+        )
+        harness.server.host = host
+        status, _, payload = harness.request("GET", "/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["weight_layout"], "block")
+        status, _, payload = harness.request("GET", "/metrics")
+        self.assertEqual(status, 200)
+        metrics = payload.decode().splitlines()
+        self.assertIn('richengine_weight_layout_info{layout="block"} 1', metrics)
+        self.assertIn('richengine_weight_layout_info{layout="affine"} 0', metrics)
 
     class CharTokenizer(FakeTokenizer):
         """One token per character, so single-letter answer slots are exact."""
@@ -3719,6 +3745,18 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             hosting._native_command(sleep_args)[-2:], ["--idle-sleep", "allow"]
         )
+        # 'auto' keeps the engine's own default; only a chosen layout is
+        # forwarded.
+        self.assertEqual(args.weight_layout, "auto")
+        self.assertNotIn("--weight-layout", hosting._native_command(args))
+        for layout in ("block", "affine"):
+            layout_args = api.parse_args(
+                [*required, "--weight-layout", layout]
+            )
+            self.assertEqual(
+                hosting._native_command(layout_args)[-2:],
+                ["--weight-layout", layout],
+            )
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "richengine")
@@ -7664,8 +7702,8 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(client.close)
         with (
             mock.patch.object(
-                api.ThreadingHTTPServer,
-                "process_request",
+                api.ConnectionWorkers,
+                "submit",
                 side_effect=RuntimeError("test"),
             ),
             mock.patch.object(api.ThreadingHTTPServer, "handle_error") as handle_error,

@@ -320,10 +320,10 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
     };
     const LinearMatrix matrix{N, K};
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
+      const LinearPlan plan = linear.plan({matrix, lanes * 16, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
                                           full);
       const LinearScratch scratch = scratchFor(plan);
-      check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
+      check(lanes * 16, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
                                            linear.decodePlan(p, lanes)));
@@ -358,7 +358,7 @@ int floatOnlyChain(MetalBackend &backend) {
   const Linear linear(device);
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const uint64_t rows = lanes * 8, bytes = rows * N * 2;
+    const uint64_t rows = lanes * 16, bytes = rows * N * 2;
     const LinearPlan plan = linear.decodePlan(blocks, lanes);
     const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),

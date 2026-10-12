@@ -747,17 +747,27 @@ void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &no
   step.graph.beginBakedSpan();
   const ops::LinearPlan gateUpPlan =
       linear.decodePlan(up, step.planLanes, ops::LinearEpilogue::GateUp, &gate);
+  const ops::LinearPlan downPlan =
+      linear.decodePlan(down, step.planLanes, ops::LinearEpilogue::Residual);
+  // The gate/up tile emits its output as the down input's Table64 into
+  // denseIntermediate plus paired half sums, sparing the prepare pass —
+  // only when both plans run the simdgroup tile.
+  const bool emitTable = gateUpPlan.usesSimdgroup() && downPlan.usesSimdgroup();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
       b.linearScratch, gateUpPlan.input());
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
-              .scratch = b.linearScratch, .prepared = normalized},
+              .scratch = b.linearScratch, .prepared = normalized, .emitTable64 = emitTable},
              up, gateUpPlan, &gate);
+  ops::LinearScratch downScratch = b.linearScratch;
+  downScratch.input = b.denseIntermediate;
   linear.add(step.graph,
-             {.input = b.denseIntermediate, .output = output, .residual = residual, .scratch = b.linearScratch},
-             down,
-             linear.decodePlan(down, step.planLanes, ops::LinearEpilogue::Residual));
+             {.input = b.denseIntermediate, .output = output, .residual = residual,
+              .scratch = emitTable ? downScratch : b.linearScratch,
+              .prepared = emitTable ? ops::PreparedInput{b.denseIntermediate, ops::LinearInput::Table64Paired}
+                                    : ops::PreparedInput{}},
+             down, downPlan);
   step.graph.endBakedSpan();
 }
 

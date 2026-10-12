@@ -53,6 +53,33 @@ struct AffineTargetFormat final {
   }
 };
 
+// The dense target's block-layout MLX images (AffineTargetLoader under
+// preferBlockWeights): every projection section is one AF4 segment, a fused
+// one included, where a GGUF image splits it into its tensors; norms stay
+// bf16 and the token table its flat affine rows, as AffineTargetFormat.
+struct AffineBlockTargetFormat final {
+  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
+
+  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
+    return readNorm(file, width, false, label);
+  }
+  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
+                                           uint32_t inputSize, std::string_view label) const {
+    return readBlockProjection(file, outputSize, inputSize, label);
+  }
+  // A fused projection is one segment too: the parts' rows are stacked in
+  // the tensor, not separate segments as in a GGUF image.
+  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                      std::string_view label,
+                                      std::initializer_list<std::string_view>) const {
+    return projection(file, outputSize, inputSize, label);
+  }
+  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
+                                                uint32_t inputSize) const {
+    return readAffineEmbedding(file, outputSize, inputSize, "embedding", false);
+  }
+};
+
 // GGUF images hold each GGUF tensor as one block-quantized segment,
 // a fused projection as its tensors in output column order, and the GGUF's
 // F32 norms. The GGUF keeps the GDN output projection's input columns in

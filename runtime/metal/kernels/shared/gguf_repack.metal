@@ -107,6 +107,12 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
       break;
     }
+    case GGUF_FMT_AF4: {   // MLX affine 64-block {qs[32], scale, bias}: group j's qs[16 j], the shared meta once
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 * j + e / 2] >> (4 * (e & 1))) & 15;
+      gguf_store_pairs(lo, out0);
+      if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[32 + i];
+      break;
+    }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
       if (p.fmt == GGUF_FMT_Q40 || p.fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
