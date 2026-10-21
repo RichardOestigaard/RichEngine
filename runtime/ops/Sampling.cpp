@@ -76,9 +76,10 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
-  if (!vocabulary)
+Sampling::Sampling(uint32_t vocabulary, uint32_t logitsStride)
+    : vocabulary_(vocabulary), logitsStride_(logitsStride ? logitsStride : vocabulary),
+      maskWords_((vocabulary + 31) / 32) {
+  if (!vocabulary || logitsStride_ < vocabulary_)
     throw std::invalid_argument("invalid sampling geometry");
 }
 
@@ -86,10 +87,15 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
                             std::span<const SamplingPolicy> policies,
                             const SamplingBuffers &buffers,
                             const PenaltyTable &table, uint32_t rowOffset,
-                            bool verify) const {
+                            bool verify, uint32_t verifyStride) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? RICHENGINE_TARGET_VERIFY_ROWS : 1;
+  params.logits_stride = logitsStride_;
+  params.rows = verify ? verifyStride : 1;
+  // The non-verify (initial) logits keep the full capacity's lane stride:
+  // each lane's slot still spans all verify rows.
+  params.verify_stride =
+      verify ? verifyStride : uint32_t{RICHENGINE_TARGET_VERIFY_ROWS};
   params.row_offset = rowOffset;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
@@ -144,17 +150,18 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          SamplingBuffers buffers, uint32_t stopToken0,
                          uint32_t stopToken1, const PenaltyTable &penalties,
                          std::span<const uint32_t> liveRows,
-                         uint32_t fusedHead) const {
-  if (policies.empty() || policies.size() > kMaximumLanes ||
+                         uint32_t fusedHead, uint32_t verifyStride) const {
+  if (policies.empty() || policies.size() > kMaximumLanes || !verifyStride ||
+      verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
       (!liveRows.empty() && liveRows.size() != policies.size()))
     throw std::invalid_argument("invalid sampling batch width");
-  addPenalties(graph, policies, buffers, penalties, 0, true);
+  addPenalties(graph, policies, buffers, penalties, 0, true, verifyStride);
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
   // follows draft token r; every row draws with the lane's correction
   // uniform.
   addSelection(graph, policies, buffers,
-               {RICHENGINE_TARGET_VERIFY_ROWS, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
-                RICHENGINE_DRAFT_PROPOSAL_TOKENS},
+               {verifyStride, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
+                RICHENGINE_DRAFT_PROPOSAL_TOKENS, verifyStride},
                stopToken0, stopToken1, liveRows, fusedHead);
 }
 
@@ -169,7 +176,8 @@ void Sampling::addVerifyTree(metal::CommandGraph &graph,
       throw std::invalid_argument("tree verify requires greedy lanes");
   addSelection(graph, policies, buffers,
                {RICHENGINE_TREE_VERIFY_NODES, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
-                RICHENGINE_DRAFT_PROPOSAL_TOKENS},
+                RICHENGINE_DRAFT_PROPOSAL_TOKENS,
+                RICHENGINE_TREE_VERIFY_NODES},
                stopToken0, stopToken1);
 }
 
@@ -182,12 +190,16 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                             uint32_t fusedHead) const {
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
+  params.logits_stride = logitsStride_;
   params.mask_words = maskWords_;
   params.rows = rows.rows;
   params.logits_row = rows.logitsRow;
   params.mask_row = rows.maskRow;
   params.uniform = rows.uniform;
   params.drafted_rows = rows.draftedRows;
+  params.lane_stride = rows.laneStride
+                           ? rows.laneStride
+                           : uint32_t{RICHENGINE_TARGET_VERIFY_ROWS};
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
   bool greedy = false;
@@ -259,9 +271,9 @@ void Sampling::addAcceptance(
     std::span<const uint32_t> maximumRetained,
     std::span<const SamplingPolicy> policies, uint32_t stopToken0,
     uint32_t stopToken1, std::span<const uint32_t> proposals,
-    uint32_t draftCandidateStride) const {
+    uint32_t draftCandidateStride, uint32_t verifyStride) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
-      maximumRetained.size() > kMaximumLanes ||
+      maximumRetained.size() > kMaximumLanes || !verifyStride ||
       (!proposals.empty() && proposals.size() != policies.size()))
     throw std::invalid_argument("invalid DFlash acceptance batch");
   const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
@@ -269,10 +281,13 @@ void Sampling::addAcceptance(
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
+    // The producer caps a lane at kDecodeRows (= TARGET_VERIFY_ROWS); the
+    // kernel then clamps retained to its verify_stride rows, so a remaining
+    // value above verifyStride only documents headroom — clamp it here.
     if (!maximumRetained[lane] ||
         maximumRetained[lane] > RICHENGINE_TARGET_VERIFY_ROWS)
       throw std::invalid_argument("invalid DFlash retention limit");
-    params.remaining[lane] = maximumRetained[lane];
+    params.remaining[lane] = std::min(maximumRetained[lane], verifyStride);
     params.proposals[lane] =
         lane < proposals.size()
             ? std::min(proposals[lane],
@@ -282,6 +297,7 @@ void Sampling::addAcceptance(
       params.sampling_mask |= uint32_t{1} << lane;
   }
   params.candidate_stride = draftCandidateStride;
+  params.verify_stride = verifyStride;
   graph.add(std::string(kDecodeAcceptDflash),
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,

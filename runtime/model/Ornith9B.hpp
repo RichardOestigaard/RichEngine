@@ -39,7 +39,8 @@ struct Ornith9BLayout final : QwenHybridLayout<8> {
                          .fullAttentionPeriod = 4,
                          .maskToken = 248077,
                          .stopTokens = {248044, 248046},
-                         .hiddenCaptureLayers = {1, 5, 9, 13, 17, 21, 25, 29}} {}
+                         .hiddenCaptureLayers = {1, 5, 9, 13, 17, 21, 25, 29},
+                         .attentionCore = kv::Core::Kv4Group4} {}
   bool operator==(const Ornith9BLayout &) const = default;
 };
 

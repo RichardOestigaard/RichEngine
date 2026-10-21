@@ -55,6 +55,7 @@ struct Gemma4MoeLayout;
 struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
+struct Lfm2Moe24BLayout;
 
 // The GGUF geometry of the dense ("llama"), LFM2 ("lfm2") and LFM2-MoE
 // ("lfm2moe") targets.
@@ -62,6 +63,7 @@ struct Lfm2MoeLayout;
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout);
 [[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout);
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Moe24BLayout &layout);
 
 // Gemma 4 has no GGUF image plan: the packed files only. The overload keeps
 // the target variant's generic dispatch compilable; the DiffusionGemma one

@@ -7,7 +7,7 @@
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement,
           uint HeadDim = RichKvHeadDimension, uint MPasses = 1>
 inline void richengine_prefill_attention_split_phase(
-    device bfloat *queries, device float *partials,
+    device bfloat *queries, device bfloat *partials,
     device float *statistics, device const RichKvPage *page_table,
     constant RichPrefillAttentionParams &params,
     threadgroup float *scores, threadgroup bfloat *probabilities,
@@ -40,7 +40,7 @@ inline void richengine_prefill_attention_split_phase(
 template <uint KVHeads, uint QueryHeadsPerKVHead,
           uint HeadDim = RichKvHeadDimension>
 inline void richengine_prefill_attention_reduce_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *output,
     constant RichPrefillAttentionParams &params, uint3 group,
     uint thread_index, threadgroup float *weights,
@@ -69,7 +69,7 @@ inline void richengine_prefill_attention_reduce_phase(
 #define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table [[buffer(3)]],                     \
       constant RichPrefillAttentionParams &params [[buffer(4)]],             \
@@ -103,7 +103,7 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
 kernel void prefill_attention_reduce(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichPrefillAttentionParams &params [[buffer(3)]],
@@ -117,7 +117,7 @@ kernel void prefill_attention_reduce(
 }
 
 kernel void prefill_attention_reduce_kv4_g4(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichPrefillAttentionParams &params [[buffer(3)]],
@@ -131,7 +131,7 @@ kernel void prefill_attention_reduce_kv4_g4(
 }
 
 kernel void prefill_attention_reduce_kv2_g8(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichPrefillAttentionParams &params [[buffer(3)]],
@@ -150,7 +150,7 @@ kernel void prefill_attention_reduce_kv2_g8(
 #define PREFILL_ATTENTION_SPLIT_HD(Name, Heads, Group, CacheElement, HeadDim) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -198,7 +198,7 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_hd512, 2, 8, bfloat, 512
 #define PREFILL_ATTENTION_SPLIT_HD_M2(Name, Heads, Group, CacheElement, HeadDim) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -226,7 +226,7 @@ PREFILL_ATTENTION_SPLIT_HD_M2(prefill_attention_bf16_split_hd512_m2, 2, 8, bfloa
 
 #define PREFILL_ATTENTION_REDUCE_HD(Name, KVHeads, Group, HeadDim)            \
   kernel void Name(                                                         \
-      device const float *partials [[buffer(0)]],                           \
+      device const bfloat *partials [[buffer(0)]],                           \
       device const float *statistics [[buffer(1)]],                         \
       device bfloat *output [[buffer(2)]],                                  \
       constant RichPrefillAttentionParams &params [[buffer(3)]],          \
@@ -253,7 +253,7 @@ PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k8q4d128, 8, 4, 128)
 #define PREFILL_ATTENTION_SPLIT_SWA(Name, Heads, Group, CacheElement, HeadDim) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -303,7 +303,7 @@ PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_bf16_split_swa_hd512, 2, 8, bfloat
 #define PREFILL_ATTENTION_SPLIT_SWA_M2(Name, Heads, Group, CacheElement, HeadDim) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -349,7 +349,7 @@ PREFILL_ATTENTION_SPLIT_SWA_M2(prefill_attention_bf16_split_swa_hd512_m2, 2, 8, 
 // Gemma reduces: h256's fused rows are 8 * 2 = 16, hd512's 8 * 8 = 64, with a
 // 512-thread reduce threadgroup whose simdgroup maxima span 16 groups.
 kernel void prefill_attention_reduce_gemma_h256(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichPrefillAttentionParams &params [[buffer(3)]],
@@ -363,7 +363,7 @@ kernel void prefill_attention_reduce_gemma_h256(
 }
 
 kernel void prefill_attention_reduce_gemma_hd512(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichPrefillAttentionParams &params [[buffer(3)]],

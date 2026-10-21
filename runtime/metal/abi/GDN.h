@@ -55,16 +55,22 @@ struct GDNDecodeBatchParams {
   // verify rows bound the serial scan. Zero or RICHENGINE_TARGET_VERIFY_ROWS
   // scans all eight rows; the commit replays only retained rows regardless.
   uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The packed lane stride of the verify tensors: RICHENGINE_TARGET_VERIFY_ROWS
+  // unless the draft's trained block is shorter (draft.verifyRows()).
+  uint32_t verify_stride;
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 48,
-              "GDN decode parameters are 48 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 56,
+              "GDN decode parameters are 56 bytes on both sides");
 
 struct GDNBatchCommitParams {
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
+  // The packed lane stride of the commit's packed tensors: a chain batch's
+  // verify stride, RICHENGINE_TREE_VERIFY_NODES for a tree lane.
+  uint32_t verify_stride;
 };
 
-static_assert(sizeof(GDNBatchCommitParams) == 24,
-              "GDN commit parameters are 24 bytes on both sides");
+static_assert(sizeof(GDNBatchCommitParams) == 32,
+              "GDN commit parameters are 32 bytes on both sides");

@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/LfmConv.h"
+#include "metal/abi/Sampling.h"
 
 // LFM2's short convolution mixer. The packed in_proj row is [B | C | x];
 // the layer computes bx = B*x, runs the causal depthwise convolution over
@@ -346,4 +347,132 @@ kernel void commit_lfm_conv_v4(
     uint task [[thread_position_in_grid]]) {
   commit_impl<4>(mixed, retained, state0_in, state1_in, state2_in, state3_in,
                  state0_out, state1_out, state2_out, state3_out, params, task);
+}
+
+// The comb-tree verify (docs/TREE_VERIFY_DESIGN.md): `params.rows` is the
+// RICHENGINE_TREE_VERIFY_NODES node stride and each node's conv taps read
+// their stream predecessors along the DFS path — the node's ancestor rows
+// for positions inside the tree, the carried state below it. `mixed` keeps
+// every live node's bx at its DFS row for commit_lfm_conv_tree; rows past
+// the lane's emitted count write zeros.
+kernel void verify_lfm_conv_tree(
+    device const bfloat *packed [[buffer(0)]],
+    device const bfloat *weights [[buffer(1)]],
+    device const bfloat *state0 [[buffer(2)]],
+    device const bfloat *state1 [[buffer(3)]],
+    device const bfloat *state2 [[buffer(4)]],
+    device const bfloat *state3 [[buffer(5)]],
+    device bfloat *mixed [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    device const uint *tree_nodes [[buffer(8)]],
+    device const uint *tree_counts [[buffer(9)]],
+    constant RichLfmConvParams &params [[buffer(10)]],
+    uint task [[thread_position_in_grid]]) {
+  const uint dimension = params.dimension;
+  const uint rows = params.rows;
+  const uint taps = params.taps;
+  if (task >= uint64_t(params.lanes) * rows * dimension)
+    return;
+  const uint lane = task / (rows * dimension);
+  const uint row = (task % (rows * dimension)) / dimension;
+  const uint channel = task % dimension;
+  const ulong slot = (ulong(lane) * rows + row) * dimension + channel;
+  if (row >= tree_counts[lane]) {
+    mixed[slot] = bfloat(0.0f);
+    output[slot] = bfloat(0.0f);
+    return;
+  }
+  device const uint *nodes =
+      tree_nodes + lane * RICHENGINE_TREE_VERIFY_NODES;
+  device const bfloat *state =
+      lane == 0 ? state0 : lane == 1 ? state1 : lane == 2 ? state2 : state3;
+  const ulong layer_base =
+      uint64_t(params.layer) * params.state_layer_bytes / 2;
+  const ulong lane_base = ulong(lane) * rows;
+  const ulong base = (lane_base + row) * 3 * dimension;
+  const float b = float(packed[base + channel]);
+  const float c = float(packed[base + dimension + channel]);
+  const float x = float(packed[base + 2 * dimension + channel]);
+  mixed[slot] = bfloat(b * x);
+  const uint depth = RICHENGINE_TREE_NODE_DEPTH(nodes[row]);
+  float conv = 0.0f;
+  for (uint tap = 0; tap < taps; ++tap) {
+    const float w = float(
+        weights[params.taps_major ? tap * dimension + channel
+                                  : channel * taps + tap]);
+    const int position = int(depth) + int(tap) - int(taps - 1);
+    float source;
+    if (position < 0) {
+      source = float(
+          state[layer_base + uint(position + int(taps - 1)) * dimension +
+                channel]);
+    } else {
+      // The tap's stream position is `depth - hops` back along the node's
+      // ancestor chain: tap taps-1 is the node itself.
+      uint ancestor = row;
+      for (uint hop = 0; hop < (taps - 1) - tap; ++hop)
+        // A corrupt parent field is 8-bit — clamp it inside the lane's
+        // node region before the packed read goes out of bounds.
+        ancestor = min(RICHENGINE_TREE_NODE_PARENT(nodes[ancestor]),
+                       tree_counts[lane] - 1);
+      const ulong source_base = (lane_base + ancestor) * 3 * dimension;
+      source = float(packed[source_base + channel]) *
+               float(packed[source_base + 2 * dimension + channel]);
+    }
+    conv += w * source;
+  }
+  output[slot] = bfloat(c * conv);
+}
+
+// The tree commit: the retained path's DFS rows replay into the FIFO the
+// way the chain commit's prefix rows do — stream element index kept+w of
+// [state | bx] reads bx of path element index-(taps-1), not the adjacent
+// row's.
+kernel void commit_lfm_conv_tree(
+    device const bfloat *mixed [[buffer(0)]],
+    device const uint *retained [[buffer(1)]],
+    device const uint *retained_path [[buffer(2)]],
+    device const bfloat *state0_in [[buffer(3)]],
+    device const bfloat *state1_in [[buffer(4)]],
+    device const bfloat *state2_in [[buffer(5)]],
+    device const bfloat *state3_in [[buffer(6)]],
+    device bfloat *state0_out [[buffer(7)]],
+    device bfloat *state1_out [[buffer(8)]],
+    device bfloat *state2_out [[buffer(9)]],
+    device bfloat *state3_out [[buffer(10)]],
+    constant RichLfmConvParams &params [[buffer(11)]],
+    uint task [[thread_position_in_grid]]) {
+  const uint dimension = params.dimension;
+  const uint depth = params.taps - 1;
+  const uint lane_tasks = depth * dimension;
+  const uint layer_tasks = params.lanes * lane_tasks;
+  if (task >= uint64_t(params.layers) * layer_tasks)
+    return;
+  const uint conv_layer = task / layer_tasks;
+  const uint lane = (task % layer_tasks) / lane_tasks;
+  const uint w = (task % lane_tasks) / dimension;
+  const uint channel = task % dimension;
+  const uint rows = params.rows;
+  device const bfloat *state_in =
+      lane == 0 ? state0_in : lane == 1 ? state1_in : lane == 2 ? state2_in : state3_in;
+  device bfloat *state_out =
+      lane == 0 ? state0_out : lane == 1 ? state1_out : lane == 2 ? state2_out : state3_out;
+  const uint kept = retained[lane];
+  if (kept > RICHENGINE_TARGET_VERIFY_ROWS)
+    return;
+  const ulong layer_base =
+      uint64_t(params.layer + conv_layer) * params.state_layer_bytes / 2;
+  const ulong mixed_base =
+      uint64_t(conv_layer) * params.mixed_layer_stride / 2;
+  const uint index = kept + w;
+  float value;
+  if (index < depth) {
+    value = float(state_in[layer_base + uint(index) * dimension + channel]);
+  } else {
+    const uint node =
+        retained_path[lane * RICHENGINE_TARGET_VERIFY_ROWS + index - depth];
+    value = float(mixed[mixed_base +
+                        (ulong(lane) * rows + node) * dimension + channel]);
+  }
+  state_out[layer_base + ulong(w) * dimension + channel] = bfloat(value);
 }

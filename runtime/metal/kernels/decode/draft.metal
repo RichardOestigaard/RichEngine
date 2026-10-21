@@ -15,12 +15,11 @@ inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *base,
                              device const bfloat *residual,
                              device bfloat *output, bool finish, uint group,
-                             uint thread_index) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+                             uint thread_index, uint rows) {
   constexpr uint ConvGroups = Hidden / 16;
   constexpr uint Dynamic = 4 * ConvGroups;
   const uint element = group * 256 + thread_index;
-  if (element >= Rows * Hidden)
+  if (element >= rows * Hidden)
     return;
   uint row = element / Hidden;
   uint channel = element % Hidden;
@@ -50,20 +49,19 @@ inline void draft_qkv_prepare_phase(
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
-    uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+    uint thread_index, uint lane, uint simd_group, uint rows) {
   constexpr uint QWidth = QHeads * HeadDim, KWidth = KVHeads * HeadDim;
   constexpr uint PackedWidth = QWidth + 2 * KWidth;
-  constexpr uint QueryTasks = Rows * QHeads;
-  constexpr uint Tasks = QueryTasks + Rows * KVHeads;
+  const uint QueryTasks = rows * QHeads;
+  const uint Tasks = QueryTasks + rows * KVHeads;
 
   const uint element = group * 256 + thread_index;
-  if (element < Rows * KVHeads * HeadDim) {
+  if (element < rows * KVHeads * HeadDim) {
     uint row = element / (KVHeads * HeadDim);
     uint remainder = element % (KVHeads * HeadDim);
     uint attention_head = remainder / HeadDim;
     uint dim = remainder % HeadDim;
-    query_values[(attention_head * HeadDim + dim) * Rows + row] =
+    query_values[(attention_head * HeadDim + dim) * rows + row] =
         proposal_qkv[row * PackedWidth + QWidth + KWidth + remainder];
   }
 
@@ -82,7 +80,7 @@ inline void draft_qkv_prepare_phase(
                     attention_head * HeadDim;
     device const bfloat *weight = query ? q_norm : k_norm;
     device bfloat *destination = (query ? queries : query_keys) +
-                                 (attention_head * Rows + row) * HeadDim;
+                                 (attention_head * rows + row) * HeadDim;
 
     float value = thread_index < HeadDim ? float(source[thread_index]) : 0.0f;
     const float inverse =
@@ -124,10 +122,12 @@ inline void draft_context_kv_commit_impl(
     constant DraftContextBatchParams &params,
     threadgroup float *reductions, threadgroup bfloat *normalized, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
-  // A context row's keys and values (draft_context_kv_phase).
+  // The context rows pack at the draft's query stride; its rope tables
+  // keep the full query capacity's stride.
+  const uint Rows = params.query_rows;
   constexpr uint RowWidth = 2 * KVHeads * HeadDim;
-  constexpr uint RopeLaneStride = Rows * (HeadDim / 2);
+  constexpr uint RopeLaneStride =
+      RICHENGINE_DRAFT_QUERY_ROWS * (HeadDim / 2);
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
   device bfloat *keys =
@@ -176,6 +176,8 @@ DRAFT_CONTEXT_COMMIT_KERNEL(draft_context_kv_commit_q16k2, 2, 128, false,
                             false)
 DRAFT_CONTEXT_COMMIT_KERNEL(draft_context_kv_commit_q32k8d64i, 8, 64, true,
                             true)
+DRAFT_CONTEXT_COMMIT_KERNEL(draft_context_kv_commit_q8k2d256, 2, 256, false,
+                            false)
 
 // One split of the attention of one KV head over the M query rows of one
 // lane (the head's query heads x the block's rows). The live window occupies
@@ -190,15 +192,16 @@ inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
     device float *partial, uint value_stride, uint cache_length, uint window,
-    uint split, bool causal,
+    uint split, bool causal, uint rows,
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort TileK = 64;
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS, Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
+  const uint Rows = rows;
+  constexpr uint Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   const uint Splits = kDraftAttentionSplits;
-  constexpr float InvSqrtD = D == 64 ? 0.125f : 0.08838834765f;
-  static_assert(D == 128 || D == 64, "uncompiled draft head dimension");
+  constexpr float InvSqrtD = D == 64 ? 0.125f : D == 256 ? 0.0625f : 0.08838834765f;
+  static_assert(D == 128 || D == 64 || D == 256, "uncompiled draft head dimension");
   static_assert(M % 8 == 0 && N % TileK == 0, "draft attention tile alignment");
   uint common_start =
       cache_length >= window - 1 ? cache_length - (window - 1) : 0;
@@ -337,9 +340,11 @@ inline void draft_attention_split_phase(
   }
 
   if (split + 1 == Splits) {
-    // Persistent query K/V contains exactly eight rows.  The K=16 padding
+    // Persistent query K/V keeps the full query capacity: rows past the
+    // block's live depth are masked below, so their stale keys score -inf
+    // and their stale values multiply a zero probability. The K=16 padding
     // required by the MPP value product exists only in threadgroup memory.
-    constexpr ushort CurrentN = Rows;
+    constexpr ushort CurrentN = RICHENGINE_DRAFT_QUERY_ROWS;
     constexpr ushort CurrentValueTile = 16;
     threadgroup float *current_raw_scores =
         score_storage + M * CurrentValueTile;
@@ -378,7 +383,8 @@ inline void draft_attention_split_phase(
       // A causal draft's current row sees only the block rows up to its own
       // position; the DFlash2 block rows all see one another.
       uint proposal_row = matrix_row % Rows;
-      float score = lane < CurrentN && (!causal || lane <= proposal_row)
+      float score = lane < CurrentN && lane < rows &&
+                            (!causal || lane <= proposal_row)
                         ? current_raw_scores[matrix_row * CurrentN + lane] *
                               InvSqrtD
                         : -INFINITY;
@@ -407,8 +413,8 @@ inline void draft_attention_split_phase(
          index += 256) {
       uint dimension = index / CurrentValueTile;
       uint token = index % CurrentValueTile;
-      current_values[index] = token < CurrentN
-                                  ? query_values[dimension * CurrentN + token]
+      current_values[index] = token < rows
+                                  ? query_values[dimension * rows + token]
                                   : bfloat(0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -478,16 +484,15 @@ inline void draft_attention_reduce_phase(device const float *partials,
 template <uint QHeads, uint HeadDim>
 inline void draft_attention_reorder_phase(device const bfloat *grouped,
                                           device bfloat *row_major, uint group,
-                                          uint thread_index) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+                                          uint thread_index, uint rows) {
   const uint element = group * 256 + thread_index;
-  if (element >= Rows * QHeads * HeadDim)
+  if (element >= rows * QHeads * HeadDim)
     return;
   uint row = element / (QHeads * HeadDim);
   uint remainder = element % (QHeads * HeadDim);
   uint query_head = remainder / HeadDim;
   uint dim = remainder % HeadDim;
-  uint grouped_index = (query_head * Rows + row) * HeadDim + dim;
+  uint grouped_index = (query_head * rows + row) * HeadDim + dim;
   row_major[element] = grouped[grouped_index];
 }
 
@@ -497,14 +502,15 @@ inline void draft_conv_decode_batch_impl(
     device const bfloat *base, device const bfloat *residual,
     device bfloat *output, constant DraftConvBatchParams &params, uint2 group,
     uint thread_index) {
-  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const ulong Rows = params.query_rows;
   constexpr ulong Dynamic = Hidden / 4;
   uint batch = group.y;
   draft_conv_phase<Hidden>(input + batch * Rows * Hidden,
                            dynamic + batch * Rows * Dynamic, base,
                            residual + batch * Rows * Hidden,
                            output + batch * Rows * Hidden,
-                           params.finish != 0, group.x, thread_index);
+                           params.finish != 0, group.x, thread_index,
+                           params.query_rows);
 }
 
 kernel void draft_conv(
@@ -543,12 +549,14 @@ inline void draft_attention_qkv_impl(
     device const bfloat *q_norm, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *query_keys, device bfloat *query_values,
+    constant DraftConvBatchParams &params,
     threadgroup float *reductions, threadgroup bfloat *head, uint2 group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const ulong Rows = params.query_rows;
   constexpr ulong Packed = (ulong(QHeads) + 2 * KVHeads) * HeadDim;
   constexpr ulong Attention = ulong(QHeads) * HeadDim;
-  constexpr ulong RopeStride = Rows * (HeadDim / 2);
+  constexpr ulong RopeStride =
+      ulong(RICHENGINE_DRAFT_QUERY_ROWS) * (HeadDim / 2);
   uint batch = group.y;
   draft_qkv_prepare_phase<QHeads, KVHeads, HeadDim, Interleaved, E5>(
       proposal_qkv + batch * Rows * Packed,
@@ -556,7 +564,7 @@ inline void draft_attention_qkv_impl(
       rope_cos + batch * RopeStride, rope_sin + batch * RopeStride,
       query_keys + batch * KVHeads * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows, reductions, head,
-      group.x, thread_index, lane, simd_group);
+      group.x, thread_index, lane, simd_group, params.query_rows);
 }
 
 #define DRAFT_QKV_KERNEL(NAME, QH, KV, HD, INTERLEAVED, E5)                  \
@@ -569,6 +577,7 @@ inline void draft_attention_qkv_impl(
       device const float *rope_sin [[buffer(5)]],                            \
       device bfloat *query_keys [[buffer(6)]],                               \
       device bfloat *query_values [[buffer(7)]],                             \
+      constant DraftConvBatchParams &params [[buffer(8)]],                   \
       uint2 group [[threadgroup_position_in_grid]],                          \
       uint thread_index [[thread_index_in_threadgroup]],                     \
       uint lane [[thread_index_in_simdgroup]],                               \
@@ -577,13 +586,14 @@ inline void draft_attention_qkv_impl(
     threadgroup bfloat head[HD];                                             \
     draft_attention_qkv_impl<QH, KV, HD, INTERLEAVED, E5>(                   \
         proposal_qkv, queries, q_norm, k_norm, rope_cos, rope_sin,           \
-        query_keys, query_values, reductions, head, group, thread_index,     \
-        lane, simd_group);                                                   \
+        query_keys, query_values, params, reductions, head, group,           \
+        thread_index, lane, simd_group);                                     \
   }
 
 DRAFT_QKV_KERNEL(draft_attention_qkv, 32, 8, 128, false, false)
 DRAFT_QKV_KERNEL(draft_attention_qkv_q16k2, 16, 2, 128, false, false)
 DRAFT_QKV_KERNEL(draft_attention_qkv_q32k8d64i, 32, 8, 64, true, true)
+DRAFT_QKV_KERNEL(draft_attention_qkv_q8k2d256, 8, 2, 256, false, false)
 
 // Grid {kv heads, lanes, splits}: every split streams its share of the live
 // ring tiles of its head and the last one adds the current rows. Partials
@@ -597,13 +607,11 @@ inline void draft_attention_split_impl(
     device bfloat *query_keys, device bfloat *query_values,
     constant DraftAttentionBatchParams &params, threadgroup float *workspace,
     uint3 group, uint thread_index, uint lane, uint simd_group) {
-  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const ulong Rows = params.query_rows;
   // M rows of a KV group's head block per threadgroup: at 8-row blocks the
   // tile covers the group's M/8 heads outright; wider blocks split the group
   // into Rows/8 head tiles, which group.x walks before the KV head.
-  constexpr uint RowTiles = Rows / 8;
-  static_assert(RowTiles >= 1 && (M / 8) * Rows % M == 0,
-                "draft attention head tiles do not tile the KV group");
+  const uint RowTiles = uint(Rows) / 8;
   constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
   constexpr ulong Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
@@ -626,9 +634,9 @@ inline void draft_attention_split_impl(
       query_values + batch * KVHeads * HeadDim * Rows +
           kv_head * Rows * HeadDim,
       partials, params.value_stride, params.cache_length[batch], params.window,
-      group.z, params.causal != 0, workspace, workspace + M * N,
-      workspace + M * N + M, workspace + M * N + 2 * M, thread_index, lane,
-      simd_group);
+      group.z, params.causal != 0, params.query_rows, workspace,
+      workspace + M * N, workspace + M * N + M, workspace + M * N + 2 * M,
+      thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split(
@@ -697,12 +705,37 @@ kernel void draft_attention_bf16_split_q32k8d64i(
       simd_group);
 }
 
+kernel void draft_attention_bf16_split_q8k2d256(
+    device bfloat *queries [[buffer(0)]],
+    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
+    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
+    device bfloat *values0 [[buffer(5)]],
+    device bfloat *values1 [[buffer(6)]],
+    device bfloat *values2 [[buffer(7)]],
+    device bfloat *values3 [[buffer(8)]],
+    device bfloat *query_keys [[buffer(9)]],
+    device bfloat *query_values [[buffer(10)]],
+    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  // N=128: the score region must also hold the current-row values' D*16
+  // bf16 (2048 floats here) — 64-wide tiles leave it overhanging the row
+  // statistics.
+  threadgroup float workspace[32 * 128 + 3 * 32];
+  draft_attention_split_impl<32, 128, 2, 256>(
+      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      query_keys, query_values, params, workspace, group, thread_index, lane,
+      simd_group);
+}
+
 template <uint M, uint KVHeads, uint HeadDim>
 inline void draft_attention_reduce_impl(device bfloat *queries,
                                         constant DraftAttentionBatchParams &params,
                                         uint2 group, uint thread_index) {
-  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
-  constexpr ulong RowTiles = Rows / 8;
+  const ulong Rows = params.query_rows;
+  const ulong RowTiles = Rows / 8;
   constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y;
@@ -730,41 +763,59 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce, 32, 8, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q16k2, 64, 2, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q32k8d64i, 32, 8, 64)
+DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q8k2d256, 32, 2, 256)
 
 template <uint QHeads, uint HeadDim>
 inline void draft_attention_reorder_impl(device const bfloat *grouped,
-                                         device bfloat *row_major, uint2 group,
+                                         device bfloat *row_major,
+                                         uint query_rows, uint2 group,
                                          uint thread_index) {
-  constexpr ulong Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const ulong Rows = query_rows;
   constexpr ulong Attention = ulong(QHeads) * HeadDim;
   uint batch = group.y;
   draft_attention_reorder_phase<QHeads, HeadDim>(
       grouped + batch * Rows * Attention, row_major + batch * Rows * Attention,
-      group.x, thread_index);
+      group.x, thread_index, query_rows);
 }
 
 kernel void draft_attention_reorder(
     device const bfloat *grouped [[buffer(0)]],
     device bfloat *row_major [[buffer(1)]],
+    constant uint &query_rows [[buffer(2)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<32, 128>(grouped, row_major, group, thread_index);
+  draft_attention_reorder_impl<32, 128>(grouped, row_major, query_rows, group,
+                                        thread_index);
 }
 
 kernel void draft_attention_reorder_q16k2(
     device const bfloat *grouped [[buffer(0)]],
     device bfloat *row_major [[buffer(1)]],
+    constant uint &query_rows [[buffer(2)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<16, 128>(grouped, row_major, group, thread_index);
+  draft_attention_reorder_impl<16, 128>(grouped, row_major, query_rows, group,
+                                        thread_index);
 }
 
 kernel void draft_attention_reorder_q32k8d64i(
     device const bfloat *grouped [[buffer(0)]],
     device bfloat *row_major [[buffer(1)]],
+    constant uint &query_rows [[buffer(2)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<32, 64>(grouped, row_major, group, thread_index);
+  draft_attention_reorder_impl<32, 64>(grouped, row_major, query_rows, group,
+                                       thread_index);
+}
+
+kernel void draft_attention_reorder_q8k2d256(
+    device const bfloat *grouped [[buffer(0)]],
+    device bfloat *row_major [[buffer(1)]],
+    constant uint &query_rows [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  draft_attention_reorder_impl<8, 256>(grouped, row_major, query_rows, group,
+                                       thread_index);
 }
 
 // The plain transformer draft's residual adds, which the DFlash2 path folds

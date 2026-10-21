@@ -52,6 +52,8 @@ RECORD_KEYS = {
     "version",
     "model",
     "family",
+    "signature",
+    "serving",
     "target_format",
     "vision_format",
     "sources",
@@ -178,7 +180,10 @@ def _well_formed(record):
     sources = record.get("sources")
     files = record.get("files")
     return (
-        set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        # signature and serving joined the record after version 1 shipped:
+        # a record without them is older, not invalid.
+        set(record) <= RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        and RECORD_KEYS - {"signature", "serving"} <= set(record)
         and type(record["version"]) is int
         and record["version"] == 1
         and isinstance(record["model"], str)

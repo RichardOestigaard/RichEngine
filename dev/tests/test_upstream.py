@@ -115,35 +115,40 @@ class UpstreamTest(unittest.TestCase):
         for name in ("someone/NotBonsai-2-27B", "someone/Qwen3.8-27BX"):
             with self.subTest(name=name):
                 self.assertIs(families.family_for(config, name=name), DENSE)
-        bonsai = text_config(families.named("Bonsai-2-27B"))
-        del bonsai["partial_rotary_factor"]
+        # A config stating a field no signature requires changes nothing:
+        # the strict match still resolves it.
+        extended = text_config(DENSE, partial_rotary_factor=0.25)
         self.assertIs(
             families.family_for(
-                {"text_config": bonsai}, name="someone/NotBonsai-2-27B"
+                {"text_config": extended}, name="someone/NotBonsai-2-27B"
             ),
             DENSE,
         )
 
-    def test_a_forbidden_field_beats_the_name_hint(self):
-        # A config declaring Qwen3.8-27B's MTP head is not Bonsai-2-27B,
-        # even when the repository's name says so and the signature's
-        # deciding field is omitted: Bonsai forbids the stated field.
+    def test_an_unstated_signature_field_does_not_disqualify(self):
+        # A config stating fields beyond the signature still resolves:
+        # the signature is a subset match, not an equality — a stock
+        # Qwen3.8 config declaring an MTP layer count (the GGUF
+        # metadata's num_nextn_predict_layers spelling) resolves.
         config = {"text_config": text_config(DENSE, num_nextn_predict_layers=1)}
-        self.assertIs(
-            families.family_for(config, name="prism-ml/Ternary-Bonsai-2-27B"),
-            DENSE,
+        self.assertEqual(
+            families.family_for(config, name="someone/Qwen3.8-27B").name,
+            "Qwen3.8-27B",
         )
 
-    def test_a_forbidden_field_beats_a_strict_match(self):
-        # The same stated field disqualifies Bonsai's own signature; the
-        # shorter Qwen3.8 signature it extends resolves instead.
-        bonsai = families.named("Bonsai-2-27B")
-        config = {"text_config": text_config(bonsai, num_nextn_predict_layers=1)}
-        self.assertIs(families.family_for(config), DENSE)
+    def test_an_unstated_field_resolves_bare(self):
+        # Bare resolution agrees: extra stated fields are ignored when
+        # every signature field matches.
+        config = {"text_config": text_config(DENSE, num_nextn_predict_layers=1)}
+        self.assertEqual(families.family_for(config).name, "Qwen3.8-27B")
 
     def test_the_runtimes_family_table_matches_the_installers(self):
         # ModelDescriptor.mm's kModelFamilies resolves model.json's family;
         # a family one table names and the other does not fails at serve.
+        # Rows may additionally name a retired family (a Legacy alias
+        # comment): existing packages still resolve, but the installer
+        # must not offer them — so extra rows are allowed only when they
+        # carry the alias marker.
         source = (
             Path(__file__).resolve().parents[2] / "runtime/model/ModelDescriptor.mm"
         ).read_text()
@@ -151,13 +156,26 @@ class UpstreamTest(unittest.TestCase):
             r'\{"([^"]+)",\s*"([^"]+)",\s*(?:nullptr|"[^"]+"),',
             source,
         )
-        self.assertEqual(
-            {name: model_type for name, model_type in rows},
-            {
-                family.name: dict(family.signature)["model_type"]
-                for family in families.FAMILIES
-            },
+        table = {name: model_type for name, model_type in rows}
+        installer = {
+            family.name: dict(family.signature)["model_type"]
+            for family in families.FAMILIES
+        }
+        legacy_names = set(
+            re.findall(r'// Legacy alias[^}]*\{"([^"]+)"', source)
         )
+        extra = set(table) - set(installer)
+        self.assertLessEqual(extra, legacy_names)
+        self.assertEqual(
+            {name: table[name] for name in set(table) - legacy_names},
+            installer,
+        )
+        # An alias row must resolve to the same model_type its
+        # LEGACY_NAMES target serves — a typo'd type here fails at load
+        # the same as a missing row.
+        for alias, target in families.LEGACY_NAMES.items():
+            self.assertIn(alias, table)
+            self.assertEqual(table[alias], installer[target])
 
     def test_gemma4_family_matches_its_published_configurations(self):
         # The text_config of google/gemma-4-26B-A4B-it's config.json, and
@@ -462,19 +480,21 @@ class UpstreamTest(unittest.TestCase):
                 },
             ),
             ("mxfp4", {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}}),
-            ("q8", {"quantization": {"bits": 8, "group_size": 64}}),
+            # Outside the oQ affine matrix (4-8 bits, groups of 64 or 128).
+            ("q3", {"quantization": {"bits": 3, "group_size": 64}}),
+            ("g32", {"quantization": {"bits": 4, "group_size": 32}}),
+            ("g256", {"quantization": {"bits": 4, "group_size": 256}}),
         ):
             with self.subTest(name=name):
                 fake.publish(f"someone/{name}", "b" * 40, target(quantization))
                 with self.assertRaisesRegex(
-                    models.ModelError, "requires an MLX affine 4-bit/group-64"
+                    models.ModelError, "requires an MLX affine checkpoint"
                 ):
                     self.prepare(selection(self.root, f"someone/{name}"))
-        # A per-tensor override quantizing differently — the LFM2.5 exports'
-        # 6-bit model.embed_tokens — refuses early rather than failing to
-        # assemble with a shape error the runtime cannot explain.
+        # A per-module override outside the matrix refuses early, naming
+        # the module.
         fake.publish(
-            "someone/q6-embed",
+            "someone/q2-embed",
             "d" * 40,
             target(
                 {
@@ -482,26 +502,50 @@ class UpstreamTest(unittest.TestCase):
                         "bits": 4,
                         "group_size": 64,
                         "mode": "affine",
-                        "model.embed_tokens": {"bits": 6, "group_size": 64},
+                        "model.embed_tokens": {"bits": 2, "group_size": 32},
                     }
                 }
             ),
         )
         with self.assertRaisesRegex(
-            models.ModelError, "quantizes model.embed_tokens at 6"
+            models.ModelError, "model.embed_tokens at 2 bits/group-32"
         ):
-            self.prepare(selection(self.root, "someone/q6-embed"))
-        # An override stating the supported quantization is no obstacle.
-        compatible = {
-            "bits": 4,
-            "group_size": 64,
-            "mode": "affine",
-            "model.lm_head": {"bits": 4, "group_size": 64},
-        }
-        fake.publish(
-            "someone/q4-override", "e" * 40, target({"quantization": compatible})
-        )
-        self.prepare(selection(self.root, "someone/q4-override"))
+            self.prepare(selection(self.root, "someone/q2-embed"))
+        # Everything in the matrix installs: uniform 8-bit, the oQ
+        # per-module overrides (the LFM2.5 exports' 6-bit model.embed_tokens
+        # among them) and a group-128 global.
+        for name, quantization in (
+            ("q8", {"bits": 8, "group_size": 64, "mode": "affine"}),
+            ("q8g128", {"bits": 8, "group_size": 128}),
+            (
+                "oq4e",
+                {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    "model.embed_tokens": {"bits": 8, "group_size": 64},
+                    "model.layers.0.self_attn.v_proj": {
+                        "bits": 6,
+                        "group_size": 128,
+                    },
+                },
+            ),
+            (
+                "q4-override",
+                {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    "model.lm_head": {"bits": 4, "group_size": 64},
+                },
+            ),
+        ):
+            with self.subTest(name=name):
+                fake.publish(
+                    f"someone/{name}", "f" * 40, target({"quantization": quantization})
+                )
+                self.prepare(selection(self.root, f"someone/{name}"))
+                assembly.verify(selection(self.root, f"someone/{name}").link)
         # MLX writes both keys, and states the mode only in newer versions.
         affine = {"bits": 4, "group_size": 64, "mode": "affine"}
         fake.publish(

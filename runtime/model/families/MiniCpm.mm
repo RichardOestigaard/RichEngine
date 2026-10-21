@@ -21,6 +21,8 @@ DFlashDraftLayout denseDraftLayout() {
   layout.targetHiddenSize = DenseLayout{}.capturedHiddenSize();
   layout.selectorRank = 0;
   layout.kvHeads = 2;
+  layout.headCore = ops::DraftHeadCore::Q16K2D128;
+  layout.contextCore = ops::DraftContextCore::Plain2048;
   layout.markovRank = 256;
   layout.blockSize = 7;
   return layout;
@@ -32,8 +34,9 @@ DFlashDraftLayout denseDraftLayout() {
 // 256-rank candidate selector, declared as DFlash2DraftModel.
 DFlashDraftLayout denseDFlash2DraftLayout() {
   DFlashDraftLayout layout = denseDraftLayout();
-  layout.kind = DraftKind::DFlash2;
+  layout.kind = DraftKind::DFlashTwo;
   layout.dynamicSize = 512;
+  layout.contextCore = ops::DraftContextCore::Hidden2048;
   layout.selectorRank = 256;
   layout.markovRank = 0;
   return layout;

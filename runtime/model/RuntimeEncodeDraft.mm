@@ -13,11 +13,15 @@ namespace richengine::model {
       throw std::logic_error("decode state length is not exact");
     }
     static_cast<void>(synchronizedPageTable(entry, item));
+    // The draft input packs at the draft's query stride, so its embedding
+    // gathers draft.queryRows() rows per lane; the anchor occupies row 0.
+    const uint32_t queryRows = geometry.draft.queryRows();
     auto *draftInput = contents<uint32_t>(
-        decodeArena->get(lane, DecodeTensor::DraftInputTokens),
-        "draft input tokens");
+        decodeArena->packed(DecodeTensor::DraftInputTokens, kLaneCount),
+        "draft input tokens") +
+        lane * queryRows;
     draftInput[0] = *entry.pendingToken;
-    std::fill(draftInput + 1, draftInput + kDecodeRows,
+    std::fill(draftInput + 1, draftInput + queryRows,
               geometry.target.maskToken);
 
     auto *positions =
@@ -123,6 +127,99 @@ namespace richengine::model {
           std::span(anchors).first(lanes), std::span(policies).first(lanes),
           treeMask);
     }, draftModel);
+  }
+
+  // The speculative next-step draft: the step's own commit has already run,
+  // so the rings hold every committed context row and the lanes' next
+  // anchors and positions are host-known. The draft's own graph replays
+  // unchanged — embedding, the baked draft span and the selector — writing
+  // ProposedTokens the next decode adopts or overwrites.
+  void Runtime::Impl::launchDraftPredraft(
+      std::span<const DecodeLaneResult> lanes,
+      std::span<const ModelBatchItem> items) {
+    if (!gpuPredraftOn_ || std::holds_alternative<NullDraft>(draftModel))
+      return;
+    const uint32_t width = static_cast<uint32_t>(lanes.size());
+    GpuPredraft predraft;
+    std::array<Request *, kLaneCount> entries{};
+    std::array<uint64_t, kLaneCount> logicalPositions{};
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Request &entry = *lanes[lane].request;
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      // Any lane that cannot take a chain draft vetoes the batch: finished
+      // or terminal anchors leave no next step to draft, a failed lane
+      // committed nothing to draft from, and a sampled, constrained or
+      // penalized policy could change before adoption.
+      if (!lanes[lane].failure.empty() || !entry.resident ||
+          !entry.pendingToken ||
+          entry.generatedTokens >= entry.maxNewTokens ||
+          isStopToken(geometry, *entry.pendingToken) || policy.samples() ||
+          policy.constrained || policy.penalties.active())
+        return;
+      predraft.requestIds[lane] = entry.id;
+      predraft.anchors[lane] = *entry.pendingToken;
+      predraft.positions[lane] =
+          items[lane].logicalPosition + lanes[lane].retained;
+      entries[lane] = &entry;
+      logicalPositions[lane] = predraft.positions[lane];
+      packDraftPredraftLane(lane, *entry.pendingToken,
+                            predraft.positions[lane]);
+    }
+    CommandGraph graph;
+    addRopeTables(
+        graph, decodeArena->packed(DecodeTensor::Positions, width), 0,
+        decodeArena->packed(DecodeTensor::DraftPositions, width),
+        width * kDecodeRows,
+        decodeArena->packed(DecodeTensor::RopeCos, width),
+        decodeArena->packed(DecodeTensor::RopeSin, width),
+        decodeArena->packed(DecodeTensor::DraftRopeCos, width),
+        decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+    encodeBatchEmbedding(graph, DecodeTensor::DraftInputTokens,
+                         DecodeTensor::DraftHidden0, width, 1,
+                         geometry.draft.queryRows());
+    encodeDraftBatchGraph(graph, {entries.data(), width},
+                          {logicalPositions.data(), width});
+    predraft.epoch = arenaEpoch_;
+    predraft.lanes = width;
+    predraft.ticket = backend.submitCommandAsync(graph.dispatches());
+    predraft.submitted = true;
+    gpuPredraft_ = std::move(predraft);
+  }
+
+  bool Runtime::Impl::adoptGpuPredraft(std::span<Request *const> entries,
+                                       std::span<const ModelBatchItem> items,
+                                       uint32_t width, bool allowed) {
+    // armed, not submitted: the ticket may already be consumed by a
+    // settleGpuPredraft on this decode path — the lane bookkeeping is the
+    // proposal proof either way.
+    if (!gpuPredraft_.lanes)
+      return false;
+    settleGpuPredraft();
+    GpuPredraft predraft = std::move(gpuPredraft_);
+    gpuPredraft_ = GpuPredraft{};
+    // The epoch proves no other decode wrote the arena's proposal buffers
+    // since the predraft ran; the per-lane match proves the same requests
+    // continue at the anchors and positions it assumed.
+    if (!allowed || width != predraft.lanes ||
+        arenaEpoch_ != predraft.epoch)
+      return false;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Request &entry = *entries[lane];
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      if (entry.id != predraft.requestIds[lane] || !entry.pendingToken ||
+          *entry.pendingToken != predraft.anchors[lane] ||
+          items[lane].logicalPosition != predraft.positions[lane] ||
+          policy.samples() || policy.constrained || policy.penalties.active()) {
+        if (draftDebug_)
+          fprintf(stderr, "gpu-predraft miss lane=%u id=%llu/%llu\n", lane,
+                  (unsigned long long)entry.id,
+                  (unsigned long long)predraft.requestIds[lane]);
+        return false;
+      }
+    }
+    if (draftDebug_)
+      fprintf(stderr, "gpu-predraft adopted lanes=%u\n", width);
+    return true;
   }
 
   void Runtime::Impl::encodeDraftStateCommitBatch(CommandGraph &graph,

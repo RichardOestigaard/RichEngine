@@ -18,5 +18,8 @@ namespace richengine::ops {
 // 32 query heads over 8 KV heads of dimension 64 with interleaved rotary:
 // LFM2.5's draft, whose kernels carry the "_q32k8d64i" suffix.
 [[nodiscard]] const char *draftCore32x8x64Interleaved(std::string_view base);
+// 8 query heads over 2 KV heads of dimension 256: MiniCPM-V 4.7's DSpark
+// draft, whose kernels carry the "_q8k2d256" suffix.
+[[nodiscard]] const char *draftCore8x2x256(std::string_view base);
 
 } // namespace richengine::ops

@@ -25,10 +25,13 @@ static_assert(sizeof(FullPrefillParams) == 8,
 struct FullDecodeBatchParams {
   uint32_t lanes;
   uint32_t rows;
+  // The lane stride of the rope cos/sin tables: the decode positions always
+  // run the full verify capacity, even on a shorter trained-block stride.
+  uint32_t rope_stride;
 };
 
-static_assert(sizeof(FullDecodeBatchParams) == 8,
-              "Full attention verify parameters are 8 bytes on both sides");
+static_assert(sizeof(FullDecodeBatchParams) == 12,
+              "Full attention verify parameters are 12 bytes on both sides");
 
 // One full-attention layer's paged KV. Every current row is written directly
 // into its final page slot before attention. Prefill and verify both read

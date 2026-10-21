@@ -241,6 +241,38 @@ struct GgufEmbedIQ3S {
     return bfloat(float(gguf_half(block, D)) * float(1 + 2 * s) * float(magnitude) * sign);
   }
 };
+// The oQ (oMLX) native token rows (metal/abi/QuantFormat.h's private AF
+// types): per Gs-element group, Gs * Bits / 8 bytes of codes as a
+// little-endian bitstream in element order — element e at bits
+// [e * Bits, (e + 1) * Bits) — then the bf16 scale and bias.
+// value = s * code + bias.
+template <uint Bits, uint Gs> struct GgufEmbedOq {
+  enum : uint { Weights = Gs, Bytes = Gs * Bits / 8 + 4, Meta = Gs * Bits / 8 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint l = dim % Weights, o = l * Bits;
+    device const uchar *q = block + (o >> 3);
+    const uint code = (uint(q[0]) | uint(q[1]) << 8) >> (o & 7) & ((1u << Bits) - 1);
+    const float s = float(as_type<bfloat>(ushort(block[Meta] | block[Meta + 1] << 8)));
+    const float m = float(as_type<bfloat>(ushort(block[Meta + 2] | block[Meta + 3] << 8)));
+    return bfloat(s * float(code) + m);
+  }
+};
+// The fp32 rows of a table oQ leaves unquantized (QuantizedSegment::kFloat32).
+struct GgufEmbedF32 {
+  enum : uint { Weights = 1, Bytes = 4 };
+  __attribute__((always_inline)) static bfloat value(device const uchar *block, uint) {
+    return bfloat(*((device const float *)block));
+  }
+};
+using GgufEmbedAF4 = GgufEmbedOq<4, 64>;
+using GgufEmbedAF5 = GgufEmbedOq<5, 64>;
+using GgufEmbedAF6 = GgufEmbedOq<6, 64>;
+using GgufEmbedAF8 = GgufEmbedOq<8, 64>;
+using GgufEmbedAF4G128 = GgufEmbedOq<4, 128>;
+using GgufEmbedAF5G128 = GgufEmbedOq<5, 128>;
+using GgufEmbedAF6G128 = GgufEmbedOq<6, 128>;
+using GgufEmbedAF8G128 = GgufEmbedOq<8, 128>;
 // Inlined, with each format's value, so every gather stays one function (the
 // compiler otherwise keeps Q6_K's as a call).
 template <class F>
@@ -273,21 +305,36 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_pq20, GgufEmbedPQ20)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4nl, GgufEmbedIQ4NL)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq4xs, GgufEmbedIQ4XS)
 GGUF_EMBEDDING_ENTRY(gguf_embed_iq3s, GgufEmbedIQ3S)
+// One per oq_embedding_format (metal/abi/Gguf.h), and the f32 gather.
+GGUF_EMBEDDING_ENTRY(gguf_embed_af4, GgufEmbedAF4)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af5, GgufEmbedAF5)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af6, GgufEmbedAF6)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af8, GgufEmbedAF8)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af4g128, GgufEmbedAF4G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af5g128, GgufEmbedAF5G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af6g128, GgufEmbedAF6G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af8g128, GgufEmbedAF8G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_f32, GgufEmbedF32)
 #undef GGUF_EMBEDDING_ENTRY
 
-// A verify step's input tokens, RICHENGINE_TARGET_VERIFY_ROWS per lane: the
+// A verify step's input tokens, params.verify_stride rows per lane (the
+// draft's trained verify depth, at most RICHENGINE_TARGET_VERIFY_ROWS): the
 // lane's anchor, row 0 of its draft input, then the draft's proposals, each
-// clamped into the vocabulary.
+// clamped into the vocabulary. A row at or past the lane's live count can
+// never be retained, so it repeats the anchor: identical tokens keep the
+// expert routing (and so the weight traffic) of dead rows on the anchor's
+// paths instead of adding their own.
 kernel void verify_input_tokens(
     device const uint *draft_input [[buffer(0)]],
     device const uint *draft_tokens [[buffer(1)]],
     device uint *verify_input [[buffer(2)]],
     constant VerifyInputBatchParams &params [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
-  uint batch = index / RICHENGINE_TARGET_VERIFY_ROWS;
-  uint row = index % RICHENGINE_TARGET_VERIFY_ROWS;
-  uint token = row == 0
-                   ? draft_input[batch * RICHENGINE_TARGET_VERIFY_ROWS]
+  uint batch = index / params.verify_stride;
+  uint row = index % params.verify_stride;
+  const uint anchor = draft_input[batch * params.draft_stride];
+  uint token = row == 0 || row >= params.live_rows[batch]
+                   ? anchor
                    : draft_tokens[batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);

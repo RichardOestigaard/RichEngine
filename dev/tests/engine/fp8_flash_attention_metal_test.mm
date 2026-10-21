@@ -72,6 +72,20 @@ makePipeline(id<MTLDevice> device, id<MTLLibrary> library,
   return result;
 }
 
+// Like makePipeline but returns nil when the device cannot build the
+// kernel (threadgroup memory above the device limit) — lets a test skip
+// a shape instead of failing on a smaller device.
+id<MTLComputePipelineState>
+tryMakePipeline(id<MTLDevice> device, id<MTLLibrary> library,
+                const std::string &name) {
+  id<MTLFunction> function =
+      [library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+  if (!function)
+    throw std::runtime_error("missing Metal kernel: " + name);
+  NSError *error = nil;
+  return [device newComputePipelineStateWithFunction:function error:&error];
+}
+
 void finish(id<MTLCommandBuffer> command) {
   [command commit];
   [command waitUntilCompleted];
@@ -309,17 +323,24 @@ struct Pipelines {
   std::string prefillSplitName;
   id<MTLComputePipelineState> prefillSplit;
   id<MTLComputePipelineState> prefillReduce;
+  bool unsupported = false;
 };
 
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                       Shape shape) {
   Pipelines result;
   result.splitName = std::string(richengine::ops::kVerifyAttentionFp8Split) + shape.suffix;
-  result.split = makePipeline(device, library, result.splitName);
+  result.split = tryMakePipeline(device, library, result.splitName);
+  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionFp8Split) + shape.suffix;
+  result.prefillSplit = tryMakePipeline(device, library, result.prefillSplitName);
+  if (!result.split || !result.prefillSplit) {
+    std::cout << "skipped " << shape.suffix
+              << ": kernel exceeds the device's threadgroup memory\n";
+    result.unsupported = true;
+    return result;
+  }
   result.reduce = makePipeline(
       device, library, std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix);
-  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionFp8Split) + shape.suffix;
-  result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
       device, library, std::string(richengine::ops::kPrefillAttentionReduce) + shape.suffix);
   std::cout << "pipeline=" << result.splitName
@@ -350,7 +371,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
   const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(float));
+      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -397,7 +418,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
   const uint64_t slots = uint64_t{shape.kvHeads} * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(float));
+      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -531,7 +552,7 @@ void benchmark(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
   const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(float));
+      device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   std::array<VerifyAttentionParams, 4> params{};
@@ -593,6 +614,8 @@ void run(const char *libraryPath) {
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
     const Pipelines pipelines = makePipelines(device, library, shape);
+    if (pipelines.unsupported)
+      continue;
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
     runCase(device, queue, pipelines, shape, 0, 8, 4);

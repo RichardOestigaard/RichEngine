@@ -33,24 +33,83 @@ class PackageFormat(NamedTuple):
     family: str
     # Manifest section -> the architecture it must declare.
     declarations: dict
+    # The draft_layer_magic values the format's manifests may state:
+    # MDFD0004 is the DFlash2 layout and the Null draft's magic, MDFS0006 a
+    # DSpark draft, MDFP0005 a packed plain-transformer DFlash draft.
+    draft_layer_magics: frozenset = frozenset({"MDFD0004"})
+    # False for formats that may pack no draft weights — gemma4's and the
+    # 24B LFM2's manifest-declared draft is optional, and DiffusionGemma
+    # carries no draft payload at all.
+    draft_payload: bool = True
 
+
+DSPARK_DRAFT_MAGIC = "MDFS0006"
+DFLASH_V1_DRAFT_MAGIC = "MDFP0005"
 
 PACKAGE_FORMATS = {
     # The splash-packed-* names are the same formats published before the
     # rename.
-    "splash-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
+    "splash-packed-q4": PackageFormat(
+        3,
+        "MDFL0006",
+        "Qwen3.8-27B",
+        {},
+        frozenset({"MDFD0004"}),
+    ),
     "splash-packed-q4-moe": PackageFormat(
         4,
         "MDFM0001",
         "Qwen3.6-35B-A3B",
         {TARGET: "qwen3_5_moe", DRAFT: "DFlash2DraftModel"},
+        frozenset({"MDFD0004", DFLASH_V1_DRAFT_MAGIC}),
     ),
-    "richengine-packed-q4": PackageFormat(3, "MDFL0006", "Qwen3.8-27B", {}),
+    "splash-packed-q4-dense": PackageFormat(
+        1, "MDFN0001", "MiniCPM5-2B", {}, frozenset({"MDFD0004", DSPARK_DRAFT_MAGIC})
+    ),
+    "splash-packed-q4-lfm2": PackageFormat(
+        1, "MDFH0001", "LFM2.5-2.6B", {}, frozenset({DSPARK_DRAFT_MAGIC})
+    ),
+    "splash-packed-q4-lfm2moe": PackageFormat(
+        1, "MDFH0003", "LFM2.5-8B-A1B", {}, frozenset({DSPARK_DRAFT_MAGIC})
+    ),
+    "richengine-packed-q4": PackageFormat(
+        3,
+        "MDFL0006",
+        "Qwen3.8-27B",
+        {},
+        frozenset({"MDFD0004"}),
+    ),
     "richengine-packed-q4-moe": PackageFormat(
         4,
         "MDFM0001",
         "Qwen3.6-35B-A3B",
         {TARGET: "qwen3_5_moe", DRAFT: "DFlash2DraftModel"},
+        frozenset({"MDFD0004", DFLASH_V1_DRAFT_MAGIC}),
+    ),
+    "richengine-packed-q4-dense": PackageFormat(
+        1, "MDFN0001", "MiniCPM5-2B", {}, frozenset({"MDFD0004", DSPARK_DRAFT_MAGIC})
+    ),
+    "richengine-packed-q4-lfm2": PackageFormat(
+        1, "MDFH0001", "LFM2.5-2.6B", {}, frozenset({DSPARK_DRAFT_MAGIC})
+    ),
+    "richengine-packed-q4-lfm2moe": PackageFormat(
+        1, "MDFH0003", "LFM2.5-8B-A1B", {}, frozenset({DSPARK_DRAFT_MAGIC})
+    ),
+    "richengine-packed-q4-lfm2moe24b": PackageFormat(
+        1,
+        "MDFH0005",
+        "LFM2.5-24B-A2B",
+        {},
+        frozenset({"MDFD0004", DSPARK_DRAFT_MAGIC}),
+        draft_payload=False,
+    ),
+    "richengine-packed-q4-gemma4": PackageFormat(
+        1, "GEMM0001", "Gemma4-26B-A4B", {},
+        frozenset({"MDFD0004", DFLASH_V1_DRAFT_MAGIC}),
+        draft_payload=False,
+    ),
+    "richengine-packed-q4-diffusiongemma": PackageFormat(
+        1, "GEMM0001", "DiffusionGemma-26B-A4B", {}, draft_payload=False
     ),
 }
 
@@ -105,13 +164,12 @@ def validate_manifest(path: Path):
     expected_format = {
         "section_alignment_bytes": ALIGNMENT,
         "target_layer_magic": layout.target_layer_magic,
-        "draft_layer_magic": "MDFD0004",
         "vision_magic": "MDFV0001",
     }
     if any(
         type(format_.get(key)) is not type(value) or format_[key] != value
         for key, value in expected_format.items()
-    ):
+    ) or format_.get("draft_layer_magic") not in layout.draft_layer_magics:
         raise models.ModelError(
             "runtime package has an unsupported packed weight format"
         )
@@ -137,7 +195,7 @@ def validate_manifest(path: Path):
     ):
         raise models.ModelError("runtime package artifact paths overlap")
     family = families.named(layout.family)
-    if family is None or family.draft is None:
+    if family is None:
         raise models.ModelError(
             "runtime package names a family this release does not serve: "
             + layout.family
@@ -147,11 +205,23 @@ def validate_manifest(path: Path):
         f"{TARGET}/embedding.bin",
         f"{TARGET}/head.bin",
         *(f"{TARGET}/layer-{index}.bin" for index in range(target_layers)),
-        f"{DRAFT}/model.bin",
-        *(f"{DRAFT}/layer-{index}.bin" for index in range(family.draft.layers)),
-        f"{VISION}/model.bin",
         *(f"{TOKENIZER}/{name}" for name in PACKAGE_TOKENIZER_FILES),
     }
+    if family.vision:
+        required_files.add(f"{VISION}/model.bin")
+    # MDFD0004 doubles as the Null draft's magic, so a declared real-draft
+    # kind (MDFP0005 DFlashV1, MDFS0006 DSpark) requires the artifacts even
+    # when the format treats the payload as optional.
+    declared_draft = format_.get("draft_layer_magic")
+    if family.draft is not None and (
+        layout.draft_payload
+        or declared_draft in {DFLASH_V1_DRAFT_MAGIC, DSPARK_DRAFT_MAGIC}
+    ):
+        required_files |= {
+            f"{DRAFT}/model.bin",
+            *(f"{DRAFT}/layer-{index}.bin"
+              for index in range(family.draft.layers)),
+        }
     missing = required_files - artifact_paths
     if missing:
         raise models.ModelError(

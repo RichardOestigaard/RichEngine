@@ -20,11 +20,17 @@ def stage_release(directory):
     for folder, names in (
         ("server", package.SERVER_FILES),
         ("install", package.INSTALL_FILES),
+        ("install/tuning", package.TUNING_FILES),
         ("install/completions", package.COMPLETION_FILES),
     ):
         (root / folder).mkdir(parents=True)
         for name in names:
             shutil.copy2(package.ROOT / folder / name, root / folder / name)
+    families = root / "install/families"
+    families.mkdir()
+    for path in (package.ROOT / "install/families").iterdir():
+        if path.suffix in (".py", ".json"):
+            shutil.copy2(path, families / path.name)
     (root / "build").mkdir()
     for name in ("richengine", "richengine.metallib"):
         (root / "build" / name).write_bytes(b"unused CPU test fixture")

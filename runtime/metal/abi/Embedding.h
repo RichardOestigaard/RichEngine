@@ -7,6 +7,8 @@
 #include <stdint.h>
 #endif
 
+#include "metal/abi/ExecutionGeometry.h"
+
 struct Q4EmbeddingParams {
   uint32_t rows;
   uint32_t vocabulary_size;
@@ -17,7 +19,21 @@ static_assert(sizeof(Q4EmbeddingParams) == 8,
 
 struct VerifyInputBatchParams {
   uint32_t vocabulary;
+  // The packed lane stride of the verify input: a lane's anchor and its
+  // proposal rows, RICHENGINE_TARGET_VERIFY_ROWS unless the draft's trained
+  // block is shorter (draft.verifyRows()).
+  uint32_t verify_stride;
+  // The packed lane stride of the draft input rows: the draft's trained
+  // query depth, RICHENGINE_DRAFT_QUERY_ROWS unless the draft's trained
+  // block is shorter (draft.queryRows()).
+  uint32_t draft_stride;
+  // Live verify rows per lane (anchor included): rows at or past a lane's
+  // count repeat its anchor instead of a proposal, so a dead row's expert
+  // routes collapse onto the anchor's rather than adding to the dispatch's
+  // distinct-expert union. The payload is patchable — budgets change per
+  // step inside the baked span.
+  uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(VerifyInputBatchParams) == 4,
-              "Verify input parameters are 4 bytes on both sides");
+static_assert(sizeof(VerifyInputBatchParams) == 28,
+              "Verify input parameters are 28 bytes on both sides");

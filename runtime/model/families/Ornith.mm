@@ -2,22 +2,9 @@
 
 namespace richengine::model {
 
-// A hypothetical DFlash2 draft for Ornith 9B, kept for source assemblies
-// whose draft config declares DFlash2DraftModel: same six layers over
-// hidden 4096 and eight captures.
-DFlashDraftLayout ornith9DFlash2DraftLayout() {
-  DFlashDraftLayout layout;
-  layout.layers = 6;
-  layout.hiddenSize = 4096;
-  layout.dynamicSize = 1024;
-  layout.qkvSize = 6144;
-  layout.attentionSize = 4096;
-  layout.intermediateSize = 12288;
-  layout.targetHiddenSize = 32768;
-  layout.kvHeads = 8;
-  layout.blockSize = 8;
-  return layout;
-}
+// Ornith 9B declares no DFlash2 draft layout: no compiled context core
+// covers hidden 4096/dynamic 1024, so a source assembly or packed manifest
+// naming DFlash2DraftModel is refused rather than mis-bound.
 
 // Ornith 1.5 9B's released DFlash draft (ornith-ai/Ornith-1.5-9B-DFlash): a
 // plain six-layer transformer over hidden 4096 reading the target's eight
@@ -38,6 +25,8 @@ DFlashDraftLayout ornith9DFlashV1DraftLayout() {
   layout.selectorRank = 0;
   layout.kvHeads = 8;
   layout.blockSize = 16;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
+  layout.contextCore = ops::DraftContextCore::Plain4096;
   return layout;
 }
 

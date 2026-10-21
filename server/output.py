@@ -184,13 +184,12 @@ def convert_value(text, types):
 
 
 def StreamingToolCallProjector(policy, request_id, structured=False):
-    """The output projector for the policy's tool-call dialect."""
+    """The output projector for the policy's tool-call dialect: its kind
+    names the projector the dialect's spelling needs; an unknown kind gets
+    the XML element reader."""
     dialect = getattr(policy, "dialect", None) or QWEN3_XML
-    if dialect.kind == "python":
-        return _PythonCallProjector(policy, request_id, structured, dialect)
-    if dialect.kind == "gemma4":
-        return _Gemma4CallProjector(policy, request_id, structured, dialect)
-    return _XmlToolCallProjector(policy, request_id, structured, dialect)
+    projector = _PROJECTORS.get(dialect.kind, _XmlToolCallProjector)
+    return projector(policy, request_id, structured, dialect)
 
 
 class _ProjectorBase:
@@ -1139,6 +1138,14 @@ def _python_call_value(token):
         return _jsonable(value)
     except (TypeError, RecursionError):
         return token
+
+
+# The projector a dialect kind binds: StreamingToolCallProjector reads it.
+# Kinds not listed read as XML elements.
+_PROJECTORS = {
+    "python": _PythonCallProjector,
+    "gemma4": _Gemma4CallProjector,
+}
 
 
 def _jsonable(value):

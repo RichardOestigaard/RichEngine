@@ -32,6 +32,7 @@ struct Qwen3_8Layout;
 struct DenseLayerWeights;
 struct Ornith9BLayout;
 struct Qwen3_6MoeLayout;
+struct MiniCpmV47MoeLayout;
 struct Qwen3_6MoeLayerWeights;
 struct DenseLayout;
 struct Gemma4MoeLayout;
@@ -39,6 +40,7 @@ struct Gemma4MoeLayerWeights;
 struct GraniteLayout;
 struct Lfm2Layout;
 struct Lfm2MoeLayout;
+struct Lfm2Moe24BLayout;
 struct Lfm2MoeLayerWeights;
 struct DiffusionGemmaLayout;
 
@@ -104,13 +106,20 @@ struct TargetModelGeometry final {
 
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
+  // The tokenizer's vocabulary: the logits argmax's bound. The head section
+  // and the logits buffers span paddedVocabularySize rows: a vocabulary that
+  // is not a storage-tile multiple pads to one (MiniCPM-V 4.7's 248144).
   uint32_t vocabularySize = 0;
+  uint32_t paddedVocabularySize = 0;
   uint32_t packedGdnWidth = 0;
   uint32_t packedFullWidth = 0;
   uint32_t convolutionDimension = 0;
   uint32_t gdnKeyHeads = 0;
   uint32_t gdnValueHeads = 0;
   uint32_t gdnHeadDimension = 0;
+  // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp);
+  // the family maker declares it, geometryFor copies it here.
+  ops::GdnCore gdnCore = ops::GdnCore::Unspecified;
   uint32_t attentionWidth = 0;
   uint32_t attentionQueryHeads = 0;
   uint32_t attentionKvHeads = 0;
@@ -206,7 +215,7 @@ struct TargetModelGeometry final {
   }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
-            convolutionDimension, packedGdnWidth};
+            convolutionDimension, packedGdnWidth, gdnCore};
   }
   [[nodiscard]] constexpr ops::LfmConvShape convShape() const noexcept {
     return {convolutionDimension, convolutionTaps, packedGdnWidth};
@@ -226,6 +235,10 @@ struct TargetModelGeometry final {
     layout.altKvHeads = 0;
     layout.altHeadDimension = 0;
     layout.windowTokens = 0;
+    // The per-kind declared core: the alt geometry carries its own binding.
+    layout.attentionCore = alt ? kvLayout.altAttentionCore
+                               : kvLayout.attentionCore;
+    layout.altAttentionCore = kv::Core::Unspecified;
     if (alt) {
       layout.kvHeads = altKvHeads;
       layout.headDimension = altHeadDimension;
@@ -494,23 +507,34 @@ public:
   // liveNodes bounds a tree batch's live node count when the caller already
   // knows the emitted counts — the attention splits and verify stores then
   // size for the real rows instead of the scratch's full capacity.
+  // verifyStride is a chain lane's packed row stride: the draft's trained
+  // verify depth (draft.verifyRows()), at most targetVerifyRows. The verify
+  // tensors are lane-major at that stride, so the fused-M projections run
+  // lanes * verifyStride rows instead of the full capacity.
   void addVerify(
       metal::CommandGraph &graph, TargetModelVerifyBuffers buffers,
       std::span<const RichKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, bool tree = false,
-      std::span<const uint32_t> liveRows = {}, uint32_t liveNodes = 0) const;
+      std::span<const uint32_t> liveRows = {}, uint32_t liveNodes = 0,
+      uint32_t verifyStride = ExecutionLimits::targetVerifyRows) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                     uint32_t lanes, ops::LinearScratch scratch,
-                    const TargetModelVerifyBuffers *fused = nullptr) const;
+                    const TargetModelVerifyBuffers *fused = nullptr,
+                    uint32_t verifyStride = ExecutionLimits::targetVerifyRows) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
-  // row 0 of its draft input, and the draft's proposals.
+  // row 0 of its draft input, and the draft's proposals. liveRows[lane]
+  // bounds the live rows (anchor included); rows past it repeat the anchor,
+  // keeping dead rows' expert routes on the anchor's paths.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                      metal::MetalBuffer verifyInput, uint32_t lanes,
+                      uint32_t verifyStride = ExecutionLimits::targetVerifyRows,
+                      uint32_t draftStride = ExecutionLimits::draftQueryRows,
+                      std::span<const uint32_t> liveRows = {}) const;
   // A tree batch's verify inputs: each lane's RICHENGINE_TREE_VERIFY_NODES nodes
   // supply the input tokens, rope positions and ancestor masks. `base` is
   // each lane's (t, h, w) rotary position at its committed length.
@@ -525,7 +549,8 @@ public:
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
-                      TargetModelCommitBuffers buffers, uint32_t lanes) const;
+                      TargetModelCommitBuffers buffers, uint32_t lanes,
+                      uint32_t verifyStride = ExecutionLimits::targetVerifyRows) const;
   // The tree batch's commit: the retained path replays its DFS rows through
   // each layer's states instead of a chain's prefix rows.
   void addStateCommitTree(metal::CommandGraph &graph,
@@ -538,9 +563,11 @@ private:
       std::variant<const TargetModelWeights<Qwen3_8Layout, DenseLayerWeights> *,
                    const TargetModelWeights<Ornith9BLayout, DenseLayerWeights> *,
                    const TargetModelWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
+                   const TargetModelWeights<MiniCpmV47MoeLayout, Qwen3_6MoeLayerWeights> *,
                    const TargetModelWeights<DenseLayout, DenseLayerWeights> *,
                    const TargetModelWeights<Lfm2Layout, DenseLayerWeights> *,
                    const TargetModelWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *,
+                   const TargetModelWeights<Lfm2Moe24BLayout, Lfm2MoeLayerWeights> *,
                    const TargetModelWeights<Gemma4MoeLayout, Gemma4MoeLayerWeights> *,
                    const TargetModelWeights<DiffusionGemmaLayout, Gemma4MoeLayerWeights> *,
                    const TargetModelWeights<GraniteLayout, DenseLayerWeights> *>;

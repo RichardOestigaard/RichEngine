@@ -2,14 +2,17 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "DFlashTwoDraft.hpp"
 #include "DSparkDraft.hpp"
 #include "DFlashV1Draft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Dense.hpp"
+#include "MiniCpmV47.hpp"
 #include "DiffusionGemma.hpp"
 #include "Gemma4Moe.hpp"
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
+#include "Lfm2Moe24B.hpp"
 #include "Ornith9B.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -38,7 +41,8 @@ class CompositeStateStorage;
 
 using TargetWeights =
     std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
-                 DenseWeights, Lfm2Weights, Lfm2MoeWeights, GraniteWeights,
+                 MiniCpmV47MoeWeights, DenseWeights, Lfm2Weights,
+                 Lfm2MoeWeights, Lfm2Moe24BWeights, GraniteWeights,
                  Gemma4MoeWeights, DiffusionGemmaWeights>;
 using DraftWeights =
     std::variant<NullDraftWeights, DFlashDraftWeights, DFlashV1DraftWeights,

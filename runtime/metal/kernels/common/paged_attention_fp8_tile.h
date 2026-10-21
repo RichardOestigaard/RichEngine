@@ -137,7 +137,7 @@ template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
 inline void richengine_paged_attention_tile_fp8(
     device bfloat *tile_queries, device const RichKvPage *page_table,
     RichKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
-    uint split, device float *partials, device float *statistics, ulong slot,
+    uint split, device bfloat *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup half *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
@@ -251,9 +251,15 @@ inline void richengine_paged_attention_tile_fp8(
       pv.run(p0, vs, running);
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    auto target = tensor(partials + slot * M * D + row_offset * D,
-                         dextents<int, 2>{D, MP}, array<int, 2>{1, D});
-    running.store(target.template slice<D, MP>(0, 0));
+    // bf16 on the bus: half the partial round-trip at ~0.2% per element.
+#pragma unroll
+    for (ushort index = 0; index < running.get_capacity(); ++index) {
+      if (!running_full && !running.is_valid_element(index))
+        continue;
+      const auto coordinates = running.get_multidimensional_index(index);
+      partials[slot * M * D + (row_offset + coordinates[1]) * D + coordinates[0]] =
+          bfloat(running[index]);
+    }
     if (thread_index < MP) {
       statistics[(slot * M + row_offset + thread_index) * 2] =
           row_max[thread_index];

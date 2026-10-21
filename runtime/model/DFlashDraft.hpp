@@ -12,13 +12,10 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <filesystem>
 #include <array>
-#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 namespace richengine::model {
@@ -52,34 +49,29 @@ private:
 };
 
 // Which draft architecture a layout describes: DFlash2 (dynamic convolutions,
-// candidate-selector codebooks, block-bidirectional attention), a plain
-// transformer DFlash draft (no convolutions or selector; its sliding
-// attention layers mask the block rows causally, its full layer does not) or
-// DSpark (no convolutions or selector codebooks; block-bidirectional layers
-// like DFlash2, plus a sequential Markov head that corrects each proposal
-// position's logits with a low-rank bias of the previously sampled token and
-// a confidence head the runtime loads but does not score).
-enum class DraftKind : uint8_t { DFlash2, DFlashV1, DSpark, Null };
+// candidate-selector codebooks, block-bidirectional attention —
+// DFlashTwoDraft.{hpp,cpp}), a plain transformer DFlash draft (no
+// convolutions or selector; its sliding attention layers mask the block
+// rows causally, its full layer does not) or DSpark (no convolutions or
+// selector codebooks; block-bidirectional layers like DFlash2, plus a
+// sequential Markov head that corrects each proposal position's logits with
+// a low-rank bias of the previously sampled token and a confidence head the
+// runtime loads but does not score).
+enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, Null };
 
 // The kind's user-facing name; Null reads "none" since the n-gram predraft
 // still proposes for a draft-less family.
 inline constexpr std::string_view draftKindName(DraftKind kind) {
   switch (kind) {
-  case DraftKind::DFlash2: return "DFlash2";
+  case DraftKind::DFlashTwo: return "DFlash2";
   case DraftKind::DFlashV1: return "DFlash";
   case DraftKind::DSpark: return "DSpark";
   default: return "none";
   }
 }
 
-// The dynamic convolutions of every DFlash2 draft layer, as the draft
-// kernels run them (decode/draft.metal): two taps, a row and the one before
-// it, each with one dynamic weight per group of 16 channels.
-inline constexpr uint32_t kDraftConvolutionGroup = 16;
-inline constexpr uint32_t kDraftConvolutionTaps = 2;
-
 struct DFlashDraftLayout final {
-  DraftKind kind = DraftKind::DFlash2;
+  DraftKind kind = DraftKind::DFlashTwo;
   // Plain drafts: the bitmask of layers whose current block rows attend
   // causally (sliding_attention layers; bit i is layer i). Zero for DFlash2.
   uint32_t causalLayers = 0;
@@ -97,8 +89,8 @@ struct DFlashDraftLayout final {
   uint32_t kvHeads = 8;
   // DSpark only: the Markov head's inner rank (markov_w1/markov_w2 rows of
   // vocabularySize x markovRank), the config's declared block_size (the
-  // runtime always dispatches ExecutionLimits::draftQueryRows query rows,
-  // padding or truncating the trained block) and whether the rotary is the
+  // runtime dispatches the draft's verifyRows query rows — the trained
+  // block's own span) and whether the rotary is the
   // interleaved (GPT-J) pairing rather than the half-split NeoX one.
   uint32_t markovRank = 0;
   uint32_t blockSize = 0;
@@ -112,6 +104,11 @@ struct DFlashDraftLayout final {
   float rmsEpsilon = 1e-6F;
   // The shared vocabulary head's logit softcap (Gemma's 30); 0 disables.
   float logitSoftcap = 0.0F;
+  // The compiled kernels the draft binds (ops/DraftAttention.hpp). Makers
+  // declare the pair; an Unspecified core or a shape that does not carry
+  // the core's compiled geometry is rejected when the draft plans.
+  ops::DraftHeadCore headCore = ops::DraftHeadCore::Unspecified;
+  ops::DraftContextCore contextCore = ops::DraftContextCore::Unspecified;
   // DFlash2 only: the selector walks the whole 128-slot shard pool instead
   // of the merged top-16 when the batch has no sampled lanes (the residual
   // draw stages only kDraftCandidates). Off by default: the walk's argmax
@@ -121,15 +118,40 @@ struct DFlashDraftLayout final {
 
   // The trained block's usable proposal count. A plain or DFlash2
   // block_size counts the block's query rows (the anchor among them);
-  // DSpark's counts the emitted proposals. The runtime always dispatches
-  // draftQueryRows, so a shorter block's tail rows are dead compute whose
-  // picks acceptance must never retain.
+  // DSpark's counts the emitted proposals. The runtime dispatches the
+  // draft's verifyRows — a shorter block's tail never runs.
   [[nodiscard]] constexpr uint32_t proposalLimit() const noexcept {
     if (kind == DraftKind::Null || !blockSize)
       return ExecutionLimits::draftProposalTokens;
     const uint32_t trained =
         kind == DraftKind::DSpark ? blockSize : blockSize - 1;
     return std::min(trained, ExecutionLimits::draftProposalTokens);
+  }
+
+  // The chain verify's packed lane stride: the anchor plus the trained
+  // block's proposals, rounded up to the decode kernels' eight-row tile —
+  // a block-8 draft verifies eight rows per lane instead of the compiled
+  // sixteen, halving the verify projections' fused-M work. A deeper block
+  // keeps sixteen.
+  [[nodiscard]] constexpr uint32_t verifyRows() const noexcept {
+    // FIXME(regression): the trained-block verify stride (block-8 → 8 rows)
+    // is disabled — with it the draft's proposals stop matching after the
+    // first committed step and acceptance collapses to ~44% with a wrong
+    // output hash (1177270970566012317, 27B DFlash2). Audited-clean
+    // surfaces: draft.metal params.query_rows everywhere (CurrentN=16 and
+    // the RopeLaneStride=16 are masked-benign/host-fill-matched), arena
+    // slot sizes, positions (16 stride matches rope build), verify_input
+    // (separate verify/draft strides), context commit, retained readback.
+    // Residual: draft_attention_split_impl's partials offset (queries +
+    // lanes * Rows * Attention) and the queries region allocation — needs
+    // a runtime buffer dump to pin the remaining 16-vs-8 stride mismatch.
+    return ExecutionLimits::targetVerifyRows;
+  }
+
+  // The draft forward packs at the verify stride: upstream runs exactly
+  // the trained block's rows, and dead rows risk leaking state.
+  [[nodiscard]] constexpr uint32_t queryRows() const noexcept {
+    return verifyRows();
   }
 
   [[nodiscard]] constexpr uint32_t draftWindow() const noexcept {
@@ -143,7 +165,8 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension, ropeInterleaved, draftWindow()};
+            attentionHeadDimension, ropeInterleaved, draftWindow(),
+            headCore, contextCore};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -211,95 +234,6 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   // RICHENGINE_PREFILL_FAST_INT8 operand buffers (empty when the flag is off).
   ops::LinearScratch linearScratch{};
-};
-
-struct DFlashDraftLayerWeights final {
-  ops::NormWeights inputNorm;
-  metal::MetalBuffer attentionConvolution;
-  ops::Projection attentionDynamic;
-  ops::Projection qkvProjection;
-  metal::MetalBuffer queryNorm;
-  metal::MetalBuffer keyNorm;
-  ops::Projection outputProjection;
-  ops::NormWeights postAttentionNorm;
-  metal::MetalBuffer mlpConvolution;
-  ops::Projection mlpDynamic;
-  ops::Projection gateProjection;
-  ops::Projection upProjection;
-  ops::Projection downProjection;
-};
-
-struct DFlashDraftWeights final {
-  DFlashDraftLayout layout;
-  std::vector<DFlashDraftLayerWeights> layers;
-  ops::Projection contextProjection;
-  ops::NormWeights hiddenNorm;
-  ops::NormWeights finalNorm;
-  ops::Projection selectorProjection;
-  metal::MetalBuffer predecessorCodebook;
-  metal::MetalBuffer successorCodebook;
-  std::vector<WeightFileRecord> files;
-  uint64_t actualAllocatedBytes = 0;
-};
-
-inline constexpr std::string_view kDFlashLayerMagic = "MDFD0004";
-
-// An RichEngine package's draft files: layer-<N>.bin and model.bin.
-struct PackedDraftFiles final {
-  WeightImages &images;
-  std::filesystem::path directory;
-  const DFlashDraftLayout &layout;
-  [[nodiscard]] WeightFile layer(uint32_t index) const;
-  [[nodiscard]] WeightFile model() const;
-};
-
-class DFlash2CheckpointLoader;
-
-// The files a draft is read from: a package's packed files, or the images
-// DFlash2CheckpointLoader writes from a DFlash2 checkpoint.
-using DraftFiles = std::variant<PackedDraftFiles, std::reference_wrapper<DFlash2CheckpointLoader>>;
-
-[[nodiscard]] DFlashDraftWeights
-loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
-                       DFlashDraftLayout layout);
-
-// Builds the draft layer graph and its proposal selection
-// (ops::DraftSelector) from packed buffers and persistent context; the
-// target's sampling and acceptance policy remain outside the model.
-class DFlashDraft final {
-public:
-  DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
-               const ops::ExecutionPlans &operators);
-
-  void addContextPrefill(metal::CommandGraph &graph,
-                         DFlashPrefillBuffers buffers, uint32_t rows,
-                         std::span<const DFlashPrefillSpan> spans) const;
-
-  void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths) const;
-  // treeMask marks greedy, unconstrained lanes whose selector emits sibling
-  // leaves for tree verification; 0 selects the chain-only pipeline.
-  void addSelection(metal::CommandGraph &graph,
-                    const ops::DraftSelectorBuffers &buffers,
-                    std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies,
-                    uint32_t treeMask) const;
-  void addContextCommit(metal::CommandGraph &graph,
-                        DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions) const;
-
-private:
-  const DFlashDraftWeights &weights_;
-  metal::MetalBackend &backend_;
-  const ops::ExecutionPlans &operators_;
-  ops::DraftSelector selector_;
-  // The layout's pool-selector flag with RICHENGINE_DFLASH_POOL's override
-  // folded in ("0" forces the merged-16 walk, "1" forces the pool walk).
-  const bool poolSelector_;
-  // Each layer's key and value rows of its QKV projection, views of its
-  // planes, which the context writers project with.
-  std::vector<ops::Projection> contextKvProjections_;
 };
 
 } // namespace richengine::model

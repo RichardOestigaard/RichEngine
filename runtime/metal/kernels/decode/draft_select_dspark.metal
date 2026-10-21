@@ -53,11 +53,12 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // predicts the next token.
 inline void draft_top16_sharded_phase(
     device const float *logits, device uint *partial_ids,
-    device float *partial_values, uint vocabulary, uint row_offset,
+    device float *partial_values, uint vocabulary, uint stride,
+    uint row_offset,
     threadgroup float *maxima, threadgroup float *thresholds,
     threadgroup float *round_values, threadgroup uint *round_ids, uint group,
-    uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+    uint thread_index, uint lane, uint simd_group, uint rows) {
+  const uint Rows = rows;
   constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = RICHENGINE_DRAFT_CANDIDATES;
@@ -66,7 +67,9 @@ inline void draft_top16_sharded_phase(
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
   uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + row_offset) * vocabulary;
+  // The row stride is the head's padded vocabulary; vocabulary bounds the
+  // tokens — a pad row's logit is never selected.
+  ulong row_start = (ulong(batch) * Rows + position + row_offset) * stride;
   uint shard_tokens = (vocabulary + Shards - 1) / Shards;
   uint begin = min(shard * shard_tokens, vocabulary);
   uint end = min(begin + shard_tokens, vocabulary);
@@ -181,7 +184,8 @@ kernel void dspark_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant DraftTop16Params &params [[buffer(3)]],
+    constant uint &query_rows [[buffer(4)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -190,10 +194,11 @@ kernel void dspark_select_top16_sharded(
   threadgroup float thresholds[8];
   threadgroup float round_values[2][8];
   threadgroup uint round_ids[2][8];
-  draft_top16_sharded_phase(logits, partial_ids, partial_values, vocabulary, 0,
+  draft_top16_sharded_phase(logits, partial_ids, partial_values,
+                            params.vocabulary, params.logits_stride, 0,
                             maxima, thresholds, &round_values[0][0],
                             &round_ids[0][0], group, thread_index, lane,
-                            simd_group);
+                            simd_group, query_rows);
 }
 
 // One group per DSpark proposal row scores every predecessor/candidate edge

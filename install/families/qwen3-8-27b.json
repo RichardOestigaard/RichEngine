@@ -1,0 +1,85 @@
+{
+  "name": "Qwen3.8-27B",
+  "repos": [
+    "mlx-community/Qwen3.8-27B-4bit"
+  ],
+  "signature": {
+    "model_type": "qwen3_5_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 5120,
+    "num_hidden_layers": 64,
+    "vocab_size": 248320,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256
+  },
+  "draft": {
+    "repo": "incoai/Qwen3.8-27B-DFlash2",
+    "base": "dflash2",
+    "signature": {
+      "num_hidden_layers": 5,
+      "hidden_size": 5120,
+      "vocab_size": 248320,
+      "intermediate_size": 17408,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "dflash_config.selector_rank": 256,
+      "dflash_config.mask_token_id": 248070,
+      "dflash_config.target_layer_ids": [
+        5,
+        19,
+        33,
+        47,
+        61
+      ]
+    }
+  },
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "qwen3-xml",
+    "vision": {
+      "pad_token": "<|image_pad|>",
+      "patch_size": 16,
+      "temporal_patch_size": 2,
+      "merge_size": 2,
+      "image_mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "image_std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "DFLASH_POOL",
+    "GDN_CHUNKED",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "HEAD_FUSED",
+    "MTL4",
+    "GGUF_PACKED",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "ANE_WAIT"
+  ]
+}

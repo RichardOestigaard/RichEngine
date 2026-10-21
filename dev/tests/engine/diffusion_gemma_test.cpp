@@ -474,8 +474,8 @@ void checkDescriptor() {
     "schema_version": 1,
     "model": "google/diffusiongemma-26B-A4B-it",
     "execution_geometry": {
-      "draft_proposal_tokens": 7,
-      "draft_query_rows": 8,
+      "draft_proposal_tokens": 15,
+      "draft_query_rows": 16,
       "draft_sliding_window": 1024
     },
     "format": {

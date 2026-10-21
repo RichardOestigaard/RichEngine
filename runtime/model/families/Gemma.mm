@@ -23,6 +23,8 @@ DFlashDraftLayout gemma4DraftDefaults() {
   layout.kvHeads = 8;
   layout.targetHiddenSize = target.capturedHiddenSize();
   layout.logitSoftcap = target.logitSoftcap;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
+  layout.contextCore = ops::DraftContextCore::Plain2816;
   return layout;
 }
 
@@ -57,6 +59,9 @@ ModelDescriptor diffusionGemmaDescriptor(std::string name) {
       std::move(name), DiffusionGemmaLayout{}, gemma4DraftDefaults(),
       vision);
   descriptor.visionSource = VisionSource::None;
+  // The canvas bundle DiffusionGemma runs under; each knob's own
+  // RICHENGINE_CANVAS_* variable still wins over the profile.
+  descriptor.tuning.canvasProfile = "paper";
   return descriptor;
 }
 

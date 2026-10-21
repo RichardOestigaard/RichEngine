@@ -1056,13 +1056,16 @@ def parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     if args.package is None:
-        args.package = launcher.model_artifacts.Selection.of(
-            launcher.model_artifacts.MODELS,
-            args.model,
-            revision=args.revision,
-            language_only=args.language_only,
-            draft_model=args.draft_model,
-        ).link
+        try:
+            args.package = launcher.model_artifacts.Selection.of(
+                launcher.model_artifacts.MODELS,
+                args.model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
+            ).link
+        except launcher.model_artifacts.ModelError as error:
+            parser.error(str(error))
     return args
 
 

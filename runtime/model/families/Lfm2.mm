@@ -16,6 +16,8 @@ DFlashDraftLayout lfm2DraftLayout() {
   layout.kvHeads = 8;
   layout.blockSize = 9;
   layout.ropeInterleaved = 1;
+  layout.headCore = ops::DraftHeadCore::Q32K8D64Interleaved;
+  layout.contextCore = ops::DraftContextCore::Plain2048;
   layout.rmsEpsilon = 1e-5F;
   return layout;
 }

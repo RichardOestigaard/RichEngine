@@ -546,6 +546,8 @@ void testSyntheticPackage(MetalBackend &backend,
     draft.attentionHeadDimension = 64;
     draft.targetHiddenSize = target.capturedHiddenSize();
     draft.selectorRank = 256;
+    draft.headCore = richengine::ops::DraftHeadCore::Q32K8D128;
+    draft.contextCore = richengine::ops::DraftContextCore::Hidden5120;
 
     VisionLayout vision;
     vision.depth = 2;
@@ -558,6 +560,8 @@ void testSyntheticPackage(MetalBackend &backend,
     vision.heads = 2;
     vision.headDimension = 64;
     vision.positionGridSide = 4;
+    vision.patchSize = 16;
+    vision.spatialMerge = 2;
 
     SyntheticAccounting expected =
         writeSyntheticPackage(root, target, draft, vision);
@@ -898,6 +902,155 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
                     d.rotaryTheta == 5'000'000.0F,
                 "LFM2.5-8B DSpark layout differs from the config");
         require(descriptor.valid(), "LFM2.5-8B descriptor is invalid");
+    }
+    {
+        // LFM2.5-24B-A2B ("lfm2_moe"): 40 layers, attention at every fourth
+        // index from 2 on ({2,6,...,38}), two leading dense-FFN layers of
+        // 11776 then the 64-expert sigmoid-gated MoE block, and its
+        // 24B-A2B DSpark draft tapping the full-attention layers
+        // {2,10,18,26,34}.
+        const std::filesystem::path package = root / "lfm25moe24b";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"LFM2.5-24B-A2B","family":"LFM2.5-24B-A2B","target_format":"gguf","vision_format":"none"})");
+        std::string layers = "[";
+        for (uint32_t layer = 0; layer < 40; ++layer) {
+            const bool attention = layer >= 2 && (layer - 2) % 4 == 0;
+            layers += layer ? "," : "";
+            layers += attention ? "\"full_attention\"" : "\"conv\"";
+        }
+        layers += "]";
+        writeJson(package / "config.json",
+                  std::string("{\"model_type\":\"lfm2_moe\",\"hidden_size\":2048,"
+                              "\"num_hidden_layers\":40,\"vocab_size\":128000,"
+                              "\"max_position_embeddings\":131072,"
+                              "\"num_attention_heads\":32,"
+                              "\"num_key_value_heads\":8,\"conv_dim\":2048,"
+                              "\"conv_L_cache\":3,\"intermediate_size\":11776,"
+                              "\"num_experts\":64,\"num_experts_per_tok\":4,"
+                              "\"moe_intermediate_size\":1536,"
+                              "\"num_dense_layers\":2,"
+                              "\"layer_types\":") +
+                      layers + "}");
+        writeJson(package / "draft" / "config.json",
+                  R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":10000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,10,18,26,34],"num_target_layers":40},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(std::holds_alternative<richengine::model::Lfm2Moe24BLayout>(descriptor.target),
+                "LFM2.5-24B target is not the LFM2-MoE 24B layout");
+        const auto &target =
+            std::get<richengine::model::Lfm2Moe24BLayout>(descriptor.target);
+        require(target.layers == 40 && target.experts == 64 &&
+                    target.expertsPerToken == 4 &&
+                    target.expertIntermediateSize == 1536 &&
+                    target.intermediateSize == 11776 &&
+                    target.rotaryTheta == 10'000'000.0F &&
+                    target.attentionLayerCount() == 10 &&
+                    target.gdnStateLayout().layers == 30 &&
+                    target.capturedHiddenSize() == 10240,
+                "LFM2.5-24B target layout differs from the config");
+        const auto &d = descriptor.draft;
+        require(d.kind == DraftKind::DSpark && d.layers == 5 &&
+                    d.vocabularySize == 128000 && d.qkvSize == 3072 &&
+                    d.kvHeads == 8 && d.attentionHeadDimension == 64 &&
+                    d.markovRank == 256 && d.blockSize == 9 &&
+                    d.targetHiddenSize == 10240 && d.ropeInterleaved &&
+                    d.rmsEpsilon == 1e-5F && d.rotaryTheta == 10'000'000.0F,
+                "LFM2.5-24B DSpark layout differs from the config");
+        require(descriptor.valid(), "LFM2.5-24B descriptor is invalid");
+    }
+    {
+        // A draft-less 24B assembly keeps the Null layout and the n-gram
+        // predraft: the declared-draft gate only opens on a draft/config.json.
+        const std::filesystem::path package = root / "lfm25moe24b-nodraft";
+        std::filesystem::create_directories(package);
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"LFM2.5-24B-A2B","family":"LFM2.5-24B-A2B","target_format":"gguf","vision_format":"none"})");
+        std::string layers = "[";
+        for (uint32_t layer = 0; layer < 40; ++layer) {
+            const bool attention = layer >= 2 && (layer - 2) % 4 == 0;
+            layers += layer ? "," : "";
+            layers += attention ? "\"full_attention\"" : "\"conv\"";
+        }
+        layers += "]";
+        writeJson(package / "config.json",
+                  std::string("{\"model_type\":\"lfm2_moe\",\"hidden_size\":2048,"
+                              "\"num_hidden_layers\":40,\"vocab_size\":128000,"
+                              "\"max_position_embeddings\":131072,"
+                              "\"num_attention_heads\":32,"
+                              "\"num_key_value_heads\":8,\"conv_dim\":2048,"
+                              "\"conv_L_cache\":3,\"intermediate_size\":11776,"
+                              "\"num_experts\":64,\"num_experts_per_tok\":4,"
+                              "\"moe_intermediate_size\":1536,"
+                              "\"num_dense_layers\":2,"
+                              "\"layer_types\":") +
+                      layers + "}");
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(descriptor.draft.kind == DraftKind::Null,
+                "draft-less LFM2.5-24B draft is not the Null layout");
+        require(descriptor.valid(), "draft-less LFM2.5-24B descriptor is invalid");
+    }
+    {
+        // MiniCPM-V 4.7 35B-A3B: the qwen3_5_moe target at the unpadded
+        // 248144 vocabulary and its DSpark draft, whose dialect nests the
+        // mask/capture fields under dflash_config and the RoPE base under
+        // rope_parameters — 8 query heads over 2 KV heads of 256.
+        const std::filesystem::path package = root / "minicpmv47";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"MiniCPM-V-4.7-35B-A3B","family":"MiniCPM-V-4.7-35B-A3B","target_format":"mlx-affine","vision_format":"none"})");
+        std::string layers = "[";
+        for (uint32_t layer = 0; layer < 40; ++layer) {
+            const bool attention = (layer + 1) % 4 == 0;
+            layers += layer ? "," : "";
+            layers += attention ? "\"full_attention\"" : "\"linear_attention\"";
+        }
+        layers += "]";
+        writeJson(package / "config.json",
+                  std::string("{\"text_config\":{\"model_type\":\"qwen3_5_moe_text\","
+                              "\"hidden_size\":2048,\"num_hidden_layers\":40,"
+                              "\"vocab_size\":248144,"
+                              "\"max_position_embeddings\":262144,"
+                              "\"num_attention_heads\":16,"
+                              "\"num_key_value_heads\":2,\"head_dim\":256,"
+                              "\"linear_num_key_heads\":16,"
+                              "\"linear_num_value_heads\":32,"
+                              "\"linear_key_head_dim\":128,"
+                              "\"linear_value_head_dim\":128,"
+                              "\"linear_conv_kernel_dim\":4,"
+                              "\"full_attention_interval\":4,"
+                              "\"rms_norm_eps\":1e-06,"
+                              "\"num_experts\":256,\"num_experts_per_tok\":8,"
+                              "\"moe_intermediate_size\":512,"
+                              "\"shared_expert_intermediate_size\":512,"
+                              "\"attention_bias\":false,"
+                              "\"attn_output_gate\":true,"
+                              "\"tie_word_embeddings\":false,"
+                              "\"hidden_act\":\"silu\","
+                              "\"rope_parameters\":{\"rope_theta\":10000000,"
+                              "\"partial_rotary_factor\":0.25,"
+                              "\"rope_type\":\"default\"},"
+                              "\"layer_types\":") +
+                      layers + "}}");
+        writeJson(package / "draft" / "config.json",
+                  R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":8,"num_key_value_heads":2,"head_dim":256,"intermediate_size":6144,"vocab_size":248144,"draft_vocab_size":248144,"hidden_act":"silu","rms_norm_eps":1e-06,"attention_bias":false,"tie_word_embeddings":false,"use_sliding_window":false,"rope_parameters":{"rope_theta":10000000,"rope_type":"default","rope_dim":256},"block_size":15,"num_target_layers":40,"markov_rank":256,"enable_confidence_head":true,"confidence_head_with_markov":true,"dflash_config":{"attention_mode":"gqa","markov_rank":256,"markov_head_type":"vanilla","projector_type":"dspark","mask_token_id":248076,"target_layer_ids":[3,11,19,27,35],"confidence_head_with_markov":true,"enable_confidence_head":true},"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"]})");
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(std::holds_alternative<richengine::model::MiniCpmV47MoeLayout>(
+                    descriptor.target),
+                "MiniCPM-V 4.7 target is not the MiniCpmV47 layout");
+        const auto &d = descriptor.draft;
+        require(d.kind == DraftKind::DSpark && d.layers == 5 &&
+                    d.vocabularySize == 248144 && d.intermediateSize == 6144 &&
+                    d.attentionSize == 2048 && d.qkvSize == 3072 &&
+                    d.kvHeads == 2 && d.attentionHeadDimension == 256 &&
+                    d.markovRank == 256 && d.blockSize == 15 &&
+                    d.targetHiddenSize == 10240 && !d.ropeInterleaved &&
+                    d.rmsEpsilon == 1e-6F && d.rotaryTheta == 10'000'000.0F &&
+                    !d.selectorRank && !d.dynamicSize,
+                "MiniCPM-V 4.7 DSpark layout differs from the config");
+        require(descriptor.stateLayout.draft ==
+                    richengine::model::DraftStateLayout{5, 2, 256, 2048},
+                "MiniCPM-V 4.7 draft state layout mismatch");
+        require(descriptor.valid(), "MiniCPM-V 4.7 descriptor is invalid");
     }
 }
 

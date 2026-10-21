@@ -659,6 +659,7 @@ struct CommandTicket::State {
 struct MetalBackend::Impl {
 
     struct BakedSpan;
+    struct GpuSpan;
 
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
@@ -672,6 +673,9 @@ struct MetalBackend::Impl {
         // When this dispatch opens a replayable span, the baked indirect
         // command buffer covering it; commit() skips the span's dispatches.
         const BakedSpan *span = nullptr;
+        // When this dispatch opens a GPU-encoded span, the span whose ICB
+        // the gpu_encode kernel fills; commit() skips the run likewise.
+        const GpuSpan *gpuSpan = nullptr;
     };
 
     // A baked indirect command buffer replaying one CommandGraph baked span,
@@ -722,6 +726,37 @@ struct MetalBackend::Impl {
         uint64_t touched = 0;
     };
 
+    // A GPU-encoded indirect command buffer covering one gpu span's run
+    // (CommandGraph::beginGpuSpan): dispatches that cannot replay from a
+    // host-baked ICB still ride one — the gpu_encode kernel writes the
+    // commands on device from staged descriptors (kernels/shared/
+    // gpu_dispatch.metal). Descriptors bind the run's buffer addresses and
+    // a staged-parameter arena, so a matching submission reuses the whole
+    // span while only the bytes payloads are restaged.
+    struct GpuSpan {
+        __strong id<MTLIndirectCommandBuffer> icb = nil;
+        // The gpu_encode kernel's argument buffer (the ICB object plus the
+        // run's indirect-capable pipeline table).
+        std::shared_ptr<MetalAllocation> argsAllocation;
+        // The descriptor table the encoder reads; its header holds the run's
+        // command count (abi/GpuDispatch.h).
+        std::shared_ptr<MetalAllocation> descAllocation;
+        // The bytes payloads every descriptor binds by address, restaged
+        // per submission like a baked span's patchable arena.
+        std::shared_ptr<MetalAllocation> paramsAllocation;
+        std::vector<BakedSpan::DispatchSnapshot> dispatches;
+        // The distinct buffers the span binds, including the parameter
+        // arena: the encoder declares their usage at replay.
+        std::vector<__weak id<MTLBuffer>> usedBuffers;
+        uint64_t touched = 0;
+        // The ICB's commands were written: gpu_encode's output derives only
+        // from the descriptor table, which gpuSpanMatches holds static for
+        // the span's lifetime, so replays after the first skip the encode
+        // pass — the byte payloads it binds restage into the params arena
+        // without touching a command.
+        mutable bool encoded = false;
+    };
+
     // A command as submission encodes it: its dispatches and every
     // allocation they bind, which its ticket retains.
     struct PreparedCommand {
@@ -730,6 +765,9 @@ struct MetalBackend::Impl {
         // Keeps the spans dispatches[].span points at alive: the baked
         // cache may evict one while a prepared command still names it.
         std::vector<std::shared_ptr<const BakedSpan>> spanRefs;
+        // The same for dispatches[].gpuSpan (gpuSpans, the GPU-encoded
+        // span cache below).
+        std::vector<std::shared_ptr<const GpuSpan>> gpuSpanRefs;
     };
 
     // A command's shape as last submitted, validated field-for-field like a
@@ -753,6 +791,7 @@ struct MetalBackend::Impl {
             DispatchSize threadsPerThreadgroup{};
             bool bakeable = false;
             bool patchableBytes = false;
+            bool gpuSpan = false;
             std::vector<uint32_t> bufferIndices;
             std::vector<BufferSnapshot> buffers;
             std::vector<BytesSnapshot> bytes;
@@ -762,6 +801,7 @@ struct MetalBackend::Impl {
         // the new run on every hit.
         std::vector<PreparedDispatch> prepared;
         std::vector<std::shared_ptr<const BakedSpan>> spanRefs;
+        std::vector<std::shared_ptr<const GpuSpan>> gpuSpanRefs;
         uint64_t boundBuffers = 0;
         uint64_t touched = 0;
     };
@@ -807,6 +847,9 @@ struct MetalBackend::Impl {
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BakedSpan>>>
         bakedSpans;
+    // GPU-encoded spans of earlier submissions, keyed like bakedSpans.
+    std::unordered_map<std::string, std::vector<std::shared_ptr<GpuSpan>>>
+        gpuSpans;
     // Prepared commands of earlier submissions, keyed by dispatch count and
     // the run's first and last pipeline; alternates per key as the spans.
     std::unordered_map<std::string,
@@ -899,6 +942,40 @@ struct MetalBackend::Impl {
     // inherited).
     std::shared_ptr<BakedSpan>
     bakeSpan(std::span<const ComputeDispatch> run);
+
+
+    // Identity of a run against a gpu span's snapshot: same checks as
+    // snapshotMatches except payload contents — every bytes payload is
+    // restaged on replay, so contents never participate.
+    [[nodiscard]] bool
+    gpuSpanMatches(const GpuSpan &span,
+                   std::span<const ComputeDispatch> run) noexcept;
+
+
+    // Builds a gpu span for the run: the ICB, the gpu_encode kernel's
+    // argument buffer (ICB + indirect-capable pipelines), the staged
+    // descriptor table and the parameter arena. Returns nullptr when the
+    // run exceeds the ABI's limits.
+    std::shared_ptr<GpuSpan>
+    bakeGpuSpan(std::span<const ComputeDispatch> run);
+
+
+    // Finds a gpu span matching this run or bakes a new one; nullptr means
+    // the run encodes directly.
+    std::shared_ptr<const GpuSpan>
+    resolveGpuSpan(size_t begin, std::span<const ComputeDispatch> run);
+
+
+    // Rewrites a gpu span's staged parameters from the run's payloads —
+    // every bytes binding, patchable or not, since the descriptors bind
+    // the arena by address.
+    static void stageGpuSpanParams(const GpuSpan &span,
+                                   std::span<const PreparedDispatch> run);
+
+
+    // The escape hatch: GPU-encoded spans are off unless
+    // RICHENGINE_GPU_SPANS is set.
+    [[nodiscard]] static bool gpuSpansEnabled() noexcept;
 
 
     // Rewrites a span's staged parameters from the run's current patchable

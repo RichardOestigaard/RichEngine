@@ -99,7 +99,9 @@ bool nativeDecodeFormat(uint32_t formatId) noexcept {
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
-  const uint32_t lanes = w.rows / RICHENGINE_TARGET_VERIFY_ROWS;
+  // rows pack at the draft's verify stride, not the compiled 16 — the
+  // producer records the lane count because it is unrecoverable here.
+  const uint32_t lanes = w.lanes ? w.lanes : w.rows / RICHENGINE_TARGET_VERIFY_ROWS;
   bool quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
@@ -509,14 +511,19 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 // reads them unchanged.
 bool Linear::addGgufHeadArgmax(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                uint32_t lanes, metal::MetalBuffer argmaxValues, metal::MetalBuffer argmaxIndices,
-                               const HeadArgmaxParams &headParams, LinearScratch scratch) const {
+                               const HeadArgmaxParams &headParams, LinearScratch scratch,
+                               uint32_t verifyRows) const {
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   if (segments.size() != 1 || segments.front().isFloat()) return false;
   const QuantizedSegment &s = segments.front();
   if (p.outputSize % GGUF_TILE_COLUMNS || p.inputSize % GGUF_TABLE16_SPAN_INPUTS) return false;
-  const LinearPlan plan = decodePlan(p, lanes);
+  const LinearPlan plan = decodePlan(p, lanes, LinearEpilogue::None, nullptr, verifyRows);
   const LinearConfig config = plan.configuration();
   const uint32_t rows = plan.storageRows();
+  // The amax kernels instantiate the staged tile's 8, 16 and 32 rows only: a
+  // plan on the register tile keeps its unpadded rows (a 24-row batch would
+  // name gguf_decode_*_m24_amax).
+  if (stagedTileRows(rows) != rows) return false;
   if (p.rotation) {
     const uint32_t k = p.inputSize, inputRows = plan.workload().rows;
     if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k ||
@@ -699,7 +706,11 @@ void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what
 bool apple9StagesFormat(uint32_t format) noexcept {
   switch (format) {
   case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS: case GGUF_FMT_IQ2S:
-  case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M: return true;
+  case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M:
+  // The 8-bit oQ formats stage too: the register tile encodes HasMin operands
+  // as bf16(0x4300 + code), which holds only 8 significant bits — codes past
+  // 127 would round.
+  case GGUF_FMT_AF8: case GGUF_FMT_AF8G128: return true;
   default: return false;
   }
 }

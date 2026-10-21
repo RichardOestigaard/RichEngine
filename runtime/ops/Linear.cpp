@@ -1,5 +1,6 @@
 #include "Linear.hpp"
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 #include "ops/DeviceTuning.hpp"
 #include "ops/KernelNames.hpp"
 
@@ -650,10 +651,16 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
       return {LinearTile::N256, std::min(tiles256, resident)};
     }
     // One- and two-lane gate/up keeps the whole N256 grid resident while it
-    // fits four tiles per core; the balanced wave measured slower on the
-    // 20-core M5 Pro.
-    if (lanes <= 2 && tiles256 <= 4 * policy_.cores)
-      return {LinearTile::N256, tiles256};
+    // fits two threadgroups per core. Past that the whole grid needs a
+    // second wave; an even half grid hands every group exactly two tiles in
+    // one wave, which measured ~12% faster on the 20-core M5 Pro
+    // ({17408,5120}: 68 groups at ~255 GB/s, 34 groups at ~267-277).
+    if (lanes <= 2 && tiles256 <= 4 * policy_.cores) {
+      const uint32_t half = tiles256 / 2;
+      const bool evenWave =
+          !(tiles256 & 1) && tiles256 > 2 * policy_.cores && half >= policy_.cores;
+      return {LinearTile::N256, evenWave ? half : tiles256};
+    }
     // The 64-row N256 tile spills its accumulators at eight simdgroups; the
     // 512-thread variant halves them back to the m32 tile's footprint.
     if (lanes == 8)
@@ -707,7 +714,7 @@ bool packedTilesDisabled() {
 // the integer NA path (prefill_linear_i8_*). NOT bit-identical to the bf16
 // tensor-op path — greedy output may diverge on near-ties.
 bool fastInt8Prefill() {
-  static const bool on = tuning().prefillFastInt8;
+  static const bool on = model::modelPolicy().prefillFastInt8;
   return on;
 }
 
@@ -769,8 +776,15 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
-                              const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+                              const Projection *gate, uint32_t verifyRows) const {
+  if (!verifyRows || verifyRows > RICHENGINE_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid decode lane row stride");
+  LinearWorkload w{LinearMatrix{p.outputSize, p.inputSize},
+                   lanes * verifyRows, LinearPhase::Decode, epilogue};
+  w.lanes = lanes;
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid linear decode batch width");
+  return plan(w, p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
                                bool canvas) const {
@@ -838,10 +852,13 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     // The GGUF decode kernels produce no output when they replay from an
     // indirect command buffer on this driver (the gguf MoE expert and
     // embedding kernels fail the same way): a suspension keeps them out of
-    // every enclosing baked span.
-    graph.suspendBakedSpan();
+    // every enclosing baked span. RICHENGINE_GPU_SPANS marks them a
+    // GPU-encoded span instead — the same replay the suspension avoids,
+    // written on device where it produces correct output.
+    const bool gpu = tuning().gpuSpans;
+    gpu ? graph.beginGpuSpan() : graph.suspendBakedSpan();
     addGguf(graph, b, p, selected, gate);
-    graph.resumeBakedSpan();
+    gpu ? graph.endGpuSpan() : graph.resumeBakedSpan();
     // Only quantized segments run the plan's tile: float segments alone
     // leave the scratch table as it was.
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;

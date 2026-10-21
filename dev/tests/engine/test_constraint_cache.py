@@ -23,12 +23,23 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(side_effect=lambda matcher, executor, contract: matcher)
+        constraint = mock.Mock(
+            side_effect=lambda matcher, executor, contract, initial_mask=None: matcher
+        )
+        import numpy
+
         for target, replacement in (
             ("guidance_tokenizer", lambda *args, **kwargs: None),
             ("LLMatcher", Matcher),
             ("LLExecutor", lambda: None),
             ("TokenConstraint", constraint),
+            (
+                "allocate_token_bitmask",
+                lambda rows, vocabulary: numpy.zeros(
+                    (rows, (vocabulary + 31) // 32 or 1), dtype="uint32"
+                ),
+            ),
+            ("fill_next_token_bitmask_par", lambda *args: None),
         ):
             self.enterContext(mock.patch.object(constraints, target, replacement))
         self.enterContext(

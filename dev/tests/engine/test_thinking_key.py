@@ -12,6 +12,7 @@ from unittest import mock
 from cryptography.fernet import Fernet
 
 from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
+from server import model_host
 from server import server as api
 from server.thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
@@ -148,12 +149,14 @@ class ThinkingKeyTests(unittest.TestCase):
             mock.patch.object(api.signal, "signal"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(
-                api,
+                model_host,
                 "load_thinking_key",
                 side_effect=ThinkingKeyError("invalid key file"),
             ),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
-            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(model_host.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                model_host.engine_runtime, "MultiplexedRuntime"
+            ) as runtime,
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             self.assertRaisesRegex(SystemExit, "1"),
         ):

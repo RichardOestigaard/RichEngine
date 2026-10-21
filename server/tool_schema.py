@@ -639,6 +639,18 @@ _DIALECT_MARKERS = (
     ("<tool_call>", QWEN3_XML),
 )
 
+# The dialects a family's serving block may name (install/families/*.json's
+# serving.tool_dialect). Dialects stay code — a grammar and a projector are
+# logic, not data — but which one a model uses is the contract's.
+DIALECTS = {dialect.name: dialect for dialect in (QWEN3_XML, MINICPM5_XML, LFM25_PYTHON, GEMMA4)}
+
+
+def dialect_named(name):
+    """The dialect a serving contract names; None for an unknown name."""
+    if name is None:
+        return None
+    return DIALECTS.get(name)
+
 
 def detect_tool_dialect(rendered):
     """The dialect of a rendered canary tool call, or None where the text

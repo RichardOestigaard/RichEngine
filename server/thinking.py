@@ -1,5 +1,7 @@
 """Client-carried hidden reasoning, authenticated by the user's serving key."""
 
+import base64
+import hashlib
 import os
 import stat
 import tempfile
@@ -74,7 +76,20 @@ class ThinkingCodec:
     MAX_SIGNATURE_BYTES = 16 * 1024 * 1024
 
     def __init__(self, key=None):
-        self.cipher = Fernet(Fernet.generate_key() if key is None else key)
+        # The raw key is kept: scoped() derives per-model keys from it
+        # without reaching into Fernet's private fields.
+        self.key = Fernet.generate_key() if key is None else key
+        self.cipher = Fernet(self.key)
+
+    def scoped(self, scope):
+        """The codec bound to one model's name: a signature minted under
+        another model's scope fails to open, so thinking signed for model A
+        cannot replay as model B's. The same key drives every scope."""
+        digest = hashlib.sha256(
+            b"richengine-thinking\0" + scope.encode("utf-8") + b"\0"
+            + base64.urlsafe_b64decode(self.key)
+        ).digest()
+        return ThinkingCodec(base64.urlsafe_b64encode(digest))
 
     def encode(self, text):
         payload = text.encode("utf-8")

@@ -1,5 +1,8 @@
 #include "model/AffinePreparation.hpp"
 #include "model/AffineToBlock.hpp"
+#include "model/GgufFile.hpp"
+#include "model/GgufImageLayout.hpp"
+#include "model/OqWrite.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -8,7 +11,9 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 
 namespace richengine::model::affine {
@@ -67,8 +72,20 @@ void gatherRows(const Section &section, const Step &step, uint32_t unit, uint8_t
   const uint64_t sourceRowBytes = uint64_t(groups) * unit;
   if (step.experts > 1) {
     const ProjectionPart &part = section.parts.front();
-    part.fields[step.field].tensor->read(uint64_t(step.firstExpert) * part.rows * sourceRowBytes,
-                                         {input, uint64_t(step.experts) * part.rows * sourceRowBytes});
+    if (!part.expertStride) {
+      part.fields[step.field].tensor->read(uint64_t(step.firstExpert) * part.rows * sourceRowBytes,
+                                           {input, uint64_t(step.experts) * part.rows * sourceRowBytes});
+      return;
+    }
+    uint8_t *to = input;
+    // A strided part's experts are not contiguous in the source: each one's
+    // rows are its window of the source's per-expert block.
+    for (uint32_t e = step.firstExpert; e < step.firstExpert + step.experts; ++e) {
+      const uint64_t offset =
+          (uint64_t(e) * part.expertStride + part.expertOffset) * sourceRowBytes;
+      part.fields[step.field].tensor->read(offset, {to, uint64_t(part.rows) * sourceRowBytes});
+      to += uint64_t(part.rows) * sourceRowBytes;
+    }
     return;
   }
   uint32_t partStart = 0;
@@ -77,7 +94,10 @@ void gatherRows(const Section &section, const Step &step, uint32_t unit, uint8_t
     const uint32_t end = std::min(step.firstRow + step.rows, partStart + part.rows);
     if (begin < end) {
       const SourceTensor &tensor = *part.fields[step.field].tensor;
-      const uint64_t offset = (uint64_t(step.firstExpert) * part.rows + begin - partStart) * sourceRowBytes +
+      const uint64_t sourceRow = part.expertStride
+          ? uint64_t(step.firstExpert) * part.expertStride + part.expertOffset + begin - partStart
+          : uint64_t(step.firstExpert) * part.rows + begin - partStart;
+      const uint64_t offset = sourceRow * sourceRowBytes +
                               uint64_t(step.firstGroup) * unit;
       uint8_t *to = input + (begin - step.firstRow) * rowBytes;
       if (step.groups == groups) {
@@ -245,14 +265,37 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
     case SectionKind::Decay:
       tasks.push_back([&section, at](std::vector<uint8_t> &input) { writeDecay(section, at, input); });
       break;
-    case SectionKind::Projection: {
+    case SectionKind::Projection:
+    case SectionKind::OqAffine: {
+      // OqAffine leads the same planes with a 16 KiB descriptor block marking
+      // them ggml::kAffineQ4 so the oQ reader picks them by type.
+      const uint64_t planes = section.kind == SectionKind::OqAffine
+                                  ? kWeightFileAlignment : 0;
+      if (planes) {
+        for (const ProjectionPart &part : section.parts)
+          for (size_t index = 1; index < part.fields.size(); ++index)
+            if (!part.fields[index].tensor ||
+                part.fields[index].tensor->dtype != "BF16")
+              throw WeightStoreError(
+                  "oQ affine tiles store BF16 scales and biases");
+        tasks.push_back([&section, at](std::vector<uint8_t> &) {
+          GgufTensorDescriptor descriptor{};
+          descriptor.type = ggml::kAffineQ4;
+          descriptor.outputSize = static_cast<uint32_t>(section.rows);
+          descriptor.inputSize = section.columns;
+          std::memcpy(at, &descriptor, sizeof descriptor);
+          std::memset(at + sizeof descriptor, 0,
+                      kWeightFileAlignment - sizeof descriptor);
+        });
+      }
       // Each expert's fields follow one another; field is expert 0's.
       const auto unit = groupBytes(section);
-      uint8_t *field = at;
+      const uint64_t planeBytes = section.bytes - planes;
+      uint8_t *field = at + planes;
       for (uint32_t index = 0; index < unit.size(); ++index) {
         for (const Step &step : steps(section, index, unit[index]))
           tasks.push_back([&section, step, unit = unit[index],
-                           field = field + uint64_t(step.firstExpert) * (section.bytes / section.experts)](
+                           field = field + uint64_t(step.firstExpert) * (planeBytes / section.experts)](
                               std::vector<uint8_t> &input) { writeProjectionStep(section, step, unit, field, input); });
         field += fieldRows * unit[index];
       }
@@ -260,6 +303,9 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
     }
     case SectionKind::Block:
       addBlockTasks(section, at, tasks);
+      break;
+    case SectionKind::Oq:
+      oq::addTasks(section, at, tasks);
       break;
     case SectionKind::Quantize: {
       const auto unit = groupBytes(section);
@@ -274,6 +320,86 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
   }
   std::vector<std::vector<uint8_t>> staging(loadThreads());
   parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
+}
+
+std::string packedStamp(const std::filesystem::path &directory,
+                        const std::vector<Image> &images) {
+  std::string stamp;
+  std::vector<std::filesystem::path> shards;
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    if (entry.path().extension() == ".safetensors")
+      shards.push_back(entry.path());
+  std::sort(shards.begin(), shards.end());
+  for (const std::filesystem::path &path : shards) {
+    std::error_code error;
+    stamp += path.filename().string() + " " +
+             std::to_string(std::filesystem::file_size(path, error)) + " " +
+             std::to_string(static_cast<long long>(
+                 std::filesystem::last_write_time(path, error).time_since_epoch().count())) +
+             "\n";
+  }
+  for (const Image &image : images) {
+    stamp += image.name + " " + image.magic + " " + std::to_string(image.layer) +
+             " " + std::to_string(image.type) + " " + std::to_string(image.bytes);
+    // The section kinds: a plan's layout may change at the same byte sizes.
+    for (const Section &section : image.sections)
+      stamp += " " + std::to_string(static_cast<uint32_t>(section.kind));
+    stamp += "\n";
+  }
+  return stamp;
+}
+
+bool packedCacheUsable(const std::filesystem::path &directory,
+                       const std::vector<Image> &images) {
+  std::ifstream stamp(directory / ".packed");
+  std::ostringstream contents;
+  contents << stamp.rdbuf();
+  if (contents.str() != packedStamp(directory, images)) return false;
+  for (const Image &image : images) {
+    std::error_code error;
+    if (std::filesystem::file_size(directory / image.name, error) != image.bytes ||
+        error)
+      return false;
+  }
+  return true;
+}
+
+void cachePackedImage(const std::filesystem::path &path,
+                      std::span<const uint8_t> bytes) {
+  std::error_code error;
+  if (!error && std::filesystem::file_size(path, error) == bytes.size()) return;
+  const std::filesystem::path tmp(path.string() + ".tmp");
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (out)
+      out.write(reinterpret_cast<const char *>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    if (!out) {
+      std::filesystem::remove(tmp, error);
+      return;
+    }
+  }
+  std::filesystem::rename(tmp, path, error);
+}
+
+void refreshPackedStamp(const std::filesystem::path &directory,
+                        const std::vector<Image> &images) {
+  std::error_code error;
+  for (const Image &image : images)
+    if (std::filesystem::file_size(directory / image.name, error) != image.bytes ||
+        error)
+      return;
+  const std::string stamp = packedStamp(directory, images);
+  const std::filesystem::path tmp = directory / ".packed.tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (out) out << stamp;
+    if (!out) {
+      std::filesystem::remove(tmp, error);
+      return;
+    }
+  }
+  std::filesystem::rename(tmp, directory / ".packed", error);
 }
 
 } // namespace richengine::model::affine

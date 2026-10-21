@@ -7,6 +7,7 @@
 #include "model/AffinePlan.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/DFlashDraft.hpp"
+#include "model/DFlashTwoDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"

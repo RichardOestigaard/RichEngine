@@ -209,8 +209,11 @@ bool tuningSupports(const Projection &projection) noexcept {
 }
 
 std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
-                                         LinearWorkload w) {
-  std::vector<LinearPlan> result{Linear(device).plan(w)};
+                                         LinearWorkload w,
+                                         std::string_view model) {
+  DevicePolicy policy = DevicePolicy::of(device);
+  policy.model = model;
+  std::vector<LinearPlan> result{Linear(policy).plan(w)};
   const auto append = [&](LinearConfig config) {
     if (std::none_of(result.begin(), result.end(), [&](const LinearPlan &plan) {
           return plan.configuration() == config;
@@ -278,7 +281,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
   };
   try {
     Linear linear(backend.capabilities());
-    const auto plans = linearCandidates(backend.capabilities(), input.workload);
+    const auto plans = linearCandidates(backend.capabilities(), input.workload, input.model);
     result.configuration = plans.front().configuration();
     if (!validMeasurementOptions(options) || !admit)
       throw std::invalid_argument("invalid Linear tuning measurement options or admission");

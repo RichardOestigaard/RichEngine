@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 from server import constraints as generation_constraints
+from server import model_host
 from server import server
 
 CONFIG = {
@@ -96,12 +97,14 @@ class TokenizerContractTests(unittest.TestCase):
         with (
             mock.patch.object(server, "parse_args", return_value=args),
             mock.patch.object(server.signal, "signal"),
-            mock.patch.object(server, "load_thinking_key", return_value=None),
+            mock.patch.object(model_host, "load_thinking_key", return_value=None),
             mock.patch.object(
-                server.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                model_host.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(server, "FrontendServer", return_value=http),
-            mock.patch.object(server.engine_runtime, "MultiplexedRuntime") as native,
+            mock.patch.object(
+                model_host.engine_runtime, "MultiplexedRuntime"
+            ) as native,
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             mock.patch("sys.stdout", new_callable=io.StringIO),
             self.assertRaises(SystemExit) as raised,

@@ -65,11 +65,15 @@ inline TargetRow selected_row(device const float *logits,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
-  const uint stride = max(params.rows, RICHENGINE_TARGET_VERIFY_ROWS);
+  const uint stride = params.lane_stride;
+  // The mask rows keep the full verify capacity's stride (a live row's mask
+  // plus the constraint row); the logits pack at the draft's verify stride.
   return {logits + (ulong(lane) * stride + params.logits_row + index) *
-                       params.vocabulary,
-          token_mask + (ulong(lane) * (stride + 1) + params.mask_row + index) *
-                           params.mask_words,
+                       params.logits_stride,
+          token_mask +
+              (ulong(lane) * (RICHENGINE_TARGET_VERIFY_ROWS + 1) +
+               params.mask_row + index) *
+                  params.mask_words,
           (params.constrained_mask & (1u << lane)) != 0,
           (params.exclude_stop_mask & (1u << lane)) != 0,
           params.stop_token_0,
@@ -961,15 +965,15 @@ inline void penalize_token(device float *logits, device const uint *words,
     return;
   device float *column =
       logits +
-      (ulong(params.logits_lane[entry]) * RICHENGINE_TARGET_VERIFY_ROWS +
-       params.row_offset) * params.vocabulary +
+      (ulong(params.logits_lane[entry]) * params.verify_stride +
+       params.row_offset) * params.logits_stride +
       token;
   for (uint row = 0; row < params.rows; ++row) {
     const uint count = (word & RICHENGINE_PENALTY_COUNT_MASK) +
                        popcount(drafted & ((2u << row) - 2u));
     if (!count && !(word & RICHENGINE_PENALTY_PROMPT_BIT))
       continue;
-    device float &logit = column[ulong(row) * params.vocabulary];
+    device float &logit = column[ulong(row) * params.logits_stride];
     logit = penalize_logit(logit, count, params.repetition[entry],
                            params.repetition_inverse[entry],
                            params.presence[entry], params.frequency[entry]);
@@ -999,9 +1003,9 @@ kernel void decode_sample_penalize_verify(
   if (token >= params.vocabulary || entry >= params.entries)
     return;
   device const uint *inputs =
-      input_tokens + ulong(params.logits_lane[entry]) * RICHENGINE_TARGET_VERIFY_ROWS;
+      input_tokens + ulong(params.logits_lane[entry]) * params.verify_stride;
   uint drafted = 0;
-  for (uint row = 1; row < RICHENGINE_TARGET_VERIFY_ROWS; ++row)
+  for (uint row = 1; row < params.verify_stride; ++row)
     drafted |= uint(inputs[row] == token) << row;
   penalize_token(logits, words, token, entry, drafted, params);
 }
@@ -1059,11 +1063,12 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // predicts the next token.
 inline void draft_top16_sharded_phase(
     device const float *logits, device uint *partial_ids,
-    device float *partial_values, uint vocabulary, uint row_offset,
+    device float *partial_values, uint vocabulary, uint stride,
+    uint row_offset,
     threadgroup float *maxima, threadgroup float *thresholds,
     threadgroup float *round_values, threadgroup uint *round_ids, uint group,
-    uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+    uint thread_index, uint lane, uint simd_group, uint rows) {
+  const uint Rows = rows;
   constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = RICHENGINE_DRAFT_CANDIDATES;
@@ -1072,7 +1077,9 @@ inline void draft_top16_sharded_phase(
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
   uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + row_offset) * vocabulary;
+  // The row stride is the head's padded vocabulary; vocabulary bounds the
+  // tokens — a pad row's logit is never selected.
+  ulong row_start = (ulong(batch) * Rows + position + row_offset) * stride;
   uint shard_tokens = (vocabulary + Shards - 1) / Shards;
   uint begin = min(shard * shard_tokens, vocabulary);
   uint end = min(begin + shard_tokens, vocabulary);
@@ -1185,7 +1192,8 @@ kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant DraftTop16Params &params [[buffer(3)]],
+    constant uint &query_rows [[buffer(4)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -1194,10 +1202,11 @@ kernel void draft_select_top16_sharded(
   threadgroup float thresholds[8];
   threadgroup float round_values[2][8];
   threadgroup uint round_ids[2][8];
-  draft_top16_sharded_phase(logits, partial_ids, partial_values, vocabulary, 1,
+  draft_top16_sharded_phase(logits, partial_ids, partial_values,
+                            params.vocabulary, params.logits_stride, 1,
                             maxima, thresholds, &round_values[0][0],
                             &round_ids[0][0], group, thread_index, lane,
-                            simd_group);
+                            simd_group, query_rows);
 }
 
 inline float sparse_lookup(device const uint *ids,
@@ -1382,17 +1391,20 @@ kernel void decode_accept_dflash(
     constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
   uint remaining = params.remaining[batch];
-  AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1,
-                           params.proposals[batch]
-                               ? min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
-                                     params.proposals[batch])
-                               : uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
-                           params.candidate_stride};
+  // The host's uncapped sentinel is the proposal table's own width: a lane
+  // can never accept more draft rows than its verify stride carries. Zero
+  // proposals is a real zero — the anchor decodes alone.
+  AcceptParams lane_params{
+      remaining, params.stop_token_0,
+      params.stop_token_1,
+      min(params.proposals[batch],
+          min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
+              params.verify_stride - 1)),
+      params.candidate_stride};
   device const uint *lane_draft =
       draft_tokens + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =
-      target_tokens + batch * RICHENGINE_TARGET_VERIFY_ROWS;
+      target_tokens + batch * params.verify_stride;
   if (params.sampling_mask & (1u << batch)) {
     accept_sampled_lane(
         lane_draft,
@@ -1400,7 +1412,7 @@ kernel void decode_accept_dflash(
                       params.candidate_stride,
         draft_probs + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS *
                           params.candidate_stride,
-        target_rows + batch * RICHENGINE_TARGET_VERIFY_ROWS,
+        target_rows + batch * params.verify_stride,
         uniforms + batch * RICHENGINE_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
   } else {
@@ -1521,19 +1533,17 @@ kernel void tree_leaf_patch(
 constant constexpr ushort kHeadArgmaxRows = 32;
 constant constexpr ushort kHeadArgmaxCols = 128;
 
-kernel void decode_head_argmax_q4(
-    device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
-    device float *partial_values [[buffer(4)]],
-    device uint *partial_indices [[buffer(5)]],
-    constant HeadArgmaxParams &params [[buffer(6)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  constexpr ushort M = kHeadArgmaxRows, TN = kHeadArgmaxCols;
-  threadgroup float tg_tile[M * TN];
-  threadgroup float input_sums[8 * M];
+// The fused-M variants size the logits tile to the live rows: a lane's
+// verify depth times the batch width, so the narrow steps skip three
+// quarters of the tile's MMA work (the same weight bytes stream either way).
+template <ushort M>
+__attribute__((always_inline)) inline void head_argmax_q4_tile(
+    device bfloat *input, device uchar *weights, device bfloat *scales,
+    device bfloat *biases, device float *partial_values,
+    device uint *partial_indices, constant HeadArgmaxParams &params,
+    threadgroup float *tg_tile, threadgroup float *input_sums,
+    uint tile, uint simd_lane, uint simd_group, uint thread_index) {
+  constexpr ushort TN = kHeadArgmaxCols;
   const uint col0 = tile * TN;
   q4_mpp_tile_sums<M, TN, false, 8, false>(
       input, weights, scales, biases, weights, scales, biases,
@@ -1551,7 +1561,9 @@ kernel void decode_head_argmax_q4(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index >= M) return;
   const uint s = thread_index;
-  const uint tiles = params.output_size / TN;
+  // The partials' row stride is the head's packed tile count; the tail
+  // tile's pad rows (tokens past output_size) never win.
+  const uint tiles = params.output_stride / TN;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
   const uint live = params.live_rows[s / params.rows];
@@ -1561,8 +1573,9 @@ kernel void decode_head_argmax_q4(
         (params.exclude_stop_mask & (1u << lane)) != 0;
     for (uint col = 0; col < TN; ++col) {
       const uint token = col0 + col;
-      if (exclude_stop &&
-          (token == params.stop_token_0 || token == params.stop_token_1))
+      if (token >= params.output_size ||
+          (exclude_stop &&
+           (token == params.stop_token_0 || token == params.stop_token_1)))
         continue;
       const float value = tg_tile[s * TN + col];
       if (value > best || (value == best && token < best_index)) {
@@ -1575,6 +1588,30 @@ kernel void decode_head_argmax_q4(
   partial_indices[s * tiles + tile] = best_index;
 }
 
+#define HEAD_ARGMAX_Q4(Name, M)                                                \
+  kernel void Name(                                                            \
+      device bfloat *input [[buffer(0)]],                                      \
+      device uchar *weights [[buffer(1)]],                                     \
+      device bfloat *scales [[buffer(2)]],                                     \
+      device bfloat *biases [[buffer(3)]],                                     \
+      device float *partial_values [[buffer(4)]],                              \
+      device uint *partial_indices [[buffer(5)]],                              \
+      constant HeadArgmaxParams &params [[buffer(6)]],                         \
+      uint tile [[threadgroup_position_in_grid]],                              \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]],                      \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    threadgroup float tg_tile[M * kHeadArgmaxCols];                            \
+    threadgroup float input_sums[8 * M];                                       \
+    head_argmax_q4_tile<M>(input, weights, scales, biases, partial_values,     \
+                           partial_indices, params, tg_tile, input_sums, tile, \
+                           simd_lane, simd_group, thread_index);               \
+  }
+HEAD_ARGMAX_Q4(decode_head_argmax_q4, kHeadArgmaxRows)
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m16, 16)
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m8, 8)
+#undef HEAD_ARGMAX_Q4
+
 // Reduces the fused head's per-(row, column tile) partials to each selected
 // greedy row's token, lowest id on ties.
 kernel void decode_head_argmax_reduce_tiles(
@@ -1586,7 +1623,9 @@ kernel void decode_head_argmax_reduce_tiles(
     uint lane [[thread_index_in_simdgroup]]) {
   if (lane_samples(params, s) || row_dead(params, s))
     return;
-  const uint tiles = params.vocabulary / kHeadArgmaxCols;
+  // The writer strides the head's packed tiles; a padded vocabulary's tail
+  // tile is within it but only real tokens were admitted.
+  const uint tiles = params.logits_stride / kHeadArgmaxCols;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
   for (uint t = lane; t < tiles; t += 32) {
@@ -1614,7 +1653,7 @@ kernel void decode_head_argmax_reduce_tiles_gguf(
     uint lane [[thread_index_in_simdgroup]]) {
   if (lane_samples(params, s) || row_dead(params, s))
     return;
-  const uint tiles = params.vocabulary / GGUF_TILE_COLUMNS;
+  const uint tiles = params.logits_stride / GGUF_TILE_COLUMNS;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
   for (uint t = lane; t < tiles; t += 32) {

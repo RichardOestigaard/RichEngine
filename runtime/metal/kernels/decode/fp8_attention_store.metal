@@ -13,8 +13,10 @@ inline void richengine_store_fp8_verify_phase(
     constant RichChunkedPrefillParams *params,
     threadgroup float *maxima, uint group, uint thread_index, uint simd_lane,
     uint simd_group) {
-  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
-  constexpr uint GroupsPerLane = 2 * Rows * KVHeads;
+  // The batch's verify stride: every lane's chunk carries the same row
+  // count (a trained-block draft's verify depth).
+  const uint Rows = params[0].chunk_tokens;
+  const uint GroupsPerLane = 2 * Rows * KVHeads;
   uint batch = group / GroupsPerLane;
   uint local_group = group % GroupsPerLane;
   constant RichChunkedPrefillParams &lane_params = params[batch];

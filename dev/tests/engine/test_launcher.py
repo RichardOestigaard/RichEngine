@@ -83,12 +83,13 @@ class LauncherTests(unittest.TestCase):
         keep_stop_signals(self)
 
     def test_serve_requires_exact_repository_id_before_build(self):
+        # With no --model a serve starts unloaded and loads one over the
+        # API; it is a parse-level success, not a rejection.
+        self.assertIsNone(launcher.parse_args(["serve"]).model)
         for arguments in (
-            ["serve"],
-            ["serve", "--model", "qwen3.6-35b-a3b"],
-            ["serve", "--model", "Qwen3.6-35B-A3B"],
             ["serve", "--model", "https://huggingface.co/community/model"],
             ["serve", "--model", "community/../model"],
+            ["serve", "--model", "unsloth/Qwen3.6-35B-A3B-GGUF:UD/Q4_K_M"],
         ):
             with (
                 self.subTest(arguments=arguments),
@@ -96,9 +97,31 @@ class LauncherTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
                 self.assertRaises(SystemExit) as failed,
             ):
-                launcher.main(arguments)
+                launcher.parse_args(arguments)
             self.assertEqual(failed.exception.code, 2)
             self.assertIn("--model", error.getvalue())
+            install.assert_not_called()
+        # A bare name is not rejected at parse: it defers to the local
+        # caches at selection time, where a miss reports cleanly and never
+        # reaches the installer.
+        for model in ("qwen3.6-35b-a3b", "Qwen3.6-35B-A3B"):
+            with (
+                self.subTest(model=model),
+                mock.patch(
+                    "install.local.find",
+                    side_effect=launcher.model_artifacts.ModelError(
+                        "no local model named"
+                    ),
+                ),
+                mock.patch.object(launcher, "_check_port"),
+                # The serve lock on the real install root is host-global: a
+                # live server holds it and this test must stay hermetic.
+                mock.patch("fcntl.flock"),
+                mock.patch.object(launcher, "_ensure_installed") as install,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                self.assertEqual(launcher.main(["serve", "--model", model]), 1)
+            self.assertIn("no local model named", error.getvalue())
             install.assert_not_called()
         for model in MODEL_IDS:
             self.assertEqual(

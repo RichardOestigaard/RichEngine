@@ -46,8 +46,11 @@ using richengine::test::require;
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
               const std::array<uint32_t, kLanes> &remainingReference,
-              uint32_t stopLane = kLanes, uint32_t stopRow = 0) {
+              uint32_t stopLane = kLanes, uint32_t stopRow = 0,
+              uint32_t verifyStride = kRows) {
   require(width >= 1 && width <= kLanes, "invalid test width");
+  require(verifyStride >= 1 && verifyStride <= kRows,
+          "invalid verify stride");
   MetalBuffer draft = shared(backend, kLanes * kProposals * sizeof(uint32_t),
                              "accept-draft");
   MetalBuffer draftIds =
@@ -80,19 +83,22 @@ void runWidth(MetalBackend &backend, uint32_t width,
   std::memset(retained.contents(), 0, retained.sizeBytes());
   std::memset(accepted.contents(), 0, accepted.sizeBytes());
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    require(acceptedReference[lane] < verifyStride,
+            "accepted count exceeds the verify stride");
     for (uint32_t token = 0; token < kProposals; ++token) {
       const uint32_t proposal = 1000 + lane * 100 + token;
       draftTokens[lane * kProposals + token] = proposal;
-      targetTokens[lane * kRows + token] =
-          token < acceptedReference[lane] ? proposal : proposal + 50;
+      if (token < verifyStride)
+        targetTokens[lane * verifyStride + token] =
+            token < acceptedReference[lane] ? proposal : proposal + 50;
     }
-    targetTokens[lane * kRows + kRows - 1] = 9000 + lane;
+    targetTokens[lane * verifyStride + verifyStride - 1] = 9000 + lane;
   }
 
   constexpr uint32_t kStopToken = 248044;
   if (stopLane < width) {
-    require(stopRow < kRows, "invalid stop row");
-    targetTokens[stopLane * kRows + stopRow] = kStopToken;
+    require(stopRow < verifyStride, "invalid stop row");
+    targetTokens[stopLane * verifyStride + stopRow] = kStopToken;
     if (stopRow < acceptedReference[stopLane])
       draftTokens[stopLane * kProposals + stopRow] = kStopToken;
   }
@@ -100,6 +106,9 @@ void runWidth(MetalBackend &backend, uint32_t width,
   AcceptBatchParams params{};
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
+  params.verify_stride = verifyStride;
+  for (uint32_t lane = 0; lane < kLanes; ++lane)
+    params.proposals[lane] = verifyStride - 1;
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
   ComputeDispatch dispatch;
@@ -209,6 +218,13 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    // A trained-block draft's eight-row verify stride packs a lane's emitted
+    // rows at half the capacity stride: acceptance reads them there while
+    // proposals stay at their fifteen-token draft stride.
+    constexpr std::array<uint32_t, kLanes> shortAccepted{0, 1, 5, 6};
+    for (uint32_t width = 1; width <= kLanes; ++width)
+      runWidth(backend, width, shortAccepted, fullRemaining, kLanes, 0, 8);
+    runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3, 8);
     testRowCopy(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";
     return 0;

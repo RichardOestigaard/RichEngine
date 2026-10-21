@@ -1,29 +1,55 @@
 """The per-family pack geometry install/pack.py packs to.
 
-The packer is generic; what a family owns lives here: the target and draft
-layout dataclasses and their shipped instances (the Gemma 4 26B-A4B MoE
-geometry and the z-lab DFlash draft's), the packed layer files' section
-names and type tags (the read order of runtime/model/Gemma4Moe.cpp
-readLayer and DFlashV1Draft.cpp), and DiffusionGemma's denoising schedule.
-The format magics, the tile geometry and the packing itself stay in
-pack.py.
+The packer is generic; what a family owns is data in its
+install/families/<name>.json "pack" section — the target and draft layout
+fields (the Layout/DraftLayout dataclasses here), the diffusion schedule
+and the package's execution geometry — which pack_layout()/draft_layout()
+materialize. The packed layer files' section names and type tags below are
+the format's, shared: the read order of runtime/model/Gemma4Moe.cpp
+readLayer and DFlashV1Draft.cpp. The format magics, the tile geometry and
+the packing itself stay in pack.py.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# DiffusionGemma's denoising schedule, as its generation_config.json and the
-# block-diffusion scheduler's defaults state it.
-DIFFUSION = {
-    "canvas_length": 256,
-    "max_denoising_steps": 48,
-    "t_min": 0.4,
-    "t_max": 0.8,
-    "entropy_bound": 0.1,
-    "confidence_threshold": 0.005,
-    "stability_threshold": 1,
-}
+
+def pack_spec(family):
+    """The family's "pack" section, or a ModelError when it declares none."""
+    from . import models
+
+    if family.pack is None:
+        raise models.ModelError(f"{family.name} declares no packed layout")
+    return family.pack
+
+
+def pack_layout(family) -> "Layout":
+    """The family's packed target geometry, per its file's pack.layout."""
+    return Layout(**pack_spec(family)["layout"])
+
+
+def draft_layout(family) -> "DraftLayout | None":
+    """The family's packed draft geometry, or None for a draft-less pack."""
+    spec = pack_spec(family).get("draft_layout")
+    return DraftLayout(**spec) if spec else None
+
+
+def diffusion_schedule(family):
+    """The family's denoising schedule, or None for an autoregressive pack."""
+    return pack_spec(family).get("diffusion")
+
+
+def execution_geometry(family, draft: "DraftLayout | None") -> dict:
+    """The manifest's execution_geometry: the family's declared values with
+    the draft sliding window the draft's signature states (its trained
+    window, under the runtime's draft ring capacity)."""
+    geometry = dict(pack_spec(family)["execution_geometry"])
+    if family.draft is not None:
+        geometry["draft_sliding_window"] = dict(family.draft.signature)[
+            "sliding_window"
+        ]
+    return geometry
 
 
 @dataclass(frozen=True)
@@ -78,8 +104,6 @@ class Layout:
         ]
 
 
-GEMMA4 = Layout()
-
 
 @dataclass(frozen=True)
 class DraftLayout:
@@ -108,8 +132,6 @@ class DraftLayout:
     def qkv(self) -> int:
         return (self.query_heads + 2 * self.kv_heads) * self.head_dim
 
-
-GEMMA4_DRAFT = DraftLayout()
 
 # The packed draft's files, in the order DFlashV1Draft.cpp reads them
 # (DraftCheckpoint.cpp dflashV1LayerImage/dflashV1ModelImage).

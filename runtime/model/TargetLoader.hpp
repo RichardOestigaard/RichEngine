@@ -2,6 +2,7 @@
 
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/OqTarget.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/TargetModel.hpp"
 #include "model/TargetFiles.hpp"
@@ -107,6 +108,38 @@ struct BlockTargetFormat final {
   }
 };
 
+// The oQ (oMLX mixed-precision) images of an MLX safetensors source
+// (model/OqTarget.cpp): the same Block32 layout a GGUF image keeps — each
+// projection a run of descriptor+plane segments, the fused ones read as a
+// segment sequence — with bf16 norms and the GDN output projection's
+// grouped column order, as the affine source keeps them.
+struct OqTargetFormat final {
+  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
+
+  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
+    return readNorm(file, width, false, label);
+  }
+  // A projection reads its descriptor then its payload: affine tiles for a
+  // ggml::kAffineQ4 section (the fast Affine64 kernels), a block segment for
+  // the rest.
+  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
+                                           uint32_t inputSize, std::string_view label) const {
+    return readOqProjection(file, outputSize, inputSize, label);
+  }
+  // The fused projection's segments in file order until they cover it —
+  // or, for a ggml::kAffineQ4 section, its affine tiles; the tensor names
+  // are only labels — mixed specs may merge or split them.
+  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                      std::string_view label,
+                                      std::initializer_list<std::string_view>) const {
+    return readOqFused(file, outputSize, inputSize, label);
+  }
+  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
+                                                uint32_t inputSize) const {
+    return readOqEmbedding(file, outputSize, inputSize, "embedding");
+  }
+};
+
 // Reads the mixer sections that follow a layer's input norm, in file order
 // (instantiated for both formats).
 template <class Format>
@@ -177,7 +210,7 @@ readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files
     WeightFile file = files.head();
     result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
     result.logitsProjection =
-        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
+        format.projection(file, paddedVocabularySize(layout.vocabularySize), layout.hiddenSize, "logits");
     // bf16 logits would round near-ties together: their spacing is 0.125 at
     // logits of 16 to 32.
     result.logitsProjection.destination = ops::FloatOutput::Float32;
@@ -235,7 +268,7 @@ template <class Layout> void requireTargetLayout(const Layout &layout) {
   validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
   validateQ4Layout(ffnWidth, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, ffnWidth);
-  validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
+  validateQ4Layout(paddedVocabularySize(layout.vocabularySize), layout.hiddenSize);
 }
 
 // Checks the layout and loads a target from its files. The architecture
@@ -250,6 +283,8 @@ loadTargetWeights(metal::MetalBackend &backend, const Layout &layout, const Targ
     return readTargetModelWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
     return readTargetModelWeights<Weights>(backend, layout, mlx->get(), AffineTargetFormat{}, readFfn);
+  if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
+    return readTargetModelWeights<Weights>(backend, layout, oq->get(), OqTargetFormat{}, readFfn);
   const auto &packed = std::get<PackedTargetFiles<Layout>>(files);
   return readTargetModelWeights<Weights>(backend, layout, packed,
                                         AffineTargetFormat{packed.tiledEmbedding}, readFfn);

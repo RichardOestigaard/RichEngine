@@ -31,13 +31,23 @@ def cpp_families():
 
 class FamilyParityTest(unittest.TestCase):
     def test_cpp_and_python_name_the_same_families(self):
+        # kModelFamilies may additionally carry Legacy-alias rows for
+        # retired family names — installed packages still resolve; the
+        # installer never offers them (families.LEGACY_NAMES).
         python = {family.name for family in families.FAMILIES}
         cpp = set(cpp_families())
         self.assertEqual(
-            python,
+            python | set(families.LEGACY_NAMES),
             cpp,
             f"Python-only: {sorted(python - cpp)}; C++-only: {sorted(cpp - python)}",
         )
+        table = cpp_families()
+        for alias, target in families.LEGACY_NAMES.items():
+            self.assertEqual(
+                table[alias][0],
+                table[target][0],
+                f"legacy alias {alias} states a different model_type than {target}",
+            )
 
     def test_each_signature_states_the_cpp_model_type(self):
         cpp = cpp_families()

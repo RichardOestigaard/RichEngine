@@ -67,7 +67,12 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
       throw WeightStoreError("source tensor type or shape does not match: " + input.name);
     input.tensor = &tensor;
   };
-  for (const auto &[module, bits] : image.quantized) source.requireQuantization(module, bits);
+  for (const auto &[module, expected] : image.quantized) {
+    // The spec the planner resolved — nullopt for a module left
+    // unquantized — must be what the checkpoint declares for it.
+    if (source.quantization(module) != expected)
+      throw WeightStoreError("unsupported affine quantization for " + std::string(module));
+  }
   for (Section &section : image.sections) {
     if (section.parts.empty()) bindInput(section.input);
     for (ProjectionPart &part : section.parts)

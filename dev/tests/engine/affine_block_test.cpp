@@ -27,6 +27,10 @@ using richengine::test::require;
 namespace {
 
 constexpr uint32_t kRows = 512, kColumns = 256, kPartRows = 256;
+// The fused-window source's per-expert block and the window's share of it
+// (the up half of a fused gate_up block: rows 256-511 of a 512-row block).
+constexpr uint32_t kWindowExperts = 2, kWindowStride = 512, kWindowRows = 256,
+                   kWindowOffset = 256;
 
 uint32_t mix(uint32_t value) {
   value ^= value >> 16;
@@ -72,8 +76,24 @@ void writeFixture(const std::filesystem::path &root) {
     }
     parts[part] = {tensor(std::move(weight)), tensor(std::move(scales)), tensor(std::move(biases))};
   }
+  // A fused window source: [kWindowExperts][kWindowStride][columns] as the
+  // fused gate_up_proj checkpoints keep them — each window's rows sit
+  // `expertOffset` into the source block's per-expert rows.
+  std::vector<uint8_t> windowWeight(kWindowExperts * kWindowStride * kColumns / 2),
+      windowScales(kWindowExperts * kWindowStride * (kColumns / 64) * 2),
+      windowBiases(windowScales.size());
+  for (size_t i = 0; i < windowWeight.size(); ++i) windowWeight[i] = uint8_t(mix(uint32_t(i) + 97));
+  for (size_t i = 0; i < windowScales.size() / 2; ++i) {
+    const float scale = 0.005F + float(mix(uint32_t(i) + 43) % 13) * 0.0002F;
+    const uint16_t s = bf16(scale), b = bf16(-3.25F * scale);
+    std::memcpy(windowScales.data() + 2 * i, &s, 2);
+    std::memcpy(windowBiases.data() + 2 * i, &b, 2);
+  }
+  const uint64_t windowWeightOffset = tensor(std::move(windowWeight));
+  const uint64_t windowScalesOffset = tensor(std::move(windowScales));
+  const uint64_t windowBiasesOffset = tensor(std::move(windowBiases));
   const uint64_t norm = tensor(std::vector<uint8_t>(128, 0x3C));
-  char header[1024];
+  char header[2048];
   const int length = std::snprintf(
       header, sizeof header,
       R"({"a.weight":{"dtype":"U32","shape":[%u,%u],"data_offsets":[0,%u]},)"
@@ -82,14 +102,22 @@ void writeFixture(const std::filesystem::path &root) {
       R"("b.weight":{"dtype":"U32","shape":[%u,%u],"data_offsets":[%llu,%llu]},)"
       R"("b.scales":{"dtype":"BF16","shape":[%u,%u],"data_offsets":[%llu,%llu]},)"
       R"("b.biases":{"dtype":"BF16","shape":[%u,%u],"data_offsets":[%llu,%llu]},)"
+      R"("window.weight":{"dtype":"U32","shape":[%u,%u,%u],"data_offsets":[%llu,%llu]},)"
+      R"("window.scales":{"dtype":"BF16","shape":[%u,%u,%u],"data_offsets":[%llu,%llu]},)"
+      R"("window.biases":{"dtype":"BF16","shape":[%u,%u,%u],"data_offsets":[%llu,%llu]},)"
       R"("norm":{"dtype":"BF16","shape":[64],"data_offsets":[%llu,%llu]}})",
       kPartRows, kColumns / 8, kPartRows * kColumns / 2, kPartRows, kColumns / 64,
       (unsigned long long)parts[0].scales, (unsigned long long)parts[0].biases, kPartRows,
       kColumns / 64, (unsigned long long)parts[0].biases, (unsigned long long)parts[1].weight,
       kPartRows, kColumns / 8, (unsigned long long)parts[1].weight, (unsigned long long)parts[1].scales,
       kPartRows, kColumns / 64, (unsigned long long)parts[1].scales, (unsigned long long)parts[1].biases,
-      kPartRows, kColumns / 64, (unsigned long long)parts[1].biases, (unsigned long long)norm,
-      (unsigned long long)norm, (unsigned long long)(norm + 128));
+      kPartRows, kColumns / 64, (unsigned long long)parts[1].biases, (unsigned long long)windowWeightOffset,
+      kWindowExperts, kWindowStride, kColumns / 8, (unsigned long long)windowWeightOffset,
+      (unsigned long long)windowScalesOffset,
+      kWindowExperts, kWindowStride, kColumns / 64, (unsigned long long)windowScalesOffset,
+      (unsigned long long)windowBiasesOffset,
+      kWindowExperts, kWindowStride, kColumns / 64, (unsigned long long)windowBiasesOffset,
+      (unsigned long long)norm, (unsigned long long)(norm), (unsigned long long)(norm + 128));
   std::vector<uint8_t> file(sizeof(uint64_t));
   const uint64_t headerBytes = uint64_t(length);
   std::memcpy(file.data(), &headerBytes, sizeof headerBytes);
@@ -119,6 +147,31 @@ affine::Image fixture() {
     section.parts.push_back(std::move(part));
   }
   affine::append(result, std::move(section));
+  return result;
+}
+
+// The fused-window projection, alone in its own image: `experts` windows of
+// `window` rows over the fused source's per-expert stride, at its row offset
+// (the up half of a fused gate_up block here).
+affine::Image windowFixture() {
+  affine::Image result = affine::image("layer-window.bin", "MDFN0001", 0, 1);
+  result.quantized.emplace_back("window", 4);
+  affine::Section window;
+  window.kind = affine::SectionKind::Projection;
+  window.rows = kWindowRows;
+  window.columns = kColumns;
+  window.bits = 4;
+  window.experts = kWindowExperts;
+  affine::ProjectionPart windowPart{kWindowRows, {}};
+  windowPart.expertStride = kWindowStride;
+  windowPart.expertOffset = kWindowOffset;
+  windowPart.fields.push_back({"window.weight", {"U32"}, {kWindowExperts, kWindowStride, kColumns / 8}});
+  windowPart.fields.push_back({"window.scales", {"BF16"}, {kWindowExperts, kWindowStride, kColumns / 64}});
+  windowPart.fields.push_back({"window.biases", {"BF16"}, {kWindowExperts, kWindowStride, kColumns / 64}});
+  window.parts.push_back(std::move(windowPart));
+  window.bytes = uint64_t(kWindowRows) * kColumns * 4 / 8 * kWindowExperts +
+                 uint64_t(kWindowRows) * kColumns / 16 * kWindowExperts;
+  affine::append(result, std::move(window));
   return result;
 }
 
@@ -211,6 +264,45 @@ int main() {
       }
     require(std::fabs(sumA - sumB) < 1e-9 * std::fabs(sumA) + 1e-12,
             "the block GEMM result differs from the affine one");
+
+    // The fused-window section, planned and written on its own image: flat
+    // row e*256+r must decode the source block's row e*512 + 256 + r — the
+    // values are the fixture's generators evaluated at that source row.
+    auto windowImage = windowFixture();
+    affine::bind(windowImage, planned->source);
+    std::vector<uint8_t> windowBytes(windowImage.bytes);
+    affine::writeAffineImage(windowBytes, windowImage);
+    const affine::Section &window = windowImage.sections.back();
+    require(window.kind == affine::SectionKind::Projection && window.experts == kWindowExperts &&
+                window.parts.size() == 1 && window.parts.front().expertStride == kWindowStride,
+            "the fused window section changed shape");
+    // The planes keep each expert's fields together: expert e's rows pack
+    // from e * (bytes/experts), weights then scales then biases.
+    for (uint32_t flat = 0; flat < kWindowExperts * kWindowRows; ++flat) {
+      const uint32_t expert = flat / kWindowRows, row = flat % kWindowRows;
+      const uint32_t source = expert * kWindowStride + kWindowOffset + row;
+      const uint32_t groups = kColumns / 64;
+      const uint64_t base = window.offset + uint64_t(expert) * (window.bytes / window.experts);
+      for (uint32_t column = 0; column < kColumns; ++column) {
+        const uint8_t byte = uint8_t(mix(source * (kColumns / 2) + column / 2 + 97));
+        const uint32_t group = source * (kColumns / 64) + column / 64;
+        const float scale =
+            fromBf16(bf16(0.005F + float(mix(group + 43) % 13) * 0.0002F));
+        const float expected =
+            scale * float((byte >> (4 * (column & 1))) & 15) +
+            fromBf16(bf16(-3.25F * (0.005F + float(mix(group + 43) % 13) * 0.0002F)));
+        const uint64_t slot = (uint64_t(row / kQ4StorageN) * groups + column / 64) * kQ4StorageN +
+                              row % kQ4StorageN;
+        const uint8_t *weights = windowBytes.data() + base + slot * 32;
+        const auto *scales = reinterpret_cast<const uint16_t *>(windowBytes.data() + base +
+                                                                uint64_t(kWindowRows) * groups * 32);
+        const auto *biases = scales + uint64_t(kWindowRows) * groups;
+        const uint32_t code = (weights[(column % 64) / 2] >> (4 * (column & 1))) & 15;
+        const float actual = fromBf16(scales[slot]) * float(code) + fromBf16(biases[slot]);
+        require(actual == expected,
+                "the window's row came from the wrong source rows");
+      }
+    }
 
     // Non-Q4 and expert sections have no block form.
     auto quantized = fixture();

@@ -238,7 +238,7 @@ template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
 inline void richengine_paged_attention_tile(
     device bfloat *tile_queries, device const RichKvPage *page_table,
     RichKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
-    uint split, device float *partials, device float *statistics, ulong slot,
+    uint split, device bfloat *partials, device float *statistics, ulong slot,
     device const uint *row_masks, float qk_scale,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -377,9 +377,16 @@ inline void richengine_paged_attention_tile(
                 .template slice<N, D>(0, 0));
       }
     }
-    auto target = tensor(partials + slot * M * D + row_offset * D,
-                         dextents<int, 2>{D, MP}, array<int, 2>{1, D});
-    running.store(target.template slice<D, MP>(0, 0));
+    // bf16 on the bus: half the partial round-trip at ~0.2% per element —
+    // inside the merge's fp64 gate; the accumulator stays fp32.
+#pragma unroll
+    for (ushort index = 0; index < running.get_capacity(); ++index) {
+      if (!running_full && !running.is_valid_element(index))
+        continue;
+      const auto coordinates = running.get_multidimensional_index(index);
+      partials[slot * M * D + (row_offset + coordinates[1]) * D + coordinates[0]] =
+          bfloat(running[index]);
+    }
     if (thread_index < MP) {
       statistics[(slot * M + row_offset + thread_index) * 2] =
           row_max[thread_index];
@@ -404,7 +411,7 @@ inline void richengine_paged_attention_tile(
 template <uint QueryHeadsPerKVHead, uint RowsPerTile,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
 inline bfloat richengine_attention_reduce_value(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values,
@@ -441,7 +448,7 @@ inline bfloat richengine_attention_reduce_value(
     const float weight = weights[split];
     const ulong stat = ((head_slot + split) * M + fused_row) * 2;
     numerator += weight *
-        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+        float(partials[((head_slot + split) * M + fused_row) * D + thread_index]);
     denominator += weight * statistics[stat + 1];
   }
   return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
@@ -450,7 +457,7 @@ inline bfloat richengine_attention_reduce_value(
 template <uint QueryHeadsPerKVHead, uint RowsPerTile,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
 inline void richengine_attention_reduce_row(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *tile_output, uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values,

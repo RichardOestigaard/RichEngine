@@ -587,6 +587,13 @@ int moe(MetalBackend &backend) {
     std::string formats;
     for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
     for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+      // The register tile's bf16 operands cannot hold the AF8 formats'
+      // eight-bit codes; production stages them (ops/LinearGguf.cpp's
+      // apple9StagesFormat).
+      if (tile == MoeGgufTile::Register &&
+          std::any_of(m.formats.begin(), m.formats.end(),
+                      [](Fmt f) { return f == AF8 || f == AF8G128; }))
+        continue;
       const int before = failures;
       Stats stats;
       std::vector<uint16_t> widest;
@@ -596,7 +603,8 @@ int moe(MetalBackend &backend) {
         // the models' MXFP4 segments.
         MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile};
         config.mxfp4Native = backend.capabilities().appleGpuFamily >= 10;
-        const MoePlan plan = MoE::decodePlan(shape, lanes, config);
+        const MoePlan plan =
+            MoE::decodePlan(shape, lanes, RICHENGINE_TARGET_VERIFY_ROWS, config);
         const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                   std::to_string(lanes);
         const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);

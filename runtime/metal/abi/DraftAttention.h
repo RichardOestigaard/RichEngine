@@ -13,10 +13,13 @@
 
 struct DraftConvBatchParams {
   uint32_t finish;
+  // The lanes' packed query-row stride: the draft's trained-block depth
+  // (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
+  uint32_t query_rows;
 };
 
-static_assert(sizeof(DraftConvBatchParams) == 4,
-              "Draft convolution parameters are 4 bytes on both sides");
+static_assert(sizeof(DraftConvBatchParams) == 8,
+              "Draft convolution parameters are 8 bytes on both sides");
 
 // The attention core's split count (RICHENGINE_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (RICHENGINE_DRAFT_SLIDING_WINDOW) are compiled in.
@@ -36,11 +39,14 @@ struct DraftAttentionBatchParams {
   // Nonzero masks the eight current rows causally (a plain DFlash draft's
   // sliding layers); zero keeps the DFlash2 block-bidirectional pattern.
   uint32_t causal;
+  // The lanes' packed query-row stride: the draft's trained-block depth
+  // (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
+  uint32_t query_rows;
   uint32_t cache_length[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 32,
-              "Draft attention parameters are 32 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 36,
+              "Draft attention parameters are 36 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;
@@ -52,7 +58,10 @@ static_assert(sizeof(DraftContextParams) == 8,
 
 struct DraftContextBatchParams {
   uint32_t start_position[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The lanes' packed query-row stride: the draft's trained-block depth
+  // (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
+  uint32_t query_rows;
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 16,
-              "Draft context commit parameters are 16 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 20,
+              "Draft context commit parameters are 20 bytes on both sides");

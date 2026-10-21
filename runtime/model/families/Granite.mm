@@ -22,6 +22,7 @@ DFlashDraftLayout graniteNullDraftLayout(const GraniteLayout &target) {
   layout.targetHiddenSize = target.capturedHiddenSize();
   layout.selectorRank = 256;
   layout.kvHeads = 8;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
   return layout;
 }
 

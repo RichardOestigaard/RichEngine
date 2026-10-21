@@ -135,6 +135,8 @@ struct Case final {
   uint32_t vocabulary;
   uint32_t lanes;
   bool sampling;
+  // The logits row stride when a padded head packs rows past the vocabulary.
+  uint32_t stride = 0;
 };
 
 void runCase(MetalBackend &backend, const Case &c) {
@@ -142,15 +144,21 @@ void runCase(MetalBackend &backend, const Case &c) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
-  const DraftSelector selector(c.vocabulary);
+  const uint32_t stride = c.stride ? c.stride : c.vocabulary;
+  const DraftSelector selector(c.vocabulary, c.stride);
 
-  MetalBuffer logits = allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
+  MetalBuffer logits = allocate(backend, uint64_t{rows} * stride * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
                             Pattern::Sparse};
-  for (uint32_t row = 0; row < rows; ++row)
-    fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
+  for (uint32_t row = 0; row < rows; ++row) {
+    fillRow(logitRows + uint64_t{row} * stride, c.vocabulary,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
+    // Pads carry bait logits: a reader at the unpadded stride or one that
+    // admits them picks a token past the vocabulary.
+    std::fill_n(logitRows + uint64_t{row} * stride + c.vocabulary,
+                stride - c.vocabulary, 1e30F);
+  }
   const MetalBuffer selectorHidden =
       randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F);
   const DraftCodebooks codebooks{
@@ -217,7 +225,7 @@ void runCase(MetalBackend &backend, const Case &c) {
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t global = lane * kPositions + position;
       const float *row =
-          logitRows + (uint64_t{lane} * kRows + position + 1) * c.vocabulary;
+          logitRows + (uint64_t{lane} * kRows + position + 1) * stride;
       const auto expected = referenceTop16(row, c.vocabulary);
       for (uint32_t rank = 0; rank < kCandidates; ++rank) {
         const uint32_t id = candidates[global * kCandidates + rank];
@@ -369,16 +377,22 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
-  const DraftSelector selector(c.vocabulary);
+  const uint32_t stride = c.stride ? c.stride : c.vocabulary;
+  const DraftSelector selector(c.vocabulary, c.stride);
 
   MetalBuffer logits =
-      allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
+      allocate(backend, uint64_t{rows} * stride * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
                             Pattern::Sparse};
-  for (uint32_t row = 0; row < rows; ++row)
-    fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
+  for (uint32_t row = 0; row < rows; ++row) {
+    fillRow(logitRows + uint64_t{row} * stride, c.vocabulary,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
+    // Pads carry bait logits: a reader at the unpadded stride or one that
+    // admits them picks a token past the vocabulary.
+    std::fill_n(logitRows + uint64_t{row} * stride + c.vocabulary,
+                stride - c.vocabulary, 1e30F);
+  }
   const DraftMarkovHead markov{
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
@@ -446,7 +460,7 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t global = lane * kPositions + position;
       const float *row =
-          logitRows + (uint64_t{lane} * kRows + position) * c.vocabulary;
+          logitRows + (uint64_t{lane} * kRows + position) * stride;
       std::array<double, kPool> scores{};
       for (uint32_t shard = 0; shard < kShards; ++shard) {
         const uint32_t begin = std::min(shard * shardTokens, c.vocabulary);
@@ -629,16 +643,22 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
-  const DraftSelector selector(c.vocabulary);
+  const uint32_t stride = c.stride ? c.stride : c.vocabulary;
+  const DraftSelector selector(c.vocabulary, c.stride);
 
   MetalBuffer logits =
-      allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
+      allocate(backend, uint64_t{rows} * stride * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
   const std::array patterns{Pattern::Peaked, Pattern::Uniform, Pattern::Ties,
                             Pattern::Sparse};
-  for (uint32_t row = 0; row < rows; ++row)
-    fillRow(logitRows + uint64_t{row} * c.vocabulary, c.vocabulary,
+  for (uint32_t row = 0; row < rows; ++row) {
+    fillRow(logitRows + uint64_t{row} * stride, c.vocabulary,
             patterns[(row / kRows + row % kRows) % patterns.size()], random);
+    // Pads carry bait logits: a reader at the unpadded stride or one that
+    // admits them picks a token past the vocabulary.
+    std::fill_n(logitRows + uint64_t{row} * stride + c.vocabulary,
+                stride - c.vocabulary, 1e30F);
+  }
   const MetalBuffer selectorHidden =
       randomBfloat(backend, uint64_t{rows} * kRank, random, 0.1F);
   const DraftCodebooks codebooks{
@@ -712,7 +732,7 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
     for (uint32_t position = 0; position < kPositions; ++position) {
       const uint32_t global = lane * kPositions + position;
       const float *row =
-          logitRows + (uint64_t{lane} * kRows + position + 1) * c.vocabulary;
+          logitRows + (uint64_t{lane} * kRows + position + 1) * stride;
       std::array<double, kPool> scores{};
       for (uint32_t shard = 0; shard < kShards; ++shard) {
         const uint32_t begin = std::min(shard * shardTokens, c.vocabulary);
@@ -923,6 +943,18 @@ int main(int argc, char **argv) {
         runDFlashPoolCase(backend, {vocabulary, lanes, true}, false);
         runDFlashPoolCase(backend, {vocabulary, lanes, false}, true);
         runDFlashPoolCase(backend, {vocabulary, lanes, true}, true);
+      }
+    }
+    // MiniCPM-V's geometry: a 248144 vocabulary over the head's padded
+    // 248320 rows — pads carry bait logits.
+    for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+      for (const bool sampling : {false, true}) {
+        const Case padded{248144U, lanes, sampling, 248320U};
+        runCase(backend, padded);
+        runDSparkCase(backend, padded, false);
+        runDSparkCase(backend, padded, true);
+        runDFlashPoolCase(backend, padded, false);
+        runDFlashPoolCase(backend, padded, true);
       }
     }
     std::cout << "draft_selector_metal_test: PASS\n";

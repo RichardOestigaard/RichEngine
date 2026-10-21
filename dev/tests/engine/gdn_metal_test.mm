@@ -551,7 +551,8 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
-       {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
+       {GdnShape{16, 48, 128, 10240, 16640, richengine::ops::GdnCore::Value48},
+        GdnShape{16, 32, 128, 8192, 12544, richengine::ops::GdnCore::Value32}}) {
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u})

@@ -83,6 +83,83 @@ template [[host_name("moe_expert_gguf_m8_g_n")]] kernel MoeExpertGgufKernel moe_
 template [[host_name("moe_expert_gguf_m32_a_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, true>;
 template [[host_name("moe_expert_gguf_m32_g_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate, true>;
 
+// The fused gate+up staged tile (ops::MoE's addGgufExperts, unpaced
+// non-register plans): each simdgroup accumulates the tile's gate columns
+// and up columns back to back on the same staged weights loop, and stores
+// silu(gate) * up straight to the intermediate — the split passes'
+// EpUpWithGate association (bf16-rounded up times silu of the bf16-rounded
+// gate) without the expertOutput round trip or a second dispatch. The
+// threadgroup barrier between the two accumulates keeps a format change's
+// pair-table refill off the other simdgroup's in-flight dequant reads.
+template <ushort Rows>
+inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+                                device uchar *gw0, device uchar *gw1, device uchar *gmeta, device uchar *gsw0,
+                                device uchar *gsw1, device uchar *gsmeta, device uchar *uw0, device uchar *uw1,
+                                device uchar *umeta, device uchar *usw0, device uchar *usw1, device uchar *usmeta,
+                                device bfloat *output, constant MoeGgufFusedParams &p, uint2 group, uint simd_lane,
+                                uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
+  if (group.y >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[group.y];
+  const MoeGgufSegment gate = moe_gguf_segment_fmt(tile.expert, p.experts, p.input_size, p.output_size,
+                                                 p.gate_routed_format, p.gate_shared_format, gw0, gw1, gmeta,
+                                                 gsw0, gsw1, gsmeta);
+  const MoeGgufSegment up = moe_gguf_segment_fmt(tile.expert, p.experts, p.input_size, p.output_size,
+                                               p.up_routed_format, p.up_shared_format, uw0, uw1, umeta,
+                                               usw0, usw1, usmeta);
+  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
+  const ulong out = ulong(group.y) * Rows * p.output_size;
+  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
+  const auto run = [&](auto rows) {
+    constexpr ushort R = decltype(rows)::value;
+    auto acc_g = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    auto acc_u = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    gguf_zero(acc_g);
+    gguf_zero(acc_u);
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(gate.format, x, gate.w0, gate.w1, gate.meta,
+                                            p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
+                                            p.input_size / GGUF_STAGED_STEP, acc_g);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(up.format, x, up.w0, up.w1, up.meta,
+                                            p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
+                                            p.input_size / GGUF_STAGED_STEP, acc_u);
+#pragma unroll
+    for (ushort i = 0; i < acc_g.get_capacity(); ++i) {
+      if (!acc_g.is_valid_element(i)) continue;
+      const auto index = acc_g.get_multidimensional_index(i);
+      const ulong o = out + ulong(index[1]) * p.output_size + origin + uint(index[0]);
+      output[o] = bfloat(float(bfloat(float(acc_u[i]))) *
+                         richengine_silu(float(bfloat(float(acc_g[i])))));
+    }
+  };
+  moe_live_rows<Rows>(tile.rows, run);
+}
+
+template <ushort Rows>
+kernel void moe_expert_gguf_fused(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                  device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
+                                  device uchar *gw1 [[buffer(4)]], device uchar *gmeta [[buffer(5)]],
+                                  device uchar *gsw0 [[buffer(6)]], device uchar *gsw1 [[buffer(7)]],
+                                  device uchar *gsmeta [[buffer(8)]], device uchar *uw0 [[buffer(9)]],
+                                  device uchar *uw1 [[buffer(10)]], device uchar *umeta [[buffer(11)]],
+                                  device uchar *usw0 [[buffer(12)]], device uchar *usw1 [[buffer(13)]],
+                                  device uchar *usmeta [[buffer(14)]], device bfloat *output [[buffer(15)]],
+                                  constant MoeGgufFusedParams &p [[buffer(16)]],
+                                  uint2 group [[threadgroup_position_in_grid]],
+                                  uint simd_lane [[thread_index_in_simdgroup]],
+                                  uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
+  moe_gguf_fused_tile<Rows>(input, tiles, tile_count, gw0, gw1, gmeta, gsw0, gsw1, gsmeta, uw0, uw1, umeta, usw0,
+                            usw1, usmeta, output, p, group, simd_lane, simd_group, stage, tl);
+}
+using MoeExpertGgufFusedKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
+                                      device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                      device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                      device uchar *, device uchar *, device bfloat *, constant MoeGgufFusedParams &,
+                                      uint2, uint, uint);
+template [[host_name("moe_expert_gguf_m8_gu")]] kernel MoeExpertGgufFusedKernel moe_expert_gguf_fused<8>;
+template [[host_name("moe_expert_gguf_m32_gu")]] kernel MoeExpertGgufFusedKernel moe_expert_gguf_fused<32>;
+
 // The pre-packed decode variant (ops::MoE's packed decode, Apple GPU family
 // 10): the gather's slot-permuted fp16 plane and per-(row, group) exponent
 // bytes (moe_gather_packed, kernels/shared/moe.metal) let an MXFP4 segment's

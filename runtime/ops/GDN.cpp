@@ -1,5 +1,6 @@
 #include "ops/GDN.hpp"
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 #include "ops/KernelNames.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
@@ -23,11 +24,19 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 [[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
   if (!shape.valid())
     throw std::invalid_argument("invalid GDN shape");
-  if (shape == GdnShape{16, 48, 128, 10240, 16640})
-    return KernelLayout::Value48;
-  if (shape == GdnShape{16, 32, 128, 8192, 12544})
-    return KernelLayout::Value32;
-  throw std::invalid_argument("unsupported compiled GDN shape");
+  switch (shape.core) {
+  case GdnCore::Value48:
+    if (shape == GdnShape{16, 48, 128, 10240, 16640, shape.core})
+      return KernelLayout::Value48;
+    break;
+  case GdnCore::Value32:
+    if (shape == GdnShape{16, 32, 128, 8192, 12544, shape.core})
+      return KernelLayout::Value32;
+    break;
+  case GdnCore::Unspecified:
+    break;
+  }
+  throw std::invalid_argument("declared GDN core does not match the shape");
 }
 
 [[nodiscard]] const char *kernelName(KernelLayout shape,
@@ -38,7 +47,7 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 
 // RICHENGINE_GDN_CHUNKED selects the WY/UT scan's chunk factor (32/64/128).
 [[nodiscard]] uint32_t gdnChunkFactor() {
-  const uint32_t parsed = tuning().gdnChunked;
+  const uint32_t parsed = model::modelPolicy().gdnChunked;
   return parsed == 32 || parsed == 64 || parsed == 128 ? parsed : 0;
 }
 
@@ -117,8 +126,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input,
-                             std::span<const uint32_t> liveRows) {
+                             std::span<const uint32_t> liveRows,
+                             uint32_t verifyStride) {
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+      !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
       (!liveRows.empty() && liveRows.size() != lanes))
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -127,7 +138,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * RICHENGINE_TARGET_VERIFY_ROWS);
+                        lanes * verifyStride);
   bindings.reserve(prepare ? 19 : 17);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
@@ -141,13 +152,13 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
-                              {}};
+                              {},
+                              verifyStride};
   for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] =
         lane < liveRows.size()
-            ? std::clamp(liveRows[lane], uint32_t{1},
-                         uint32_t{RICHENGINE_TARGET_VERIFY_ROWS})
-            : RICHENGINE_TARGET_VERIFY_ROWS;
+            ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
+            : verifyStride;
   const std::string name = std::string(kVerifyGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
@@ -185,7 +196,8 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
-                              {}};
+                              {},
+                              RICHENGINE_TARGET_VERIFY_ROWS};
   for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] = RICHENGINE_TARGET_VERIFY_ROWS;
   const std::string name = std::string(kVerifyTreeGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
@@ -197,9 +209,9 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                     GdnShape shape, uint32_t layers, uint32_t lanes,
-                    GdnStateStrides state) {
+                    GdnStateStrides state, uint32_t verifyStride) {
   if (!layers || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
-      !state.valid())
+      !state.valid() || !verifyStride)
     throw std::invalid_argument("invalid GDN commit geometry");
   const KernelLayout kernel = kernelShape(shape);
   std::vector<metal::MetalBuffer> bindings{
@@ -209,7 +221,8 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   bindings.push_back(buffers.retainedCounts);
   const GDNBatchCommitParams params{state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
-                                    state.convolutionStateBytes};
+                                    state.convolutionStateBytes,
+                                    verifyStride};
   // Static parameters and arena/state buffers: replayable. The current/next
   // state swap alternates between the span cache's two slots.
   graph.beginBakedSpan();
@@ -235,7 +248,8 @@ void GDN::addCommitTree(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   bindings.insert(bindings.end(), {buffers.retainedCounts, retainedPath});
   const GDNBatchCommitParams params{state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
-                                    state.convolutionStateBytes};
+                                    state.convolutionStateBytes,
+                                    RICHENGINE_TARGET_VERIFY_ROWS};
   graph.beginBakedSpan();
   graph.add(kernelName(kernel, kVerifyGdnCommitTree.data(),
                        kVerifyGdnCommitTreeVh32.data()),

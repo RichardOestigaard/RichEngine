@@ -73,6 +73,20 @@ id<MTLComputePipelineState> makePipeline(id<MTLDevice> device,
   return result;
 }
 
+// Like makePipeline but returns nil when the device cannot build the
+// kernel (threadgroup memory above the device limit) — lets a test skip
+// a shape instead of failing on a smaller device.
+id<MTLComputePipelineState> tryMakePipeline(id<MTLDevice> device,
+                                            id<MTLLibrary> library,
+                                            const std::string &name) {
+  id<MTLFunction> function =
+      [library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+  if (!function)
+    throw std::runtime_error("missing Metal kernel: " + name);
+  NSError *error = nil;
+  return [device newComputePipelineStateWithFunction:function error:&error];
+}
+
 void finish(id<MTLCommandBuffer> command) {
   [command commit];
   [command waitUntilCompleted];
@@ -340,7 +354,7 @@ struct Scratch {
 };
 
 Scratch makeScratch(id<MTLDevice> device, uint64_t slots, uint64_t outElements) {
-  return {makeBuffer(device, slots * kFused * kDim * sizeof(float)),
+  return {makeBuffer(device, slots * kFused * kDim * sizeof(BFloat16Bits)),
           makeBuffer(device, slots * kFused * 2 * sizeof(float)),
           makeBuffer(device, outElements * sizeof(BFloat16Bits))};
 }
@@ -556,19 +570,25 @@ int main(int argc, char **argv) {
         id<MTLComputePipelineState> prefill, prefillM2, canvas, canvasM2,
             verify, verifyM2;
       } pipes{
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_hd512"),
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_hd512_m2"),
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_canvas_hd512"),
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_canvas_hd512_m2"),
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kVerifyAttention) + "_" + name + "_split_gemma_hd512"),
-          makePipeline(device, library,
+          tryMakePipeline(device, library,
                        std::string(richengine::ops::kVerifyAttention) + "_" + name + "_split_gemma_hd512_m2"),
       };
+      if (!pipes.prefill || !pipes.prefillM2 || !pipes.canvas ||
+          !pipes.canvasM2 || !pipes.verify || !pipes.verifyM2) {
+        printf("skipped %s: kernel exceeds the device's threadgroup memory\n",
+               name.c_str());
+        continue;
+      }
       for (const uint32_t committed : {0U, 1024U}) {
         const uint32_t rows = 64; // eight tiles
         const uint32_t splits = committed == 0 ? 1 : 3;
@@ -641,23 +661,27 @@ int main(int argc, char **argv) {
     {
       auto data = makeCase(device, Format::Int8, 2048, 64, 4, 0x777);
       data.window = 1024;
-      const auto oldPipe = makePipeline(
+      const auto oldPipe = tryMakePipeline(
           device, library, std::string(richengine::ops::kPrefillAttentionQ8SplitCanvasSwaHd512));
-      const auto newPipe = makePipeline(
+      const auto newPipe = tryMakePipeline(
           device, library, std::string(richengine::ops::kPrefillAttentionQ8SplitCanvasSwaHd512M2));
+      const auto oldVerify = tryMakePipeline(
+          device, library, std::string(richengine::ops::kVerifyAttentionQ8SplitSwaHd512));
+      const auto newVerify = tryMakePipeline(
+          device, library, std::string(richengine::ops::kVerifyAttentionQ8SplitSwaHd512M2));
+      if (!oldPipe || !newPipe || !oldVerify || !newVerify) {
+        printf("skipped q8 swa: kernel exceeds the device's threadgroup memory\n");
+      } else {
       const auto a = runPrefill(queue, oldPipe, canvasReduce, data, true, true);
       const auto b = runPrefill(queue, newPipe, canvasReduce, data, true, true);
       require(compare(a, b).mismatched == 0,
               "canvas swa hd512_m2 output differs");
-      const auto oldVerify = makePipeline(
-          device, library, std::string(richengine::ops::kVerifyAttentionQ8SplitSwaHd512));
-      const auto newVerify = makePipeline(
-          device, library, std::string(richengine::ops::kVerifyAttentionQ8SplitSwaHd512M2));
       const auto va = runVerify(queue, oldVerify, verifyReduce, data, 2, true);
       const auto vb = runVerify(queue, newVerify, verifyReduce, data, 2, true);
       require(compare(va, vb).mismatched == 0,
               "verify swa hd512_m2 output differs");
       std::cout << "parity q8 swa canvas+verify: bitwise identical\n";
+      }
     }
 
     // ---- Timing: canvas-shape 256 rows (32 tiles) at prefixes 0/1024/8192.
@@ -665,11 +689,16 @@ int main(int argc, char **argv) {
     std::cout << "\n-- hd512 canvas split timings (256 rows, 2 KV heads) --\n";
     for (Format format : formats) {
       const std::string name = stem(format);
-      const auto oldPipe = makePipeline(
+      const auto oldPipe = tryMakePipeline(
           device, library, std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_canvas_hd512");
-      const auto newPipe = makePipeline(
+      const auto newPipe = tryMakePipeline(
           device, library,
           std::string(richengine::ops::kPrefillAttention) + "_" + name + "_split_canvas_hd512_m2");
+      if (!oldPipe || !newPipe) {
+        printf("skipped %s: kernel exceeds the device's threadgroup memory\n",
+               name.c_str());
+        continue;
+      }
       for (const uint32_t committed : {0U, 1024U, 8192U}) {
         const uint32_t splits = committed >= 8192 ? 4 : 1;
         auto data = makeCase(device, format, committed, 256, splits,

@@ -1,0 +1,231 @@
+{
+  "ADAPTIVE_PROPOSALS": {
+    "env": "RICHENGINE_ADAPTIVE_PROPOSALS",
+    "values": [
+      "0"
+    ],
+    "reason": "per-row proposal width vs the fixed rows; off by default",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ]
+  },
+  "ANE_WAIT": {
+    "env": "RICHENGINE_ANE_WAIT_MS",
+    "values": [
+      "1",
+      "0",
+      "8"
+    ],
+    "reason": "milliseconds a decode step waits on the ANE predraft before running the GPU draft; inert unless an ANE predraft artifact is loaded",
+    "requires_env": [
+      "RICHENGINE_ANE_PREDRAFT"
+    ]
+  },
+  "DFLASH_POOL": {
+    "env": "RICHENGINE_DFLASH_POOL",
+    "values": [
+      "1"
+    ],
+    "reason": "the 128-slot pool selector over the merged top-16; off by default",
+    "draft_kinds": [
+      "dflash2"
+    ],
+    "min_bandwidth_gbps": 200
+  },
+  "DRAFT_BYPASS": {
+    "env": "RICHENGINE_DRAFT_BYPASS",
+    "values": [
+      "0"
+    ],
+    "reason": "anchor-only decode when the draft's acceptance EWMA is low",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ]
+  },
+  "DRAFT_BYPASS_EXPECT": {
+    "env": "RICHENGINE_DRAFT_BYPASS_EXPECT",
+    "values": [
+      "0.08",
+      "0.30"
+    ],
+    "reason": "the acceptance EWMA below which the batch bypasses the draft",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ]
+  },
+  "DRAFT_SPLITS": {
+    "env": "RICHENGINE_DRAFT_SPLITS",
+    "values": [
+      "2",
+      "8"
+    ],
+    "reason": "draft attention tile splits vs the compiled 4; off-table values ride the draft kernel's function constant",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ]
+  },
+  "GDN_CHUNKED": {
+    "env": "RICHENGINE_GDN_CHUNKED",
+    "values": [
+      "32",
+      "64",
+      "128"
+    ],
+    "reason": "the WY/UT chunked prefill scan vs the serial one; off by default",
+    "model_types": [
+      "qwen3_5_text",
+      "qwen3_5_moe_text"
+    ]
+  },
+  "GGUF_PACKED": {
+    "env": "RICHENGINE_GGUF_PACKED_ON",
+    "values": [
+      "1"
+    ],
+    "reason": "packed GGUF decode operands; off by default",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "HEAD_FUSED": {
+    "env": "RICHENGINE_HEAD_FUSED_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "the fused greedy argmax head vs the logits-then-sample path"
+  },
+  "ICB_OFF": {
+    "env": "RICHENGINE_ICB_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "direct dispatch vs the baked indirect command buffer; ICB on by default"
+  },
+  "MOE_PACKED_OFF": {
+    "env": "RICHENGINE_MOE_PACKED_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "the unpacked expert path vs the packed one; packed on by default"
+  },
+  "MOE_UNION": {
+    "env": "RICHENGINE_MOE_UNION",
+    "values": [
+      "16",
+      "8",
+      "4"
+    ],
+    "reason": "routed-expert union cap per decode step; off by default \u2014 drops each row's routes that miss the union without renormalizing, so every cap changes the emitted tokens (measured: cap 16 diverges from the baseline stream at token 8)",
+    "quality_sensitive": true,
+    "ordered": true
+  },
+  "MTL4": {
+    "env": "RICHENGINE_MTL4",
+    "values": [
+      "1"
+    ],
+    "reason": "the Metal 4 command-graph path; off by default",
+    "min_gpu_family": 10
+  },
+  "NGRAM_DRAFT_EXPECT": {
+    "env": "RICHENGINE_NGRAM_DRAFT_EXPECT",
+    "values": [
+      "2.0",
+      "6.0"
+    ],
+    "reason": "expected acceptance a lane must total to go predrafted",
+    "diffusion": false
+  },
+  "NGRAM_PREDRAFT": {
+    "env": "RICHENGINE_NGRAM_PREDRAFT",
+    "values": [
+      "0"
+    ],
+    "reason": "the learning-free n-gram predraft; on by default",
+    "diffusion": false
+  },
+  "NGRAM_TREE_MIN": {
+    "env": "RICHENGINE_NGRAM_TREE_MIN",
+    "values": [
+      "0.5",
+      "2.0"
+    ],
+    "reason": "EWMA a lane needs before its table emits sibling leaves",
+    "diffusion": false
+  },
+  "NGRAM_WARMUP": {
+    "env": "RICHENGINE_NGRAM_WARMUP",
+    "values": [
+      "4",
+      "16"
+    ],
+    "reason": "rounds before a lane's acceptance EWMA is trusted",
+    "diffusion": false
+  },
+  "NO_FUSED_GATE": {
+    "env": "RICHENGINE_NO_FUSED_GATE",
+    "values": [
+      "1"
+    ],
+    "reason": "the two-pass verify reduce vs the fused out-projection fold; on by default"
+  },
+  "PATCHABLE_OFF": {
+    "env": "RICHENGINE_PATCHABLE_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "non-bakeable spans vs the patchable-payload replay; on by default"
+  },
+  "PREFILL_FAST_INT8": {
+    "env": "RICHENGINE_PREFILL_FAST_INT8",
+    "values": [
+      "1"
+    ],
+    "reason": "the split int8 prefill operand path; off by default"
+  },
+  "PREPARED_CACHE_OFF": {
+    "env": "RICHENGINE_PREPARED_CACHE_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "full command prepare vs the prepared-command cache; cache on by default"
+  },
+  "PROPOSAL_CAP": {
+    "env": "RICHENGINE_PROPOSAL_CAP",
+    "values": [
+      "6",
+      "4"
+    ],
+    "reason": "per-step proposal cap vs the draft's trained block limit",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ],
+    "ordered": true
+  },
+  "SUBMIT_AHEAD": {
+    "env": "RICHENGINE_SUBMIT_AHEAD",
+    "values": [
+      "1"
+    ],
+    "reason": "a second prefill command overlapping the running one; off by default"
+  },
+  "VERIFY_TREE": {
+    "env": "RICHENGINE_VERIFY_TREE",
+    "values": [
+      "1",
+      "0"
+    ],
+    "reason": "comb-tree verify of draft proposals; off-by-default on GPU drafts",
+    "diffusion": false
+  }
+}

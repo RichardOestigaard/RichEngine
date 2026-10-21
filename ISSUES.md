@@ -15,6 +15,19 @@ GPU work) makes it pass — scheduling quirk, not our encoding.
 Workaround: `CommandGraph::suspendBakedSpan()`/`resumeBakedSpan()` around
 `Linear::add`'s Block32 `addGguf` path and the MoE expert passes; everything
 else stays baked. Candidate for a Metal Feedback report with a minimal repro.
+Update (2026-10-17): commands *encoded on device* replay correctly —
+`RICHENGINE_GPU_SPANS=1` marks the suspended runs as GPU-encoded spans
+(`gpu_encode` writes the `MTLIndirectComputeCommand`s from staged
+descriptors, `kernels/shared/gpu_dispatch.metal`), verified bitwise against
+direct encoding on gguf-moe-benchmark B1–B4 and the full gguf-moe parity
+suite. One anomaly: under `MTL_SHADER_VALIDATION=1` a staged B4 run zeroed
+one expert tile (unvalidated runs are bitwise-clean everywhere). The
+current read is a validation-layer limitation, but this is unverified —
+no minimal repro exists, and the same run mutates ICB contents on device,
+so a real hazard in the encode→barrier→execute ordering is not ruled
+out. The anomaly is recorded unresolved; the path stays opt-in
+(`RICHENGINE_GPU_SPANS=1`) and must not ship enabled-by-default until a
+repro under validation decides which side is at fault.
 
 ### `verify_attention_q8_split` repeat flake
 Identical submissions of the int8 split-attention kernel occasionally differ by
@@ -99,4 +112,137 @@ multimodal upstream but no vision layout is wired. Image requests will fail.
 Resolved since: `runtime-bootstrap` and `linear-plan` pass; `execution-plans`
 constants were updated for the verify-rows 8→16 / draft ring 2048→4096
 geometry; `model-runtime-oracle` was fixed for the `model.draft` weights
-variant.
+variant; `q8-flash-attention` was fixed for the same 8→16 bump (its prefill
+dispatch never ran the second tile — a test-side fix, not a kernel bug).
+
+### fp8/hd512 attention tests exceed 32 KB threadgroup on this device
+`fp8-flash-attention` and `hd512-attention` fail at pipeline creation:
+`Threadgroup memory size (34384/34308) exceeds the maximum 32768`.
+Stale pre-change binaries fail identically — the kernels' scratch
+(scores+probabilities+staging) exceeds the device limit, so the tests
+cannot run on this machine/SDK. Opt-in-tier kernels; not production
+paths.
+
+### backend-benchmark behind draft-geometry change
+The LFM2.5-2.6B GGUF decode scenario aborts with "physical width
+accounting mismatch" (drafted=15, expected=2). The execution_geometry
+contract is fixed — `validateExecutionGeometry` now bounds-checks the
+recorded draft block against runtime capacity rather than demanding
+equality, so existing packed-q4 packages load again. The GGUF
+scenario's width accounting still predates the verify-stride change;
+realign the harness before using it for A/B decode runs.
+
+### Qwen3.8-27B decode: proposal-substitution layer cost ~70% of B1
+Measured 2026-10-18 (M5 Pro, packed Q4 + incoai DFlash2, decode scenario):
+the n-gram predraft gate compared its expected score against a constant
+(`ngramDraftExpect=4`), never the GPU draft's measured EWMA, so 3-gram
+history chains preempted a draft that lands ~2.6 accepted/step — B1
+30 tok/s, B4 ~105. The gate now compares against `proposalAcceptedAvg`
+(which now trains unconditionally, excluding n-gram-supplied steps), and
+`adaptiveProposals` is maker-disabled for this family — its saved verify
+rows cost nothing against a 14.5 GiB pass while its shrunk budget loses
+tail tokens (measured ~10 tok/s B1). Result: B1 ~51, B4 ~120, reported
+acceptance 36.5% (drafted now counts offered clamped to verifyStride-1,
+not the compiled 15). Residual to upstream's published 74/170: the B1
+step is ~72 ms of which ~62 ms is `decode_linear_q4*` weight streaming
+(~204 GB/s effective); upstream runs GGUF-tile sgmatrix decode kernels
+on the same chip. Step time, not acceptance, is now the dominant gap.
+Knob A/B 2026-10-18: RICHENGINE_MTL4=1 → 47.7 B1 (worse),
+RICHENGINE_SUBMIT_AHEAD=1 → 47.8 B1 (worse); defaults stand. A clean
+autotune sweep needs the GPU uncontended — an installed serve holds the
+lock and marks every measurement contaminated, so nothing can win.
+
+Clean sweep 2026-10-18 (no contention): kernel pass fitted 7 of 88
+Linear plans (+5–27% isolated: Split128×2 on {16640,5120} and
+{17408,5120} GateUp at rows=64, N128-112 on {14336,5120}, N256-65 on
+{16640,5120}@48, Split128 on {5120,25600}@64 and {6144,5120}@48/64);
+env pass kept only VERIFY_TREE=1 (+22% B1 on its harness). On the
+packed-model decode bench the plans are neutral (51.2/120.5) and
+VERIFY_TREE loses B1 (39.2) while B2 hits the tree lane-divergence
+defect (35.5, acc 0.187): the env was dropped from tuning.json with a
+note; the fitted plans spec stays and applies at serve.
+
+Decode B1 follow-up 2026-10-18 (M5 Pro, same model/harness): three
+changes measured in the real profile (decode-profile, 2 cycles):
+- `decode_head_argmax_q4` ran a fixed 32x128 logits tile regardless of
+  live rows: ~156 GB/s on the 715 MB head stream. Row-sized variants
+  (M8/M16, same per-row math, bitwise-identical argmax) measure
+  ~270 GB/s — 4.07 -> 2.66 ms at B1, 4.09 -> 2.64 at B2.
+- `decode_linear_q4_n256_gate_up` is now Pipelined (documented
+  bit-identical) and the one/two-lane GateUp plan takes an even
+  half grid past two threadgroups per core ({17408,5120}: 34 groups
+  x 2 tiles, ~267-277 GB/s isolated, vs 68 x 1 at ~255). In-model
+  27.5 -> ~26.1 ms over 69 dispatches.
+- Ruled out: the affine sgmatrix/Table64 path (decode_linear_q4_sg*)
+  on Apple10 — ~2x slower than the mpp tiles on every hot shape at
+  rows 8-16 (gate_up 115 GB/s, residual/psum ~2x worse); a four-
+  simdgroup fused gate/up kernel hangs the fused command (reverted).
+Residual: weight streams run ~235-255 GB/s in-model vs ~265-280
+isolated (q4-decode-profile sweep); the fused cycle loses the rest to
+non-linear kernels and dispatch serialization (fused == sum of parts,
+~0% overlap headroom). Reaching upstream's 74 tok/s on B1 needs the
+cycle near ~47 ms — below the 15.6 GB/cycle streaming bound at
+307 GB/s — so either acceptance must rise or the weight layout must
+change: repacking Affine64 into GGUF tiles (a load-time
+AffineToBlock-style pass writing QUANT_TILE_ROWS-interleaved planes)
+would unlock the gguf decode tile family, but the affine epilogue
+(scale,bias per 64-group) already maps onto them, so the true win
+there is unproven on this chip — the sgmatrix result above suggests
+the gap is upstream's acceptance/draft accounting, not kernel shape.
+
+GDN_CHUNKED=128 measured 64.7 B1 on the sweep harness but was rejected
+on its own regression rule (prefill 334 vs 408).
+
+Conditioning chain verdicts 2026-10-18: verify_attention_bf16_split
+(the last unverified kernel in the verify->draft chain) now has fp64
+oracle coverage at the production stride - paged-attention-plan's
+checkVerify takes a rows parameter and runs rows=8 across
+int8/int4/bf16 x lanes 1-4 x histories 0/1023/16384, all PASS; the
+kernel is clean at rowCapacity=8. draft_conv row-0 tap-1 (draft.metal
+if (row > 0)) is identical to upstream's draft_conv_phase - by design,
+not a defect. With the ring commit already exonerated by
+RICHENGINE_SKIP_CONTEXT_COMMIT (zero delta), every hop of the
+decode-time conditioning chain is now verified clean: the ~36.5%/0.75
+conditional acceptance is the DFlash2 checkpoint's behavior on this
+pairing, not a runtime defect.
+
+Decode fusion pass 2026-10-18 (M5 Pro, Qwen3.8-27B packed Q4 + DFlash2,
+verifyStride=8): two candidate wins on the ~74 ms B1 verify step.
+
+- `decode_linear_q4_n128_split_residual` runs 128x/step: the residual
+  epilogue is ALREADY fused — the count is two distinct residual GEMMs
+  per layer (mixer out {5120,6144} + FFN down {5120,17408}), each one
+  dispatch, not down-proj + a separate add. A "single fused tile" for
+  the down-proj was measured and is NOT bandwidth-neutral (q4-decode-
+  profile: paired-residual 0.261 ms / sequential residual 0.293 ms vs
+  split-residual s4 0.238 ms at 8 rows), so the remaining lever is the
+  split count. kMeasuredDecode gains rows for both residual shapes at
+  the block-8 verify strides: {5120,17408} Residual @8/16/32 ->
+  Split128 s4/s8/s4 and {5120,6144} Residual @8/16/24 -> Split128 s4
+  (the wave-fit rule stops at s2 on the 40-tile grid). Installed
+  tuning.json plans keep priority (rows 48/64, no residual rows), so
+  both mechanisms coexist. In-model (decode-profile, 2 cycles):
+  split_residual 18.83 -> 18.56 ms B1, 21.66 -> 20.54 B2, ~flat B3/B4;
+  backend-benchmark decode: B1 49.1 -> 50.9 gpu tok/s, B4 114.9 ->
+  116.0, output_token_hash 5877947751290141417 identical at every
+  width, performance_pass, no lane divergence.
+- `verify_gdn_commit` (~1.2 ms, one dispatch) into `verify_gdn_fused`
+  is RULED OUT by ordering: the fused kernel encodes inside the target
+  forward (Runtime.mm encodeTargetVerifyBatchForward / the constrained
+  ticket's `target` graph) while `decode_accept_dflash` writes
+  RetainedCount later in the same command buffer — and, on the
+  constrained path, in a different graph submitted after the forward
+  completes. The commit's replay of `retained` rows needs the count at
+  encode-ordered execution time; the fused kernel would read the
+  previous step's value. The current separate dispatch is correctly
+  ordered after acceptance (same encoder -> sees earlier outputs). A
+  merge would have to target a post-acceptance kernel (the draft state
+  commit chain), not the fused mixer.
+
+Re-tune 2026-10-18 (post-fusion, clean GPU): kernel pass changed only 2
+of 88 plans - the new kMeasuredDecode rows already cover the hot
+shapes. Env pass kept RICHENGINE_VERIFY_TREE=0 (flipped from the
+earlier sweep's =1: the fused-head disable now outweighs the tree
+gain post-fusion, and pinning it off also blocks the known B2
+lane-acceptance defect at serve). Best env B1 38.25 / B4 62.2 in the
+sweep harness; tuning.json updated (VERIFY_TREE=0 + 2 fitted plans).

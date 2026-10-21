@@ -8,7 +8,7 @@
 #define PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim)                    \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -45,7 +45,7 @@
                                     HeadDim>(                                  \
         queries + (ulong(batch) * Heads + kv_head) * group_stride,             \
         page_table, lane_params.kv, kv_head, lane_params.committed_tokens,     \
-        RICHENGINE_TARGET_VERIFY_ROWS, lane_params.split_count, split, partials,   \
+        lane_params.active_rows, lane_params.split_count, split, partials,   \
         statistics,                                                            \
         (ulong(batch) * Heads + kv_head) * lane_params.slot_splits + split,    \
         scores, probabilities, row_max, row_sum, previous_scale, &rescale,     \

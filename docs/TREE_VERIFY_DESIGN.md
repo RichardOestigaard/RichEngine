@@ -60,7 +60,7 @@ depth=p+1 and its logits are checked by its parent's row.
 ## Gating
 
 `VerifyMode` in bootstrap config: `RICHENGINE_VERIFY_TREE` env (0/1) or
-`--verify-tree` flag. Auto-on only when `DraftKind::DFlash2` AND the batch
+`--verify-tree` flag. Auto-on only when `DraftKind::DFlashTwo` AND the batch
 has ≥1 unconstrained greedy lane AND width ≤ tree cap (B4 rows=64 → LM head
 compute-bound; cap may fall back to chain by width — decide on benchmark).
 `fp8e4m3` KV → off (near-tie noise compounds width). Escape: env kill

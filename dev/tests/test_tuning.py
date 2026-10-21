@@ -382,10 +382,10 @@ class TestBadPathPruning(unittest.TestCase):
         stats = autotune._family_stats(doc, "M4 Max", "Fam-1")
         self.assertEqual(stats["RICHENGINE_X=1"], {"wins": 4, "losses": 1})
         self.assertEqual(stats["RICHENGINE_Y=1"], {"wins": 1, "losses": 0})
-        # A family with no bucket still inherits the pooled history.
+        # A family with no bucket inherits nothing: flat entries name no
+        # family, so crediting them to Fam-2 leaks another family's history.
         other = autotune._family_stats(doc, "M4 Max", "Fam-2")
-        self.assertEqual(other["RICHENGINE_X=1"], {"wins": 0, "losses": 20})
-        self.assertNotIn("RICHENGINE_Y=1", other)
+        self.assertEqual(other, {})
         self.assertEqual(autotune._family_stats(doc, "M1", "Fam-1"), {})
 
     def test_prior_stats_expires_on_engine_or_knob_change(self):

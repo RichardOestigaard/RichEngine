@@ -53,8 +53,8 @@ void testContract() {
           "the final cycle's verification rows exceeded physical KV scratch");
   require(verifyAttentionSplits(0) == kVerifySplits &&
               verifyAttentionSplits(16 * 1024) == kVerifySplits + 1 &&
-              verifyAttentionSplits(131072) == kVerifyMaximumSplits,
-          "verify split scaling departed from one split per 16 visible pages");
+              verifyAttentionSplits(131072) == kVerifyPolicySplits,
+          "verify split scaling departed from one split per 64 visible pages");
   // The scratch runway is a tree verify's RICHENGINE_TREE_VERIFY_NODES - 1
   // emitted rows, not a chain's fifteen.
   finalCycle.committed_tokens = richengine::kv::kMaximumPhysicalTokens - kRows + 1;
@@ -363,8 +363,11 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
-  require(scratch == result.prefillSplit.staticThreadgroupMemoryLength,
-          "verify tile left the shared score/probability footprint");
+  // The verify tile runs sixteen fused rows to the prefill tile's eight,
+  // so its scratch is larger; both must fit the 32 KB threadgroup limit.
+  require(scratch <= 32768 &&
+              result.prefillSplit.staticThreadgroupMemoryLength <= 32768,
+          "attention tile left the 32 KB score/probability footprint");
   return result;
 }
 
@@ -395,7 +398,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
   const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
+      device, slots * shape.fusedRows() * kHeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -444,9 +447,13 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
   const uint64_t slots = uint64_t{shape.kvHeads} * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
+      device, slots * shape.fusedRows() * kHeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The kernels split the rows into eight-row tiles on the tile axis.
+  const uint32_t tiles =
+      (data.params.rows + RICHENGINE_PREFILL_ATTENTION_TILE_ROWS - 1) /
+      RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -457,14 +464,14 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:4];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, tiles, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
   [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), tiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -650,47 +657,81 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  id<MTLLibrary> library, Shape shape, uint32_t splits,
                  uint32_t activeRows) {
   const uint32_t m = shape.fusedRows(), d = kHeadDimension;
-  auto partials = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * d * 4);
+  // Verify slots are [head][split] of all m fused rows; prefill adds the
+  // tile dimension [tile][head][split] of tileRows each. Both layouts get
+  // the same logical values so the two entries merge identical inputs.
+  const uint32_t tileRows =
+      RICHENGINE_PREFILL_ATTENTION_TILE_ROWS * shape.queryHeadsPerKvHead;
+  const uint32_t tiles = (m + tileRows - 1) / tileRows;
+  auto partials = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * d * 2);
   auto stats = makeBuffer(device, uint64_t{shape.kvHeads} * splits * m * 2 * 4);
-  auto *p = static_cast<float *>(partials.contents);
+  auto prefillPartials =
+      makeBuffer(device, uint64_t{shape.kvHeads} * tiles * splits * tileRows * d * 2);
+  auto prefillStats =
+      makeBuffer(device, uint64_t{shape.kvHeads} * tiles * splits * tileRows * 2 * 4);
+  auto *p = static_cast<BFloat16Bits *>(partials.contents);
   auto *t = static_cast<float *>(stats.contents);
+  auto *pp = static_cast<BFloat16Bits *>(prefillPartials.contents);
+  auto *pt = static_cast<float *>(prefillStats.contents);
   for (uint32_t head = 0; head < shape.kvHeads; ++head)
     for (uint32_t split = 0; split < splits; ++split)
       for (uint32_t row = 0; row < m; ++row) {
         const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+        const uint32_t tile = row / tileRows, local = row % tileRows;
+        const uint64_t pindex =
+            (uint64_t{tile * shape.kvHeads + head} * splits + split) * tileRows + local;
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         // Alternate underflow-scale differences and fractional exp weights.
         const float spacing = row % 2 ? 0.25f : 500.0f;
-        t[index * 2] = active ? float(int(split % 5) - 2) * spacing : -INFINITY;
-        t[index * 2 + 1] = active ? 1.0f + float(split % 7) : 0.0f;
-        for (uint32_t dim = 0; dim < d; ++dim)
-          p[index * d + dim] = float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f;
+        const float maximum =
+            active ? float(int(split % 5) - 2) * spacing : -INFINITY;
+        const float sum = active ? 1.0f + float(split % 7) : 0.0f;
+        t[index * 2] = maximum;
+        t[index * 2 + 1] = sum;
+        pt[pindex * 2] = maximum;
+        pt[pindex * 2 + 1] = sum;
+        for (uint32_t dim = 0; dim < d; ++dim) {
+          const auto value = floatToBFloat16(
+              float(int((split * 71 + dim * 37 + row * 13) % 257) - 128) * 0.125f);
+          p[index * d + dim] = value;
+          pp[pindex * d + dim] = value;
+        }
       }
   // One entry's merge of the partials into a poisoned output.
-  const auto reduce = [&](const std::string &entry, const auto &params) {
+  const auto reduce = [&](const std::string &entry, const auto &params,
+                          id<MTLBuffer> inPartials, id<MTLBuffer> inStats,
+                          uint32_t reduceTiles = 1) {
     id<MTLBuffer> output = makeBuffer(device, uint64_t{shape.kvHeads} * kStride *
                                                  shape.queryHeadsPerKvHead * d * 2);
     std::memset(output.contents, 0xa5, output.length);
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(device, library, entry + shape.suffix)];
-    [encoder setBuffer:partials offset:0 atIndex:0];
-    [encoder setBuffer:stats offset:0 atIndex:1];
+    [encoder setBuffer:inPartials offset:0 atIndex:0];
+    [encoder setBuffer:inStats offset:0 atIndex:1];
     [encoder setBuffer:output offset:0 atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
-    [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, 1)
+    [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, m, reduceTiles)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [encoder endEncoding];
     finish(command);
     return output;
   };
   // The fp64 merge of each active row, the inactive rows' zeros and the
-  // poison kept past the verify-row view.
-  const auto check = [&](id<MTLBuffer> output) {
+  // poison kept past the covered tiles and the verify-row view.
+  const auto check = [&](id<MTLBuffer> output, const char *tag = "?",
+                         uint32_t covered = UINT32_MAX) {
+    covered = std::min(covered, m);
     const auto *out = static_cast<const BFloat16Bits *>(output.contents);
     for (uint32_t head = 0; head < shape.kvHeads; ++head)
       for (uint32_t row = 0; row < m; ++row) {
         const uint64_t offset = (uint64_t{head} * kStride * shape.queryHeadsPerKvHead + row) * d;
+        if (row >= covered) {
+          for (uint32_t dim = 0; dim < d; ++dim)
+            require(out[offset + dim] == 0xa5a5,
+                    "attention merge wrote beyond its dispatched tiles");
+          continue;
+        }
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         if (!active) {
           for (uint32_t dim = 0; dim < d; ++dim)
@@ -705,11 +746,15 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
           for (uint32_t split = 0; split < splits; ++split) {
             const uint64_t index = (uint64_t{head} * splits + split) * m + row;
             const double weight = std::exp(double(t[index * 2]) - maximum);
-            numerator += weight * p[index * d + dim];
+            numerator += weight * bfloat16ToFloat(p[index * d + dim]);
             denominator += weight * t[index * 2 + 1];
           }
           const double expected = numerator / denominator;
           const double actual = bfloat16ToFloat(out[offset + dim]);
+          if (!(std::isfinite(actual) &&
+                std::abs(actual - expected) <= std::abs(expected) * 0.004 + 0.000002))
+            std::fprintf(stderr, "merge mismatch %s head=%u row=%u dim=%u expected=%g actual=%g splits=%u\n",
+                         tag, head, row, dim, expected, actual, splits);
           // Final bf16 rounding plus fp32 reduction; cancellation uses an
           // absolute floor so an exact zero reference remains a useful check.
           require(std::isfinite(actual) &&
@@ -731,8 +776,9 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
     const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, kRows, kRows, 0};
-    verify = reduce(std::string(richengine::ops::kVerifyAttentionReduce), params);
-    check(verify);
+    verify = reduce(std::string(richengine::ops::kVerifyAttentionReduce), params,
+                    partials, stats);
+    check(verify, "verify");
     // The fused reduce/gate of a Plain-input out-projection: its attention
     // output is the plain reduce's bitwise, and its hidden rows are the
     // separate gate kernel's on that output, bitwise.
@@ -768,7 +814,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
     id<MTLBuffer> referenceHidden = makeBuffer(device, fusedHidden.length);
     std::memset(referenceHidden.contents, 0xa5, referenceHidden.length);
     const uint32_t elements = kRows * qHeads * d;
-    FullDecodeBatchParams gateParams{1, kRows};
+    FullDecodeBatchParams gateParams{1, kRows, kRows};
     command = [queue commandBuffer];
     encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:makePipeline(
@@ -787,8 +833,13 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   if (splits <= RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
     const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits, 0};
-    id<MTLBuffer> prefill = reduce(std::string(richengine::ops::kPrefillAttentionReduce), params);
-    check(prefill);
+    const uint32_t coveredTiles =
+        (activeRows + RICHENGINE_PREFILL_ATTENTION_TILE_ROWS - 1) /
+        RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
+    id<MTLBuffer> prefill =
+        reduce(std::string(richengine::ops::kPrefillAttentionReduce), params,
+               prefillPartials, prefillStats, coveredTiles);
+    check(prefill, "prefill", coveredTiles * tileRows);
     if (verify)
       require(!std::memcmp(verify.contents, prefill.contents, verify.length),
               "verify and prefill entries merged the same partials differently");

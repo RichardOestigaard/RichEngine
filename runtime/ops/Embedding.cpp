@@ -6,6 +6,8 @@
 #include "metal/abi/Sampling.h"
 #include "ops/KernelNames.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,9 +15,13 @@
 namespace richengine::ops {
 
 NativeRows::NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
-  if (!gguf_embedding_format(formatId)) throw std::invalid_argument("unsupported native embedding format");
+  if (!gguf_embedding_format(formatId) && !oq_embedding_format(formatId) &&
+      formatId != QuantizedSegment::kFloat32)
+    throw std::invalid_argument("unsupported native embedding format");
 }
-const char *NativeRows::name() const noexcept { return kQuantFormats[formatId].name; }
+const char *NativeRows::name() const noexcept {
+  return formatId == QuantizedSegment::kFloat32 ? "f32" : kQuantFormats[formatId].name;
+}
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
@@ -75,17 +81,34 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                metal::MetalBuffer draftInputTokens,
                                metal::MetalBuffer proposedTokens,
                                metal::MetalBuffer verifyInputTokens,
-                               uint32_t vocabulary, uint32_t lanes) {
-  if (!vocabulary || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH)
+                               uint32_t vocabulary, uint32_t lanes,
+                               uint32_t verifyStride, uint32_t draftStride,
+                               std::span<const uint32_t> liveRows) {
+  if (!vocabulary || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
+      !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
+      !draftStride || draftStride > RICHENGINE_DRAFT_QUERY_ROWS ||
+      (!liveRows.empty() && liveRows.size() != lanes))
     throw std::invalid_argument("invalid verify input batch");
-  const VerifyInputBatchParams params{vocabulary};
-  // One static-parameter dispatch over stable arena buffers: replayable.
+  VerifyInputBatchParams params{};
+  params.vocabulary = vocabulary;
+  params.verify_stride = verifyStride;
+  params.draft_stride = draftStride;
+  // A/B kill switch: treating every row as live restores the pre-anchor-fill
+  // routing for measurement.
+  static const bool allLive = std::getenv("RICHENGINE_VERIFY_ALL_LIVE") != nullptr;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    params.live_rows[lane] =
+        !allLive && lane < liveRows.size()
+            ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
+            : verifyStride;
+  // One dispatch over stable arena buffers: replayable, with the per-step
+  // proposal budgets patched into the span's staged parameters.
   graph.beginBakedSpan();
-  graph.add(std::string(kVerifyInputTokens),
-            {std::move(draftInputTokens), std::move(proposedTokens),
-             std::move(verifyInputTokens)},
-            params, {uint64_t{lanes} * RICHENGINE_TARGET_VERIFY_ROWS, 1, 1},
-            {1, 1, 1});
+  graph.addPatchable(std::string(kVerifyInputTokens),
+                     {std::move(draftInputTokens), std::move(proposedTokens),
+                      std::move(verifyInputTokens)},
+                     params, {uint64_t{lanes} * verifyStride, 1, 1},
+                     {1, 1, 1});
   graph.endBakedSpan();
 }
 

@@ -46,15 +46,18 @@ inline void gdn_decode_prologue(
     device bfloat *mixed_qkv, device const float *a_scale,
     device const bfloat *dt_bias, device float *decay, device bfloat *beta,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
-    uint simd_group) {
-  constexpr uint Tokens = RICHENGINE_TARGET_VERIFY_ROWS;
+    uint simd_group, uint tokens) {
+  const uint Tokens = tokens;
+  static_assert(!(RICHENGINE_TARGET_VERIFY_ROWS % kDecodeSimdgroups) &&
+                    HeadDim == 128,
+                "rows stride over the simdgroups, four channels per lane");
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   constexpr uint BOffset = ConvDim + ValueWidth;
   constexpr uint AOffset = BOffset + ValueHeads;
   constexpr uint Groups = HeadDim / 32;
-  static_assert(!(Tokens % kDecodeSimdgroups) && HeadDim == 128,
+  static_assert(HeadDim == 128,
                 "rows stride over the simdgroups, four channels per lane");
   const uint key_head = value_head / HeadsPerKey;
   // The key head's q/k rows and conv carry are shared by HeadsPerKey value
@@ -321,7 +324,6 @@ inline void gdn_commit_prefix_batch_phase(
     device uchar *next_3, device const uint *retained,
     constant GDNBatchCommitParams &params, uint3 group, uint thread_index,
     uint simd_lane, uint simd_group) {
-  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   uint batch = group.z;
   uint layer = group.y;
   device const uchar *current = batch == 0   ? current_0
@@ -332,7 +334,7 @@ inline void gdn_commit_prefix_batch_phase(
                        : batch == 1 ? next_1
                        : batch == 2 ? next_2
                                     : next_3;
-  const ulong rows = (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch) * Rows;
+  const ulong rows = (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch) * params.verify_stride;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
   decay += rows * ValueHeads;
@@ -482,13 +484,13 @@ inline void gdn_commit_tree_batch_phase(
                        : batch == 1 ? next_1
                        : batch == 2 ? next_2
                                     : next_3;
-  // The arena's GDN tensors hold RICHENGINE_TARGET_VERIFY_ROWS-row units per
-  // lane slot; a tree lane's Rows rows occupy Nodes/Verify units from
-  // batch * Nodes/Verify.
+  // The arena's GDN tensors hold verify_stride-row units per lane slot; a
+  // tree lane's Nodes rows occupy Nodes/Verify units of the sixteen-row
+  // stride a tree batch carries.
   const ulong rows =
       (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH +
        batch * (RICHENGINE_TREE_VERIFY_NODES / RICHENGINE_TARGET_VERIFY_ROWS)) *
-      RICHENGINE_TARGET_VERIFY_ROWS;
+      params.verify_stride;
   packed += rows * PackedWidth;
   mixed_qkv += rows * ConvDim;
   decay += rows * ValueHeads;
@@ -560,7 +562,6 @@ inline void gdn_decode_batch_phase(
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
     TP *table, SP *sums) {
-  constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
   device const uchar *current = batch == 0
@@ -569,10 +570,11 @@ inline void gdn_decode_batch_phase(
   device uchar *next = batch == 0
       ? next0
       : (batch == 1 ? next1 : (batch == 2 ? next2 : next3));
-  packed += ulong(batch) * Rows * PackedWidth;
-  mixed += ulong(batch) * Rows * ConvDim;
-  decay += ulong(batch) * Rows * ValueHeads;
-  beta += ulong(batch) * Rows * ValueHeads;
+  const uint stride = params.verify_stride;
+  packed += ulong(batch) * stride * PackedWidth;
+  mixed += ulong(batch) * stride * ConvDim;
+  decay += ulong(batch) * stride * ValueHeads;
+  beta += ulong(batch) * stride * ValueHeads;
   device const bfloat *conv_state_in =
       reinterpret_cast<device const bfloat *>(
           current + ulong(params.layer) * params.conv_layer_bytes);
@@ -585,23 +587,24 @@ inline void gdn_decode_batch_phase(
       next + params.convolution_state_bytes +
       ulong(params.layer) * params.recurrent_layer_bytes);
 
-  device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
-  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-      packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
-      dt_bias, decay, beta, shared, group.x, lane, simd_group);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Adaptive proposal budgets bound the serial scan; a zero or full count
-  // runs all eight rows. Rows past the count keep stale hidden values and
-  // are never committed or selected.
+  device bfloat *lane_hidden = gdn_hidden + ulong(batch) * stride * ValueWidth;
+  // Adaptive proposal budgets bound the conv's token sweep and the serial
+  // scan; a zero or full count runs the lane's whole verify stride. Rows
+  // past the count keep stale hidden values and are never committed or
+  // selected.
   const uint live = params.live_rows[batch];
   const uint tokens =
-      live && live < Rows ? live : Rows;
+      live && live < stride ? live : stride;
+  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+      packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
+      dt_bias, decay, beta, shared, group.x, lane, simd_group, tokens);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
                                          lane, simd_group, tokens);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
-  for (uint token = simd_group; token < Rows; token += kDecodeSimdgroups) {
+  for (uint token = simd_group; token < stride; token += kDecodeSimdgroups) {
     gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
         shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
         token);
@@ -612,8 +615,8 @@ inline void gdn_decode_batch_phase(
       for (uint g = 0; g < HeadDim / 64; ++g) {
         const uint column = head * HeadDim + g * 64 + 2 * lane;
         const uint local = token * HeadDim + g * 64 + 2 * lane;
-        Table::write_row(table + ulong(batch) * ValueWidth * Rows,
-                     sums + ulong(batch) * (Rows / q4sg::kRows) * Table::sums_per_tile(ValueWidth), ValueWidth,
+        Table::write_row(table + ulong(batch) * ValueWidth * stride,
+                     sums + ulong(batch) * (stride / q4sg::kRows) * Table::sums_per_tile(ValueWidth), ValueWidth,
                      column / 64, token, lane, shared.rows[local], shared.rows[local + 1]);
       }
     }
@@ -667,6 +670,9 @@ GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, 16640, float)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+// bf16-normed GGUF/MLX models take the same Table16 feed with bfloat rows.
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16, 16, 48, 128, 10240, 16640, gguf_sg::Table16, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, bfloat)
 // The mxfp4p-operand variant (LinearInput::Packed): the fp16 plane and the
 // exponent bytes take the table and sums slots; gguf_sg::Packed::write shares
 // the table path's lane partitioning (elements 2 lane, 2 lane + 1 of a
@@ -679,6 +685,8 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 125
   }
 GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed_f32, 16, 48, 128, 10240, 16640, float)
 GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed_vh32_f32, 16, 32, 128, 8192, 12544, float)
+GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed, 16, 48, 128, 10240, 16640, bfloat)
+GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed_vh32, 16, 32, 128, 8192, 12544, bfloat)
 #undef GDN_DECODE_PACKED_ENTRY
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
@@ -986,8 +994,12 @@ GDN_TREE_DECODE_ENTRY(verify_tree_gdn_fused_f32, 16, 48, 128, 10240, 16640, floa
 GDN_TREE_DECODE_ENTRY(verify_tree_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float)
 GDN_TREE_DECODE_TABLE_ENTRY(verify_tree_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
 GDN_TREE_DECODE_TABLE_ENTRY(verify_tree_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+GDN_TREE_DECODE_TABLE_ENTRY(verify_tree_gdn_fused_table16, 16, 48, 128, 10240, 16640, gguf_sg::Table16, bfloat)
+GDN_TREE_DECODE_TABLE_ENTRY(verify_tree_gdn_fused_table16_vh32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, bfloat)
 GDN_TREE_DECODE_PACKED_ENTRY(verify_tree_gdn_fused_packed_f32, 16, 48, 128, 10240, 16640, float)
 GDN_TREE_DECODE_PACKED_ENTRY(verify_tree_gdn_fused_packed_vh32_f32, 16, 32, 128, 8192, 12544, float)
+GDN_TREE_DECODE_PACKED_ENTRY(verify_tree_gdn_fused_packed, 16, 48, 128, 10240, 16640, bfloat)
+GDN_TREE_DECODE_PACKED_ENTRY(verify_tree_gdn_fused_packed_vh32, 16, 32, 128, 8192, 12544, bfloat)
 #undef GDN_TREE_DECODE_PACKED_ENTRY
 #undef GDN_TREE_DECODE_ENTRY
 #undef GDN_TREE_DECODE_TABLE_ENTRY

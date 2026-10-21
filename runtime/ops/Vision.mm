@@ -26,8 +26,21 @@ constexpr uint32_t kQkDimension = 80; // head dimension 72 padded to 16
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint64_t kFloatBytes = 4;
 
-// The one vision tower the kernels are specialized for.
-constexpr VisionLayout kTower{};
+// The one vision tower the kernels are specialized for. The makers'
+// declared VisionLayout must match it except outputHiddenSize, which is the
+// target's hidden width (requireLayout below).
+constexpr VisionLayout kTower{.depth = 27,
+                              .hiddenSize = 1152,
+                              .patchDimension = 1536,
+                              .intermediateSize = 4304,
+                              .paddedIntermediateSize = 4352,
+                              .mergedHiddenSize = 4608,
+                              .outputHiddenSize = 5120,
+                              .heads = 16,
+                              .headDimension = 72,
+                              .positionGridSide = 48,
+                              .patchSize = 16,
+                              .spatialMerge = 2};
 static_assert(kTower.headDimension + 8 == kQkDimension && kTower.hiddenSize % kGemmColumnTile == 0 &&
                   kTower.paddedIntermediateSize % kGemmColumnTile == 0 &&
                   kTower.mergedHiddenSize % kMergerColumnTile == 0 &&

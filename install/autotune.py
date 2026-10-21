@@ -73,9 +73,9 @@ RECHECK_DEPTH = 0.08
 # Cross-model priors, shared under the models root:
 # {chip: {family: {"KNOB=value": {"wins": n, "losses": n}}}} — a knob's
 # history pools only within its model family, since one family's loser
-# says little about another's. Records written by older sweeps pool the
-# stats flat under the chip; reads still fold them in so nothing learned
-# is lost. A Quick sweep skips candidates whose Beta(1+wins, 1+losses)
+# says little about another's. Flat entries under a chip (written before
+# priors keyed by family) taught no family anything — reads and writes
+# drop them. A Quick sweep skips candidates whose Beta(1+wins, 1+losses)
 # win rate cannot reach the bound even at its optimistic edge after
 # enough observations; Complete measures them anyway.
 PRIORS_NAME = ".tuning-priors.json"
@@ -595,16 +595,15 @@ def _read_priors(path: Path) -> dict:
 
 
 def _family_stats(doc: dict, chip: str, family: str) -> dict:
-    """The (chip, family) candidate stats, merged with the chip's legacy
-    flat pool — records written before priors keyed by family."""
+    """The (chip, family) candidate stats. Flat entries under the chip are
+    records written before priors keyed by family: they merged into every
+    family's reads, so a knob one family measured losing skewed the rest.
+    They are dropped rather than folded in."""
     chip_doc = doc.get(chip)
     if not isinstance(chip_doc, dict):
         return {}
-    stats = {key: value for key, value in chip_doc.items() if "=" in key}
     bucket = chip_doc.get(family)
-    if isinstance(bucket, dict):
-        stats.update(bucket)
-    return stats
+    return dict(bucket) if isinstance(bucket, dict) else {}
 
 
 def _prior_stats(doc: dict, chip: str, family: str, *, engine: str, knobs: str) -> dict:
@@ -658,7 +657,12 @@ def _update_priors(
     changed table expiries every prior, like tuning.json's own check."""
     doc = _read_priors(path)
     doc["_meta"] = {"engine": engine, "knobs": knobs}
-    stats = doc.setdefault(chip, {}).setdefault(family, {})
+    # Flat chip-level entries are the pre-family pool: drop them so they
+    # stop reaching every family's reads.
+    chip_doc = doc.setdefault(chip, {})
+    for key in [key for key in chip_doc if "=" in key]:
+        del chip_doc[key]
+    stats = chip_doc.setdefault(family, {})
     for key, entry in results.items():
         if (
             key == "baseline"

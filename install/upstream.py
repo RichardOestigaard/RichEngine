@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, layout, legacy, models, pack
+from . import assembly, families, gguf, hub, layout, legacy, local, models, pack
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -134,6 +134,13 @@ def select_vision(repo):
     )
 
 
+def _jsonable(value):
+    """A signature value as record JSON states it: tuples as lists."""
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def inspect_target(repo, variant, language_only):
     """What the target repository supplies, from metadata alone: a GGUF
     header read by range requests, or an MLX config and shard index. A
@@ -166,16 +173,21 @@ def _gguf_target(repo, variant, language_only):
     if pack.packable(config):
         # The runtime has no gemma4/diffusion_gemma GGUF tensor map; the
         # safetensors checkpoint is packed at installation instead.
+        packed_repos = [
+            repo_id
+            for f in families.FAMILIES
+            if f.defaults.packed_format
+            for repo_id in f.repos
+        ]
         raise models.ModelError(
             "this model loads from packed files only; install its safetensors "
-            "checkpoint (google/gemma-4-26B-A4B-it or "
-            "google/diffusiongemma-26B-A4B-it), not a GGUF"
+            f"checkpoint ({' or '.join(packed_repos)}), not a GGUF"
         )
     gguf.require_loadable(header)
     files = {layout.TARGET + "/" + name: name}
     if not language_only:
         files[layout.GGUF_VISION], vision_header = select_vision(repo)
-        _validate_processor(gguf.processor_config(vision_header))
+        _validate_processor(gguf.processor_config(vision_header), family)
         config["vision_config"] = gguf.vision_config(vision_header)
     print(f"Selected {models.accent(name)} from {repo.name}.", flush=True)
     return Target("gguf", "none" if language_only else "gguf", config, files)
@@ -213,35 +225,19 @@ def _mlx_target(repo, language_only):
         return _packed_target(repo, config)
     # MLX states its quantization under "quantization"; a transformers
     # quantization_config alone describes another method (GPTQ, AWQ, ...).
-    quant = config.get("quantization")
-    if (
-        not isinstance(quant, dict)
-        or quant.get("mode", "affine") != "affine"
-        or quant.get("bits") != 4
-        or quant.get("group_size") != 64
-    ):
+    # What the runtime loads is the affine matrix — uniform Q4/64 and the
+    # oMLX oQ matrix of 4-8 bits over groups of 64 or 128, per module or
+    # globally (local.quantization_support); a module with no entry keeps
+    # its float weight.
+    if reason := local.quantization_support(config):
         raise models.ModelError(
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
+            "this model requires an MLX affine checkpoint (4-8 bit, "
+            f"group 64/128) or a supported GGUF: {reason}"
         )
-    # Per-tensor overrides quantize no differently: the runtime's affine
-    # kernels read 4-bit/64 everywhere the image declares them. The LFM2.5
-    # exports' 6-bit model.embed_tokens is the shape this refuses early.
-    for name, override in quant.items():
-        if isinstance(override, dict) and (
-            override.get("mode", quant.get("mode", "affine")) != "affine"
-            or override.get("bits", quant["bits"]) != 4
-            or override.get("group_size", quant["group_size"]) != 64
-        ):
-            raise models.ModelError(
-                f"this checkpoint quantizes {name} at "
-                f"{override.get('bits')} bits/group-{override.get('group_size')}, "
-                "which the runtime cannot load"
-            )
     # A family the runtime serves text-only takes no tower, whether or not
     # the repository describes one; _install resolves the family again.
-    language_only = (
-        language_only or not families.family_for(config, name=repo.name).vision
-    )
+    family = families.family_for(config, name=repo.name)
+    language_only = language_only or not family.vision
     files = {
         path: "config.json"
         for path in (
@@ -252,7 +248,7 @@ def _mlx_target(repo, language_only):
     }
     files |= {layout.TOKENIZER + "/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     if not language_only:
-        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
+        _validate_processor(models.read_json(repo.file("preprocessor_config.json")), family)
         shards = _weight_files(repo, "vision_tower.")
         if not shards:
             raise models.ModelError(
@@ -323,17 +319,18 @@ def _safetensors_tensors(repo, name):
     return set(header) - {"__metadata__"}
 
 
-def _validate_processor(config):
-    """RichEngine prepares images one way (server/images.py): 16-pixel patches in
-    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
-    configuration asking for another is rejected before any download; it is
+def _validate_processor(config, family):
+    """A processor configuration must match the vision spec the family's
+    file declares (serving.vision) — the same spec server/images.py
+    prepares to. Asking for another is rejected before any download; it is
     not installed, since nothing reads it."""
+    spec = (family.serving or {}).get("vision", {})
     expected = {
-        "patch_size": 16,
-        "temporal_patch_size": 2,
-        "merge_size": 2,
-        "image_mean": [0.5, 0.5, 0.5],
-        "image_std": [0.5, 0.5, 0.5],
+        "patch_size": spec.get("patch_size", 16),
+        "temporal_patch_size": spec.get("temporal_patch_size", 2),
+        "merge_size": spec.get("merge_size", 2),
+        "image_mean": spec.get("image_mean", [0.5, 0.5, 0.5]),
+        "image_std": spec.get("image_std", [0.5, 0.5, 0.5]),
     }
     if any(config.get(key) != value for key, value in expected.items()):
         raise models.ModelError("unsupported vision preprocessing configuration")
@@ -562,10 +559,15 @@ def _install(selection, repo, installed, draft=None):
         )
         return
     files |= {path: downloaded[name] for path, name in target.files.items()}
+    # The record self-describes: the resolved signature and serving contract
+    # ride beside the family name, so an assembly stays legible to releases
+    # whose families differ and the server needs no code lookup to serve it.
     record = {
         "version": 1,
         "model": selection.model,
         "family": family.name,
+        "signature": {key: _jsonable(value) for key, value in family.signature},
+        "serving": family.serving or {},
         "target_format": target.format,
         "vision_format": target.vision_format,
         "sources": {layout.TARGET: repo.identity()}
@@ -611,6 +613,8 @@ def _changes(installed, family, draft):
     if draft is None:
         if recorded is not None:
             changes.append("its draft is now none")
+    elif recorded is None:
+        changes.append(f"its draft is now {_at(draft)}")
     elif draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"

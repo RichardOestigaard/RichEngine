@@ -7,6 +7,7 @@
 // TargetModelGemmaHelpers.hpp.
 #include "model/TargetModelGemmaHelpers.hpp"
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "model/Lfm2Moe.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "ops/AneFfn.hpp"
@@ -121,7 +122,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
   const TargetModelVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes);
+  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes, ops::LinearEpilogue::None, nullptr, step.rowCapacity);
   // Norm, input projection, fused GDN and residual output projection replay
   // from a baked indirect command buffer: every parameter is per-layer
   // geometry and the bound buffers are the decode arena's (the GDN state
@@ -134,7 +135,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
               .prepared = normalized},
              mixer.inputProjection, inputPlan);
   const ops::LinearPlan outputPlan =
-      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual);
+      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   const ops::PreparedInput hidden =
       step.tree
           ? ops::GDN::addDecodeTree(
@@ -161,7 +162,8 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
                  geometry_.stateLayout.convolutionBytes()},
-                mixer.outputHeadOrder, outputPlan.input(), step.liveRows);
+                mixer.outputHeadOrder, outputPlan.input(), step.liveRows,
+                step.rowCapacity);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
               .prepared = hidden},
@@ -177,10 +179,8 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
                                               const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const TargetModelVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
-  if (step.tree)
-    throw std::invalid_argument("LFM2 convolutions have no tree verify path");
   const uint32_t layer = step.gdnLayer++;
-  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes);
+  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes, ops::LinearEpilogue::None, nullptr, step.rowCapacity);
   step.graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
@@ -189,16 +189,26 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
               .prepared = normalized},
              mixer.inputProjection, inputPlan);
   const ops::LinearPlan outputPlan =
-      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual);
+      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   // The conv reads every lane's current state and writes its bx rows for the
   // commit; its output is the out-projection's input. The consumer packs its
-  // own operand table, so no prepared input is passed.
-  ops::LfmConv::addVerify(
-      step.graph,
-      {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates,
-       b.gdnMixed[layer], b.gdnHidden},
-      geometry_.convShape(), step.lanes, ExecutionLimits::targetVerifyRows,
-      layer, geometry_.stateLayout.convolutionLayerBytes(), mixer.convolutionTapsMajor);
+  // own operand table, so no prepared input is passed. A tree step's taps
+  // follow the nodes' ancestor paths and commit through the retained path.
+  if (step.tree) {
+    ops::LfmConv::addVerifyTree(
+        step.graph,
+        {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates,
+         b.gdnMixed[layer], b.gdnHidden, b.treeNodes, b.treeCounts},
+        geometry_.convShape(), step.lanes, step.rowCapacity,
+        layer, geometry_.stateLayout.convolutionLayerBytes(), mixer.convolutionTapsMajor);
+  } else {
+    ops::LfmConv::addVerify(
+        step.graph,
+        {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates,
+         b.gdnMixed[layer], b.gdnHidden},
+        geometry_.convShape(), step.lanes, step.rowCapacity,
+        layer, geometry_.stateLayout.convolutionLayerBytes(), mixer.convolutionTapsMajor);
+  }
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch},
              mixer.outputProjection, outputPlan);
@@ -242,15 +252,15 @@ void TargetModel::addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &laye
 
 void TargetModel::addStateCommit(metal::CommandGraph &graph,
                                 TargetModelCommitBuffers buffers,
-                                uint32_t lanes) const {
-  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
+                                uint32_t lanes, uint32_t verifyStride) const {
+  if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || !verifyStride)
     throw std::invalid_argument("invalid state commit batch");
   if (!geometry_.gdnLayers) {
     // LFM2's conv FIFOs: every conv layer rolls its lanes' states forward by
     // the retained rows' bx, kept in VerifyMixedBase like the GDN's. The
     // layer's slice of it is lane-major with the decode row count's stride.
     if (!geometry_.convLayers) return;
-    const uint32_t laneStride = uint32_t{ExecutionLimits::targetVerifyRows} *
+    const uint32_t laneStride = verifyStride *
                                 geometry_.convolutionDimension * 2;
     const uint64_t layerBytes =
         uint64_t{ExecutionLimits::maximumBatchWidth} * laneStride;
@@ -260,7 +270,7 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
         graph,
         {buffers.mixed, buffers.retainedCounts, buffers.currentStates,
          buffers.nextStates},
-        geometry_.convShape(), lanes, ExecutionLimits::targetVerifyRows,
+        geometry_.convShape(), lanes, verifyStride,
         /*layer*/ 0, geometry_.stateLayout.convolutionLayerBytes(),
         geometry_.convLayers, layerBytes, /*tapsMajor*/ false);
     return;
@@ -273,7 +283,8 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
       geometry_.gdnShape(), geometry_.stateLayout.layers, lanes,
       {geometry_.stateLayout.convolutionLayerBytes(),
        geometry_.stateLayout.recurrentLayerBytes(),
-       geometry_.stateLayout.convolutionBytes()});
+       geometry_.stateLayout.convolutionBytes()},
+      verifyStride);
 }
 
 void TargetModel::addStateCommitTree(metal::CommandGraph &graph,
@@ -283,9 +294,24 @@ void TargetModel::addStateCommitTree(metal::CommandGraph &graph,
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || !retainedPath)
     throw std::invalid_argument("invalid tree state commit batch");
   if (!geometry_.gdnLayers) {
+    // LFM2's conv FIFOs: one dispatch rolls every conv layer's lanes forward
+    // by the retained path's bx rows — the tree counterpart of the chain
+    // commit's retained prefix.
     if (!geometry_.convLayers) return;
-    throw std::invalid_argument(
-        "LFM2 convolutions have no tree commit path");
+    const uint32_t laneStride =
+        uint32_t{RICHENGINE_TREE_VERIFY_NODES} *
+        geometry_.convolutionDimension * 2;
+    const uint64_t layerBytes =
+        uint64_t{ExecutionLimits::maximumBatchWidth} * laneStride;
+    ops::LfmConv::addCommitTree(
+        graph,
+        {buffers.mixed, buffers.retainedCounts, std::move(retainedPath),
+         buffers.currentStates, buffers.nextStates},
+        geometry_.convShape(), lanes,
+        RICHENGINE_TREE_VERIFY_NODES, /*layer*/ 0,
+        geometry_.stateLayout.convolutionLayerBytes(),
+        geometry_.convLayers, layerBytes, /*tapsMajor*/ false);
+    return;
   }
   ops::GDN::addCommitTree(
       graph,

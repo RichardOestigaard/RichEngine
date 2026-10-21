@@ -79,6 +79,9 @@ DenseWeights loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
     return readTargetModelWeights<DenseWeights>(backend, layout, mlx->get(),
                                                AffineTargetFormat{}, readFfn);
   }
+  if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
+    return readTargetModelWeights<DenseWeights>(backend, layout, oq->get(),
+                                               OqTargetFormat{}, readFfn);
   const auto &packed = std::get<PackedTargetFiles<DenseLayout>>(files);
   return readTargetModelWeights<DenseWeights>(backend, layout, packed,
                                              AffineTargetFormat{packed.tiledEmbedding}, readFfn);

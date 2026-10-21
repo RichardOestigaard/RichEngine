@@ -1,0 +1,162 @@
+{
+  "name": "Gemma4-26B-A4B",
+  "repos": [
+    "google/gemma-4-26B-A4B-it"
+  ],
+  "note": "A global layer every sixth (5, 11, 17, 23, 29), as config.json's layer_types states them and the GGUF's sliding_window_pattern implies. Gemma 4's released weights carry a vision tower the runtime does not serve.",
+  "signature": {
+    "model_type": "gemma4_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 2816,
+    "num_hidden_layers": 30,
+    "vocab_size": 262144,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 2,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "intermediate_size": 2112,
+    "num_experts": 128,
+    "top_k_experts": 8,
+    "moe_intermediate_size": 704,
+    "enable_moe_block": true,
+    "sliding_window": 1024,
+    "num_kv_shared_layers": 0,
+    "attention_k_eq_v": true,
+    "final_logit_softcapping": 30.0,
+    "tie_word_embeddings": true,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ]
+  },
+  "draft": {
+    "repo": "z-lab/gemma-4-26B-A4B-it-DFlash",
+    "base": "dflash_gemma4",
+    "signature": {
+      "num_hidden_layers": 5,
+      "num_target_layers": 30,
+      "hidden_size": 2816,
+      "vocab_size": 262144,
+      "intermediate_size": 5632,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "dflash_config.mask_token_id": 4,
+      "dflash_config.target_layer_ids": [
+        1,
+        6,
+        11,
+        17,
+        22,
+        27
+      ]
+    }
+  },
+  "vision": false,
+  "defaults": {
+    "packed_format": "packed-gemma4",
+    "quant": "q4"
+  },
+  "serving": {
+    "think": {
+      "end": "<channel|>",
+      "open": "<|channel>thought\n",
+      "open_token": "<|channel>",
+      "flag": "<|think|>"
+    },
+    "tool_dialect": "gemma4"
+  },
+  "pack": {
+    "layout": {
+      "layers": 30,
+      "hidden": 2816,
+      "vocabulary": 262144,
+      "query_heads": 16,
+      "kv_heads": 8,
+      "head_dim": 256,
+      "global_kv_heads": 2,
+      "global_head_dim": 512,
+      "global_period": 6,
+      "experts": 128,
+      "experts_per_token": 8,
+      "expert_intermediate": 704,
+      "packed_expert_width": 768,
+      "shared_intermediate": 2112,
+      "packed_shared_width": 2304,
+      "sliding_window": 1024,
+      "rotary_theta": 10000,
+      "global_rotary_theta": 1000000,
+      "logit_softcap": 30.0,
+      "max_position_embeddings": 262144
+    },
+    "draft_layout": {
+      "layers": 5,
+      "hidden": 2816,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "query_heads": 32,
+      "intermediate": 5632,
+      "rotary_theta": 1000000,
+      "block_size": 16,
+      "sliding_window": 2048,
+      "target_hidden": 16896,
+      "causal_layers": 15
+    },
+    "execution_geometry": {
+      "draft_proposal_tokens": 15,
+      "draft_query_rows": 16,
+      "draft_sliding_window": 2048
+    }
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "HEAD_FUSED",
+    "MOE_UNION",
+    "MOE_PACKED_OFF",
+    "MTL4",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "ANE_WAIT"
+  ]
+}

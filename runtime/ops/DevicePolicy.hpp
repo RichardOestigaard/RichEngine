@@ -3,6 +3,7 @@
 #include "metal/DeviceCapabilities.hpp"
 
 #include <cstdint>
+#include <string_view>
 
 namespace richengine::ops {
 
@@ -33,6 +34,10 @@ struct DevicePolicy final {
   // count matches only a reported one: an assumed count is a plan, not a
   // measurement the row was fitted to.
   bool coresReported = false;
+  // The model family the plans serve (the descriptor's family name), for
+  // the measured rows scoped to one model. Empty is the bare-device policy
+  // tests and offline tools use: model-scoped rows do not match it.
+  std::string_view model = {};
 
   [[nodiscard]] static constexpr DevicePolicy of(const DeviceCapabilities &device) noexcept {
     return {device.appleGpuFamily, plannedGpuCores(device), device.gpuCoreCount != 0};

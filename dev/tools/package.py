@@ -27,7 +27,6 @@ INSTALL_FILES = (
     "layout.py",
     "models.py",
     "hub.py",
-    "families.py",
     "assembly.py",
     "legacy.py",
     "pack.py",
@@ -36,17 +35,12 @@ INSTALL_FILES = (
     "gguf.py",
     "catalog.py",
     "autotune.py",
+    "local.py",
     "requirements.txt",
 )
 TUNING_FILES = (
     "__init__.py",
     "base.py",
-    "qwen.py",
-    "ornith.py",
-    "minicpm.py",
-    "lfm2.py",
-    "granite.py",
-    "gemma.py",
 )
 COMPLETION_FILES = (
     "models",
@@ -84,6 +78,14 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "disk.py",
+    "installer.py",
+    "model_host.py",
+    "serving.py",
+    "thermal.py",
+    "tuner.py",
+    "webfetch.py",
+    "websearch.py",
     "chat.html",
     "favicon.svg",
 )
@@ -108,6 +110,13 @@ def stage_runtime(destination, version):
         source = ROOT / ("build" if folder == "engine" else folder)
         for name in names:
             shutil.copy2(source / name, destination / folder / name)
+    # The family registry is data: every families/*.json ships, so a new
+    # model needs no package-list edit.
+    families_dir = destination / "install/families"
+    families_dir.mkdir()
+    for path in sorted((ROOT / "install/families").iterdir()):
+        if path.suffix in (".py", ".json"):
+            shutil.copy2(path, families_dir / path.name)
     for name in LICENSE_FILES:
         shutil.copy2(ROOT / name, destination / name)
     (destination / "release.json").write_text(

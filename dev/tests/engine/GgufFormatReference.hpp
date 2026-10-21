@@ -25,8 +25,16 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            Q3K = GGUF_FMT_Q3K, Q80 = GGUF_FMT_Q80, IQ3S = GGUF_FMT_IQ3S, Q2K = GGUF_FMT_Q2K, IQ3XXS = GGUF_FMT_IQ3XXS,
            IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
-           PQ20 = GGUF_FMT_PQ20, AF4 = GGUF_FMT_AF4, FMT_COUNT = GGUF_FMT_COUNT };
+           PQ20 = GGUF_FMT_PQ20, AF4 = GGUF_FMT_AF4,
+           AF5 = GGUF_FMT_AF5, AF6 = GGUF_FMT_AF6, AF8 = GGUF_FMT_AF8,
+           AF4G128 = GGUF_FMT_AF4G128, AF5G128 = GGUF_FMT_AF5G128, AF6G128 = GGUF_FMT_AF6G128,
+           AF8G128 = GGUF_FMT_AF8G128, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
+// The private AF formats (AF4 and the oQ family): native blocks of an
+// element-order code bitstream then a bf16 scale and bias.
+inline bool afFormat(Fmt f) { return f >= AF4; }
+// An AF format's code width: (block_bytes - 4 meta) * 8 over block_elements.
+inline uint32_t afBits(Fmt f) { return (kQuantFormats[f].block_bytes - 4) * 8 / kQuantFormats[f].block_elements; }
 // The bf16 a float's high half holds, truncated (fixture scales need no rounding).
 inline uint16_t f2b(float f) { uint32_t u; memcpy(&u, &f, 4); return uint16_t(u >> 16); }
 inline float b2f(uint16_t u) { const uint32_t w = uint32_t(u) << 16; float f; memcpy(&f, &w, 4); return f; }
@@ -72,11 +80,11 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
   for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
     uint8_t *blk = v.data() + b * fi.block_bytes;
     const uint16_t d = scale();
-    if (f == AF4) {
+    if (afFormat(f)) {
       // bf16 scale and bias after the codes; the bias centers the weights.
       const float s = h2f(d);
       const uint16_t m = f2b(-7.5f * s), sb = f2b(s);
-      memcpy(blk + 32, &sb, 2); memcpy(blk + 34, &m, 2);
+      memcpy(blk + fi.block_bytes - 4, &sb, 2); memcpy(blk + fi.block_bytes - 2, &m, 2);
       continue;
     }
     if (f == IQ1M) {
@@ -96,7 +104,8 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
 // model's have (a few hundredths), so the GEMM checks see realistic sums.
 inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
   switch (f) {
-    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4: case AF4:
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
+    case AF4: case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
     case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
     case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
@@ -132,6 +141,16 @@ inline void packPairs(const uint8_t *slots, uint8_t *dst) {
     uint32_t v = 0;
     for (uint32_t i = 0; i < 8; ++i) v |= uint32_t(slots[8 * c + i]) << ((i & 1) * 16 + 4 * (i >> 1));
     memcpy(dst + 4 * c, &v, 4);
+  }
+}
+// The oQ formats' plane0: the 32 slots' codes as one contiguous little-endian
+// bitstream, slot s at bits [s*bits, (s+1)*bits) of the group's 4*bits bytes.
+inline void packSlotStream(const uint8_t *slots, uint32_t bits, uint8_t *dst) {
+  memset(dst, 0, 4 * bits);
+  for (uint32_t s = 0; s < 32; ++s) {
+    const uint32_t o = s * bits;
+    for (uint32_t b = 0; b < bits; ++b)
+      if ((slots[s] >> b) & 1) dst[(o + b) / 8] |= uint8_t(1u << ((o + b) & 7));
   }
 }
 // llama.cpp's ksigns_iq2xs: the eight signs of a 7-bit sign index, bit 7 their parity.
@@ -298,6 +317,21 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       }
       packPairs(lo, p0); return;
     }
+    // The oQ formats: a {codes, bf16 scale, bf16 bias} block per gs elements,
+    // codes an element-order bitstream (element e at bits e*bits); plane0 the
+    // same codes in slot order.
+    case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128: {
+      const uint32_t bits = afBits(f);
+      uint16_t s16, m16; memcpy(&s16, blk + fi.block_bytes - 4, 2); memcpy(&m16, blk + fi.block_bytes - 2, 2);
+      const float s = b2f(s16), m = b2f(m16);
+      for (int k = 0; k < 32; ++k) {
+        const uint32_t o = (j * 32 + k) * bits;
+        const uint8_t code = uint8_t((blk[o / 8] | (blk[o / 8 + 1] << 8)) >> (o % 8) & ((1u << bits) - 1));
+        lo[quant_slot(k)] = code;
+        vals[k] = s * code + m;
+      }
+      packSlotStream(lo, bits, p0); return;
+    }
     // The IQ3_XXS, IQ2 and IQ1 planes are the group's native bytes (metal/abi/QuantFormat.h).
     case IQ3XXS: {
       const uint8_t *qs = blk + 2 + 8 * j;
@@ -377,7 +411,8 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
     case IQ1S: case Q40: case Q41: case MXFP4: case PQ20:
       memcpy(dst, blk, fi.meta_bytes); return;
-    case AF4: memcpy(dst, blk + 32, fi.meta_bytes); return;
+    case AF4: case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128:
+      memcpy(dst, blk + fi.block_bytes - 4, fi.meta_bytes); return;
     case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
     case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
     case Q2K: memcpy(dst, blk + kQ2KD, 4); memcpy(dst + 4, blk, 16); return;
@@ -428,8 +463,9 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
     "dequantize_row_q2_K", "dequantize_row_iq3_xxs", "dequantize_row_iq2_xxs", "dequantize_row_iq2_xs",
     "dequantize_row_iq2_s", "dequantize_row_iq1_s", "dequantize_row_iq1_m", "dequantize_row_q4_0",
     "dequantize_row_q4_1", "dequantize_row_mxfp4", "dequantize_row_pq2_0",
-    // AF4 is the engine's private format; no upstream symbol exists.
-    "dequantize_row_af4"};
+    // The AF formats are the engine's private types; no upstream symbols exist.
+    "dequantize_row_af4", "dequantize_row_af5", "dequantize_row_af6", "dequantize_row_af8",
+    "dequantize_row_af4g128", "dequantize_row_af5g128", "dequantize_row_af6g128", "dequantize_row_af8g128"};
   static_assert(std::size(symbols) == FMT_COUNT, "a GGML dequantize_row_* symbol per format");
   using Dequantize = void (*)(const void *, float *, int64_t);
   auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbols[f]));

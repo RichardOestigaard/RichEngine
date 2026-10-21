@@ -42,16 +42,23 @@ static_assert(kVerifyChunkStride >= kVerifyRows &&
 // Verify attention runs one split per kVerifyPagesPerSplit visible Page32
 // blocks, at least kVerifySplits and at most the maximum that sizes the
 // partial workspace (verifyAttentionSplits).
-inline constexpr uint32_t kVerifySplits = 32;
-inline constexpr uint32_t kVerifyPagesPerSplit = 16;
-static_assert(kVerifySplits <= kVerifyMaximumSplits);
+// The attention-sweep optimum (~32-64 Page32 blocks per split at every
+// width and history measured, M5 Pro): partial write+read traffic grows
+// linearly in splits and already exceeds the KV stream below ~8K at the
+// old floor/cap, while too few splits starve occupancy at long history.
+inline constexpr uint32_t kVerifySplits = 8;
+inline constexpr uint32_t kVerifyPagesPerSplit = 64;
+inline constexpr uint32_t kVerifyPolicySplits = 64;
+static_assert(kVerifySplits <= kVerifyPolicySplits &&
+              kVerifyPolicySplits <= kVerifyMaximumSplits);
 
 // One lane's verify split count: one split per kVerifyPagesPerSplit
 // pages its history and verify rows fill, never fewer than kVerifySplits
-// and never more than the maximum the partial workspace is sized for. It
-// depends only on the lane's own history, so batching never changes a
-// lane's arithmetic. `rows` is the lane's live row count: kVerifyRows for
-// a chain, RICHENGINE_TREE_VERIFY_NODES - 1 for a tree lane.
+// and never more than the measured optimum, nor the maximum the partial
+// workspace is sized for. It depends only on the lane's own history, so
+// batching never changes a lane's arithmetic. `rows` is the lane's live
+// row count: kVerifyRows for a chain, RICHENGINE_TREE_VERIFY_NODES - 1
+// for a tree lane.
 [[nodiscard]] inline uint32_t
 verifyAttentionSplits(uint32_t committedTokens,
                       uint32_t rows = kVerifyRows) noexcept {
@@ -63,7 +70,7 @@ verifyAttentionSplits(uint32_t committedTokens,
   // workspace stays sized for kVerifyMaximumSplits and the shader
   // contract's baked bound still admits the smaller count.
   const uint64_t maximum =
-      std::min<uint64_t>(kVerifyMaximumSplits, tuning().verifySplitsMax);
+      std::min<uint64_t>(kVerifyPolicySplits, tuning().verifySplitsMax);
   return static_cast<uint32_t>(std::min<uint64_t>(
       std::max<uint64_t>(kVerifySplits, scaled), maximum));
 }
@@ -230,10 +237,13 @@ public:
   // tree's live node count per lane (the store kernel decodes lanes by a
   // uniform row count, so callers pass the batch's maximum); 0 or a value
   // over the capacity keeps the full RICHENGINE_TREE_VERIFY_NODES - 1.
+  // rows is a chain lane's packed verify stride: draft.verifyRows() — a
+  // trained-block draft verifies fewer than kVerifyRows rows per lane. Tree
+  // plans keep RICHENGINE_TREE_VERIFY_NODES regardless.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens, bool tree = false,
-             uint32_t liveNodes = 0);
+             uint32_t liveNodes = 0, uint32_t rows = kv::kVerifyRows);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -298,7 +308,8 @@ public:
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams
-  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries,
+               uint32_t rows = kv::kVerifyRows);
   // A tree lane's chunk: its emitted nodes' DFS rows. liveNodes is the
   // batch-uniform live node count — a leafless comb's eight chain rows cost
   // a chain's verify instead of the full tree's.

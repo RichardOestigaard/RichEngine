@@ -8,19 +8,22 @@
 
 namespace richengine::ops {
 
+// The vision tower's geometry. No shipped defaults: each vision-capable
+// family declares its tower explicitly in its maker (families/*.mm), so a
+// new tower can never silently inherit another model's dimensions.
 struct VisionLayout final {
-  uint32_t depth = 27;
-  uint32_t hiddenSize = 1152;
-  uint32_t patchDimension = 1536;
-  uint32_t intermediateSize = 4304;
-  uint32_t paddedIntermediateSize = 4352;
-  uint32_t mergedHiddenSize = 4608;
-  uint32_t outputHiddenSize = 5120;
-  uint32_t heads = 16;
-  uint32_t headDimension = 72;
-  uint32_t positionGridSide = 48;
-  uint32_t patchSize = 16;
-  uint32_t spatialMerge = 2;
+  uint32_t depth = 0;
+  uint32_t hiddenSize = 0;
+  uint32_t patchDimension = 0;
+  uint32_t intermediateSize = 0;
+  uint32_t paddedIntermediateSize = 0;
+  uint32_t mergedHiddenSize = 0;
+  uint32_t outputHiddenSize = 0;
+  uint32_t heads = 0;
+  uint32_t headDimension = 0;
+  uint32_t positionGridSide = 0;
+  uint32_t patchSize = 0;
+  uint32_t spatialMerge = 0;
 
   bool operator==(const VisionLayout &) const = default;
 };

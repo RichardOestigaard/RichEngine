@@ -166,6 +166,10 @@ LinearConfig measuredOverride(LinearMatrix matrix, uint32_t rows,
         {{2048, 10240}, 8, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
         {{2048, 10752}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
         {{512, 2048}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        // LFM2.5-8B-A1B DSpark draft.
+        {{2048, 2048}, 64, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{2048, 6144}, 64, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{6144, 2048}, 64, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
   };
   for (const Override &o : overrides)
     if (matrix == o.matrix && rows == o.rows && epilogue == o.epilogue)
@@ -1466,7 +1470,7 @@ void producerTableContract(metal::MetalBackend &backend) {
             "the norm's table contract");
   }
   {
-    const GdnShape shape{16, 32, 128, 8192, 12544};
+    const GdnShape shape{16, 32, 128, 8192, 12544, GdnCore::Value32};
     const std::array<metal::MetalBuffer, RICHENGINE_MAXIMUM_BATCH_WIDTH> states{};
     GdnDecodeBuffers buffers;
     buffers.currentStates = states;
@@ -1483,7 +1487,8 @@ void producerTableContract(metal::MetalBackend &backend) {
             "the GDN decode's table contract");
   }
   {
-    const kv::Layout layout{1, 4, 256};
+    kv::Layout layout{1, 4, 256};
+    layout.attentionCore = kv::Core::Kv4Group6;
     metal::CommandGraph graph;
     rejects([&] {
       (void)PagedAttention::addVerifyGate(graph, {}, {}, {}, 24, layout, kLanes, {}, LinearInput::Table64);

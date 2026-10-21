@@ -69,13 +69,14 @@ namespace richengine::model {
     // The fused head's argmax tile holds 32 rows; banding wider batches
     // through it measured no better than the ordinary projection.
     buffers.fusedHead = !headFusedOff && !tree &&
-        uint64_t{lanes} * ExecutionLimits::targetVerifyRows <= 32 &&
+        uint64_t{lanes} * geometry.draft.verifyRows() <= 32 &&
         ((headShape.layout() == ops::WeightLayout::Affine64 &&
           headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0) ||
          ggufHead);
     buffers.headArgs.output_size = geometry.target.vocabularySize;
+    buffers.headArgs.output_stride = geometry.target.paddedVocabularySize;
     buffers.headArgs.input_size = geometry.target.hiddenSize;
-    buffers.headArgs.rows = ExecutionLimits::targetVerifyRows;
+    buffers.headArgs.rows = geometry.draft.verifyRows();
     buffers.headArgs.stop_token_0 = geometry.target.stopTokens[0];
     buffers.headArgs.stop_token_1 = geometry.target.stopTokens[1];
     for (uint32_t lane = 0; lane < lanes && buffers.fusedHead; ++lane) {
@@ -89,8 +90,8 @@ namespace richengine::model {
       buffers.headArgs.live_rows[lane] =
           lane < liveRows.size()
               ? std::clamp(liveRows[lane], uint32_t{1},
-                           ExecutionLimits::targetVerifyRows)
-              : ExecutionLimits::targetVerifyRows;
+                           geometry.draft.verifyRows())
+              : geometry.draft.verifyRows();
     }
     if (buffers.fusedHead) {
       buffers.headArgmaxValues = d(DecodeTensor::HeadArgmaxValues);
@@ -125,7 +126,8 @@ namespace richengine::model {
                      liveNodes)
                : ops::PagedAttention::verifyParams(
                      items[lane].logicalPosition,
-                     static_cast<uint32_t>(items[lane].pageTable.size()));
+                     static_cast<uint32_t>(items[lane].pageTable.size()),
+                     geometry.draft.verifyRows());
     bindPageTables(entries, buffers.pageTables);
     if (gdnLayers)
       bindGdnStates(entries, buffers.currentGdnStates,
@@ -148,7 +150,7 @@ namespace richengine::model {
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes, tree,
-                          liveRows, liveNodes);
+                          liveRows, liveNodes, geometry.draft.verifyRows());
   }
 
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
@@ -200,7 +202,7 @@ namespace richengine::model {
     // partials for a head that never ran would reduce stale scratch — the
     // logits it skipped are never written.
     uint32_t fusedHead = headFusedOff ||
-            uint64_t{lanes} * ExecutionLimits::targetVerifyRows > 32 ? 0 :
+            uint64_t{lanes} * geometry.draft.verifyRows() > 32 ? 0 :
         headShape.layout() == ops::WeightLayout::Affine64 &&
                 headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0
             ? 1
@@ -225,7 +227,7 @@ namespace richengine::model {
                        vBuffers, geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
                        {penaltyTable, std::span(stateLanes).first(lanes)},
-                       liveRows, fusedHead);
+                       liveRows, fusedHead, geometry.draft.verifyRows());
   }
 
   void Runtime::Impl::encodeBatchAcceptance(CommandGraph &graph,
@@ -278,16 +280,20 @@ namespace richengine::model {
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1],
         proposals,
-        dspark ? RICHENGINE_DSPARK_POOL : RICHENGINE_DRAFT_CANDIDATES);
+        dspark ? RICHENGINE_DSPARK_POOL : RICHENGINE_DRAFT_CANDIDATES,
+        geometry.draft.verifyRows());
   }
 
-  void Runtime::Impl::encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
+  void Runtime::Impl::encodeBatchVerifyInput(
+      CommandGraph &graph, uint32_t lanes,
+      std::span<const uint32_t> liveRows) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
     targetModel.addVerifyInput(
         graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes);
+        decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes,
+        geometry.draft.verifyRows(), geometry.draft.queryRows(), liveRows);
   }
 
   // A tree batch's verify inputs: the selector's tables carry every lane's
@@ -368,7 +374,8 @@ namespace richengine::model {
           decodeArena->packed(DecodeTensor::RetainedPath, width), width);
       return;
     }
-    targetModel.addStateCommit(graph, std::move(buffers), width);
+    targetModel.addStateCommit(graph, std::move(buffers), width,
+                               geometry.draft.verifyRows());
   }
 
 } // namespace richengine::model

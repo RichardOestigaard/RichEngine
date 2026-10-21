@@ -83,7 +83,15 @@ std::string shapeName(const std::string &shape) {
 // after `history` tokens, with their plan's scratch.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
                               uint32_t history, uint32_t extentPages) {
-  const kv::Layout layout{1, shape.kvHeads, shape.headDimension, shape.format};
+  kv::Layout layout{1, shape.kvHeads, shape.headDimension, shape.format};
+  // The declared attention core each benchmark geometry binds (the family
+  // makers' values mirrored for these production shapes).
+  layout.attentionCore =
+      shape.queryHeads == 24   ? kv::Core::Kv4Group6
+      : shape.kvHeads == 4     ? kv::Core::Kv4Group4
+      : shape.headDimension == 128 ? kv::Core::Kv2Group8D128
+      : shape.headDimension == 64  ? kv::Core::Kv8Group4D64
+                                   : kv::Core::Kv2Group8;
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);

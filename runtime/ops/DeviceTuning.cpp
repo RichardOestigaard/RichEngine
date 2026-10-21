@@ -23,15 +23,22 @@ struct MeasuredScope final {
   uint32_t minFamily;
   uint32_t maxFamily;
   uint32_t cores;
+  // The model family a measurement is scoped to (the descriptor's family
+  // name): a winner that only holds there — a draft-path reassociation
+  // another family's token stream does not survive, say. Empty shares the
+  // row across models; the shape key already decides most rows agree.
+  std::string_view model = {};
   [[nodiscard]] constexpr bool matches(const DevicePolicy &device) const noexcept {
     return device.family >= minFamily && (!maxFamily || device.family <= maxFamily) &&
-           (!cores || (device.coresReported && cores == device.cores));
+           (!cores || (device.coresReported && cores == device.cores)) &&
+           (model.empty() || model == device.model);
   }
   // Ordering among matching rows: more constrained fields win (a
   // core-scoped row beats an unscoped one), then the higher minFamily — the
   // family's own measurement beats a carried-forward one.
   [[nodiscard]] constexpr unsigned specificity() const noexcept {
-    return (minFamily ? 4u : 0u) + (maxFamily ? 2u : 0u) + (cores ? 1u : 0u);
+    return (!model.empty() ? 8u : 0u) + (minFamily ? 4u : 0u) +
+           (maxFamily ? 2u : 0u) + (cores ? 1u : 0u);
   }
 };
 
@@ -40,6 +47,10 @@ struct MeasuredScope final {
 // names an exact core count.
 constexpr MeasuredScope kApple10Plus{10, 0, 0};
 constexpr MeasuredScope kApple10Plus20Cores{10, 0, 20};
+// A measured row only valid on one model: draft-path tile changes
+// reassociate reductions and flip emitted tokens on families they were
+// never measured for, so rows a shape share cannot carry stay model-scoped.
+constexpr MeasuredScope kLfm2_5_8B{10, 0, 0, "LFM2.5-8B-A1B"};
 
 // A measured affine plan: exact {matrix, rows, epilogue} rows so no
 // unmeasured workload changes policy.
@@ -105,6 +116,22 @@ constexpr MeasuredLinear kMeasuredDecode[] = {
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +12.8%
     {kApple10Plus, {5120, 17408}, 24, LinearEpilogue::Residual,
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +5.1%
+    // The residual pair every Qwen3.8 layer runs — the 64-row down and the
+    // mixer out projection — at the block-8 draft's verify strides
+    // (q4-decode-profile, 20-core M5 Pro): deeper K splits stream the wide-K
+    // down faster at every width, the narrow-K mixer out only through 24.
+    {kApple10Plus, {5120, 17408}, 8, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +10%
+    {kApple10Plus, {5120, 17408}, 16, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},   // +10%
+    {kApple10Plus, {5120, 17408}, 32, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +17%
+    {kApple10Plus, {5120, 6144}, 8, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +5%
+    {kApple10Plus, {5120, 6144}, 16, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +2%
+    {kApple10Plus, {5120, 6144}, 24, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +3%
     {kApple10Plus, {5120, 17408}, 32, LinearEpilogue::None,
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +5.5%
     {kApple10Plus, {5120, 25600}, 24, LinearEpilogue::None,
@@ -157,6 +184,30 @@ constexpr MeasuredLinear kMeasuredDecode[] = {
     // kv is 256-wide and never reaches it.
     {kApple10Plus, {512, 2048}, 24, LinearEpilogue::None,
      {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},   // +3%
+    // LFM2.5-8B-A1B's DSpark draft at the verify block width (20-core
+    // M5 Pro): the Split128/eight-simdgroup pick beats the defaults on the
+    // out projections, the fused hidden+feature input and the gate/up.
+    // Model-scoped: {2048,2048} and {6144,2048}@64 also match other
+    // families' draft and target FFN shapes at four lanes, and a tile
+    // change there reassociates a draft-path reduction — the hazard the
+    // rejected rows below documented (Bonsai @23, Ornith @100, MiniCPM5
+    // acceptance 0.152→0.007).
+    {kLfm2_5_8B, {2048, 2048}, 64, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +20.9%
+    {kLfm2_5_8B, {2048, 6144}, 64, LinearEpilogue::Residual,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +12.7%
+    {kLfm2_5_8B, {6144, 2048}, 64, LinearEpilogue::GateUp,
+     {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},   // +16.4%
+    // Isolated winners measured and rejected (decode-profile --dump-tokens,
+    // 20-core M5 Pro): Ornith-1.5-35B-A3B's draft and expert shapes
+    // ({2048,4096}@64, {2048,16384}@32/@64, {9216,2048}@48, {12544,2048}@64,
+    // {248320,2048}@64; prefill {2048,6144}/{2048,16384}@64), Ternary-
+    // Bonsai-2-27B's DFlash2 draft ({1280,5120}@48/@64, {5120,17408}@32,
+    // {6144,5120}@48/@64, {14336,5120}@64, {16640,5120}@64, {17408,5120}@64),
+    // and MiniCPM-V-4.7's DSpark draft ({2048,2048}@48, {2048,10240}@64):
+    // +5% to +33% isolated, but every one reassociates a draft-path or
+    // prefill reduction and flipped the emitted token stream (Bonsai
+    // diverged at token 23, Ornith at 100). Same hazard as the rows below.
     // MiniCPM5-2B, 20-core M5 Pro: Paired128 fills the machine better than
     // the Paired256 low-lane pick on the 130560-row head (+28% isolated).
     // The {2560,2048}@32 and {2048,10240}@32 rows measured +15%/+8%

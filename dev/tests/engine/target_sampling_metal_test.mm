@@ -543,7 +543,7 @@ const std::array<SamplingPolicy, kLanes> kMixedPolicies{
 void penalties(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                bool argmaxPath, uint32_t &changedSelections) {
   Random random(0x70656e + uint64_t{vocabulary} * 8 + lanes * 2 + argmaxPath);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   for (uint32_t row = 0; row < batch.rows; ++row) {
@@ -672,7 +672,7 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
   const std::array<SamplingPenalties, lanes> penalties{
       SamplingPenalties{1.2F, 2.0F, 2.0F}, SamplingPenalties{1.0F, 1.5F, 0.0F}};
   Random random(0x73706563 + samplingMask);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   AcceptanceBuffers acceptance{
@@ -808,7 +808,7 @@ void extremes(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t kSaturated = 50;
   constexpr uint32_t kTopK = 20;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::span<uint32_t> words = tableRow(table, vocabulary, 2);
@@ -888,7 +888,7 @@ void extremes(MetalBackend &backend) {
 // encodes nothing.
 void invalidPenalties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = penaltyTable(backend, vocabulary);
   const SamplingPolicy penalized{1, 0.0F, 1.0F, false, false,
@@ -977,7 +977,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
                  bool minP) {
   Random random(0x77696465 + uint64_t{vocabulary} * 8 + lanes +
                 (minP ? 64 : 0));
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const SamplingPolicy narrow{20, 0.9F, 0.95F, false};
   const SamplingPolicy disabled{0, 1.0F, 0.95F, false};
@@ -1103,7 +1103,7 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
 // are poisoned, so a missing argmax or draw cannot pass by reading old data.
 void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
   constexpr uint32_t vocabulary = 1003;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   batch.poison();
   Random random(9831 + lanes);
@@ -1167,7 +1167,7 @@ void mixedVerify(MetalBackend &backend, uint32_t lanes, uint32_t samplingMask) {
 void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t lanes = 2;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const std::array<SamplingPolicy, lanes> policies{
       SamplingPolicy{},
       SamplingPolicy{
@@ -1221,7 +1221,7 @@ void unconstrainedRowsIgnoreMasks(MetalBackend &backend) {
 // their values, which decide the argmax among equal integer parts: reading
 // them rounded would pick the lowest id instead.
 void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const uint32_t words = batch.maskWords();
   for (uint32_t row = 0; row < batch.rows; ++row)
@@ -1318,7 +1318,7 @@ void targetTop1(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
 // them selects one; the other lanes take the row's best remaining token.
 void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
   const auto stops = shardEdgeStopTokens(vocabulary);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, kLanes);
   const auto best = [&](uint32_t row) {
     return 5 + row * 7919 % (vocabulary - 8);
@@ -1444,7 +1444,7 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
 // the first one cut has none.
 void ties(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::array<uint32_t, 1> tableRows{1};
@@ -1523,7 +1523,7 @@ void ties(MetalBackend &backend) {
 // from both sides: one has its probability, the other none.
 void minPCuts(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 4096;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   struct Class final {
     uint32_t first;
@@ -1601,7 +1601,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
   constexpr uint32_t lanes = 4;
   constexpr std::array<uint32_t, lanes> kWrongAt{2, kPositions, 4, 6};
   Random random(0x77686f6c);
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, lanes);
   const std::vector<SamplingPolicy> policies{
       {0, 1.0F, 1.0F, false},
@@ -1708,7 +1708,7 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
 // as the next anchor.
 void overProposedResidual(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 4096;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const SamplingPolicy policy{0, 1.0F, 1.0F, false};
   AcceptanceBuffers acceptance{
@@ -1787,7 +1787,7 @@ void overProposedResidual(MetalBackend &backend) {
 // of the temperature alone once took thousands and stalled the batch.
 void extremeSearches(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 248320;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const MetalBuffer table = allocate(backend, uint64_t{kLanes} * vocabulary * 4);
   const std::array<uint32_t, 1> tableRows{2};
@@ -1865,7 +1865,7 @@ void extremeSearches(MetalBackend &backend) {
 void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
-  Sampling sampling(vocabulary);
+  Sampling sampling(vocabulary, vocabulary);
   const Batch batch = makeBatch(backend, vocabulary, 1);
   const AcceptanceBuffers acceptance{
       allocate(backend, kPositions * sizeof(uint32_t)),

@@ -24,6 +24,7 @@ class PackageTests(unittest.TestCase):
             root = Path(temporary)
             for folder, names in (
                 ("install", package.INSTALL_FILES),
+                ("install/tuning", package.TUNING_FILES),
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
                 ("build", ("richengine", "richengine.metallib")),
@@ -31,6 +32,10 @@ class PackageTests(unittest.TestCase):
                 (root / folder).mkdir(parents=True)
                 for name in names:
                     (root / folder / name).write_text("fixture")
+            families = root / "install/families"
+            families.mkdir()
+            for name in ("__init__.py", "_drafts.json", "_knobs.json", "Fixture-1B.json"):
+                (families / name).write_text("fixture")
             for name in package.LICENSE_FILES:
                 (root / name).write_text("fixture")
             (root / "install/completions/official-models.txt").write_text(
@@ -85,6 +90,7 @@ class PackageTests(unittest.TestCase):
             stage.mkdir()
             for folder, names in (
                 ("install", package.INSTALL_FILES),
+                ("install/tuning", package.TUNING_FILES),
                 ("server", package.SERVER_FILES),
                 ("build", ("richengine", "richengine.metallib")),
             ):
@@ -93,6 +99,10 @@ class PackageTests(unittest.TestCase):
                     (root / folder / name).write_text("fixture")
             for name in package.LICENSE_FILES:
                 (root / name).write_text("license")
+            families = root / "install/families"
+            families.mkdir()
+            for name in ("__init__.py", "_drafts.json", "Fixture-1B.json"):
+                (families / name).write_text("fixture")
             completions = root / "install/completions"
             completions.mkdir()
             completion_names = {
@@ -126,7 +136,7 @@ class PackageTests(unittest.TestCase):
             )
             self.assertEqual(
                 {p.name for p in (stage / "install").iterdir()},
-                {*package.INSTALL_FILES, "completions"},
+                {*package.INSTALL_FILES, "completions", "tuning", "families"},
             )
             shipped = stage / "install/completions"
             self.assertEqual({p.name for p in shipped.iterdir()}, completion_names)

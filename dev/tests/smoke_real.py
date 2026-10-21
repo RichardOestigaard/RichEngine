@@ -1483,12 +1483,16 @@ def add_server_arguments(parser):
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 
-def resolve_server_arguments(arguments):
+def resolve_server_arguments(parser, arguments):
     """Serve --package, or else the selection link of --model."""
-    if arguments.package is None:
+    if arguments.package is not None:
+        return arguments
+    try:
         arguments.package = model_artifacts.selection_link(
             model_artifacts.MODELS, arguments.model
         )
+    except model_artifacts.ModelError as error:
+        parser.error(str(error))
     return arguments
 
 
@@ -1514,7 +1518,7 @@ def hold_package(arguments):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_server_arguments(parser)
-    return resolve_server_arguments(parser.parse_args(argv))
+    return resolve_server_arguments(parser, parser.parse_args(argv))
 
 
 def main(argv=None) -> int:

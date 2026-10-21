@@ -22,6 +22,7 @@ from .tool_schema import (
     THINK_OPEN,
     TOOL_CALL_OPEN,
     TOOL_CALL_OPEN_ALT,
+    dialect_named,
 )
 
 # The think-block spellings the served families use, in preference order:
@@ -66,21 +67,29 @@ class TokenizerContract:
 
 class TokenConstraint:
     # A mask request simulates at most the engine's target verify rows
-    # (ExecutionLimits::targetVerifyRows, 8: the pending anchor and seven
-    # draft proposals) and takes a mask before and after each.
-    MAX_ROWS = 9
+    # (ExecutionLimits::targetVerifyRows, 16: the pending anchor and the
+    # proposal table's 15 slots) and takes a mask before and after each.
+    MAX_ROWS = 17
 
-    def __init__(self, matcher, executor, contract):
+    def __init__(self, matcher, executor, contract, initial_mask=None):
         self.matcher = matcher
         self.executor = executor
         self.vocabulary = contract.vocabulary
         self.eos_tokens = contract.eos_tokens
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.vocabulary)
+        # The grammar start state's mask, compiled once per grammar by the
+        # factory. Serving it from cache keeps the only fully serialized mask
+        # request — the one a finished prompt waits on before its first
+        # token — off the grammar executor.
+        self._initial_mask = initial_mask
         # Generated batches the grammar has not consumed yet. The reader
         # thread commits them; the mask thread consumes them before the next
         # mask, so reading the native stream never waits for the grammar.
         self._lock = threading.Lock()
         self._committed: list[tuple[int, ...]] = []
+        # Whether generated tokens have advanced the grammar past its start
+        # state; only then is a cached start-state mask no longer valid.
+        self._advanced = False
 
     def commit(self, token_ids):
         if any(not 0 <= token < self.vocabulary for token in token_ids):
@@ -94,6 +103,12 @@ class TokenConstraint:
 
     def masks(self, simulation_tokens):
         self._consume_committed()
+        if (
+            not simulation_tokens
+            and not self._advanced
+            and self._initial_mask is not None
+        ):
+            return self._initial_mask
         if len(simulation_tokens) >= self.MAX_ROWS:
             raise ConstraintError("too many simulation tokens")
         in_range = next(
@@ -127,6 +142,8 @@ class TokenConstraint:
     def _consume_committed(self):
         with self._lock:
             batches, self._committed = self._committed, []
+        if batches:
+            self._advanced = True
         for token_ids in batches:
             # LLGuidance's bulk API rejects EOS after a NoExtension stop.
             stopped_eos = (
@@ -150,13 +167,15 @@ class TokenConstraint:
                 )
 
 
-def validate_tokenizer(tokenizer, config):
+def validate_tokenizer(tokenizer, config, serving=None):
     """Checks the loaded tokenizer against the loaded model's configuration
     and returns the ids generation is bound to, a TokenizerContract.
 
     config is the configuration mapping itself, or the directory holding it:
     the tokenizer files an assembly links sit beside a copy of the model's
-    config.json."""
+    config.json. serving is the model's ServingContract: its think framing
+    and tool dialect name the spellings to bind; without one (an old
+    assembly) the spellings are probed, as they always were."""
     generation_config = None
     if not isinstance(config, dict):
         config_dir = config
@@ -215,39 +234,61 @@ def validate_tokenizer(tokenizer, config):
         raise engine_runtime.EngineUnhealthy(
             "tokenizer assigns a native token id to several tokens"
         )
-    # The think framing is the family's whose close token the vocabulary
-    # has; the open's leading special token decodes for the output parser.
-    framing = next(
-        (item for item in THINK_FRAMINGS if vocabulary.get(item[0]) is not None),
-        None,
-    )
+    # The think framing is the contract's where the model declares one;
+    # otherwise the family's whose close token the vocabulary has. The
+    # open's leading special token decodes for the output parser.
+    if serving is not None and vocabulary.get(serving.think.end) is not None:
+        framing = (
+            serving.think.end,
+            serving.think.open,
+            serving.think.open_token,
+            serving.think.flag,
+        )
+    else:
+        framing = next(
+            (item for item in THINK_FRAMINGS if vocabulary.get(item[0]) is not None),
+            None,
+        )
     think_end, think_open, open_token, think_flag = (
         framing if framing is not None else (THINK_END, THINK_OPEN, None, None)
     )
     think_end_id = vocabulary.get(think_end)
     think_open_id = vocabulary.get(open_token) if open_token is not None else None
-    # The call-open token is the default framing's or the family's.
-    tool_call_open_id = next(
+    # The call-open token is the contract dialect's marker first, then the
+    # other spellings served families use.
+    declared = None
+    if serving is not None:
+        dialect = dialect_named(serving.tool_dialect)
+        if dialect is not None:
+            # The call-open's leading special token where the dialect marks
+            # one; the bare spelling otherwise.
+            declared = (
+                dialect.structural[0] if dialect.structural else dialect.call_open
+            )
+    call_tokens = tuple(
+        dict.fromkeys(
+            token
+            for token in (declared, TOOL_CALL_OPEN, TOOL_CALL_OPEN_ALT)
+            if token is not None
+        )
+    )
+    tool_call_open = next(
         (
-            token_id
-            for token in (TOOL_CALL_OPEN, TOOL_CALL_OPEN_ALT)
-            if (token_id := vocabulary.get(token)) is not None
+            token
+            for token in call_tokens
+            if vocabulary.get(token) is not None
         ),
         None,
+    )
+    tool_call_open_id = (
+        vocabulary.get(tool_call_open) if tool_call_open is not None else None
     )
     expected = [(by_id.get(token_id), token_id) for token_id in eos_tokens]
     expected.append((think_end, think_end_id))
     if think_open_id is not None:
         expected.append((open_token, think_open_id))
-    if tool_call_open_id is not None:
-        expected.append(
-            (
-                TOOL_CALL_OPEN
-                if vocabulary.get(TOOL_CALL_OPEN) is not None
-                else TOOL_CALL_OPEN_ALT,
-                tool_call_open_id,
-            )
-        )
+    if tool_call_open is not None:
+        expected.append((tool_call_open, tool_call_open_id))
     for token, token_id in expected:
         if token is None or token_id is None:
             raise engine_runtime.EngineUnhealthy(
@@ -313,8 +354,22 @@ class ConstraintFactory:
         grammar that cannot. A grammar can compile and still exceed the
         parser's limits where generation reaches a construct, after the whole
         prompt has been processed."""
-        matcher = self._matcher(grammar, timeout, prefixes)
-        return TokenConstraint(matcher.deep_copy(), self.executor, self.contract)
+        matcher, initial_mask = self._matcher(grammar, timeout, prefixes)
+        return TokenConstraint(
+            matcher.deep_copy(), self.executor, self.contract, initial_mask
+        )
+
+    def _compile_initial_mask(self, matcher):
+        """The start-state next-token mask, identical for every request a
+        grammar serves: computed once, at compile time and off the serving
+        path, where the engine's initial mask request used to wait for it."""
+        if not self.contract.vocabulary:
+            return None
+        bitmask = allocate_token_bitmask(1, self.contract.vocabulary)
+        fill_next_token_bitmask_par(
+            self.executor, [(matcher.deep_copy(), 0)], bitmask
+        )
+        return bitmask[:1].tobytes()
 
     def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share
@@ -324,7 +379,7 @@ class ConstraintFactory:
             if cached is not None:
                 self.cache.move_to_end(grammar)
                 self.hits += 1
-                return cached[0]
+                return cached[0], cached[2]
             pending = self.pending.get(grammar)
             owner = pending is None
             if owner:
@@ -332,12 +387,12 @@ class ConstraintFactory:
         if not owner:
             if not wait((pending,), timeout=timeout).done:
                 raise APIError(504, "request timed out", "request_timeout")
-            matcher = pending.result()
+            matcher, initial_mask = pending.result()
             with self.lock:
                 if grammar in self.cache:
                     self.cache.move_to_end(grammar)
                 self.hits += 1
-            return matcher
+            return matcher, initial_mask
         try:
             error = LLMatcher.validate_grammar(grammar, self.tokenizer)
             if error:
@@ -348,22 +403,23 @@ class ConstraintFactory:
             for tokens, message in prefixes() if prefixes else ():
                 if not matcher.deep_copy().consume_tokens(tokens):
                     raise APIError(400, message)
+            initial_mask = self._compile_initial_mask(matcher)
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.
             # This bounds source bytes; LLGuidance bounds compiler complexity.
             with self.lock:
                 self.misses += 1
                 if size <= self.CACHE_SOURCE_BYTES:
-                    self.cache[grammar] = (matcher, size)
+                    self.cache[grammar] = (matcher, size, initial_mask)
                     self.source_bytes += size
                     while (
                         len(self.cache) > self.CACHE_SIZE
                         or self.source_bytes > self.CACHE_SOURCE_BYTES
                     ):
-                        _, (_, evicted_size) = self.cache.popitem(last=False)
+                        _, (_, evicted_size, _) = self.cache.popitem(last=False)
                         self.source_bytes -= evicted_size
-            pending.set_result(matcher)
-            return matcher
+            pending.set_result((matcher, initial_mask))
+            return matcher, initial_mask
         except BaseException as error:
             pending.set_exception(error)
             raise

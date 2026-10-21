@@ -80,8 +80,8 @@ struct GgufHeadArgmaxParams {
   GgufDecodeParams decode;
   HeadArgmaxParams head;
 };
-static_assert(sizeof(GgufHeadArgmaxParams) == 56,
-              "GGUF head argmax parameters are 56 bytes on both sides");
+static_assert(sizeof(GgufHeadArgmaxParams) == 60,
+              "GGUF head argmax parameters are 60 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.
@@ -108,6 +108,11 @@ inline constexpr bool gguf_embedding_format(uint32_t format) {
   return format == GGUF_FMT_Q4K || format == GGUF_FMT_Q5K || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K ||
          format == GGUF_FMT_Q2K || format == GGUF_FMT_Q80 || format == GGUF_FMT_Q40 || format == GGUF_FMT_Q41 ||
          format == GGUF_FMT_IQ4XS || format == GGUF_FMT_IQ4NL || format == GGUF_FMT_IQ3S || format == GGUF_FMT_PQ20;
+}
+// The oQ (oMLX) formats whose native token rows the gathers read
+// (gguf_embed_af*): the whole private AF id range.
+inline constexpr bool oq_embedding_format(uint32_t format) {
+  return format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128;
 }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights

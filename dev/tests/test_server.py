@@ -410,6 +410,14 @@ class FakeRuntime:
     def pending_count(self):
         return sum(not call.done for call in self.calls)
 
+    def mask_stats(self):
+        return {
+            "calls": 0,
+            "queue_ms_total": 0.0,
+            "eval_ms_total": 0.0,
+            "eval_ms_max": 0.0,
+        }
+
     def status(self, timeout=5.0):
         if timeout <= 0:
             raise ValueError("status timeout must be positive")

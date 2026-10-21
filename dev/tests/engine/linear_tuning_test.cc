@@ -107,8 +107,8 @@ void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
   const auto admit = [](uint64_t, const std::function<void()> &) -> metal::AllocationResult {
     throw std::logic_error("invalid tuning input reached admission");
   };
-  for (const LinearTuningInput &input : {LinearTuningInput{blocks, {{block, std::nullopt}}},
-                                         LinearTuningInput{affine, {{block, std::nullopt}}}}) {
+  for (const LinearTuningInput &input : {LinearTuningInput{blocks, {}, {{block, std::nullopt}}},
+                                         LinearTuningInput{affine, {}, {{block, std::nullopt}}}}) {
     const auto result = tuneLinear(backend, admit, input);
     require(!result.complete && result.failure && result.measurements.empty(),
             "an untuned or mismatched tuning input was accepted");
@@ -119,7 +119,7 @@ void blockInputs(metal::MetalBackend &backend, const Projection &projection) {
 
 void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
-  const LinearTuningInput input{workload, {{projection, std::nullopt}}};
+  const LinearTuningInput input{workload, {}, {{projection, std::nullopt}}};
   const auto baseline = Linear(backend.capabilities()).plan(workload).configuration();
   const uint64_t before = BackendInstrumentation::submittedCommands(backend);
   size_t calls = 0;
@@ -140,9 +140,9 @@ void gpuControls(metal::MetalBackend &backend, const Projection &projection) {
   options.warmupPairs = 0;
   assertStopped(tuneLinear(backend, admit, input, options), true);
   assertStopped(tuneLinear(backend, {}, input), true);
-  assertStopped(tuneLinear(backend, admit, {workload, {}}), true);
-  assertStopped(tuneLinear(backend, admit, {workload, {{{}, {}}}}), true);
-  assertStopped(tuneLinear(backend, admit, {workload, {{projection, projection}}}), true);
+  assertStopped(tuneLinear(backend, admit, {workload, {}, {}}), true);
+  assertStopped(tuneLinear(backend, admit, {workload, {}, {{{}, {}}}}), true);
+  assertStopped(tuneLinear(backend, admit, {workload, {}, {{projection, projection}}}), true);
   auto tooMany = input;
   tooMany.weights.resize(kMaximumLinearTuningRepresentatives + 1, input.weights[0]);
   assertStopped(tuneLinear(backend, admit, tooMany), true);
@@ -185,7 +185,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
               uint32_t rows, LinearPhase phase, LinearEpilogue epilogue) {
   const auto &projection = projections.front();
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, rows, phase, epilogue};
-  LinearTuningInput input{workload, {}};
+  LinearTuningInput input{workload, {}, {}};
   std::vector<uint64_t> weightsBefore;
   for (const auto &weights : projections) {
     input.weights.push_back({weights, epilogue == LinearEpilogue::GateUp
@@ -253,7 +253,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Projection> projecti
 
 void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
   const LinearWorkload workload{{projection.outputSize, projection.inputSize}, 8};
-  const LinearTuningInput input{workload, {{projection, std::nullopt}}};
+  const LinearTuningInput input{workload, {}, {{projection, std::nullopt}}};
   const auto plans = linearCandidates(backend.capabilities(), workload);
   require(plans.size() > 1, "interruption fixture has no alternative");
   const auto admit = [](uint64_t, const auto &allocate) {
@@ -301,7 +301,7 @@ void gpuInterruptions(metal::MetalBackend &backend, Projection &projection) {
 void gpuEveryRepresentative(metal::MetalBackend &backend,
                             const Projection &first, Projection &second) {
   const LinearWorkload workload{{first.outputSize, first.inputSize}, 8};
-  const LinearTuningInput input{workload, {{first, {}}, {second, {}}}};
+  const LinearTuningInput input{workload, {}, {{first, {}}, {second, {}}}};
   const auto plans = linearCandidates(backend.capabilities(), workload);
   auto *scales = static_cast<uint16_t *>(second.affine().scales.contents());
   const auto saved = scales[0];

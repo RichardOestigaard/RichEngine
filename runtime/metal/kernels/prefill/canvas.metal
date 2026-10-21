@@ -21,7 +21,7 @@
 #define PREFILL_ATTENTION_SPLIT_CANVAS(Name, Heads, Group, CacheElement, HeadDim, Windowed) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -87,7 +87,7 @@ PREFILL_ATTENTION_SPLIT_CANVAS(prefill_attention_bf16_split_canvas_h256, 8, 2, b
 #define PREFILL_ATTENTION_SPLIT_CANVAS_M2(Name, Heads, Group, CacheElement, HeadDim, Windowed) \
   kernel void Name(                                                         \
       device bfloat *queries [[buffer(0)]],                                 \
-      device float *partials [[buffer(1)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
       device const RichKvPage *page_table [[buffer(3)]],                  \
       constant RichPrefillAttentionParams &params [[buffer(4)]],          \
@@ -135,7 +135,7 @@ PREFILL_ATTENTION_SPLIT_CANVAS_M2(prefill_attention_bf16_split_canvas_swa_hd512_
 
 #define PREFILL_ATTENTION_REDUCE_CANVAS(Name, KVHeads, Group, HeadDim, Groups) \
   kernel void Name(                                                         \
-      device const float *partials [[buffer(0)]],                           \
+      device const bfloat *partials [[buffer(0)]],                           \
       device const float *statistics [[buffer(1)]],                         \
       device bfloat *output [[buffer(2)]],                                  \
       constant RichPrefillAttentionParams &params [[buffer(3)]],            \

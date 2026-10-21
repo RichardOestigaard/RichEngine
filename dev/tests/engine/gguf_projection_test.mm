@@ -86,6 +86,16 @@ void section(const std::string &what) {
 }
 
 const char *tileName(LinearTile tile) { return tile == LinearTile::GgufRegister ? "register" : "staged"; }
+// The formats a tile decodes: all but the register tile's, whose bf16
+// operands cannot hold the oQ AF8 formats' eight-bit codes — the Apple9
+// policy stages them instead (ops/LinearGguf.cpp's apple9StagesFormat).
+std::vector<uint32_t> tileFormats(LinearTile tile) {
+  std::vector<uint32_t> formats;
+  for (uint32_t f = 0; f < FMT_COUNT; ++f)
+    if (tile != LinearTile::GgufRegister || (f != GGUF_FMT_AF8 && f != GGUF_FMT_AF8G128))
+      formats.push_back(f);
+  return formats;
+}
 const char *epilogueName(LinearEpilogue e) {
   switch (e) {
     case LinearEpilogue::None: return "plain";
@@ -409,8 +419,10 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   constexpr uint32_t N = 512, K = 2048, columns = N + kPadding;
   const bool staged = tile == LinearTile::GgufStaged;
-  for (int fi = 0; fi < FMT_COUNT; ++fi) {
-    const Tensor w = tensor(backend, Fmt(fi), N, K), g = tensor(backend, Fmt((fi + 3) % FMT_COUNT), N, K);
+  const std::vector<uint32_t> formats = tileFormats(tile);
+  for (size_t fi = 0; fi < formats.size(); ++fi) {
+    const Tensor w = tensor(backend, Fmt(formats[fi]), N, K),
+                 g = tensor(backend, Fmt(formats[(fi + 3) % formats.size()]), N, K);
     const Projection up = projection({&w}, columns), gate = projection({&g}, columns);
     for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
       const std::vector<float> x = activations(inputs, kMaximumRows, K);
@@ -419,7 +431,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
       const std::vector<Dot> gateDots = products({&g}, columns, x, kMaximumRows);
       for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
         for (const uint32_t splits : kSplits) {
-          const std::string what = std::string(fmtName(fi)) + (inputs == Inputs::Sparse ? " sparse " : " dense ") +
+          const std::string what = std::string(fmtName(formats[fi])) + (inputs == Inputs::Sparse ? " sparse " : " dense ") +
                                    epilogueName(epilogue) + " S=" + std::to_string(splits);
           const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           std::vector<Outcome> lanesAlone;
@@ -453,7 +465,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
     }
   }
-  section(std::string(tileName(tile)) + " decode: " + std::to_string(FMT_COUNT) + " formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
+  section(std::string(tileName(tile)) + " decode: " + std::to_string(formats.size()) + " formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
           "sparse inputs within fp64, lanes equal to one-lane projections, fp32 plain outputs rounding to bf16's");
 }
 
@@ -461,9 +473,11 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 // split, within fp64 and equal to the projections of each segment alone.
 void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   constexpr uint32_t K = 2048;
-  for (int fi = 0; fi < FMT_COUNT; ++fi) {
-    const Tensor a = tensor(backend, Fmt(fi), 512, K), b = tensor(backend, Fmt((fi + 3) % FMT_COUNT), 256, K),
-                 c = tensor(backend, Fmt((fi + 5) % FMT_COUNT), 256, K);
+  const std::vector<uint32_t> formats = tileFormats(tile);
+  for (size_t fi = 0; fi < formats.size(); ++fi) {
+    const Tensor a = tensor(backend, Fmt(formats[fi]), 512, K),
+                 b = tensor(backend, Fmt(formats[(fi + 3) % formats.size()]), 256, K),
+                 c = tensor(backend, Fmt(formats[(fi + 5) % formats.size()]), 256, K);
     const std::vector<const Tensor *> parts{&a, &b, &c};
     const uint32_t covered = segmentColumns(parts), columns = covered + kPadding;
     const Projection fused = projection(parts, columns);
@@ -496,7 +510,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
       }
   }
-  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(FMT_COUNT) + " format triples, 1-4 lanes, S 1-8 within fp64 "
+  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(formats.size()) + " format triples, 1-4 lanes, S 1-8 within fp64 "
           "and equal to each segment's projection");
 }
 
@@ -519,12 +533,13 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     checkValues(out, products({&u}, columns, x, wl.rows), products({&g}, columns, x, wl.rows), {}, wl, wl.rows, N,
                 tile == LinearTile::GgufStaged, label);
   };
-  for (int gf = 0; gf < FMT_COUNT; ++gf)
-    for (int uf = 0; uf < FMT_COUNT; ++uf)
+  const std::vector<uint32_t> formats = tileFormats(tile);
+  for (const uint32_t gf : formats)
+    for (const uint32_t uf : formats)
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(Fmt(gf), Fmt(uf), 256, lanes);
   const std::array<std::array<Fmt, 2>, kMaximumLanes> wide{{{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}}};
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(wide[lanes - 1][0], wide[lanes - 1][1], 1024, lanes);
-  section(std::string(tileName(tile)) + " gate/up: " + std::to_string(FMT_COUNT * FMT_COUNT) + " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
+  section(std::string(tileName(tile)) + " gate/up: " + std::to_string(formats.size() * formats.size()) + " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, "
           "within fp64");
 }
 

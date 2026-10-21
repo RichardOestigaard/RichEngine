@@ -8,9 +8,12 @@
 // rounds it, the GDN decay becomes float(-exp(double(A_log))), and every
 // other tensor is copied as stored.
 
+#include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightSource.hpp"
 
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -18,11 +21,19 @@
 
 namespace richengine::model::affine {
 
+using QuantSpec = SafetensorsCheckpoint::QuantSpec;
+
 // Block is a Projection planned into the block image layout instead of the
 // affine tiles (model/AffineToBlock.cpp): a GgufTensorDescriptor, the AF4
 // plane0 tiles and the meta plane, each at a 16 KiB boundary within the
-// section.
-enum class SectionKind { Copy, Decay, Projection, Quantize, Block };
+// section. Oq is an oMLX mixed-precision checkpoint's projections (model/
+// OqWrite.cpp): a run of GgufTensorDescriptor + plane0/meta segments at the
+// parts' own formats, or F32 float segments for the parts left unquantized.
+// OqAffine is an oQ section whose parts the affine tiles encode as well (all
+// 4-bit over groups of 64): a GgufTensorDescriptor typed ggml::kAffineQ4, then
+// the same planes a Projection section writes, so the oQ reader can pick the
+// Affine64 kernels where they measure faster (model/OqWrite.cpp).
+enum class SectionKind { Copy, Decay, Projection, Quantize, Block, Oq, OqAffine };
 
 // A checkpoint tensor a section reads: its name, the dtypes it is read in and
 // its shape, planned from the layout; tensor is bound once the checkpoint is
@@ -35,10 +46,31 @@ struct Input {
 };
 
 // Source rows of a fused projection: its MLX weight, scales and biases
-// (Projection), or its BF16 weight (Quantize).
+// (Projection), or its BF16 weight (Quantize). Oq sections plan each part's
+// own spec: bits and groupSize of the checkpoint's, unquantized for a plain
+// float weight, and nativeRows for the token table's gathered rows.
 struct ProjectionPart {
   uint32_t rows = 0;
   std::vector<Input> fields;
+  uint32_t bits = 4, groupSize = 64;
+  bool unquantized = false;
+  // Quantized in the source but written dequantized into an F32 float
+  // segment: the block MoE reads its router and scalar gate as F32.
+  bool dequantize = false;
+  bool nativeRows = false;
+  // A window of a fused source's rows: MiniCPM-V's experts.gate_up_proj
+  // stores each expert's gate and up rows interleaved [gate|up], so its
+  // sections read expertStride-row source blocks at a row offset. Zero
+  // declares the part's rows contiguous — expertStride defaults to rows.
+  uint32_t expertStride = 0, expertOffset = 0;
+  [[nodiscard]] uint32_t sourceExpertRows() const noexcept {
+    return expertStride ? expertStride : rows;
+  }
+  // The source row of destination row `flat` ([0, experts * rows)).
+  [[nodiscard]] uint64_t sourceRow(uint64_t flat) const noexcept {
+    return expertStride ? (flat / rows) * expertStride + expertOffset + flat % rows
+                        : flat;
+  }
 };
 
 struct Section {
@@ -52,13 +84,14 @@ struct Section {
 };
 
 // A 16-byte header (magic, layer, type) in a 16 KiB block, then 16 KiB-aligned
-// sections; quantized lists the affine modules it reads and their bits.
+// sections; quantized lists the affine modules it reads and the spec the
+// planner expects of each, nullopt for a module left unquantized.
 struct Image {
   std::string name, magic;
   uint32_t layer = 0, type = 0;
   uint64_t bytes = 0;
   std::vector<Section> sections;
-  std::vector<std::pair<std::string, uint32_t>> quantized;
+  std::vector<std::pair<std::string, std::optional<QuantSpec>>> quantized;
 };
 
 // Quantizes one group of 64 BF16 weights to the codes, scale and bias the
@@ -67,5 +100,23 @@ void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint
 
 // Writes every byte of a bound image into destination, which is its size.
 void writeAffineImage(std::span<uint8_t> destination, const Image &image);
+
+// The packed cache of a safetensors load: every image written verbatim to
+// directory/<name>.bin, and .packed listing the safetensors shards it came
+// from and the plan that produced it ("name size mtime-ns" per shard, then
+// "name magic layer type bytes" per image). A matching stamp with every
+// image file present lets later loads read the images as packed files —
+// identical bytes, no transpose, no quantize.
+std::string packedStamp(const std::filesystem::path &directory,
+                        const std::vector<Image> &images);
+bool packedCacheUsable(const std::filesystem::path &directory,
+                       const std::vector<Image> &images);
+// Writes destination to path (a tmp file, then rename) unless it already
+// holds the bytes' size — best effort: the cache only speeds later loads.
+void cachePackedImage(const std::filesystem::path &path, std::span<const uint8_t> bytes);
+// The stamp lands once every image file is present; a partial cache keeps
+// failing the check and fills in on later loads.
+void refreshPackedStamp(const std::filesystem::path &directory,
+                        const std::vector<Image> &images);
 
 } // namespace richengine::model::affine

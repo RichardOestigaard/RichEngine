@@ -172,7 +172,7 @@ serve: preflight $(TARGET)
 
 # The SolidJS app builds into server/webui/, which the server serves at /.
 webui:
-	cd web && npm ci && npm run build
+	cd web && pnpm install --frozen-lockfile && pnpm build
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -253,6 +253,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/draft_cores/Draft16x2x128.cpp \
 	runtime/ops/draft_cores/Draft32x8x128.cpp \
 	runtime/ops/draft_cores/Draft32x8x64Interleaved.cpp \
+	runtime/ops/draft_cores/Draft8x2x256.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -292,6 +293,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/AffineTarget.cpp \
 	runtime/model/AffinePreparation.cpp \
 	runtime/model/AffineToBlock.cpp \
+	runtime/model/OqTarget.cpp \
+	runtime/model/OqWrite.cpp \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
 	runtime/model/WeightImages.cpp \
@@ -303,6 +306,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DiffusionSampler.cpp \
 	runtime/model/Lfm2.cpp \
 	runtime/model/Lfm2Moe.cpp \
+	runtime/model/Lfm2Moe24B.cpp \
+	runtime/model/MiniCpmV47.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/Ornith9B.cpp \
@@ -314,6 +319,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/TargetModelHybrid.cpp \
 	runtime/model/TargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
+	runtime/model/DFlashTwoDraft.cpp \
 	runtime/model/DSparkDraft.cpp \
 	runtime/model/DFlashV1Draft.cpp \
 	runtime/model/ModelFactory.cpp \
@@ -328,7 +334,9 @@ ENGINE_MM_SOURCES := \
 	runtime/model/families/Qwen.mm \
 	runtime/model/families/Ornith.mm \
 	runtime/model/families/MiniCpm.mm \
+	runtime/model/families/MiniCpmV.mm \
 	runtime/model/families/Lfm2.mm \
+	runtime/model/families/Lfm2Moe24B.mm \
 	runtime/model/families/Granite.mm \
 	runtime/model/families/Gemma.mm \
 	runtime/model/Runtime.mm \

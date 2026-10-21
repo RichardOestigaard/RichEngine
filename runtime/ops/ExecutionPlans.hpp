@@ -14,8 +14,10 @@ namespace richengine::ops {
 class ExecutionPlans final {
 public:
   // moeUnionCap: --moe-union, the decode plan's routed-expert budget.
+  // model: the descriptor's family name — model-scoped measured rows apply.
   explicit ExecutionPlans(const DeviceCapabilities &device,
-                          uint32_t moeUnionCap = 0);
+                          uint32_t moeUnionCap = 0,
+                          std::string_view model = {});
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -23,13 +25,18 @@ public:
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
       uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
       std::span<const uint32_t> historyTokens, bool tree = false,
-      uint32_t liveNodes = 0) const;
+      uint32_t liveNodes = 0,
+      uint32_t rows = RICHENGINE_TARGET_VERIFY_ROWS) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
-      DraftAttentionShape shape, uint32_t lanes) const;
+      DraftAttentionShape shape, uint32_t lanes,
+      uint32_t queryRows = RICHENGINE_DRAFT_QUERY_ROWS) const;
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;
   // The DiffusionGemma trunk's plan family: canvas-phase expert sweeps.
   [[nodiscard]] MoePlan moeCanvas(MoeShape shape, uint32_t rows) const;
-  [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
+  // verifyRows is the lanes' packed verify row stride: a trained-block
+  // draft's verify depth, at most RICHENGINE_TARGET_VERIFY_ROWS.
+  [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes,
+      uint32_t verifyRows = RICHENGINE_TARGET_VERIFY_ROWS) const;
 
   // Bounds cover every row count up to the requested maximum, not just that
   // one. Packed decode arenas use a per-lane stride of

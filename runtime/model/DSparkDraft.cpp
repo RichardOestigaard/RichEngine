@@ -65,7 +65,8 @@ DSparkDraft::DSparkDraft(const DSparkDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
+      selector_(weights.layout.vocabularySize,
+                paddedVocabularySize(weights.layout.vocabularySize)),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DSparkDraft::addSelection(
@@ -76,12 +77,12 @@ void DSparkDraft::addSelection(
     selector_.addDSparkTree(
         graph, buffers,
         {weights_.markovEmbedding, weights_.markovProjection}, anchors,
-        policies, treeMask);
+        policies, treeMask, weights_.layout.queryRows());
     return;
   }
   selector_.addDSpark(graph, buffers,
                       {weights_.markovEmbedding, weights_.markovProjection},
-                      anchors, policies);
+                      anchors, policies, weights_.layout.queryRows());
 }
 
 void DSparkDraft::addContextPrefill(
@@ -140,9 +141,9 @@ void DSparkDraft::addDecode(
     throw std::invalid_argument("invalid draft decode batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * layout.queryRows();
   const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes);
+      operators_.draftAttention(layout.attentionShape(), lanes, layout.queryRows());
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
@@ -156,7 +157,7 @@ void DSparkDraft::addDecode(
     const uint32_t next = current ^ 1;
     const bool causal = (layout.causalLayers >> layer) & 1;
     const DFlashV1DraftLayerWeights &weights = weights_.layers[layer];
-    const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes);
+    const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, qkvPlan.input());
@@ -182,8 +183,9 @@ void DSparkDraft::addDecode(
                        .residual = buffers.hidden[current], .scratch = scratch},
                weights.outputProjection,
                linear.decodePlan(weights.outputProjection, lanes,
-                                 ops::LinearEpilogue::Residual));
-    const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes);
+                                 ops::LinearEpilogue::Residual, nullptr,
+                                 layout.queryRows()));
+    const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpPlan.input());
@@ -192,18 +194,19 @@ void DSparkDraft::addDecode(
                 .scratch = scratch,
                 .prepared = mlpNormalized},
                weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
+               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection, layout.queryRows()),
                &weights.gateProjection);
     linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
                        .residual = buffers.residual, .scratch = scratch},
                weights.downProjection,
                linear.decodePlan(weights.downProjection, lanes,
-                                 ops::LinearEpilogue::Residual));
+                                 ops::LinearEpilogue::Residual, nullptr,
+                                 layout.queryRows()));
   }
 
   // The final norm feeds the shared vocabulary head; the DSpark selector
   // works on the head's logits directly and needs no projection of its own.
-  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
+  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
@@ -223,21 +226,21 @@ void DSparkDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * layout.verifyRows();
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows()));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer) kvPlan = linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},
@@ -246,7 +249,7 @@ void DSparkDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape());
+        startPositions, layout.attentionShape(), layout.verifyRows());
   }
 }
 

@@ -85,9 +85,13 @@ struct Lfm2MoeLayout final {
     return count;
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept { return 0; }
+  // The compiled attention kernel the layers bind (ops/PagedKv.hpp).
+  kv::Core attentionCore = kv::Core::Kv8Group4D64;
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads,
-            attentionHeadDimension};
+    kv::Layout layout{attentionLayerCount(), attentionKvHeads,
+                      attentionHeadDimension};
+    layout.attentionCore = attentionCore;
+    return layout;
   }
   // Conv-state layers only: the FIFO of taps-1 rows, no recurrent matrix.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {

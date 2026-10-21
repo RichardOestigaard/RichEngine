@@ -21,8 +21,8 @@ inline void full_qkv_decode_phase(
   FullPrefillParams lane_params{rows, Stride};
   full_qkv_storage_phase<QHeads, KHeads>(
       qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
-      rope_cos + ulong(batch) * rows * RotaryPairs,
-      rope_sin + ulong(batch) * rows * RotaryPairs,
+      rope_cos + ulong(batch) * params.rope_stride * RotaryPairs,
+      rope_sin + ulong(batch) * params.rope_stride * RotaryPairs,
       queries + ulong(batch) * QHeads * Stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,
@@ -80,8 +80,8 @@ inline void full_qkv_decode_phase_hd(
   FullPrefillParams lane_params{rows, Stride};
   full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, false, Norms>(
       qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
-      rope_cos + ulong(batch) * rows * RotaryPairs,
-      rope_sin + ulong(batch) * rows * RotaryPairs,
+      rope_cos + ulong(batch) * params.rope_stride * RotaryPairs,
+      rope_sin + ulong(batch) * params.rope_stride * RotaryPairs,
       queries + ulong(batch) * QHeads * Stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,
@@ -318,8 +318,8 @@ inline void full_qkv_decode_phase_gemma(
                          bfloat, KeyEqualsValue, NormalizeValues,
                          ProportionalRope>(
       qkv + ulong(batch) * rows * PackedStride, q_norm, k_norm,
-      rope_cos + ulong(batch) * rows * RotaryPairs,
-      rope_sin + ulong(batch) * rows * RotaryPairs,
+      rope_cos + ulong(batch) * params.rope_stride * RotaryPairs,
+      rope_sin + ulong(batch) * params.rope_stride * RotaryPairs,
       queries + ulong(batch) * QHeads * Stride * HeadDim,
       keys + ulong(batch) * kv_lane_stride,
       values + ulong(batch) * kv_lane_stride, lane_params, reductions,

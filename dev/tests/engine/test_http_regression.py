@@ -51,6 +51,12 @@ class HttpRegressionTests(unittest.TestCase):
                 with (
                     self.subTest(parse=parse, arguments=arguments),
                     contextlib.redirect_stderr(io.StringIO()),
+                    # Bare names defer to the local caches; a miss must exit
+                    # cleanly regardless of what this machine holds.
+                    mock.patch(
+                        "install.local.find",
+                        side_effect=smoke.model_artifacts.ModelError("missing"),
+                    ),
                 ):
                     with self.assertRaises(SystemExit):
                         parse(arguments)

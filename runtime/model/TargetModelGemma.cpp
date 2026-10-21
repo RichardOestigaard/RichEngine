@@ -6,6 +6,7 @@
 // translation units share live in TargetModelGemmaHelpers.hpp.
 #include "model/TargetModelGemmaHelpers.hpp"
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 
 #include "model/Gemma4Moe.hpp"
 
@@ -164,7 +165,7 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
   const uint32_t intermediate = step.rows * geometry_.denseIntermediateSize;
   // RICHENGINE_GEGLU_OFF: debug gate that leaves the raw sharedUp output in
   // denseIntermediate, separating the GEMM from the geglu_multiply pass.
-  static const bool gegluOff = tuning().gegluOff;
+  static const bool gegluOff = modelPolicy().gegluOff;
   if (!gegluOff)
     step.graph.add("geglu_multiply", {b.denseGateScratch, b.denseIntermediate, b.denseIntermediate},
                    intermediate, {(intermediate + 255) / 256, 1, 1}, {256, 1, 1});
@@ -221,7 +222,7 @@ void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeig
       b.fullQueries, b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer],
       geometry_.attentionQueryHeads, layerKv, step.lanes, step.rowCapacity);
   const ops::LinearPlan outputPlan = linear.decodePlan(mixer.outputProjection, step.planLanes);
-  static const bool noFusedGate = tuning().noFusedGate;
+  static const bool noFusedGate = modelPolicy().noFusedGate;
   const ops::VerifyAttentionPlan &plan =
       global ? *step.altAttention : step.attention;
   const bool fusedReduce = !noFusedGate && !step.tree &&

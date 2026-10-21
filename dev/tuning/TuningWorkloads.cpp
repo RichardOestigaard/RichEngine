@@ -36,7 +36,8 @@ bool sameWeights(const LinearTuningWeights &left, const LinearTuningWeights &rig
 
 void appendDistinct(std::map<ops::LinearWorkload, LinearTuningInput> &table,
                     const ops::LinearWorkload &workload, const LinearTuningWeights &weights) {
-  auto &input = table.try_emplace(workload, LinearTuningInput{workload, {}}).first->second;
+  auto &input = table.try_emplace(workload,
+                                        LinearTuningInput{workload, {}, {}}).first->second;
   if (std::none_of(input.weights.begin(), input.weights.end(),
                    [&](const auto &existing) { return sameWeights(existing, weights); }))
     input.weights.push_back(weights);
@@ -148,6 +149,7 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
   std::vector<LinearTuningInput> result;
   result.reserve(linear.size());
   for (auto &[key, input] : linear) {
+    input.model = package.descriptor.family;
     retainRepresentatives(input.weights);
     result.push_back(std::move(input));
   }

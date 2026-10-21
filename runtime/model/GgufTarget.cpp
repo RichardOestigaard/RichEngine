@@ -4,6 +4,7 @@
 #include "model/GgufPreparation.hpp"
 #include "model/Lfm2.hpp"
 #include "model/Lfm2Moe.hpp"
+#include "model/Lfm2Moe24B.hpp"
 
 namespace richengine::model {
 
@@ -95,6 +96,36 @@ gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout) {
   geometry.expertsPerToken = layout.expertsPerToken;
   geometry.expertIntermediateSize = layout.expertIntermediateSize;
   geometry.leadingDenseLayers = Lfm2MoeLayout::denseLayers;
+  geometry.sharedExpert = false;
+  return geometry;
+}
+
+// The LFM2.5-24B-A2B target ("lfm2moe"): the same hybrid shape as the 8B
+// at 40 layers — 10 full-attention layers, two leading dense-FFN layers of
+// 11776 and 64 sigmoid-gated experts of 1536 from there on.
+gguf::TargetGeometry ggufTargetGeometry(const Lfm2Moe24BLayout &layout) {
+  gguf::TargetGeometry geometry;
+  geometry.arch = "lfm2moe";
+  geometry.layers = layout.layers;
+  geometry.hiddenSize = layout.hiddenSize;
+  geometry.vocabularySize = layout.vocabularySize;
+  geometry.intermediateSize = layout.intermediateSize;
+  geometry.attentionMask = Lfm2Moe24BLayout::attentionMask;
+  geometry.convolutionDimension = layout.convolutionDimension;
+  geometry.convolutionTaps = Lfm2Moe24BLayout::convolutionTaps;
+  geometry.rmsEpsilon = layout.rmsEpsilon;
+  geometry.attentionWidth = layout.attentionWidth;
+  geometry.attentionKvHeads = layout.attentionKvHeads;
+  geometry.attentionHeadDimension = layout.attentionHeadDimension;
+  geometry.rotaryPairs = layout.rotaryPairs;
+  geometry.rotaryTheta = layout.rotaryTheta;
+  geometry.attentionQueryGate = false;
+  geometry.attentionQkNorm = true;
+  geometry.tiedOutput = true;
+  geometry.experts = layout.experts;
+  geometry.expertsPerToken = layout.expertsPerToken;
+  geometry.expertIntermediateSize = layout.expertIntermediateSize;
+  geometry.leadingDenseLayers = Lfm2Moe24BLayout::denseLayers;
   geometry.sharedExpert = false;
   return geometry;
 }

@@ -2,6 +2,7 @@
 #include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "model/AnePredictor.hpp"
+#include "model/ModelPolicy.hpp"
 #include "model/CompositeStateStorage.hpp"
 #include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -47,7 +48,12 @@
 namespace richengine::model {
 
 Runtime::Runtime(RuntimeContext context)
-    : impl_(std::make_unique<Impl>(context)) {}
+    // A serving process binds one model: install its declared policy before
+    // Impl's members read any model knob, so a maker's defaults — not the
+    // process environment — drive them.
+    : impl_((
+          installModelPolicy(context.package.descriptor.tuning),
+          std::make_unique<Impl>(context))) {}
 
 Runtime::~Runtime() = default;
 
@@ -85,6 +91,9 @@ void Runtime::suspend(uint64_t requestId) {
   if (!entry.resident || entry.verifyMaskInFlight) {
     throw std::logic_error("request cannot be suspended");
   }
+  // A speculative draft still in flight reads the lane's rings; it drains
+  // before the lane's buffers pool.
+  impl_->settleGpuPredraft();
   impl_->states.releaseLane(entry.stateLane, requestId);
   impl_->pageTableBindings[entry.stateLane] = {};
   impl_->releaseImages(entry);
@@ -271,6 +280,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
+  // A pending speculative draft holds the one in-flight command slot.
+  impl_->settleGpuPredraft();
   CommandTicket command;
   try {
     command = impl_->aneFfn
@@ -442,6 +453,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
+  // A pending speculative draft holds the one in-flight command slot.
+  impl_->settleGpuPredraft();
   const auto encodeStart = std::chrono::steady_clock::now();
   const bool constrained = plan.constrained;
   if (plan.decodeStage != DecodeStage::Regular) {
@@ -504,10 +517,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // rows it could still keep. The draft checkpoint's trained block bounds
     // the ceiling: queries past it emit picks the block never learned.
     const uint32_t proposalCap =
-        std::getenv("RICHENGINE_PROPOSAL_CAP")
-            ? static_cast<uint32_t>(
-                  std::atoi(std::getenv("RICHENGINE_PROPOSAL_CAP")))
-            : impl_->geometry.draft.proposalLimit();
+        modelPolicy().proposalCap.value_or(impl_->geometry.draft.proposalLimit());
     const uint32_t budget =
         impl_->adaptiveProposals_ && !constrained
             ? std::clamp(entry.proposalBudget,
@@ -523,6 +533,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       proposals[lane] = 0;
       liveRows[lane] = 1;
     }
+    laneResult.proposals = proposals[lane];
 
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
@@ -546,7 +557,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->ngram_.predraftedTree_ = false;
   const bool predrafted =
       (!constrained || nullDraft) &&
-      (impl_->applyAnePredraft(entries, items, width) ||
+      (impl_->adoptGpuPredraft(entries, items, width, !treeBatch) ||
+       impl_->applyAnePredraft(entries, items, width) ||
        impl_->applyNgramPredraft(entries, width, nullDraft && treeBatch));
   // Adaptive draft bypass: when every lane's acceptance EWMA sits below the
   // draft's break-even cost, the batch decodes anchor-only — the draft
@@ -568,13 +580,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (draftBypassed) {
       for (uint32_t lane = 0; lane < width; ++lane) {
         Impl::Request &entry = *entries[lane];
-        // The acceptance kernel reads proposals=0 as "uncapped", so the
+        // The full proposal-table width is the acceptance kernel's
+        // uncapped value — it clamps to the lane's verify stride — so the
         // bypass is expressed through the buffer: anchor-repeat proposals
         // almost never match the target's argmax, and a lucky match only
         // emits real verified tokens. All verify rows stay live so a
         // matched row never emits a dead row's stale argmax.
-        proposals[lane] = 0;
+        proposals[lane] = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
         liveRows[lane] = kDecodeRows;
+        lanes[lane].proposals = proposals[lane];
         entry.draftBypassed = true;
         std::fill_n(
             contents<uint32_t>(
@@ -589,6 +603,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
   const bool tree = !draftBypassed && treeBatch &&
                     (predrafted ? impl_->ngram_.predraftedTree_ : true);
+  // Everything below writes the arena's draft tensors: the bump invalidates
+  // any predraft a later decode might still be holding.
+  ++impl_->arenaEpoch_;
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   if (tree) {
@@ -620,7 +637,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
   if (!predrafted && !draftBypassed) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                                DecodeTensor::DraftHidden0, width);
+                                DecodeTensor::DraftHidden0, width, 1,
+                                impl_->geometry.draft.queryRows());
     impl_->encodeDraftBatchGraph(commandGraph, entries,
                                  {logicalPositions.data(), width});
   }
@@ -674,9 +692,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (!skipCommits && !skipDraft && !nullDraft)
       impl_->encodeDraftStateCommitBatch(commandGraph, entries, items, true);
   } else {
-    impl_->encodeBatchVerifyInput(commandGraph, width);
+    impl_->encodeBatchVerifyInput(commandGraph, width, {liveRows.data(), width});
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                                DecodeTensor::Hidden0, width);
+                                DecodeTensor::Hidden0, width, 1,
+                                impl_->geometry.draft.verifyRows());
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false,
                                           {liveRows.data(), width});
     impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, false,
@@ -697,6 +716,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  encodeStart, encodeEnd](CommandTiming timing) mutable {
     const auto t0 = std::chrono::steady_clock::now();
     auto result = impl->finalizeDecode(lanes, items, timing, tree);
+    // The committed step's anchors and positions are host-known now: the
+    // next block's draft forward runs on the GPU through the host's
+    // result-handling gap. Tree steps predraft nothing — a tree-capable
+    // batch would only discard a chain table.
+    if (!tree)
+      impl->launchDraftPredraft(lanes, items);
+    if (tuning().opTimings &&
+        std::any_of(lanes.begin(), lanes.end(), [](const auto &l) {
+          return l.request->generatedTokens >= l.request->maxNewTokens;
+        }))
+      metal::dumpOpTimings();
     if (decodeTiming) {
       const auto t1 = std::chrono::steady_clock::now();
       fprintf(stderr,
@@ -747,6 +777,15 @@ uint32_t Runtime::statesToActivate() const noexcept {
 }
 
 uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
+  // Reclaim runs only between commands: a speculative draft still in flight
+  // reads state the releases below would give back or let eviction take, so
+  // it drains first — as submissions already do. A failed drain leaves the
+  // backend unhealthy; nothing is freed for it then.
+  try {
+    impl_->settleGpuPredraft();
+  } catch (...) {
+    return 0;
+  }
   // One unit per call, so a denied allocation frees only what it needs;
   // rebuildable caches go once the pool has nothing more to give.
   if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
@@ -795,6 +834,10 @@ void Runtime::end(uint64_t requestId) {
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
     return;
+  // A speculative draft still in flight reads the lane's rings and reaches
+  // its KV through the page table; it drains before the lane's buffers pool
+  // and its extents become eviction candidates.
+  impl_->settleGpuPredraft();
   impl_->releaseImages(found->second);
   if (found->second.resident) {
     impl_->states.releaseLane(found->second.stateLane, requestId);

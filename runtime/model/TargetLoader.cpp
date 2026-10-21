@@ -63,5 +63,7 @@ template MixerWeights readMixer(WeightFile &, const AffineTargetFormat &,
                                         const MixerGeometry &, bool);
 template MixerWeights readMixer(WeightFile &, const BlockTargetFormat &,
                                         const MixerGeometry &, bool);
+template MixerWeights readMixer(WeightFile &, const OqTargetFormat &,
+                                        const MixerGeometry &, bool);
 
 } // namespace richengine::model

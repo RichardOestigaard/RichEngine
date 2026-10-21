@@ -4,6 +4,7 @@
 #include "tuning/Measurement.hpp"
 
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace richengine::ops::tuning {
@@ -20,7 +21,8 @@ inline constexpr size_t kMaximumLinearTuningRepresentatives = 8;
 // the workload. A block-quantized workload gets the staged and register
 // tiles at each split count (prefill: staged splits or the prefill tile).
 [[nodiscard]] std::vector<LinearPlan> linearCandidates(
-    const DeviceCapabilities &device, LinearWorkload workload);
+    const DeviceCapabilities &device, LinearWorkload workload,
+    std::string_view model = {});
 
 // The GGUF formats whose block projections tune: dense Q4_K and the
 // MLX-derived AF4 first. A block workload with any other format throws —
@@ -41,6 +43,9 @@ struct LinearTuningWeights final {
 
 struct LinearTuningInput final {
   LinearWorkload workload;
+  // The model family the workload was collected from — model-scoped
+  // measured rows apply as this input's policy baseline.
+  std::string_view model;
   // 1..8 immutable representative views supplied by the model. Each timed
   // batch visits them in this fixed order before repeating the ring. The
   // operator never copies weights or invents a cache-flushing workload.

@@ -8,7 +8,7 @@
 #define PAGED_PREFILL_FP8_SPLIT(Name, Heads, Group, HeadDim)                   \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table [[buffer(3)]],                     \
       constant RichPrefillAttentionParams &params [[buffer(4)]],             \

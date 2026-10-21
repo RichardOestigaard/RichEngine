@@ -52,6 +52,7 @@ struct Lfm2Layout final {
   // The DSpark draft's mask token id and hidden-state capture layers; the
   // draft config declares both under dflash_config.
   uint32_t maskToken = 125017;
+  // LFM2.5 states a single end token; it fills both slots.
   std::array<uint32_t, 2> stopTokens = {124900, 124900};
   std::array<uint32_t, 5> hiddenCaptureLayers = {2, 9, 17, 21, 27};
   uint32_t intermediateSize = 10752;
@@ -69,9 +70,13 @@ struct Lfm2Layout final {
     return count;
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept { return 0; }
+  // The compiled attention kernel the layers bind (ops/PagedKv.hpp).
+  kv::Core attentionCore = kv::Core::Kv8Group4D64;
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads,
-            attentionHeadDimension};
+    kv::Layout layout{attentionLayerCount(), attentionKvHeads,
+                      attentionHeadDimension};
+    layout.attentionCore = attentionCore;
+    return layout;
   }
   // Conv-state layers only: the FIFO of taps-1 rows, no recurrent matrix.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {

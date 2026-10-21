@@ -12,6 +12,7 @@
 #include "Env.hpp"
 #include "Tuning.hpp"
 #include "model/AnePredictor.hpp"
+#include "model/ModelPolicy.hpp"
 #include "model/NullDraft.hpp"
 #include "model/CompositeStateStorage.hpp"
 #include "model/TargetModel.hpp"
@@ -193,6 +194,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    // The proposals the verify batch was offered this step: the lane's
+    // adaptive budget clamped by its retention limit (the bypass's uncapped
+    // write keeps the buffer's full width for the acceptance clamp).
+    uint32_t proposals = 0;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -278,38 +283,38 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // slot per step so a mid-chunk early exit still drains in order — the
     // extra steps past it were dead compute only. 1 restores the old
     // encode/wait-per-step loop.
-    const uint32_t canvasStepsPerCmd_ = tuning().canvasStepsPerCmd;
+    const uint32_t canvasStepsPerCmd_ = modelPolicy().canvasStepsPerCmd;
     // RICHENGINE_CANVAS_PREFIX_EXIT (default 1; "0" disables): early exit
     // judges argmax stability over the prefix bounded by the first stop
     // token, so churn past it does not hold the canvas alive.
-    const bool canvasPrefixExit_ = tuning().canvasPrefixExit;
+    const bool canvasPrefixExit_ = modelPolicy().canvasPrefixExit;
     // RICHENGINE_CANVAS_COMMIT_TAIL (default 1; "0" disables): the last
     // scheduled step encodes without canvas_entropy_accept — the commit
     // reads the row-stats argmax directly.
-    const bool canvasCommitTail_ = tuning().canvasCommitTail;
+    const bool canvasCommitTail_ = modelPolicy().canvasCommitTail;
     // RICHENGINE_CANVAS_SPECULATIVE_PREFILL (default on; "0" disables): once
     // a drained step leaves the whole-canvas argmax unchanged, the encoder
     // commit prefill is encoded ahead of the formal exit on dedicated
     // buffers and skipped later if the commit mismatches.
-    const bool canvasSpecPrefill_ = tuning().canvasSpeculativePrefill;
+    const bool canvasSpecPrefill_ = modelPolicy().canvasSpecPrefill;
     // RICHENGINE_CANVAS_PROFILE ("paper"|"balanced"|"fast"): bundles the
     // speed/quality knobs below for serve's --canvas-profile. Each knob's own
     // RICHENGINE_* variable wins over the profile when set.
-    const std::string_view canvasProfile_ = tuning().canvasProfile;
+    const std::string_view canvasProfile_ = modelPolicy().canvasProfile;
     // RICHENGINE_CANVAS_EXIT_STABLE (default 0.9; "0" disables): the
     // fraction-settled exit — at least this share of argmax-stable rows whose
     // mean entropy is under the confidence threshold commits early. Renoised
     // rows never settle on open-ended prompts, so the paper's strict
     // whole-canvas mean is otherwise unreachable.
-    const float canvasExitStable_ = tuning().canvasExitStable;
+    const float canvasExitStable_ = modelPolicy().canvasExitStable;
     // RICHENGINE_CANVAS_EXIT_DRIFT (default 0; "1" enables): fraction-settled
     // exit without the confidence check — commits a mostly-stable canvas's
     // argmax, freezing its churning minority early.
-    const bool canvasDriftExit_ = tuning().canvasDriftExit;
+    const bool canvasDriftExit_ = modelPolicy().canvasDriftExit;
     // RICHENGINE_CANVAS_MAX_STEPS (default 0 = the manifest's 48): caps the
     // denoising schedule. Prose canvases never settle inside 48 steps, so
     // the cap is the speed/quality dial — 24 roughly doubles throughput.
-    const uint32_t canvasMaxSteps_ = tuning().canvasMaxSteps;
+    const uint32_t canvasMaxSteps_ = modelPolicy().canvasMaxSteps;
     // RICHENGINE_CANVAS_PROBE ("notrunk"|"notail"|"nosc"): a timing probe
     // that skips the named stage of every canvas step — the trunk pass, the
     // head+row-stats+accept tail, or the self-conditioning chain. Output is
@@ -386,7 +391,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // the per-row vocabulary/argmax sweeps — instead of the fixed eight.
   // On by default; RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
   const bool adaptiveProposals_ =
-      tuning().adaptiveProposals && geometry.tuning.adaptiveProposals;
+      modelPolicy().adaptiveProposals && geometry.tuning.adaptiveProposals;
   // Per-step debug gates, read once: getenv scans environ linearly and these
   // ran inside the decode/finalize paths on every command.
   const bool treeDebug_ = tuning().treeDebug;
@@ -422,15 +427,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // feeds the same ProposedTokens injection the ANE artifact uses — a wrong
   // candidate only wastes verify rows.
   struct NgramPredraft final {
-    explicit NgramPredraft(const ModelTuning &modelTuning)
-        : ngramDraftExpect_(tuning().ngramDraftExpectSet
-                                ? tuning().ngramDraftExpect
-                                : modelTuning.ngramDraftExpect),
-          ngramWarmup_(tuning().ngramWarmupSet ? tuning().ngramWarmup
-                                               : modelTuning.ngramWarmup),
-          ngramTreeMin_(tuning().ngramTreeMinSet ? tuning().ngramTreeMin
-                                                 : modelTuning.ngramTreeMin) {}
-    const bool ngramPredraft_ = tuning().ngramPredraft;
+    NgramPredraft()
+        : ngramDraftExpect_(modelPolicy().ngramDraftExpect),
+          ngramWarmup_(modelPolicy().ngramWarmup),
+          ngramTreeMin_(modelPolicy().ngramTreeMin) {}
+    const bool ngramPredraft_ = modelPolicy().ngramPredraft;
     // Acceptance gate (SSSD-style): a batch goes n-gram-predrafted when the
     // lanes' expected accepted-token scores total at least what the GPU draft
     // would have delivered. A lane with a weak EWMA or no match drags the
@@ -451,11 +452,73 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // stores size for it instead of the scratch's full capacity.
     uint32_t predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
   };
-  NgramPredraft ngram_{geometry.tuning};
+  NgramPredraft ngram_{};
   // The env switch AND the family's default (ModelDescriptor.tuning).
   [[nodiscard]] bool ngramPredraftEnabled() const noexcept {
     return ngram_.ngramPredraft_ && geometry.tuning.ngramPredraft;
   }
+  // Speculative next-step draft on the GPU (RICHENGINE_GPU_PREDRAFT, =0
+  // disables): once a committed step's anchors and positions are
+  // host-known, the batch's next draft forward is encoded and submitted
+  // while the engine consumes this step's results — its GPU work overlaps
+  // the host gap instead of sitting inside the next command. The next
+  // decode adopts the predrafted proposals when the same lanes continue
+  // greedy, unconstrained and unpenalized at the same positions; anything
+  // else redrafts. The draft decode is read-only on the rings, so a
+  // discarded predraft corrupts nothing.
+  struct GpuPredraft final {
+    CommandTicket ticket;
+    bool submitted = false;
+    uint64_t epoch = 0;
+    uint32_t lanes = 0;
+    std::array<uint64_t, kLaneCount> requestIds{};
+    std::array<uint32_t, kLaneCount> anchors{};
+    std::array<uint64_t, kLaneCount> positions{};
+  };
+  GpuPredraft gpuPredraft_;
+  const bool gpuPredraftOn_ =
+      modelPolicy().gpuPredraft && geometry.tuning.gpuPredraft;
+  // Bumped once per decodeAsync's buffer-writing phase: a predraft's
+  // recorded epoch proves no other decode wrote the arena between its
+  // submission and the adoption check.
+  uint64_t arenaEpoch_ = 0;
+  // Waits out a pending speculative draft — the backend admits one
+  // in-flight command — and charges its timing into the decode counters.
+  // The lane bookkeeping stays for adoptGpuPredraft.
+  void settleGpuPredraft() {
+    if (!gpuPredraft_.submitted)
+      return;
+    const CommandTiming timing = gpuPredraft_.ticket.wait();
+    counters.totalDecodeGpuSeconds += timing.gpuSeconds;
+    counters.totalDecodeWallSeconds += timing.wallSeconds;
+    gpuPredraft_.submitted = false;
+  }
+  // Packs one lane's next-step draft inputs without prepareDecodeLane's
+  // readiness asserts or page-table work: the anchor the step just
+  // committed plus mask rows, and the draft rotary positions continuing at
+  // the lane's new logical position.
+  void packDraftPredraftLane(uint32_t lane, uint32_t anchor,
+                             uint64_t logicalPosition) {
+    const uint32_t queryRows = geometry.draft.queryRows();
+    auto *draftInput = contents<uint32_t>(
+                           decodeArena->packed(DecodeTensor::DraftInputTokens,
+                                               kLaneCount),
+                           "draft input tokens") +
+                       lane * queryRows;
+    draftInput[0] = anchor;
+    std::fill(draftInput + 1, draftInput + queryRows,
+              geometry.target.maskToken);
+    auto *draftPositions =
+        contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftPositions),
+                           "decode draft RoPE positions");
+    for (uint32_t row = 0; row < kDecodeRows; ++row)
+      draftPositions[row] = static_cast<uint32_t>(logicalPosition + row);
+  }
+  void launchDraftPredraft(std::span<const DecodeLaneResult> lanes,
+                           std::span<const ModelBatchItem> items);
+  bool adoptGpuPredraft(std::span<Request *const> entries,
+                        std::span<const ModelBatchItem> items, uint32_t width,
+                        bool allowed);
   // Adaptive draft bypass (default on): when every lane's acceptance EWMA
   // falls below the draft's break-even cost — the draft's per-step weight
   // traffic as a share of the whole step — the batch decodes anchor-only
@@ -463,13 +526,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // A lane probes again each kDraftProbeTokens so a recovered EWMA
   // re-enables it. RICHENGINE_DRAFT_BYPASS=0 disables.
   const bool draftBypass_ =
-      tuning().draftBypass && geometry.tuning.draftBypass;
+      modelPolicy().draftBypass && geometry.tuning.draftBypass;
   // Break-even measured on the M5 Pro's MiniCPM5-2B-MLX: the draft pass is
   // ~14% of a drafted step, so anchor-only wins once the accepted-token EWMA
   // sits under ~0.16. 0.15 keeps a hair of margin below it.
-  const double draftBypassExpect_ =
-      tuning().draftBypassExpectSet ? tuning().draftBypassExpect
-                                    : geometry.tuning.draftBypassExpect;
+  const double draftBypassExpect_ = modelPolicy().draftBypassExpect;
   static constexpr uint32_t kDraftProbeTokens = 256;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -478,7 +539,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
-        sampling(geometry.target.vocabularySize),
+        sampling(geometry.target.vocabularySize,
+                 geometry.target.paddedVocabularySize),
         // RICHENGINE_DIFFUSION_AR=1 drops a diffusion package onto the
         // ordinary autoregressive decode path: the trunk is the same
         // Gemma4Moe weights, and the model keeps its AR capability. The
@@ -820,19 +882,40 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     if (policy == ModelTuning::TreeVerify::Off)
       return false;
     return verifyTreeEnvSet_ ? verifyTreeEnabled
-                             : policy == ModelTuning::TreeVerify::On;
+                             : policy != ModelTuning::TreeVerify::OptIn;
+  }
+  // Whether a lane's rolling acceptance decides its tree admission: only the
+  // maker's Adaptive policy — an explicit RICHENGINE_VERIFY_TREE is a static
+  // On/Off that bypasses the band entirely.
+  bool treeAdmissionAdaptive() const noexcept {
+    return !verifyTreeEnvSet_ &&
+           geometry.tuning.treeVerify == ModelTuning::TreeVerify::Adaptive;
   }
   // A batch verifies the selector's comb trees only when every lane can:
   // greedy, unconstrained and unpenalized tree-capable lanes, at most two
   // wide (a tree lane doubles its row block, and four virtual lanes is the
-  // row budget), on a target with the tree kernels — GDN and attention
-  // mixers, dense FFN, no fp8 KV. Anything else runs the chain verify.
+  // row budget), on a target with the tree kernels — GDN, conv and
+  // attention mixers, dense FFN, no fp8 KV. Anything else runs the chain
+  // verify.
   bool treeVerifyBatch(std::span<Request *const> entries, uint32_t width,
                        bool constrained) const {
+    // GPU-drafted sparse MoE keeps the chain verify: the tree's doubled
+    // lane block routes its dead slot too, which measured a 2.5x union
+    // (31 -> 79 experts/layer) for no retained-token gain on MiniCPM-V-4.7 —
+    // 40.9 tok/s against the chain's 59.6. A Null-draft MoE (LFM2.5-24B-A2B)
+    // proposes from the n-gram predraft instead: its sparser trees get the
+    // gate until a measurement says the union inflates the same way.
+    // RICHENGINE_VERIFY_TREE=1 or a family's treeVerify On opts a
+    // GPU-drafted sparse-MoE target into trees anyway: the MiniCPM-V
+    // measurement keeps the gate by default.
+    const bool treeOn = verifyTreeEnvSet_
+                            ? verifyTreeEnabled
+                            : geometry.tuning.treeVerify ==
+                                  ModelTuning::TreeVerify::On;
     if (constrained || !treeDraftCapable() || !width ||
         width > kLaneCount / 2 ||
-        (geometry.target.convLayers && !geometry.target.gdnLayers) ||
-        geometry.target.ffnKind == FfnKind::SparseMoe ||
+        (!treeOn && geometry.target.ffnKind == FfnKind::SparseMoe &&
+         !std::holds_alternative<NullDraft>(draftModel)) ||
         geometry.target.kvLayout.format == kv::Format::Float8E4M3)
       return false;
     for (uint32_t lane = 0; lane < width; ++lane) {
@@ -840,6 +923,18 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       if (policy.samples() || policy.constrained ||
           policy.penalties.active())
         return false;
+    }
+    // Adaptive admission: the batch trees only while every lane's
+    // accepted-proposal EWMA sits inside the band — saturated lanes keep
+    // the deeper chain (the comb's leaves never win once the top pick
+    // lands), starved ones aren't worth the doubled row block.
+    if (treeAdmissionAdaptive()) {
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        const double ewma = entries[lane]->proposalAcceptedAvg;
+        if (ewma < modelPolicy().treeAcceptMin ||
+            ewma > modelPolicy().treeAcceptMax)
+          return false;
+      }
     }
     return true;
   }
@@ -1365,8 +1460,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                              std::span<const uint32_t> proposals = {});
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes,
-                            uint32_t rowFactor = 1);
-  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes);
+                            uint32_t rowFactor = 1,
+                            uint32_t rowStride = kDecodeRows);
+  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes,
+                              std::span<const uint32_t> liveRows = {});
   // A tree batch's verify inputs: the selector's tables carry every lane's
   // emitted nodes; the pass emits the input tokens, rotary positions and
   // ancestor masks, two decode rows' storage per lane.
@@ -1401,6 +1498,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // RICHENGINE_MOE_STATS: the step's MoE layers left a record each in the
     // shared tile-count scratch; this readback is why the flag is debug-only.
     ops::MoE::logStats(decodeArena->moeScratch(1).tileCount);
+    // The acceptance kernels pack a lane's emitted rows at the chain's
+    // verify stride (the tree's at its node stride), not the lane's
+    // capacity slot — reads follow the packed stride, never get(lane).
+    const uint32_t rowStride =
+        tree ? uint32_t{ExecutionLimits::targetVerifyRows}
+             : geometry.draft.verifyRows();
+    const uint32_t *packedOutputTokens = contents<uint32_t>(
+        decodeArena->packed(DecodeTensor::OutputTokens,
+                            static_cast<uint32_t>(items.size())),
+        "target output tokens");
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
       auto d = [&](DecodeTensor tensor) {
@@ -1410,6 +1517,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
+      const uint32_t *outputTokens = packedOutputTokens + lane * rowStride;
       if (!laneResult.retained || laneResult.retained > kDecodeRows) {
         if (treeDebug_) {
           const uint32_t *out = contents<uint32_t>(d(DecodeTensor::OutputTokens), "out");
@@ -1429,34 +1537,37 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // The retained target tokens end with the next anchor. A non-finite
       // target row can also accept a sentinel draft proposal as an interior
       // token, so every retained token is checked.
-      const uint32_t *targetTokens = contents<uint32_t>(
-          d(DecodeTensor::OutputTokens), "target output tokens");
+      const uint32_t *targetTokens = outputTokens;
       if (draftDebug_ && !tree) {
         const uint32_t *props = contents<uint32_t>(
             d(DecodeTensor::ProposedTokens), "proposed tokens");
         const uint16_t *hidden = contents<uint16_t>(
-            d(DecodeTensor::FinalHidden), "final hidden");
+            decodeArena->packed(DecodeTensor::FinalHidden,
+                                uint32_t(lanes.size())),
+            "final hidden") + lane * rowStride * geometry.target.hiddenSize;
         uint64_t h0 = 1469598103934665603ULL;
         for (uint32_t e = 0; e < geometry.target.hiddenSize; ++e) {
           h0 = (h0 ^ hidden[e]) * 1099511628211ULL;
         }
         const float *logits = contents<float>(
-            d(DecodeTensor::Logits), "logits");
+            decodeArena->packed(DecodeTensor::Logits,
+                                uint32_t(lanes.size())),
+            "logits") + lane * rowStride * geometry.target.paddedVocabularySize;
         float lmax = -INFINITY; uint32_t lmaxi = 0; uint32_t lnans = 0;
         for (uint32_t e = 0; e < geometry.target.vocabularySize; ++e) {
           const float v = logits[e];
           if (!std::isfinite(v)) { ++lnans; continue; }
           if (v > lmax) { lmax = v; lmaxi = e; }
         }
-        const uint32_t *flatOut = contents<uint32_t>(
-            decodeArena->packed(DecodeTensor::OutputTokens,
+        const uint32_t *flatIn = contents<uint32_t>(
+            decodeArena->packed(DecodeTensor::InputTokens,
                                 uint32_t(lanes.size())),
-            "flat out");
+            "flat in");
         fprintf(stderr, "  lane=%u lmax=%f@%u nans=%u in0=%u flat=[%u %u %u %u]\n",
                 lane, lmax, lmaxi, lnans,
-                *contents<uint32_t>(d(DecodeTensor::InputTokens), "in"),
-                flatOut[lane * 16], flatOut[lane * 16 + 1],
-                flatOut[lane * 16 + 2], flatOut[lane * 16 + 15]);
+                flatIn[lane * rowStride],
+                outputTokens[0], outputTokens[1],
+                outputTokens[2], outputTokens[rowStride - 1]);
         std::string p, t;
         for (uint32_t i = 0; i < kDraftProposalTokens; ++i)
           p += (i ? " " : "") + std::to_string(props[i]);
@@ -1490,11 +1601,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             return std::bit_cast<float>(uint32_t{bits} << 16);
           };
           const uint16_t *hidden = contents<uint16_t>(
-              d(DecodeTensor::DraftFinalHidden), "draft final hidden");
+              decodeArena->packed(DecodeTensor::DraftFinalHidden,
+                                  uint32_t(lanes.size())),
+              "draft final hidden") +
+              lane * geometry.draft.queryRows() * hiddenSize;
           const uint32_t *props = contents<uint32_t>(
               d(DecodeTensor::ProposedTokens), "proposed tokens");
           const uint32_t *anchor = contents<uint32_t>(
-              d(DecodeTensor::InputTokens), "decode anchor");
+              decodeArena->packed(DecodeTensor::InputTokens,
+                                  uint32_t(lanes.size())),
+              "decode anchor") + lane * rowStride;
           const uint16_t *cw = contents<uint16_t>(w.confidenceWeight,
                                                   "confidence weight");
           const uint16_t *w1 = contents<uint16_t>(w.markovEmbedding,
@@ -1708,8 +1824,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         continue;
       }
       const uint32_t *targetTokens =
-          contents<uint32_t>(decodeArena->get(lane, DecodeTensor::OutputTokens),
-                             "target output tokens");
+          packedOutputTokens + lane * rowStride;
       std::vector<uint32_t> output;
       output.reserve(laneResult.retained);
       output.push_back(laneResult.currentAnchor);
@@ -1730,23 +1845,30 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // poison the EWMA, so only the next probe is scheduled.
         entry.draftBypassed = false;
         entry.draftProbeAt = entry.generatedTokens + kDraftProbeTokens;
-      } else if (adaptiveProposals_ && !tree) {
-        entry.proposalAcceptedAvg =
-            0.75 * entry.proposalAcceptedAvg + 0.25 * laneResult.accepted;
-        if (laneResult.accepted >= entry.proposalBudget) {
-          // A capped count can't show how much further the chain would have
-          // run; widen until the trained block's cap stops binding.
-          entry.proposalBudget =
-              std::min<uint32_t>(geometry.draft.proposalLimit(),
-                                 entry.proposalBudget + 1);
-        } else {
-          // Shrink toward the EWMA target one row per step: a single-visit
-          // clamp to avg+2 oscillates the live verify width whenever the
-          // rolling rate hovers across an integer boundary.
-          const uint32_t target = std::clamp<uint32_t>(
-              static_cast<uint32_t>(entry.proposalAcceptedAvg) + 2, 1,
-              kDraftProposalTokens);
-          if (target < entry.proposalBudget) --entry.proposalBudget;
+      } else {
+        // The draft's acceptance EWMA is the bypass and n-gram predraft
+        // gates' measure of what the GPU draft would have scored, so it
+        // trains whether or not the budget adapts — and never on a step a
+        // different proposer (n-gram, ANE) supplied.
+        if (!entry.ngramInFlight)
+          entry.proposalAcceptedAvg =
+              0.75 * entry.proposalAcceptedAvg + 0.25 * laneResult.accepted;
+        if (adaptiveProposals_ && !tree) {
+          if (laneResult.accepted >= entry.proposalBudget) {
+            // A capped count can't show how much further the chain would
+            // have run; widen until the trained block's cap stops binding.
+            entry.proposalBudget =
+                std::min<uint32_t>(geometry.draft.proposalLimit(),
+                                   entry.proposalBudget + 1);
+          } else {
+            // Shrink toward the EWMA target one row per step: a
+            // single-visit clamp to avg+2 oscillates the live verify width
+            // whenever the rolling rate hovers across an integer boundary.
+            const uint32_t target = std::clamp<uint32_t>(
+                static_cast<uint32_t>(entry.proposalAcceptedAvg) + 2, 1,
+                kDraftProposalTokens);
+            if (target < entry.proposalBudget) --entry.proposalBudget;
+          }
         }
       }
       if (entry.ngramInFlight) {
@@ -1764,13 +1886,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
-      results.push_back({entry.id,
-                         0,
-                         std::move(output),
-                         false,
-                         DecodeStage::Regular,
-                         kDraftProposalTokens,
-                         std::min(laneResult.accepted, laneResult.retained - 1)});
+      results.push_back(
+          {entry.id, 0, std::move(output), false, DecodeStage::Regular,
+           // A chain lane's drafted count is what verify could actually
+           // have accepted: the offered proposals clamped to its trained
+           // row stride. A tree's is the full comb width, as before.
+           tree ? kDraftProposalTokens
+                : std::min(laneResult.proposals,
+                           geometry.draft.verifyRows() - 1),
+           std::min(laneResult.accepted, laneResult.retained - 1)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
@@ -1818,6 +1942,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           entries[lane] = &entry;
 
           if (!abandoned_[lane]) {
+            // The mask response is a fixed kDecodeRows+1 rows whatever the
+            // live budget, so the simulation sends the table's full proposal
+            // stride; slots a short-block draft never emitted are stale
+            // tokens the grammar's out-of-range truncation already skips.
             ModelMaskRequest request;
             request.requestId = entry.id;
             request.simulationTokens.reserve(kDecodeRows);
@@ -1831,9 +1959,21 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeBatchVerifyInput(target, width);
+        // Constrained lanes skip the adaptive budget, so each lane's live
+        // verify rows are the proposal cap clipped by its retention limit —
+        // the same arithmetic the unconstrained path computes up front.
+        const uint32_t cap =
+            modelPolicy().proposalCap.value_or(
+                impl_.geometry.draft.proposalLimit());
+        std::array<uint32_t, kLaneCount> liveRows{};
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          liveRows[lane] =
+              std::min(cap, lanes_[lane].maximumRetained - 1) + 1;
+        }
+        impl_.encodeBatchVerifyInput(target, width, {liveRows.data(), width});
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width);
+                                   DecodeTensor::Hidden0, width, 1,
+                                   impl_.geometry.draft.verifyRows());
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_);
         submit(target);
@@ -1862,11 +2002,21 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           maskWaitStarted_.reset();
           std::array<Request *, kLaneCount> entries{};
           std::array<uint32_t, kLaneCount> maximumRetained{};
+          std::array<uint32_t, kLaneCount> proposals{};
+          const uint32_t cap =
+              modelPolicy().proposalCap.value_or(
+                  impl_.geometry.draft.proposalLimit());
           for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
             DecodeLaneResult &laneResult = lanes_[lane];
             Request &entry = *laneResult.request;
             entries[lane] = &entry;
             maximumRetained[lane] = laneResult.maximumRetained;
+            // Rows past a lane's live budget carry anchor duplicates; they
+            // must never be retained, or the draft context commits a row
+            // whose token its hidden state never saw.
+            proposals[lane] =
+                std::min(cap, laneResult.maximumRetained - 1);
+            laneResult.proposals = proposals[lane];
             if (abandoned_[lane])
               impl_.admitEveryToken(lane);
             else
@@ -1877,7 +2027,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           impl_.encodeTargetVerifyBatchPolicy(commit,
                                               {entries.data(), lanes_.size()});
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
-                                      {maximumRetained.data(), lanes_.size()});
+                                      {maximumRetained.data(), lanes_.size()},
+                                      false,
+                                      {proposals.data(), lanes_.size()});
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_);

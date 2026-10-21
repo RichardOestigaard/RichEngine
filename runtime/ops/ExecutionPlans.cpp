@@ -1,6 +1,7 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -23,15 +24,23 @@ void include(Workspace &bound, const Workspace &required,
   }
 }
 
+[[nodiscard]] constexpr DevicePolicy policyFor(const DeviceCapabilities &device,
+                                               std::string_view model) noexcept {
+  DevicePolicy policy = DevicePolicy::of(device);
+  policy.model = model;
+  return policy;
+}
+
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
-                               uint32_t moeUnionCap)
-    : policy_(DevicePolicy::of(device)),
+                               uint32_t moeUnionCap, std::string_view model)
+    : policy_(policyFor(device, model)),
       linear_(policy_),
-      // RICHENGINE_MOE_UNION is the env form --moe-union overrides.
+      // --moe-union wins; else the resolved policy (an explicit
+      // RICHENGINE_MOE_UNION over the model's declared cap).
       moeUnionCap_(moeUnionCap ? moeUnionCap
-                              : tuning().moeUnionCap),
+                              : model::modelPolicy().moeUnionCap),
       moeRouteWideRows_(moeRouteWideRows(policy_.cores)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(policy_)) {}
 
@@ -43,14 +52,15 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, bool tree,
-    uint32_t liveNodes) const {
+    uint32_t liveNodes, uint32_t rows) const {
   return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens,
-                                    tree, liveNodes);
+                                    tree, liveNodes, rows);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
-                                                 uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+                                                 uint32_t lanes,
+                                                 uint32_t queryRows) const {
+  return DraftAttention::plan(shape, lanes, queryRows);
 }
 
 // The router threshold, the expert tile, the simdgroups of a decode plan's
@@ -89,11 +99,14 @@ MoePlan ExecutionPlans::moeCanvas(MoeShape shape, uint32_t rows) const {
   return MoE::canvasPlan(shape, rows, moeConfig(shape, rows, MoePhase::Canvas));
 }
 
-MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
+MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes,
+                                  uint32_t verifyRows) const {
   // Validate before multiplying an untrusted width into the plan's rows.
-  if (!lanes || lanes > kMaximumLanes)
+  if (!lanes || lanes > kMaximumLanes || !verifyRows ||
+      verifyRows > kDecodeRows)
     throw std::invalid_argument("invalid MoE decode width");
-  return MoE::decodePlan(shape, lanes, moeConfig(shape, lanes * kDecodeRows, MoePhase::Decode));
+  return MoE::decodePlan(shape, lanes, verifyRows,
+                         moeConfig(shape, lanes * verifyRows, MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(

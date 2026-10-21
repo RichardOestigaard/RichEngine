@@ -483,6 +483,10 @@ struct FmtPQ20 {
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
 
+// The oQ (oMLX) formats AF5..AF8G128: one FmtOq template, defined here while
+// the QUANT_FORMAT macro stands.
+#include "metal/kernels/common/oq_formats.h"
+
 #undef QUANT_FORMAT
 
 // Every format as X(format type, kernel name token), the token being its kQuantFormats name.
@@ -490,7 +494,8 @@ struct FmtPQ20 {
   X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
   X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
-  X(FmtAF4, af4)
+  X(FmtAF4, af4) X(FmtAF5, af5) X(FmtAF6, af6) X(FmtAF8, af8)                                                     \
+  X(FmtAF4G128, af4g128) X(FmtAF5G128, af5g128) X(FmtAF6G128, af6g128) X(FmtAF8G128, af8g128)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids

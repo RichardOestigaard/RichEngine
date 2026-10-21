@@ -2,7 +2,9 @@
 
 The engine handles normalization and vision inference. Grid geometry and a
 content digest identify image prefixes; a byte-budgeted cache reuses images
-resent in chat history.
+resent in chat history. The patch geometry is the served model's: its
+serving contract's vision spec arrives as an ImageGeometry, and the module
+constants state the default the geometry falls back to.
 """
 
 import base64
@@ -13,7 +15,7 @@ import math
 import struct
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 PATCH = 16
 MERGE = 2
@@ -27,6 +29,25 @@ MAX_PIXELS = 4_194_304
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
+
+
+@dataclass(frozen=True, slots=True)
+class ImageGeometry:
+    """The patch geometry the served model's vision tower consumes: patch
+    side, merge factor and the shortest-edge pixel floor. One model's tower
+    cannot resize to another's grid, so the contract carries it."""
+
+    patch: int = PATCH
+    merge: int = MERGE
+    min_pixels: int = MIN_PIXELS
+
+    @property
+    def factor(self) -> int:
+        """The alignment unit: patch * merge."""
+        return self.patch * self.merge
+
+
+DEFAULT_GEOMETRY = ImageGeometry()
 
 
 class ImageError(ValueError):
@@ -44,11 +65,13 @@ class PreparedImage:
     pixels: bytes
     digest_lo: int
     digest_hi: int
+    geometry: ImageGeometry = field(default=DEFAULT_GEOMETRY, compare=False)
 
     @property
     def tokens(self) -> int:
         """Merged language tokens the image occupies."""
-        return (self.grid_height // MERGE) * (self.grid_width // MERGE)
+        merge = self.geometry.merge
+        return (self.grid_height // merge) * (self.grid_width // merge)
 
 
 def decode_data_url(url) -> bytes:
@@ -68,42 +91,55 @@ def decode_data_url(url) -> bytes:
     return raw
 
 
-def max_patches(max_pixels: int) -> int:
+def max_patches(max_pixels: int, geometry: ImageGeometry = DEFAULT_GEOMETRY) -> int:
     """The most patches an image resized within max_pixels can have: its
-    sides are whole merge units, so its patch count is a multiple of 4."""
-    return max_pixels // (PATCH * PATCH) // 4 * 4
+    sides are whole merge units, so its patch count is a multiple of the
+    merge area."""
+    merge_area = geometry.merge * geometry.merge
+    patch_area = geometry.patch * geometry.patch
+    return max_pixels // patch_area // merge_area * merge_area
 
 
-def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
-    """Upstream Qwen2VL smart-resize: patch/merge-aligned sides inside the
-    pixel budget with the aspect ratio preserved as closely as possible."""
+def smart_resize(
+    height: int,
+    width: int,
+    max_pixels: int,
+    geometry: ImageGeometry = DEFAULT_GEOMETRY,
+) -> tuple[int, int]:
+    """Patch/merge-aligned sides inside the pixel budget with the aspect
+    ratio preserved as closely as possible (Qwen2VL's smart resize)."""
+    factor = geometry.factor
     if height <= 0 or width <= 0:
         raise ImageError("image dimensions must be positive")
-    if not MIN_PIXELS <= max_pixels <= MAX_PIXELS:
+    if not geometry.min_pixels <= max_pixels <= MAX_PIXELS:
         raise ImageError("invalid image pixel budget")
     if max(height, width) / min(height, width) > 200:
         raise ImageError("absolute aspect ratio must be smaller than 200")
-    h_bar = round(height / FACTOR) * FACTOR
-    w_bar = round(width / FACTOR) * FACTOR
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
     if h_bar * w_bar > max_pixels:
         beta = math.sqrt((height * width) / max_pixels)
-        h_bar = max(FACTOR, math.floor(height / beta / FACTOR) * FACTOR)
-        w_bar = max(FACTOR, math.floor(width / beta / FACTOR) * FACTOR)
-    elif h_bar * w_bar < MIN_PIXELS:
-        beta = math.sqrt(MIN_PIXELS / (height * width))
-        h_bar = math.ceil(height * beta / FACTOR) * FACTOR
-        w_bar = math.ceil(width * beta / FACTOR) * FACTOR
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < geometry.min_pixels:
+        beta = math.sqrt(geometry.min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
     # Upscaling to the minimum can also overshoot a small serving cap after
     # alignment. The hard cap takes precedence over that soft minimum.
     while h_bar * w_bar > max_pixels:
-        if h_bar >= w_bar and h_bar > FACTOR:
-            h_bar -= FACTOR
+        if h_bar >= w_bar and h_bar > factor:
+            h_bar -= factor
         else:
-            w_bar -= FACTOR
+            w_bar -= factor
     return h_bar, w_bar
 
 
-def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
+def prepare(
+    payload: bytes,
+    max_pixels: int = MAX_PIXELS,
+    geometry: ImageGeometry = DEFAULT_GEOMETRY,
+) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
     from PIL import Image, ImageOps
 
@@ -112,7 +148,9 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
-            height, width = smart_resize(decoded.height, decoded.width, max_pixels)
+            height, width = smart_resize(
+                decoded.height, decoded.width, max_pixels, geometry
+            )
             # Cameras store the sensor's orientation and an EXIF tag that
             # turns it upright for display; show the model the upright one.
             # A malformed tag leaves the stored orientation.
@@ -135,10 +173,12 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
         raise
     except Exception as error:
         raise ImageError("image could not be decoded") from error
-    grid_height, grid_width = height // PATCH, width // PATCH
+    grid_height, grid_width = height // geometry.patch, width // geometry.patch
     digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
     digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
-    return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
+    return PreparedImage(
+        grid_height, grid_width, pixels, digest_lo, digest_hi, geometry
+    )
 
 
 class PreparedImages(list):
@@ -175,7 +215,8 @@ class ImageCache:
     BUDGET_BYTES = 256 * 1024 * 1024
     REQUEST_BUDGET_BYTES = 256 * 1024 * 1024
 
-    def __init__(self):
+    def __init__(self, geometry: ImageGeometry = DEFAULT_GEOMETRY):
+        self.geometry = geometry
         # GC may finalize a cancelled batch during a cache insertion on this
         # same thread; returning its byte charge must not deadlock the cache.
         self._lock = threading.RLock()
@@ -193,7 +234,7 @@ class ImageCache:
             if cached is not None:
                 self._entries.move_to_end(key)
                 return cached
-        prepared = prepare(payload, max_pixels)
+        prepared = prepare(payload, max_pixels, self.geometry)
         if len(prepared.pixels) > self.BUDGET_BYTES:
             return prepared
         with self._lock:

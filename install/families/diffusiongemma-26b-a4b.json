@@ -1,0 +1,227 @@
+{
+  "name": "DiffusionGemma-26B-A4B",
+  "repos": [
+    "google/diffusiongemma-26B-A4B-it"
+  ],
+  "note": "DiffusionGemma's text_config states bidirectional attention where Gemma 4's states attention_k_eq_v. A global layer every sixth, as config.json's layer_types states them. No draft \u2014 the packed manifest keeps the Null predraft's magic; its encoder's vision tower is not served.",
+  "signature": {
+    "model_type": "diffusion_gemma_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 2816,
+    "num_hidden_layers": 30,
+    "vocab_size": 262144,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 2,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "intermediate_size": 2112,
+    "num_experts": 128,
+    "top_k_experts": 8,
+    "moe_intermediate_size": 704,
+    "sliding_window": 1024,
+    "use_bidirectional_attention": "vision",
+    "final_logit_softcapping": 30.0,
+    "tie_word_embeddings": true,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ]
+  },
+  "vision": false,
+  "defaults": {
+    "packed_format": "packed-diffusiongemma",
+    "quant": "q4"
+  },
+  "serving": {
+    "sampling": {},
+    "think": {
+      "end": "<channel|>",
+      "open": "<|channel>thought\n",
+      "open_token": "<|channel>",
+      "flag": "<|think|>"
+    },
+    "tool_dialect": "gemma4"
+  },
+  "pack": {
+    "layout": {
+      "layers": 30,
+      "hidden": 2816,
+      "vocabulary": 262144,
+      "query_heads": 16,
+      "kv_heads": 8,
+      "head_dim": 256,
+      "global_kv_heads": 2,
+      "global_head_dim": 512,
+      "global_period": 6,
+      "experts": 128,
+      "experts_per_token": 8,
+      "expert_intermediate": 704,
+      "packed_expert_width": 768,
+      "shared_intermediate": 2112,
+      "packed_shared_width": 2304,
+      "sliding_window": 1024,
+      "rotary_theta": 10000,
+      "global_rotary_theta": 1000000,
+      "logit_softcap": 30.0,
+      "max_position_embeddings": 262144
+    },
+    "draft_layout": {
+      "layers": 5,
+      "hidden": 2816,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "query_heads": 32,
+      "intermediate": 5632,
+      "rotary_theta": 1000000,
+      "block_size": 16,
+      "sliding_window": 2048,
+      "target_hidden": 16896,
+      "causal_layers": 15
+    },
+    "execution_geometry": {
+      "draft_proposal_tokens": 15,
+      "draft_query_rows": 16,
+      "draft_sliding_window": 2048
+    },
+    "diffusion": {
+      "canvas_length": 256,
+      "max_denoising_steps": 48,
+      "t_min": 0.4,
+      "t_max": 0.8,
+      "entropy_bound": 0.1,
+      "confidence_threshold": 0.005,
+      "stability_threshold": 1,
+      "pad_token": 0
+    }
+  },
+  "tuning": [
+    "PREFILL_FAST_INT8",
+    "HEAD_FUSED",
+    "MTL4",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "MOE_UNION",
+    "MOE_PACKED_OFF",
+    {
+      "env": "RICHENGINE_CANVAS_PROFILE",
+      "values": [
+        "fast",
+        "balanced"
+      ],
+      "reason": "the bundled speed/quality preset; 'paper' is the default",
+      "diffusion": true,
+      "quality_sensitive": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_STEPS_PER_CMD",
+      "values": [
+        "1",
+        "4"
+      ],
+      "reason": "denoise steps encoded per command buffer",
+      "diffusion": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_MAX_STEPS",
+      "values": [
+        "24",
+        "32"
+      ],
+      "reason": "the denoising schedule cap; 0 keeps the manifest's 48",
+      "diffusion": true,
+      "quality_sensitive": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_EXIT_STABLE",
+      "values": [
+        "0.6",
+        "0.75"
+      ],
+      "reason": "the fraction-settled early exit's share",
+      "diffusion": true,
+      "quality_sensitive": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_EXIT_DRIFT",
+      "values": [
+        "1"
+      ],
+      "reason": "fraction-settled exit without the confidence check",
+      "diffusion": true,
+      "quality_sensitive": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_SPECULATIVE_PREFILL",
+      "values": [
+        "0"
+      ],
+      "reason": "the commit prefill encoded ahead of the formal exit",
+      "diffusion": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_COMMIT_TAIL",
+      "values": [
+        "0"
+      ],
+      "reason": "the last scheduled step's argmax-direct commit",
+      "diffusion": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_EMBED_HIST",
+      "values": [
+        "0"
+      ],
+      "reason": "the fused embed-histogram kernel vs the unfused path; on by default",
+      "diffusion": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_STATS_FUSED",
+      "values": [
+        "0"
+      ],
+      "reason": "the fused canvas-stats kernel vs the unfused path; on by default",
+      "diffusion": true
+    },
+    {
+      "env": "RICHENGINE_CANVAS_PREFIX_EXIT",
+      "values": [
+        "0"
+      ],
+      "reason": "the prefix-settled early exit vs the full schedule; on by default",
+      "diffusion": true,
+      "quality_sensitive": true
+    }
+  ]
+}

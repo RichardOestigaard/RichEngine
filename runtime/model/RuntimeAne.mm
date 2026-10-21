@@ -31,20 +31,26 @@ namespace richengine::model {
     input->lanes = kLaneCount;
     input->hidden.resize(size_t{kLaneCount} * RICHENGINE_TARGET_VERIFY_ROWS *
                          hiddenSize);
+    // The acceptance kernels pack a lane's rows at the draft's verify
+    // stride, not the arena's capacity slot — reads follow the packed
+    // stride, never get(lane).
+    const uint32_t rowStride = geometry.draft.verifyRows();
+    const uint16_t *captured = contents<uint16_t>(
+        decodeArena->packed(DecodeTensor::CapturedTargetHidden, width),
+        "captured verify hidden");
+    const uint32_t *emittedTokens = contents<uint32_t>(
+        decodeArena->packed(DecodeTensor::OutputTokens, width),
+        "emitted tokens");
     for (uint32_t lane = 0; lane < width; ++lane) {
       const DecodeLaneResult &result = lanes[lane];
       input->retained[lane] = static_cast<int32_t>(result.retained);
-      const uint16_t *source = contents<uint16_t>(
-          decodeArena->get(lane, DecodeTensor::CapturedTargetHidden),
-          "captured verify hidden");
+      const uint16_t *source = captured + size_t{lane} * rowStride * hiddenSize;
       _Float16 *rows = input->hidden.data() +
                        size_t{lane} * RICHENGINE_TARGET_VERIFY_ROWS * hiddenSize;
       for (uint32_t row = 0; row < result.retained; ++row)
         bf16ToFp16Row(source + size_t{row} * hiddenSize,
                       rows + size_t{row} * hiddenSize, hiddenSize);
-      const uint32_t *emitted = contents<uint32_t>(
-          decodeArena->get(lane, DecodeTensor::OutputTokens),
-          "emitted tokens");
+      const uint32_t *emitted = emittedTokens + lane * rowStride;
       input->anchors[lane] = emitted[result.retained - 1];
       input->positions[lane] = items[lane].logicalPosition + result.retained;
     }

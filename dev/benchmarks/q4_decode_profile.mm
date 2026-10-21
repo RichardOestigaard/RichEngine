@@ -244,6 +244,10 @@ void run(const std::string &metallibPath) {
       {"lfm_ffn", 10'752, 2'048, 60},
       {"lfm_down", 2'048, 10'752, 48},
       {"lfm_head", 128'000, 2'048, 1'000},
+      // LFM2.5-24B-A2B (2048): the same conv-in, QKV, out and head dims as
+      // the 2.6B, plus its leading dense FFNs at 11776.
+      {"a2b_ffn", 11'776, 2'048, 66},
+      {"a2b_down", 2'048, 11'776, 52},
       // LFM2.5 DSpark draft (affine, 5 layers, 2048-wide, SwiGLU 6144) and
       // its context projection fc.
       {"draft_q", 2'048, 2'048, 10},
@@ -257,7 +261,8 @@ void run(const std::string &metallibPath) {
     const WeightSet first = allocateWeights(backend, shape, shape.label);
     const std::string label = shape.label;
     const bool gateUp = label == "ffn_gate_up" || label == "dense_ffn" ||
-                        label == "lfm_ffn" || label == "draft_ffn";
+                        label == "lfm_ffn" || label == "a2b_ffn" ||
+                        label == "draft_ffn";
     const WeightSet second =
         gateUp ? allocateWeights(backend, shape, std::string(shape.label) + " up")
                : WeightSet{};

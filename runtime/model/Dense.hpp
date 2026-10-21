@@ -55,9 +55,13 @@ struct DenseLayout final {
     return layers;
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept { return 0; }
+  // The compiled attention kernel the layers bind (ops/PagedKv.hpp).
+  kv::Core attentionCore = kv::Core::Kv2Group8D128;
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads,
-            attentionHeadDimension};
+    kv::Layout layout{attentionLayerCount(), attentionKvHeads,
+                      attentionHeadDimension};
+    layout.attentionCore = attentionCore;
+    return layout;
   }
   // No recurrent layers at all: the empty state layout.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {

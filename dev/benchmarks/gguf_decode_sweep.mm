@@ -115,6 +115,11 @@ void run(const std::string &metallibPath) {
       // LFM2.5-8B-A1B's two leading dense FFNs (gate/up 7168 x 2048).
       {"a1b_dense_up", 7'168, 2'048, GGUF_FMT_Q4K},
       {"a1b_dense_down", 2'048, 7'168, GGUF_FMT_Q4K},
+      // LFM2.5-24B-A2B's two leading dense FFNs (gate/up 11776 x 2048).
+      {"a2b_dense_up", 11'776, 2'048, GGUF_FMT_Q4K},
+      {"a2b_dense_down", 2'048, 11'776, GGUF_FMT_Q4K},
+      {"a2b_dense_up_q6k", 11'776, 2'048, GGUF_FMT_Q6K},
+      {"a2b_dense_down_q6k", 2'048, 11'776, GGUF_FMT_Q6K},
       // The 2B shapes' MXFP4 decode tiers on family 10: the staged table
       // decode (mxfp4n), the multiplane tile (mxfp4m) and the packed
       // activation decode (mxfp4p) production single-tensor plans run.

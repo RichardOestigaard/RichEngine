@@ -1,0 +1,81 @@
+{
+  "name": "MiniCPM5-2B",
+  "repos": [
+    "openbmb/MiniCPM5-2B-MLX",
+    "openbmb/MiniCPM5-2B-GGUF"
+  ],
+  "signature": {
+    "model_type": "llama",
+    "max_position_embeddings": 131072,
+    "hidden_size": 2048,
+    "num_hidden_layers": 42,
+    "vocab_size": 130560,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "intermediate_size": 6144
+  },
+  "draft": {
+    "repo": "openbmb/MiniCPM5-2B-DSpark",
+    "base": "dspark",
+    "signature": {
+      "architectures": [
+        "Qwen3DSparkModel"
+      ],
+      "hidden_size": 2048,
+      "vocab_size": 130560,
+      "intermediate_size": 6144,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 2,
+      "head_dim": 128,
+      "num_target_layers": 42,
+      "block_size": 7,
+      "max_position_embeddings": 131072,
+      "rms_norm_eps": 1e-06,
+      "attention_bias": false,
+      "tie_word_embeddings": false,
+      "attention_mode": "gqa",
+      "mask_token_id": 75982,
+      "target_layer_ids": [
+        1,
+        10,
+        20,
+        30,
+        39
+      ],
+      "projector_type": "dspark",
+      "confidence_head_alpha": 1.0,
+      "confidence_head_with_markov": true
+    }
+  },
+  "vision": false,
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "minicpm5-xml"
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "GGUF_PACKED",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "HEAD_FUSED",
+    "MTL4",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "ANE_WAIT"
+  ]
+}

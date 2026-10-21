@@ -28,30 +28,18 @@ namespace {
   return std::clamp(maximum / tiles, 1u, maximum);
 }
 
-// Partials and statistics of `rows` fused rows of headDimension elements.
+// Partials (bf16 on the bus) and statistics of `rows` fused rows of
+// headDimension elements.
 [[nodiscard]] constexpr AttentionWorkspace attentionWorkspace(uint64_t rows,
                                                               uint32_t headDimension) {
-  return {rows * headDimension * sizeof(float), rows * 2 * sizeof(float)};
+  return {rows * headDimension * 2, rows * 2 * sizeof(float)};
 }
 
-// The kernel family's attention geometry. HeadDim 256 keeps the original
-// three layouts; headDim 128 (the dense target) and 64 (LFM2) run their own
-// KV/group combinations.
-enum class KernelLayout : uint8_t {
-  Kv4Group6,
-  Kv4Group4,
-  Kv2Group8,
-  Kv2Group8D128,
-  Kv8Group4D64,
-  // Granite's KV8 layouts: 3B's 40 query heads of 64 (group 5) and 8B's
-  // 32 of 128 (group 4).
-  Kv8Group5D64,
-  Kv8Group4D128,
-  // Gemma 4's layouts: the sliding layers' KV8 group-2 pages of 256 and the
-  // k_eq_v global layers' KV2 group-8 pages of 512.
-  GemmaKv8H256,
-  GemmaKv2H512
-};
+// The kernel family's attention geometry (kv::Core, ops/PagedKv.hpp):
+// headDim 256 keeps the original three layouts; headDim 128 (the dense
+// target) and 64 (LFM2) run their own KV/group combinations. The family
+// maker declares a layer layout's core; the probe here only validates.
+using KernelLayout = kv::Core;
 
 [[nodiscard]] constexpr uint32_t kernelLayoutHeadDim(KernelLayout layout) noexcept {
   switch (layout) {
@@ -69,6 +57,8 @@ enum class KernelLayout : uint8_t {
     return 128;
   case KernelLayout::GemmaKv2H512:
     return 512;
+  case KernelLayout::Unspecified:
+    break;
   }
   return 0;
 }
@@ -95,6 +85,8 @@ enum class KernelLayout : uint8_t {
     return "_gemma_h256";
   case KernelLayout::GemmaKv2H512:
     return "_gemma_hd512";
+  case KernelLayout::Unspecified:
+    break;
   }
   return {};
 }
@@ -136,42 +128,52 @@ enum class KernelLayout : uint8_t {
   throw std::invalid_argument("unsupported attention layout");
 }
 
-[[nodiscard]] KernelLayout attentionKernelLayout(const kv::Layout &layout,
-                                                 uint32_t queryHeads) {
-  if (layout.headDimension == 256 && layout.kvHeads == 4)
-    switch (queryHeads) {
-    case 24:
-      return KernelLayout::Kv4Group6;
-    case 16:
-      return KernelLayout::Kv4Group4;
-    }
-  // Gemma 4's sliding layers: KV8 of 256 with 16 query heads (group 2); its
-  // k_eq_v globals: KV2 of 512 with 16 (group 8).
-  if (layout.headDimension == 256 && layout.kvHeads == 8 &&
-      queryHeads == 16)
-    return KernelLayout::GemmaKv8H256;
-  if (layout.headDimension == 512 && layout.kvHeads == 2 &&
-      queryHeads == 16)
-    return KernelLayout::GemmaKv2H512;
-  const KernelLayout kernel = storageKernelLayout(layout);
-  switch (kernel) {
+// The (kvHeads, headDimension, queryHeads) triple each compiled core covers.
+[[nodiscard]] constexpr bool coreMatches(KernelLayout core,
+                                         const kv::Layout &layout,
+                                         uint32_t queryHeads) noexcept {
+  switch (core) {
+  case KernelLayout::Kv4Group6:
+    return layout.kvHeads == 4 && layout.headDimension == 256 &&
+           queryHeads == 24;
+  case KernelLayout::Kv4Group4:
+    return layout.kvHeads == 4 && layout.headDimension == 256 &&
+           queryHeads == 16;
   case KernelLayout::Kv2Group8:
-    if (queryHeads == 16) return kernel;
-    break;
+    return layout.kvHeads == 2 && layout.headDimension == 256 &&
+           queryHeads == 16;
   case KernelLayout::Kv2Group8D128:
-    if (queryHeads == 16) return kernel;
-    break;
+    return layout.kvHeads == 2 && layout.headDimension == 128 &&
+           queryHeads == 16;
   case KernelLayout::Kv8Group4D64:
-    if (queryHeads == 32) return kernel;
-    if (queryHeads == 40) return KernelLayout::Kv8Group5D64;
-    break;
+    return layout.kvHeads == 8 && layout.headDimension == 64 &&
+           queryHeads == 32;
+  case KernelLayout::Kv8Group5D64:
+    return layout.kvHeads == 8 && layout.headDimension == 64 &&
+           queryHeads == 40;
   case KernelLayout::Kv8Group4D128:
-    if (queryHeads == 32) return kernel;
-    break;
-  default:
+    return layout.kvHeads == 8 && layout.headDimension == 128 &&
+           queryHeads == 32;
+  case KernelLayout::GemmaKv8H256:
+    return layout.kvHeads == 8 && layout.headDimension == 256 &&
+           queryHeads == 16;
+  case KernelLayout::GemmaKv2H512:
+    return layout.kvHeads == 2 && layout.headDimension == 512 &&
+           queryHeads == 16;
+  case KernelLayout::Unspecified:
     break;
   }
-  throw std::invalid_argument("unsupported attention layout");
+  return false;
+}
+
+[[nodiscard]] KernelLayout attentionKernelLayout(const kv::Layout &layout,
+                                                 uint32_t queryHeads) {
+  // The maker's declared core selects the compiled kernels; the layout's
+  // geometry must carry what the core was compiled for.
+  if (!coreMatches(layout.attentionCore, layout, queryHeads))
+    throw std::invalid_argument(
+        "declared attention core does not match the layout");
+  return layout.attentionCore;
 }
 
 [[nodiscard]] const char *formatTag(kv::Format format) noexcept {
@@ -232,7 +234,13 @@ enum class KernelLayout : uint8_t {
     name += "_m2";
   // The kv4/g6 chain tile's 96 fused rows at 16 verify rows halve core
   // residency; its _r2 splits run the two fused-row passes on two groups.
-  if (stem == kVerifyAttention && kernel == KernelLayout::Kv4Group6)
+  // Kill switch: the _r2 kernels corrupt verify attention — draft
+  // acceptance fell to ~4% from ~18-20% on the Qwen3.8-27B decode
+  // benchmark — so selection stays off until the pass-split partial
+  // writes are fixed and the plan test re-pins the name.
+  constexpr bool kVerifySplitR2 = false;
+  if (kVerifySplitR2 && stem == kVerifyAttention &&
+      kernel == KernelLayout::Kv4Group6)
     name += "_r2";
   return name;
 }
@@ -369,7 +377,8 @@ PagedAttention::prefillCanvasPlan(uint32_t rows, uint32_t queryHeads,
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, bool tree, uint32_t liveNodes) {
+    std::span<const uint32_t> historyTokens, bool tree, uint32_t liveNodes,
+    uint32_t rowStride) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!kv::validFormat(layout.format))
     throw std::invalid_argument("paged attention requires a kv format");
@@ -379,7 +388,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       historyTokens.size() != lanes)
     throw std::invalid_argument("verify lane count is out of range");
   const uint32_t rows =
-      tree ? RICHENGINE_TREE_VERIFY_NODES : kv::kVerifyRows;
+      tree ? RICHENGINE_TREE_VERIFY_NODES : rowStride;
   // A host-emitted comb knows its batch-maximum node count at encode time;
   // a kernel-emitted table's counts are on the GPU, so it keeps the full
   // scratch. A leafless comb then stores and attends a chain's eight rows.
@@ -387,7 +396,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       tree ? (liveNodes && liveNodes < RICHENGINE_TREE_VERIFY_NODES
                   ? liveNodes
                   : RICHENGINE_TREE_VERIFY_NODES)
-           : kv::kVerifyRows;
+           : rowStride;
   std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -493,7 +502,9 @@ void PagedAttention::addVerifyProjection(
   std::string kernel = std::string(kVerifyAttentionQkv) +
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
-  FullDecodeBatchParams params{.lanes = lanes, .rows = rows};
+  FullDecodeBatchParams params{.lanes = lanes,
+                               .rows = rows,
+                               .rope_stride = RICHENGINE_TARGET_VERIFY_ROWS};
   graph.add(kernel,
             {packed, hasNorms ? queryNorm.buffer : queries,
              hasNorms ? keyNorm.buffer : queries, ropeCos, ropeSin, queries,
@@ -509,7 +520,9 @@ PreparedInput PagedAttention::addVerifyGate(
     uint32_t queryHeads, kv::Layout layout, uint32_t lanes,
     LinearScratch scratch, LinearInput input, bool queryGate, uint32_t rows) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
-  FullDecodeBatchParams params{.lanes = lanes, .rows = rows};
+  FullDecodeBatchParams params{.lanes = lanes,
+                               .rows = rows,
+                               .rope_stride = RICHENGINE_TARGET_VERIFY_ROWS};
   if (input == LinearInput::Plain) {
     graph.addPatchable(gateKernel(kVerifyAttention, queryGate, kernelLayout),
               {packed, attention, hidden}, params,
@@ -543,8 +556,8 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
 }
 
 kv::ChunkedPrefillParams PagedAttention::verifyParams(
-    uint64_t logicalPosition, uint32_t pageTableEntries) {
-  return prefillParams(logicalPosition, kv::kVerifyRows,
+    uint64_t logicalPosition, uint32_t pageTableEntries, uint32_t rows) {
+  return prefillParams(logicalPosition, rows,
                        kv::kVerifyChunkStride, pageTableEntries);
 }
 

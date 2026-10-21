@@ -241,9 +241,10 @@ class Repository:
         """name at the commit revision names now. This decides whether the
         Hub is asked.
 
-        Only an absolute path is a local directory: parse_draft_model makes a
-        --draft-model directory absolute, and a target is always a Hub ID,
-        whatever the working directory holds. installed is the commit a
+        Only an absolute path is a local directory: Selection makes a local
+        target directory absolute the same way parse_draft_model makes a
+        --draft-model directory, and anything else is a Hub ID, whatever
+        the working directory holds. installed is the commit a
         verified installation of this selection records; its links name its
         files, wherever HF_HUB_CACHE points now. A commit revision never
         moves and HF_HUB_OFFLINE forbids requests, so with installed either

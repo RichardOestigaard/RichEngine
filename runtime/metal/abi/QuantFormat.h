@@ -64,7 +64,16 @@
 #define GGUF_FMT_MXFP4 17u
 #define GGUF_FMT_PQ20 18u
 #define GGUF_FMT_AF4 19u
-#define GGUF_FMT_COUNT 20u
+// The oQ (oMLX) affine formats: mixed-precision group-64 and group-128 MLX
+// affine quantization, as safetensors checkpoints carry it (model/Oq*).
+#define GGUF_FMT_AF5 20u
+#define GGUF_FMT_AF6 21u
+#define GGUF_FMT_AF8 22u
+#define GGUF_FMT_AF4G128 23u
+#define GGUF_FMT_AF5G128 24u
+#define GGUF_FMT_AF6G128 25u
+#define GGUF_FMT_AF8G128 26u
+#define GGUF_FMT_COUNT 27u
 
 // The tensor type AF4 sections carry in a GgufTensorDescriptor (and
 // kQuantFormats' ggml_type column): a private id no GGUF file may use, not
@@ -72,6 +81,15 @@
 // (dev/tests/test_gguf_metadata.py), which reads each row's leading decimal
 // type, does not mistake it for a loadable GGML type.
 #define GGUF_PRIVATE_TYPE_AF4 0x80000af4u
+// The oQ formats' private tensor types, as AF4's: the low bytes name the
+// bits and the group span (0x80000 = gs64, 0x80001 = gs128).
+#define GGUF_PRIVATE_TYPE_AF5 0x80000af5u
+#define GGUF_PRIVATE_TYPE_AF6 0x80000af6u
+#define GGUF_PRIVATE_TYPE_AF8 0x80000af8u
+#define GGUF_PRIVATE_TYPE_AF4G128 0x80001af4u
+#define GGUF_PRIVATE_TYPE_AF5G128 0x80001af5u
+#define GGUF_PRIVATE_TYPE_AF6G128 0x80001af6u
+#define GGUF_PRIVATE_TYPE_AF8G128 0x80001af8u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type
@@ -109,6 +127,18 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     // scale, bias}: one bf16 scale and bias per meta unit, so the unit's two
     // groups of 32 share them (value = scale * code + bias, no zero point).
     {GGUF_PRIVATE_TYPE_AF4, 64, 36, 16, 0, 4, 2, "af4"},
+    // The oQ affine formats (oMLX mixed-precision safetensors; model/Oq*):
+    // plane0 codes as a slot-order bitstream, meta one bf16 scale and bias
+    // per group of 64 (meta_groups 2) or 128 (meta_groups 4) elements. The
+    // native block is one group as the token gather stores it:
+    // {codes, scale, bias}.
+    {GGUF_PRIVATE_TYPE_AF5, 64, 44, 20, 0, 4, 2, "af5"},
+    {GGUF_PRIVATE_TYPE_AF6, 64, 52, 24, 0, 4, 2, "af6"},
+    {GGUF_PRIVATE_TYPE_AF8, 64, 68, 32, 0, 4, 2, "af8"},
+    {GGUF_PRIVATE_TYPE_AF4G128, 128, 68, 16, 0, 4, 4, "af4g128"},
+    {GGUF_PRIVATE_TYPE_AF5G128, 128, 84, 20, 0, 4, 4, "af5g128"},
+    {GGUF_PRIVATE_TYPE_AF6G128, 128, 100, 24, 0, 4, 4, "af6g128"},
+    {GGUF_PRIVATE_TYPE_AF8G128, 128, 132, 32, 0, 4, 4, "af8g128"},
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.

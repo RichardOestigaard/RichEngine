@@ -27,8 +27,18 @@ class Element {
     this.classList = {add() {}, remove() {}, toggle() {}};
   }
   addEventListener(name, callback) { this.handlers[name] = callback; }
+  add(option) { this.options.push(option); }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
+  set innerHTML(html) {
+    this.children = [...String(html).matchAll(/<[a-z]+\b/g)].map(() => new Element());
+  }
+  get innerHTML() { return ''; }
+  get firstElementChild() { return this.children[0] || null; }
+  get parentElement() { return this._parent || (this._parent = Object.create(Element.prototype)); }
+  insertAdjacentHTML(position, html) {
+    this.children.push(...[...String(html).matchAll(/<[a-z]+\b/g)].map(() => new Element()));
+  }
   remove() {} focus() {} setAttribute() {} removeAttribute() {}
   querySelector() { return new Element(); }
 }
@@ -42,7 +52,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   let scrolls = 0;
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
-                   'mobile-new', 'menu', 'scrim']) elements[id] = new Element();
+                   'mobile-new', 'menu', 'scrim', 'model', 'to-bottom', 'sr-status']) elements[id] = new Element();
   elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
   class FileReader {
     readAsDataURL(file) {
@@ -54,7 +64,9 @@ function createChat(storage = new Map(), writable = true, models = null,
     document: {
       querySelector: selector => elements[selector.slice(1)] || null,
       createElement: tag => new Element(tag),
+      addEventListener() {},
       body: new Element(),
+      documentElement: {scrollHeight: 0},
     },
     localStorage: {
       getItem: key => storage.get(key) ?? null,
@@ -63,7 +75,17 @@ function createChat(storage = new Map(), writable = true, models = null,
         storage.set(key, value);
       },
     },
-    scrollTo() { scrolls += 1; }, AbortController, TextDecoder, Uint8Array, console, FileReader,
+    scrollTo() { scrolls += 1; }, addEventListener() {}, AbortController, TextDecoder, Uint8Array, console, FileReader,
+    setTimeout, requestIdleCallback: callback => setImmediate(callback),
+    requestAnimationFrame: callback => setImmediate(callback),
+    performance, navigator: {},
+    scrollY: 0, innerHeight: 1000,
+    Option: class {
+      constructor(text, value) {
+        this.textContent = text;
+        this.value = value;
+      }
+    },
     crypto,
     fetch(url, options) {
       if (url === '/v1/models') {
@@ -211,7 +233,7 @@ for (const writable of [true, false]) {
   const chat = createChat(storage, writable);
   assert.equal(chat.elements.effort.value, 'low');
   assert.equal(chat.elements.recents.children.length, 1);
-  chat.elements.recents.children[0].handlers.click();
+  chat.elements.recents.children[0].children[0].handlers.click();
   setText(chat, 'continue');
   submit(chat);
   assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
@@ -314,7 +336,7 @@ for (const writable of [true, false]) {
   assert.deepEqual(saved().map(conversation => conversation.title.split(' ')[0]), ['three', 'two']);
   // The open page keeps every chat with its images.
   assert.equal(chat.elements.recents.children.length, 7);
-  chat.elements.recents.children[4].handlers.click();
+  chat.elements.recents.children[4].children[0].handlers.click();
   setText(chat, 'again');
   submit(chat);
   assert.deepEqual(chat.requests.at(-1).body.messages[0].content,
@@ -567,7 +589,7 @@ for (const [name, overrides, shouldSend] of [
       await flush();
       const reading = pasteImage(chat, 'old-chat');
       if (navigation === 'new chat') chat.elements['new-chat'].handlers.click();
-      else chat.elements.recents.children[0].handlers.click();
+      else chat.elements.recents.children[0].children[0].handlers.click();
       assert.equal(chat.elements.attachments.children.length, 0);
       const next = pasteImage(chat, 'new-chat');
       if (outcome === 'load') reading.onload();

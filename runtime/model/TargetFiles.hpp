@@ -11,11 +11,12 @@ namespace richengine::model {
 template <class Layout> struct PackedTargetFiles;
 class AffineTargetLoader;
 class GgufTargetLoader;
+class OqTargetLoader;
 
 // The files a target is read from: packed files (richengine-packed-q4 formats),
-// or the images a loader writes from an MLX or GGUF source.
+// or the images a loader writes from an MLX, oQ or GGUF source.
 template <class Layout>
 using TargetFiles = std::variant<PackedTargetFiles<Layout>, std::reference_wrapper<AffineTargetLoader>,
-                                     std::reference_wrapper<GgufTargetLoader>>;
+                                     std::reference_wrapper<GgufTargetLoader>, std::reference_wrapper<OqTargetLoader>>;
 
 } // namespace richengine::model

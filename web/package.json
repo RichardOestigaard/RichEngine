@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "preinstall": "node -e \"if (!/^pnpm\\//.test(process.env.npm_config_user_agent || '')) { console.error('use pnpm'); process.exit(1) }\"",
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit"
@@ -18,5 +19,8 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.3",
     "vite-plugin-solid": "^2.11.8"
+  },
+  "engines": {
+    "pnpm": ">=12.5"
   }
 }

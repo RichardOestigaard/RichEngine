@@ -360,7 +360,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", type=Path, default=Path("build/release/http-regression.json")
     )
-    args = smoke.resolve_server_arguments(parser.parse_args(argv))
+    args = smoke.resolve_server_arguments(parser, parser.parse_args(argv))
     args.contexts = [int(value) for value in args.contexts.split(",")]
     if args.samples < 2 or not args.contexts or min(args.contexts) < 256:
         parser.error("at least two samples and contexts >= 256 are required")

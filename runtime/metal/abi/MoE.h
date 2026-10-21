@@ -132,6 +132,24 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 24,
               "MoE GGUF expert parameters are 24 bytes on both sides");
 
+// The fused gate+up pass (moe_expert_gguf_*_gu): one dispatch computes both
+// projections of a tile and stores silu(gate) * up — the split passes'
+// EpUpWithGate association without the intermediate store. Each segment
+// selects its own routed/shared format pair.
+struct MoeGgufFusedParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t gate_routed_format;
+  uint32_t gate_shared_format;
+  uint32_t up_routed_format;
+  uint32_t up_shared_format;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(MoeGgufFusedParams) == 32,
+              "MoE GGUF fused parameters are 32 bytes on both sides");
+
 struct MoeCombineParams {
   uint32_t rows;
   uint32_t hidden_size;

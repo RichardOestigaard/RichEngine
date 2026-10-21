@@ -163,6 +163,13 @@ struct ComputeDispatch {
   // parameter arena — the submission just rewrites the staged bytes instead
   // of re-baking, so the binding itself never drifts.
   bool patchableBytes = false;
+  // Set by CommandGraph::beginGpuSpan: the dispatch joins a GPU-encoded
+  // span — an indirect command buffer the gpu_encode kernel fills on device
+  // (kernels/shared/gpu_dispatch.metal) instead of the host bake, so runs
+  // that cannot replay from a host-baked ICB still ride one. Unlike
+  // bakeable it is a commitment, not a candidate: the encoder stages the
+  // run's bindings and parameter payloads every submission.
+  bool gpuSpan = false;
 };
 
 // Orders a command against another agent, such as the Neural Engine, after

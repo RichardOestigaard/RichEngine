@@ -1,6 +1,7 @@
 #include "model/TargetModel.hpp"
 #include "model/TargetModelGemmaHelpers.hpp"
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 
 #include "metal/abi/GDN.h"
 #include "model/Dense.hpp"
@@ -9,6 +10,8 @@
 #include "model/Lfm2.hpp"
 #include "model/Granite.hpp"
 #include "model/Lfm2Moe.hpp"
+#include "model/Lfm2Moe24B.hpp"
+#include "model/MiniCpmV47.hpp"
 #include "model/Ornith9B.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
@@ -37,6 +40,7 @@ TargetModelGeometry commonGeometry(const Layout &layout) {
   result.layers = layout.layers;
   result.hiddenSize = layout.hiddenSize;
   result.vocabularySize = layout.vocabularySize;
+  result.paddedVocabularySize = model::paddedVocabularySize(layout.vocabularySize);
   result.packedGdnWidth = layout.packedGdnWidth;
   result.packedFullWidth = layout.packedFullWidth;
   result.convolutionDimension = layout.convolutionDimension;
@@ -69,12 +73,14 @@ TargetModelGeometry commonGeometry(const Layout &layout) {
 TargetModelGeometry geometryFor(const Qwen3_8Layout &layout) {
   TargetModelGeometry result = commonGeometry(layout);
   result.denseIntermediateSize = layout.intermediateSize;
+  result.gdnCore = ops::GdnCore::Value48;
   return result;
 }
 
 TargetModelGeometry geometryFor(const Ornith9BLayout &layout) {
   TargetModelGeometry result = commonGeometry(layout);
   result.denseIntermediateSize = layout.intermediateSize;
+  result.gdnCore = ops::GdnCore::Value32;
   return result;
 }
 
@@ -83,6 +89,16 @@ TargetModelGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
   result.experts = layout.experts;
   result.expertsPerToken = layout.expertsPerToken;
   result.expertIntermediateSize = layout.expertIntermediateSize;
+  result.gdnCore = ops::GdnCore::Value32;
+  return result;
+}
+
+TargetModelGeometry geometryFor(const MiniCpmV47MoeLayout &layout) {
+  TargetModelGeometry result = commonGeometry(layout);
+  result.experts = layout.experts;
+  result.expertsPerToken = layout.expertsPerToken;
+  result.expertIntermediateSize = layout.expertIntermediateSize;
+  result.gdnCore = ops::GdnCore::Value32;
   return result;
 }
 
@@ -137,6 +153,23 @@ TargetModelGeometry geometryFor(const Lfm2MoeLayout &layout) {
   return result;
 }
 
+// LFM2.5-24B-A2B: the 8B MoE target's mixers at 40 layers — 30 convs, 10
+// attention — its dense leading FFNs widened to 11776 and the MoE blocks'
+// 64 sigmoid-gated experts of 1536.
+TargetModelGeometry geometryFor(const Lfm2Moe24BLayout &layout) {
+  TargetModelGeometry result = commonGeometry(layout);
+  result.denseIntermediateSize = layout.intermediateSize;
+  result.experts = layout.experts;
+  result.expertsPerToken = layout.expertsPerToken;
+  result.expertIntermediateSize = layout.expertIntermediateSize;
+  result.moeSharedExpert = false;
+  result.gdnLayers = 0;
+  result.convLayers = layout.gdnStateLayout().layers;
+  result.convolutionTaps = Lfm2Moe24BLayout::convolutionTaps;
+  result.ropeAxes = 1;
+  return result;
+}
+
 // Gemma 4 26B-A4B: 30 attention layers — 25 sliding (KV8x256, full rotary
 // at 1e4, 1024-token window) and five globals (KV2x512, p-RoPE of 64 at 1e6,
 // k_eq_v) — each followed by the GeGLU MoE block; no recurrent state, tied
@@ -146,6 +179,7 @@ TargetModelGeometry geometryFor(const Gemma4MoeLayout &layout) {
   result.layers = layout.layers;
   result.hiddenSize = layout.hiddenSize;
   result.vocabularySize = layout.vocabularySize;
+  result.paddedVocabularySize = model::paddedVocabularySize(layout.vocabularySize);
   result.attentionQueryHeads = layout.attentionQueryHeads;
   result.attentionKvHeads = layout.attentionKvHeads;
   result.attentionHeadDimension = layout.attentionHeadDimension;
@@ -231,11 +265,15 @@ template TargetModel::TargetModel(const Ornith9BWeights &, const TargetModelGeom
                                 const ops::ExecutionPlans &);
 template TargetModel::TargetModel(const Qwen3_6MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
+template TargetModel::TargetModel(const MiniCpmV47MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &);
 template TargetModel::TargetModel(const DenseWeights &, const TargetModelGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 template TargetModel::TargetModel(const Lfm2Weights &, const TargetModelGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 template TargetModel::TargetModel(const Lfm2MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
+                                const ops::ExecutionPlans &);
+template TargetModel::TargetModel(const Lfm2Moe24BWeights &, const TargetModelGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 template TargetModel::TargetModel(const Gemma4MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
@@ -368,9 +406,11 @@ TargetModelGeometry targetModelGeometry(const TargetModelWeights<Layout, Layer> 
 template TargetModelGeometry targetModelGeometry(const Qwen3_8Weights &);
 template TargetModelGeometry targetModelGeometry(const Ornith9BWeights &);
 template TargetModelGeometry targetModelGeometry(const Qwen3_6MoeWeights &);
+template TargetModelGeometry targetModelGeometry(const MiniCpmV47MoeWeights &);
 template TargetModelGeometry targetModelGeometry(const DenseWeights &);
 template TargetModelGeometry targetModelGeometry(const Lfm2Weights &);
 template TargetModelGeometry targetModelGeometry(const Lfm2MoeWeights &);
+template TargetModelGeometry targetModelGeometry(const Lfm2Moe24BWeights &);
 template TargetModelGeometry targetModelGeometry(const Gemma4MoeWeights &);
 template TargetModelGeometry targetModelGeometry(const DiffusionGemmaTrunkWeights &);
 template TargetModelGeometry targetModelGeometry(const GraniteWeights &);
@@ -594,9 +634,11 @@ void TargetModel::addVerify(
     metal::CommandGraph &graph, TargetModelVerifyBuffers buffers,
     std::span<const RichKvLayer> kvLayers,
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
-    bool tree, std::span<const uint32_t> liveRows, uint32_t liveNodes) const {
+    bool tree, std::span<const uint32_t> liveRows, uint32_t liveNodes,
+    uint32_t verifyStride) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       (!liveRows.empty() && liveRows.size() != lanes) ||
+      !verifyStride || verifyStride > ExecutionLimits::targetVerifyRows ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.gdnPacked.size() != geometry_.stateLayout.layers ||
       buffers.gdnMixed.size() != geometry_.stateLayout.layers ||
@@ -607,18 +649,17 @@ void TargetModel::addVerify(
     throw std::invalid_argument("invalid verify batch");
   }
   // A tree lane doubles its row block: RICHENGINE_TREE_VERIFY_NODES rows, of
-  // which nodes 1..15 hold the emitted tree. Tree mode supports the GDN and
-  // attention mixers only — LFM2 convolutions stay on the chain path.
+  // which nodes 1..15 hold the emitted tree. Tree mode supports the GDN,
+  // attention and LFM2 conv mixers.
   if (tree &&
       (lanes * 2 > ExecutionLimits::maximumBatchWidth ||
-       (geometry_.convLayers && !geometry_.gdnLayers) ||
        !buffers.treeNodes || !buffers.treeCounts || !buffers.treeMasks ||
        !buffers.capturedPath)) {
     throw std::invalid_argument("invalid tree verify batch");
   }
   const uint32_t rowCapacity =
       tree ? uint32_t{RICHENGINE_TREE_VERIFY_NODES}
-           : ExecutionLimits::targetVerifyRows;
+           : verifyStride;
   const uint32_t rows = lanes * rowCapacity;
   const uint32_t planLanes = tree ? 2 * lanes : lanes;
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> histories{};
@@ -626,16 +667,18 @@ void TargetModel::addVerify(
     histories[lane] = chunks[lane].committed_tokens;
   VerifyStep step{graph, buffers, kvLayers, chunks, lanes, rows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.layerKvLayout(false),
-                                             std::span(histories).first(lanes), tree, liveNodes)};
+                                             std::span(histories).first(lanes), tree, liveNodes, rowCapacity)};
   if (geometry_.altAttentionMask)
     step.altAttention.emplace(operators_.verifyAttention(
         lanes, geometry_.attentionQueryHeads, geometry_.layerKvLayout(true),
-        std::span(histories).first(lanes), tree, liveNodes));
+        std::span(histories).first(lanes), tree, liveNodes, rowCapacity));
   step.planLanes = planLanes;
   step.rowCapacity = rowCapacity;
   step.tree = tree;
   step.liveRows = liveRows;
-  if (geometry_.ffnKind == FfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes);
+  if (geometry_.ffnKind == FfnKind::SparseMoe)
+    step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes,
+                                    rowCapacity);
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const auto &layer = weights->layers[index];
@@ -671,7 +714,8 @@ void TargetModel::addVerify(
     requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   }, weights_);
   addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, planLanes,
-               buffers.linearScratch, &buffers);
+               buffers.linearScratch, &buffers,
+               tree ? uint32_t{RICHENGINE_TREE_VERIFY_NODES} : verifyStride);
 }
 
 metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const AttentionMixerWeights &mixer,
@@ -679,7 +723,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
   const TargetModelVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
-  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes);
+  const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes, ops::LinearEpilogue::None, nullptr, step.rowCapacity);
   // Norm, input projection, QKV projection, gate and residual output
   // projection replay from baked indirect command buffers; the paged
   // store/split/reduce between them suspends the span — their parameter
@@ -695,9 +739,9 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes,
                                            step.rowCapacity);
   const ops::LinearPlan outputPlan =
-      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual);
+      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   ops::PreparedInput hidden;
-  static const bool noFusedGate = tuning().noFusedGate;
+  static const bool noFusedGate = modelPolicy().noFusedGate;
   // A Plain-input out-projection folds its operand pass into the attention
   // reduce: the query gate of the gated targets, the hidden-row gather of
   // the no-gate ones (chain verifies only — tree plans keep the two-pass
@@ -746,9 +790,9 @@ void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &no
   // command buffer; all parameters and buffers are static per batch width.
   step.graph.beginBakedSpan();
   const ops::LinearPlan gateUpPlan =
-      linear.decodePlan(up, step.planLanes, ops::LinearEpilogue::GateUp, &gate);
+      linear.decodePlan(up, step.planLanes, ops::LinearEpilogue::GateUp, &gate, step.rowCapacity);
   const ops::LinearPlan downPlan =
-      linear.decodePlan(down, step.planLanes, ops::LinearEpilogue::Residual);
+      linear.decodePlan(down, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   // The gate/up tile emits its output as the down input's Table64 into
   // denseIntermediate plus paired half sums, sparing the prepare pass —
   // only when both plans run the simdgroup tile.
@@ -780,7 +824,8 @@ void TargetModel::addVerifyFfn(VerifyStep &step, const DenseLayerWeights &layer,
 void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                               metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
                               ops::LinearScratch scratch,
-                              const TargetModelVerifyBuffers *fused) const {
+                              const TargetModelVerifyBuffers *fused,
+                              uint32_t verifyStride) const {
   const ops::Linear &linear = operators_.linear();
   const ops::Projection &head = vocabularyProjection();
   // Fused greedy head: the Ornith-9B {248320, 4096} affine projection runs
@@ -792,7 +837,7 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
     graph.beginBakedSpan();
     ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
                                geometry_.hiddenSize,
-                               lanes * ExecutionLimits::targetVerifyRows,
+                               lanes * verifyStride,
                                scratch, ops::LinearInput::Plain);
     if (head.layout() == ops::WeightLayout::Block32) {
       // The GGUF head's staged decode argmaxes per 64-column tile; the
@@ -800,7 +845,7 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
       if (linear.addGgufHeadArgmax(graph, finalHidden, head, lanes,
                                    fused->headArgmaxValues,
                                    fused->headArgmaxIndices, fused->headArgs,
-                                   scratch)) {
+                                   scratch, verifyStride)) {
         graph.endBakedSpan();
         return;
       }
@@ -808,7 +853,14 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
       // path adds the projection below.
     } else {
       const ops::AffineWeights &w = head.affine();
-      graph.add("decode_head_argmax_q4",
+      // The fused-M kernels size their logits tile to the live rows: the
+      // 8- and 16-row variants skip the 32-row tile's dead MMA work.
+      const uint32_t liveRows = lanes * verifyStride;
+      const std::string_view kernel =
+          liveRows <= 8    ? "decode_head_argmax_q4_m8"
+          : liveRows <= 16 ? "decode_head_argmax_q4_m16"
+                           : "decode_head_argmax_q4";
+      graph.add(std::string(kernel),
                 {finalHidden, w.weights, w.scales, w.biases,
                  fused->headArgmaxValues, fused->headArgmaxIndices},
                 fused->headArgs, {head.outputSize / 128, 1, 1}, {256, 1, 1});
@@ -817,12 +869,14 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
     }
     graph.endBakedSpan();
   }
-  const ops::LinearPlan logitsPlan = linear.decodePlan(vocabularyProjection(), lanes);
+  const ops::LinearPlan logitsPlan = linear.decodePlan(
+      vocabularyProjection(), lanes, ops::LinearEpilogue::None, nullptr,
+      verifyStride);
   // The final norm and vocabulary projection replay from a baked span.
   graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       graph, std::move(hidden), weightsBase_.finalNorm, finalHidden, geometry_.hiddenSize,
-      lanes * ExecutionLimits::targetVerifyRows, scratch, logitsPlan.input());
+      lanes * verifyStride, scratch, logitsPlan.input());
   linear.add(graph,
              {.input = std::move(finalHidden), .output = logits, .scratch = scratch,
               .prepared = normalized},
@@ -831,7 +885,7 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
   // monotonic, so the fused argmax head never needs it.
   if (geometry_.logitSoftcap > 0.0F) {
     const uint32_t count =
-        lanes * ExecutionLimits::targetVerifyRows * geometry_.vocabularySize;
+        lanes * verifyStride * geometry_.vocabularySize;
     graph.addTail("decode_logit_softcap", {logits}, geometry_.logitSoftcap,
                   count, {(count + 255) / 256, 1, 1}, {256, 1, 1});
   }
@@ -842,10 +896,13 @@ void TargetModel::addVerifyInput(metal::CommandGraph &graph,
                                 metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals,
                                 metal::MetalBuffer verifyInput,
-                                uint32_t lanes) const {
+                                uint32_t lanes, uint32_t verifyStride,
+                                uint32_t draftStride,
+                                std::span<const uint32_t> liveRows) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput),
                                  std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 geometry_.vocabularySize, lanes, verifyStride,
+                                 draftStride, liveRows);
 }
 
 void TargetModel::addVerifyTreeInput(metal::CommandGraph &graph,

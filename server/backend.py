@@ -639,6 +639,7 @@ class NativeBackend:
         }
         if stale_error is not None:
             snapshot["transport"]["error"] = engine_error or str(stale_error)
+        snapshot["masks"] = self.runtime.mask_stats()
         if not transport_ready:
             snapshot["ready"] = False
         return snapshot

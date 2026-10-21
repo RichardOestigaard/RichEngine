@@ -59,14 +59,18 @@ struct DraftMarkovHead final {
 // for a sampling lane, drawing at its temperature.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  // vocabulary is the token bound; logitsStride the row stride of the logits
+  // buffer the top-16 kernels index — a padded vocabulary's storage stride.
+  explicit DraftSelector(uint32_t vocabulary, uint32_t logitsStride = 0);
 
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
-           std::span<const SamplingPolicy> policies) const;
+           std::span<const SamplingPolicy> policies,
+           uint32_t queryRows =
+               RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The same pipeline plus draft_select_tree, which emits each lane's verify
   // tree tables. treeMask marks the lanes whose comb leaves are emitted
   // (greedy lanes of a tree-capable draft); other lanes get a linear table.
@@ -74,7 +78,9 @@ public:
                const DraftCodebooks &codebooks,
                std::span<const uint32_t> anchors,
                std::span<const SamplingPolicy> policies,
-               uint32_t treeMask) const;
+               uint32_t treeMask,
+               uint32_t queryRows =
+                   RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The plain DFlash draft's selection (draft_select_top16_sharded +
   // draft_select_plain): per position the best or a drawn candidate of the
   // draft logits, with no predecessor/successor codebooks. The codebookless
@@ -82,7 +88,9 @@ public:
   void addPlain(metal::CommandGraph &graph,
                 const DraftSelectorBuffers &buffers,
                 std::span<const uint32_t> anchors,
-                std::span<const SamplingPolicy> policies) const;
+                std::span<const SamplingPolicy> policies,
+                uint32_t queryRows =
+                    RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The same plain selection ending in draft_select_plain_tree: treeMask
   // lanes additionally write each position's rank-1 candidate as a sibling
   // leaf of the verify comb.
@@ -90,7 +98,9 @@ public:
                     const DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
                     std::span<const SamplingPolicy> policies,
-                    uint32_t treeMask) const;
+                    uint32_t treeMask,
+                    uint32_t queryRows =
+                        RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
   // dspark_select_edges + draft_select_dspark): like the plain path, but
   // position p reads logits row p (the anchor row already predicts a token)
@@ -104,7 +114,9 @@ public:
                  const DraftSelectorBuffers &buffers,
                  const DraftMarkovHead &markov,
                  std::span<const uint32_t> anchors,
-                 std::span<const SamplingPolicy> policies) const;
+                 std::span<const SamplingPolicy> policies,
+                 uint32_t queryRows =
+                     RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The same DSpark pipeline ending in draft_select_dspark_tree, which
   // emits each lane's verify tree tables: the chain plus, for lanes in
   // treeMask, every position's biased runner-up as a sibling leaf.
@@ -113,7 +125,9 @@ public:
                     const DraftMarkovHead &markov,
                     std::span<const uint32_t> anchors,
                     std::span<const SamplingPolicy> policies,
-                    uint32_t treeMask) const;
+                    uint32_t treeMask,
+                    uint32_t queryRows =
+                        RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The DFlash2 selector over the whole shard pool
   // (dflash_select_pool_edges + the shared draft_select_dspark pool walk):
   // the hidden-conditioned codebook edge scores all 128 partial slots per
@@ -125,7 +139,9 @@ public:
                const DraftSelectorBuffers &buffers,
                const DraftCodebooks &codebooks,
                std::span<const uint32_t> anchors,
-               std::span<const SamplingPolicy> policies) const;
+               std::span<const SamplingPolicy> policies,
+               uint32_t queryRows =
+                   RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The same pool pipeline ending in the shared draft_select_dspark_tree
   // walk: treeMask lanes get each position's biased pool runner-up as a
   // sibling leaf.
@@ -134,10 +150,13 @@ public:
                    const DraftCodebooks &codebooks,
                    std::span<const uint32_t> anchors,
                    std::span<const SamplingPolicy> policies,
-                   uint32_t treeMask) const;
+                   uint32_t treeMask,
+                   uint32_t queryRows =
+                       RICHENGINE_DRAFT_QUERY_ROWS) const;
 
 private:
   uint32_t vocabulary_ = 0;
+  uint32_t logitsStride_ = 0;
 };
 
 } // namespace richengine::ops

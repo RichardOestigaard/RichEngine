@@ -45,6 +45,26 @@ struct LfmConvCommitBuffers final {
   std::span<const metal::MetalBuffer> nextStates;
 };
 
+struct LfmConvTreeVerifyBuffers final {
+  metal::MetalBuffer packed;    // the layer's [lanes*nodes][packedWidth]
+  metal::MetalBuffer weights;
+  std::span<const metal::MetalBuffer> currentStates;
+  metal::MetalBuffer mixed;     // bx rows at the node stride, for the commit
+  metal::MetalBuffer output;    // [lanes*nodes][dim]
+  metal::MetalBuffer treeNodes; // lanes' comb descriptors (Sampling.h's fields)
+  metal::MetalBuffer treeCounts;
+};
+
+struct LfmConvTreeCommitBuffers final {
+  metal::MetalBuffer mixed;
+  metal::MetalBuffer retainedCounts;
+  // Each lane's committed path as DFS rows, RICHENGINE_TARGET_VERIFY_ROWS
+  // stride (the tree acceptance's RetainedPath).
+  metal::MetalBuffer retainedPath;
+  std::span<const metal::MetalBuffer> currentStates;
+  std::span<const metal::MetalBuffer> nextStates;
+};
+
 class LfmConv final {
 public:
   // `tapsMajor` records the conv weight's stored order; every current
@@ -67,6 +87,21 @@ public:
                         uint32_t rows, uint32_t layer,
                         uint64_t stateLayerBytes, uint32_t layers,
                         uint64_t mixedLayerStride, bool tapsMajor);
+  // The comb-tree variants: `nodes` is each lane's
+  // RICHENGINE_TREE_VERIFY_NODES row stride, `rows` on the chain calls'
+  // role. The commit's `mixed` and `retainedPath` steer the FIFO by the
+  // retained path's DFS rows.
+  static void addVerifyTree(metal::CommandGraph &graph,
+                            const LfmConvTreeVerifyBuffers &buffers,
+                            const LfmConvShape &shape, uint32_t lanes,
+                            uint32_t nodes, uint32_t layer,
+                            uint64_t stateLayerBytes, bool tapsMajor);
+  static void addCommitTree(metal::CommandGraph &graph,
+                            const LfmConvTreeCommitBuffers &buffers,
+                            const LfmConvShape &shape, uint32_t lanes,
+                            uint32_t nodes, uint32_t layer,
+                            uint64_t stateLayerBytes, uint32_t layers,
+                            uint64_t mixedLayerStride, bool tapsMajor);
 };
 
 } // namespace richengine::ops

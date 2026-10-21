@@ -1,0 +1,77 @@
+{
+  "dflash2": {
+    "architectures": [
+      "DFlash2DraftModel"
+    ],
+    "sliding_window": 2048,
+    "is_causal": false,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "rope_parameters.rope_type": "default",
+    "rope_parameters.rope_theta": 10000000,
+    "dflash_config.block_size": 8,
+    "dflash_config.conv_group_size": 16,
+    "dflash_config.conv_kernel_size": 2,
+    "dflash_config.selector_top_k": 16
+  },
+  "dflash": {
+    "architectures": [
+      "DFlashDraftModel"
+    ],
+    "model_type": "qwen3",
+    "sliding_window": 4096,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "rope_parameters.rope_type": "default",
+    "rope_parameters.rope_theta": 10000000,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "dflash_config.block_size": 16
+  },
+  "dflash_gemma4": {
+    "architectures": [
+      "DFlashDraftModel"
+    ],
+    "model_type": "qwen3",
+    "sliding_window": 2048,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "rope_theta": 1000000,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "block_size": 16,
+    "final_logit_softcapping": 30.0
+  },
+  "dspark": {
+    "model_type": "qwen3",
+    "hidden_act": "silu",
+    "num_hidden_layers": 5,
+    "layer_types": [
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention"
+    ],
+    "markov_rank": 256,
+    "markov_head_type": "vanilla",
+    "enable_confidence_head": true
+  }
+}

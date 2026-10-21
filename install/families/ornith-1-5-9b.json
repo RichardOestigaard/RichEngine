@@ -1,0 +1,74 @@
+{
+  "name": "Ornith-1.5-9B",
+  "repos": [
+    "ornith-ai/Ornith-1.5-9B-MLX-4bit"
+  ],
+  "note": "Ornith's released weights carry a vision tower the runtime does not serve.",
+  "signature": {
+    "model_type": "qwen3_5_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "vocab_size": 248320,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 256
+  },
+  "draft": {
+    "repo": "ornith-ai/Ornith-1.5-9B-DFlash",
+    "base": "dflash",
+    "signature": {
+      "num_hidden_layers": 6,
+      "num_target_layers": 32,
+      "hidden_size": 4096,
+      "vocab_size": 248320,
+      "intermediate_size": 12288,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "dflash_config.mask_token_id": 248077,
+      "dflash_config.target_layer_ids": [
+        1,
+        5,
+        9,
+        13,
+        17,
+        21,
+        25,
+        29
+      ]
+    }
+  },
+  "vision": false,
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "qwen3-xml"
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "DFLASH_POOL",
+    "GDN_CHUNKED",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "HEAD_FUSED",
+    "MTL4",
+    "GGUF_PACKED",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "ANE_WAIT"
+  ]
+}

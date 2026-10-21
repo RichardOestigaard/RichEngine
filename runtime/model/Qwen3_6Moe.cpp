@@ -24,10 +24,11 @@ void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLa
   };
 }
 
-// GGUF images keep the tensors as the GGUF stores them, the router and the
-// shared-expert scalar gate in F32.
+// GGUF and oQ images keep the tensors as block segments in the same order,
+// the router and the shared-expert scalar gate in F32.
+template <class Format>
 void readFfn(WeightFile &file, Qwen3_6MoeLayerWeights &layer, const Qwen3_6MoeLayout &,
-             const BlockTargetFormat &) {
+             const Format &) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
   ffn.gate.routed = readQuantizedSegment(file, "experts-gate");

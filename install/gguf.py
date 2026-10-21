@@ -15,6 +15,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import layout, models
@@ -386,39 +387,230 @@ def tokenizer_files(metadata):
     }
 
 
-# The GGUF text architectures RichEngine serves, and the model type of each one's
-# text configuration.
-TEXT_MODEL_TYPES = {
-    "qwen35": "qwen3_5_text",
-    "qwen35moe": "qwen3_5_moe_text",
-    "llama": "llama",
-    "granite": "granite",
-    "lfm2": "lfm2",
-    "lfm2moe": "lfm2_moe",
-    "gemma4": "gemma4_text",
-}
+# The GGUF text architectures RichEngine serves: a registry where each arch
+# owns its derivation — how the shared field map reads its head width and
+# KV head count, which extra config fields it states (config), and which
+# tensors the native loader reads of it (tensors). Adding an architecture
+# is a new row and its handlers, not edits inside another's branches.
+@dataclass(frozen=True)
+class GgufArch:
+    # The model_type the derived text_config states.
+    model_type: str
+    # The metadata key of the local (sliding) layers' head width; gemma4's
+    # key_length is its global layers' width and key_length_swa the local.
+    head_dim_key: str = "attention.key_length"
+    # head_count_kv arrives as a per-layer list (lfm2's conv layers state 0,
+    # gemma4's two attention kinds state their own count).
+    kv_per_layer: bool = False
+    # A per-layer kv list reduces to its maximum (gemma4's per-kind split is
+    # validated in its fields handler).
+    kv_max: bool = False
+    # The arch states no key_length; the head width is hidden/heads.
+    head_dim_derived: bool = False
+    # feed_forward_length states the config's intermediate_size.
+    feed_forward: bool = False
+    # (text, metadata) -> None: the arch's own config fields.
+    fields: "callable" = None
+    # (metadata, layers) -> tensor map: the arch's loaded_tensors.
+    tensors: "callable" = None
+
+
+def _granite_fields(arch, text, metadata):
+    # The runtime's config check reads rope_theta and the fixed softmax
+    # multiplier.
+    theta = metadata.values.get(arch + ".rope.freq_base")
+    if type(theta) is not float or theta <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".rope.freq_base"
+        )
+    text["rope_theta"] = theta
+    scale = metadata.values.get(arch + ".attention.scale")
+    if type(scale) is not float or scale <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".attention.scale"
+        )
+    text["attention_multiplier"] = scale
+    # Only the attention multiplier reaches the kernels. A granite that
+    # also scales embeddings, residuals or logits (the 3.x series) would
+    # generate silently wrong output, so refuse it here.
+    for other in ("embedding_scale", "residual_scale", "logit_scale"):
+        value = metadata.values.get(arch + "." + other)
+        if value is not None and (type(value) is not float or value != 1.0):
+            raise ModelError(
+                "unsupported GGUF metadata: " + arch + "." + other + " must be 1.0"
+            )
+
+
+def _lfm2_fields(arch, text, metadata):
+    if arch == "lfm2moe":
+        text["num_experts"] = metadata.positive(arch + ".expert_count")
+        text["num_experts_per_tok"] = metadata.positive(arch + ".expert_used_count")
+        text["moe_intermediate_size"] = metadata.positive(
+            arch + ".expert_feed_forward_length"
+        )
+        text["num_dense_layers"] = metadata.positive(
+            arch + ".leading_dense_block_count"
+        )
+    # The per-layer KV head count names the conv (0) and full-attention
+    # layers, as the config's layer_types does.
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    if isinstance(kv, list):
+        text["layer_types"] = [
+            "conv" if count == 0 else "full_attention" for count in kv
+        ]
+    text["conv_dim"] = text["hidden_size"]
+    text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
+
+
+def _qwen35moe_fields(arch, text, metadata):
+    text.update(
+        num_experts=metadata.positive(arch + ".expert_count"),
+        num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
+    )
+
+
+def _gemma4_fields(arch, text, metadata):
+    layers = text["num_hidden_layers"]
+    # The sliding-window pattern names each layer's attention kind, as
+    # the config's layer_types does: True marks the local layers.
+    pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
+    if (
+        not isinstance(pattern, list)
+        or len(pattern) < layers
+        or not all(type(swa) is bool for swa in pattern[:layers])
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.sliding_window_pattern"
+        )
+    text["layer_types"] = [
+        "sliding_attention" if swa else "full_attention" for swa in pattern[:layers]
+    ]
+    # head_count_kv is per layer: the local layers' count is the
+    # config's num_key_value_heads, the global layers' its
+    # num_global_key_value_heads. Each kind states one count.
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    if (
+        not isinstance(kv, list)
+        or len(kv) < layers
+        or not all(type(count) is int and count > 0 for count in kv[:layers])
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
+        )
+    local = {kv[i] for i in range(layers) if pattern[i]}
+    wide = {kv[i] for i in range(layers) if not pattern[i]}
+    if len(local) != 1 or len(wide) != 1:
+        raise ModelError(
+            "unsupported GGUF metadata: "
+            + arch
+            + ".attention.head_count_kv differs between layers of a kind"
+        )
+    text["num_key_value_heads"] = local.pop()
+    text["num_global_key_value_heads"] = wide.pop()
+    text["global_head_dim"] = metadata.positive(arch + ".attention.key_length")
+    # Gemma 4 requires K == V head widths on both layer kinds
+    # (attention_k_eq_v); refuse a GGUF stating otherwise.
+    for swa in ("", "_swa"):
+        key = arch + ".attention.key_length" + swa
+        value = metadata.values.get(
+            arch + ".attention.value_length" + swa,
+            metadata.values.get(key),
+        )
+        if value != metadata.values.get(key):
+            raise ModelError(
+                "unsupported GGUF metadata: " + key + " and its value_length differ"
+            )
+    text["attention_k_eq_v"] = True
+    text["sliding_window"] = metadata.positive(arch + ".attention.sliding_window")
+    shared = metadata.values.get(arch + ".attention.shared_kv_layers", 0)
+    if type(shared) is not int or shared < 0:
+        raise ModelError(
+            "invalid GGUF metadata: " + arch + ".attention.shared_kv_layers"
+        )
+    text["num_kv_shared_layers"] = shared
+    # Per-layer token inputs (gemma4's per_layer_token_embd path) are
+    # unsupported; the field must state them absent.
+    per_layer = metadata.values.get(arch + ".embedding_length_per_layer_input", 0)
+    if type(per_layer) is not int or per_layer != 0:
+        raise ModelError(
+            "unsupported GGUF metadata: "
+            + arch
+            + ".embedding_length_per_layer_input must be 0"
+        )
+    text.update(
+        num_experts=metadata.positive(arch + ".expert_count"),
+        top_k_experts=metadata.positive(arch + ".expert_used_count"),
+        moe_intermediate_size=metadata.positive(
+            arch + ".expert_feed_forward_length"
+        ),
+        enable_moe_block=True,
+        tie_word_embeddings=True,
+    )
+    softcap = metadata.values.get(arch + ".final_logit_softcapping")
+    if type(softcap) is not float or softcap <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".final_logit_softcapping"
+        )
+    text["final_logit_softcapping"] = softcap
+    # The GGUF states the two rope bases flat, where config.json nests
+    # them under rope_parameters by layer kind; emit config.json's shape.
+    bases = {}
+    for kind, key in (
+        ("full_attention", "rope.freq_base"),
+        ("sliding_attention", "rope.freq_base_swa"),
+    ):
+        theta = metadata.values.get(arch + "." + key)
+        if type(theta) is not float or theta <= 0:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + "." + key
+            )
+        bases[kind] = theta
+    text["rope_parameters"] = {
+        "full_attention": {
+            "rope_theta": bases["full_attention"],
+            "rope_type": "proportional",
+            # The global layers' p-RoPE rotates the first 128 of 512
+            # head dimensions; GGUF states no factor, the checkpoint's
+            # config.json does.
+            "partial_rotary_factor": 0.25,
+        },
+        "sliding_attention": {
+            "rope_theta": bases["sliding_attention"],
+            "rope_type": "default",
+        },
+    }
 
 
 def text_architecture(metadata):
     arch = metadata.require("general.architecture", str)
-    if arch not in TEXT_MODEL_TYPES:
+    if arch not in GGUF_ARCHS:
         raise ModelError("unsupported GGUF model architecture: " + arch)
     return arch
 
 
+# Architectures whose checkpoints install packed (install/pack.py), never
+# from a GGUF: deriving just their model_type reaches pack.packable's
+# refusal, which names the safetensors checkpoint to install instead.
+PACKED_ONLY_ARCHS = {"diffusiongemma": "diffusion_gemma_text"}
+
+
 def model_config(metadata, vision=None):
+    arch = metadata.require("general.architecture", str)
+    if arch in PACKED_ONLY_ARCHS:
+        return {
+            "model_type": PACKED_ONLY_ARCHS[arch].removesuffix("_text"),
+            "text_config": {"model_type": PACKED_ONLY_ARCHS[arch]},
+        }
     arch = text_architecture(metadata)
+    entry = GGUF_ARCHS[arch]
     fields = {
         "hidden_size": "embedding_length",
         "max_position_embeddings": "context_length",
         "num_attention_heads": "attention.head_count",
         "num_key_value_heads": "attention.head_count_kv",
-        # gemma4's key_length is its global layers' head width; the local
-        # (sliding-attention) head width the config calls head_dim is
-        # key_length_swa.
-        "head_dim": (
-            "attention.key_length_swa" if arch == "gemma4" else "attention.key_length"
-        ),
+        "head_dim": entry.head_dim_key,
     }
     text = {}
     for name, key in fields.items():
@@ -426,17 +618,17 @@ def model_config(metadata, vision=None):
         if isinstance(value, list):
             # Only the architectures whose layers differ in kind state
             # head_count_kv per layer: lfm2's conv layers state 0, gemma4's
-            # two attention kinds state their own count (separated below).
-            # Any other array, and any lfm2 attention layers that disagree,
-            # is a geometry the runtime does not serve.
+            # two attention kinds state their own count (separated in its
+            # fields handler). Any other array, and any lfm2 attention
+            # layers that disagree, is a geometry the runtime does not serve.
             if (
                 key != "attention.head_count_kv"
-                or arch not in ("lfm2", "lfm2moe", "gemma4")
+                or not entry.kv_per_layer
                 or not all(type(item) is int and item >= 0 for item in value)
                 or not value
             ):
                 raise ModelError("invalid GGUF metadata array: " + arch + "." + key)
-            if arch == "gemma4":
+            if entry.kv_max:
                 value = max(value)
             else:
                 counts = {item for item in value if item}
@@ -447,11 +639,7 @@ def model_config(metadata, vision=None):
                         + ".attention.head_count_kv differs between attention layers"
                     )
                 value = counts.pop()
-        elif (
-            value is None
-            and name == "head_dim"
-            and arch in ("lfm2", "lfm2moe", "granite")
-        ):
+        elif value is None and name == "head_dim" and entry.head_dim_derived:
             # lfm2 and granite state no key_length; their head width divides
             # the hidden size evenly across the attention heads.
             continue
@@ -466,171 +654,13 @@ def model_config(metadata, vision=None):
         text["head_dim"] = text["hidden_size"] // text["num_attention_heads"]
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
-        model_type=TEXT_MODEL_TYPES[arch],
+        model_type=entry.model_type,
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
-    if arch in ("llama", "lfm2", "lfm2moe", "granite", "gemma4"):
+    if entry.feed_forward:
         text["intermediate_size"] = metadata.positive(arch + ".feed_forward_length")
-    if arch == "granite":
-        # The runtime's config check reads rope_theta and the fixed softmax
-        # multiplier.
-        theta = metadata.values.get(arch + ".rope.freq_base")
-        if type(theta) is not float or theta <= 0:
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + ".rope.freq_base"
-            )
-        text["rope_theta"] = theta
-        scale = metadata.values.get(arch + ".attention.scale")
-        if type(scale) is not float or scale <= 0:
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + ".attention.scale"
-            )
-        text["attention_multiplier"] = scale
-        # Only the attention multiplier reaches the kernels. A granite that
-        # also scales embeddings, residuals or logits (the 3.x series) would
-        # generate silently wrong output, so refuse it here.
-        for other in ("embedding_scale", "residual_scale", "logit_scale"):
-            value = metadata.values.get(arch + "." + other)
-            if value is not None and (type(value) is not float or value != 1.0):
-                raise ModelError(
-                    "unsupported GGUF metadata: " + arch + "." + other + " must be 1.0"
-                )
-    if arch == "lfm2moe":
-        text["num_experts"] = metadata.positive(arch + ".expert_count")
-        text["num_experts_per_tok"] = metadata.positive(arch + ".expert_used_count")
-        text["moe_intermediate_size"] = metadata.positive(
-            arch + ".expert_feed_forward_length"
-        )
-        text["num_dense_layers"] = metadata.positive(
-            arch + ".leading_dense_block_count"
-        )
-    if arch in ("lfm2", "lfm2moe"):
-        # The per-layer KV head count names the conv (0) and full-attention
-        # layers, as the config's layer_types does.
-        kv = metadata.values.get(arch + ".attention.head_count_kv")
-        if isinstance(kv, list):
-            text["layer_types"] = [
-                "conv" if count == 0 else "full_attention" for count in kv
-            ]
-        text["conv_dim"] = text["hidden_size"]
-        text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
-    if arch == "qwen35moe":
-        text.update(
-            num_experts=metadata.positive(arch + ".expert_count"),
-            num_experts_per_tok=metadata.positive(arch + ".expert_used_count"),
-        )
-    if arch == "gemma4":
-        layers = text["num_hidden_layers"]
-        # The sliding-window pattern names each layer's attention kind, as
-        # the config's layer_types does: True marks the local layers.
-        pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
-        if (
-            not isinstance(pattern, list)
-            or len(pattern) < layers
-            or not all(type(swa) is bool for swa in pattern[:layers])
-        ):
-            raise ModelError(
-                "missing or invalid GGUF metadata: "
-                + arch
-                + ".attention.sliding_window_pattern"
-            )
-        text["layer_types"] = [
-            "sliding_attention" if swa else "full_attention" for swa in pattern[:layers]
-        ]
-        # head_count_kv is per layer: the local layers' count is the
-        # config's num_key_value_heads, the global layers' its
-        # num_global_key_value_heads. Each kind states one count.
-        kv = metadata.values.get(arch + ".attention.head_count_kv")
-        if (
-            not isinstance(kv, list)
-            or len(kv) < layers
-            or not all(type(count) is int and count > 0 for count in kv[:layers])
-        ):
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
-            )
-        local = {kv[i] for i in range(layers) if pattern[i]}
-        wide = {kv[i] for i in range(layers) if not pattern[i]}
-        if len(local) != 1 or len(wide) != 1:
-            raise ModelError(
-                "unsupported GGUF metadata: "
-                + arch
-                + ".attention.head_count_kv differs between layers of a kind"
-            )
-        text["num_key_value_heads"] = local.pop()
-        text["num_global_key_value_heads"] = wide.pop()
-        text["global_head_dim"] = metadata.positive(arch + ".attention.key_length")
-        # Gemma 4 requires K == V head widths on both layer kinds
-        # (attention_k_eq_v); refuse a GGUF stating otherwise.
-        for swa in ("", "_swa"):
-            key = arch + ".attention.key_length" + swa
-            value = metadata.values.get(
-                arch + ".attention.value_length" + swa,
-                metadata.values.get(key),
-            )
-            if value != metadata.values.get(key):
-                raise ModelError(
-                    "unsupported GGUF metadata: " + key + " and its value_length differ"
-                )
-        text["attention_k_eq_v"] = True
-        text["sliding_window"] = metadata.positive(arch + ".attention.sliding_window")
-        shared = metadata.values.get(arch + ".attention.shared_kv_layers", 0)
-        if type(shared) is not int or shared < 0:
-            raise ModelError(
-                "invalid GGUF metadata: " + arch + ".attention.shared_kv_layers"
-            )
-        text["num_kv_shared_layers"] = shared
-        # Per-layer token inputs (gemma4's per_layer_token_embd path) are
-        # unsupported; the field must state them absent.
-        per_layer = metadata.values.get(arch + ".embedding_length_per_layer_input", 0)
-        if type(per_layer) is not int or per_layer != 0:
-            raise ModelError(
-                "unsupported GGUF metadata: "
-                + arch
-                + ".embedding_length_per_layer_input must be 0"
-            )
-        text.update(
-            num_experts=metadata.positive(arch + ".expert_count"),
-            top_k_experts=metadata.positive(arch + ".expert_used_count"),
-            moe_intermediate_size=metadata.positive(
-                arch + ".expert_feed_forward_length"
-            ),
-            enable_moe_block=True,
-            tie_word_embeddings=True,
-        )
-        softcap = metadata.values.get(arch + ".final_logit_softcapping")
-        if type(softcap) is not float or softcap <= 0:
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + ".final_logit_softcapping"
-            )
-        text["final_logit_softcapping"] = softcap
-        # The GGUF states the two rope bases flat, where config.json nests
-        # them under rope_parameters by layer kind; emit config.json's shape.
-        bases = {}
-        for kind, key in (
-            ("full_attention", "rope.freq_base"),
-            ("sliding_attention", "rope.freq_base_swa"),
-        ):
-            theta = metadata.values.get(arch + "." + key)
-            if type(theta) is not float or theta <= 0:
-                raise ModelError(
-                    "missing or invalid GGUF metadata: " + arch + "." + key
-                )
-            bases[kind] = theta
-        text["rope_parameters"] = {
-            "full_attention": {
-                "rope_theta": bases["full_attention"],
-                "rope_type": "proportional",
-                # The global layers' p-RoPE rotates the first 128 of 512
-                # head dimensions; GGUF states no factor, the checkpoint's
-                # config.json does.
-                "partial_rotary_factor": 0.25,
-            },
-            "sliding_attention": {
-                "rope_theta": bases["sliding_attention"],
-                "rope_type": "default",
-            },
-        }
+    if entry.fields is not None:
+        entry.fields(arch, text, metadata)
     for name in ("eos", "bos", "padding"):
         value = metadata.values.get(f"tokenizer.ggml.{name}_token_id")
         if value is not None and (type(value) is not int or value < 0):
@@ -638,7 +668,7 @@ def model_config(metadata, vision=None):
         if type(value) is int:
             text[name + "_token_id"] = value
     config = {
-        "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
+        "model_type": entry.model_type.removesuffix("_text"),
         "text_config": text,
     }
     if vision is not None:
@@ -886,76 +916,79 @@ GEMMA4_LAYER_TENSORS = {
 }
 
 
-def loaded_tensors(metadata):
-    """Each tensor the native loader reads from the target that metadata
-    describes, with the types it accepts. MTP layers are not loaded; every
-    full_attention_interval-th qwen35 layer is full attention, the others
-    GDN; a llama is all attention, and an lfm2's per-layer KV head count
-    names its conv (0) and attention layers. A gemma4's sliding-window
-    pattern names its local layers, which alone carry attn_v."""
+def _gemma4_tensors(metadata, layers):
+    arch = "gemma4"
+    pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
+    if (
+        not isinstance(pattern, list)
+        or len(pattern) < layers
+        or not all(type(swa) is bool for swa in pattern[:layers])
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.sliding_window_pattern"
+        )
+    # The fused gate_up experts tensor and the split pair are
+    # alternatives; require whichever the file states (or the fused one
+    # when the header was read without its tensor table).
+    fused = not metadata.tensors or any(
+        name.endswith("ffn_gate_up_exps.weight") for name in metadata.tensors
+    )
+    tensors = dict(GEMMA4_MODEL_TENSORS)
+    for layer in range(layers):
+        expected = dict(GEMMA4_LAYER_TENSORS)
+        if pattern[layer]:
+            expected["attn_v.weight"] = QUANTIZED_TYPES
+        if fused:
+            expected["ffn_gate_up_exps.weight"] = QUANTIZED_TYPES
+        else:
+            expected["ffn_gate_exps.weight"] = QUANTIZED_TYPES
+            expected["ffn_up_exps.weight"] = QUANTIZED_TYPES
+        for name, types in expected.items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def _dense_tensors(metadata, layers):
+    tensors = dict(MODEL_TENSORS)
+    for layer in range(layers):
+        for name, types in (
+            LLAMA_LAYER_TENSORS | LLAMA_ATTENTION_TENSORS | DENSE_TENSORS
+        ).items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def _lfm2_tensors(metadata, layers):
     arch = text_architecture(metadata)
-    layers = loaded_layers(metadata, arch)
-    if arch == "gemma4":
-        pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
-        if (
-            not isinstance(pattern, list)
-            or len(pattern) < layers
-            or not all(type(swa) is bool for swa in pattern[:layers])
-        ):
-            raise ModelError(
-                "missing or invalid GGUF metadata: "
-                + arch
-                + ".attention.sliding_window_pattern"
-            )
-        # The fused gate_up experts tensor and the split pair are
-        # alternatives; require whichever the file states (or the fused one
-        # when the header was read without its tensor table).
-        fused = not metadata.tensors or any(
-            name.endswith("ffn_gate_up_exps.weight") for name in metadata.tensors
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    if (
+        not isinstance(kv, list)
+        or len(kv) < layers
+        or not all(type(count) is int and count >= 0 for count in kv[:layers])
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
         )
-        tensors = dict(GEMMA4_MODEL_TENSORS)
-        for layer in range(layers):
-            expected = dict(GEMMA4_LAYER_TENSORS)
-            if pattern[layer]:
-                expected["attn_v.weight"] = QUANTIZED_TYPES
-            if fused:
-                expected["ffn_gate_up_exps.weight"] = QUANTIZED_TYPES
-            else:
-                expected["ffn_gate_exps.weight"] = QUANTIZED_TYPES
-                expected["ffn_up_exps.weight"] = QUANTIZED_TYPES
-            for name, types in expected.items():
-                tensors[f"blk.{layer}.{name}"] = types
-        return tensors
-    if arch in ("llama", "granite"):
-        tensors = dict(MODEL_TENSORS)
-        for layer in range(layers):
-            for name, types in (
-                LLAMA_LAYER_TENSORS | LLAMA_ATTENTION_TENSORS | DENSE_TENSORS
-            ).items():
-                tensors[f"blk.{layer}.{name}"] = types
-        return tensors
-    if arch in ("lfm2", "lfm2moe"):
-        kv = metadata.values.get(arch + ".attention.head_count_kv")
-        if (
-            not isinstance(kv, list)
-            or len(kv) < layers
-            or not all(type(count) is int and count >= 0 for count in kv[:layers])
-        ):
-            raise ModelError(
-                "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
-            )
-        tensors = dict(LFM2_MODEL_TENSORS)
-        dense_layers = (
-            metadata.positive(arch + ".leading_dense_block_count")
-            if arch == "lfm2moe"
-            else layers
-        )
-        for layer in range(layers):
-            mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
-            ffn = DENSE_TENSORS if layer < dense_layers else LFM2MOE_TENSORS
-            for name, types in (LLAMA_LAYER_TENSORS | mixer | ffn).items():
-                tensors[f"blk.{layer}.{name}"] = types
-        return tensors
+    tensors = dict(LFM2_MODEL_TENSORS)
+    dense_layers = (
+        metadata.positive(arch + ".leading_dense_block_count")
+        if arch == "lfm2moe"
+        else layers
+    )
+    for layer in range(layers):
+        mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
+        ffn = DENSE_TENSORS if layer < dense_layers else LFM2MOE_TENSORS
+        for name, types in (LLAMA_LAYER_TENSORS | mixer | ffn).items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def _gdn_tensors(metadata, layers):
+    """qwen35 and qwen35moe: every full_attention_interval-th layer is full
+    attention, the others GDN."""
+    arch = text_architecture(metadata)
     period = metadata.positive(arch + ".full_attention_interval")
     ffn = MOE_TENSORS if arch == "qwen35moe" else DENSE_TENSORS
     tensors = dict(MODEL_TENSORS)
@@ -964,6 +997,58 @@ def loaded_tensors(metadata):
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+GGUF_ARCHS = {
+    "qwen35": GgufArch("qwen3_5_text", tensors=_gdn_tensors),
+    "qwen35moe": GgufArch(
+        "qwen3_5_moe_text", fields=_qwen35moe_fields, tensors=_gdn_tensors
+    ),
+    "llama": GgufArch("llama", feed_forward=True, tensors=_dense_tensors),
+    "granite": GgufArch(
+        "granite",
+        head_dim_derived=True,
+        feed_forward=True,
+        fields=_granite_fields,
+        tensors=_dense_tensors,
+    ),
+    "lfm2": GgufArch(
+        "lfm2",
+        kv_per_layer=True,
+        head_dim_derived=True,
+        feed_forward=True,
+        fields=_lfm2_fields,
+        tensors=_lfm2_tensors,
+    ),
+    "lfm2moe": GgufArch(
+        "lfm2_moe",
+        kv_per_layer=True,
+        head_dim_derived=True,
+        feed_forward=True,
+        fields=_lfm2_fields,
+        tensors=_lfm2_tensors,
+    ),
+    "gemma4": GgufArch(
+        "gemma4_text",
+        head_dim_key="attention.key_length_swa",
+        kv_per_layer=True,
+        kv_max=True,
+        feed_forward=True,
+        fields=_gemma4_fields,
+        tensors=_gemma4_tensors,
+    ),
+}
+
+
+def loaded_tensors(metadata):
+    """Each tensor the native loader reads from the target that metadata
+    describes, with the types it accepts. MTP layers are not loaded; every
+    full_attention_interval-th qwen35 layer is full attention, the others
+    GDN; a llama is all attention, and an lfm2's per-layer KV head count
+    names its conv (0) and attention layers. A gemma4's sliding-window
+    pattern names its local layers, which alone carry attn_v."""
+    arch = text_architecture(metadata)
+    return GGUF_ARCHS[arch].tensors(metadata, loaded_layers(metadata, arch))
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys

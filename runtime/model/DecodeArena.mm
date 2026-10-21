@@ -118,12 +118,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::FinalHidden,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Logits,
-      bytesFor<float>(r * geometry.target.vocabularySize));
+      bytesFor<float>(r * geometry.target.paddedVocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
   // The fused greedy head's per-(row, column tile) partials: the affine
   // kernel's tiles are 128 wide, the GGUF one's 64 — reserve the latter's.
-  const uint64_t headTiles = geometry.target.vocabularySize / 64;
+  const uint64_t headTiles = geometry.target.paddedVocabularySize / 64;
   put(DecodeTensor::HeadArgmaxValues,
       bytesFor<float>(uint64_t{r} * headTiles));
   put(DecodeTensor::HeadArgmaxIndices,

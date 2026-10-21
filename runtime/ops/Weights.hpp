@@ -186,8 +186,10 @@ private:
   uint32_t planeInputs_ = 0;
 };
 
-// A token table's rows as the GGUF stores them, in a gguf_embedding_format
-// (metal/abi/Gguf.h), gathered, never multiplied (Embedding.cpp).
+// A token table's rows as the checkpoint stores them, in a
+// gguf_embedding_format or oq_embedding_format (metal/abi/Gguf.h), or fp32
+// rows (QuantizedSegment::kFloat32) of a table oQ leaves unquantized —
+// gathered, never multiplied (Embedding.cpp).
 struct NativeRows final {
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;

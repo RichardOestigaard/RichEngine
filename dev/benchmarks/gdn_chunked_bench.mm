@@ -160,8 +160,8 @@ int main(int argc, const char *argv[]) {
     const uint32_t reps = argc > 3 ? std::atoi(argv[3]) : 5;
     MetalBackend backend(argv[1]);
     for (const GdnShape &shape :
-         {GdnShape{16, 48, 128, 10240, 16640},
-          GdnShape{16, 32, 128, 8192, 12544}}) {
+         {GdnShape{16, 48, 128, 10240, 16640, richengine::ops::GdnCore::Value48},
+          GdnShape{16, 32, 128, 8192, 12544, richengine::ops::GdnCore::Value32}}) {
       Inputs in = makeInputs(backend, shape, tokens, 0x9E3779B97F4A7C15ULL);
       const uint64_t valW = uint64_t{shape.valueHeads} * kHeadDim;
       const uint64_t stateEl = uint64_t{shape.valueHeads} * kHeadDim * kHeadDim;

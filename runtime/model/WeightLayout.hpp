@@ -16,6 +16,12 @@ inline constexpr uint64_t kBFloat16Bytes = 2;
 
 inline constexpr uint64_t kWeightFileAlignment = 16 * 1024;
 inline constexpr uint32_t kQ4StorageN = 256;
+// The vocabulary rows a quantized head must span: output projections are
+// kQ4StorageN-row tiles, so a vocabulary that is not a multiple pads its
+// head and embedding sections with zero rows the argmax bound excludes.
+[[nodiscard]] inline constexpr uint32_t paddedVocabularySize(uint32_t vocabularySize) {
+  return (vocabularySize + kQ4StorageN - 1) / kQ4StorageN * kQ4StorageN;
+}
 
 // The packed vision tower.
 inline constexpr std::string_view kVisionMagic = "MDFV0001";

@@ -7,6 +7,8 @@
 #include "Granite.hpp"
 #include "Lfm2.hpp"
 #include "Lfm2Moe.hpp"
+#include "Lfm2Moe24B.hpp"
+#include "MiniCpmV47.hpp"
 #include "Model.hpp"
 #include "ModelTuning.hpp"
 #include "Ornith9B.hpp"
@@ -22,8 +24,9 @@
 namespace richengine::model {
 
 using TargetLayout =
-    std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout, DenseLayout,
-                 Lfm2Layout, Lfm2MoeLayout, GraniteLayout, Gemma4MoeLayout,
+    std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout,
+                 MiniCpmV47MoeLayout, DenseLayout, Lfm2Layout, Lfm2MoeLayout,
+                 Lfm2Moe24BLayout, GraniteLayout, Gemma4MoeLayout,
                  DiffusionGemmaLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
@@ -36,6 +39,10 @@ enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 // consumes capabilities; model loading consumes the concrete layouts.
 struct ModelDescriptor final {
   std::string name;
+  // The kModelFamilies entry name the model resolved to ("" when the
+  // package manifest predates family names): model-scoped measured tuning
+  // rows match on it.
+  std::string family;
   TargetLayout target;
   DFlashDraftLayout draft;
   ops::VisionLayout vision;

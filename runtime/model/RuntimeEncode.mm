@@ -40,11 +40,11 @@ namespace richengine::model {
 
   void Runtime::Impl::encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes,
-                            uint32_t rowFactor) {
+                            uint32_t rowFactor, uint32_t rowStride) {
     if (!lanes || lanes * rowFactor > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     const uint32_t storage = lanes * rowFactor;
-    const uint32_t rows = lanes * rowFactor * kDecodeRows;
+    const uint32_t rows = lanes * rowFactor * rowStride;
     targetModel.addEmbedding(graph, decodeArena->packed(tokens, storage),
                              decodeArena->packed(output, storage), rows);
   }

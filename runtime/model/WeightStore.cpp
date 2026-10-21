@@ -167,22 +167,32 @@ ops::NormWeights readNorm(WeightFile &file, uint32_t width, bool float32,
 }
 
 namespace {
-GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label) {
+GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label,
+                                        bool tiled = true) {
     metal::MetalBuffer section = file.section(sizeof(GgufTensorDescriptor), std::string(label) + "-desc");
     const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
     GgufTensorDescriptor d;
     std::memcpy(&d, bytes, sizeof d);
-    // Float tensors are rows as stored; quantized ones fill whole tiles.
+    // Float tensors are rows as stored; quantized ones fill whole tiles. An
+    // affine-tile section (ggml::kAffineQ4) takes the StorageN/64-group
+    // alignment its planes need instead of the block one. A native-rows
+    // section (the token table) stores flat rows, so a vocabulary that is
+    // not a tile multiple is fine.
+    const bool affine = d.type == ggml::kAffineQ4;
     if (!d.outputSize || !d.inputSize ||
-        (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
+        (tiled && d.type != ggml::kF32 && !affine &&
+         (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)) ||
+        (tiled && affine && (d.outputSize % kQ4StorageN || d.inputSize % kQ4GroupElements)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
-} // namespace
 
-ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
-    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+// The segment a GGUF descriptor's payload holds: an F32 tensor's rows, or
+// the plane0/plane1/meta planes of its declared format.
+ops::QuantizedSegment segmentFromDescriptor(WeightFile &file,
+                                            const GgufTensorDescriptor &d,
+                                            std::string_view label) {
     if (d.type == ggml::kF32) {
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
             d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
@@ -206,6 +216,11 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     return ops::QuantizedSegment::planes(format, d.outputSize, d.inputSize, std::move(plane0),
                                          std::move(plane1), std::move(meta));
 }
+} // namespace
+
+ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
+    return segmentFromDescriptor(file, readGgufDescriptor(file, label), label);
+}
 
 ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                     std::string_view label) {
@@ -224,7 +239,7 @@ ops::Projection readProjection(WeightFile &file, uint32_t outputSize, uint32_t i
 
 ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                          std::string_view label) {
-    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label, /*tiled=*/false);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
     const uint32_t format = gguf_format_of(d.type);
@@ -233,6 +248,75 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
         throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
     return {outputSize, inputSize,
             ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
+}
+
+ops::EmbeddingWeights readOqEmbedding(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                      std::string_view label) {
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label, /*tiled=*/false);
+    if (d.outputSize != outputSize || d.inputSize != inputSize)
+        throw WeightStoreError("oQ embedding does not match the layout: " + std::string(label));
+    if (d.type == ggml::kF32) {
+        if (d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            throw WeightStoreError("oQ float embedding rows are inconsistent: " + std::string(label));
+        return {outputSize, inputSize,
+                ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"),
+                                ops::QuantizedSegment::kFloat32)};
+    }
+    const uint32_t format = gguf_format_of(d.type);
+    if (format == GGUF_FMT_COUNT ||
+        d.plane0Bytes != d.outputSize * ggufRowBytes(kQuantFormats[format], d.inputSize))
+        throw WeightStoreError("oQ embedding rows are not native affine blocks: " + std::string(label));
+    return {outputSize, inputSize,
+            ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
+}
+
+ops::Projection readOqFused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                          std::string_view label) {
+    ops::BlockWeights weights;
+    uint32_t covered = 0;
+    while (covered < outputSize) {
+        const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+        if (d.type == ggml::kAffineQ4) {
+            if (covered || d.outputSize != outputSize || d.inputSize != inputSize)
+                throw WeightStoreError("oQ affine sections lead a whole projection: " +
+                                       std::string(label));
+            validateQ4Layout(outputSize, inputSize);
+            const uint64_t elements = q4Elements(outputSize, inputSize);
+            const std::vector<metal::MetalBuffer> planes =
+                file.split({elements / 2, elements / 32, elements / 32}, label);
+            return {outputSize, inputSize,
+                    ops::AffineWeights{planes[0], planes[1], planes[2]}};
+        }
+        ops::QuantizedSegment segment = segmentFromDescriptor(file, d, label);
+        if (segment.outputSize > outputSize - covered)
+            throw WeightStoreError("oQ segments overshoot the projection: " + std::string(label));
+        segment.columnOffset = covered;
+        covered += segment.outputSize;
+        weights.segments.push_back(std::move(segment));
+    }
+    return {outputSize, inputSize, std::move(weights)};
+}
+
+// One descriptor-prefixed projection of an oQ image: the affine tiles of a
+// ggml::kAffineQ4 section, or the single block segment any other covers.
+ops::Projection readOqProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                 std::string_view label) {
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+    if (d.type == ggml::kAffineQ4) {
+        if (d.outputSize != outputSize || d.inputSize != inputSize)
+            throw WeightStoreError("oQ affine tensor does not match the layout: " +
+                                   std::string(label));
+        validateQ4Layout(outputSize, inputSize);
+        const uint64_t elements = q4Elements(outputSize, inputSize);
+        const std::vector<metal::MetalBuffer> planes =
+            file.split({elements / 2, elements / 32, elements / 32}, label);
+        return {outputSize, inputSize,
+                ops::AffineWeights{planes[0], planes[1], planes[2]}};
+    }
+    const ops::QuantizedSegment segment = segmentFromDescriptor(file, d, label);
+    if (segment.outputSize != outputSize || segment.inputSize != inputSize)
+        throw WeightStoreError("oQ tensor does not match the layout: " + std::string(label));
+    return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 
 ops::Q8Projection readAffineQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,

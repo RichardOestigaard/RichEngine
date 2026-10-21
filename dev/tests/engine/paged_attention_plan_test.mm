@@ -86,6 +86,22 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
 constexpr std::array<std::array<uint32_t, 2>, 3> kGeometries{
     {{24, 4}, {16, 4}, {16, 2}}};
 
+// The declared attention core each fixture geometry binds (the family
+// makers declare these; the fixtures mirror them).
+[[nodiscard]] constexpr kv::Core coreFor(uint32_t queryHeads,
+                                         uint32_t kvHeads) noexcept {
+  if (kvHeads == 4)
+    return queryHeads == 24 ? kv::Core::Kv4Group6 : kv::Core::Kv4Group4;
+  return kv::Core::Kv2Group8;
+}
+
+[[nodiscard]] kv::Layout testLayout(uint32_t queryHeads, uint32_t kvHeads,
+                                    kv::Format format) noexcept {
+  kv::Layout layout{1, kvHeads, 256, format};
+  layout.attentionCore = coreFor(queryHeads, kvHeads);
+  return layout;
+}
+
 std::string geometrySuffix(uint32_t queryHeads, kv::Layout layout) {
   return layout.kvHeads == 2    ? "_kv2_g8"
          : queryHeads == 16     ? "_kv4_g4"
@@ -116,7 +132,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 plan.reduceGroups.z == tiles,
             "prefill split/reduce geometry disagrees");
     const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
-    require(plan.workspace.partialsBytes == fused * 256 * 4 &&
+    require(plan.workspace.partialsBytes == fused * 256 * 2 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4,
             "prefill split dispatch and exact scratch disagree");
     const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
@@ -125,12 +141,14 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "prefill arena omitted a valid shorter plan");
   }
   // The plain-suffix kv4/g6 chain verify dispatches its two row passes as
-  // the _r2 pair of groups; the suffixed layouts keep their own splits.
+  // one split each: the _r2 pair-of-groups variant is disabled — it
+  // corrupted verify attention on the Qwen3.8-27B path (acceptance ~4%
+  // vs ~18-20%); PagedAttention.cpp's kill switch keeps it unreachable.
   const std::string verifySplit = std::string(
       layout.format == kv::Format::Int8      ? ops::kVerifyAttentionQ8Split
       : layout.format == kv::Format::Int4    ? ops::kVerifyAttentionInt4Split
                                              : ops::kVerifyAttentionBf16Split) +
-      geometrySuffix + (geometrySuffix.empty() ? "_r2" : "");
+      geometrySuffix;
   const std::string verifyReduce = std::string(ops::kVerifyAttentionReduce) + geometrySuffix;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
@@ -149,15 +167,15 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     const uint64_t fused =
         uint64_t{lanes} * kv::kVerifyRows * kv::kVerifyMaximumSplits * queryHeads;
     require(plan.splits == maximum &&
-                plan.workspace.partialsBytes == fused * 256 * 4 &&
+                plan.workspace.partialsBytes == fused * 256 * 2 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
                 plan.splitGroups.y == plan.splits &&
                 plan.splitGroups.z == lanes &&
                 plan.reduceGroups.y == kv::kVerifyRows * queryHeads / layout.kvHeads &&
                 plan.reduceGroups.z == lanes,
             "verify split/reduce/scratch disagree");
-    require(plan.laneSplits[0] == 32 &&
-                (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
+    require(plan.laneSplits[0] == kv::kVerifySplits &&
+                (lanes < 4 || plan.laneSplits[3] == kv::kVerifyPolicySplits),
             "verify partition changed");
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout); });
@@ -342,7 +360,8 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     data.tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(RichKvPage));
     data.pool.writeTable(data.pages[lane], data.tables[lane].contents());
     data.stores[lane] =
-        verify ? ops::PagedAttention::verifyParams(historyLengths[lane], pageCounts[lane])
+        verify ? ops::PagedAttention::verifyParams(historyLengths[lane],
+                                                   pageCounts[lane], rows)
                : ops::PagedAttention::prefillParams(historyLengths[lane], rows, data.stride,
                                                     pageCounts[lane]);
     for (uint32_t token = 0; token < historyLengths[lane]; ++token) {
@@ -714,7 +733,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
-                                            histories);
+                                            histories, false, 0, data.rows);
     }
   }();
   constexpr uint64_t guardBytes = 256;
@@ -865,15 +884,16 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
 }
 
 void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
-                  uint32_t history, uint32_t lanes) {
-  auto data = makeCase(backend, heads, layout, lanes, kv::kVerifyRows, history, true);
+                  uint32_t history, uint32_t lanes,
+                  uint32_t rows = kv::kVerifyRows) {
+  auto data = makeCase(backend, heads, layout, lanes, rows, history, true);
   const auto output = run<Phase::Verify>(backend, data, true);
   checkReference(data, output);
-  auto oneExtent = makeCase(backend, heads, layout, lanes, kv::kVerifyRows, history, true, true);
+  auto oneExtent = makeCase(backend, heads, layout, lanes, rows, history, true, true);
   require(run<Phase::Verify>(backend, oneExtent, false) == output,
           "verify attention over extents differs from one extent of the same pages");
   std::cout << "paged verify: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
-            << " lanes=" << lanes << " PASS\n";
+            << " lanes=" << lanes << " rows=" << rows << " PASS\n";
 }
 
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
@@ -986,7 +1006,7 @@ int main(int argc, char **argv) {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
       for (const auto &[heads, kvHeads] : kGeometries)
-        checkPlans(heads, {1, kvHeads, 256, format});
+        checkPlans(heads, testLayout(heads, kvHeads, format));
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
@@ -997,13 +1017,13 @@ int main(int argc, char **argv) {
     for (const auto &[heads, kvHeads] : kGeometries)
       for (bool float32 : {false, true})
         for (bool verify : {false, true})
-          checkProjection(backend, heads, {1, kvHeads, 256, kv::Format::Int8}, float32,
-                          verify);
+          checkProjection(backend, heads, testLayout(heads, kvHeads, kv::Format::Int8),
+                          float32, verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
       for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
         for (const auto &[heads, kvHeads] : kGeometries)
           for (uint32_t history : {131072U, 260096U}) {
-            const kv::Layout layout{1, kvHeads, 256, format};
+            const kv::Layout layout = testLayout(heads, kvHeads, format);
             auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
             checkReference(prefill, run<Phase::Prefill>(backend, prefill, true));
             auto verify = makeCase(backend, heads, layout, 4, kv::kVerifyRows, history, true);
@@ -1017,7 +1037,7 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
     for (const auto &[heads, kvHeads] : kGeometries) {
-      const kv::Layout layout{1, kvHeads, 256, format};
+      const kv::Layout layout = testLayout(heads, kvHeads, format);
       for (const auto [history, rows] :
            std::array<std::array<uint32_t, 2>, 10>{{{0, 1}, {33, 7}, {255, 17},
                                                   {1023, 8}, {0, 2048},
@@ -1028,8 +1048,13 @@ int main(int argc, char **argv) {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         checkVerify(backend, heads, layout, 0, lanes);
         checkVerify(backend, heads, layout, 1023, lanes);
+        // The production block-8 verify stride (trained-block drafts):
+        // dead rows beyond the live eight are the kernels' problem.
+        checkVerify(backend, heads, layout, 0, lanes, 8);
+        checkVerify(backend, heads, layout, 1023, lanes, 8);
       }
       checkVerify(backend, heads, layout, 16384, 2);
+      checkVerify(backend, heads, layout, 16384, 2, 8);
     }
     std::cout << "paged attention plans: PASS\n";
   } catch (const std::exception &error) {

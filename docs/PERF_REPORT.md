@@ -29,7 +29,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 
 ## A.2 Speculative decoding — DFlash 2 draft
 
-- `runtime/model/DFlashDraft.{hpp,cpp}` — `DraftKind::DFlash2` (also `Plain`, `DSpark`). 5-layer block-diffusion draft: per layer = input RMSNorm → dynamic projection (hidden→dynamicSize 1280) → two-tap dynamic convolution (`draft_conv`) → fused QKV → block-bidirectional attention over a KV ring → MLP with same conv pattern. Conditioned on `CapturedTargetHidden` written by the verify pass (`DFlashDraft.cpp:160–264`).
+- `runtime/model/DFlashTwoDraft.{hpp,cpp}` — `DraftKind::DFlashTwo` (also `DFlashV1`, `DSpark`). 5-layer block-diffusion draft: per layer = input RMSNorm → dynamic projection (hidden→dynamicSize 1280) → two-tap dynamic convolution (`draft_conv`) → fused QKV → block-bidirectional attention over a KV ring → MLP with same conv pattern. Conditioned on `CapturedTargetHidden` written by the verify pass (`DFlashTwoDraft.cpp`).
 - Geometry (`runtime/metal/abi/ExecutionGeometry.h`): `RICHENGINE_DRAFT_QUERY_ROWS=8`, `RICHENGINE_DRAFT_PROPOSAL_TOKENS=7`, `RICHENGINE_TARGET_VERIFY_ROWS=8`, `RICHENGINE_TREE_VERIFY_NODES=16`, `RICHENGINE_MAXIMUM_BATCH_WIDTH=4`, `RICHENGINE_DRAFT_SLIDING_WINDOW=2048`, `RICHENGINE_DRAFT_CANDIDATES=16`, `RICHENGINE_DRAFT_SELECTOR_RANK=256`.
 - Selector (all on GPU, `runtime/metal/kernels/decode/sampling.metal`, host glue `runtime/ops/DraftSelector.cpp`):
   - `draft_select_top16_sharded` (:1170) — top-16 per position over 248K vocab.

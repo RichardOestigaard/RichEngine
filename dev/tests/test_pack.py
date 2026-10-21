@@ -71,6 +71,38 @@ DRAFT_LAYOUT = pack_layouts.DraftLayout(
     causal_layers=0,
 )
 
+def _fields(obj):
+    import dataclasses
+
+    return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
+
+
+PACK_SPEC = {
+    "layout": _fields(LAYOUT),
+    "draft_layout": _fields(DRAFT_LAYOUT),
+    "execution_geometry": {
+        "draft_proposal_tokens": 15,
+        "draft_query_rows": 16,
+        "draft_sliding_window": DRAFT_LAYOUT.sliding_window,
+    },
+}
+
+DIFFUSION_SPEC = {
+    **PACK_SPEC,
+    "draft_layout": None,
+    # DiffusionGemma's denoising schedule, as its generation_config.json
+    # and the block-diffusion scheduler's defaults state it.
+    "diffusion": {
+        "canvas_length": 256,
+        "max_denoising_steps": 48,
+        "t_min": 0.4,
+        "t_max": 0.8,
+        "entropy_bound": 0.1,
+        "confidence_threshold": 0.005,
+        "stability_threshold": 1,
+    },
+}
+
 
 def synthetic_draft_checkpoint(root):
     """A draft safetensors shard at DRAFT_LAYOUT's shapes, the tensor names
@@ -394,8 +426,7 @@ class PackTests(unittest.TestCase):
             {"tokenizer.json": shard, "tokenizer_config.json": shard},
             {"draft/config.json": shard, "draft/model.safetensors": draft},
             {"target": {"repo": "owner/gemma4-test", "revision": "a" * 40}},
-            layout=LAYOUT,
-            draft_layout=DRAFT_LAYOUT,
+            pack=PACK_SPEC,
         )
         self.assertEqual(manifest["format"]["name"], pack.FORMAT_NAME)
         self.assertEqual(manifest["format"]["target_layer_magic"], "GEMM0001")
@@ -418,7 +449,7 @@ class PackTests(unittest.TestCase):
             {"tokenizer.json": shard},
             {},
             {"target": {"repo": "owner/gemma4-test", "revision": "a" * 40}},
-            layout=LAYOUT,
+            pack={**PACK_SPEC, "draft_layout": None},
         )
         self.assertNotIn("draft", bare)
         self.assertEqual(bare["format"]["draft_layer_magic"], "MDFD0004")
@@ -477,7 +508,7 @@ class PackTests(unittest.TestCase):
             {"tokenizer.json": shard},
             {},
             {"target": {"repo": "owner/diffusiongemma-test", "revision": "a" * 40}},
-            layout=LAYOUT,
+            pack=DIFFUSION_SPEC,
         )
         self.assertEqual(manifest["format"]["name"], pack.DIFFUSION_FORMAT_NAME)
         self.assertEqual(manifest["format"]["draft_layer_magic"], "MDFD0004")

@@ -45,10 +45,14 @@ struct HeadArgmaxParams {
   uint32_t stop_token_0;
   uint32_t stop_token_1;
   uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The head's packed output rows: output_size padded to its tile. A
+  // vocabulary that is not a tile multiple pads the last tile's rows; the
+  // pad tokens' argmax stays out by the output_size bound.
+  uint32_t output_stride;
 };
 
-static_assert(sizeof(HeadArgmaxParams) == 40,
-              "Head argmax parameters are 40 bytes on both sides");
+static_assert(sizeof(HeadArgmaxParams) == 44,
+              "Head argmax parameters are 44 bytes on both sides");
 
 struct TargetSamplingParams {
   uint32_t vocabulary;
@@ -74,10 +78,17 @@ struct TargetSamplingParams {
   // selection kernels skip it. Unadapted dispatches fill every lane with
   // rows.
   uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The packed lane stride of the logits and mask rows: a chain batch's
+  // verify stride (draft.verifyRows()), RICHENGINE_TREE_VERIFY_NODES for a
+  // tree lane.
+  uint32_t lane_stride;
+  // A row's logits span in the logits buffer: vocabulary padded to the
+  // head's section rows when the vocabulary is not a tile multiple.
+  uint32_t logits_stride;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 128,
-              "Target sampling parameters are 128 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 136,
+              "Target sampling parameters are 136 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -142,10 +153,16 @@ struct SamplingPenaltyParams {
   float repetition_inverse[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   float presence[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   float frequency[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The packed lane stride of the logits and verify-input rows each entry
+  // addresses: the batch's verify stride (draft.verifyRows()).
+  uint32_t verify_stride;
+  // A row's logits span in the logits buffer (vocabulary padded to the
+  // head's section rows); the words table strides vocabulary.
+  uint32_t logits_stride;
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 112,
-              "Sampling penalty parameters are 112 bytes on both sides");
+static_assert(sizeof(SamplingPenaltyParams) == 120,
+              "Sampling penalty parameters are 120 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
@@ -159,10 +176,24 @@ struct SelectorBatchParams {
   uint32_t sampling_mask;
   uint32_t vocabulary;
   uint32_t tree_mask;
+  // The lanes' packed draft query-row stride: the draft's trained-block
+  // depth (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
+  uint32_t query_rows;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 48,
-              "Draft selector parameters are 48 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 52,
+              "Draft selector parameters are 52 bytes on both sides");
+
+// The draft top-16 shard kernels' scalar payload (draft_select_top16_sharded,
+// dspark_select_top16_sharded): the token bound and the logits row stride,
+// which differ on a padded-vocabulary target.
+struct DraftTop16Params {
+  uint32_t vocabulary;
+  uint32_t logits_stride;
+};
+
+static_assert(sizeof(DraftTop16Params) == 8,
+              "Draft top-16 parameters are 8 bytes on both sides");
 
 // One node of a lane's verify tree (draft_select_tree): the DFS row of its
 // parent (0xFF for the anchor), its depth from the anchor, and its proposal
@@ -187,10 +218,13 @@ struct AcceptBatchParams {
   // position (RICHENGINE_DRAFT_CANDIDATES for merged selectors, the
   // shards-times-candidates pool for DSpark).
   uint32_t candidate_stride;
+  // The packed lane stride of the target rows: the batch's verify stride
+  // (draft.verifyRows()).
+  uint32_t verify_stride;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 48,
-              "Batched acceptance parameters are 48 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 52,
+              "Batched acceptance parameters are 52 bytes on both sides");
 
 // verify_input_tree_tokens parameters: one thread per (lane, node) fills the
 // node's verify input token, its (t, h, w) rope position (the lane's base

@@ -24,6 +24,17 @@ static inline void gguf_store_pairs(thread const uchar *slots, device uchar *dst
     ((device uint *)dst)[c] = word;
   }
 }
+// 32 slot values of `bits` bits each as one contiguous bitstream (the oQ
+// plane0 order): slot s at bits [s*bits, s*bits+bits), for bits that do not
+// divide a word.
+static inline void gguf_store_stream(thread const uchar *slots, uint bits, device uchar *dst) {
+  for (uint i = 0; i < 4 * bits; ++i) dst[i] = 0;
+  for (uint s = 0; s < 32; ++s) {
+    const uint bit = s * bits;
+    dst[bit >> 3] |= uchar(slots[s] << (bit & 7));
+    if ((bit & 7) + bits > 8) dst[(bit >> 3) + 1] |= uchar(slots[s] >> (8 - (bit & 7)));
+  }
+}
 // A group of a format that keeps its native bytes (metal/abi/QuantFormat.h): group j's plane0 and plane1 bytes of
 // the block from `at0` and `at1` on, and once per block the meta unit from `atMeta`.
 static inline void gguf_copy_native(device const uchar *blk, uint j, constant QuantFormat &f, uint at0, uint at1,
@@ -111,6 +122,20 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 * j + e / 2] >> (4 * (e & 1))) & 15;
       gguf_store_pairs(lo, out0);
       if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[32 + i];
+      break;
+    }
+    case GGUF_FMT_AF5: case GGUF_FMT_AF6: case GGUF_FMT_AF8:
+    case GGUF_FMT_AF4G128: case GGUF_FMT_AF5G128: case GGUF_FMT_AF6G128: case GGUF_FMT_AF8G128: {
+      // oQ affine: the block's element-order bitstream of block_elements*bits/8 bytes, then the meta unit.
+      const uint obits = f.plane0_bytes * 8 / 32;
+      device const uchar *qs = blk + j * 4 * obits;
+      for (uint e = 0; e < 32; ++e) {
+        const uint bit = e * obits;
+        lo[quant_slot(e)] = uchar((uint(qs[bit >> 3]) | (uint(qs[(bit >> 3) + 1]) << 8)) >> (bit & 7)) &
+                            uchar((1u << obits) - 1);
+      }
+      gguf_store_stream(lo, obits, out0);
+      if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[f.block_elements * obits / 8 + i];
       break;
     }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]

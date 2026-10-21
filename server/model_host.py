@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 from . import images as image_input
 from . import runtime as engine_runtime
 from . import serve_options
+from . import serving
 from .backend import NativeBackend
 from .chat_templates import ChatTemplates
 from .constraints import ConstraintFactory, validate_tokenizer
@@ -27,6 +28,7 @@ from .diagnostics import accent, dim, print_request, print_status
 from .errors import APIError
 from .frontend import Frontend
 from .thinking import ThinkingCodec, load_thinking_key
+from .tool_schema import dialect_named
 
 NATIVE_START_TIMEOUT = 600.0
 IDLE_WATCH_TICK = 30.0
@@ -154,13 +156,16 @@ class ModelHost:
             model_artifacts.parse_model_id(model_id)
         except argparse.ArgumentTypeError as error:
             raise APIError(400, str(error)) from None
-        selection = model_artifacts.Selection.of(
-            self._models_root(),
-            model_id,
-            revision=revision,
-            language_only=language_only,
-            draft_model=draft_model,
-        )
+        try:
+            selection = model_artifacts.Selection.of(
+                self._models_root(),
+                model_id,
+                revision=revision,
+                language_only=language_only,
+                draft_model=draft_model,
+            )
+        except model_artifacts.ModelError as error:
+            raise APIError(400, str(error)) from None
         if model_artifacts.installation_kind(selection.link) is None:
             raise APIError(
                 404,
@@ -183,16 +188,27 @@ class ModelHost:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, local_files_only=True, trust_remote_code=False
         )
-        contract = validate_tokenizer(tokenizer, str(tokenizer_path))
+        # The assembly's serving contract: the spellings and defaults this
+        # model's record declares (or its family file does), per model, not
+        # per server.
+        serving_contract = serving.load(assembly_dir)
+        contract = validate_tokenizer(tokenizer, str(tokenizer_path), serving_contract)
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Special tokens the output parser needs as text: the dialect's call
         # markup, and the think-close token where it is a special token.
         visible_token_ids = {contract.think_end_id, contract.think_open_id}
-        for template in chat_templates.templates.values():
-            dialect = template.dialect
-            if dialect is None:
-                continue
+        dialects = {
+            template.dialect
+            for template in chat_templates.templates.values()
+            if template.dialect is not None
+        }
+        # The contract's dialect counts too: the probe may render a template
+        # whose call markup it cannot classify while the family file names it.
+        declared = dialect_named(serving_contract.tool_dialect)
+        if declared is not None:
+            dialects.add(declared)
+        for dialect in dialects:
             for marker in dialect.structural:
                 ids = tokenizer.encode(marker, add_special_tokens=False)
                 if len(ids) == 1:
@@ -201,12 +217,6 @@ class ModelHost:
         native_fields = vars(self.args).copy()
         native_fields["assembly_dir"] = str(assembly_dir)
         native_args = argparse.Namespace(**native_fields)
-        # The canvas profile reaches the engine through the environment; an
-        # explicit RICHENGINE_CANVAS_PROFILE wins over the flag, and both win
-        # over autotune below. Only a non-default choice is exported — the
-        # "paper" default would shadow a tuned profile forever.
-        if self.args.canvas_profile != "paper":
-            os.environ.setdefault("RICHENGINE_CANVAS_PROFILE", self.args.canvas_profile)
         # Autotune's per-chip knob winners (install/autotune.py's sweep) reach
         # the engine as environment at spawn; any variable the user set wins.
         # A record made on another engine build is stale and ignored.
@@ -229,12 +239,26 @@ class ModelHost:
                 + (", ".join(applied) if applied else "all overridden")
                 + (f" · your env keeps {', '.join(overridden)}" if overridden else "")
             )
+        # The canvas profile reaches the engine through the environment; an
+        # explicit RICHENGINE_CANVAS_PROFILE wins over the flag, and both win
+        # over the tuned value below. Only a non-default choice is exported —
+        # the "paper" default would shadow a tuned profile forever — and it
+        # goes to this engine's spawn environment only, so one model's
+        # profile never persists into the next model's.
+        canvas_profile = self.args.canvas_profile
+        tuned_env = autotune.tuned_environment(assembly_dir, binary=binary)
+        if canvas_profile != "paper":
+            env = tuned_env if tuned_env is not None else dict(os.environ)
+            env["RICHENGINE_CANVAS_PROFILE"] = os.environ.get(
+                "RICHENGINE_CANVAS_PROFILE", canvas_profile
+            )
+            tuned_env = env
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(native_args),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=self.args.queue_size,
             eager_start=False,
-            env=autotune.tuned_environment(assembly_dir, binary=binary),
+            env=tuned_env,
         )
         # The packed manifest names diffusion targets (packed-only families
         # install as packages; an assembly has no manifest); their canvas
@@ -294,12 +318,13 @@ class ModelHost:
                 constraint_factory=constraint_factory,
                 chat_templates=chat_templates,
                 max_image_pixels=self.args.max_image_pixels,
-                thinking_codec=self.thinking_codec,
+                thinking_codec=self.thinking_codec.scoped(model_id),
                 served_model_names=self.args.served_model_name,
                 announce_served_name=self.args.announce_served_name,
                 default_reasoning_effort=self.args.default_reasoning_effort,
                 vision=readiness.vision,
                 contract=contract,
+                serving=serving_contract,
                 shared_prefix_states=self.args.shared_prefix_state,
             )
         except BaseException:

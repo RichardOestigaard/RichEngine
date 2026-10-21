@@ -1,7 +1,9 @@
 #include "TestChecks.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/TargetLoader.hpp"
+#include "model/MiniCpmV47.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "ops/DraftAttention.hpp"
 
 #include "metal/abi/QuantFormat.h"
 
@@ -29,12 +31,16 @@ model::ModelPackage package() {
     draft.dynamicSize = 512;
     draft.intermediateSize = 6144;
     draft.targetHiddenSize = target.layout.capturedHiddenSize();
+  } else if constexpr (std::is_same_v<Weights, model::MiniCpmV47MoeWeights>) {
+    draft = model::minicpmV47DraftLayout();
   }
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::AffineWeights{});
   };
   const auto &layout = target.layout;
-  target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
+  target.logitsProjection =
+      projection(model::paddedVocabularySize(layout.vocabularySize),
+                 layout.hiddenSize);
   target.layers.resize(layout.layers);
   for (uint32_t i = 0; i < layout.layers; ++i) {
     auto &layer = target.layers[i];
@@ -151,7 +157,8 @@ void checkLaneScratch(const model::ModelPackage &package) {
       const ops::ExecutionPlans plans(device);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
-        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
+        if (matrix.outputSize && matrix.inputSize)
+          for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
             const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
@@ -204,6 +211,64 @@ void checkGdnWidths() {
   require(geometryRejected(withoutGates), "packed GDN rows without the gates reached arena sizing");
 }
 
+// The chain verify's packed lane stride follows the draft's trained block
+// depth, rounded up to the decode kernels' eight-row tile and capped at the
+// verify capacity: a block-8 draft verifies eight rows (its seven proposals
+// plus the anchor), a deeper block keeps sixteen, and a draftless model
+// takes the full capacity.
+void checkVerifyRows() {
+  model::DFlashDraftLayout null{};
+  require(null.verifyRows() == model::ExecutionLimits::targetVerifyRows,
+          "a draftless model must verify the full capacity");
+  model::DFlashDraftLayout dflash2{model::DraftKind::DFlashTwo};
+  dflash2.blockSize = 8;
+  require(dflash2.verifyRows() == 8 && dflash2.proposalLimit() == 7,
+          "a block-8 draft must verify its trained depth");
+  dflash2.blockSize = 16;
+  require(dflash2.verifyRows() == model::ExecutionLimits::targetVerifyRows,
+          "a block-16 draft keeps the full verify depth");
+  model::DFlashDraftLayout block9{model::DraftKind::DFlashV1};
+  block9.blockSize = 9;
+  require(block9.verifyRows() == model::ExecutionLimits::targetVerifyRows &&
+              block9.proposalLimit() == 8,
+          "a nine-row verify depth rounds up to the next eight-row tile");
+  model::DFlashDraftLayout block7{model::DraftKind::DFlashTwo};
+  block7.blockSize = 7;
+  require(block7.verifyRows() == 8 && block7.proposalLimit() == 6,
+          "a block-7 draft's six proposals and anchor fit the first tile");
+  // MiniCPM-V 4.7's DSpark: a 15-proposal block verifies the full stride.
+  const auto dspark = model::minicpmV47DraftLayout();
+  require(dspark.kind == model::DraftKind::DSpark && dspark.blockSize == 15 &&
+              dspark.verifyRows() == model::ExecutionLimits::targetVerifyRows &&
+              dspark.proposalLimit() == 15 &&
+              dspark.queryRows() == model::ExecutionLimits::targetVerifyRows,
+          "the MiniCPM DSpark draft must keep the full verify stride");
+}
+
+// MiniCPM-V 4.7 keeps the 35B MoE geometry with a vocabulary (248144) that
+// is not a tile multiple: the packed head and each logits row span round to
+// it (248320), the token ids stay within the real vocabulary, and the
+// draft's 8x2x256 attention head pattern plans.
+void checkMiniCpm() {
+  auto sparse = package<model::MiniCpmV47MoeWeights>();
+  const auto geometry = model::RuntimeGeometry::from(sparse, kv::Format::Int8);
+  require(geometry.target.vocabularySize == 248144 &&
+              geometry.target.paddedVocabularySize == 248320,
+          "the MiniCPM vocabulary's padded storage must round to a tile");
+  const auto &draft = geometry.draft;
+  require(draft.hiddenSize == 2048 && draft.kvHeads == 2 &&
+              draft.attentionHeadDimension == 256 && draft.layers == 5 &&
+              draft.targetHiddenSize == 5 * 2048,
+          "the MiniCPM DSpark draft geometry changed");
+  // The head-kernel dispatch shape: 8 query heads over 2 kv heads of 256
+  // (the _q8k2d256 cores). A packed forward keeps the full 16-row stride.
+  const auto shape = draft.attentionShape();
+  require(shape.queryHeads == 8 && shape.kvHeads == 2 &&
+              shape.headDimension == 256 && shape.qkvSize == 3072,
+          "the MiniCPM draft attention shape changed");
+  (void)ops::DraftAttention::plan(shape, 1, model::ExecutionLimits::targetVerifyRows);
+}
+
 } // namespace
 
 int main() {
@@ -211,11 +276,15 @@ int main() {
     checkUnsizedProjection();
     checkGdnWidths();
     checkMixedLayouts();
+    checkVerifyRows();
+    checkMiniCpm();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
+    const auto minicpm = package<model::MiniCpmV47MoeWeights>();
     checkLaneScratch(dense);
     checkLaneScratch(sparse);
-    std::cout << "model execution plans: PASS (two paired geometries)\n";
+    checkLaneScratch(minicpm);
+    std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

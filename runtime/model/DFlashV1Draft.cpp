@@ -63,7 +63,8 @@ DFlashV1Draft::DFlashV1Draft(const DFlashV1DraftWeights &weights,
                        metal::MetalBackend &backend,
                        const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
+      selector_(weights.layout.vocabularySize,
+                paddedVocabularySize(weights.layout.vocabularySize)),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashV1Draft::addSelection(
@@ -72,9 +73,11 @@ void DFlashV1Draft::addSelection(
     std::span<const ops::SamplingPolicy> policies,
     uint32_t treeMask) const {
   if (treeMask)
-    selector_.addPlainTree(graph, buffers, anchors, policies, treeMask);
+    selector_.addPlainTree(graph, buffers, anchors, policies, treeMask,
+                           weights_.layout.queryRows());
   else
-    selector_.addPlain(graph, buffers, anchors, policies);
+    selector_.addPlain(graph, buffers, anchors, policies,
+                     weights_.layout.queryRows());
 }
 
 void DFlashV1Draft::addContextPrefill(
@@ -133,9 +136,9 @@ void DFlashV1Draft::addDecode(
     throw std::invalid_argument("invalid draft decode batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * layout.queryRows();
   const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes);
+      operators_.draftAttention(layout.attentionShape(), lanes, layout.queryRows());
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
@@ -149,7 +152,7 @@ void DFlashV1Draft::addDecode(
     const uint32_t next = current ^ 1;
     const bool causal = (layout.causalLayers >> layer) & 1;
     const DFlashV1DraftLayerWeights &weights = weights_.layers[layer];
-    const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes);
+    const ops::LinearPlan qkvPlan = linear.decodePlan(weights.qkvProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
     const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, qkvPlan.input());
@@ -175,8 +178,9 @@ void DFlashV1Draft::addDecode(
                        .residual = buffers.hidden[current], .scratch = scratch},
                weights.outputProjection,
                linear.decodePlan(weights.outputProjection, lanes,
-                                 ops::LinearEpilogue::Residual));
-    const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes);
+                                 ops::LinearEpilogue::Residual, nullptr,
+                                 layout.queryRows()));
+    const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpPlan.input());
@@ -185,18 +189,19 @@ void DFlashV1Draft::addDecode(
                 .scratch = scratch,
                 .prepared = mlpNormalized},
                weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection),
+               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection, layout.queryRows()),
                &weights.gateProjection);
     linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
                        .residual = buffers.residual, .scratch = scratch},
                weights.downProjection,
                linear.decodePlan(weights.downProjection, lanes,
-                                 ops::LinearEpilogue::Residual));
+                                 ops::LinearEpilogue::Residual, nullptr,
+                                 layout.queryRows()));
   }
 
   // The final norm feeds the shared vocabulary head; the plain selector
   // works on the head's logits directly and needs no projection of its own.
-  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
+  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
@@ -223,21 +228,21 @@ void DFlashV1Draft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * layout.verifyRows();
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
-             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes));
+             weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows()));
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
+  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes);
+    if (layer) kvPlan = linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},
@@ -246,7 +251,7 @@ void DFlashV1Draft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape());
+        startPositions, layout.attentionShape(), layout.verifyRows());
   }
 }
 

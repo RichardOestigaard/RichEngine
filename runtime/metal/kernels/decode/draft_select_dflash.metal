@@ -70,7 +70,7 @@ kernel void draft_select_edges(
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const uint Rows = params.query_rows;
   constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
@@ -108,8 +108,11 @@ kernel void draft_select_edges(
   device float *table = partial_values +
                         ulong(params.lanes) * Positions * Shards * Candidates +
                         ulong(row) * Candidates * Candidates;
+  // Positions past the live block's last row read the next lane's
+  // selector-hidden; dead positions' picks are discarded downstream, so
+  // clamping the source row inside the lane is free and bounds-safe.
   device const bfloat *row_hidden =
-      hidden + (ulong(batch) * Rows + position + 1) * Rank;
+      hidden + (ulong(batch) * Rows + min(position + 1, Rows - 1)) * Rank;
   for (uint task = simd_group; task < tasks; task += threads / 32) {
     uint predecessor_index = task / (Candidates / TaskCandidates);
     uint first_candidate =
@@ -162,7 +165,7 @@ kernel void dflash_select_pool_edges(
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = RICHENGINE_DRAFT_QUERY_ROWS;
+  const uint Rows = params.query_rows;
   constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
@@ -175,7 +178,7 @@ kernel void dflash_select_pool_edges(
                         ulong(params.lanes) * Positions * Pool +
                         ulong(row) * Pool * Pool;
   device const bfloat *row_hidden =
-      hidden + (ulong(batch) * Rows + position + 1) * Rank;
+      hidden + (ulong(batch) * Rows + min(position + 1, Rows - 1)) * Rank;
   const uint tasks = (position ? Pool : 1u) * (Pool / TaskCandidates);
   for (uint task = simd_group; task < tasks; task += threads / 32) {
     const uint predecessor_index = task / (Pool / TaskCandidates);

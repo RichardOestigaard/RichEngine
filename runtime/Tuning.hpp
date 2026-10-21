@@ -36,6 +36,7 @@ struct Tuning {
   bool mtl4 = false;            // RICHENGINE_MTL4 (presence)
   bool preparedCacheOff = false; // RICHENGINE_PREPARED_CACHE_OFF (presence)
   bool opTimings = false;       // RICHENGINE_OP_TIMINGS=1
+  bool gpuSpans = false;        // RICHENGINE_GPU_SPANS (presence)
   // metal/CommandGraph.hpp
   bool patchableOff = false;    // RICHENGINE_PATCHABLE_OFF (presence)
   // model/TargetModelGemma.cpp
@@ -64,16 +65,21 @@ struct Tuning {
   bool adaptiveProposals = true;    // RICHENGINE_ADAPTIVE_PROPOSALS, =0 disables
   bool ngramPredraft = true;        // RICHENGINE_NGRAM_PREDRAFT, =0 disables
   bool draftBypass = true;          // RICHENGINE_DRAFT_BYPASS, =0 disables
+  bool gpuPredraft = true;          // RICHENGINE_GPU_PREDRAFT, =0 disables
   double draftBypassExpect = 0.15;  // RICHENGINE_DRAFT_BYPASS_EXPECT
   double ngramDraftExpect = 4.0;    // RICHENGINE_NGRAM_DRAFT_EXPECT
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;        // RICHENGINE_NGRAM_TREE_MIN
+  double treeAcceptMin = 0.0;       // RICHENGINE_TREE_ACCEPT_MIN
+  double treeAcceptMax = 6.0;       // RICHENGINE_TREE_ACCEPT_MAX
   // Presence flags for the threshold knobs above: a family's ModelTuning
   // value is the default and an explicitly set variable overrides it.
   bool draftBypassExpectSet = false;
   bool ngramDraftExpectSet = false;
   bool ngramWarmupSet = false;
   bool ngramTreeMinSet = false;
+  bool treeAcceptMinSet = false;
+  bool treeAcceptMaxSet = false;
   // model/RuntimeImpl.hpp debug gates
   bool treeDebug = false;           // RICHENGINE_TREE_DEBUG (presence)
   bool draftDebug = false;          // RICHENGINE_DRAFT_DEBUG (presence)
@@ -85,7 +91,7 @@ struct Tuning {
   const char *aneMedusa = nullptr;  // RICHENGINE_ANE_MEDUSA path
   const char *anePredraft = nullptr; // RICHENGINE_ANE_PREDRAFT path
   bool diffusionAr = false;         // RICHENGINE_DIFFUSION_AR=1
-  // model/DFlashDraft.cpp
+  // model/DFlashTwoDraft.cpp
   bool dflashPoolSet = false;       // RICHENGINE_DFLASH_POOL (presence)
   bool dflashPool = false;          // RICHENGINE_DFLASH_POOL=1
   // Registered for completeness; the call sites below live in engine/ or in
@@ -145,6 +151,7 @@ inline Tuning makeTuning() {
   t.mtl4 = envFlag("RICHENGINE_MTL4");
   t.preparedCacheOff = envFlag("RICHENGINE_PREPARED_CACHE_OFF");
   t.opTimings = envFlagOn("RICHENGINE_OP_TIMINGS");
+  t.gpuSpans = envFlag("RICHENGINE_GPU_SPANS");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");
@@ -185,6 +192,7 @@ inline Tuning makeTuning() {
   t.adaptiveProposals = unlessZero("RICHENGINE_ADAPTIVE_PROPOSALS");
   t.ngramPredraft = unlessZero("RICHENGINE_NGRAM_PREDRAFT");
   t.draftBypass = unlessZero("RICHENGINE_DRAFT_BYPASS");
+  t.gpuPredraft = unlessZero("RICHENGINE_GPU_PREDRAFT");
   t.draftBypassExpectSet = envFlag("RICHENGINE_DRAFT_BYPASS_EXPECT");
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
   t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");
@@ -193,6 +201,10 @@ inline Tuning makeTuning() {
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
   t.ngramTreeMin = envDouble("RICHENGINE_NGRAM_TREE_MIN", 1.0);
+  t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");
+  t.treeAcceptMin = envDouble("RICHENGINE_TREE_ACCEPT_MIN", 0.0);
+  t.treeAcceptMaxSet = envFlag("RICHENGINE_TREE_ACCEPT_MAX");
+  t.treeAcceptMax = envDouble("RICHENGINE_TREE_ACCEPT_MAX", 6.0);
   t.treeDebug = envFlag("RICHENGINE_TREE_DEBUG");
   t.draftDebug = envFlag("RICHENGINE_DRAFT_DEBUG");
   t.draftConf = envFlag("RICHENGINE_DRAFT_CONF");

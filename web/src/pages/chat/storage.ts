@@ -121,9 +121,9 @@ function withoutMedia(conversation: Conversation): Conversation {
 // flushed synchronously when the page goes away.
 let saveScheduled = false;
 const idleRun: (fn: () => void, options?: { timeout: number }) => void =
-  typeof window.requestIdleCallback === "function"
-    ? (fn, options) => { window.requestIdleCallback(fn, options); }
-    : (fn) => { setTimeout(fn, 300); };
+  typeof globalThis.requestIdleCallback === "function"
+    ? (fn, options) => { globalThis.requestIdleCallback(fn, options); }
+    : (fn, options) => { setTimeout(fn, options?.timeout ?? 300); };
 
 function persistChats(): void {
   // Browser storage holds a few MB per site, which one photo can fill. Rather

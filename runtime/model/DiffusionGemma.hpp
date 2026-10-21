@@ -33,10 +33,8 @@ struct DiffusionSchedule final {
   float confidenceThreshold = 0.005F;
   uint32_t stabilityThreshold = 1;
   // The token that fills canvas positions past the first stop token of a
-  // committed canvas.
+  // committed canvas (Gemma's <pad>, id 0; the manifest may state it).
   uint32_t padToken = 0;
-  // The previous-step soft embeddings' scale (sqrt(hidden)).
-  float softEmbedScale = 0.0F; // derived: sqrt(hiddenSize)
 
   [[nodiscard]] constexpr float temperature(uint32_t step) const noexcept {
     return tMin + (tMax - tMin) * static_cast<float>(step) /

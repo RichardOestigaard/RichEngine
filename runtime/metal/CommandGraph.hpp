@@ -173,6 +173,18 @@ public:
     --bakedSpanSuspend_;
   }
 
+  // Marks the dispatches added between the calls as one GPU-encoded span:
+  // MetalBackend stages their descriptors and lets the gpu_encode kernel
+  // write the indirect commands on device (ComputeDispatch::gpuSpan).
+  // Spans nest like the baked ones; a gpu span's dispatches are never
+  // bakeable.
+  void beginGpuSpan() { ++gpuSpanDepth_; }
+  void endGpuSpan() {
+    if (!gpuSpanDepth_)
+      throw std::logic_error("CommandGraph gpu span was not open");
+    --gpuSpanDepth_;
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   // The dispatches alone; command() has the event steps too.
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
@@ -189,7 +201,9 @@ private:
     dispatch.pipelineName = std::move(pipeline);
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
-    dispatch.bakeable = bakedSpanDepth_ > 0 && !bakedSpanSuspend_;
+    dispatch.bakeable =
+        bakedSpanDepth_ > 0 && !bakedSpanSuspend_ && !gpuSpanDepth_;
+    dispatch.gpuSpan = gpuSpanDepth_ > 0;
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
@@ -204,6 +218,7 @@ private:
 
   uint32_t bakedSpanDepth_ = 0;
   uint32_t bakedSpanSuspend_ = 0;
+  uint32_t gpuSpanDepth_ = 0;
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;

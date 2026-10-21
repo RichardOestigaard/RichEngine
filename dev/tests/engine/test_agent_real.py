@@ -294,7 +294,6 @@ class AgentRunnerTests(unittest.TestCase):
             ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", True),
             ("unsloth/Qwen3.6-35B-A3B-GGUF:", False),
             ("unsloth/Qwen3.6-35B-A3B-GGUF:UD/Q4_K_M", False),
-            ("qwen3.8-27b", False),
         ):
             for name, parse in parsers.items():
                 with (
@@ -306,6 +305,23 @@ class AgentRunnerTests(unittest.TestCase):
                     else:
                         with self.assertRaises(SystemExit):
                             parse(model)
+        # A bare name is not a repository ID: serve defers its resolution to
+        # selection time while the real helpers resolve eagerly at parse, so
+        # only they reject a name no local cache holds.
+        with mock.patch(
+            "install.local.find",
+            side_effect=agent.launcher.model_artifacts.ModelError("missing"),
+        ):
+            self.assertEqual(
+                parsers["richengine serve"]("qwen3.8-27b").model, "qwen3.8-27b"
+            )
+            for name in ("agent_real", "smoke_real"):
+                with (
+                    self.subTest(parser=name, model="qwen3.8-27b"),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit):
+                        parsers[name]("qwen3.8-27b")
 
     def test_complete_phase_handles_auxiliary_cancellation_and_retains_failures(self):
         for mode in (

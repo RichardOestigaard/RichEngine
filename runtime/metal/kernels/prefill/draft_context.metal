@@ -43,3 +43,5 @@ PREFILL_DRAFT_CONTEXT_KERNEL(prefill_draft_context_kv_q16k2, 2, 128, false,
                              false)
 PREFILL_DRAFT_CONTEXT_KERNEL(prefill_draft_context_kv_q32k8d64i, 8, 64, true,
                              true)
+PREFILL_DRAFT_CONTEXT_KERNEL(prefill_draft_context_kv_q8k2d256, 2, 256, false,
+                             false)

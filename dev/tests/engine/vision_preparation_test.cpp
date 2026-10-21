@@ -78,6 +78,7 @@ int main(int argc, char **argv) {
     layout.heads = 2;
     layout.headDimension = 4;
     layout.positionGridSide = 2;
+    layout.spatialMerge = 2;
     const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
     std::vector<uint8_t> bytes(image.bytes);
     image.write(bytes, {});

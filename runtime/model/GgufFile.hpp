@@ -29,6 +29,10 @@ public:
 // rest are looked up in kGgmlTypes.
 namespace ggml {
 inline constexpr uint32_t kF32 = 0, kBF16 = 30, kPQ2_0 = 142;
+// Not a ggml type: the private id marking a descriptor-prefixed section whose
+// planes are StorageN-packed affine q4 tiles, so an oQ image can hold a
+// projection the Affine64 kernels read (model/OqWrite.cpp).
+inline constexpr uint32_t kAffineQ4 = 0x80000a04;
 }
 
 struct GgmlTypeTraits {
@@ -40,7 +44,7 @@ struct GgmlTypeTraits {
 // (id, name, block elements, block bytes) of the ggml types this parser can
 // size, as ggml-common.h defines them and, for 142, PrismML-Eng/llama.cpp's
 // block_pq2_0; a tensor of another type is rejected.
-inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 32> kGgmlTypes{{
+inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 39> kGgmlTypes{{
     {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
     {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
     {8, {"Q8_0", 32, 34}},      {9, {"Q8_1", 32, 36}},      {10, {"Q2_K", 256, 84}},
@@ -55,6 +59,14 @@ inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 32> kGgmlTypes{
     // Not a GGML type: the private id of the AF4 sections an MLX affine
     // image carries (metal/abi/QuantFormat.h), listed so its tensors size.
     {0x80000af4, {"AF4", 64, 36}},
+    // The oQ formats' private ids, as AF4's (metal/abi/QuantFormat.h).
+    {0x80000af5, {"AF5", 64, 44}},
+    {0x80000af6, {"AF6", 64, 52}},
+    {0x80000af8, {"AF8", 64, 68}},
+    {0x80001af4, {"AF4G128", 128, 68}},
+    {0x80001af5, {"AF5G128", 128, 84}},
+    {0x80001af6, {"AF6G128", 128, 100}},
+    {0x80001af8, {"AF8G128", 128, 132}},
 }};
 
 // nullptr for type ids this parser does not know.

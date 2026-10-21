@@ -119,6 +119,25 @@ namespace detail {
 
 } // namespace detail
 
+// The compiled attention kernel set a model's KV geometry binds, declared
+// by the family maker on its target layout. The attention dispatch
+// validates the layer's shape against the declared core instead of
+// inferring one, so a geometry drift fails rather than silently binding
+// another model's kernels. Storage-only callers (page sizing) may leave it
+// Unspecified.
+enum class Core : uint8_t {
+  Unspecified,
+  Kv4Group6,
+  Kv4Group4,
+  Kv2Group8,
+  Kv2Group8D128,
+  Kv8Group4D64,
+  Kv8Group5D64,
+  Kv8Group4D128,
+  GemmaKv8H256,
+  GemmaKv2H512,
+};
+
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric
 // quantization (INT8 bytes, FP8 E4M3 bytes or INT4 nibbles, two elements per
 // byte). Layer and head counts vary by target.
@@ -146,6 +165,10 @@ struct Layout final {
   // full layer's — so it travels on the per-layer layout the attention
   // dispatches take, not on the pool's.
   uint32_t windowTokens = 0;
+  // The declared attention kernels: attentionCore for the primary geometry,
+  // altAttentionCore for the altLayerMask layers (Gemma 4's globals).
+  Core attentionCore = Core::Unspecified;
+  Core altAttentionCore = Core::Unspecified;
 
   [[nodiscard]] constexpr bool isAltLayer(uint32_t layer) const noexcept {
     return layer < 64 && ((altLayerMask >> layer) & 1);
@@ -156,10 +179,13 @@ struct Layout final {
   [[nodiscard]] constexpr uint32_t headDimensionAt(uint32_t layer) const noexcept {
     return isAltLayer(layer) ? altHeadDimension : headDimension;
   }
+  [[nodiscard]] constexpr Core attentionCoreAt(uint32_t layer) const noexcept {
+    return isAltLayer(layer) ? altAttentionCore : attentionCore;
+  }
   // The uniform one-layer layout a layer's kernels take.
   [[nodiscard]] constexpr Layout layerLayout(uint32_t layer) const noexcept {
     return {1, kvHeadsAt(layer), headDimensionAt(layer), format, scoreScale,
-            0, 0, 0, windowTokens};
+            0, 0, 0, windowTokens, attentionCoreAt(layer), Core::Unspecified};
   }
 
   [[nodiscard]] constexpr bool valid() const noexcept {

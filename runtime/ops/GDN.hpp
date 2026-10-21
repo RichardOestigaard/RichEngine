@@ -9,6 +9,11 @@
 
 namespace richengine::ops {
 
+// The compiled GDN kernel set a model's recurrent block binds, declared by
+// the family maker (TargetModelGeometry::gdnCore). The plan validates the
+// shape carries the core's compiled geometry instead of inferring it.
+enum class GdnCore : uint8_t { Unspecified, Value48, Value32 };
+
 // Tensor geometry mapped to a compiled Metal variant during graph construction.
 struct GdnShape final {
   uint32_t keyHeads = 0;
@@ -16,6 +21,7 @@ struct GdnShape final {
   uint32_t headDimension = 0;
   uint32_t convolutionDimension = 0;
   uint32_t packedWidth = 0;
+  GdnCore core = GdnCore::Unspecified;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return keyHeads && valueHeads && valueHeads % keyHeads == 0 &&
@@ -110,12 +116,16 @@ public:
   // cannot hold it.
   // liveRows bounds each lane's serial verify scan (adaptive proposal
   // budgets); empty scans all RICHENGINE_TARGET_VERIFY_ROWS rows.
+  // verifyStride is the lanes' packed row stride: draft.verifyRows() for a
+  // trained-block draft — the packed, mixed, decay, beta and hidden tensors
+  // are lane-major at that stride.
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
                                  LinearInput input,
-                                 std::span<const uint32_t> liveRows = {});
+                                 std::span<const uint32_t> liveRows = {},
+                                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS);
   // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.
@@ -128,7 +138,8 @@ public:
                                      GdnHeadOrder order, LinearInput input);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
-                        GdnStateStrides state);
+                        GdnStateStrides state,
+                        uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS);
   static void addCommitTree(metal::CommandGraph &graph,
                             GdnCommitBuffers buffers,
                             metal::MetalBuffer retainedPath,

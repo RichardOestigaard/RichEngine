@@ -61,14 +61,19 @@ public:
     if (const GgufTensor *tensor = floatVector(name, elements)) copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
-  // Quantized rows [N, K] repacked into planes, rows in `order`.
+  // Quantized rows [N, K] repacked into planes, rows in `order`. `rows`
+  // may exceed the tensor's own within one tail tile: a vocabulary that is
+  // not a tile multiple pads its head section with zero rows.
   void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
-    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (tensor->rows() > rows || rows - tensor->rows() >= QUANT_TILE_ROWS ||
+        tensor->columns() != columns)
+      throw GgufError("unexpected shape for " + name);
     const uint32_t format = gguf_format_of(tensor->type);
     Repack repack = planes(format, rows, columns, name);
-    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
+    repack.sources.push_back(
+        tensorRows(*tensor, tensor->rows(), ggufRowBytes(kQuantFormats[format], columns), order));
     image_.repacks.push_back(std::move(repack));
   }
 
@@ -507,7 +512,7 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
                                      : "output_norm.weight",
                  geometry.hiddenSize);
   head.quantized(geometry.tiedOutput ? "token_embd.weight" : "output.weight",
-                 geometry.vocabularySize, geometry.hiddenSize);
+                 paddedVocabularySize(geometry.vocabularySize), geometry.hiddenSize);
   images.push_back(head.finish());
   Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   embedding.embeddingRows("token_embd.weight");

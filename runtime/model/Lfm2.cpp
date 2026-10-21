@@ -123,6 +123,8 @@ Lfm2Weights loadLfm2Weights(metal::MetalBackend &backend, Lfm2Layout layout,
   };
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     return load(gguf->get(), BlockTargetFormat{});
+  if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
+    return load(oq->get(), OqTargetFormat{});
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
     return load(mlx->get(), AffineTargetFormat{});
   const auto &packed = std::get<PackedTargetFiles<Lfm2Layout>>(files);

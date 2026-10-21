@@ -118,8 +118,8 @@ struct SafetensorsCheckpoint::Impl {
   NSDictionary *textConfig = nil;
 
   void readConfiguration(const std::filesystem::path &path) {
-    if (std::filesystem::file_size(path) > 1024 * 1024)
-      throw WeightStoreError("source configuration exceeds metadata bound");
+    if (!std::filesystem::exists(path) || std::filesystem::file_size(path) > 1024 * 1024)
+      throw WeightStoreError("cannot read " + path.string());
     NSData *configuration = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
     if (!configuration) throw WeightStoreError("cannot read " + path.string());
     NSDictionary *config = object(configuration);
@@ -178,6 +178,64 @@ void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uin
         number(entry[@"group_size"] ?: impl_->quantization[@"group_size"]) != 64 ||
         (mode && ![mode isEqual:@"affine"]))
       throw WeightStoreError("unsupported affine quantization for " + std::string(projection));
+  }
+}
+
+std::optional<SafetensorsCheckpoint::QuantSpec>
+SafetensorsCheckpoint::quantization(std::string_view module) const {
+  @autoreleasepool {
+    // A plain tensor the quantizer skipped keeps no scales; the global dict
+    // entry alone does not make a module quantized.
+    const std::string scales = std::string(module) + ".scales";
+    if (!find(scales)) return std::nullopt;
+    NSString *key = [[NSString alloc] initWithBytes:module.data() length:module.size() encoding:NSUTF8StringEncoding];
+    NSDictionary *entry = impl_->quantization[key];
+    if (!entry && [key hasPrefix:@"language_model."])
+      entry = impl_->quantization[[key substringFromIndex:@"language_model.".length]];
+    if (![entry isKindOfClass:[NSDictionary class]]) entry = impl_->quantization;
+    if (![entry isKindOfClass:[NSDictionary class]]) return std::nullopt;
+    // Fields a per-module entry omits take the global's, mode defaulting to
+    // affine, as requireQuantization resolves them.
+    id bits = entry[@"bits"] ?: impl_->quantization[@"bits"];
+    id groupSize = entry[@"group_size"] ?: impl_->quantization[@"group_size"];
+    if (!bits || !groupSize) return std::nullopt;
+    QuantSpec spec;
+    spec.bits = static_cast<uint32_t>(number(bits));
+    spec.groupSize = static_cast<uint32_t>(number(groupSize));
+    id mode = entry[@"mode"] ?: impl_->quantization[@"mode"];
+    if (mode) {
+      if (![mode isKindOfClass:[NSString class]])
+        throw WeightStoreError("invalid source quantization configuration");
+      spec.mode = [mode UTF8String];
+    }
+    return spec;
+  }
+}
+
+namespace {
+// hasMixedQuantization on a parsed quantization dict.
+bool mixedQuantization(NSDictionary *quantization) {
+  if (![quantization isKindOfClass:[NSDictionary class]]) return false;
+  for (id key in quantization)
+    if ([quantization[key] isKindOfClass:[NSDictionary class]]) return true;
+  id bits = quantization[@"bits"];
+  if (!bits) return false;
+  id groupSize = quantization[@"group_size"], mode = quantization[@"mode"];
+  return number(bits) != 4 || (groupSize && number(groupSize) != 64) ||
+         (mode && (![mode isKindOfClass:[NSString class]] || ![mode isEqual:@"affine"]));
+}
+} // namespace
+
+bool SafetensorsCheckpoint::hasMixedQuantization() const {
+  @autoreleasepool {
+    return mixedQuantization(impl_->quantization);
+  }
+}
+bool SafetensorsCheckpoint::hasMixedQuantization(const std::filesystem::path &directory) {
+  @autoreleasepool {
+    Impl impl;
+    impl.readConfiguration(directory / "config.json");
+    return mixedQuantization(impl.quantization);
   }
 }
 namespace {

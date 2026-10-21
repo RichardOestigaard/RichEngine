@@ -4,6 +4,7 @@
 #include "ops/Linear.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace richengine::ops {
 
@@ -17,12 +18,20 @@ public:
   // A verify step's input tokens, RICHENGINE_TARGET_VERIFY_ROWS per lane: the
   // lane's anchor, row 0 of its draft input rows, then the draft's
   // RICHENGINE_DRAFT_PROPOSAL_TOKENS proposals, each clamped into the
-  // vocabulary.
+  // vocabulary. liveRows[lane] bounds the live rows (anchor included); a row
+  // past it can never be retained, so it repeats the anchor and keeps the
+  // dead rows' expert routing on the anchor's paths. An empty span leaves
+  // every row live.
+  // verifyStride is the lanes' packed row stride: the draft's trained verify
+  // depth (draft.verifyRows()), at most RICHENGINE_TARGET_VERIFY_ROWS.
   static void addVerifyInput(metal::CommandGraph &graph,
                              metal::MetalBuffer draftInputTokens,
                              metal::MetalBuffer proposedTokens,
                              metal::MetalBuffer verifyInputTokens,
-                             uint32_t vocabulary, uint32_t lanes);
+                             uint32_t vocabulary, uint32_t lanes,
+                             uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+                             uint32_t draftStride = RICHENGINE_DRAFT_QUERY_ROWS,
+                             std::span<const uint32_t> liveRows = {});
   // A tree-verify step's inputs, RICHENGINE_TREE_VERIFY_NODES per lane: each
   // node's token, its (t, h, w) rope position (the lane's base triple plus
   // the node's depth) and its ancestor bitmask, from draft_select_tree's

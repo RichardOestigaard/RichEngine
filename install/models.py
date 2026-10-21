@@ -144,10 +144,46 @@ def split_model_id(value: str) -> tuple[str, str | None]:
     return repo_id, variant
 
 
+def _local_directory(value: str) -> Path | None:
+    """The local model directory value names, when it names one: an
+    existing path that looks like a path (absolute, ~, or . — a bare
+    owner/repo stays a repository ID even if it shadows a directory),
+    local:<author>/NAME or local:NAME, or a bare NAME a local cache
+    holds (install/local.py)."""
+    from . import local
+
+    if not value:
+        return None
+    if value.startswith("local:"):
+        found = local.find(value.removeprefix("local:"))
+        return found.resolve() if found is not None else None
+    expanded = Path(value).expanduser()
+    if Path(value).is_absolute() or value.startswith(("~", ".")):
+        if expanded.is_dir():
+            return expanded.resolve()
+        raise ModelError(f"model directory not found: {expanded}")
+    if "/" not in value:
+        # Not a repository ID; the local caches may hold it by name.
+        try:
+            found = local.find(value)
+        except ModelError as error:
+            raise ModelError(
+                f"{error}; a repository needs its owner (owner/repo)"
+            ) from error
+        return found.resolve() if found is not None else None
+    return None
+
+
 def parse_model_id(value: str) -> str:
     try:
         split_model_id(value)
     except ModelError as error:
+        # A local directory or scanned name resolves at selection time.
+        if (
+            (Path(value).is_absolute() or value.startswith(("~", ".")))
+            and Path(value).expanduser().is_dir()
+        ) or value.startswith("local:") or "/" not in value:
+            return value
         raise argparse.ArgumentTypeError(str(error)) from error
     return value
 
@@ -156,6 +192,10 @@ def parse_draft_model(value: str) -> str:
     # A local draft directory is recorded as an absolute path, so the
     # installation it selects does not depend on the working directory.
     if value and (local := Path(value).expanduser()).is_dir():
+        # --draft-model is an explicit local-artifact flag: any existing
+        # directory wins, including a relative path under the cwd. (The
+        # target install path stays strict — a bare owner/repo is a Hub
+        # ID even when it shadows a directory.)
         return str(local.resolve())
     try:
         return validate_repo_id(value)
@@ -202,15 +242,27 @@ def selection_link(
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
-    .selections/<hash of the selection>."""
-    repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model:
+    .selections/<hash of the selection> — a local model directory's too,
+    which has no repository ID to name it by. Every name resolves through
+    _local_directory so local paths and bare names take the same link
+    Selection.of computes."""
+    local_path = _local_directory(model_id)
+    key_id = str(local_path) if local_path is not None else model_id
+    if (
+        revision
+        or language_only
+        or draft_model
+        or local_path is not None
+        or Path(model_id).is_absolute()
+        or model_id.startswith("local:")
+    ):
         selection = json.dumps(
-            [model_id, revision, language_only, draft_model], separators=(",", ":")
+            [key_id, revision, language_only, draft_model], separators=(",", ":")
         )
         return (
             models / layout.SELECTIONS / hashlib.sha256(selection.encode()).hexdigest()
         )
+    repo_id, variant = split_model_id(model_id)
     if variant is None:
         return models / repo_id
     return models / f"{repo_id}{VARIANT_SEPARATOR}{variant}"
@@ -248,17 +300,24 @@ class Selection:
     def of(
         cls, models_root, model, *, revision=None, language_only=False, draft_model=None
     ):
-        repo_id, variant = split_model_id(model)
+        path = _local_directory(model)
+        if path is not None:
+            # A local model directory: its path is the source Repository
+            # resolve reads (hub.Repository.resolve), its name the display.
+            repo_id, variant, display, link_key = str(path), None, path.name, str(path)
+        else:
+            repo_id, variant = split_model_id(model)
+            display, link_key = model, model
         models_root = Path(models_root).resolve()
         link = selection_link(
             models_root,
-            model,
+            link_key,
             revision=revision,
             language_only=language_only,
             draft_model=draft_model,
         )
         return cls(
-            model,
+            display,
             repo_id,
             variant,
             revision,
@@ -321,9 +380,8 @@ def parse_args(argv=None):
     parser.add_argument("--models", type=Path, default=MODELS)
     parser.add_argument(
         "--model",
-        required=True,
         type=parse_model_id,
-        help="Hugging Face repository ID (owner/repo[:variant])",
+        help="Hugging Face repository ID (owner/repo[:variant]) or a local model directory",
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(
@@ -340,25 +398,48 @@ def parse_args(argv=None):
     commands.add_parser("prepare")
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
-    return parser.parse_args(argv)
+    commands.add_parser(
+        "local", help="list the models the local caches hold (LM Studio, oMLX)"
+    )
+    args = parser.parse_args(argv)
+    if args.command != "local" and not args.model:
+        parser.error("--model is required")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
-    selection = Selection.of(
-        args.models,
-        args.model,
-        revision=args.revision,
-        language_only=args.language_only,
-        draft_model=args.draft_model,
-    )
-    if args.command == "link":
-        print(selection.link)
+    if args.command == "local":
+        from . import local
+
+        candidates = local.scan()
+        if not candidates:
+            roots = ", ".join(str(root) for root in local.model_dirs()) or "none"
+            print(f"No models found under the local model directories ({roots}).")
+            return 0
+        width = max(len(candidate.name) for candidate in candidates)
+        for candidate in candidates:
+            size = f"{candidate.bytes / 1e9:.1f} GB" if candidate.bytes else "-"
+            verdict = candidate.reason or candidate.family or ""
+            detail = (
+                f"{candidate.quantization}; " if candidate.quantization else ""
+            ) + verdict
+            print(f"{candidate.name:<{width}}  {candidate.format:<6} {detail} ({size})")
         return 0
     # The installers import this module, so it imports them once it exists.
     from . import assembly, legacy, pack, upstream
 
     try:
+        selection = Selection.of(
+            args.models,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+        )
+        if args.command == "link":
+            print(selection.link)
+            return 0
         # The launcher starts this with the stop signals blocked, so that one
         # sent while it starts is not lost; it arrives here.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))

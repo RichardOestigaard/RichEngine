@@ -509,6 +509,20 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual((text["num_experts"], text["num_experts_per_tok"]), (256, 8))
         self.assertEqual(families.family_for(config).name, "Qwen3.6-35B-A3B")
 
+    def test_minicpm_vocabulary_selects_its_family(self):
+        # MiniCPM-V 4.7's vocabulary is 248144 — the 35B-A3B geometry with
+        # the tile padding absent; the vocabulary alone names the family.
+        values = fixture(native=True)
+        values["tokenizer.ggml.tokens"] = values["tokenizer.ggml.tokens"][:248144]
+        values["tokenizer.ggml.token_type"] = values[
+            "tokenizer.ggml.token_type"
+        ][:248144]
+        config = gguf.model_config(self.metadata(values))
+        self.assertEqual(config["text_config"]["vocab_size"], 248144)
+        self.assertEqual(
+            families.family_for(config).name, "MiniCPM-V-4.7-35B-A3B"
+        )
+
     def test_gemma4_config_states_its_two_layer_kinds_and_identifies_the_family(self):
         config = gguf.model_config(self.metadata(gemma4_fixture()))
         text = config["text_config"]

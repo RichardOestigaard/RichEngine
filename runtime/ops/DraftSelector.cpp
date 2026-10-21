@@ -18,8 +18,10 @@ constexpr uint32_t kEdgeThreads = 256;
 
 } // namespace
 
-DraftSelector::DraftSelector(uint32_t vocabulary) : vocabulary_(vocabulary) {
-  if (!vocabulary)
+DraftSelector::DraftSelector(uint32_t vocabulary, uint32_t logitsStride)
+    : vocabulary_(vocabulary),
+      logitsStride_(logitsStride ? logitsStride : vocabulary) {
+  if (!vocabulary || logitsStride_ < vocabulary)
     throw std::invalid_argument("invalid draft selector vocabulary");
 }
 
@@ -44,13 +46,15 @@ void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks,
                         std::span<const uint32_t> anchors,
-                        std::span<const SamplingPolicy> policies) const {
+                        std::span<const SamplingPolicy> policies,
+                        uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
@@ -58,9 +62,10 @@ void DraftSelector::add(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
@@ -79,13 +84,14 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
                             const DraftCodebooks &codebooks,
                             std::span<const uint32_t> anchors,
                             std::span<const SamplingPolicy> policies,
-                            uint32_t treeMask) const {
+                            uint32_t treeMask, uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   params.tree_mask = treeMask;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -94,15 +100,19 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
              codebooks.successor},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
+  // The tree comb always emits kDraftQueryRows-deep nodes; on a draft
+  // with queryRows() < kDraftQueryRows the rows past its live span are
+  // dead compute — clamped and never retained, but still verified.
   graph.add(std::string(kDraftSelectTree),
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
@@ -114,13 +124,15 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
 void DraftSelector::addPlain(metal::CommandGraph &graph,
                              const DraftSelectorBuffers &buffers,
                              std::span<const uint32_t> anchors,
-                             std::span<const SamplingPolicy> policies) const {
+                             std::span<const SamplingPolicy> policies,
+                             uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
@@ -128,9 +140,10 @@ void DraftSelector::addPlain(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlain),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.candidates, buffers.proposalProbabilities,
@@ -142,13 +155,14 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
                                  const DraftSelectorBuffers &buffers,
                                  std::span<const uint32_t> anchors,
                                  std::span<const ops::SamplingPolicy> policies,
-                                 uint32_t treeMask) const {
+                                 uint32_t treeMask, uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   params.tree_mask = treeMask;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -157,9 +171,10 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlainTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.candidates, buffers.proposalProbabilities,
@@ -172,13 +187,15 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
                               const DraftSelectorBuffers &buffers,
                               const DraftMarkovHead &markov,
                               std::span<const uint32_t> anchors,
-                              std::span<const SamplingPolicy> policies) const {
+                              std::span<const SamplingPolicy> policies,
+                              uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
@@ -186,9 +203,10 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDsparkSelectTop16Sharded),
+  graph.addTail(std::string(kDsparkSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
              markov.projection},
@@ -205,13 +223,14 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
                               const DraftMarkovHead &markov,
                               std::span<const uint32_t> anchors,
                               std::span<const SamplingPolicy> policies,
-                              uint32_t treeMask) const {
+                              uint32_t treeMask, uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   params.tree_mask = treeMask;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -220,9 +239,10 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDsparkSelectTop16Sharded),
+  graph.addTail(std::string(kDsparkSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
              markov.projection},
@@ -239,13 +259,15 @@ void DraftSelector::addPool(metal::CommandGraph &graph,
                             const DraftSelectorBuffers &buffers,
                             const DraftCodebooks &codebooks,
                             std::span<const uint32_t> anchors,
-                            std::span<const SamplingPolicy> policies) const {
+                            std::span<const SamplingPolicy> policies,
+                            uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
@@ -253,9 +275,10 @@ void DraftSelector::addPool(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,
              codebooks.predecessor, codebooks.successor},
@@ -275,13 +298,14 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
                                 const DraftCodebooks &codebooks,
                                 std::span<const uint32_t> anchors,
                                 std::span<const SamplingPolicy> policies,
-                                uint32_t treeMask) const {
+                                uint32_t treeMask, uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
+  params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   params.tree_mask = treeMask;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -290,9 +314,10 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
     if (policies[lane].samples())
       params.sampling_mask |= uint32_t{1} << lane;
   }
-  graph.add(std::string(kDraftSelectTop16Sharded),
+  graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,
              codebooks.predecessor, codebooks.successor},

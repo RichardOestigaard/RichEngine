@@ -31,7 +31,7 @@ void testLookupFollowsEarlierOccurrence() {
   std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
   const uint32_t found = ngram::lookup(t, out.data());
   require(found == 6, "lookup should follow the earlier occurrence");
-  require((out == std::array{40u, 50u, 60u, 1u, 2u, 3u, 0u}),
+  require((out == std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>{40u, 50u, 60u, 1u, 2u, 3u, 0u}),
           "lookup should copy the occurrence's followers");
 }
 
@@ -43,7 +43,7 @@ void testLookupPicksLongestExtension() {
   std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
   const uint32_t found = ngram::lookup(t, out.data());
   require(found == 5, "lookup should take the better-extended occurrence");
-  require((out == std::array{88u, 42u, 1u, 2u, 3u, 0u, 0u}),
+  require((out == std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>{88u, 42u, 1u, 2u, 3u, 0u, 0u}),
           "lookup should emit the better-extended followers");
 }
 
@@ -105,7 +105,7 @@ void testCombTableDescriptors() {
   require(nodes[0] ==
               (RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 16)),
           "anchor depth must be zero");
-  for (uint32_t p = 0; p < RICHENGINE_DRAFT_PROPOSAL_TOKENS; ++p) {
+  for (uint32_t p = 0; p < 7; ++p) {
     require(tokens[1 + p] == proposals[p], "chain row should carry the proposal");
     require(nodes[1 + p] == (p | ((p + 1) << 8) | (p << 16)),
             "chain descriptor should be (parent, depth, position)");
@@ -128,7 +128,7 @@ void testCombTableLeafless() {
   std::array<uint32_t, RICHENGINE_TREE_VERIFY_NODES> nodes{};
   const uint32_t count =
       ngram::combTable(t, 77, proposals, 7, tokens.data(), nodes.data());
-  require(count == RICHENGINE_TARGET_VERIFY_ROWS,
+  require(count == RICHENGINE_TREE_VERIFY_NODES / 2,
           "a leafless comb verifies like a chain");
   for (uint32_t row = 8; row < RICHENGINE_TREE_VERIFY_NODES; ++row)
     require(nodes[row] == kDead, "leaf rows stay dead without alternates");
@@ -142,7 +142,7 @@ void testCombTableHonoursFoundBound() {
   std::array<uint32_t, RICHENGINE_TREE_VERIFY_NODES> nodes{};
   const uint32_t count =
       ngram::combTable(t, 77, proposals, 1, tokens.data(), nodes.data());
-  require(count == RICHENGINE_TARGET_VERIFY_ROWS,
+  require(count == RICHENGINE_TREE_VERIFY_NODES / 2,
           "positions past the real match emit no leaves");
 }
 

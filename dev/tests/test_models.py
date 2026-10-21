@@ -20,7 +20,7 @@ import httpx
 from huggingface_hub.hf_api import RepoSibling
 
 from dev.tests.installer_fixtures import http_error
-from install import hub, legacy
+from install import families, hub, legacy
 from install import models as installer
 
 
@@ -58,7 +58,10 @@ class ModelArtifactTest(unittest.TestCase):
             file.seek(legacy.ALIGNMENT - 1)
             file.write(b"\0")
 
-    def package_fixture(self, *, schema=3, model_id=None, revision=None):
+    def package_fixture(self, *, format="richengine-packed-q4", model_id=None,
+                        revision=None):
+        layout = legacy.PACKAGE_FORMATS[format]
+        schema = layout.schema_version
         self.fixture_number += 1
         snapshot = (
             self.root
@@ -67,7 +70,14 @@ class ModelArtifactTest(unittest.TestCase):
             / "snapshots"
             / (revision or self.REVISION)
         )
-        target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
+        target_layers = dict(
+            families.named(layout.family).signature
+        )["num_hidden_layers"]
+        draft_layers = (
+            families.named(layout.family).draft.layers
+            if layout.draft_payload
+            else 0
+        )
         target_files = (
             "embedding.bin",
             "head.bin",
@@ -98,18 +108,17 @@ class ModelArtifactTest(unittest.TestCase):
             "schema_version": schema,
             "model": "Community fine-tuned model",
             "format": {
-                "name": "richengine-packed-q4" + ("-moe" if schema == 4 else ""),
+                "name": format,
                 "section_alignment_bytes": legacy.ALIGNMENT,
-                "target_layer_magic": "MDFM0001" if schema == 4 else "MDFL0006",
-                "draft_layer_magic": "MDFD0004",
+                "target_layer_magic": layout.target_layer_magic,
+                "draft_layer_magic": sorted(layout.draft_layer_magics)[0],
                 "vision_magic": "MDFV0001",
             },
             "execution_geometry": {},
             "artifacts": records,
         }
-        if schema == 4:
-            manifest["target"] = {"architecture": "qwen3_5_moe"}
-            manifest["draft"] = {"architecture": "DFlash2DraftModel"}
+        for section, architecture in layout.declarations.items():
+            manifest[section] = {"architecture": architecture}
         self.write_manifest(snapshot, manifest)
         return snapshot, manifest
 
@@ -193,15 +202,23 @@ class ModelArtifactTest(unittest.TestCase):
                     self.subTest(model=model),
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
-                    with self.assertRaises(SystemExit) as raised:
-                        installer.main(args)
-                    self.assertEqual(raised.exception.code, 2)
+                    # Argparse rejects shapes that can be neither a
+                    # repository ID nor a local model (SystemExit 2); a
+                    # plausible-but-missing local name fails the selection
+                    # (exit 1).
+                    try:
+                        result = installer.main(args)
+                    except SystemExit as raised:
+                        self.assertEqual(raised.code, 2)
+                    else:
+                        self.assertEqual(result, 1)
             download.assert_not_called()
         self.assertFalse(destination.exists())
         with self.assertRaises(installer.ModelError):
             installer.validate_repo_id(None)
-        with self.assertRaises(argparse.ArgumentTypeError):
-            installer.parse_model_id("short-name")
+        # A bare name resolves against the local model caches at selection
+        # time, so argparse no longer rejects it here.
+        self.assertEqual(installer.parse_model_id("short-name"), "short-name")
 
     def test_a_selection_validates_its_model_before_creating_paths(self):
         models = self.root / "uncreated"
@@ -223,10 +240,23 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(installer.ModelError, "checksum changed"):
             legacy.verify(models / self.MODEL_ID, self.MODEL_ID, full=True)
 
+    def test_every_registered_package_format_validates(self):
+        for format_name, layout in legacy.PACKAGE_FORMATS.items():
+            with self.subTest(format=format_name):
+                snapshot, manifest = self.package_fixture(format=format_name)
+                validated = legacy.validate_manifest(snapshot / "manifest.json")
+                legacy.verify_artifacts(snapshot, validated, full=True)
+                # A draft magic the format does not carry is refused.
+                bad = copy.deepcopy(manifest)
+                bad["format"]["draft_layer_magic"] = "MDFT0001"
+                self.write_manifest(snapshot, bad)
+                with self.assertRaises(installer.ModelError):
+                    legacy.validate_manifest(snapshot / "manifest.json")
+
     def test_accepts_both_formats_with_arbitrary_display_name_and_metadata(self):
-        for schema in (3, 4):
-            with self.subTest(schema=schema):
-                snapshot, manifest = self.package_fixture(schema=schema)
+        for format in ("richengine-packed-q4", "richengine-packed-q4-moe"):
+            with self.subTest(format=format):
+                snapshot, manifest = self.package_fixture(format=format)
                 # Aggregate digest algorithms and descriptive metadata are producer-owned.
                 manifest["artifact_set_sha256"] = "producer-specific metadata"
                 manifest["execution_geometry"]["extra_metadata"] = 1
@@ -258,7 +288,7 @@ class ModelArtifactTest(unittest.TestCase):
                 self.download.assert_not_called()
 
     def test_format_magic_and_moe_architecture_are_checked(self):
-        snapshot, original = self.package_fixture(schema=4)
+        snapshot, original = self.package_fixture(format="richengine-packed-q4-moe")
         for section, key, value in (
             ("format", "target_layer_magic", "WRONG"),
             ("format", "section_alignment_bytes", 1),
@@ -273,8 +303,9 @@ class ModelArtifactTest(unittest.TestCase):
                     legacy.validate_manifest(snapshot / "manifest.json")
 
     def test_manifest_must_list_every_file_the_runtime_reads(self):
-        for schema in (3, 4):
-            snapshot, original = self.package_fixture(schema=schema)
+        for format in ("richengine-packed-q4", "richengine-packed-q4-moe"):
+            schema = 3 if format.endswith("q4") else 4
+            snapshot, original = self.package_fixture(format=format)
             for name in (
                 "target/embedding.bin",
                 "target/head.bin",
@@ -285,7 +316,7 @@ class ModelArtifactTest(unittest.TestCase):
                 "vision/model.bin",
                 "tokenizer/config.json",
             ):
-                with self.subTest(schema=schema, missing=name):
+                with self.subTest(format=format, missing=name):
                     manifest = {
                         **original,
                         "artifacts": [
@@ -763,7 +794,7 @@ class ModelArtifactTest(unittest.TestCase):
         model_id = "incoai/Qwen3.6-35B-A3B-RichEngine"
         for kind in ("directory", "absolute link", "relative link"):
             with self.subTest(kind=kind):
-                old, manifest = self.package_fixture(schema=4)
+                old, manifest = self.package_fixture(format="richengine-packed-q4-moe")
                 manifest["draft"]["dummy"] = True
                 self.write_manifest(old, manifest)
                 models = self.root / f"models-{self.fixture_number}"
@@ -779,7 +810,7 @@ class ModelArtifactTest(unittest.TestCase):
                         target_is_directory=True,
                     )
                 expected = (old_package / "manifest.json").read_bytes()
-                official, _ = self.package_fixture(schema=4, model_id=model_id)
+                official, _ = self.package_fixture(format="richengine-packed-q4-moe", model_id=model_id)
                 self.configure_hub(official)
                 args = installer.Selection.of(models, model_id)
                 output = io.StringIO()
@@ -886,8 +917,11 @@ class ModelArtifactTest(unittest.TestCase):
         for code in (errno.EACCES, errno.EPERM, errno.EROFS):
             with self.subTest(errno=code):
                 errors = io.StringIO()
+                # pin() writes its reference through a temporary file.
                 with mock.patch.object(
-                    hub.os, "link", side_effect=OSError(code, "read only")
+                    hub.tempfile,
+                    "NamedTemporaryFile",
+                    side_effect=OSError(code, "read only"),
                 ):
                     with (
                         contextlib.redirect_stdout(io.StringIO()),

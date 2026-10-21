@@ -600,7 +600,7 @@ void planBounds() {
     rejects([&] { (void)shipped.moeDecode(shape, 5); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
             "affine 8-row prefill tile");
-    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
+    rejects([&] { (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32}); },
             "affine 32-row decode tile");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
@@ -617,21 +617,34 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   const auto dispatches = graph.dispatches();
   const bool split = plan.splitExperts();
   const size_t expertPasses = split ? 3 : 2;
-  // Two router dispatches, grouping, the expert passes and combine; prefill
-  // plans' gate and up passes read the rows' inputs through grouped_routes,
-  // while decode plans still gather first.
-  require(dispatches.size() == (split ? 4 : 5) + expertPasses,
+  // Two router dispatches, grouping, the expert passes and combine; a
+  // decode plan whose gate/up spans few column tiles reads its rows through
+  // grouped_routes instead of gathering first (the indirect bound of
+  // ops::MoE's fusedExpertPasses).
+  const bool indirect = !split && kIntermediate <= 4 * 128;
+  const size_t gathered = !split && !indirect ? 1 : 0;
+  require(dispatches.size() == 4 + expertPasses + gathered,
           "MoE plan must encode the entire operator");
   const auto route =
       richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores(route.rows == 8 ? richengine::ops::kMoeRouteScoresQ8M8
                                            : richengine::ops::kMoeRouteScoresQ8M32);
-  const size_t experts = split ? 3 : 4;
+  const size_t experts = 3 + gathered;
   const size_t combine = experts + expertPasses;
+  // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
+  // to N256; every other fused pass keeps N128 at 256 threads.
+  const bool four = plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
+  const std::string gateUp(four ? richengine::ops::kMoeExpertGateUpQ4M8N128Sg4
+                                : richengine::ops::kMoeExpertGateUpQ4M8);
+  const std::string gateUpIndirect(
+      four ? richengine::ops::kMoeExpertGateUpQ4M8N128Sg4Indirect
+           : richengine::ops::kMoeExpertGateUpQ4M8Indirect);
   require(dispatches[0].pipelineName == scores &&
               dispatches[1].pipelineName == richengine::ops::kMoeRouteSelectQ8 &&
               dispatches[2].pipelineName == richengine::ops::kMoeGroupRoutes &&
-              (split || dispatches[3].pipelineName == richengine::ops::kMoeGatherRows) &&
+              (split || dispatches[3].pipelineName ==
+                            (indirect ? gateUpIndirect
+                                      : std::string(richengine::ops::kMoeGatherRows))) &&
               dispatches[combine].pipelineName == richengine::ops::kMoeCombine,
           "MoE plan chose inconsistent pipelines");
   if (split) {
@@ -652,14 +665,10 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
                 dispatches[experts + 2].threadgroups.x == kHidden / 256,
             "split MoE plan chose inconsistent gate scratch or column tiles");
   } else {
-    // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
-    // to N256; every other fused pass keeps N128 at 256 threads.
-    const bool four = plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
-    const std::string gateUp(four ? richengine::ops::kMoeExpertGateUpQ4M8N128Sg4
-                                  : richengine::ops::kMoeExpertGateUpQ4M8);
     const std::string down(four ? richengine::ops::kMoeExpertDownQ4M8N256Sg4
                                 : richengine::ops::kMoeExpertDownQ4M8);
-    require(dispatches[experts].pipelineName == gateUp &&
+    require(dispatches[experts].pipelineName ==
+                    (indirect ? gateUpIndirect : gateUp) &&
                 dispatches[experts + 1].pipelineName == down,
             "fused MoE plan chose inconsistent expert pipelines");
     const uint32_t threads = four ? 128 : 256;
@@ -686,7 +695,6 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
               dispatches[0].threadgroups.y ==
                   (kExperts + route.experts - 1) / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
-              (split || dispatches[3].threadgroups.x == plan.maximumTiles()) &&
               tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
           "MoE plan chose inconsistent dispatch bounds");

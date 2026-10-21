@@ -116,7 +116,9 @@ struct AcceptanceBuffers final {
 // stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  // vocabulary bounds the token ids; logitsStride is a logits row's span
+  // (vocabulary padded to the head's section rows).
+  explicit Sampling(uint32_t vocabulary, uint32_t logitsStride);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a packed batch; the operator owns sharding.
@@ -157,12 +159,15 @@ public:
   // liveRows, when nonempty, gives each lane's live verify row count
   // (proposal budget + 1): selection skips rows at or past it. Empty means
   // every lane keeps all RICHENGINE_TARGET_VERIFY_ROWS rows.
+  // verifyStride is the lanes' packed verify row stride: the draft's trained
+  // verify depth (draft.verifyRows()), at most RICHENGINE_TARGET_VERIFY_ROWS.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties,
                  std::span<const uint32_t> liveRows = {},
-                 uint32_t fusedHead = 0) const;
+                 uint32_t fusedHead = 0,
+                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
   // The tree batch's selection: RICHENGINE_TREE_VERIFY_NODES argmax rows per
   // lane. Tree mode is greedy-only — a sampled, constrained or penalized
   // lane throws (the runtime falls back to the chain batch).
@@ -172,12 +177,15 @@ public:
                      uint32_t stopToken1) const;
   // proposals, when nonempty, caps each lane's accepted draft tokens at its
   // adaptive budget; empty means RICHENGINE_DRAFT_PROPOSAL_TOKENS for all.
+  // verifyStride is the lanes' packed verify row stride: the draft's trained
+  // verify depth (draft.verifyRows()), at most RICHENGINE_TARGET_VERIFY_ROWS.
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1, std::span<const uint32_t> proposals = {},
-      uint32_t draftCandidateStride = RICHENGINE_DRAFT_CANDIDATES) const;
+      uint32_t draftCandidateStride = RICHENGINE_DRAFT_CANDIDATES,
+      uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
   // Greedy acceptance over the lanes' verify trees: the walk emits the
   // retained path's tokens and its emitted-row indices for the KV, GDN and
   // captured-hidden commits.
@@ -212,16 +220,21 @@ private:
     uint32_t maskRow = 0;
     uint32_t uniform = 0;
     uint32_t draftedRows = 0;
+    // The packed lane stride of the logits and mask rows; zero resolves to
+    // RICHENGINE_TARGET_VERIFY_ROWS.
+    uint32_t laneStride = 0;
   };
 
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
   // all its rows, each also counting the draft tokens its context adds.
   // Policies come from validated requests (Model.hpp
-  // SamplingParameters::validationError).
+  // SamplingParameters::validationError). verifyStride is the packed lane
+  // stride of the verify logits and input tokens.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
-                    uint32_t rowOffset, bool verify) const;
+                    uint32_t rowOffset, bool verify,
+                    uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
   // Selects the rows that rows names of every lane. liveRows bounds each
   // lane's selected rows; empty leaves every lane's full row count.
   void addSelection(metal::CommandGraph &graph,
@@ -232,6 +245,7 @@ private:
                     uint32_t fusedHead = 0) const;
 
   uint32_t vocabulary_ = 0;
+  uint32_t logitsStride_ = 0;
   uint32_t maskWords_ = 0;
 };
 

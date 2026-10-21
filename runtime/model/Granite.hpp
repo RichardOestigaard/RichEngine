@@ -63,10 +63,14 @@ struct GraniteLayout final {
     return layers;
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept { return 0; }
+  // The compiled attention kernel the layers bind (ops/PagedKv.hpp);
+  // granite8BLayout swaps it for the 8B's 32x128 geometry.
+  kv::Core attentionCore = kv::Core::Kv8Group5D64;
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     kv::Layout layout{attentionLayerCount(), attentionKvHeads,
                       attentionHeadDimension};
     layout.scoreScale = attentionScale;
+    layout.attentionCore = attentionCore;
     return layout;
   }
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
@@ -92,6 +96,7 @@ struct GraniteLayout final {
   layout.attentionWidth = 4096;
   layout.attentionQueryHeads = 32;
   layout.attentionHeadDimension = 128;
+  layout.attentionCore = kv::Core::Kv8Group4D128;
   layout.rotaryPairs = 64;
   layout.attentionScale = 0.0078125F;
   layout.intermediateSize = 12800;

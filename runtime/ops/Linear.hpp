@@ -95,6 +95,9 @@ struct LinearWorkload final {
   // canvas plan family so canvas-only tiles never alter a normal chunk's
   // plan. Part of the plan key (operator<=>).
   bool canvas = false;
+  // The lane count the rows were packed from (decodePlan's stride rows
+  // cannot be recovered from rows once the verify stride varies).
+  uint32_t lanes = 0;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -311,9 +314,13 @@ public:
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
                                        LinearEpilogue epilogue,
                                        bool canvas = false) const;
+  // verifyRows is the lanes' packed row stride: the default
+  // RICHENGINE_TARGET_VERIFY_ROWS, or a trained-block draft's shorter
+  // verify depth (draft.verifyRows()).
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
-                                      const Projection *gate = nullptr) const;
+                                      const Projection *gate = nullptr,
+                                      uint32_t verifyRows = RICHENGINE_TARGET_VERIFY_ROWS) const;
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.
@@ -368,13 +375,16 @@ public:
   // shared/gguf_linear.metal): the vocabulary projection's staged decode,
   // writing per-(row, GGUF_TILE_COLUMNS) argmax partials instead of logits.
   // One quantized segment, decode rows; a rotated input is rotated into
-  // scratch.rotated first. Returns false when the projection cannot run it —
-  // a float segment or several segments — and the caller falls back to the
+  // scratch.rotated first. `verifyRows` is the lanes' packed row stride
+  // (draft.verifyRows()), the decode plan's row count. Returns false when the
+  // projection cannot run it — a float segment, several segments or a plan
+  // whose rows no amax instantiation holds — and the caller falls back to the
   // logits path.
   [[nodiscard]] bool addGgufHeadArgmax(metal::CommandGraph &graph,
                                        metal::MetalBuffer input, const Projection &projection, uint32_t lanes,
                                        metal::MetalBuffer argmaxValues, metal::MetalBuffer argmaxIndices,
-                                       const HeadArgmaxParams &headParams, LinearScratch scratch) const;
+                                       const HeadArgmaxParams &headParams, LinearScratch scratch,
+                                       uint32_t verifyRows = RICHENGINE_TARGET_VERIFY_ROWS) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it

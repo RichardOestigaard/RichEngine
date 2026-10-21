@@ -52,6 +52,10 @@ namespace richengine::model {
         proposals{};
     std::array<uint32_t, kLaneCount> foundCounts{};
     double score = 0;
+    // The bar the n-gram chain must clear is the GPU draft's own measured
+    // expectation — its acceptance EWMA — not a constant: a proposer that
+    // lands less than the draft it displaces only burns verify rows.
+    double draftExpect = 0;
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = *entries[lane];
       // Sampled lanes cannot consume probability-free proposals; a Null
@@ -70,11 +74,12 @@ namespace richengine::model {
                     *entry.pendingToken);
       }
       score += ngramLaneScore(entry, found != 0);
+      draftExpect += entry.proposalAcceptedAvg;
       if (ngramDebug_)
         fprintf(stderr, "ngram-predraft lane=%u match=%u score=%.2f\n", lane,
                 found, ngramLaneScore(entry, found != 0));
     }
-    if (score < width * ngram_.ngramDraftExpect_ && !nullDraft)
+    if (score < draftExpect && !nullDraft)
       return false;
     // The comb costs a wider verify per step; emit it only while some lane's
     // acceptance EWMA says the proposer is landing often enough for sibling

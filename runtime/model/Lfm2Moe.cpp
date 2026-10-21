@@ -100,11 +100,12 @@ Lfm2DenseFfn readDenseFfn(WeightFile &file, const Format &format,
           format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down")};
 }
 
-// The sigmoid-gated MoE block of a GGUF image: the F32 router, the F32
-// per-expert selection bias (exp_probs_b) and the quantized expert slabs.
-// There is no shared expert.
+// The sigmoid-gated MoE block of a GGUF or oQ image: the F32 router, the
+// F32 per-expert selection bias (exp_probs_b) and the quantized expert
+// slabs, in the same section order. There is no shared expert.
+template <class Format>
 void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
-                const Lfm2MoeLayout &, const BlockTargetFormat &) {
+                const Lfm2MoeLayout &, const Format &) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
   ffn.expertBias = readQuantizedSegment(file, "expert-bias");
@@ -181,6 +182,8 @@ Lfm2MoeWeights loadLfm2MoeWeights(metal::MetalBackend &backend,
     return load(gguf->get(), BlockTargetFormat{});
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
     return load(mlx->get(), AffineTargetFormat{});
+  if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
+    return load(oq->get(), OqTargetFormat{});
   const auto &packed = std::get<PackedTargetFiles<Lfm2MoeLayout>>(files);
   return load(packed, AffineTargetFormat{packed.tiledEmbedding});
 }

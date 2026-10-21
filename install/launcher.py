@@ -690,7 +690,7 @@ def list_models(args):
         print(
             json.dumps(
                 {
-                    "installed": installed if args.verbose else installed_ids,
+                    "installed": installed if args.verbose else sorted(installed_ids),
                     "available": known,
                 },
                 indent=2,
@@ -2009,7 +2009,7 @@ def main(argv=None):
         if args.command == "disk":
             return disk(args)
         return coding_client(args)
-    except (LauncherError, clients.ClientError, OSError) as error:
+    except (LauncherError, clients.ClientError, model_artifacts.ModelError, OSError) as error:
         print(_styled("error:", "31;1", stream=sys.stderr), error, file=sys.stderr)
         if getattr(error, "hint", None):
             print(

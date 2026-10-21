@@ -119,10 +119,14 @@ struct Gemma4MoeLayout {
     return local > global ? local : global;
   }
   // The pool layout: local geometry primary, globals the alternate regions.
+  // The compiled attention kernels: the sliding layers bind GemmaKv8H256,
+  // the k_eq_v globals GemmaKv2H512 (ops/PagedKv.hpp).
+  kv::Core attentionCore = kv::Core::GemmaKv8H256;
+  kv::Core altAttentionCore = kv::Core::GemmaKv2H512;
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {layers, attentionKvHeads, attentionHeadDimension,
             kv::Format::Int8, 1.0F, globalKvHeads, globalHeadDimension,
-            globalLayerMask(), 0};
+            globalLayerMask(), 0, attentionCore, altAttentionCore};
   }
   [[nodiscard]] constexpr kv::Layout kvLayout(kv::Format format) const noexcept {
     kv::Layout layout = kvLayout();

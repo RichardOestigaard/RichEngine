@@ -27,10 +27,17 @@ struct AttentionShape final {
   kv::Layout layout;
 };
 constexpr std::array attentionShapes{
-    AttentionShape{24, {1, 4, 256}}, AttentionShape{16, {1, 2, 256}}};
+    AttentionShape{24,
+                   {.attentionLayers = 1, .kvHeads = 4, .headDimension = 256,
+                    .attentionCore = kv::Core::Kv4Group6}},
+    AttentionShape{16,
+                   {.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
+                    .attentionCore = kv::Core::Kv2Group8}}};
 constexpr std::array draftShapes{
-    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128, 0, 0,
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden5120},
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128, 0, 0,
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2048}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};
@@ -103,13 +110,13 @@ void baselinePlans() {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
         const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout,
                                                     std::span(histories).first(lanes));
-        require(selected.splits == 32, "verify baseline changed");
+        require(selected.splits == 8, "verify baseline changed");
         covers(stride, selected.workspace, lanes, attentionFields);
       }
       {
         const std::array<uint32_t, 1> deep{131072};
         const auto scaled = plans.verifyAttention(1, queryHeads, kvLayout, deep);
-        require(scaled.splits == kv::kVerifyMaximumSplits &&
+        require(scaled.splits == kv::kVerifyPolicySplits &&
                     scaled.laneSplits[0] == scaled.splits,
                 "verify splits did not scale with history");
         covers(stride, scaled.workspace, 1, attentionFields);
@@ -243,14 +250,14 @@ void ggufMoePlans() {
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
   // The register tile reads GGUF 8-row tiles only.
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
                                                        MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
+  rejects([&] { (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
                                                  MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
   // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
   // ones for 32-row prefill and 8-row decode tiles.
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); });
+  rejects([&] { (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32}); });
+  rejects([&] { (void)MoE::decodePlan(routedShape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
 }
 
@@ -350,7 +357,7 @@ void workspaceBounds() {
   const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
                   uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
-                      kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
+                      kv::kVerifyMaximumSplits * 24 * 256 * 2 &&
               verify.statisticsBytes ==
                   uint64_t{RICHENGINE_TREE_VERIFY_NODES} *
                       kv::kVerifyMaximumSplits * 24 * 2 * 4,
@@ -391,7 +398,7 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - kv::kVerifyRows};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
-  require(finalVerify.splits == kv::kVerifyMaximumSplits,
+  require(finalVerify.splits == kv::kVerifyPolicySplits,
           "valid final physical verify rows were rejected");
   ++edge[0];
   rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });

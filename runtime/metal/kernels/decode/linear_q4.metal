@@ -100,7 +100,9 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_paired, residual,
                     (q4_mpp_tile<8, 128, false, true, false, 8, true>), 64, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual, residual,
                     (q4_mpp_tile<8, 128, false, true>), 64, 128)
-Q4_DECODE_GATE_UP(decode_linear_q4_n256_gate_up, (q4_mpp_tile<8, 256, true, false>), 64, 256)
+// Pipelined: two groups' weight loads overlap each epilogue; bit-identical
+// and measured ahead of the sequential form on the one- and two-lane grid.
+Q4_DECODE_GATE_UP(decode_linear_q4_n256_gate_up, (q4_mpp_tile<8, 256, true, false, false, 8, true>), 64, 256)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m16, residual,
                     (q4_mpp_tile<16, 128, false, true>), 128, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m24, residual,
@@ -108,7 +110,7 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m24, residual,
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m24_sg4, residual,
                     (q4_mpp_tile<24, 128, false, true, false, 4>), 192, 128)
 Q4_DECODE_GATE_UP(decode_linear_q4_n256_gate_up_m16,
-                  (q4_mpp_tile<16, 256, true, false>), 128, 256)
+                  (q4_mpp_tile<16, 256, true, false, false, 8, true>), 128, 256)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_m32,
                  (q4_mpp_tile<32, 128, false, false>), 256, 128)
 Q4_DECODE_AFFINE(decode_linear_q4_n256_m32,

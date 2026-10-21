@@ -369,7 +369,11 @@ struct MoE final {
   // The DiffusionGemma trunk's expert sweep: prefill-shaped dispatches on a
   // canvas plan family.
   [[nodiscard]] static MoePlan canvasPlan(MoeShape shape, uint32_t rows, MoeConfig config);
-  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // verifyRows is the lanes' packed verify row stride: a trained-block
+  // draft's verify depth, at most RICHENGINE_TARGET_VERIFY_ROWS.
+  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes,
+                                          uint32_t verifyRows,
+                                          MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
   // Gemma 4's block: moe_route_scores_gemma over `routerInput` (or `input`),

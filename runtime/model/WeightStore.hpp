@@ -109,6 +109,22 @@ inline constexpr uint32_t kBlockWeightsImageType = 1u << 31;
 [[nodiscard]] ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize,
                                                        uint32_t inputSize, std::string_view label);
 
+// The token table of an oQ image (model/OqWrite.cpp): native block rows of
+// a private affine type — NativeRows of the block format — or the F32 rows
+// of a table the checkpoint leaves unquantized — NativeRows of kFloat32.
+[[nodiscard]] ops::EmbeddingWeights readOqEmbedding(WeightFile &file, uint32_t outputSize,
+                                                  uint32_t inputSize, std::string_view label);
+// A fused projection of an oQ image: the segments the section holds, in
+// order, until their output sizes cover the projection's, or the affine
+// tiles of a ggml::kAffineQ4 section leading it. The tensor names the GGUF
+// format reads per segment are only labels here.
+[[nodiscard]] ops::Projection readOqFused(WeightFile &file, uint32_t outputSize,
+                                        uint32_t inputSize, std::string_view label);
+// A single projection of an oQ image: the affine tiles of a
+// ggml::kAffineQ4 section, or the one block segment any other holds.
+[[nodiscard]] ops::Projection readOqProjection(WeightFile &file, uint32_t outputSize,
+                                             uint32_t inputSize, std::string_view label);
+
 // Embedding weights, scales and biases are independently aligned sections
 // so token gather can bind each table directly. `tiled` records the packed
 // format's 256-row plane layout (pack.py); safetensors-sourced images copy

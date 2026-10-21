@@ -58,6 +58,9 @@ template <size_t CaptureLayers> struct QwenHybridLayout {
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, CaptureLayers> hiddenCaptureLayers{};
+  // The compiled attention kernel the full-attention layers bind
+  // (kv::Core); each family declares it in its derived constructor.
+  kv::Core attentionCore = kv::Core::Unspecified;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -70,8 +73,10 @@ template <size_t CaptureLayers> struct QwenHybridLayout {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
   }
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads,
-            attentionHeadDimension};
+    kv::Layout layout{attentionLayerCount(), attentionKvHeads,
+                      attentionHeadDimension};
+    layout.attentionCore = attentionCore;
+    return layout;
   }
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     return {layers - attentionLayerCount(), kGdnConvolutionTaps - 1,

@@ -3,7 +3,7 @@
 // affine Q4 layer, on the device's plans and the other GGUF tile: a 2048-row prefill chunk, decode B1-B4 and prefill
 // chunks of their rows, prefill chunks of 64 to 512 rows, then every dispatch of the long chunk, B1 and B4 replayed as
 // its own command. The numbers behind the MoE plans of ops/MoE.cpp:
-//   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [topk] [a1b]
+//   gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [topk] [a1b|a2b]
 // Printed are medians of GPU ms per layer over `rounds` (20) commands. Every row routes to top-k experts of a pool of
 // 24 per request lane (decode, short chunks) or of all 256 (chunks of 64 rows or more), identically for both formats.
 // `topk` overrides expertsPerToken (8, or 4 with a1b). MOE_BENCH_SKEW=1 instead draws each route 70% from a hot set of
@@ -92,19 +92,26 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat, bool a1b,
-           uint32_t topk) {
-  // The 35B shape by default; `a1b` is LFM2.5-8B-A1B's sparse block: 32
-  // experts, top 4, intermediate 1792, sigmoid-bias router, no shared expert.
-  const uint32_t H = 2048, I = a1b ? 1792 : 512, E = a1b ? 32 : 256,
-                 TOPK = topk ? topk : (a1b ? 4 : 8), kRowsMax = 2048;
+int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat,
+           const char *shape, uint32_t topk) {
+  // The 35B shape by default; `a1b` is LFM2.5-8B-A1B's sparse block (32
+  // experts, top 4, intermediate 1792) and `a2b` LFM2.5-24B-A2B's (64
+  // experts, top 4, intermediate 1536): both sigmoid-bias routers, no
+  // shared expert.
+  const bool a1b = shape && !std::strcmp(shape, "a1b");
+  const bool a2b = shape && !std::strcmp(shape, "a2b");
+  const bool sigmoid = a1b || a2b;
+  const uint32_t H = 2048, I = a2b ? 1536 : a1b ? 1792 : 512,
+                 E = a2b ? 64 : a1b ? 32 : 256,
+                 TOPK = topk ? topk : (sigmoid ? 4 : 8), kRowsMax = 2048;
   // MOE_BENCH_SKEW=1 draws each route 70% from a hot set of E/4 experts and
   // 30% uniformly over all E, like real correlated routing.
   const char *skewEnv = std::getenv("MOE_BENCH_SKEW");
   const bool skew = skewEnv && std::string_view(skewEnv) != "0";
   // gate and up hold most of the routed expert weights.
-  const MoeShape affineShape{H, E, TOPK, I}, ggufShape{H, E, TOPK, I, WeightLayout::Block32,
-                                                       uint32_t(gateUpFormat), !a1b};
+  const MoeShape affineShape{H, E, TOPK, I, WeightLayout::Affine64,
+                             uint32_t(GGUF_FMT_COUNT), !sigmoid},
+      ggufShape{H, E, TOPK, I, WeightLayout::Block32, uint32_t(gateUpFormat), !sigmoid};
   std::mt19937 local(9);
   // Affine: random Q4 slabs with finite scales, the router and shared gate of the routing fixture.
   const auto affineExperts = [&](uint32_t experts, uint32_t n, uint32_t k) {
@@ -140,6 +147,8 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
       .sharedUp = affineExperts(1, I, H),
       .sharedDown = affineExperts(1, H, I),
       .sharedScalarGate = affineRouter(false),
+      .expertBias = sigmoid ? floatSegment(backend, std::vector<float>(E, 0.0f), 1, E).plane0
+                        : MetalBuffer{},
   };
   // GGUF: the same routing in an F32 router.
   const auto planes = [&](Fmt f, uint32_t rows, uint32_t k) {
@@ -151,9 +160,9 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   for (uint32_t e = 0; e < E; ++e) router[uint64_t{e} * H + e] = 4.0f;
   const QuantizedSegment routerSegment = floatSegment(backend, router, E, H);
   const QuantizedSegment sharedGateSegment =
-      a1b ? QuantizedSegment{} : floatSegment(backend, sharedGate, 1, H);
+      sigmoid ? QuantizedSegment{} : floatSegment(backend, sharedGate, 1, H);
   const QuantizedSegment biasSegment =
-      a1b ? floatSegment(backend, bias, 1, E) : QuantizedSegment{};
+      sigmoid ? floatSegment(backend, bias, 1, E) : QuantizedSegment{};
   MoeWeights gguf;
   gguf = BlockMoeWeights{routerSegment, sharedGateSegment,
                              {planes(gateUpFormat, E * I, H), planes(Q80, I, H)},
@@ -233,21 +242,22 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   printf("  prefill %u rows: affine %.3f  gguf %.3f\n", kRowsMax, affinePrefill,
          time(gguf, plans.moePrefill(ggufShape, kRowsMax)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const Input in = input(lanes * 8, a1b ? E : 24);
+    const uint32_t rows = plans.moeDecode(affineShape, lanes).rows();
+    const Input in = input(rows, sigmoid ? E : 24);
     b.input = bfloatBuffer(backend, in.x, "input");
-    const uint32_t touched = expertUnion(in, E), routes = lanes * 8 * TOPK;
+    const uint32_t touched = expertUnion(in, E), routes = rows * TOPK;
     MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
     config.ggufTile = other;
     const double a = time(affine, plans.moeDecode(affineShape, lanes));
     const double g = time(gguf, plans.moeDecode(ggufShape, lanes));
-    const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, config));
-    const double ap = time(affine, plans.moePrefill(affineShape, lanes * 8));
-    const double gp = time(gguf, plans.moePrefill(ggufShape, lanes * 8));
+    const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, RICHENGINE_TARGET_VERIFY_ROWS, config));
+    const double ap = time(affine, plans.moePrefill(affineShape, rows));
+    const double gp = time(gguf, plans.moePrefill(ggufShape, rows));
     printf("  decode B%u (%u rows, k=%u): union=%u/%u routes (%u%% of E)  affine %.3f  gguf %s %.3f  gguf %s "
            "%.3f  | prefill chunk of %u rows: affine %.3f  gguf %.3f\n",
-           lanes, lanes * 8, TOPK, touched, routes, touched * 100 / E, a,
+           lanes, rows, TOPK, touched, routes, touched * 100 / E, a,
            device == MoeGgufTile::Register ? "register" : "staged", g,
-           other == MoeGgufTile::Register ? "register" : "staged", o, lanes * 8, ap, gp);
+           other == MoeGgufTile::Register ? "register" : "staged", o, rows, ap, gp);
   }
   for (const uint32_t rows : {64u, 128u, 256u, 512u}) {
     b.input = bfloatBuffer(backend, input(rows, E).x, "input");
@@ -263,7 +273,7 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
         std::tuple{"gguf B1", &gguf, plans.moeDecode(ggufShape, 1)},
         std::tuple{"affine B4", &affine, plans.moeDecode(affineShape, 4)},
         std::tuple{"gguf B4", &gguf, plans.moeDecode(ggufShape, 4)}}) {
-    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax || a1b ? E : 24).x, "input");
+    b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax || sigmoid ? E : 24).x, "input");
     allocate(backend, b, plan);
     CommandGraph graph;
     MoE::add(graph, b, *weights, plan);
@@ -275,6 +285,55 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     for (const auto &[name, ms] : spent) printf(" %s %.3f", name.c_str(), ms);
     printf("\n");
   }
+  // RICHENGINE_GPU_SPANS=1: replay the B1 gguf decode plan twice — direct
+  // and with every dispatch inside a GPU-encoded span — and compare the
+  // MoE output bitwise plus the submission wall time, which carries the
+  // host encode cost the spans replace. The GPU-encoded ICB must produce
+  // what direct encoding produces, including the gguf expert kernels that
+  // produce no output when host-baked.
+  if (std::getenv("RICHENGINE_GPU_SPANS")) {
+    const auto check = [&](uint32_t lanes) {
+      const MoePlan plan = plans.moeDecode(ggufShape, lanes);
+      const Input in = input(plan.rows(), sigmoid ? E : 24);
+      b.input = bfloatBuffer(backend, in.x, "input");
+      allocate(backend, b, plan);
+      const uint64_t bytes = uint64_t{plan.rows()} * H * sizeof(__bf16);
+      const auto submit = [&](bool gpu) {
+        CommandGraph graph;
+        if (gpu) graph.beginGpuSpan();
+        MoE::add(graph, b, gguf, plan);
+        if (gpu) graph.endGpuSpan();
+        return backend.submitCommand(graph.dispatches());
+      };
+      std::vector<uint8_t> reference(bytes), candidate(bytes);
+      { const auto t = submit(false); (void)t;
+        std::memcpy(reference.data(), b.output.contents(), bytes); }
+      { const auto t = submit(true); (void)t;
+        std::memcpy(candidate.data(), b.output.contents(), bytes); }
+      const auto run = [&](bool gpu) {
+        std::vector<double> gpuMs, wallMs;
+        for (uint32_t i = 0; i < rounds + 1; ++i) {
+          const auto t = submit(gpu);
+          if (i) {
+            gpuMs.push_back(t.gpuSeconds * 1e3);
+            wallMs.push_back(t.wallSeconds * 1e3);
+          }
+        }
+        std::sort(gpuMs.begin(), gpuMs.end());
+        std::sort(wallMs.begin(), wallMs.end());
+        return std::pair{gpuMs[gpuMs.size() / 2], wallMs[wallMs.size() / 2]};
+      };
+      const auto [directGpu, directWall] = run(false);
+      const auto [spanGpu, spanWall] = run(true);
+      printf("  gpu span B%u: %s   direct %.3f ms GPU / %.3f wall,"
+             " gpu span %.3f ms GPU / %.3f wall\n",
+             lanes,
+             reference == candidate ? "identical to direct encoding"
+                                    : "MISMATCH against direct encoding",
+             directGpu, directWall, spanGpu, spanWall);
+    };
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) check(lanes);
+  }
   return 0;
 }
 
@@ -282,17 +341,18 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    const bool a1b = argc > 1 && std::string_view(argv[argc - 1]) == "a1b";
-    const int args = argc - (a1b ? 1 : 0);
+    const char *last = argc > 1 ? argv[argc - 1] : "";
+    const char *shape = (!std::strcmp(last, "a1b") || !std::strcmp(last, "a2b")) ? last : nullptr;
+    const int args = argc - (shape ? 1 : 0);
     const Fmt gateUp = args > 3 ? fmtNamed(argv[3]) : Q4K, down = args > 4 ? fmtNamed(argv[4]) : Q5K;
     if (args < 2 || args > 6 || gateUp == FMT_COUNT || down == FMT_COUNT) {
       std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [topk] "
-                   "[a1b]  (MOE_BENCH_SKEW=1 for correlated routing)\n";
+                   "[a1b|a2b]  (MOE_BENCH_SKEW=1 for correlated routing)\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      return timing(backend, args > 2 ? std::stoul(argv[2]) : 20, gateUp, down, a1b,
+      return timing(backend, args > 2 ? std::stoul(argv[2]) : 20, gateUp, down, shape,
                     args > 5 ? std::stoul(argv[5]) : 0);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';

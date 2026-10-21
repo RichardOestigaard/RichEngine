@@ -156,6 +156,14 @@ class FakeRuntime:
     def pending_count(self):
         return sum(not call.done for call in self.calls)
 
+    def mask_stats(self):
+        return {
+            "calls": 0,
+            "queue_ms_total": 0.0,
+            "eval_ms_total": 0.0,
+            "eval_ms_max": 0.0,
+        }
+
     def submit(self, request, *, on_event, on_complete):
         self.submit_attempts += 1
         if self.mode == "pending_limit":
@@ -282,9 +290,13 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(provider(simulation), array.array("I", range(1, 19)).tobytes())
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
+        # The engine simulates at most its 16 verify rows — the pending
+        # anchor plus a full-width draft's live proposals (16-row drafts
+        # send the anchor and their 15 proposals); one more overflows
+        # MAX_ROWS.
         with self.assertRaises(api_errors.ConstraintError):
             generation_constraints.TokenConstraint(None, None, CONTRACT).masks(
-                tuple(range(9))
+                tuple(range(17))
             )
 
     def test_http_fields_reach_native_generation_request(self):

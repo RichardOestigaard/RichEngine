@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
       for (const auto &input : workloads) {
         if (interrupted) break;
         const auto result = tuneLinear(backend, admit, input, options.measurement, underPressure, stop);
-        const auto plans = linearCandidates(device, input.workload);
+        const auto plans = linearCandidates(device, input.workload, input.model);
         const auto baseline = plans.front().configuration();
         const bool didChange = result.complete && result.configuration != baseline;
         outcome(describe(input.workload), result.complete, didChange,

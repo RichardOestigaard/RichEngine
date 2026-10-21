@@ -27,8 +27,8 @@ class PromptToolsTests(unittest.TestCase):
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            for option, tokens in pool.map(tokenize, range(32)):
-                self.assertEqual(tokens, expected[option])
+            for option, data in pool.map(tokenize, range(32)):
+                self.assertEqual(data["tokens"], expected[option])
         self.assertEqual(self.harness.app.preparation_active, 0)
         self.assertEqual(self.harness.app.preparation_waiting, 0)
 
@@ -202,9 +202,11 @@ class PromptToolsTests(unittest.TestCase):
             {"content": []},
             {"content": "hello", "add_special": 1},
             {"content": "hello", "parse_special": False},
-            {"content": "hello", "with_pieces": True},
+            {"content": "hello", "with_pieces": 1},
         ):
             self.post("/tokenize", body, 400)
+        data = self.post("/tokenize", {"content": "hello", "with_pieces": True})
+        self.assertEqual(len(data["offsets"]), len(data["tokens"]))
         for body in (
             {},
             {"messages": "bad"},

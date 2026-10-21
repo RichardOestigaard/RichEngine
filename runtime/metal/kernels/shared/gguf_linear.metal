@@ -144,6 +144,7 @@ kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w
       counters + hp.decode.out_offset / GGUF_TILE_COLUMNS + group.x, hp.decode.out_stride, column0,
       simd_group * 32 + simd_lane, &arrival, [&](uint row, uint column, float v) {
         const uint token = column0 + column;
+        if (token >= hp.head.output_size) return;
         const uint lane_index = row / hp.head.rows;
         if (row % hp.head.rows >= hp.head.live_rows[lane_index]) return;
         if ((hp.head.exclude_stop_mask & (1u << lane_index)) &&

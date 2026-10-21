@@ -41,10 +41,7 @@ import numpy as np
 from . import models
 from .layout import DRAFT, PACK_STAGING, PACKAGE_MANIFEST, PACKED, TARGET, TOKENIZER
 from .pack_layouts import (
-    DIFFUSION,
     ENCODER_SCALARS_TYPE,
-    GEMMA4,
-    GEMMA4_DRAFT,
     HEAD_LAYER_TYPE,
     LAYER_SECTIONS,
     LAYER_TYPE_GLOBAL,
@@ -52,6 +49,8 @@ from .pack_layouts import (
     SELF_CONDITIONING_TYPE,
     DraftLayout,
     Layout,
+    draft_layout as family_draft_layout,
+    execution_geometry,
 )
 
 # The format constants the packed readers fix (runtime/model/WeightLayout.hpp,
@@ -511,7 +510,10 @@ def package_manifest(
     *,
     format_name: str = FORMAT_NAME,
     architecture: str,
+    geometry: dict,
     diffusion=None,
+    serving=None,
+    signature=None,
 ):
     """manifest.json of a built package, as inspectModelPackage validates it
     (validateGemma4 / validateNewPackedFormat)."""
@@ -519,6 +521,14 @@ def package_manifest(
         "model": model,
         "schema_version": 1,
         "family": family_name,
+        # The family data the server reads at load, recorded so the package
+        # serves the same spellings even if the family file changes later.
+        **({"serving": dict(serving)} if serving else {}),
+        **(
+            {"signature": {k: _jsonable(v) for k, v in signature.items()}}
+            if signature
+            else {}
+        ),
         "built_by": "install/pack.py",
         "sources": sources,
         "format": {
@@ -533,13 +543,9 @@ def package_manifest(
             ),
             "vision_magic": VISION_MAGIC,
         },
-        "execution_geometry": {
-            "draft_proposal_tokens": 15,
-            "draft_query_rows": 16,
-            # The DFlash draft's trained window (family signature), under the
-            # runtime's draft ring capacity.
-            "draft_sliding_window": 2048,
-        },
+        # The family's declared geometry: the draft sliding window is the
+        # draft signature's trained window (execution_geometry()).
+        "execution_geometry": geometry,
         TARGET: {
             "architecture": architecture,
             "layers": layout.layers,
@@ -586,6 +592,13 @@ def package_manifest(
         **({"diffusion": dict(diffusion)} if diffusion is not None else {}),
         "artifacts": artifacts,
     }
+
+
+def _jsonable(value):
+    """A signature value as manifest JSON states it: tuples as lists."""
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _text_type(config):
@@ -696,12 +709,26 @@ def build_package(
     draft_files,
     sources,
     *,
-    layout: Layout = GEMMA4,
-    draft_layout: DraftLayout | None = GEMMA4_DRAFT,
+    layout: Layout | None = None,
+    draft_layout: DraftLayout | None = None,
+    pack: dict | None = None,
+    serving: dict | None = None,
+    signature: dict | None = None,
 ):
     """Write the packed package into stage: manifest.json, target/*.bin from
     the checkpoint shards in weights (path per repository name), the
-    tokenizer files and the draft's packed layer files."""
+    tokenizer files and the draft's packed layer files.
+
+    The geometry is the family's: pass its pack section (pack=family.pack)
+    or the layouts directly (tests). serving and signature are the family's
+    serving contract and identity signature, recorded into the manifest so
+    the package self-describes (server/serving.py reads it at load)."""
+    if pack is not None:
+        layout = Layout(**pack["layout"])
+        spec_draft = pack.get("draft_layout")
+        draft_layout = DraftLayout(**spec_draft) if spec_draft else None
+    if layout is None:
+        raise models.ModelError("build_package needs the family's pack geometry")
     stage.mkdir(parents=True, exist_ok=True)
     target_dir = stage / TARGET
     target_dir.mkdir()
@@ -755,7 +782,11 @@ def build_package(
         path for name, path in draft_files.items() if name.endswith(".safetensors")
     ]
     if draft_weights:
-        draft = draft_layout or GEMMA4_DRAFT
+        if draft_layout is None:
+            raise models.ModelError(
+                "the family's pack declares no draft layout for its draft files"
+            )
+        draft = draft_layout
         draft_dir = stage / DRAFT
         draft_dir.mkdir()
         pack_draft(Checkpoint(draft_weights), draft_dir, draft)
@@ -772,7 +803,14 @@ def build_package(
         draft,
         format_name=PACKABLE.get(model_type, (FORMAT_NAME,))[0],
         architecture=model_type if model_type in PACKABLE else "gemma4_text",
-        diffusion=DIFFUSION if diffusion else None,
+        geometry=(
+            (pack or {}).get("execution_geometry")
+            or {"draft_proposal_tokens": 15, "draft_query_rows": 16,
+                "draft_sliding_window": draft.sliding_window if draft else 2048}
+        ),
+        diffusion=(pack or {}).get("diffusion") if diffusion else None,
+        serving=serving,
+        signature=signature,
     )
     (stage / PACKAGE_MANIFEST).write_bytes(models.json_bytes(manifest))
     return manifest
@@ -826,6 +864,22 @@ def install(selection, family, config, repo, target_files, draft_repo, draft_fil
     sources = {TARGET: repo.identity()}
     if draft_repo is not None:
         sources[DRAFT] = draft_repo.identity()
+    # The family file declares the pack: its format must be one this packer
+    # writes, and the model_type's PACKABLE entry must agree.
+    model_type = _text_type(config)
+    if (
+        family.defaults.packed_format is None
+        or family.defaults.packed_format not in TARGET_FORMATS
+        or PACKABLE.get(model_type, (None, None))[1]
+        != family.defaults.packed_format
+    ):
+        raise models.ModelError(
+            f"{family.name} declares no packed format for {model_type}"
+        )
+    spec = dict(family.pack)
+    spec["execution_geometry"] = execution_geometry(
+        family, family_draft_layout(family)
+    )
     models_root = selection.models_root
     destination = models_root / PACKED / _package_key(sources)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -840,6 +894,9 @@ def install(selection, family, config, repo, target_files, draft_repo, draft_fil
             tokenizer,
             draft_files,
             sources,
+            pack=spec,
+            serving=family.serving,
+            signature=dict(family.signature),
         )
         if destination.exists():
             shutil.rmtree(destination)

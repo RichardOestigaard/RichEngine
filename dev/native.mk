@@ -61,6 +61,8 @@ TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
 TEST_AFFINE_PREPARATION := $(ENGINE_TEST_BUILD)/affine-preparation
 TEST_AFFINE_CHECKPOINT := $(ENGINE_TEST_BUILD)/affine-checkpoint
 TEST_AFFINE_BLOCK := $(ENGINE_TEST_BUILD)/affine-block
+TEST_OQ_CHECKPOINT := $(ENGINE_TEST_BUILD)/oq-checkpoint
+TEST_OQ_WRITE := $(ENGINE_TEST_BUILD)/oq-write
 TEST_WEIGHT_SOURCE := $(ENGINE_TEST_BUILD)/weight-source
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
@@ -76,6 +78,10 @@ TEST_GGUF_PLANNER := $(ENGINE_TEST_BUILD)/gguf-planner
 TEST_GGUF_PREPARATION := $(ENGINE_TEST_BUILD)/gguf-preparation
 TEST_GGUF_DEQUANT_AIR := $(ENGINE_TEST_BUILD)/gguf-dequant.air
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
+# The oQ (oMLX) format checks dispatch both production and dequant test
+# kernels, so their library links the production AIRs and the test one.
+TEST_OQ_FORMATS := $(ENGINE_TEST_BUILD)/oq-formats
+TEST_OQ_FORMATS_LIB := $(ENGINE_TEST_BUILD)/oq-formats.metallib
 # Every hash the weight tests compare against, and how to update them.
 WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
@@ -83,6 +89,7 @@ TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
 TEST_NGRAM_INDEX_TEST := $(ENGINE_TEST_BUILD)/ngram-index
+TEST_MODEL_POLICY_TEST := $(ENGINE_TEST_BUILD)/model-policy
 TEST_KV_FIRST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/kv-first-engine
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
 TEST_PROTOCOL_TEST := $(ENGINE_TEST_BUILD)/protocol
@@ -138,6 +145,7 @@ TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_MTL4_BENCHMARK := $(ENGINE_TEST_BUILD)/mtl4-benchmark
+TEST_ML_ENCODER_BENCH := $(ENGINE_TEST_BUILD)/ml-encoder-bench
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_AFFINE_SOURCE_ORACLE := $(ENGINE_TEST_BUILD)/affine-source-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
@@ -187,7 +195,7 @@ TEST_SLOT_FILE := $(ENGINE_TEST_BUILD)/slot-file
 TEST_CACHE_DIRECTORY := $(ENGINE_TEST_BUILD)/cache-directory
 TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
-TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_AFFINE_BLOCK) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
+TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREPARATION) $(TEST_AFFINE_CHECKPOINT) $(TEST_AFFINE_BLOCK) $(TEST_OQ_CHECKPOINT) $(TEST_OQ_WRITE) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_GGUF_FILE) \
 	$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) \
 	$(TEST_TUNING_WORKLOADS) \
@@ -207,6 +215,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREP
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_NGRAM_INDEX_TEST) \
+	$(TEST_MODEL_POLICY_TEST) \
 	$(TEST_KV_FIRST_ENGINE_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
 	$(TEST_PROTOCOL_TEST) \
@@ -225,6 +234,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_ANE_FFN) \
 	$(TEST_ANE_PROGRAM_FAULTS) \
 	$(TEST_GGUF_DEQUANT) \
+	$(TEST_OQ_FORMATS) \
 	$(TEST_GGUF_ROTATION) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_PREPARATION) \
@@ -257,7 +267,8 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_HANDOFF_TEST) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
 	$(TEST_FP8_LIB) $(TEST_FP8_ATTENTION_LIB) \
-	$(TEST_GGUF_DEQUANT_LIB)
+	$(TEST_GGUF_DEQUANT_LIB) \
+	$(TEST_OQ_FORMATS_LIB)
 
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
@@ -265,7 +276,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GGUF_DECODE_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
-	$(TEST_MTL4_BENCHMARK) \
+	$(TEST_MTL4_BENCHMARK) $(TEST_ML_ENCODER_BENCH) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) \
 	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB) \
@@ -304,6 +315,12 @@ $(TEST_AFFINE_CHECKPOINT): dev/tests/engine/affine_checkpoint_test.cpp $(ENGINE_
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_AFFINE_BLOCK): dev/tests/engine/affine_block_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_OQ_CHECKPOINT): dev/tests/engine/oq_checkpoint_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_OQ_WRITE): dev/tests/engine/oq_write_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -364,6 +381,16 @@ $(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal \
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
+# The production kernels and the dequant test kernels in one library: the oQ
+# checks dispatch both gguf_embed_* and gguf_test_dequant_*.
+$(TEST_OQ_FORMATS_LIB): $(PRODUCTION_AIRS) $(TEST_GGUF_DEQUANT_AIR) $(LIB)
+	$(RUN_CONFIGURED) $(METALLIB) $(filter %.air,$^) -o $@
+
+$(TEST_OQ_FORMATS): dev/tests/engine/oq_formats_test.mm \
+	$(ENGINE_LIBRARY) $(TEST_OQ_FORMATS_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/memory/MemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp | $(ENGINE_TEST_BUILD)
@@ -385,6 +412,10 @@ $(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
 
 $(TEST_NGRAM_INDEX_TEST): runtime/model/NgramIndex.hpp \
 		dev/tests/engine/ngram_index_test.cpp | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+
+$(TEST_MODEL_POLICY_TEST): runtime/model/ModelPolicy.hpp runtime/model/ModelTuning.hpp \
+		dev/tests/engine/model_policy_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_KV_FIRST_CACHE_TEST): $(CACHE_SOURCES) runtime/model/SlotFile.cpp \
@@ -795,6 +826,12 @@ $(TEST_MTL4_BENCHMARK): dev/benchmarks/mtl4_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+# Standalone MTL4 encoder dispatch probe; engine-independent, so no engine
+# library on the link line.
+$(TEST_ML_ENCODER_BENCH): dev/tests/engine/ml_encoder_bench.mm | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LINKFLAGS) -o $@
+
 .PHONY: verify-build-identity
 verify-build-identity: $(TARGET) $(BUILD_ID_HEADER) $(BUILD_ID_STAMP)
 	$(BUILD_ID_PYTHON) $(BUILD_ID_SCRIPT) check --root . \
@@ -816,6 +853,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(BUILD_ID_PYTHON) dev/tests/engine/run_vision_preparation.py $(TEST_VISION_PREPARATION) $(WEIGHT_GOLDENS)
 	$(TEST_AFFINE_CHECKPOINT)
 	$(TEST_AFFINE_BLOCK)
+	$(TEST_OQ_CHECKPOINT)
+	$(TEST_OQ_WRITE)
 	$(TEST_WEIGHT_SOURCE)
 	$(TEST_GGUF_FILE)
 	$(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS)
@@ -857,6 +896,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 		$(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREPARATION) $(LIB) $(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_DEQUANT_LIB)
+	$(METAL_TEST_ENV) $(TEST_OQ_FORMATS) $(TEST_OQ_FORMATS_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_ROTATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ANE_FFN) $(LIB) kernels

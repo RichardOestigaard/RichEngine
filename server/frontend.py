@@ -38,6 +38,7 @@ from .tool_schema import (
     QWEN3_XML,
     THINK_END,
     THINK_END_TOKEN_ID,
+    dialect_named,
     ToolPolicy,
     json_grammar,
     normalize_response_format,
@@ -278,6 +279,13 @@ class GenerationOptions:
 
 
 class Frontend:
+    # Class-level fallbacks for harnesses that bypass __init__ (tests): the
+    # served model's contract overrides each at construction.
+    image_pad_token = IMAGE_PAD_TOKEN
+    image_geometry = image_input.DEFAULT_GEOMETRY
+    sampling_defaults: dict = {}
+    serving_dialect = None
+
     def __init__(
         self,
         tokenizer,
@@ -296,6 +304,7 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         contract=None,
+        serving=None,
         shared_prefix_states=False,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
@@ -317,6 +326,48 @@ class Frontend:
         self.think_open = "<think>" if contract is None else contract.think_open
         self.think_end = THINK_END if contract is None else contract.think_end
         self.think_flag = None if contract is None else contract.think_flag
+        # The serving contract's spellings and defaults. Where the model
+        # declares none (old assemblies) every field keeps the probe/default
+        # the server has always used.
+        self.serving = serving
+        # The contract's sampling defaults are validated here, at load: a
+        # bad value is the model file's fault, not the first request's, and
+        # must not surface as a 400.
+        self.sampling_defaults = {}
+        for name, value in (serving.sampling if serving else {}).items():
+            if name == "top_k":
+                if not isinstance(value, int) or isinstance(value, bool) or value < -1:
+                    raise ValueError(
+                        "serving contract's sampling default top_k must be "
+                        "0 or -1 (disabled) or a positive integer"
+                    )
+            elif name in SAMPLING_NUMBERS:
+                _, accepts, requirement = SAMPLING_NUMBERS[name]
+                if not is_finite_number(value) or not accepts(value):
+                    raise ValueError(
+                        f"serving contract's sampling default {name} must be {requirement}"
+                    )
+            self.sampling_defaults[name] = value
+        self.image_pad_token = (
+            serving.vision.pad_token
+            if serving is not None and serving.vision is not None
+            else IMAGE_PAD_TOKEN
+        )
+        self.image_geometry = (
+            image_input.ImageGeometry(
+                patch=serving.vision.patch_size,
+                merge=serving.vision.merge_size,
+                min_pixels=serving.vision.min_pixels,
+            )
+            if serving is not None and serving.vision is not None
+            else image_input.DEFAULT_GEOMETRY
+        )
+        # The contract's tool dialect fills in where the template probe
+        # spells no known framing; a detected one still wins — the template
+        # decides how calls render.
+        self.serving_dialect = (
+            dialect_named(serving.tool_dialect) if serving is not None else None
+        )
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, None if contract is None else contract.marker
         )
@@ -325,6 +376,11 @@ class Frontend:
         # can never hide what served a request (#81).
         self.model = model
         served = tuple(parse_served_model_name(name) for name in served_model_names)
+        # The contract's aliases join the command line's.
+        if serving is not None:
+            served += tuple(
+                parse_served_model_name(name) for name in serving.served_names
+            )
         if announce_served_name and not served:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
@@ -338,12 +394,18 @@ class Frontend:
             and default_reasoning_effort not in REASONING_EFFORTS
         ):
             raise ValueError("invalid default_reasoning_effort")
+        # The contract's effort applies where the flag stated none.
+        if default_reasoning_effort is None and serving is not None:
+            effort = serving.reasoning_effort
+            if effort is not None and effort not in REASONING_EFFORTS:
+                raise ValueError("invalid serving reasoning_effort")
+            default_reasoning_effort = effort
         self.default_reasoning_effort = default_reasoning_effort
         self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
-        self.images = image_input.ImageCache()
+        self.images = image_input.ImageCache(self.image_geometry)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
@@ -458,7 +520,7 @@ class Frontend:
                 **template,
                 "tokenize": False,
                 "chat_template": template["chat_template"].replace(
-                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
+                    self.image_pad_token, IMAGE_RENDER_MARKER
                 ),
             },
         )
@@ -467,9 +529,9 @@ class Frontend:
         offset = 0
         for part in parts[:-1]:
             offset += len(part)
-            image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
-            offset += len(IMAGE_PAD_TOKEN)
-        rendered = IMAGE_PAD_TOKEN.join(parts)
+            image_offsets.add((offset, offset + len(self.image_pad_token)))
+            offset += len(self.image_pad_token)
+        rendered = self.image_pad_token.join(parts)
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
@@ -483,7 +545,7 @@ class Frontend:
         return list(encoded["input_ids"]), positions, rendered
 
     def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.image_pad_token)
         if len(positions) != len(prepared) or any(
             prompt_tokens[position] != pad_id for position in positions
         ):
@@ -502,7 +564,7 @@ class Frontend:
             sum(len(image.pixels) for image in prepared),
         )
         expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.image_pad_token)
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
             spans.append(
@@ -877,7 +939,8 @@ class Frontend:
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
-            self.chat_templates.select(body.get("tools")).dialect,
+            self.chat_templates.select(body.get("tools")).dialect
+            or self.serving_dialect,
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
@@ -963,7 +1026,7 @@ class Frontend:
                 prompt.messages, deadline, check_context=check_context
             )
         remaining_request_time(deadline)
-        if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
+        if images and self.tokenizer.convert_tokens_to_ids(self.image_pad_token) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
         try:
@@ -1203,7 +1266,7 @@ class Frontend:
         may come next, so a tool with more of them than the parser admits
         fails there."""
         reasoning = [self.think_end_id] if thinking else []
-        dialect = policy.dialect or QWEN3_XML
+        dialect = policy.dialect or self.serving_dialect or QWEN3_XML
         return [
             (
                 reasoning
@@ -1219,7 +1282,7 @@ class Frontend:
     def _generation_options(self, body):
         numbers = {}
         for name, (default, accepts, requirement) in SAMPLING_NUMBERS.items():
-            value = body.get(name, default)
+            value = body.get(name, self.sampling_defaults.get(name, default))
             if not is_finite_number(value) or not accepts(value):
                 raise APIError(400, f"{name} must be {requirement}")
             numbers[name] = float(value)
@@ -1228,7 +1291,7 @@ class Frontend:
         # A top_k of 0 or -1 keeps every token, which the frame says with 0. A
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
-        top_k = body.get("top_k", TOP_K_DEFAULT)
+        top_k = body.get("top_k", self.sampling_defaults.get("top_k", TOP_K_DEFAULT))
         if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
             raise APIError(
                 400, "top_k must be 0 or -1 (disabled) or a positive integer"

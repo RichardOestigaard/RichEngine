@@ -259,6 +259,7 @@ class ArchitectureTests(unittest.TestCase):
     def test_only_engine_assembly_depends_on_concrete_models(self):
         headers = (
             "model/DFlashDraft.hpp",
+            "model/DFlashTwoDraft.hpp",
             "model/ModelFactory.hpp",
             "model/Qwen3_6Moe.hpp",
             "model/Qwen3_8.hpp",

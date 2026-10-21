@@ -1,6 +1,7 @@
 #include "model/PrefillArena.hpp"
 
 #include "Tuning.hpp"
+#include "model/ModelPolicy.hpp"
 #include "ops/GDN.hpp"
 
 namespace richengine::model {
@@ -43,7 +44,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   {
     // RICHENGINE_GDN_CHUNKED (32/64/128) sizes the WY/UT scratch at this
     // geometry's GDN shape; the serial scan binds nothing here.
-    const uint32_t factor = tuning().gdnChunked;
+    const uint32_t factor = modelPolicy().gdnChunked;
     if (factor == 32 || factor == 64 || factor == 128) {
       put(PrefillTensor::GdnChunkScratch,
           bytesFor<float>(ops::GDN::chunkScratchFloats(
@@ -155,7 +156,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearPacked, linear.input);
     put(PrefillTensor::LinearExponents, linear.sums);
   }
-  if (tuning().prefillFastInt8) {
+  if (modelPolicy().prefillFastInt8) {
     const uint64_t inputWidth =
         uint64_t{geometry.projectionSumsWidth()} * kQ4GroupElements;
     put(PrefillTensor::I8Codes, uint64_t{kPrefillRows} * inputWidth);

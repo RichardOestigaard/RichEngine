@@ -299,13 +299,16 @@ class Tuner:
                     400, f"unknown selection: {selection}", "invalid_request"
                 )
         else:
-            link = model_artifacts.Selection.of(
-                models_root,
-                model,
-                revision=revision,
-                language_only=language_only,
-                draft_model=draft_model,
-            ).link
+            try:
+                link = model_artifacts.Selection.of(
+                    models_root,
+                    model,
+                    revision=revision,
+                    language_only=language_only,
+                    draft_model=draft_model,
+                ).link
+            except model_artifacts.ModelError as error:
+                raise APIError(400, str(error), "invalid_request") from None
         if model_artifacts.installation_kind(link) is None:
             raise APIError(404, f"{model} is not installed", "model_not_found")
         if not allow_loaded and (serving or _other_serve_running()):

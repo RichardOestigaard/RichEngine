@@ -84,6 +84,44 @@ void LfmConv::addVerify(metal::CommandGraph &graph, const LfmConvVerifyBuffers &
                      groups(uint64_t{lanes} * rows * shape.dimension));
 }
 
+void LfmConv::addVerifyTree(metal::CommandGraph &graph, const LfmConvTreeVerifyBuffers &buffers,
+                            const LfmConvShape &shape, uint32_t lanes, uint32_t nodes,
+                            uint32_t layer, uint64_t stateLayerBytes, bool tapsMajor) {
+  if (!shape.valid() || !nodes || !buffers.treeNodes || !buffers.treeCounts)
+    throw std::invalid_argument("invalid conv tree shape");
+  requireStateSet(buffers.currentStates, lanes);
+  const auto p = params(nodes, shape, tapsMajor, layer, stateLayerBytes, lanes);
+  const std::vector<metal::MetalBuffer> bindings =
+      {buffers.packed, buffers.weights, buffers.currentStates[0],
+       buffers.currentStates[1], buffers.currentStates[2],
+       buffers.currentStates[3], buffers.mixed, buffers.output,
+       buffers.treeNodes, buffers.treeCounts};
+  graph.addPatchable(std::string(kVerifyLfmConvTree), bindings, p,
+                     groups(uint64_t{lanes} * nodes * shape.dimension));
+}
+
+void LfmConv::addCommitTree(metal::CommandGraph &graph, const LfmConvTreeCommitBuffers &buffers,
+                            const LfmConvShape &shape, uint32_t lanes, uint32_t nodes,
+                            uint32_t layer, uint64_t stateLayerBytes, uint32_t layers,
+                            uint64_t mixedLayerStride, bool tapsMajor) {
+  if (!shape.valid() || !nodes || !layers || !buffers.retainedPath)
+    throw std::invalid_argument("invalid conv tree commit shape");
+  requireStateSet(buffers.currentStates, lanes);
+  requireStateSet(buffers.nextStates, lanes);
+  auto p = params(nodes, shape, tapsMajor, layer, stateLayerBytes, lanes);
+  p.layers = layers;
+  p.mixed_layer_stride = mixedLayerStride;
+  const std::vector<metal::MetalBuffer> bindings =
+      {buffers.mixed, buffers.retainedCounts, buffers.retainedPath,
+       buffers.currentStates[0], buffers.currentStates[1],
+       buffers.currentStates[2], buffers.currentStates[3],
+       buffers.nextStates[0], buffers.nextStates[1],
+       buffers.nextStates[2], buffers.nextStates[3]};
+  const uint64_t tasks =
+      uint64_t{layers} * lanes * (shape.taps - 1) * shape.dimension;
+  graph.addPatchable(std::string(kCommitLfmConvTree), bindings, p, groups(tasks));
+}
+
 void LfmConv::addCommit(metal::CommandGraph &graph, const LfmConvCommitBuffers &buffers,
                         const LfmConvShape &shape, uint32_t lanes, uint32_t rows,
                         uint32_t layer, uint64_t stateLayerBytes, uint32_t layers,

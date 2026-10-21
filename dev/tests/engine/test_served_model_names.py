@@ -19,6 +19,7 @@ from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
 from server import protocol as native_wire
 from server import serve_options
+from server import model_host
 from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
@@ -318,24 +319,26 @@ class ServedModelNamesTests(unittest.TestCase):
         )
         with (
             mock.patch.object(api, "parse_args", return_value=args),
-            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(model_host, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                model_host.AutoTokenizer, "from_pretrained", return_value=object()
             ),
-            mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(model_host, "validate_tokenizer"),
+            mock.patch.object(model_host, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
-            mock.patch.object(api, "NativeBackend"),
-            mock.patch.object(api, "ConstraintFactory"),
-            mock.patch.object(api, "Frontend") as app_type,
+            mock.patch.object(model_host, "NativeBackend"),
+            mock.patch.object(model_host, "ConstraintFactory"),
+            mock.patch.object(model_host, "Frontend") as app_type,
             mock.patch.object(
                 api, "FrontendServer", return_value=mock.Mock(server_port=8000)
             ),
             mock.patch.object(api.signal, "signal"),
             mock.patch.object(api, "print_status"),
         ):
+            app_type.return_value.max_context = 8192
+            app_type.return_value.vision = True
             api.main()
         self.assertEqual(app_type.call_args.kwargs["served_model_names"], ["local"])
         self.assertIs(app_type.call_args.kwargs["announce_served_name"], True)

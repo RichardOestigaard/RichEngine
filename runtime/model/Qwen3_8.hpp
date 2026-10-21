@@ -37,7 +37,8 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
                          .fullAttentionPeriod = 4,
                          .maskToken = 248070,
                          .stopTokens = {248044, 248046},
-                         .hiddenCaptureLayers = {5, 19, 33, 47, 61}} {}
+                         .hiddenCaptureLayers = {5, 19, 33, 47, 61},
+                         .attentionCore = kv::Core::Kv4Group6} {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
 

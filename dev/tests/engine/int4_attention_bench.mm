@@ -61,7 +61,8 @@ struct Result {
 
 Result run(metal::MetalBackend &backend, uint32_t history, uint32_t lanes,
            uint32_t repeat, bool oldLayout) {
-  const kv::Layout layout{1, kKvHeads, 256, kv::Format::Int4};
+  kv::Layout layout{1, kKvHeads, 256, kv::Format::Int4};
+  layout.attentionCore = kv::Core::Kv4Group6;
   const kv::Layout poolLayout{2, kKvHeads, 256, kv::Format::Int4};
   const uint32_t tokens = history + kRows;
   const uint32_t pages = (tokens + 31) / 32;

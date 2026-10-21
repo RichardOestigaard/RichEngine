@@ -1,6 +1,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/AffinePlan.hpp"
 #include "model/DFlashDraft.hpp"
+#include "model/DFlashTwoDraft.hpp"
 #include "model/DSparkDraft.hpp"
 #include "model/DFlashV1Draft.hpp"
 

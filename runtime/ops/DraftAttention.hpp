@@ -8,6 +8,28 @@
 
 namespace richengine::ops {
 
+// The compiled kernels a model's draft binds. The family maker declares the
+// pair on its DFlashDraftLayout (the ops/draft_cores/ files name each head
+// geometry's kernels); the plan validates the declared geometry rather than
+// inferring a kernel from it, so an unmatched shape fails instead of
+// silently binding another model's kernels.
+enum class DraftHeadCore : uint8_t {
+  Unspecified,
+  Q32K8D128,
+  Q16K2D128,
+  Q32K8D64Interleaved,
+  Q8K2D256,
+};
+enum class DraftContextCore : uint8_t {
+  Unspecified,
+  Hidden5120,
+  Hidden2048,
+  Plain5120,
+  Plain4096,
+  Plain2816,
+  Plain2048,
+};
+
 struct DraftAttentionShape final {
   uint32_t hiddenSize = 0;
   uint32_t dynamicSize = 0;
@@ -22,6 +44,10 @@ struct DraftAttentionShape final {
   // The draft's declared sliding_window clamped to the ring capacity: how far
   // back its attention reads, independent of the ring's physical size.
   uint32_t slidingWindow = 0;
+  // The maker-declared kernel bindings (see above). Unspecified is rejected
+  // at plan time.
+  DraftHeadCore headCore = DraftHeadCore::Unspecified;
+  DraftContextCore contextCore = DraftContextCore::Unspecified;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };
@@ -42,14 +68,18 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // The lanes' packed query-row stride: the draft's trained-block depth
+  // (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes, uint32_t rows)
+      : shape_(shape), lanes_(lanes), rows_(rows) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
+  uint32_t rows_;
 
   friend class DraftAttention;
 };
@@ -86,7 +116,9 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes,
+                                               uint32_t queryRows =
+                                                   RICHENGINE_DRAFT_QUERY_ROWS);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
@@ -129,7 +161,8 @@ public:
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
+      std::span<const uint32_t> startPositions, DraftAttentionShape shape,
+      uint32_t queryRows = RICHENGINE_DRAFT_QUERY_ROWS);
 };
 
 } // namespace richengine::ops

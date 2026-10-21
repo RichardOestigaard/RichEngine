@@ -461,6 +461,17 @@ class MultiplexedRuntime:
             max_workers=self._mask_workers,
             thread_name_prefix="richengine-mask",
         )
+        # CPU mask jobs sit between the draft's completion and the target's
+        # commit: how long each one queued for a worker and how long the
+        # grammar itself took. Totals the engine's residual-wait telemetry
+        # cannot see until a mask misses the target forward's overlap.
+        self._mask_timing_lock = threading.Lock()
+        self._mask_timing = {
+            "calls": 0,
+            "queue_ms_total": 0.0,
+            "eval_ms_total": 0.0,
+            "eval_ms_max": 0.0,
+        }
 
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -547,6 +558,10 @@ class MultiplexedRuntime:
     def last_crash_trace(self) -> str | None:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
+
+    def mask_stats(self) -> dict:
+        with self._mask_timing_lock:
+            return dict(self._mask_timing)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Start an engine unless one serves, and wait for its Ready.
@@ -1233,10 +1248,23 @@ class MultiplexedRuntime:
             )
             return
 
+        enqueued = time.monotonic()
+
         def compute():
+            started = time.monotonic()
             if call.cancel_requested or call.done:
                 return b""
-            return provider(event)
+            try:
+                return provider(event)
+            finally:
+                ended = time.monotonic()
+                eval_ms = (ended - started) * 1000.0
+                with self._mask_timing_lock:
+                    timing = self._mask_timing
+                    timing["calls"] += 1
+                    timing["queue_ms_total"] += (started - enqueued) * 1000.0
+                    timing["eval_ms_total"] += eval_ms
+                    timing["eval_ms_max"] = max(timing["eval_ms_max"], eval_ms)
 
         try:
             future = self._mask_executor.submit(compute)

@@ -61,7 +61,7 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
 #define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -96,7 +96,7 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
     richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
                                 CacheElement, HeadDim>(                        \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, tile.active_rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, nullptr,                \
         params[group.z].score_scale, scores,                                 \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -158,7 +158,7 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_gemma_hd512, 2, 8, bfloat, 512)
     richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
                                 CacheElement, HeadDim, 2>(                   \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, tile.active_rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, nullptr,                \
         params[group.z].score_scale, scores,                                 \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -197,7 +197,7 @@ PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, 256)
     richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,   \
                                 CacheElement, HeadDim, 2>(                   \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,     \
-        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, tile.active_rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, nullptr,                \
         params[group.z].score_scale, scores,                                 \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -215,7 +215,7 @@ PAGED_VERIFY_SPLIT_R2(verify_attention_bf16_split_r2, 4, 6, bfloat, 256)
 #define PAGED_VERIFY_SPLIT_SWA(Name, Heads, Group, CacheElement, HeadDim)    \
   kernel void Name(                                                          \
       device bfloat *queries [[buffer(0)]],                                  \
-      device float *partials [[buffer(1)]],                                  \
+      device bfloat *partials [[buffer(1)]],                                  \
       device float *statistics [[buffer(2)]],                                \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -230,7 +230,7 @@ PAGED_VERIFY_SPLIT_R2(verify_attention_bf16_split_r2, 4, 6, bfloat, 256)
     richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
                                 CacheElement, HeadDim>(                        \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, tile.active_rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, nullptr,                \
         params[group.z].score_scale, scores,                                 \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -249,7 +249,7 @@ PAGED_VERIFY_SPLIT_SWA(verify_attention_bf16_split_swa_hd512, 2, 8, bfloat, 512)
 #define PAGED_VERIFY_SPLIT_SWA_M2(Name, Heads, Group, CacheElement, HeadDim) \
   kernel void Name(                                                          \
       device bfloat *queries [[buffer(0)]],                                  \
-      device float *partials [[buffer(1)]],                                  \
+      device bfloat *partials [[buffer(1)]],                                  \
       device float *statistics [[buffer(2)]],                                \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -264,7 +264,7 @@ PAGED_VERIFY_SPLIT_SWA(verify_attention_bf16_split_swa_hd512, 2, 8, bfloat, 512)
     richengine_paged_attention_tile<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,       \
                                 CacheElement, HeadDim, 2>(                   \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, tile.active_rows, tile.splits,         \
         tile.split, partials, statistics, tile.slot, nullptr,                \
         params[group.z].score_scale, scores,                                 \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -295,7 +295,7 @@ PAGED_VERIFY_SPLIT_SWA_M2(verify_attention_bf16_split_swa_hd512_m2, 2, 8, bfloat
 #define PAGED_VERIFY_TREE_SPLIT(Name, Heads, Group, CacheElement, HeadDim)     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -354,7 +354,7 @@ PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_k8q4d128, 8, 4, bfloat,
 #define PAGED_VERIFY_TREE_SPLIT_M2(Name, Heads, Group, CacheElement, HeadDim)  \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
+      device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const RichKvPage *page_table0 [[buffer(3)]],                    \
       device const RichKvPage *page_table1 [[buffer(4)]],                    \
@@ -394,7 +394,7 @@ PAGED_VERIFY_TREE_SPLIT_M2(verify_tree_attention_bf16_split_kv2_g8_m2, 2, 8, bfl
 template <uint KVHeads, uint QueryHeadsPerKVHead,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
 inline void richengine_verify_attention_reduce_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *output,
     constant RichVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
@@ -413,14 +413,14 @@ inline void richengine_verify_attention_reduce_phase(
                                    RICHENGINE_TARGET_VERIFY_ROWS, HeadDim>(
       partials, statistics,
       output + (ulong(batch) * KVHeads + kv_head) * group_stride,
-      lane_params.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS,
+      lane_params.committed_tokens, lane_params.active_rows,
       lane_params.split_count,
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
       thread_index, weights, group_values);
 }
 
 kernel void verify_attention_reduce(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -433,7 +433,7 @@ kernel void verify_attention_reduce(
 }
 
 kernel void verify_attention_reduce_kv4_g4(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -446,7 +446,7 @@ kernel void verify_attention_reduce_kv4_g4(
 }
 
 kernel void verify_attention_reduce_kv2_g8(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -468,7 +468,7 @@ kernel void verify_attention_reduce_kv2_g8(
 // `hidden` its [row][query head][dimension] gate output.
 template <uint KVHeads, uint QueryHeadsPerKVHead>
 inline void richengine_verify_attention_reduce_gate_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *output, device const bfloat *packed_qkv,
     device bfloat *hidden,
     constant RichVerifyAttentionParams *params, uint3 group,
@@ -488,25 +488,27 @@ inline void richengine_verify_attention_reduce_gate_phase(
       ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
   const bfloat value = richengine_attention_reduce_value<QueryHeadsPerKVHead,
                                                      RICHENGINE_TARGET_VERIFY_ROWS>(
-      partials, statistics, lane_params.committed_tokens, RICHENGINE_TARGET_VERIFY_ROWS,
+      partials, statistics, lane_params.committed_tokens, lane_params.active_rows,
       lane_params.split_count,
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
       thread_index, weights, group_values);
   output[(ulong(batch) * KVHeads + kv_head) * group_stride + fused_row * D +
          thread_index] = value;
   const uint row = fused_row / QueryHeadsPerKVHead;
+  if (row >= lane_params.active_rows)
+    return;
   const uint query_head = kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
   const float gate = float(
-      packed_qkv[(ulong(batch) * RICHENGINE_TARGET_VERIFY_ROWS + row) * PackedStride +
+      packed_qkv[(ulong(batch) * lane_params.row_capacity + row) * PackedStride +
                  query_head * 2 * D + D + thread_index]);
-  hidden[((ulong(batch) * RICHENGINE_TARGET_VERIFY_ROWS + row) * QHeads + query_head) *
+  hidden[((ulong(batch) * lane_params.row_capacity + row) * QHeads + query_head) *
              D +
          thread_index] = bfloat(float(value) * richengine_sigmoid(gate));
 }
 
 #define PAGED_VERIFY_REDUCE_GATE(Name, Heads, Group)                            \
   kernel void Name(                                                             \
-      device const float *partials [[buffer(0)]],                               \
+      device const bfloat *partials [[buffer(0)]],                               \
       device const float *statistics [[buffer(1)]],                             \
       device bfloat *output [[buffer(2)]],                                      \
       device const bfloat *packed_qkv [[buffer(3)]],                            \
@@ -531,7 +533,7 @@ PAGED_VERIFY_REDUCE_GATE(verify_attention_reduce_gate_kv2_g8, 2, 8)
 // entries.
 #define PAGED_VERIFY_REDUCE_HD(Name, Heads, Group, HeadDim)                  \
   kernel void Name(                                                        \
-      device const float *partials [[buffer(0)]],                          \
+      device const bfloat *partials [[buffer(0)]],                          \
       device const float *statistics [[buffer(1)]],                        \
       device bfloat *output [[buffer(2)]],                                 \
       constant RichVerifyAttentionParams *params [[buffer(3)]],          \
@@ -553,7 +555,7 @@ PAGED_VERIFY_REDUCE_HD(verify_attention_reduce_k8q4d128, 8, 4, 128)
 // 256, eight simdgroup maxima) and the global layers' KV2 group-8 of 512
 // (threadgroup 512, sixteen).
 kernel void verify_attention_reduce_gemma_h256(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -567,7 +569,7 @@ kernel void verify_attention_reduce_gemma_h256(
 }
 
 kernel void verify_attention_reduce_gemma_hd512(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -590,7 +592,7 @@ kernel void verify_attention_reduce_gemma_hd512(
 // staging rows are not written: with no gate nothing reads them afterward.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
 inline void richengine_verify_attention_reduce_gather_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *hidden,
     constant RichVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
@@ -607,13 +609,15 @@ inline void richengine_verify_attention_reduce_gather_phase(
       richengine_attention_reduce_value<QueryHeadsPerKVHead,
                                     RICHENGINE_TARGET_VERIFY_ROWS, HeadDim>(
           partials, statistics, lane_params.committed_tokens,
-          RICHENGINE_TARGET_VERIFY_ROWS, lane_params.split_count,
+          lane_params.active_rows, lane_params.split_count,
           (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits,
           fused_row, thread_index, weights, group_values);
   const uint row = fused_row / QueryHeadsPerKVHead;
+  if (row >= lane_params.active_rows)
+    return;
   const uint query_head =
       kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
-  hidden[((ulong(batch) * RICHENGINE_TARGET_VERIFY_ROWS + row) * QHeads +
+  hidden[((ulong(batch) * lane_params.row_capacity + row) * QHeads +
           query_head) *
              HeadDim +
          thread_index] = value;
@@ -621,7 +625,7 @@ inline void richengine_verify_attention_reduce_gather_phase(
 
 #define PAGED_VERIFY_REDUCE_GATHER(Name, Heads, Group, HeadDim)            \
   kernel void Name(                                                        \
-      device const float *partials [[buffer(0)]],                          \
+      device const bfloat *partials [[buffer(0)]],                          \
       device const float *statistics [[buffer(1)]],                        \
       device bfloat *hidden [[buffer(2)]],                                 \
       constant RichVerifyAttentionParams *params [[buffer(3)]],          \
@@ -642,7 +646,7 @@ PAGED_VERIFY_REDUCE_GATHER(verify_attention_reduce_gather_k8q4d128, 8, 4, 128)
 // Gemma's fused reduce/gathers, with group_values sized to the head
 // dimension's simdgroup count (hd512's sixteen).
 kernel void verify_attention_reduce_gather_gemma_h256(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *hidden [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -656,7 +660,7 @@ kernel void verify_attention_reduce_gather_gemma_h256(
 }
 
 kernel void verify_attention_reduce_gather_gemma_hd512(
-    device const float *partials [[buffer(0)]],
+    device const bfloat *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *hidden [[buffer(2)]],
     constant RichVerifyAttentionParams *params [[buffer(3)]],
@@ -675,7 +679,7 @@ kernel void verify_attention_reduce_gather_gemma_hd512(
 template <uint KVHeads, uint QueryHeadsPerKVHead,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
 inline void richengine_verify_tree_attention_reduce_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *output,
     constant RichVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
@@ -702,7 +706,7 @@ inline void richengine_verify_tree_attention_reduce_phase(
 
 #define PAGED_VERIFY_TREE_REDUCE(Name, Heads, Group, HeadDim)              \
   kernel void Name(                                                        \
-      device const float *partials [[buffer(0)]],                          \
+      device const bfloat *partials [[buffer(0)]],                          \
       device const float *statistics [[buffer(1)]],                        \
       device bfloat *output [[buffer(2)]],                                 \
       constant RichVerifyAttentionParams *params [[buffer(3)]],          \
@@ -728,7 +732,7 @@ PAGED_VERIFY_TREE_REDUCE(verify_tree_attention_reduce_k8q4d128, 8, 4, 128)
 // row count.
 template <uint KVHeads, uint QueryHeadsPerKVHead>
 inline void richengine_verify_tree_attention_reduce_gate_phase(
-    device const float *partials, device const float *statistics,
+    device const bfloat *partials, device const float *statistics,
     device bfloat *output, device const bfloat *packed_qkv,
     device bfloat *hidden,
     constant RichVerifyAttentionParams *params, uint3 group,
@@ -769,7 +773,7 @@ inline void richengine_verify_tree_attention_reduce_gate_phase(
 
 #define PAGED_VERIFY_TREE_REDUCE_GATE(Name, Heads, Group)                     \
   kernel void Name(                                                             \
-      device const float *partials [[buffer(0)]],                               \
+      device const bfloat *partials [[buffer(0)]],                               \
       device const float *statistics [[buffer(1)]],                             \
       device bfloat *output [[buffer(2)]],                                      \
       device const bfloat *packed_qkv [[buffer(3)]],                            \
