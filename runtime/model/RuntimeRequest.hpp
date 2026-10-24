@@ -123,6 +123,12 @@ struct RuntimeRequest final {
   // computation with target verification. This is model runtime state, not a
   // scheduler decode stage.
   bool verifyMaskInFlight = false;
+  // The mask rows the in-flight verify request asked for — the simulated
+  // tokens plus the pre-anchor row, the lane's live verify rows + 1 — so
+  // provideMask validates the response against the count actually sent.
+  // Zero means no row count was recorded (a wait opened before the record
+  // or an abandoned one), which keeps the legacy full-table expectation.
+  uint32_t verifyMaskRows = 0;
   // The request's GPU-DFA constraint: while set, decode computes the lane's
   // masks with the dfa kernels and no host mask request goes out.
   std::optional<RequestDfa> dfa;

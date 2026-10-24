@@ -20,6 +20,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Dfa.h"
+#include "metal/abi/StepPack.h"
 #include "ops/Embedding.hpp"
 #include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
@@ -423,6 +424,44 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::unique_ptr<AnePredictor> anePredraft_;
   MetalBuffer aneLeafTokens_;  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS]
   MetalBuffer aneFlag_;        // one u32: the medusa serial last published
+  // Three u32s the mask-grid kernel fills under RICHENGINE_GPU_DECODE_GRID:
+  // the DFA mask pass's MTLDispatchThreadgroupsIndirectArguments.
+  MetalBuffer dfaMaskGrid_;
+  // RICHENGINE_GPU_DECODE_GRID (presence): the constrained verify round's
+  // GPU-DFA mask dispatch takes its threadgroup count from a GPU-written
+  // grid instead of the host's span readback.
+  const bool gpuDecodeGridOn_ = tuning().gpuDecodeGrid;
+  // RICHENGINE_DFA_MERGE (presence): a Full-mode constrained batch whose
+  // lanes all carry a GPU DFA and owe no host-pushed forced span encodes
+  // draft, verify and commit as one command — the WaitingMask stage never
+  // opens. ConstrainedDecodeTicket::mergedSubmit is the fused encode.
+  const bool dfaMergeOn_ = tuning().dfaMerge;
+  // RICHENGINE_DFA_SPAN_SKIP_DRAFT (presence): decodeAsync leaves the draft
+  // embedding and forward unencoded when every lane of the batch is a
+  // greedy DFA lane whose pending forced span covers its proposal budget.
+  // Safe because the draft's persistent state — the per-layer KV rings —
+  // is written only by the commit stage's context commit, which recomputes
+  // K/V from the captured target hidden of retained rows and never reads a
+  // draft-decode output.
+  const bool dfaSpanSkipDraft_ = tuning().dfaSpanSkipDraft;
+  // RICHENGINE_DEVICE_VERIFY_PARAMS (presence): decode_step_pack runs as
+  // the last dispatch of every committed decode graph and mirrors each
+  // lane's acceptance results into stepPack_, one DecodeStepPackLane per
+  // dispatch lane — the device-side copy of what finalizeDecode's
+  // readback feeds the next step's host encode. Allocated lazily.
+  const bool deviceVerifyParams_ = tuning().deviceVerifyParams;
+  MetalBuffer stepPack_;
+  // The lazily-allocated pack block, zeroed so an unwritten lane's zero
+  // request id can never match a live request's.
+  [[nodiscard]] const MetalBuffer &stepPackBuffer() {
+    if (!stepPack_) {
+      stepPack_ = backend.allocateBuffer(
+          sizeof(DecodeStepPackLane) * kLaneCount, BufferStorage::Shared,
+          "decode-step-pack");
+      std::memset(stepPack_.contents(), 0, stepPack_.sizeBytes());
+    }
+    return stepPack_;
+  }
   std::atomic<uint32_t> medusaSerial_{0};
   std::atomic<uint32_t> predraftSerial_{0};
   std::atomic<uint32_t> predraftDone_{0};
@@ -968,12 +1007,23 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
         "dfa forced spans")[stateLane];
   }
+  // The span lanes whose GPU forced spans the mask-grid kernel consumes
+  // on-device under RICHENGINE_GPU_DECODE_GRID, plus each lane's retention
+  // limit — the kernel's live-row derivation mirrors the host's.
+  struct DfaGridLanes {
+    uint32_t gpuSpanMask = 0;
+    std::array<uint32_t, kLaneCount> maximumRetained{};
+  };
   // The DFA lanes' chain + mask dispatches, encoded after the verify-input
   // tokens pass of the same graph: chain walks the packed InputTokens into
   // DfaRowStates and mask fills the lanes' DfaNextStates rows — each token's
   // post-walk state or -1, one row per live verify row plus the anchor's.
+  // A non-null `grid` emits decode_dfa_mask_grid first — it consumes the
+  // named GPU forced spans and packs the mask pass's launch on-device —
+  // and launches the mask pass through that indirect grid.
   void encodeDfaMasks(CommandGraph &graph, std::span<Request *const> entries,
-                      uint32_t lanes, std::span<const uint32_t> liveRows);
+                      uint32_t lanes, std::span<const uint32_t> liveRows,
+                      const DfaGridLanes *grid = nullptr);
   // The greedy DFA lanes' truncation pass (decode_dfa_truncate), encoded
   // after the unmasked selection: names each lane's correction row and
   // patches its GPU forced-span prefix into the selected tokens.
@@ -1005,6 +1055,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // (and the dispatch lane's ProposedTokens).
   void encodeDfaForced(CommandGraph &graph,
                        std::span<Request *const> entries, uint32_t lanes);
+  // The merged constrained step's on-device span apply
+  // (RICHENGINE_DFA_MERGE), dispatched between the draft pass and the
+  // verify input of the same command: the in-command twin of the split
+  // path's host copy of the pending DfaForcedSpan over ProposedTokens.
+  void encodeDfaSpanApply(CommandGraph &graph,
+                          std::span<Request *const> entries, uint32_t lanes,
+                          uint32_t laneMask,
+                          std::span<const uint32_t> maximumRetained);
   // The initial selection's row-0 mask for each DFA lane: the host writes
   // the lane's mirrored state into its DfaRowStates row 0 first, then the
   // mask dispatch produces one next-state row.
@@ -1634,8 +1692,24 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                             DecodeTensor output, uint32_t lanes,
                             uint32_t rowFactor = 1,
                             uint32_t rowStride = kDecodeRows);
-  void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes,
+  void encodeBatchVerifyInput(CommandGraph &graph,
+                              std::span<Request *const> entries,
+                              std::span<const ModelBatchItem> items,
+                              uint32_t lanes,
                               std::span<const uint32_t> liveRows = {});
+  // The committed step's bridge into the next command's encode
+  // (RICHENGINE_DEVICE_VERIFY_PARAMS): decode_step_pack reads each lane's
+  // RetainedCount/AcceptedCount/OutputTokens and writes the pack lane's
+  // next-step anchor, position base, cache length, retention limit and
+  // live rows — device-side what the host readback would compute.
+  // `budgets` carries the proposal budget the host assigns the lane's
+  // next step; `outputStride` is the step's packed OutputTokens lane
+  // stride. A no-op when the flag is unset.
+  void encodeBatchStepPack(CommandGraph &graph,
+                           std::span<Request *const> entries,
+                           std::span<const ModelBatchItem> items,
+                           std::span<const uint32_t> budgets,
+                           uint32_t outputStride);
   // A tree batch's verify inputs: the selector's tables carry every lane's
   // emitted nodes; the pass emits the input tokens, rotary positions and
   // ancestor masks, two decode rows' storage per lane.
@@ -2094,6 +2168,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         entry.maskWords.clear();
         entry.ngramInFlight = false;
         entry.verifyMaskInFlight = false;
+        entry.verifyMaskRows = 0;
         entry.gpuMaskInFlight = false;
         results.push_back({.requestId = entry.id,
                            .failure = std::move(laneResult.failure)});
@@ -2162,6 +2237,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
+      entry.verifyMaskRows = 0;
       entry.gpuMaskInFlight = false;
       results.push_back(
           {entry.id, 0, std::move(output), false, DecodeStage::Regular,
@@ -2195,11 +2271,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::span<const ModelBatchItem> items,
-                            const CommandGraph &draft,
-                            std::function<void()> completion)
+                            CommandGraph draft,
+                            std::function<void()> completion, bool merged)
         : impl_(impl), lanes_(std::move(lanes)),
           items_(items.begin(), items.end()),
           wake_(std::move(completion)) {
+      if (merged) {
+        mergedSubmit(draft);
+        return;
+      }
       submit(draft);
     }
 
@@ -2208,6 +2288,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       if (stage_ == Stage::Draft && command_.ready()) {
         addTiming(command_.wait());
         std::array<Request *, kLaneCount> entries{};
+        // RICHENGINE_GPU_DECODE_GRID records the lanes whose GPU forced
+        // spans the target command's grid kernel consumes on-device; the
+        // host keeps its own clear for the direct mask dispatch.
+        DfaGridLanes dfaGrid;
+        // Constrained lanes skip the adaptive budget, so each lane's live
+        // verify rows are the proposal cap clipped by its retention limit —
+        // the same arithmetic the unconstrained path computes up front.
+        const uint32_t cap =
+            modelPolicy().proposalCap.value_or(
+                impl_.geometry.draft.proposalLimit());
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
@@ -2245,7 +2335,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                   std::min<uint32_t>(kDraftProposalTokens,
                                      laneResult.maximumRetained - 1));
               std::copy_n(span.token_ids, forced_[lane], proposed);
-              span.tokens = 0;
+              // Under the GPU-grid gate the mask pass's grid kernel
+              // consumes the span on-device and sizes the mask launch
+              // from it; the host keeps the clear for the direct path.
+              if (impl_.gpuDecodeGridOn_) {
+                dfaGrid.gpuSpanMask |= uint32_t{1} << lane;
+                dfaGrid.maximumRetained[lane] = laneResult.maximumRetained;
+              } else {
+                span.tokens = 0;
+              }
               ++impl_.counters.gpuForcedSpansApplied;
               impl_.counters.forcedTokensEmitted += forced_[lane];
             }
@@ -2280,45 +2378,55 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             }
           }
 
+          // The lane's live verify rows: its forced prefix, or the
+          // proposal cap clipped by its retention limit, plus the anchor.
+          liveRows_[lane] =
+              forced_[lane]
+                  ? forced_[lane] + 1
+                  : std::min(cap, laneResult.maximumRetained - 1) + 1;
           if (!abandoned_[lane] && !gpuMask_[lane]) {
-            // The mask response is a fixed kDecodeRows+1 rows whatever the
-            // live budget, so the simulation sends the table's full proposal
-            // stride; slots a short-block draft never emitted are stale
-            // tokens the grammar's out-of-range truncation already skips.
+            // The mask response carries one row per simulated token plus
+            // the pre-anchor row, so the simulation stops at the lane's
+            // live verify rows — the selection never reads the mask rows
+            // past them. The row count goes on the entry for provideMask's
+            // validation. Slots a short-block draft never emitted are
+            // stale tokens the grammar's out-of-range truncation skips.
             ModelMaskRequest request;
             request.requestId = entry.id;
-            request.simulationTokens.reserve(kDecodeRows);
+            request.simulationTokens.reserve(liveRows_[lane]);
             request.simulationTokens.push_back(*entry.pendingToken);
             request.simulationTokens.insert(request.simulationTokens.end(),
                                             proposed,
-                                            proposed + kDraftProposalTokens);
+                                            proposed + liveRows_[lane] - 1);
+            entry.verifyMaskRows = liveRows_[lane] + 1;
             requests.push_back(std::move(request));
           }
         }
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        // Constrained lanes skip the adaptive budget, so each lane's live
-        // verify rows are the proposal cap clipped by its retention limit —
-        // the same arithmetic the unconstrained path computes up front.
-        const uint32_t cap =
-            modelPolicy().proposalCap.value_or(
-                impl_.geometry.draft.proposalLimit());
-        for (uint32_t lane = 0; lane < width; ++lane) {
-          liveRows_[lane] = forced_[lane]
-                                ? forced_[lane] + 1
-                                : std::min(cap, lanes_[lane].maximumRetained - 1) +
-                                      1;
+        try {
+          impl_.encodeBatchVerifyInput(target, {entries.data(), width},
+                                       items_, width,
+                                       {liveRows_.data(), width});
+          impl_.encodeDfaMasks(target, {entries.data(), width}, width,
+                               {liveRows_.data(), width},
+                               dfaGrid.gpuSpanMask ? &dfaGrid : nullptr);
+          impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
+                                     DecodeTensor::Hidden0, width, 1,
+                                     impl_.geometry.draft.verifyRows());
+          impl_.encodeTargetVerifyBatchForward(
+              target, {entries.data(), lanes_.size()}, items_);
+          submit(target);
+        } catch (...) {
+          // A span the grid kernel would have consumed stays pending when
+          // the command never reaches the GPU; drop it like the host
+          // clear would have.
+          for (uint32_t lane = 0; lane < width; ++lane)
+            if (dfaGrid.gpuSpanMask & (uint32_t{1} << lane))
+              impl_.clearDfaForced(entries[lane]->stateLane);
+          throw;
         }
-        impl_.encodeBatchVerifyInput(target, width, {liveRows_.data(), width});
-        impl_.encodeDfaMasks(target, {entries.data(), width}, width,
-                             {liveRows_.data(), width});
-        impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width, 1,
-                                   impl_.geometry.draft.verifyRows());
-        impl_.encodeTargetVerifyBatchForward(
-            target, {entries.data(), lanes_.size()}, items_);
-        submit(target);
         stage_ = Stage::TargetForward;
       }
 
@@ -2404,6 +2512,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_);
+          // Constrained lanes skip the adaptive budget, so the step pack
+          // gets the flat proposal cap as each lane's next-step budget.
+          std::array<uint32_t, kLaneCount> budgets{};
+          budgets.fill(cap);
+          impl_.encodeBatchStepPack(
+              commit, {entries.data(), lanes_.size()}, items_,
+              {budgets.data(), lanes_.size()},
+              impl_.geometry.draft.verifyRows());
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -2489,6 +2605,116 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     void addTiming(CommandTiming value) noexcept {
       timing_.gpuSeconds += value.gpuSeconds;
       timing_.wallSeconds += value.wallSeconds;
+    }
+
+    // RICHENGINE_DFA_MERGE: the whole step — draft, verify input, DFA
+    // masks, target forward, selection and commits — appends onto the
+    // draft graph, one command in place of the split path's three. The
+    // gate admits only Full-mode lanes that all carry a GPU DFA and owe
+    // no host-pushed forced span, so no host mask request exists to
+    // answer: the pending GPU forced spans apply on-device
+    // (decode_dfa_span_apply) between the draft pass and the verify
+    // input. The span itself is host-readable at encode time — the
+    // commit that wrote it retired before this step was planned — so
+    // the forced and live constants stay host-derived exactly as the
+    // split path's, and the mask pass keeps the direct launch its
+    // host-computed rows already give it. A settle racing the single
+    // command changes nothing the GPU computes: the abandoned lane's
+    // admit-everything fallback exists only for a mask wait this path
+    // never opens, and a dead lane's committed tokens never publish.
+    void mergedSubmit(CommandGraph &graph) {
+      const uint32_t width = static_cast<uint32_t>(lanes_.size());
+      const uint32_t cap =
+          modelPolicy().proposalCap.value_or(
+              impl_.geometry.draft.proposalLimit());
+      std::array<Request *, kLaneCount> entries{};
+      std::array<uint32_t, kLaneCount> maximumRetained{};
+      std::array<uint32_t, kLaneCount> proposals{};
+      uint32_t spanMask = 0;
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        DecodeLaneResult &laneResult = lanes_[lane];
+        Request &entry = *laneResult.request;
+        entries[lane] = &entry;
+        entry.maskWords.clear();
+        // Every lane took the gate's GPU-mask branch, so this is the
+        // bookkeeping the split path's Draft stage does for one.
+        gpuMask_[lane] = true;
+        entry.gpuMaskInFlight = true;
+        entry.verifyMaskInFlight = false;
+        // The span bookkeeping the split path does host-side: the forced
+        // prefix length, its auto-accept record and the lane's live
+        // verify rows, plus the counters the apply reports.
+        forced_[lane] = 0;
+        gpuForced_[lane] = 0;
+        DfaForcedSpan &span = impl_.dfaForcedSpan(entry.stateLane);
+        if (entry.pendingToken && span.tokens) {
+          forced_[lane] = std::min<uint32_t>(
+              span.tokens,
+              std::min<uint32_t>(kDraftProposalTokens,
+                                 laneResult.maximumRetained - 1));
+          gpuForced_[lane] = forced_[lane];
+          spanMask |= uint32_t{1} << lane;
+          ++impl_.counters.gpuForcedSpansApplied;
+          impl_.counters.forcedTokensEmitted += forced_[lane];
+        }
+        liveRows_[lane] =
+            forced_[lane]
+                ? forced_[lane] + 1
+                : std::min(cap, laneResult.maximumRetained - 1) + 1;
+        maximumRetained[lane] = laneResult.maximumRetained;
+        proposals[lane] = liveRows_[lane] - 1;
+        laneResult.proposals = proposals[lane];
+      }
+      try {
+        impl_.encodeDfaSpanApply(graph, {entries.data(), width}, width,
+                               spanMask, {maximumRetained.data(), width});
+        impl_.encodeBatchVerifyInput(graph, {entries.data(), width}, items_,
+                                     width, {liveRows_.data(), width});
+        impl_.encodeDfaMasks(graph, {entries.data(), width}, width,
+                             {liveRows_.data(), width});
+        impl_.encodeBatchEmbedding(graph, DecodeTensor::InputTokens,
+                                   DecodeTensor::Hidden0, width, 1,
+                                   impl_.geometry.draft.verifyRows());
+        impl_.encodeTargetVerifyBatchForward(graph, {entries.data(), width},
+                                             items_);
+        impl_.encodeTargetVerifyBatchPolicy(graph, {entries.data(), width},
+                                            false,
+                                            {liveRows_.data(), width});
+        const uint32_t truncMask =
+            impl_.greedyDfaLaneMask({entries.data(), width});
+        impl_.encodeDfaTruncation(graph, width, truncMask,
+                                {proposals.data(), width},
+                                {gpuForced_.data(), width});
+        impl_.encodeDfaCorrectionMasks(graph, {entries.data(), width},
+                                       width, truncMask);
+        impl_.encodeDfaCorrections(graph, {entries.data(), width}, width,
+                                   truncMask, {liveRows_.data(), width});
+        impl_.encodeBatchAcceptance(graph, {entries.data(), width},
+                                    {maximumRetained.data(), width}, false,
+                                    {proposals.data(), width}, truncMask);
+        impl_.encodeDfaAdvance(graph, {entries.data(), width}, width);
+        impl_.encodeDfaForced(graph, {entries.data(), width}, width);
+        impl_.encodeBatchGdnCommit(graph, {entries.data(), width});
+        impl_.encodeDraftStateCommitBatch(graph, {entries.data(), width},
+                                          items_);
+        // Constrained lanes skip the adaptive budget, so the step pack
+        // gets the flat proposal cap as each lane's next-step budget.
+        std::array<uint32_t, kLaneCount> budgets{};
+        budgets.fill(cap);
+        impl_.encodeBatchStepPack(graph, {entries.data(), width}, items_,
+                                  {budgets.data(), width},
+                                  impl_.geometry.draft.verifyRows());
+        submit(graph);
+      } catch (...) {
+        // A span the apply kernel would have consumed stays pending when
+        // the command never reaches the GPU; drop it like the split
+        // path's catch does for the grid kernel's spans.
+        for (uint32_t lane = 0; lane < width; ++lane)
+          if (spanMask & (uint32_t{1} << lane))
+            impl_.clearDfaForced(entries[lane]->stateLane);
+        throw;
+      }
+      stage_ = Stage::Commit;
     }
 
     Impl &impl_;

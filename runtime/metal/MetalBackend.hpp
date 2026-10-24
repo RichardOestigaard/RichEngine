@@ -151,6 +151,21 @@ struct ComputeDispatch {
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // A GPU-written grid: when set, the dispatch's threadgroup count comes
+  // from the MTLDispatchThreadgroupsIndirectArguments (three uint32s) at
+  // the start of this buffer view, so a prior kernel can size the launch
+  // without a host readback. `threadgroups` still must be nonzero — it is
+  // the recorded bound the command and span snapshots compare. Indirect
+  // grids never join baked or GPU-encoded spans: indirect commands bake
+  // literal sizes.
+  MetalBuffer indirectGrid{};
+  // On the first dispatch of a baked or GPU-encoded span run only, a
+  // GPU-written replay range: the MTLIndirectCommandBufferExecutionRange
+  // (two uint32s, location then length) at the view's start replaces the
+  // literal {0, span length} of the replayed commands, so a kernel can
+  // shrink or drop the span's tail at replay. Ignored when the run encodes
+  // directly; setting it on a dispatch that cannot open a span throws.
+  MetalBuffer indirectRange{};
   // True while a CommandGraph baked span is open: a maximal run of these is
   // eligible for replay through a cached indirect command buffer (see
   // CommandGraph::beginBakedSpan). Submission revalidates every field of the

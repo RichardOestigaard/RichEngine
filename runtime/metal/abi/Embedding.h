@@ -37,3 +37,20 @@ struct VerifyInputBatchParams {
 
 static_assert(sizeof(VerifyInputBatchParams) == 28,
               "Verify input parameters are 28 bytes on both sides");
+
+// verify_input_tokens_dev's payload (RICHENGINE_DEVICE_VERIFY_PARAMS):
+// the batch parameters plus the per-lane facts the kernel proves the step
+// pack against before taking a device field — the request id and the
+// host-computed position and live rows. device_lanes marks the lanes
+// trusted to take the pack without the equality proof: the submit-ahead
+// encode's lanes, zero on the readback path.
+struct VerifyInputDeviceParams {
+  // The u64 ids lead so the 4-byte batch fields tail without padding.
+  uint64_t request_id[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  VerifyInputBatchParams verify;
+  uint32_t position_base[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t device_lanes;
+};
+
+static_assert(sizeof(VerifyInputDeviceParams) == 80,
+              "Verify input device parameters are 80 bytes on both sides");

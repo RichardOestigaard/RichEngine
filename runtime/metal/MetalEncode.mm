@@ -112,7 +112,10 @@ id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) 
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(name);
+        id<MTLComputePipelineState> result =
+            name.find_first_of("[|") == std::string_view::npos
+                ? newPipeline(name)
+                : newSpecializedPipeline(name);
         pipelines.emplace(name, result);
         sampleDeviceMemory();
         return result;
@@ -136,6 +139,270 @@ id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view nam
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
         }
+        return result;
+    }
+
+// The extended pipeline-name grammar, resolved by newSpecializedPipeline:
+//
+//   entry[hook=impl:arity,...]   call-site function stitching: every
+//     [[stitchable]] function `hook` declared in `entry` is bound to a
+//     single-node stitch graph whose output calls the library function
+//     `impl`, forwarded the hook's `arity` leading arguments. Multiple
+//     hooks are comma-separated. The kernel is looked up in the stitched
+//     library, whose synthesized hook functions carry the bindings.
+//   entry|option,...             pipeline options compiled through the
+//     Metal 4 compiler (MTL4Compiler): `persistent` sets
+//     optimizeForPersistentKernel, `fp=weak`/`fp=simd` set
+//     forwardProgressUsage (for device-side atomic wait/notify kernels),
+//     `relief=none` sets contentionRelief none.
+//
+// Stitches and options compose: `entry[hook=impl:1]|persistent`.
+namespace {
+
+struct PipelineOptionSpec {
+    std::string_view entry;
+    struct Hook {
+        std::string_view name;
+        std::string_view impl;
+        uint32_t arity = 0;
+    };
+    std::vector<Hook> hooks;
+    bool persistent = false;
+    bool reliefNone = false;
+    // 0 unset, else an MTLForwardProgressUsage value.
+    NSInteger forwardProgress = 0;
+};
+
+[[maybe_unused]] PipelineOptionSpec parsePipelineSpec(std::string_view name) {
+    PipelineOptionSpec spec;
+    const auto take = [](std::string_view &text, char stop) {
+        const size_t at = text.find(stop);
+        std::string_view part = text.substr(0, at);
+        text = at == std::string_view::npos ? std::string_view{}
+                                            : text.substr(at + 1);
+        return part;
+    };
+    const size_t hooksAt = name.find('[');
+    const size_t hooksEnd =
+        hooksAt == std::string_view::npos ? std::string_view::npos
+                                          : name.find(']', hooksAt);
+    const size_t optionsAt = name.find('|');
+    spec.entry = name.substr(0, std::min({hooksAt, optionsAt}));
+    if (hooksAt != std::string_view::npos) {
+        if (hooksEnd == std::string_view::npos)
+            throw MetalBackendError(
+                "unterminated stitch list in pipeline name " +
+                std::string(name));
+        std::string_view list = name.substr(hooksAt + 1,
+                                            hooksEnd - hooksAt - 1);
+        while (!list.empty()) {
+            std::string_view binding = take(list, ',');
+            PipelineOptionSpec::Hook hook;
+            hook.name = take(binding, '=');
+            std::string_view arity = binding;
+            hook.impl = take(arity, ':');
+            if (hook.name.empty() || hook.impl.empty() || arity.empty())
+                throw MetalBackendError(
+                    "stitch binding needs hook=impl:arity in " +
+                    std::string(name));
+            hook.arity = static_cast<uint32_t>(
+                std::stoul(std::string(arity)));
+            spec.hooks.push_back(hook);
+        }
+    }
+    if (optionsAt != std::string_view::npos) {
+        std::string_view list = name.substr(optionsAt + 1);
+        while (!list.empty()) {
+            const std::string_view option = take(list, ',');
+            if (option == "persistent") {
+                spec.persistent = true;
+            } else if (option == "relief=none") {
+                spec.reliefNone = true;
+            } else if (option == "fp=weak") {
+                spec.forwardProgress = MTLForwardProgressUsageWeak;
+            } else if (option == "fp=simd") {
+                spec.forwardProgress =
+                    MTLForwardProgressUsageSIMDGroupParallel;
+            } else {
+                throw MetalBackendError(
+                    "unknown pipeline option " + std::string(option) +
+                    " in " + std::string(name));
+            }
+        }
+    }
+    return spec;
+}
+
+} // namespace
+
+// A stitched or optioned pipeline (the grammar above). Stitching resolves
+// through a stitched library, which both encoder paths can dispatch; the
+// options go through the Metal 4 compiler's pipeline descriptor, with the
+// Metal 3 descriptor as the same-fields fallback.
+    id<MTLComputePipelineState>
+    MetalBackend::Impl::newSpecializedPipeline(std::string_view name) {
+        const PipelineOptionSpec spec = parsePipelineSpec(name);
+        // The kernel itself comes from the main library; hooks are bound
+        // through a stitched library's synthesized functions, linked into
+        // the pipeline as private functions.
+        id<MTLFunction> function =
+            [library newFunctionWithName:
+                         checkedNSString(spec.entry, "pipeline name")
+                            constantValues:functionConstantValues()
+                                     error:nil];
+        if (!function)
+            throw MetalBackendError(
+                "missing Metal function: " + std::string(spec.entry));
+        NSMutableArray<id<MTLFunction>> *bound = nil;
+        id<MTLLibrary> fnLibrary = nil;
+        if (!spec.hooks.empty()) {
+            MTLStitchedLibraryDescriptor *stitch =
+                [MTLStitchedLibraryDescriptor new];
+            NSMutableArray<id<MTLFunction>> *pool = [NSMutableArray new];
+            NSMutableArray<MTLFunctionStitchingGraph *> *graphs =
+                [NSMutableArray new];
+            for (const PipelineOptionSpec::Hook &hook : spec.hooks) {
+                NSString *implName =
+                    checkedNSString(hook.impl, "stitch implementation");
+                id<MTLFunction> impl =
+                    [library newFunctionWithName:implName];
+                if (!impl)
+                    throw MetalBackendError(
+                        "missing Metal stitch function: " +
+                        std::string(hook.impl));
+                NSMutableArray<MTLFunctionStitchingInputNode *> *args =
+                    [NSMutableArray new];
+                for (uint32_t a = 0; a < hook.arity; ++a)
+                    [args addObject:[[MTLFunctionStitchingInputNode alloc]
+                                        initWithArgumentIndex:a]];
+                MTLFunctionStitchingFunctionNode *node =
+                    [[MTLFunctionStitchingFunctionNode alloc]
+                              initWithName:implName
+                                 arguments:args
+                       controlDependencies:@[]];
+                [graphs addObject:
+                    [[MTLFunctionStitchingGraph alloc]
+                        initWithFunctionName:
+                            checkedNSString(hook.name, "stitch hook")
+                                       nodes:@[node]
+                                  outputNode:node
+                                  attributes:
+                            @[ [MTLFunctionStitchingAttributeAlwaysInline
+                                   new] ]]];
+                [pool addObject:impl];
+            }
+            stitch.functionGraphs = graphs;
+            stitch.functions = pool;
+            NSError *error = nil;
+            fnLibrary =
+                [device newLibraryWithStitchedDescriptor:stitch error:&error];
+            if (!fnLibrary)
+                throw MetalBackendError(
+                    "unable to create stitched library for " +
+                    std::string(name) + ": " + errorDescription(error));
+            stitchedLibraries.emplace(std::string(name), fnLibrary);
+            // Each synthesized hook function is what the kernel's
+            // [[stitchable]] call site binds by name.
+            bound = [NSMutableArray new];
+            for (const PipelineOptionSpec::Hook &hook : spec.hooks) {
+                id<MTLFunction> hooked = [fnLibrary newFunctionWithName:
+                    checkedNSString(hook.name, "stitch hook")];
+                if (!hooked)
+                    throw MetalBackendError(
+                        "stitched library produced no " +
+                        std::string(hook.name));
+                [bound addObject:hooked];
+            }
+        }
+#if RICHENGINE_MTL4_AVAILABLE
+        // The Metal 4 compiler carries the options and the private-function
+        // links in one descriptor.
+        if (bound || spec.persistent || spec.reliefNone ||
+            spec.forwardProgress) {
+            if (!compiler4) {
+                NSError *error = nil;
+                compiler4 =
+                    [device newCompilerWithDescriptor:
+                                [MTL4CompilerDescriptor new]
+                                                error:&error];
+                if (!compiler4)
+                    throw MetalBackendError(
+                        "unable to create a Metal 4 compiler: " +
+                        errorDescription(error));
+            }
+            MTL4LibraryFunctionDescriptor *entry =
+                [MTL4LibraryFunctionDescriptor new];
+            entry.name = function.name;
+            entry.library = library;
+            MTL4SpecializedFunctionDescriptor *specialized =
+                [MTL4SpecializedFunctionDescriptor new];
+            specialized.functionDescriptor = entry;
+            specialized.constantValues = functionConstantValues();
+            MTL4ComputePipelineDescriptor *descriptor =
+                [MTL4ComputePipelineDescriptor new];
+            descriptor.computeFunctionDescriptor = specialized;
+            descriptor.supportIndirectCommandBuffers =
+                MTL4IndirectCommandBufferSupportStateEnabled;
+            descriptor.optimizeForPersistentKernel = spec.persistent;
+            descriptor.forwardProgressUsage =
+                static_cast<MTLForwardProgressUsage>(spec.forwardProgress);
+            descriptor.contentionRelief =
+                spec.reliefNone ? MTLContentionReliefNone
+                                : MTLContentionReliefAutomatic;
+            if (bound) {
+                MTL4StaticLinkingDescriptor *linking =
+                    [MTL4StaticLinkingDescriptor new];
+                NSMutableArray<MTL4LibraryFunctionDescriptor *> *hooks4 =
+                    [NSMutableArray new];
+                for (id<MTLFunction> hooked in bound) {
+                    MTL4LibraryFunctionDescriptor *hookDesc =
+                        [MTL4LibraryFunctionDescriptor new];
+                    hookDesc.name = hooked.name;
+                    hookDesc.library = fnLibrary;
+                    [hooks4 addObject:hookDesc];
+                }
+                linking.privateFunctionDescriptors = hooks4;
+                descriptor.staticLinkingDescriptor = linking;
+            }
+            NSError *error = nil;
+            id<MTLComputePipelineState> result =
+                [compiler4 newComputePipelineStateWithDescriptor:descriptor
+                                             compilerTaskOptions:nil
+                                                           error:&error];
+            if (!result)
+                throw MetalBackendError(
+                    "unable to create Metal 4 pipeline " + std::string(name) +
+                    ": " + errorDescription(error));
+            sampleDeviceMemory();
+            return result;
+        }
+#else
+        if (spec.persistent || spec.reliefNone || spec.forwardProgress)
+            throw MetalBackendError(
+                "pipeline options need Metal 4: " + std::string(name));
+#endif
+        NSError *error = nil;
+        id<MTLComputePipelineState> result;
+        if (bound) {
+            MTLComputePipelineDescriptor *descriptor =
+                [MTLComputePipelineDescriptor new];
+            descriptor.computeFunction = function;
+            MTLLinkedFunctions *linked = [MTLLinkedFunctions new];
+            linked.privateFunctions = bound;
+            descriptor.linkedFunctions = linked;
+            result =
+                [device newComputePipelineStateWithDescriptor:descriptor
+                                                      options:0
+                                                   reflection:nil
+                                                        error:&error];
+        } else {
+            result = [device newComputePipelineStateWithFunction:function
+                                                           error:&error];
+        }
+        if (!result)
+            throw MetalBackendError(
+                "unable to create Metal pipeline " + std::string(name) +
+                ": " + errorDescription(error));
         return result;
     }
 
@@ -186,8 +453,8 @@ id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view nam
         return tuning().icbOff;
     }
 
-// The Metal 4 encoder is opt-in (RICHENGINE_MTL4=1) while it is benchmarked
-    // against the Metal 3 path it mirrors.
+// The Metal 4 encoder is on by default (RICHENGINE_MTL4_OFF disables) —
+    // measured never slower than the Metal 3 path it mirrors.
     bool MetalBackend::Impl::mtl4Enabled() noexcept {
         return tuning().mtl4;
     }
@@ -803,6 +1070,34 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 }
                 claim(binding.index);
             }
+            const auto checkIndirect = [](const MetalBuffer &view,
+                                          uint64_t minimum,
+                                          const char *what) {
+                if (!view.impl_ || !view.impl_->allocation->buffer) {
+                    throw MetalBackendError(
+                        std::string("compute dispatch binds an empty ") +
+                        what);
+                }
+                if (view.impl_->offsetBytes % 4 ||
+                    view.impl_->lengthBytes < minimum) {
+                    throw MetalBackendError(
+                        std::string("compute dispatch ") + what +
+                        " is misaligned or too small");
+                }
+            };
+            if (dispatch.indirectGrid) {
+                if (dispatch.bakeable || dispatch.gpuSpan)
+                    throw MetalBackendError(
+                        "indirect dispatch cannot join a span");
+                checkIndirect(dispatch.indirectGrid, 12, "indirect grid");
+            }
+            if (dispatch.indirectRange) {
+                if (!dispatch.bakeable && !dispatch.gpuSpan)
+                    throw MetalBackendError(
+                        "indirect span range on a dispatch outside a span");
+                checkIndirect(dispatch.indirectRange, 8,
+                              "indirect span range");
+            }
             bindings += dispatch.buffers.size();
             command.dispatches.push_back(item);
         }
@@ -819,6 +1114,14 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         // Each allocation the command binds, once.
         command.retainedAllocations.reserve(bindings);
         retainBound(dispatches, command.retainedAllocations);
+        for (const ComputeDispatch &dispatch : dispatches) {
+            if (dispatch.indirectGrid)
+                command.retainedAllocations.push_back(
+                    dispatch.indirectGrid.impl_->allocation);
+            if (dispatch.indirectRange)
+                command.retainedAllocations.push_back(
+                    dispatch.indirectRange.impl_->allocation);
+        }
 
         // Maximal runs of CommandGraph baked-span dispatches replay through a
         // cached indirect command buffer; a run that cannot bake encodes
@@ -906,10 +1209,24 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             const ComputeDispatch &dispatch = run[i];
             const CachedCommand::DispatchSnapshot &snapshot =
                 cached.dispatches[i];
+            const auto viewIdentity =
+                [&](const CachedCommand::BufferSnapshot &saved,
+                    const MetalBuffer &view) {
+                    if (!view != !saved.object) return false;
+                    if (!view) return true;
+                    const MetalBuffer::Impl &impl = *view.impl_;
+                    return impl.offsetBytes == saved.offsetBytes &&
+                           impl.lengthBytes == saved.lengthBytes &&
+                           bindingIdentity(saved.allocation, saved.object,
+                                           impl);
+                };
             if (snapshot.pipelineName != dispatch.pipelineName ||
                 snapshot.bakeable != dispatch.bakeable ||
                 snapshot.gpuSpan != dispatch.gpuSpan ||
                 snapshot.patchableBytes != dispatch.patchableBytes ||
+                !viewIdentity(snapshot.indirectGrid, dispatch.indirectGrid) ||
+                !viewIdentity(snapshot.indirectRange,
+                              dispatch.indirectRange) ||
                 snapshot.threadgroups.x != dispatch.threadgroups.x ||
                 snapshot.threadgroups.y != dispatch.threadgroups.y ||
                 snapshot.threadgroups.z != dispatch.threadgroups.z ||
@@ -969,6 +1286,15 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             snapshot.bakeable = dispatch.bakeable;
             snapshot.patchableBytes = dispatch.patchableBytes;
             snapshot.gpuSpan = dispatch.gpuSpan;
+            const auto saveView = [](const MetalBuffer &view,
+                                     CachedCommand::BufferSnapshot &saved) {
+                if (!view) return;
+                const MetalBuffer::Impl &impl = *view.impl_;
+                saved = {impl.allocation, impl.allocation->buffer,
+                         impl.offsetBytes, impl.lengthBytes};
+            };
+            saveView(dispatch.indirectGrid, snapshot.indirectGrid);
+            saveView(dispatch.indirectRange, snapshot.indirectRange);
             for (const BufferBinding &binding : dispatch.buffers) {
                 const MetalBuffer::Impl &view = *binding.buffer.impl_;
                 snapshot.bufferIndices.push_back(binding.index);
@@ -1197,9 +1523,19 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                            usage:MTLResourceUsageRead |
                                                  MTLResourceUsageWrite];
                     }
-                    [encoder executeCommandsInBuffer:item.span->icb
-                                           withRange:NSMakeRange(
-                                                         0, item.span->dispatches.size())];
+                    if (item.source->indirectRange) {
+                        const MetalBuffer::Impl &range =
+                            *item.source->indirectRange.impl_;
+                        [encoder useResource:range.allocation->buffer
+                                       usage:MTLResourceUsageRead];
+                        [encoder executeCommandsInBuffer:item.span->icb
+                                          indirectBuffer:range.allocation->buffer
+                                     indirectBufferOffset:range.offsetBytes];
+                    } else {
+                        [encoder executeCommandsInBuffer:item.span->icb
+                                               withRange:
+                            NSMakeRange(0, item.span->dispatches.size())];
+                    }
                     index += item.span->dispatches.size() - 1;
                     closeDispatch(std::string(item.source->pipelineName));
                     continue;
@@ -1249,8 +1585,19 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                            usage:MTLResourceUsageRead |
                                                  MTLResourceUsageWrite];
                     }
-                    [encoder executeCommandsInBuffer:span.icb
-                                           withRange:NSMakeRange(0, count)];
+                    if (item.source->indirectRange) {
+                        const MetalBuffer::Impl &range =
+                            *item.source->indirectRange.impl_;
+                        [encoder useResource:range.allocation->buffer
+                                       usage:MTLResourceUsageRead];
+                        [encoder executeCommandsInBuffer:span.icb
+                                          indirectBuffer:range.allocation->buffer
+                                     indirectBufferOffset:range.offsetBytes];
+                    } else {
+                        [encoder executeCommandsInBuffer:span.icb
+                                               withRange:
+                            NSMakeRange(0, count)];
+                    }
                     index += span.dispatches.size() - 1;
                     closeDispatch(std::string(item.source->pipelineName));
                     continue;
@@ -1277,8 +1624,19 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                length:binding.sizeBytes
                               atIndex:binding.index];
                 }
-                [encoder dispatchThreadgroups:item.groups
-                         threadsPerThreadgroup:item.threads];
+                if (dispatch.indirectGrid) {
+                    const MetalBuffer::Impl &grid =
+                        *dispatch.indirectGrid.impl_;
+                    [encoder dispatchThreadgroupsWithIndirectBuffer:
+                                 grid.allocation->buffer
+                                               indirectBufferOffset:
+                                 grid.offsetBytes
+                                          threadsPerThreadgroup:
+                                 item.threads];
+                } else {
+                    [encoder dispatchThreadgroups:item.groups
+                             threadsPerThreadgroup:item.threads];
+                }
                 closeDispatch(std::string(dispatch.pipelineName));
             }
             encodeSteps(dispatches.size());
@@ -1308,16 +1666,23 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
     // The Metal 4 encoding of commit(): same prepared dispatches, same
     // ticket contract, encoded through one reused allocator and argument
     // table and committed with a commit-feedback handler in place of the
-    // completed handler.
+    // completed handler. Event steps map to queue-level signalEvent /
+    // waitForEvent between the split's commits, where commit() encoded
+    // them into command buffers instead.
     CommandTicket MetalBackend::Impl::commit4(std::span<const PreparedDispatch> dispatches,
+                          std::span<const EventStep> events,
                           std::vector<std::shared_ptr<MetalAllocation>> retained,
                           CommandCompletion completion) {
         // The submit-ahead ring may commit a second command while this one
         // runs. Baked spans stay exclusive to the GPU-idle case:
         // patchSpanParams rewrites the shared parameter arena an in-flight
         // replay still reads, so a pipelined submission encodes every
-        // dispatch directly instead.
-        const bool replaySpans = !asyncState->hasActiveSubmission();
+        // dispatch directly instead. A command with event steps also
+        // encodes directly, as commit() does: a replayed span skips the
+        // encodeSteps calls of the indices it covers, and its steps would
+        // never order against the other agent (EventStep).
+        const bool replaySpans =
+            events.empty() && !asyncState->hasActiveSubmission();
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
@@ -1373,17 +1738,35 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         // Metal 3 path's.
         @autoreleasepool {
             [allocator4[bank] reset];
-            id<MTL4CommandBuffer> command = [device newCommandBuffer];
-            if (!command) {
-                failBeforeCommit("unable to create Metal command buffer");
-            }
-            [command beginCommandBufferWithAllocator:allocator4[bank]];
             ticketState->wallStart = wallStart;
-            id<MTL4ComputeCommandEncoder> encoder =
-                [command computeCommandEncoder];
-            if (!encoder) {
-                failBeforeCommit("unable to create Metal compute encoder");
+            // Event steps commit leading buffers during the encode below;
+            // hold the residency set from the first of them, not the last.
+            residency->use();
+            // Commit feedback is per commit and covers only that commit's
+            // buffers, so a command split at event steps shares one record
+            // across its pieces: the final commit's finishCommand4 then
+            // reports the whole command the way finishCommand aggregates
+            // its leading buffers. The feedbacks run on the queue's single
+            // serial feedback queue in commit order, so the record is
+            // complete before the last one reads it.
+            std::shared_ptr<SplitFeedback4> split4;
+            if (!events.empty()) {
+                split4 = std::make_shared<SplitFeedback4>();
+                ticketState->split4 = split4;
             }
+            // `command` exists only while work is being encoded toward the
+            // next commit: an event boundary ends it, and the next dispatch
+            // starts a fresh buffer on the same allocator bank.
+            id<MTL4CommandBuffer> command = nil;
+            id<MTL4ComputeCommandEncoder> encoder = nil;
+            const auto newCommand = [&]() -> id<MTL4CommandBuffer> {
+                id<MTL4CommandBuffer> next = [device newCommandBuffer];
+                if (!next)
+                    failBeforeCommit(
+                        "unable to create Metal command buffer");
+                [next beginCommandBufferWithAllocator:allocator4[bank]];
+                return next;
+            };
             uint8_t *stagingContents =
                 staging ? static_cast<uint8_t *>(staging->buffer.contents)
                         : nullptr;
@@ -1423,6 +1806,10 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         item.span && replaySpans &&
                         index + item.span->dispatches.size() <=
                             dispatches.size();
+                    const bool replaysGpuSpan =
+                        item.gpuSpan && replaySpans &&
+                        index + item.gpuSpan->dispatches.size() <=
+                            dispatches.size();
                     ranges.clear();
                     if (replaysSpan) {
                         for (__weak id<MTLBuffer> weak :
@@ -1432,11 +1819,42 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                     {buffer, 0, buffer.length});
                             }
                         }
-                    } else {
+                    } else if (replaysGpuSpan) {
+                        ranges.push_back(
+                            {item.gpuSpan->descAllocation->buffer, 0,
+                             item.gpuSpan->descAllocation->buffer.length});
+                        for (__weak id<MTLBuffer> weak :
+                             item.gpuSpan->usedBuffers) {
+                            if (id<MTLBuffer> buffer = weak) {
+                                ranges.push_back(
+                                    {buffer, 0, buffer.length});
+                            }
+                        }
+                    }
+                    if ((replaysSpan || replaysGpuSpan) &&
+                        item.source->indirectRange) {
+                        const MetalBuffer::Impl &range =
+                            *item.source->indirectRange.impl_;
+                        ranges.push_back({range.allocation->buffer,
+                                          range.offsetBytes,
+                                          range.offsetBytes +
+                                              range.lengthBytes});
+                    }
+                    if (!replaysSpan && !replaysGpuSpan) {
                         for (const BufferBinding &binding :
                              item.source->buffers) {
                             const MetalBuffer::Impl &view =
                                 *binding.buffer.impl_;
+                            ranges.push_back({view.allocation->buffer,
+                                              view.offsetBytes,
+                                              view.offsetBytes +
+                                                  view.lengthBytes});
+                        }
+                        for (const MetalBuffer &indirect :
+                             {item.source->indirectGrid,
+                              item.source->indirectRange}) {
+                            if (!indirect) continue;
+                            const MetalBuffer::Impl &view = *indirect.impl_;
                             ranges.push_back({view.allocation->buffer,
                                               view.offsetBytes,
                                               view.offsetBytes +
@@ -1463,6 +1881,8 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                     ranges.end());
                     if (replaysSpan)
                         index += item.span->dispatches.size() - 1;
+                    else if (replaysGpuSpan)
+                        index += item.gpuSpan->dispatches.size() - 1;
                 }
             }
             const auto orderAfterPrevious = [&](size_t index) {
@@ -1471,13 +1891,95 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                               beforeEncoderStages:MTLStageDispatch
                                  visibilityOptions:MTL4VisibilityOptionDevice];
             };
+            // An execute's span range: literal unless the run's first
+            // dispatch carries a GPU-written indirect range view.
+            const auto executeSpan = [&](const auto &span, size_t at) {
+                const MetalBuffer &range = dispatches[at].source->indirectRange;
+                if (range) {
+                    const MetalBuffer::Impl &view = *range.impl_;
+                    [encoder executeCommandsInBuffer:span.icb
+                                      indirectBuffer:
+                        view.allocation->buffer.gpuAddress +
+                            view.offsetBytes];
+                } else {
+                    [encoder executeCommandsInBuffer:span.icb
+                                           withRange:
+                        NSMakeRange(0, span.dispatches.size())];
+                }
+            };
+            // Encodes the event steps that follow the first `encoded`
+            // dispatches. Signals and waits are queue-level operations on
+            // Metal 4 — signalEvent orders after the work committed so far,
+            // waitForEvent before the work committed next — so a boundary
+            // carrying any step first commits the in-progress buffer, the
+            // split commit() makes only at signals: a queue wait taken while
+            // the buffer was still open would wrongly hold the work already
+            // encoded into it.
+            auto step = events.begin();
+            const auto encodeSteps = [&](size_t encoded) {
+                if (step == events.end() || step->before != encoded) return;
+                // Every signal of this boundary, gathered before the steps
+                // run: a queue signalEvent after a failed buffer may never
+                // execute — the same loss commit() guards against with the
+                // completed handler of the buffer that encoded the signal —
+                // so the commit's feedback delivers them from the CPU on
+                // error. Signals at a later boundary always have encoded
+                // work before them, so this boundary's commit is the last
+                // that can cover them.
+                std::vector<std::pair<SharedEvent, uint64_t>> covered;
+                for (auto signal = step;
+                     signal != events.end() && signal->before == encoded;
+                     ++signal) {
+                    if (signal->kind == EventStep::Kind::Signal)
+                        covered.emplace_back(signal->event, signal->value);
+                }
+                if (command || !covered.empty()) {
+                    if (!command) command = newCommand();
+                    // A signal with nothing encoded still gets its empty
+                    // carrier, as commit()'s signal-only buffer did: the
+                    // failure fallback needs a commit to ride.
+                    if (encoder) {
+                        [encoder endEncoding];
+                        encoder = nil;
+                    }
+                    [command endCommandBuffer];
+                    MTL4CommitOptions *options = [MTL4CommitOptions new];
+                    [options addFeedbackHandler:
+                        ^(id<MTL4CommitFeedback> feedback) {
+                            split4->record(feedback);
+                            if (feedback.error)
+                                for (const auto &[event, value] : covered)
+                                    event.signal(value);
+                        }];
+                    id<MTL4CommandBuffer> committed = command;
+                    [queue4 commit:&committed count:1 options:options];
+                    command = nil;
+                }
+                for (; step != events.end() && step->before == encoded;
+                     ++step) {
+                    id<MTLSharedEvent> event =
+                        (__bridge id<MTLSharedEvent>)
+                            step->event.nativeHandle();
+                    if (step->kind == EventStep::Kind::Wait) {
+                        [queue4 waitForEvent:event value:step->value];
+                    } else {
+                        [queue4 signalEvent:event value:step->value];
+                    }
+                }
+            };
             for (size_t index = 0; index < dispatches.size(); ++index) {
+                encodeSteps(index);
                 const PreparedDispatch &item = dispatches[index];
+                if (!command) command = newCommand();
+                if (!encoder) {
+                    encoder = [command computeCommandEncoder];
+                    if (!encoder) {
+                        failBeforeCommit(
+                            "unable to create Metal compute encoder");
+                    }
+                }
                 // A baked span replays its whole run from the indirect
                 // command buffer; the run's own dispatches are skipped.
-                // NOTE: gpuSpan (GPU-encoded spans) is not replayed on the
-                // Metal-4 path — its dispatches encode scalar here, so
-                // RICHENGINE_GPU_SPANS is a silent no-op under commit4.
                 if (item.span && replaySpans &&
                     index + item.span->dispatches.size() <=
                         dispatches.size()) {
@@ -1485,10 +1987,49 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         *item.span, dispatches.subspan(
                                         index, item.span->dispatches.size()));
                     orderAfterPrevious(index);
-                    [encoder executeCommandsInBuffer:item.span->icb
-                                           withRange:NSMakeRange(
-                                                         0, item.span->dispatches.size())];
+                    executeSpan(*item.span, index);
                     index += item.span->dispatches.size() - 1;
+                    continue;
+                }
+                // A GPU-encoded span replays like a baked one: gpu_encode
+                // fills its indirect command buffer once (its commands are a
+                // pure function of the span's static descriptor table), the
+                // dispatch-stage barrier orders the write before the replay,
+                // and every bytes payload restages into the span's arena.
+                if (item.gpuSpan && replaySpans &&
+                    index + item.gpuSpan->dispatches.size() <=
+                        dispatches.size()) {
+                    const GpuSpan &span = *item.gpuSpan;
+                    stageGpuSpanParams(
+                        span, dispatches.subspan(
+                                  index, span.dispatches.size()));
+                    orderAfterPrevious(index);
+                    const NSUInteger count = span.dispatches.size();
+                    if (!span.encoded) {
+                        [encoder setComputePipelineState:
+                                     pipeline("gpu_encode")];
+                        [argumentTable4 setAddress:
+                            span.argsAllocation->buffer.gpuAddress
+                                           atIndex:0];
+                        [argumentTable4 setAddress:
+                            span.descAllocation->buffer.gpuAddress +
+                                kGpuSpanDescHeader
+                                           atIndex:1];
+                        [argumentTable4 setAddress:
+                            span.descAllocation->buffer.gpuAddress
+                                           atIndex:2];
+                        [encoder setArgumentTable:argumentTable4];
+                        [encoder dispatchThreadgroups:
+                            MTLSizeMake((count + 255) / 256, 1, 1)
+                             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [encoder barrierAfterEncoderStages:MTLStageDispatch
+                                    beforeEncoderStages:MTLStageDispatch
+                                       visibilityOptions:
+                            MTL4VisibilityOptionDevice];
+                        span.encoded = true;
+                    }
+                    executeSpan(span, index);
+                    index += count - 1;
                     continue;
                 }
                 const ComputeDispatch &dispatch = *item.source;
@@ -1512,10 +2053,25 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 // The table's contents are snapshotted at each dispatch, so
                 // one table serves the whole encoder.
                 [encoder setArgumentTable:argumentTable4];
-                [encoder dispatchThreadgroups:item.groups
-                         threadsPerThreadgroup:item.threads];
+                if (dispatch.indirectGrid) {
+                    const MetalBuffer::Impl &grid =
+                        *dispatch.indirectGrid.impl_;
+                    [encoder dispatchThreadgroupsWithIndirectBuffer:
+                        grid.allocation->buffer.gpuAddress + grid.offsetBytes
+                                              threadsPerThreadgroup:
+                        item.threads];
+                } else {
+                    [encoder dispatchThreadgroups:item.groups
+                             threadsPerThreadgroup:item.threads];
+                }
             }
-            [encoder endEncoding];
+            encodeSteps(dispatches.size());
+            if (encoder) [encoder endEncoding];
+            // A command ending on an event boundary already committed its
+            // last work; the ticket's feedback still needs a carrier, so a
+            // fresh — possibly empty — buffer takes the final commit, as
+            // commit()'s last buffer does.
+            if (!command) command = newCommand();
             [command endCommandBuffer];
 
             // The commit feedback delivers the GPU timing and error the
@@ -1526,7 +2082,6 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 ^(id<MTL4CommitFeedback> feedback) {
                     ticketState->finishCommand4(feedback);
                 }];
-            residency->use();
             asyncState->commitSubmission4(ticketState->sequence);
             id<MTL4CommandBuffer> committed = command;
             [queue4 commit:&committed count:1 options:options];
@@ -1597,10 +2152,11 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     checkEvents(command.events, command.dispatches.size());
     Impl::PreparedCommand prepared = impl_->prepared(command.dispatches);
 #if RICHENGINE_MTL4_AVAILABLE
-    // The Metal 4 path has no shared-event encoding: a command with event
-    // steps takes the Metal 3 encoder.
-    if (command.events.empty() && impl_->useMtl4()) {
-        return impl_->commit4(prepared.dispatches,
+    // Event-bearing commands stay on the Metal 3 path: the commit4 event
+    // split misattributed GPU timing and regressed prefix-hit prefill
+    // output and wall time — gated off until the split is fixed.
+    if (impl_->useMtl4() && command.events.empty()) {
+        return impl_->commit4(prepared.dispatches, command.events,
                               std::move(prepared.retainedAllocations),
                               std::move(completion));
     }

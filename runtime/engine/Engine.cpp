@@ -317,6 +317,9 @@ bool Engine::tick(double now) {
       Pending command = std::move(pending_.front());
       pending_.pop_front();
       std::vector<ModelStepResult> results = command.ticket->wait();
+      // The step's wait() committed the anchors the next decode needs; its
+      // command can go to the GPU while apply() retires this step's lanes.
+      static_cast<void>(trySubmitAheadDecode(command, results, now));
       apply(command.plan, results, command.ticket->wallMilliseconds(),
             now - command.startedMilliseconds,
             command.ticket->prefillTimingIsRepresentative(), now);
@@ -1361,6 +1364,135 @@ bool Engine::trySubmitAhead(double now) {
   std::vector<ModelBatchItem> items;
   if (prepare(*plan, items, now, /*forAhead=*/true) != Prepared::Runnable)
     return false;
+  std::unique_ptr<ModelBatchTicket> ticket =
+      model_.submit(*plan, items, completionNotifier_);
+  if (!ticket) {
+    throw std::logic_error("model returned an empty command ticket");
+  }
+  scheduler_.commit(*plan, excluded);
+  pending_.push_back(Pending{std::move(*plan), std::move(ticket),
+                             busySinceMilliseconds_.value_or(now)});
+  return true;
+}
+
+bool Engine::trySubmitAheadDecode(const Pending &retired,
+                                  std::span<const ModelStepResult> results,
+                                  double now) {
+  // Opt-in: RICHENGINE_DECODE_RING2. A decode step's own anchor is unknown
+  // until its ticket's wait() runs the commit on the host, so unlike a
+  // prefill chunk the next command cannot be encoded while the step is
+  // still on the GPU. It can be submitted right after wait() returns,
+  // before apply(): the commit tail — token events, block publications,
+  // lane teardown, the scheduler's phase updates — then overlaps the
+  // command instead of the GPU idling through it. The Metal queue keeps
+  // command order; the backend admits two submissions in flight, the
+  // second slot already serving a draft predraft.
+  // Default on (measured decode win); RICHENGINE_DECODE_RING2_OFF disables.
+  static const bool enabled = !envFlag("RICHENGINE_DECODE_RING2_OFF");
+  // An ahead command behind the retired one would make a third pending
+  // command; the scheduler's active window and the backend's ring both
+  // hold at most two. The AR decode contract is the only one the ring
+  // covers: a canvas decode runs its whole schedule inside submit() and a
+  // constrained batch exchanges masks with the host between commands.
+  if (!enabled || !pending_.empty() ||
+      retired.plan.kind != WorkKind::Decode || retired.plan.constrained ||
+      retired.plan.decodeStage != DecodeStage::Regular ||
+      retired.plan.items.size() != results.size() ||
+      model_.decodeAdmissionTokens() !=
+          model::ExecutionLimits::speculativeScratchTokens) {
+    return false;
+  }
+  // A lane the retired step ends must not be resubmitted: its model
+  // request rejects a decode past a terminal anchor or an exhausted
+  // budget. The tests mirror the ends apply() is about to compute —
+  // settlement, the model's own finish flags and the output budget — and
+  // lanes failing them are excluded from the plan for apply() to retire.
+  std::vector<uint64_t> excluded;
+  for (const auto &[id, active] : requests_) {
+    if (active.lane && active.resourceWait.pending &&
+        !resourceRetryReady(active, now))
+      excluded.push_back(id);
+  }
+  for (size_t index = 0; index < results.size(); ++index) {
+    const ModelStepResult &result = results[index];
+    if (result.requestId != retired.plan.items[index].requestId)
+      return false; // apply() raises the order contract error
+    const Request &active = request(result.requestId);
+    bool ends =
+        active.finalized || active.pendingEnd ||
+        scheduler_.phase(active.request.id) != Phase::Decode ||
+        active.request.deadlineMilliseconds <= now ||
+        !active.request.scoreTokens.empty() || !result.failure.empty() ||
+        result.finished || result.nextDecodeStage != DecodeStage::Regular ||
+        result.outputTokensWithoutKv ||
+        std::any_of(result.outputTokens.begin(), result.outputTokens.end(),
+                    [&](uint32_t token) {
+                      return token >= config_.vocabularySize;
+                    });
+    if (!ends) {
+      const uint64_t completionTokens = active.exactTokens.size() +
+                                        result.outputTokens.size() -
+                                        active.promptTokens;
+      ends = completionTokens >= active.request.maxNewTokens;
+    }
+    if (ends)
+      excluded.push_back(result.requestId);
+  }
+  // The retiring lanes still decode and still carry their old stage, so the
+  // plan and the scheduler's commit both read the pre-completion state
+  // correctly; complete() then records the same phases the plan assumed.
+  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
+  if (!plan || plan->kind != WorkKind::Decode || plan->constrained ||
+      plan->decodeStage != DecodeStage::Regular || plan->empty()) {
+    return false;
+  }
+  std::vector<ModelBatchItem> items;
+  items.reserve(plan->items.size());
+  std::vector<BatchItem> admitted;
+  admitted.reserve(plan->items.size());
+  Request *const yielding = laneToYield();
+  for (const BatchItem &scheduled : plan->items) {
+    Request &active = request(scheduled.requestId);
+    if (!active.lane)
+      throw std::logic_error("scheduled request is not resident");
+    // apply() has not appended the retired step's output yet: a lane it
+    // served starts the next step that many positions later, exactly where
+    // the model's commit left its state length.
+    uint64_t position = active.exactTokens.size();
+    for (const ModelStepResult &result : results) {
+      if (result.requestId == scheduled.requestId) {
+        position += result.outputTokens.size();
+        break;
+      }
+    }
+    const uint64_t workEnd = position + model_.decodeAdmissionTokens();
+    const ReclaimClass upTo =
+        &active == yielding && anotherResident(active.request.id)
+            ? ReclaimClass::Ordinary
+            : ReclaimClass::InUse;
+    const auto kv = allocate(
+        [&] { return cache_.ensureTokens(active.request.id, workEnd); },
+        true, upTo);
+    // An ahead plan yields nothing: a denied lane simply runs on the next
+    // pass instead, as in prepare().
+    if (!kv.admission.granted())
+      continue;
+    admitted.push_back(scheduled);
+    // A lane that runs is waiting for nothing.
+    active.resourceWait = {};
+    ModelBatchItem item;
+    item.requestId = active.request.id;
+    item.logicalPosition = position;
+    item.tokenCount = scheduled.tokenCount;
+    const PageTableView pageTable = cache_.pageTable(active.request.id);
+    item.pageTable = pageTable.pages;
+    item.pageTableRevision = pageTable.revision;
+    item.pageTableFirstChanged = pageTable.firstChanged;
+    items.push_back(std::move(item));
+  }
+  if (admitted.empty())
+    return false;
+  plan->items = std::move(admitted);
   std::unique_ptr<ModelBatchTicket> ticket =
       model_.submit(*plan, items, completionNotifier_);
   if (!ticket) {

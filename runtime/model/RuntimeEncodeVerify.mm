@@ -299,15 +299,75 @@ namespace richengine::model {
   }
 
   void Runtime::Impl::encodeBatchVerifyInput(
-      CommandGraph &graph, uint32_t lanes,
+      CommandGraph &graph, std::span<Request *const> entries,
+      std::span<const ModelBatchItem> items, uint32_t lanes,
       std::span<const uint32_t> liveRows) {
-    if (!lanes || lanes > kLaneCount)
+    if (!lanes || lanes > kLaneCount ||
+        entries.size() < lanes || items.size() < lanes)
       throw std::invalid_argument("invalid verify-input batch width");
+    const MetalBuffer draftInput =
+        decodeArena->packed(DecodeTensor::DraftInputTokens, lanes);
+    const MetalBuffer proposals =
+        decodeArena->packed(DecodeTensor::ProposedTokens, lanes);
+    const MetalBuffer verifyInput =
+        decodeArena->packed(DecodeTensor::InputTokens, lanes);
+    if (deviceVerifyParams_) {
+      // The device variant binds the step pack: each lane takes its
+      // anchor and live count from the pack when it proves to be that
+      // lane's own predecessor's. The staged payload still carries the
+      // host's values — they are the proof's reference and the fallback.
+      // device_lanes stays zero on the readback path: the equality proof
+      // alone decides.
+      std::array<uint64_t, kLaneCount> requestIds{};
+      std::array<uint32_t, kLaneCount> positionBases{};
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        requestIds[lane] = entries[lane]->id;
+        positionBases[lane] =
+            static_cast<uint32_t>(items[lane].logicalPosition);
+      }
+      ops::Embedding::addVerifyInputDevice(
+          graph, draftInput, proposals, verifyInput, stepPackBuffer(),
+          {requestIds.data(), lanes}, {positionBases.data(), lanes},
+          /*deviceLanes=*/0, geometry.target.vocabularySize, lanes,
+          geometry.draft.verifyRows(), geometry.draft.queryRows(),
+          liveRows);
+      return;
+    }
     targetModel.addVerifyInput(
-        graph, decodeArena->packed(DecodeTensor::DraftInputTokens, lanes),
-        decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->packed(DecodeTensor::InputTokens, lanes), lanes,
+        graph, draftInput, proposals, verifyInput, lanes,
         geometry.draft.verifyRows(), geometry.draft.queryRows(), liveRows);
+  }
+
+  void Runtime::Impl::encodeBatchStepPack(
+      CommandGraph &graph, std::span<Request *const> entries,
+      std::span<const ModelBatchItem> items,
+      std::span<const uint32_t> budgets, uint32_t outputStride) {
+    if (!deviceVerifyParams_)
+      return;
+    if (entries.empty() || entries.size() > kLaneCount ||
+        entries.size() != items.size() || entries.size() != budgets.size())
+      throw std::invalid_argument("invalid step-pack batch");
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    DecodeStepPackParams params{};
+    params.lanes = lanes;
+    params.output_stride = outputStride;
+    params.decode_rows = kDecodeRows;
+    params.verify_stride = geometry.draft.verifyRows();
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const Request &entry = *entries[lane];
+      params.request_id[lane] = entry.id;
+      params.position_base[lane] =
+          static_cast<uint32_t>(items[lane].logicalPosition);
+      params.remaining[lane] =
+          entry.maxNewTokens - entry.generatedTokens;
+      params.budget[lane] = budgets[lane];
+    }
+    graph.add(std::string(ops::kDecodeStepPack),
+              {decodeArena->packed(DecodeTensor::RetainedCount, lanes),
+               decodeArena->packed(DecodeTensor::AcceptedCount, lanes),
+               decodeArena->packed(DecodeTensor::OutputTokens, lanes),
+               stepPackBuffer()},
+              params, {lanes, 1, 1}, {1, 1, 1});
   }
 
   // A tree batch's verify inputs: the selector's tables carry every lane's
@@ -410,7 +470,34 @@ namespace richengine::model {
 
   void Runtime::Impl::encodeDfaMasks(
       CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes,
-      std::span<const uint32_t> liveRows) {
+      std::span<const uint32_t> liveRows, const DfaGridLanes *grid) {
+    // The GPU-grid path's span consumer: decode_dfa_mask_grid packs the
+    // mask pass's launch size from the same live-row arithmetic the host
+    // applies and clears each consumed span on-device, so it dispatches
+    // even when no mask pass follows — a skipped dispatch would leave the
+    // span pending for a later round to reapply.
+    if (grid && grid->gpuSpanMask) {
+      if (!packedVocab_)
+        throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+      if (!dfaMaskGrid_)
+        dfaMaskGrid_ = backend.allocateBuffer(16, BufferStorage::Shared,
+                                              "dfa-mask-grid");
+      DfaMaskGridParams gridParams{};
+      gridParams.vocabulary_groups =
+          static_cast<uint32_t>((packedVocab_->vocab + 255) / 256);
+      gridParams.lanes = lanes;
+      gridParams.gpu_span_lanes = grid->gpuSpanMask;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        gridParams.state_lanes[lane] = entries[lane]->stateLane;
+        gridParams.maximum_retained[lane] = grid->maximumRetained[lane];
+        gridParams.live_rows[lane] =
+            lane < liveRows.size() ? liveRows[lane] : kDecodeRows;
+      }
+      graph.add(std::string(ops::kDecodeDfaMaskGrid),
+                {decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
+                 dfaMaskGrid_},
+                gridParams, {1, 1, 1}, {1, 1, 1});
+    }
     // Forced mode keeps the host mask round trip: the chain's row states
     // feed only the mask kernel, so both stay unencoded.
     if (dfaMode_ != DfaMode::Full)
@@ -468,17 +555,24 @@ namespace richengine::model {
               walk, {lanes, 1, 1}, {1, 1, 1});
     if (!mask.lane_mask)
       return;
-    graph.add(std::string(ops::kDecodeDfaMask),
-              {tables[0], tables[1], tables[2], tables[3],
-               accepts[0], accepts[1], accepts[2], accepts[3],
-               packedVocab_->bytes, packedVocab_->offsets,
-               decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
-               nextStates,
-               decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
-               markers[0], markers[1], markers[2], markers[3],
-               packedVocab_->special},
-              mask,
-              {(uint64_t{packedVocab_->vocab} + 255) / 256, mask.rows, lanes},
+    const std::vector<MetalBuffer> maskBuffers{
+        tables[0], tables[1], tables[2], tables[3],
+        accepts[0], accepts[1], accepts[2], accepts[3],
+        packedVocab_->bytes, packedVocab_->offsets,
+        decodeArena->packed(DecodeTensor::DfaRowStates, lanes), nextStates,
+        decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
+        markers[0], markers[1], markers[2], markers[3],
+        packedVocab_->special};
+    if (grid && grid->gpuSpanMask) {
+      // The grid kernel's MTLDispatchThreadgroupsIndirectArguments sizes
+      // the launch: {vocabulary groups, mask.rows, lanes}.
+      graph.addIndirect(std::string(ops::kDecodeDfaMask), maskBuffers, mask,
+                        backend.view(dfaMaskGrid_, 0, 12), {256, 1, 1});
+      return;
+    }
+    graph.add(std::string(ops::kDecodeDfaMask), maskBuffers, mask,
+              {(uint64_t{packedVocab_->vocab} + 255) / 256, mask.rows,
+               lanes},
               {256, 1, 1});
   }
 
@@ -649,6 +743,31 @@ namespace richengine::model {
                markers[0], markers[1], markers[2], markers[3],
                packedVocab_->special},
               walk, {lanes, 1, 1}, {1024, 1, 1});
+  }
+
+  // The merged constrained step's on-device span apply
+  // (RICHENGINE_DFA_MERGE): between the draft pass and the verify input of
+  // the same command, each named lane copies its state lane's pending
+  // DfaForcedSpan tokens over the draft's own proposals and clears the
+  // span — what the split path's host apply writes after the draft command
+  // completes.
+  void Runtime::Impl::encodeDfaSpanApply(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes,
+      uint32_t laneMask, std::span<const uint32_t> maximumRetained) {
+    if (!laneMask)
+      return;
+    DfaSpanApplyParams params{};
+    params.lane_mask = laneMask;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      params.state_lanes[lane] = entries[lane]->stateLane;
+      params.maximum_retained[lane] =
+          lane < maximumRetained.size() ? maximumRetained[lane]
+                                        : kDecodeRows;
+    }
+    graph.add(std::string(ops::kDecodeDfaSpanApply),
+              {decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
+               decodeArena->packed(DecodeTensor::ProposedTokens, lanes)},
+              params, {lanes, 1, 1}, {1, 1, 1});
   }
 
   void Runtime::Impl::encodeDfaInitialMasks(

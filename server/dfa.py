@@ -22,14 +22,25 @@ from . import tool_schema
 from .errors import APIError
 from .tool_schema import MAX_NAME_LENGTH, NAME_SPACE, QWEN3_XML, THINK_END
 
-# Compiled DFAs stay small enough to ship in a CONSTRAINT_DFA frame (whose
-# wire limit is 32767).
-MAX_DFA_STATES = 4096
+# Compiled DFAs stay small enough to ship in a CONSTRAINT_DFA frame, whose
+# wire limit is 32767 states (Protocol.cpp kMaximumDfaStates). Staying one
+# below keeps every state id — including the stop state at n_states — inside
+# the int16 domain the transition table speaks.
+MAX_DFA_STATES = 32766
 # Object properties a schema leaves optional compile to state-sharing
-# branches; more than this many is the grammar path's job.
-MAX_OPTIONAL_PROPERTIES = 4
-# Array item bounds above this compile unbounded or fall back.
+# branches; measured growth is linear (~85 states per string-valued
+# property), so this is a compile-time guard, not a semantic one — the state
+# cap above stays the real bound.
+MAX_OPTIONAL_PROPERTIES = 64
+# Array item bounds above this compile unbounded or fall back. This must
+# match tool_schema.MAX_GRAMMAR_BOUND exactly: the grammar path drops
+# minItems/maxItems above its bound, so a larger DFA bound would enforce a
+# constraint the fallback grammar does not — a semantic split, not a subset
+# widening.
 MAX_ARRAY_BOUND = 64
+# Keep at 16: deep value chains make _minimize's Moore refinement run a
+# round per distinguishable level — O(states² · 256) — so a deeper bound
+# would blow up compile time long before the state cap bites.
 MAX_SCHEMA_DEPTH = 16
 MAX_FORCED_BYTES = 4096
 # Determinization bail-out; the minimized DFA may still end smaller.

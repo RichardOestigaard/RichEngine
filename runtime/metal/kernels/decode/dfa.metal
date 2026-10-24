@@ -585,3 +585,58 @@ kernel void decode_dfa_forced_tokens(
     span.consumed = tg_offset;
   }
 }
+
+// RICHENGINE_GPU_DECODE_GRID: one thread packs decode_dfa_mask's
+// MTLDispatchThreadgroupsIndirectArguments — {vocabulary groups, row span,
+// lanes} — and consumes each forced-span lane's DfaForcedSpan, which the
+// previous round's decode_dfa_forced_* derived on-device. A span lane's
+// live rows are its capped span length + 1, the same arithmetic the host
+// applies when it consumes the span for the direct dispatch; a lane whose
+// span was already cleared falls back to the encoded live_rows snapshot,
+// so the indirect launch is byte-identical to the host-computed one.
+kernel void decode_dfa_mask_grid(
+    device DfaForcedSpan *forced [[buffer(0)]],
+    device uint *grid [[buffer(1)]],
+    constant DfaMaskGridParams &params [[buffer(2)]]) {
+  uint rows = 0;
+  for (uint lane = 0; lane < params.lanes; ++lane) {
+    uint live = params.live_rows[lane];
+    if (params.gpu_span_lanes & (1u << lane)) {
+      device DfaForcedSpan &span = forced[params.state_lanes[lane]];
+      const uint tokens = span.tokens;
+      if (tokens) {
+        live = min(tokens,
+                   min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
+                       params.maximum_retained[lane] - 1)) +
+               1;
+      }
+      span.tokens = 0;
+    }
+    rows = max(rows, min(live + 1, kDfaRows));
+  }
+  grid[0] = params.vocabulary_groups;
+  grid[1] = rows;
+  grid[2] = params.lanes;
+}
+
+// RICHENGINE_DFA_MERGE: one thread per named lane, between the draft pass
+// and the verify input of the same command. Applies the state lane's
+// pending forced span over the draft's own proposals — the same tokens and
+// the same cap the split path's host apply writes after the draft command
+// completes — then clears the span so a later round cannot reapply it.
+kernel void decode_dfa_span_apply(
+    device DfaForcedSpan *forced [[buffer(0)]],
+    device uint *proposed [[buffer(1)]],
+    constant DfaSpanApplyParams &params [[buffer(2)]],
+    uint lane [[thread_position_in_grid]]) {
+  if (!(params.lane_mask & (1u << lane)))
+    return;
+  device DfaForcedSpan &span = forced[params.state_lanes[lane]];
+  const uint count =
+      min(span.tokens, min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
+                           params.maximum_retained[lane] - 1));
+  for (uint i = 0; i < count; ++i)
+    proposed[lane * RICHENGINE_DRAFT_PROPOSAL_TOKENS + i] =
+        span.token_ids[i];
+  span.tokens = 0;
+}

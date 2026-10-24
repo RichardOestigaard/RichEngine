@@ -489,6 +489,33 @@ private:
 // the per-pipeline table (MetalEncode.mm).
 void recordOpTiming(const std::string &name, double gpuSeconds);
 
+#if RICHENGINE_MTL4_AVAILABLE
+// What a Metal 4 command split at event steps shares across its commits:
+// commit feedback is per commit and covers only that commit's buffers, so
+// every piece reports its GPU start and its error here, and the final
+// commit's finishCommand4 reports the whole command — the same aggregate
+// finishCommand reads off its leading buffers.
+struct SplitFeedback4 {
+    std::atomic<double> gpuStart{std::numeric_limits<double>::infinity()};
+    std::mutex mutex;
+    __strong NSError *error = nil;
+
+    // Merges one commit's feedback: the earliest start and the first
+    // error win, matching the leading-buffers scan of finishCommand.
+    void record(id<MTL4CommitFeedback> feedback) {
+        const double start = feedback.GPUStartTime;
+        double current = gpuStart.load(std::memory_order_relaxed);
+        while (start < current &&
+               !gpuStart.compare_exchange_weak(current, start,
+                                               std::memory_order_relaxed)) {}
+        if (NSError *failure = feedback.error) {
+            std::lock_guard lock(mutex);
+            if (!error) error = failure;
+        }
+    }
+};
+#endif
+
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
@@ -500,6 +527,12 @@ struct CommandTicket::State {
     AwakeClock::time_point wallStart;
     // Command buffers committed before the last one, split at event signals.
     std::vector<id<MTLCommandBuffer>> leadingCommands;
+#if RICHENGINE_MTL4_AVAILABLE
+    // Set by commit4 while event steps split the command into several
+    // commits: the leading commits' starts and errors land here for the
+    // final commit's finishCommand4.
+    std::shared_ptr<SplitFeedback4> split4;
+#endif
     std::string error;
     bool completed = false;
     bool released = false;
@@ -545,8 +578,20 @@ struct CommandTicket::State {
     void finishCommand4(id<MTL4CommitFeedback> feedback) {
         auto wallEnd = AwakeClock::now();
         CommandTiming timing;
-        timing.gpuSeconds =
-            feedback.GPUEndTime - feedback.GPUStartTime;
+        double gpuStart = feedback.GPUStartTime;
+        NSError *failure = feedback.error;
+        // A command split at event steps committed once per piece: the
+        // leading commits report through split4, which completes what
+        // this commit's own feedback covers — the whole command's start
+        // and its first error, like finishCommand's leading-buffers scan.
+        if (split4) {
+            const double earlier =
+                split4->gpuStart.load(std::memory_order_relaxed);
+            if (earlier < gpuStart) gpuStart = earlier;
+            std::lock_guard lock(split4->mutex);
+            if (split4->error) failure = split4->error;
+        }
+        timing.gpuSeconds = feedback.GPUEndTime - gpuStart;
         if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
             timing.gpuSeconds = 0.0;
         }
@@ -554,10 +599,10 @@ struct CommandTicket::State {
             std::chrono::duration<double>(wallEnd - wallStart).count();
 
         std::string error;
-        if (feedback.error) {
+        if (failure) {
             std::ostringstream message;
             message << "Metal command " << sequence << " failed: "
-                    << errorDescription(feedback.error);
+                    << errorDescription(failure);
             error = message.str();
         }
 
@@ -792,6 +837,10 @@ struct MetalBackend::Impl {
             bool bakeable = false;
             bool patchableBytes = false;
             bool gpuSpan = false;
+            // Indirect dispatch parameter views (ComputeDispatch): empty
+            // snapshots mean the dispatch encodes literal values.
+            BufferSnapshot indirectGrid;
+            BufferSnapshot indirectRange;
             std::vector<uint32_t> bufferIndices;
             std::vector<BufferSnapshot> buffers;
             std::vector<BytesSnapshot> bytes;
@@ -827,6 +876,9 @@ struct MetalBackend::Impl {
     __strong id<MTL4CommandQueue> queue4 = nil;
     __strong id<MTL4CommandAllocator> allocator4[2] = {nil, nil};
     __strong id<MTL4ArgumentTable> argumentTable4 = nil;
+    // The Metal 4 compiler, created on first use: stitched pipelines and the
+    // |opt: name flags are the MTL4 compiler pathway's clients.
+    __strong id<MTL4Compiler> compiler4 = nil;
     // MTL4ArgumentTable binds GPU addresses and has no setBytes equivalent:
     // every BytesBinding payload is staged here, 256-byte aligned, and bound
     // as an address into this buffer. Grown to a submission's total.
@@ -865,6 +917,11 @@ struct MetalBackend::Impl {
     std::unordered_map<std::string, id<MTLComputePipelineState>,
                        PipelineNameHash, std::equal_to<>>
         icbPipelines;
+    // Stitched libraries behind stitched pipeline names, keyed by the hook
+    // bindings that built them.
+    std::unordered_map<std::string, id<MTLLibrary>,
+                       PipelineNameHash, std::equal_to<>>
+        stitchedLibraries;
 
     DeviceCapabilities capabilities;
     std::shared_ptr<AllocationAccounting> accounting =
@@ -898,6 +955,12 @@ struct MetalBackend::Impl {
 
 
     id<MTLComputePipelineState> newPipeline(std::string_view name);
+
+
+    // Pipeline-name grammar beyond the plain function name: call-site
+    // stitching (`entry[hook=impl:arity,...]`) and Metal 4 compiler pipeline
+    // options (`entry|persistent,fp=weak,...`). See MetalEncode.mm.
+    id<MTLComputePipelineState> newSpecializedPipeline(std::string_view name);
 
 
     // The pipeline a baked indirect command binds: the same function as
@@ -1037,10 +1100,12 @@ struct MetalBackend::Impl {
 
 #if RICHENGINE_MTL4_AVAILABLE
     // The Metal 4 encoding of commit(): same prepared dispatches, same
-    // ticket contract, encoded through one reused allocator and argument
-    // table and committed with a commit-feedback handler in place of the
-    // completed handler.
+    // event steps, same ticket contract, encoded through one reused
+    // allocator and argument table and committed with a commit-feedback
+    // handler in place of the completed handler. Event steps map to
+    // queue-level signalEvent/waitForEvent between the split's commits.
     CommandTicket commit4(std::span<const PreparedDispatch> dispatches,
+                          std::span<const EventStep> events,
                           std::vector<std::shared_ptr<MetalAllocation>> retained,
                           CommandCompletion completion);
 

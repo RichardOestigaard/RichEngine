@@ -150,6 +150,40 @@ public:
     }
   }
 
+  // Like add(), but the threadgroup count is read on the GPU from `grid` —
+  // an MTLDispatchThreadgroupsIndirectArguments (three uint32s) at the
+  // view's start — written by an earlier kernel of the same command or a
+  // previous command. `groups` remains the recorded bound the snapshots
+  // compare. Indirect dispatches cannot join a span.
+  template <class Params>
+  void addIndirect(std::string pipeline, std::vector<MetalBuffer> buffers,
+                   const Params &params, MetalBuffer grid,
+                   DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    add(std::move(pipeline), std::move(buffers), params, {1, 1, 1}, threads);
+    ComputeDispatch &dispatch = dispatches_.back();
+    if (dispatch.bakeable || dispatch.gpuSpan)
+      throw std::invalid_argument("indirect dispatch cannot join a span");
+    dispatch.indirectGrid = std::move(grid);
+  }
+
+  // Like add() with no parameter payload, but GPU-sized as addIndirect().
+  void addIndirect(std::string pipeline, std::vector<MetalBuffer> buffers,
+                   MetalBuffer grid,
+                   DispatchSize threads = {kDefaultThreads, 1, 1}) {
+    ComputeDispatch &dispatch =
+        push(std::move(pipeline), std::move(buffers), {1, 1, 1}, threads);
+    if (dispatch.bakeable || dispatch.gpuSpan)
+      throw std::invalid_argument("indirect dispatch cannot join a span");
+    dispatch.indirectGrid = std::move(grid);
+  }
+
+  // A GPU-written replay range (two uint32s: location, length —
+  // MTLIndirectCommandBufferExecutionRange) at the view's start for the
+  // span the next added dispatch opens (ComputeDispatch::indirectRange).
+  void setIndirectRange(MetalBuffer range) {
+    pendingRange_ = std::move(range);
+  }
+
   // Marks the dispatches added between the calls as one replayable span.
   // Every buffer binding, parameter payload and geometry of the span must be
   // identical on each submission that reuses it; the backend revalidates and
@@ -204,6 +238,7 @@ private:
     dispatch.bakeable =
         bakedSpanDepth_ > 0 && !bakedSpanSuspend_ && !gpuSpanDepth_;
     dispatch.gpuSpan = gpuSpanDepth_ > 0;
+    dispatch.indirectRange = std::exchange(pendingRange_, {});
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
@@ -219,6 +254,7 @@ private:
   uint32_t bakedSpanDepth_ = 0;
   uint32_t bakedSpanSuspend_ = 0;
   uint32_t gpuSpanDepth_ = 0;
+  MetalBuffer pendingRange_;
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;

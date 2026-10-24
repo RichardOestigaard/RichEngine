@@ -24,6 +24,7 @@ inline constexpr std::string_view kDecodeAcceptDflash = "decode_accept_dflash";
 // token-walk next-state rows, committed-state advance and the commit-stage
 // forced-span pair.
 inline constexpr std::string_view kDecodeDfaMask = "decode_dfa_mask";
+inline constexpr std::string_view kDecodeDfaMaskGrid = "decode_dfa_mask_grid";
 inline constexpr std::string_view kDecodeDfaChain = "decode_dfa_chain";
 inline constexpr std::string_view kDecodeDfaTrunc = "decode_dfa_truncate";
 inline constexpr std::string_view kDecodeDfaArgmaxSharded = "decode_dfa_argmax_sharded";
@@ -31,7 +32,12 @@ inline constexpr std::string_view kDecodeDfaArgmaxReduce = "decode_dfa_argmax_re
 inline constexpr std::string_view kDecodeDfaAdvance = "decode_dfa_advance";
 inline constexpr std::string_view kDecodeDfaForcedBytes = "decode_dfa_forced_bytes";
 inline constexpr std::string_view kDecodeDfaForcedTokens = "decode_dfa_forced_tokens";
+inline constexpr std::string_view kDecodeDfaSpanApply = "decode_dfa_span_apply";
 inline constexpr std::string_view kDecodeAcceptTree = "decode_accept_tree";
+// The RICHENGINE_DEVICE_VERIFY_PARAMS step bridge (kernels/decode/
+// step_pack.metal): the committed step's last dispatch mirrors the
+// acceptance results into the next step's device params block.
+inline constexpr std::string_view kDecodeStepPack = "decode_step_pack";
 inline constexpr std::string_view kDecodeLogitSoftcap = "decode_logit_softcap";
 inline constexpr std::string_view kDecodeHeadArgmaxQ4 = "decode_head_argmax_q4";
 inline constexpr std::string_view kTreeLeafPatch = "tree_leaf_patch";
@@ -174,6 +180,7 @@ inline constexpr std::string_view kEmbeddingQ4H = "embedding_q4_h";
 inline constexpr std::string_view kEmbeddingQ4tH = "embedding_q4t_h";
 inline constexpr std::string_view kEmbeddingQ4ScaledH = "embedding_q4_scaled_h";
 inline constexpr std::string_view kVerifyInputTokens = "verify_input_tokens";
+inline constexpr std::string_view kVerifyInputTokensDev = "verify_input_tokens_dev";
 inline constexpr std::string_view kVerifyInputTreeTokens = "verify_input_tree_tokens";
 inline constexpr std::string_view kTreeCaptureGather = "tree_capture_gather";
 
@@ -328,6 +335,10 @@ inline constexpr std::string_view kCanvasSelfCondition = "canvas_self_condition"
 inline constexpr std::string_view kTestCopyU32 = "test_copy_u32";
 inline constexpr std::string_view kTestFillU32 = "test_fill_u32";
 inline constexpr std::string_view kTestAddU32 = "test_add_u32";
+inline constexpr std::string_view kTestAddHookU32 = "test_add_hook_u32";
+inline constexpr std::string_view kTestWriteGrid = "test_write_grid";
+inline constexpr std::string_view kTestWriteRange = "test_write_range";
+inline constexpr std::string_view kTestMarkGridU32 = "test_mark_grid_u32";
 inline constexpr std::string_view kAddressedWriteU32 = "addressed_write_u32";
 inline constexpr std::string_view kAddressedCheckU32 = "addressed_check_u32";
 inline constexpr std::string_view kDoesNotExist = "does_not_exist";

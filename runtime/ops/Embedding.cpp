@@ -112,6 +112,46 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   graph.endBakedSpan();
 }
 
+void Embedding::addVerifyInputDevice(
+    metal::CommandGraph &graph, metal::MetalBuffer draftInputTokens,
+    metal::MetalBuffer proposedTokens, metal::MetalBuffer verifyInputTokens,
+    metal::MetalBuffer stepPack, std::span<const uint64_t> requestIds,
+    std::span<const uint32_t> positionBases, uint32_t deviceLanes,
+    uint32_t vocabulary, uint32_t lanes, uint32_t verifyStride,
+    uint32_t draftStride, std::span<const uint32_t> liveRows) {
+  if (!vocabulary || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
+      !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
+      !draftStride || draftStride > RICHENGINE_DRAFT_QUERY_ROWS ||
+      requestIds.size() != lanes || positionBases.size() != lanes ||
+      (!liveRows.empty() && liveRows.size() != lanes))
+    throw std::invalid_argument("invalid verify input device batch");
+  VerifyInputDeviceParams params{};
+  params.verify.vocabulary = vocabulary;
+  params.verify.verify_stride = verifyStride;
+  params.verify.draft_stride = draftStride;
+  params.device_lanes = deviceLanes & ((uint32_t{1} << lanes) - 1);
+  // A/B kill switch parity with addVerifyInput: treating every row as live
+  // restores the pre-anchor-fill routing for measurement.
+  static const bool allLive = std::getenv("RICHENGINE_VERIFY_ALL_LIVE") != nullptr;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    params.verify.live_rows[lane] =
+        !allLive && lane < liveRows.size()
+            ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
+            : verifyStride;
+    params.request_id[lane] = requestIds[lane];
+    params.position_base[lane] = positionBases[lane];
+  }
+  // Same replayable shape as the staged variant: the pack binding is a
+  // stable runtime-owned buffer, the per-step payload stays patchable.
+  graph.beginBakedSpan();
+  graph.addPatchable(std::string(kVerifyInputTokensDev),
+                     {std::move(draftInputTokens), std::move(proposedTokens),
+                      std::move(verifyInputTokens), std::move(stepPack)},
+                     params, {uint64_t{lanes} * verifyStride, 1, 1},
+                     {1, 1, 1});
+  graph.endBakedSpan();
+}
+
 void Embedding::addVerifyTreeInput(
     metal::CommandGraph &graph, metal::MetalBuffer treeTokens,
     metal::MetalBuffer treeNodes, metal::MetalBuffer treeCounts,

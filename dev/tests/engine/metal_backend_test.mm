@@ -420,6 +420,101 @@ void pendingCommandStillTimesOut(const std::string &metallibPath) {
     std::cout << "PASS pending GPU command watchdog and resource lifetime\n";
 }
 
+// The Metal 4.1 pathway surface: call-site stitching, GPU-written dispatch
+// grids, and GPU-written span replay ranges — identical semantics on the
+// Metal 3 and Metal 4 encoders (run with and without RICHENGINE_MTL4).
+void indirectAndStitchedDispatches(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    const uint32_t count = 8;
+
+    // Stitching: the kernel's [[stitchable]] hook binds each implementation
+    // through the "[hook=impl:arity]" name grammar.
+    for (const auto *impl : {"test_addend_one", "test_addend_seven"}) {
+        MetalBuffer values = sharedBuffer(backend, count * sizeof(uint32_t));
+        std::memset(values.contents(), 0, count * sizeof(uint32_t));
+        const uint32_t increment = 10;
+        ComputeDispatch dispatch;
+        dispatch.pipelineName =
+            std::string(richengine::ops::kTestAddHookU32) +
+            "[test_select_addend=" + impl + ":1]";
+        dispatch.buffers = {{0, values}};
+        dispatch.bytes = {{1, &count, sizeof(count)},
+                          {2, &increment, sizeof(increment)}};
+        dispatch.threadgroups = {1, 1, 1};
+        dispatch.threadsPerThreadgroup = {count, 1, 1};
+        (void)backend.submit(dispatch);
+        const uint32_t expected =
+            std::strstr(impl, "seven") ? increment + 7 : increment + 1;
+        for (uint32_t i = 0; i < count; ++i)
+            require(static_cast<uint32_t *>(values.contents())[i] == expected,
+                    "stitched pipeline bound the wrong hook implementation");
+    }
+
+    // Indirect grid: a kernel writes the launch size, the following
+    // dispatch takes its threadgroup count from that buffer on the GPU.
+    MetalBuffer grid = sharedBuffer(backend, 16);
+    MetalBuffer marks = sharedBuffer(backend, 4 * 64 * sizeof(uint32_t));
+    std::memset(marks.contents(), 0, 4 * 64 * sizeof(uint32_t));
+    const uint32_t gridValue[3] = {3, 2, 1};
+    const uint32_t limit = 64;
+    {
+        richengine::metal::CommandGraph graph;
+        graph.add(std::string(richengine::ops::kTestWriteGrid), {grid},
+                  std::array<uint32_t, 3>{3, 2, 1},
+                  {1, 1, 1}, {1, 1, 1});
+        graph.addIndirect(std::string(richengine::ops::kTestMarkGridU32),
+                          {marks}, limit, backend.view(grid, 0, 12),
+                          {1, 1, 1});
+        (void)backend.submitCommand(graph.dispatches());
+    }
+    const auto *words = static_cast<const uint32_t *>(marks.contents());
+    for (uint32_t y = 0; y < 4; ++y)
+        for (uint32_t x = 0; x < 8; ++x) {
+            const bool inside = x < gridValue[0] && y < gridValue[1];
+            require((words[y * 64 + x] != 0) == inside,
+                    "indirect grid launch shape did not follow the "
+                    "GPU-written size");
+        }
+
+    // Indirect range: a baked span of three copies replays the range a
+    // kernel wrote — {0, 2} drops the span's third command.
+    MetalBuffer first = sharedBuffer(backend, count * sizeof(uint32_t));
+    MetalBuffer second = sharedBuffer(backend, count * sizeof(uint32_t));
+    MetalBuffer third = sharedBuffer(backend, count * sizeof(uint32_t));
+    MetalBuffer range = sharedBuffer(backend, 16);
+    auto *firstWords = static_cast<uint32_t *>(first.contents());
+    for (uint32_t i = 0; i < count; ++i) firstWords[i] = 100 + i;
+    std::memset(second.contents(), 0, count * sizeof(uint32_t));
+    std::memset(third.contents(), 0, count * sizeof(uint32_t));
+    {
+        richengine::metal::CommandGraph graph;
+        graph.add(std::string(richengine::ops::kTestWriteRange), {range},
+                  std::array<uint32_t, 2>{0, 2}, {1, 1, 1}, {1, 1, 1});
+        graph.setIndirectRange(backend.view(range, 0, 8));
+        graph.beginBakedSpan();
+        graph.add(std::string(richengine::ops::kTestCopyU32), {first, second},
+                  count, {1, 1, 1}, {count, 1, 1});
+        graph.add(std::string(richengine::ops::kTestCopyU32), {second, third},
+                  count, {1, 1, 1}, {count, 1, 1});
+        graph.add(std::string(richengine::ops::kTestFillU32), {third},
+                  std::array<uint32_t, 2>{0xdeadbeefu, count},
+                  {1, 1, 1}, {count, 1, 1});
+        graph.endBakedSpan();
+        // Bake on the first submission, replay the GPU range on the second.
+        (void)backend.submitCommand(graph.dispatches());
+        (void)backend.submitCommand(graph.dispatches());
+    }
+    const auto *thirdWords = static_cast<const uint32_t *>(third.contents());
+    for (uint32_t i = 0; i < count; ++i) {
+        require(static_cast<const uint32_t *>(second.contents())[i] ==
+                    100 + i,
+                "indirect range replay dropped a command inside the range");
+        require(thirdWords[i] == 100 + i,
+                "indirect range replay did not trim the span's tail");
+    }
+    std::cout << "PASS indirect grids, indirect span ranges and stitching\n";
+}
+
 // Polls until the backend holds no allocations.
 bool awaitAllocationsReleased(const MetalBackend &backend) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1888,6 +1983,9 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            // Runs first so a RICHENGINE_MTL4 run reaches it before the
+            // swizzle-based Metal 3 tests that cannot apply there.
+            indirectAndStitchedDispatches(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
             terminalCommandRecovers(argv[1], false, true);

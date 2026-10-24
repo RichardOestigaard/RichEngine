@@ -1,8 +1,11 @@
 #include "metal/kernels/common/paged_attention_fp8_tile.h"
 
 // FP8 E4M3 verify splits: the shared page loop over native fp8 pages, with
-// fp16-staged queries and probabilities (matmul2d admits no bf16 operand
-// against fp8). The row merge is the shared reduce the other tiers use.
+// fp16-staged queries and probabilities. Re-verified on toolchain 32023 /
+// MSL 4.1: matmul2d's fp8 right operand pairs only with an f16 or
+// same-format fp8 left operand — bfloat x fp8 has no run intrinsic —
+// so the bf16 queries must still stage through half. The row merge is the
+// shared reduce the other tiers use.
 #if defined(__HAVE_METAL_FP8_E4M3_FORMAT_TYPE__)
 
 #define PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim)                    \

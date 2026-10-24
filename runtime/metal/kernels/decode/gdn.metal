@@ -610,8 +610,11 @@ inline void gdn_decode_batch_phase(
         token);
     if (table) {
       // Each group owns this head for every row; each simdgroup writes
-      // the table of the row it just gated.
-      simdgroup_barrier(mem_flags::mem_threadgroup);
+      // the table of the row it just gated. The write_row reads stay
+      // inside this simdgroup's row, so acq_rel at simdgroup scope pairs
+      // the lane-to-lane hand-off.
+      simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                        thread_scope_simdgroup);
       for (uint g = 0; g < HeadDim / 64; ++g) {
         const uint column = head * HeadDim + g * 64 + 2 * lane;
         const uint local = token * HeadDim + g * 64 + 2 * lane;
@@ -929,7 +932,10 @@ inline void gdn_decode_tree_batch_phase(
         token);
   }
   if (table) {
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    // As above: every simdgroup tables only the rows it gated itself, so
+    // the lane-to-lane publish pairs at simdgroup scope.
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
     const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
     for (uint token = simd_group; token < Rows; token += kDecodeSimdgroups) {
       for (uint g = 0; g < HeadDim / 64; ++g) {

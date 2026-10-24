@@ -485,6 +485,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::array<uint32_t, kLaneCount> maximumRetained{};
   std::array<uint32_t, kLaneCount> proposals{};
   std::array<uint32_t, kLaneCount> liveRows{};
+  std::array<uint32_t, kLaneCount> budgets{};
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
@@ -530,6 +531,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
             ? std::clamp(entry.proposalBudget,
                          std::min<uint32_t>(1, proposalCap), proposalCap)
             : proposalCap;
+    budgets[lane] = budget;
     proposals[lane] =
         std::min(budget, laneResult.maximumRetained - 1);
     liveRows[lane] = proposals[lane] + 1;
@@ -642,7 +644,22 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::RopeCosAlt, width),
         impl_->decodeArena->packed(DecodeTensor::RopeSinAlt, width));
   }
-  if (!predrafted && !draftBypassed) {
+  // RICHENGINE_DFA_SPAN_SKIP_DRAFT: a greedy lane whose GPU DFA holds a
+  // pending forced span covering its proposal budget takes every live
+  // proposal row from the span — the draft's proposal table and selector
+  // output are all overwritten (or never read past the forced prefix), and
+  // the draft's persistent rings are written only by the commit stage's
+  // context commit, which derives them from the captured target hidden, so
+  // skipping the draft forward commits no stale state. The draft pass
+  // encodes batch-wide, so it runs unless every lane qualifies.
+  bool spanSkipDraft = impl_->dfaSpanSkipDraft_;
+  for (uint32_t lane = 0; spanSkipDraft && lane < width; ++lane) {
+    const Impl::Request &entry = *entries[lane];
+    spanSkipDraft =
+        entry.dfa.has_value() && !Impl::samplingEnabled(entry) &&
+        impl_->dfaForcedSpan(entry.stateLane).tokens >= proposals[lane];
+  }
+  if (!predrafted && !draftBypassed && !spanSkipDraft) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width, 1,
                                 impl_->geometry.draft.queryRows());
@@ -650,8 +667,19 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                  {logicalPositions.data(), width});
   }
   if (constrained) {
+    // RICHENGINE_DFA_MERGE: a Full-mode batch whose lanes all carry a GPU
+    // DFA owes no host mask work — unless a host-pushed forced span is
+    // pending, which keeps the split path — so the ticket encodes draft,
+    // verify and commit as one command instead of three.
+    bool merged = impl_->dfaMergeOn_;
+    for (uint32_t lane = 0; merged && lane < width; ++lane) {
+      const Impl::Request &entry = *entries[lane];
+      if (!impl_->gpuDfaMasks(entry) || !entry.forcedTokens.empty())
+        merged = false;
+    }
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, commandGraph, std::move(completion));
+        *impl_, std::move(lanes), items, std::move(commandGraph),
+        std::move(completion), merged);
   }
   if (tree) {
     const bool skipForward = impl_->treeSkip_.find('f') != std::string::npos;
@@ -698,8 +726,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // would dispatch work whose result nothing consumes.
     if (!skipCommits && !skipDraft && !nullDraft)
       impl_->encodeDraftStateCommitBatch(commandGraph, entries, items, true);
+    impl_->encodeBatchStepPack(commandGraph, entries, items,
+                               {budgets.data(), width},
+                               ExecutionLimits::targetVerifyRows);
   } else {
-    impl_->encodeBatchVerifyInput(commandGraph, width, {liveRows.data(), width});
+    impl_->encodeBatchVerifyInput(commandGraph, entries, items, width,
+                                  {liveRows.data(), width});
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width, 1,
                                 impl_->geometry.draft.verifyRows());
@@ -712,6 +744,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                  {proposals.data(), width});
     impl_->encodeBatchGdnCommit(commandGraph, entries);
     impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
+    impl_->encodeBatchStepPack(commandGraph, entries, items,
+                               {budgets.data(), width},
+                               impl_->geometry.draft.verifyRows());
   }
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
@@ -815,9 +850,17 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
     throw std::logic_error("request is not waiting for a token mask");
   }
   const uint32_t maskWords = impl_->geometry.maskWords();
-  uint64_t expected = entry.verifyMaskInFlight
-                          ? uint64_t{kDecodeRows + 1} * maskWords
-                          : maskWords;
+  // A verify request records the row count it asked for — the lane's live
+  // verify rows plus the pre-anchor row — so the response validates against
+  // the count actually sent, not the table's full stride. A wait without a
+  // recorded count (an abandoned one, or one opened before the record)
+  // keeps the full stride.
+  const uint64_t expected =
+      entry.verifyMaskInFlight
+          ? uint64_t{entry.verifyMaskRows ? entry.verifyMaskRows
+                                         : kDecodeRows + 1} *
+                maskWords
+          : maskWords;
   // The native loop matches each response's word count to its request.
   if (words.size() != expected) {
     throw std::logic_error("token mask has the wrong word count");

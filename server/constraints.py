@@ -4,6 +4,7 @@ import array
 import json
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future, wait
 from dataclasses import dataclass
@@ -149,7 +150,11 @@ class TokenConstraint:
             self._ff_failed = True
             return ()
 
-    def commit(self, token_ids):
+    def commit(self, token_ids, *, forced=True):
+        """Consume generated tokens and return the span the grammar forces
+        next. `forced=False` keeps every bookkeeping effect — the pending
+        batch and the fast-forward matcher's position — but skips computing
+        a span the caller is going to discard."""
         if any(not 0 <= token < self.vocabulary for token in token_ids):
             raise ConstraintError("generated token is out of range")
         with self._lock:
@@ -159,7 +164,7 @@ class TokenConstraint:
                     self._ff_matcher.consume_tokens(list(token_ids))
                 except Exception:
                     self._ff_failed = True
-            return self.forced_tokens()
+            return self.forced_tokens() if forced else ()
 
     def finish(self):
         """Checks the tokens generated after the last mask."""
@@ -295,6 +300,24 @@ def _vocab_token_bytes(tokenizer, vocabulary):
     return tuple(out)
 
 
+# RICHENGINE_DFA_MASK_CACHE opts DfaConstraint.masks into serving rows a
+# per-state LRU instead of the delegate matcher. The rows come from
+# CompiledDfa.masks_for_state — a pure-Python walk of the whole vocabulary
+# that costs far more per miss than the matcher's mask (the reason the
+# no-delegate path is documented as too slow to serve traffic) — so the
+# flag is a measurement path, not a serving one: the constraint's
+# mask_stats() records what hits save and what misses cost.
+_MASK_ROW_CACHE_SIZE = 512
+# (id(dfa), state) -> (dfa, allowed ids). The stored reference pins the
+# compiled DFA, so an id freed and reused can never alias a stale row.
+_mask_row_cache = OrderedDict()
+_mask_row_cache_lock = threading.Lock()
+
+
+def _mask_cache_enabled():
+    return bool(os.environ.get("RICHENGINE_DFA_MASK_CACHE"))
+
+
 class DfaConstraint:
     """A TokenConstraint-shaped constraint backed by a compiled byte DFA.
 
@@ -328,6 +351,13 @@ class DfaConstraint:
         self._initial_mask = None
         self._lock = threading.Lock()
         self._committed: list[tuple[int, ...]] = []
+        # RICHENGINE_DFA_MASK_CACHE counters; see _mask_row_cache above.
+        self._mask_timing = {
+            "cached_rows": 0,
+            "computed_rows": 0,
+            "compute_ms_total": 0.0,
+            "delegate_fallbacks": 0,
+        }
 
     def _advance(self, state, token_id):
         return self.dfa.advance_token(
@@ -360,22 +390,27 @@ class DfaConstraint:
             return self._inner.forced_tokens()
         return tokens
 
-    def commit(self, token_ids):
+    def commit(self, token_ids, *, forced=True):
+        """Consume generated tokens and return the forced span at the mirror
+        position, like TokenConstraint.commit. `forced=False` — a GPU-DFA
+        mode whose engine derives the span itself — skips the mirror's
+        encode-and-validate answer while the delegate and the mirror still
+        advance."""
         if any(not 0 <= token < self.vocabulary for token in token_ids):
             raise ConstraintError("generated token is out of range")
         # The delegate consumes the same tokens for its mask bookkeeping;
         # its own forced-token answer is superseded by the DFA mirror's.
         if self._inner is not None:
-            self._inner.commit(token_ids)
+            self._inner.commit(token_ids, forced=forced)
         with self._lock:
-            if self._inner is None:
+            if self._inner is None or _mask_cache_enabled():
                 self._committed.append(tuple(token_ids))
             if not self._ff_failed:
                 try:
                     self._advance_mirror(token_ids)
                 except Exception:
                     self._ff_failed = True
-            return self.forced_tokens()
+            return self.forced_tokens() if forced else ()
 
     def _foreign_stop(self, state, token_id):
         """A special token the DFA cannot consume at an EOS-admitting state:
@@ -416,6 +451,8 @@ class DfaConstraint:
 
     def masks(self, simulation_tokens):
         if self._inner is not None:
+            if _mask_cache_enabled():
+                return self._cached_masks(simulation_tokens)
             return self._inner.masks(simulation_tokens)
         self._consume_committed()
         if (
@@ -457,6 +494,72 @@ class DfaConstraint:
         if len(states) < rows:
             mask[len(states) * words :] = mask[(len(states) - 1) * words : len(states) * words]
         return mask.tobytes()
+
+    def _cached_masks(self, simulation_tokens):
+        """The RICHENGINE_DFA_MASK_CACHE path: the same rows the no-delegate
+        branch computes, through the per-state LRU, with the delegate's mask
+        as the answer for a state the DFA walk cannot cover."""
+        if len(simulation_tokens) >= self.MAX_ROWS:
+            raise ConstraintError("too many simulation tokens")
+        self._consume_committed()
+        rows = len(simulation_tokens) + 1
+        words = self._words
+        mask = array.array("I", [0] * (rows * words))
+        states = [self._state]
+        cursor = self._state
+        for token_id in simulation_tokens:
+            if not 0 <= token_id < self.vocabulary:
+                break
+            cursor = self._advance(cursor, token_id)
+            if cursor < 0:
+                break
+            states.append(cursor)
+        for row in range(len(states)):
+            allowed = self._mask_row(states[row])
+            if not allowed:
+                # A state the DFA has no row for — a stopped request, or an
+                # empty row — is the delegate's question to answer anyway.
+                self._mask_timing["delegate_fallbacks"] += 1
+                return self._inner.masks(simulation_tokens)
+            base = row * words
+            for token_id in allowed:
+                mask[base + (token_id >> 5)] |= 1 << (token_id & 31)
+        if len(states) < rows:
+            mask[len(states) * words :] = mask[(len(states) - 1) * words : len(states) * words]
+        return mask.tobytes()
+
+    def _mask_row(self, state):
+        """One state's sorted allowed-token ids, LRU-cached per compiled
+        DFA; None for the stopped state the table has no row for."""
+        if state >= self.dfa.n_states:
+            return None
+        key = (id(self.dfa), state)
+        with _mask_row_cache_lock:
+            entry = _mask_row_cache.get(key)
+            if entry is not None:
+                _mask_row_cache.move_to_end(key)
+        if entry is not None:
+            self._mask_timing["cached_rows"] += 1
+            return entry[1]
+        started = time.perf_counter()
+        allowed = tuple(
+            self.dfa.masks_for_state(
+                state, self.vocab_tokens, self._eos, self.special_tokens
+            )
+        )
+        timing = self._mask_timing
+        timing["computed_rows"] += 1
+        timing["compute_ms_total"] += (time.perf_counter() - started) * 1000.0
+        with _mask_row_cache_lock:
+            _mask_row_cache[key] = (self.dfa, allowed)
+            _mask_row_cache.move_to_end(key)
+            while len(_mask_row_cache) > _MASK_ROW_CACHE_SIZE:
+                _mask_row_cache.popitem(last=False)
+        return allowed
+
+    def mask_stats(self):
+        """A copy of the RICHENGINE_DFA_MASK_CACHE counters."""
+        return dict(self._mask_timing)
 
     def _consume_committed(self):
         with self._lock:

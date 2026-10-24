@@ -84,7 +84,62 @@ management, and per-device kernel autotuning.
   plans) replacing hardcoded shape-match overrides. `Linear.cpp` and
   `LinearGguf.cpp` shrank accordingly.
 
-## 7. Misc
+## 8. Metal 4.1 decode pathways
+
+Opt-in Metal 4.1 surface for decode. All flags default off; all verified
+byte-exact (identical `output_token_hash` and acceptance rates) in ABBA
+decode runs on MiniCPM5-2B-MLX, Ornith-1.5-9B-MLX-4bit and
+Qwen3.8-27B-4bit.
+
+- `ComputeDispatch::indirectGrid` / `indirectRange`
+  (`MetalBackend.hpp`, `CommandGraph::addIndirect`/`setIndirectRange`,
+  `MetalEncode.mm` both encoders) — GPU-written
+  `MTLDispatchThreadgroupsIndirectArguments` launch sizes and
+  `MTLIndirectCommandBufferExecutionRange` span replay ranges.
+  Substrate for device-driven decode; `decode_dfa_mask` is the first
+  consumer under `RICHENGINE_GPU_DECODE_GRID` (`decode_dfa_mask_grid`
+  kernel writes the grid, consuming `DfaForcedSpan` on-device).
+- `commit4` handles `EventStep` commands — queue-level
+  `signalEvent:`/`waitForEvent:` splits with per-commit
+  `MTL4CommitFeedback` merged via `SplitFeedback4`; event-bearing commands
+  no longer fall back to the Metal 3 encoder.
+- GPU-encoded spans replay on the MTL4 path (`gpu_encode` +
+  `executeCommandsInBuffer` through the argument table) — previously a
+  silent scalar-encode no-op under `RICHENGINE_MTL4`.
+- Pipeline-name grammar (`MetalEncode.mm` `newSpecializedPipeline`):
+  `kernel[hook=impl:arity]` binds `[[stitchable]]` call sites via
+  `MTLStitchedLibraryDescriptor` + `linkedFunctions.privateFunctions`
+  (MTL3) / `MTL4Compiler` + `MTL4StaticLinkingDescriptor` (MTL4);
+  `kernel|persistent,fp=weak|fp=simd,relief=none` sets
+  `MTL4ComputePipelineDescriptor` options through `MTL4Compiler`.
+- `gdn.metal` intra-simdgroup barriers narrowed to
+  `memory_order_acq_rel` + `thread_scope_simdgroup`.
+- `split_reduce.h` gained an MSL 4.1 atomic wait/notify merge (first
+  arriver parks, last arriver notifies) — opt-in
+  `-DRICHENGINE_SPLIT_WAIT_NOTIFY`; this device rejects
+  SIMDGroupParallelForwardProgress at pipeline creation so it stays off.
+- `decode_step_pack` kernel + `verify_input_tokens_dev`: pack kernel
+  writes next-step `anchor`/`live_rows`/`position_base`/`cache_length`
+  from `RetainedCount`/`AcceptedCount`/`OutputTokens`; verify-input
+  tokens bind the pack buffer when provably identical to the staged
+  payload. Opt-in `RICHENGINE_DEVICE_VERIFY_PARAMS`.
+- `Engine.cpp` depth-2 decode submission ring behind
+  `RICHENGINE_DECODE_RING2`: `trySubmitAheadDecode` plans and submits the
+  next decode before the retiring plan's `apply()`, overlapping the host
+  turnaround with the ahead command's GPU execution.
+- GGUF Q2_K native packed tile (`common/q2k_mpp_tile.h`,
+  `decode/linear_gguf_q2k_sgmatrix.metal`, `gguf_decode_q2km_*`): matmul2d
+  on `uint2b_format` packed data instead of staged dequant; routed under
+  `nativeFormats()` + `RICHENGINE_GGUF_PACKED_ON` like its siblings.
+- `dev/benchmarks/mtl4_benchmark.mm` — three-graph (direct/icb/gpuspan)
+  A/B harness; `--compare` re-execs both encoder paths and prints the
+  delta table.
+- Verified non-starters on toolchain 32023 / Apple family 10 (recorded in
+  `UNTAPPED_POTENTIAL.md`): `bf16 × fp8` matmul2d operands (no intrinsic
+  — fp8 right operands pair only with half or same-format fp8) and
+  `resetCommandsInBuffer:` (the replay path never rewrites commands).
+
+## 9. Misc
 
 - `model/NgramIndex.hpp` — n-gram predraft logic extracted into a pure,
   testable header.

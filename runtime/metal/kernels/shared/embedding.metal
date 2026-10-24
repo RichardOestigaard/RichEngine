@@ -340,6 +340,43 @@ kernel void verify_input_tokens(
   verify_input[index] = min(token, params.vocabulary - 1u);
 }
 
+// The RICHENGINE_DEVICE_VERIFY_PARAMS variant: the anchor and live-row
+// count come from the step pack the previous step's decode_step_pack
+// wrote out of the acceptance results, so the encode needs no host
+// readback. A lane takes the device fields only when the pack proves to
+// be its own predecessor's — a matching nonzero request id and, unless
+// device_lanes trusts it, a position and live-row count equal to the
+// staged payload's. Anything else falls back to the staged values, so
+// the emitted tokens are identical either way.
+kernel void verify_input_tokens_dev(
+    device const uint *draft_input [[buffer(0)]],
+    device const uint *draft_tokens [[buffer(1)]],
+    device uint *verify_input [[buffer(2)]],
+    device const DecodeStepPackLane *step_pack [[buffer(3)]],
+    constant VerifyInputDeviceParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+  uint batch = index / params.verify.verify_stride;
+  uint row = index % params.verify.verify_stride;
+  const device DecodeStepPackLane &pack = step_pack[batch];
+  const bool own = pack.request_id != 0 &&
+                   pack.request_id == params.request_id[batch];
+  const bool proven =
+      pack.position_base == params.position_base[batch] &&
+      pack.live_rows == params.verify.live_rows[batch];
+  const bool device_side =
+      own && ((params.device_lanes & (1u << batch)) || proven);
+  const uint anchor =
+      device_side ? pack.anchor
+                  : draft_input[batch * params.verify.draft_stride];
+  const uint live =
+      device_side ? pack.live_rows : params.verify.live_rows[batch];
+  uint token = row == 0 || row >= live
+                   ? anchor
+                   : draft_tokens[batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS +
+                                  row - 1];
+  verify_input[index] = min(token, params.verify.vocabulary - 1u);
+}
+
 // A tree-verify step's inputs, RICHENGINE_TREE_VERIFY_NODES per lane: each live
 // node's token from draft_select_tree's tables, its rope position (the
 // lane's base triple plus the node's depth) and the ancestor bitmask the

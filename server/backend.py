@@ -901,13 +901,15 @@ class NativeBackend:
             if event.sequence_offset == 0:
                 state.first_token_batch_tokens = len(event.tokens)
             if job.constraint is not None:
-                forced = job.constraint.commit(event.tokens)
-                if (
-                    forced
-                    and state.call is not None
-                    and self._pushes_forced(job.constraint)
-                ):
-                    state.call.send_forced_tokens(forced)
+                if self._pushes_forced(job.constraint):
+                    forced = job.constraint.commit(event.tokens)
+                    if forced and state.call is not None:
+                        state.call.send_forced_tokens(forced)
+                else:
+                    # A GPU-DFA mode derives the span on-device: the commit
+                    # still advances the constraint, but the forced-token
+                    # answer it would compute is discarded — skip it.
+                    job.constraint.commit(event.tokens, forced=False)
             state.streamer.put_tokens(event.tokens)
 
     def _remember_reply(self, job, streamer):

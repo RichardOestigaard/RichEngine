@@ -53,7 +53,8 @@ const char *kernelFormat(const DevicePolicy &device, const QuantizedSegment &s) 
 // 0.25 staged; 16 rows 0.23 vs 0.32; 32 rows 0.41 vs 0.34 — kMxfp4Tiers
 // picks the splits it wins by).
 // The formats with a packed-operand decode kernel (`<f>m`, the
-// gguf_decode_packed instantiations of shared/gguf_linear.metal) on Apple
+// gguf_decode_packed instantiations of shared/gguf_linear.metal and Q2_K's
+// of decode/linear_gguf_q2k_sgmatrix.metal) on Apple
 // GPU family 10 and up. Measured 2.5-4x slower than the staged decode at
 // every row count and split (see the tile's comment in
 // kernels/common/gguf_mxfp4_tile.h), so decodeFormat keeps them for
@@ -65,6 +66,7 @@ const char *packedFormat(uint32_t formatId) noexcept {
   case GGUF_FMT_Q4K: return "q4km";
   case GGUF_FMT_Q80: return "q80m";
   case GGUF_FMT_PQ20: return "pq20m";
+  case GGUF_FMT_Q2K: return "q2km";
   default: return nullptr;
   }
 }

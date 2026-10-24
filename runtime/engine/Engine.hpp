@@ -378,6 +378,15 @@ private:
   // rules allow it: a prefill plan behind an in-flight prefill, with the
   // model holding a free host-input bank for it.
   [[nodiscard]] bool trySubmitAhead(double now);
+  // Commits the next decode command while apply() retires the one whose
+  // ticket just drained: the anchors and state lengths it needs were
+  // committed by the ticket's wait(), so the command is correct once the
+  // lanes that end are left out. Only a regular, unconstrained decode behind
+  // such a decode qualifies.
+  [[nodiscard]] bool
+  trySubmitAheadDecode(const Pending &retired,
+                       std::span<const ModelStepResult> results,
+                       double nowMilliseconds);
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the

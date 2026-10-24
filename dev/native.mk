@@ -140,6 +140,7 @@ TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_GGUF_DECODE_SWEEP := $(ENGINE_TEST_BUILD)/gguf-decode-sweep
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
+TEST_DFA_BENCHMARK := $(ENGINE_TEST_BUILD)/dfa-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
@@ -188,6 +189,7 @@ TEST_Q8_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/q8-attention.metallib
 TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_HANDOFF_TEST := $(ENGINE_TEST_BUILD)/handoff
 TEST_METAL_BACKEND_AIR := $(ENGINE_TEST_BUILD)/metal-backend.air
+TEST_GPU_DISPATCH_AIR := $(ENGINE_TEST_BUILD)/kernels/shared/gpu_dispatch.air
 TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 TEST_PRODUCTION_LIB := $(ENGINE_TEST_BUILD)/production-and-test.metallib
 
@@ -283,7 +285,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
-	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS) $(WEIGHT_DIGESTS)
+	$(TEST_BACKEND_BENCHMARK) $(TEST_DFA_BENCHMARK) $(TUNE_KERNELS) $(WEIGHT_DIGESTS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN) \
@@ -743,7 +745,11 @@ $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
 
-$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
+# gpu_dispatch.metal joins the test library so the GPU-encoded span path
+# (RICHENGINE_GPU_SPANS) can encode through gpu_encode in backend tests and
+# the mtl4 benchmark's gpuspan graph; the kernels/%.air pattern rule builds it.
+$(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR) \
+		$(TEST_GPU_DISPATCH_AIR)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
 # The production kernels and the test kernels of metal_backend_test.metal in
@@ -814,6 +820,13 @@ $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 
 $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		dev/benchmarks/PrefillWork.hpp \
+		$(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER) \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -include $(BUILD_ID_HEADER) $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_DFA_BENCHMARK): dev/benchmarks/dfa_benchmark.mm \
 		$(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER) \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -include $(BUILD_ID_HEADER) $< \
@@ -961,7 +974,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)"
 
-.PHONY: benchmark-prefill benchmark-decode benchmark-backend \
+.PHONY: benchmark-prefill benchmark-decode benchmark-backend benchmark-dfa \
 	benchmark-decode-profile benchmark-attention-sweep \
 	benchmark-gguf-projection benchmark-gguf-moe
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
@@ -997,6 +1010,20 @@ benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"
+
+# Real constrained decode through the engine's host-mask and GPU-DFA paths:
+# dfa_pack.py writes the packed vocabulary, a production-compiled byte-DFA
+# for a tool-call-style JSON schema, and a tokenized prompt; the benchmark
+# then runs unconstrained/mask/mask-forced/dfa scenarios, reporting
+# wall/GPU time and the DFA counters per run. A/B the GPU flags with
+# RICHENGINE_DFA_MODE=forced|full (and _MERGE/_SPAN_SKIP_DRAFT); the pack's
+# DFA mirror answers MASK_REQUESTs the way the server does.
+DFA_BENCH_PACK := $(BUILD)/dfa-bench.pack
+.PHONY: benchmark-dfa
+benchmark-dfa: preflight $(TARGET) $(TEST_DFA_BENCHMARK) $(LIB)
+	$(PYTHON) dev/benchmarks/dfa_pack.py "$(MODEL_ROOT)" $(DFA_BENCH_PACK)
+	$(TEST_DFA_BENCHMARK) $(LIB) "$(MODEL_ROOT)" --pack $(DFA_BENCH_PACK) \
+		$(DFA_BENCHMARK_ARGS)
 
 # Metal 3 against Metal 4 submission encode cost on a decode-shaped graph of
 # small dispatches; MTL4_BENCHMARK_ARGS passes [dispatches] [rounds].

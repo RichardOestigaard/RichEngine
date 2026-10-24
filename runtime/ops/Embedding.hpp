@@ -32,6 +32,23 @@ public:
                              uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
                              uint32_t draftStride = RICHENGINE_DRAFT_QUERY_ROWS,
                              std::span<const uint32_t> liveRows = {});
+  // The RICHENGINE_DEVICE_VERIFY_PARAMS variant (verify_input_tokens_dev):
+  // the step pack decode_step_pack wrote from the previous step's
+  // acceptance results rides as a buffer binding, and each lane takes its
+  // anchor and live count from it when the pack proves to be the lane's
+  // own predecessor's (matching request id and — unless the lane is in
+  // `deviceLanes` — matching position and live rows against the staged
+  // payload). `requestIds` and `positionBases` carry the host's values for
+  // that proof, one entry per lane.
+  static void addVerifyInputDevice(
+      metal::CommandGraph &graph, metal::MetalBuffer draftInputTokens,
+      metal::MetalBuffer proposedTokens, metal::MetalBuffer verifyInputTokens,
+      metal::MetalBuffer stepPack, std::span<const uint64_t> requestIds,
+      std::span<const uint32_t> positionBases, uint32_t deviceLanes,
+      uint32_t vocabulary, uint32_t lanes,
+      uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+      uint32_t draftStride = RICHENGINE_DRAFT_QUERY_ROWS,
+      std::span<const uint32_t> liveRows = {});
   // A tree-verify step's inputs, RICHENGINE_TREE_VERIFY_NODES per lane: each
   // node's token, its (t, h, w) rope position (the lane's base triple plus
   // the node's depth) and its ancestor bitmask, from draft_select_tree's

@@ -121,3 +121,39 @@ struct DfaTruncParams {
 
 static_assert(sizeof(DfaTruncParams) == 40,
               "DFA truncation parameters are 40 bytes on both sides");
+
+// Per-dispatch scalars of decode_dfa_mask_grid, the RICHENGINE_GPU_DECODE_GRID
+// companion of decode_dfa_mask: the single-thread kernel packs the mask
+// pass's MTLDispatchThreadgroupsIndirectArguments — {vocabulary_groups,
+// rows, lanes} — while consuming the GPU forced spans of the lanes
+// gpu_span_lanes names (a span indexes its state lane). live_rows is the
+// host's per-lane live verify-row bound, the span-free fallback a lane
+// takes when its span was already consumed or cleared; maximum_retained
+// caps a span's row count exactly as the host's forced-span derivation
+// does.
+struct DfaMaskGridParams {
+  uint32_t vocabulary_groups;
+  uint32_t lanes;
+  uint32_t gpu_span_lanes;
+  uint32_t state_lanes[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t maximum_retained[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(DfaMaskGridParams) == 60,
+              "DFA mask grid parameters are 60 bytes on both sides");
+
+// Per-dispatch scalars of decode_dfa_span_apply, the
+// RICHENGINE_DFA_MERGE bridge between the draft pass and the verify input
+// of the same command: each named lane copies its state lane's pending
+// DfaForcedSpan proposals over the draft's own — capped exactly as the
+// split path's host apply — and clears the span so a later round cannot
+// reapply it.
+struct DfaSpanApplyParams {
+  uint32_t lane_mask;
+  uint32_t state_lanes[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t maximum_retained[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(DfaSpanApplyParams) == 36,
+              "DFA span-apply parameters are 36 bytes on both sides");

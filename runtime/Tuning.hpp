@@ -33,10 +33,30 @@ struct Tuning {
   bool prefillFastInt8 = false; // RICHENGINE_PREFILL_FAST_INT8 (presence)
   // metal/MetalEncode.mm
   bool icbOff = false;          // RICHENGINE_ICB_OFF (presence)
-  bool mtl4 = false;            // RICHENGINE_MTL4 (presence)
+  bool mtl4 = false;            // RICHENGINE_MTL4_OFF disables (default on)
   bool preparedCacheOff = false; // RICHENGINE_PREPARED_CACHE_OFF (presence)
   bool opTimings = false;       // RICHENGINE_OP_TIMINGS=1
   bool gpuSpans = false;        // RICHENGINE_GPU_SPANS (presence)
+  // model/RuntimeEncodeVerify.mm: the verify round's GPU-DFA mask pass
+  // launches through an indirect grid written on-device by
+  // decode_dfa_mask_grid, which also consumes the lanes' GPU forced spans.
+  bool gpuDecodeGrid = false;   // RICHENGINE_GPU_DECODE_GRID_OFF disables (default on)
+  // model/RuntimeEncodeVerify.mm: decode_step_pack mirrors each lane's
+  // acceptance output into a device params block the next step's
+  // verify-input pass binds for its anchor and live rows — the encode
+  // carries no host-readback dependency on the previous step.
+  bool deviceVerifyParams = false; // RICHENGINE_DEVICE_VERIFY_PARAMS_OFF disables (default on)
+  // model/RuntimeImpl.hpp: a Full-mode constrained batch whose lanes all
+  // carry a GPU DFA and owe no host-pushed forced span encodes draft,
+  // verify and commit as one command — decode_dfa_span_apply moves the
+  // forced-span patch on-device and the WaitingMask stage never opens.
+  // Unset keeps the three-command split.
+  bool dfaMerge = false;          // RICHENGINE_DFA_MERGE_OFF disables (default on)
+  // model/Runtime.mm: a greedy DFA lane whose pending GPU forced span
+  // covers its whole proposal budget takes every live proposal row from
+  // the span, so when every lane of a batch qualifies the draft embedding
+  // and forward encode nothing the verify stage reads and are skipped.
+  bool dfaSpanSkipDraft = false;  // RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF disables (default on)
   // metal/CommandGraph.hpp
   bool patchableOff = false;    // RICHENGINE_PATCHABLE_OFF (presence)
   // model/TargetModelGemma.cpp
@@ -103,6 +123,7 @@ struct Tuning {
   // model/*.mm files outside the conversion scope and still read the
   // environment directly.
   bool submitAhead = false;         // RICHENGINE_SUBMIT_AHEAD — engine/Engine.cpp
+  bool decodeRing2 = false;         // RICHENGINE_DECODE_RING2_OFF disables (default on) — engine/Engine.cpp
   bool decodeTiming = false;        // RICHENGINE_DECODE_TIMING — model/Runtime.mm
   bool headFusedOff = false;        // RICHENGINE_HEAD_FUSED_OFF — model/RuntimeEncode.mm
   bool proposalCapSet = false;      // RICHENGINE_PROPOSAL_CAP (presence) — model/Runtime.mm
@@ -153,10 +174,15 @@ inline Tuning makeTuning() {
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
   t.prefillFastInt8 = envFlag("RICHENGINE_PREFILL_FAST_INT8");
   t.icbOff = envFlag("RICHENGINE_ICB_OFF");
-  t.mtl4 = envFlag("RICHENGINE_MTL4");
+  // A/B-measured winners default on; the *_OFF flag is the escape hatch.
+  t.mtl4 = !envFlag("RICHENGINE_MTL4_OFF");
   t.preparedCacheOff = envFlag("RICHENGINE_PREPARED_CACHE_OFF");
   t.opTimings = envFlagOn("RICHENGINE_OP_TIMINGS");
   t.gpuSpans = envFlag("RICHENGINE_GPU_SPANS");
+  t.gpuDecodeGrid = !envFlag("RICHENGINE_GPU_DECODE_GRID_OFF");
+  t.deviceVerifyParams = !envFlag("RICHENGINE_DEVICE_VERIFY_PARAMS_OFF");
+  t.dfaMerge = !envFlag("RICHENGINE_DFA_MERGE_OFF");
+  t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");
@@ -225,6 +251,7 @@ inline Tuning makeTuning() {
   t.dflashPoolSet = envFlag("RICHENGINE_DFLASH_POOL");
   t.dflashPool = envFlagOn("RICHENGINE_DFLASH_POOL");
   t.submitAhead = envFlag("RICHENGINE_SUBMIT_AHEAD");
+  t.decodeRing2 = !envFlag("RICHENGINE_DECODE_RING2_OFF");
   t.decodeTiming = envFlag("RICHENGINE_DECODE_TIMING");
   t.headFusedOff = envFlag("RICHENGINE_HEAD_FUSED_OFF");
   t.proposalCapSet = envFlag("RICHENGINE_PROPOSAL_CAP");
