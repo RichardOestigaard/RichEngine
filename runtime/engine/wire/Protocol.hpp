@@ -33,6 +33,9 @@ enum class FrameType : uint16_t {
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  ForcedTokens = 0x0005,
+  ConstraintDfa = 0x0006,
+  Vocabulary = 0x0007,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -187,6 +190,13 @@ struct RequestFrame {
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
 //                  u32 count, u32 simulation tokens
+//   ConstraintDfa  u64 requestId, u32 nStates, u32 flags,
+//                  i16 table[nStates*256], u8 accepting[ceil(nStates/8)],
+//                  u32 eosCount, u32 eosIds[eosCount],
+//                  u32 markerBytes, u8 marker[nStates*32]
+//   Vocabulary     u32 vocab, u32 token byte count, u8 token bytes,
+//                  i32 offsets[vocab + 1],
+//                  u32 specBitsBytes, u8 specBits[ceil(vocab/8)]
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
 //                  u64 wallMicros, u32 count, f32 option logits
@@ -211,6 +221,47 @@ struct StatusRequestFrame {
   uint64_t correlationId = 0;
 
   bool operator==(const StatusRequestFrame &) const = default;
+};
+
+// Grammar-forced tokens the constraint computed at the last committed
+// position: tokens[0] sits where the lane's pending anchor does, so the span
+// applies only while they are equal. The rest verify under their masks.
+struct ForcedTokensFrame {
+  uint64_t requestId = 0;
+  std::vector<uint32_t> tokens;
+
+  bool operator==(const ForcedTokensFrame &) const = default;
+};
+
+// A compiled byte-DFA for one request's grammar: while the engine holds it,
+// decode computes the lane's masks on the GPU (kernels/decode/dfa.metal)
+// and no MaskRequest event goes out. The table is row-major Q x 256 with
+// -1 for a dead transition (the host prunes edges that cannot reach an
+// accepting state, so a non-dead end always stays live). accepting is the
+// EOS-admitting bitset — the grammar's accepting ∪ free-text states;
+// eosIds is its grammar-EOS set (≤ 8 ids); marker is 32 bytes per state,
+// bit b of state s marking edge (s, b) special-only.
+struct ConstraintDfaFrame {
+  uint64_t requestId = 0;
+  std::vector<int16_t> table;
+  std::vector<uint8_t> accepting;
+  std::vector<uint32_t> eosIds;
+  std::vector<uint8_t> marker;
+
+  bool operator==(const ConstraintDfaFrame &) const = default;
+};
+
+// The packed token vocabulary the DFA walk kernels index: the bytes of
+// every vocabulary token behind vocab + 1 prefix offsets; equal offsets
+// mark a dead token the mask never admits; specBits bit t names token t
+// special for the marker rule. Process-wide: applies to every request
+// after it, and is resent after an engine restart.
+struct VocabularyFrame {
+  std::vector<uint8_t> tokenBytes;
+  std::vector<int32_t> tokenOffsets;
+  std::vector<uint8_t> specialBits;
+
+  bool operator==(const VocabularyFrame &) const = default;
 };
 
 struct ReadyEvent {
@@ -295,8 +346,10 @@ struct StatusJsonEvent {
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
-using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame>;
+using ClientMessage =
+    std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
+                 StatusRequestFrame, ForcedTokensFrame, ConstraintDfaFrame,
+                 VocabularyFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;

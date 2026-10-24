@@ -121,14 +121,16 @@ public:
            Conversion::NarrowToBfloat16);
   }
 
-  // LFM2's conv kernel F32, as the exact bf16 values the conv kernel
-  // reads, in the stored channel-major [channels, taps] order.
+  // LFM2's conv kernel F32, as the bf16 values the conv kernel reads, in
+  // the stored channel-major [channels, taps] order. The taps are a few
+  // thousand values: rounding them is how every serving stack loads the
+  // QAD builds, whose distilled F32 taps do not narrow exactly.
   void convTaps(const std::string &name) {
     const uint32_t channels = geometry_.convolutionDimension;
     const uint64_t taps = geometry_.convolutionTaps ? geometry_.convolutionTaps : kGdnConvolutionTaps;
     if (const GgufTensor *tensor = floatVector(name, channels * taps))
       copy(tensorRows(*tensor, taps, tensor->bytes / taps),
-           Conversion::NarrowToBfloat16);
+           Conversion::RoundToBfloat16);
   }
 
   // A per value head F32 vector in grouped head order: as stored, or as the
@@ -202,7 +204,7 @@ private:
 
   // Rows written as stored, or narrowed to bf16, into their own section.
   void copy(TensorRows source, Conversion conversion = Conversion::None) {
-    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 ? 2 : 1);
+    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 || conversion == Conversion::RoundToBfloat16 ? 2 : 1);
     image_.copies.push_back({section(bytes), std::move(source), conversion});
   }
 

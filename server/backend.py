@@ -12,7 +12,7 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec
 from . import protocol as wire
 from . import runtime as engine_runtime
-from .constraints import TokenConstraint
+from .constraints import DfaConstraint, TokenConstraint, dfa_mode
 from .diagnostics import log_unexpected, print_status
 from .errors import APIError, ConstraintError
 from .latency import RequestLatency
@@ -134,6 +134,9 @@ class Job:
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
     latency: RequestLatency | None = None
+    # The PromptTokenizer remembering emitted reply ids for later prompts;
+    # None where the request cannot record one.
+    reply_memory: object | None = None
 
     @property
     def may_call_tools(self):
@@ -233,18 +236,18 @@ class CallbackStreamer:
                 if self.stop_sequence is not None:
                     break
 
-    def _decode_all(self):
-        """The whole output as text, keeping the special tokens the output
-        parser needs while other specials stay skipped."""
+    def _decode(self, token_ids):
+        """`token_ids` as text, keeping the special tokens the output parser
+        needs while other specials stay skipped."""
         keep = self.visible_token_ids
         if not keep:
             return self.tokenizer.decode(
-                self.token_ids,
+                token_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
         parts, run = [], []
-        for token_id in self.token_ids:
+        for token_id in token_ids:
             if token_id in keep:
                 if run:
                     parts.append(self.tokenizer.decode(run, skip_special_tokens=True))
@@ -257,6 +260,11 @@ class CallbackStreamer:
         if run:
             parts.append(self.tokenizer.decode(run, skip_special_tokens=True))
         return "".join(parts)
+
+    def _decode_all(self):
+        """The whole output as text, keeping the special tokens the output
+        parser needs while other specials stay skipped."""
+        return self._decode(self.token_ids)
 
     def end(self):
         if self.stop_sequence is not None:
@@ -364,6 +372,9 @@ class NativeBackend:
         self.refresh_due = False
         self.failures = 0
         self.fatal_error = None
+        # The runtime generation the vocabulary frame was last sent to; the
+        # engine's DFA masks need it once per engine process.
+        self._vocab_generation = 0
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
         # Why the engine cannot serve: its failure, the last failed restart or
@@ -640,6 +651,8 @@ class NativeBackend:
         if stale_error is not None:
             snapshot["transport"]["error"] = engine_error or str(stale_error)
         snapshot["masks"] = self.runtime.mask_stats()
+        # Host-side forced-span pushes join the engine's forced counters.
+        snapshot.setdefault("forced", {}).update(self.runtime.forced_stats())
         if not transport_ready:
             snapshot["ready"] = False
         return snapshot
@@ -765,6 +778,14 @@ class NativeBackend:
             call = self.runtime.submit(
                 request, on_event=on_event, on_complete=on_complete
             )
+            if isinstance(job.constraint, DfaConstraint):
+                self._send_constraint_dfa(call, job.constraint)
+            if job.constraint is not None and self._pushes_forced(
+                job.constraint
+            ):
+                forced = job.constraint.forced_tokens()
+                if forced:
+                    call.send_forced_tokens(forced)
             with self.lock:
                 if not state.detached:
                     state.call = call
@@ -785,6 +806,65 @@ class NativeBackend:
                     # Not admitted: refused as a request arriving now would be.
                     refusal = self.refusal()
                 job.events.put(("error", refusal or self._api_error(error)))
+
+    @staticmethod
+    def _pushes_forced(constraint):
+        """Whether the host pushes this constraint's forced-token spans. A
+        GPU-DFA mode derives a DfaConstraint's span on-device, where a host
+        push would only race it; every other constraint needs the push."""
+        return not isinstance(constraint, DfaConstraint) or dfa_mode() == "off"
+
+    def _send_constraint_dfa(self, call, constraint):
+        """Ship the vocabulary (once per engine generation) then the request's
+        constraint DFA. Stream order is what makes the pair safe: both write
+        through the call's client before the engine can mask the request."""
+        with self.lock:
+            vocab_due = self._vocab_generation != call.generation
+            if vocab_due:
+                self._vocab_generation = call.generation
+        client = call._client
+        if vocab_due:
+            client._write_bytes(
+                wire.serialize_message(
+                    wire.VocabularyFrame(
+                        constraint.vocab_tokens,
+                        tuple(sorted(constraint.special_tokens)),
+                    )
+                ),
+                call.generation,
+                call=call,
+            )
+        # The wire's eos set is the grammar's — the contract's eos ids, not
+        # the engine's own stop tokens; past the frame's limit the host-mask
+        # path serves the request instead.
+        if len(constraint.eos_tokens) > 8:
+            logger.info(
+                "constraint dfa skipped: %d grammar eos ids over frame limit",
+                len(constraint.eos_tokens),
+            )
+            return
+        compiled = constraint.dfa
+        # The frame's accepting bitset is the set of EOS-admitting states:
+        # the DFA's accepting states plus its free-text states, where the
+        # grammar also lets the model stop mid-token-stream.
+        eos_states = bytes(
+            acc | ok for acc, ok in zip(compiled.accepting, compiled.eos_ok)
+        )
+        marker = b"".join(m.to_bytes(32, "little") for m in compiled.marker)
+        client._write_bytes(
+            wire.serialize_message(
+                wire.ConstraintDfaFrame(
+                    call.request_id,
+                    compiled.n_states,
+                    compiled.table,
+                    eos_states,
+                    tuple(constraint.eos_tokens),
+                    marker,
+                )
+            ),
+            call.generation,
+            call=call,
+        )
 
     def _detach_locked(self, state):
         state.detach()
@@ -821,8 +901,42 @@ class NativeBackend:
             if event.sequence_offset == 0:
                 state.first_token_batch_tokens = len(event.tokens)
             if job.constraint is not None:
-                job.constraint.commit(event.tokens)
+                forced = job.constraint.commit(event.tokens)
+                if (
+                    forced
+                    and state.call is not None
+                    and self._pushes_forced(job.constraint)
+                ):
+                    state.call.send_forced_tokens(forced)
             state.streamer.put_tokens(event.tokens)
+
+    def _remember_reply(self, job, streamer):
+        """Hand the job's reply memory the ids this turn emitted for the
+        content a client resends as the assistant message: the span after the
+        think block and before any tool call, decoded as the streamer emits
+        it. A later prompt resending that text splices the same ids back."""
+        ids = streamer.token_ids
+        if not ids:
+            return
+        start = 0
+        if job.thinking:
+            try:
+                start = ids.index(streamer.think_end_id) + 1
+            except ValueError:
+                # The reply never left its think block; no content follows.
+                return
+        end = len(ids)
+        call_open_id = streamer.tool_call_open_id
+        if call_open_id is not None:
+            for index in range(start, end):
+                if ids[index] == call_open_id and streamer._opens_call(index):
+                    end = index
+                    break
+        if start >= end:
+            return
+        text = streamer._decode(ids[start:end])
+        if text:
+            job.reply_memory.record_reply(text, ids[start:end])
 
     def cancel(self, job):
         call = None
@@ -895,6 +1009,11 @@ class NativeBackend:
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
+            if job.reply_memory is not None and result.reason != "cancelled":
+                try:
+                    self._remember_reply(job, state.streamer)
+                except Exception as unexpected:
+                    log_unexpected(unexpected)
         except engine_runtime.EngineUnhealthy:
             # An admitted request ends with EngineUnhealthy only when the
             # engine running it fails. The listener has already decided

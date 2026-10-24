@@ -85,10 +85,16 @@ struct TargetSamplingParams {
   // A row's logits span in the logits buffer: vocabulary padded to the
   // head's section rows when the vocabulary is not a tile multiple.
   uint32_t logits_stride;
+  // Constrained lanes whose admission reads the GPU-DFA next-state rows
+  // (DecodeTensor::DfaNextStates) instead of the bitmask: the row for
+  // selected row s is mask_row + s % rows of the lane's
+  // RICHENGINE_TARGET_VERIFY_ROWS + 1 rows of vocabulary int16s, and a token
+  // is admitted iff its entry is not -1.
+  uint32_t dfa_mask;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 136,
-              "Target sampling parameters are 136 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 140,
+              "Target sampling parameters are 140 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -221,10 +227,15 @@ struct AcceptBatchParams {
   // The packed lane stride of the target rows: the batch's verify stride
   // (draft.verifyRows()).
   uint32_t verify_stride;
+  // Greedy GPU-DFA lanes whose accepted prefix is capped by the truncation
+  // pass's per-lane row (buffer 9): the row emits the masked correction,
+  // so the prefix must stop there even when the corrected token equals the
+  // proposal.
+  uint32_t trunc_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 52,
-              "Batched acceptance parameters are 52 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 56,
+              "Batched acceptance parameters are 56 bytes on both sides");
 
 // verify_input_tree_tokens parameters: one thread per (lane, node) fills the
 // node's verify input token, its (t, h, w) rope position (the lane's base

@@ -1,3 +1,4 @@
+import os
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -241,13 +242,41 @@ class PromptTokenizationTests(unittest.TestCase):
                 )
                 self.assertEqual(cache.stats()["entries"], 0)
 
+    def test_remembered_reply_ids_splice_and_miss_falls_back(self):
+        reply = "Hello world!"
+        canonical = self.tokenizer(reply, add_special_tokens=False)["input_ids"]
+        # The split a model emitted, which decodes to the same reply but is
+        # not the canonical re-encoding of its text.
+        emitted = (
+            self.tokenizer("Hello wo", add_special_tokens=False)["input_ids"]
+            + self.tokenizer("rld!", add_special_tokens=False)["input_ids"]
+        )
+        self.assertNotEqual(emitted, canonical)
+        self.cache.record_reply(reply, [*emitted, self.cache.marker_id])
+        self.assertEqual(self.cache.stats()["reply_entries"], 1)
+        prompt = '<|im_start|>' + "assistant\n" + reply + '<|im_end|>' + "\n"
+        expected = (
+            self.tokenizer(
+                '<|im_start|>' + "assistant\n", add_special_tokens=False
+            )["input_ids"]
+            + emitted
+            + self.tokenizer('<|im_end|>' + "\n", add_special_tokens=False)["input_ids"]
+        )
+        self.assertEqual(self.cache.encode(prompt), expected)
+        self.assertGreater(self.cache.stats()["reply_hits"], 0)
+        # A reply the memory does not know re-encodes canonically, and so
+        # does everything once RICHENGINE_NO_REPLY_ID_MEMORY disables it.
+        self.assert_encoding('<|im_start|>' + "assistant\nOther." + '<|im_end|>' + "\n")
+        with mock.patch.dict(os.environ, {"RICHENGINE_NO_REPLY_ID_MEMORY": "1"}):
+            self.assert_encoding(prompt)
+
     def test_partial_marker_consumed_by_another_added_token_is_not_cached(self):
         self.tokenizer.backend_tokenizer.add_special_tokens(
-            [AddedToken("hello<|im_end", normalized=False)]
+            [AddedToken("hello" + '<|im_end|>'[:-1], normalized=False)]
         )
         cache = PromptTokenizer(self.tokenizer)
         self.assertTrue(cache.enabled)
-        text = "Hello world!" * 500 + "hello<|im_end|>suffix"
+        text = "Hello world!" * 500 + "hello" + '<|im_end|>' + "suffix"
         self.assert_encoding(text, cache)
         self.assertEqual(cache.stats()["entries"], 0)
 

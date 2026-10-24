@@ -100,9 +100,8 @@ class TokenConstraintTest(unittest.TestCase):
                 )
 
         a, z = self.a, self.z
-        constraint = self.Constraint(
-            Uncopyable(self.matcher.deep_copy()), Executor(self.executor)
-        )
+        constraint = self.Constraint(self.matcher.deep_copy(), Executor(self.executor))
+        constraint.matcher = Uncopyable(constraint.matcher)
         rows = self.rows(constraint.masks((a, z)))
         constraint.commit([a])
         self.assertEqual(self.rows(constraint.masks(())), rows[1:2])

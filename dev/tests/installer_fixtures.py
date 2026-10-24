@@ -11,9 +11,9 @@ import shutil
 from types import SimpleNamespace
 from unittest import mock
 
-import httpx
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_api import RepoSibling
+from huggingface_hub.utils import httpx
 
 from install import families, hub, models
 

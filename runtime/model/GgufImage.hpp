@@ -110,7 +110,14 @@ struct Fill {
 // How a copy writes each value: as stored, narrowed from F32 to the bf16
 // value it equals exactly (rows the kernels read as bf16), or widened from
 // BF16 to the F32 value it equals (rows the kernels read as F32).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32 };
+enum class Conversion : uint8_t {
+  None,
+  NarrowToBfloat16,
+  WidenToFloat32,
+  // F32 -> bf16 by rounding, not exactness: LFM2's shortconv taps ship F32
+  // in the QAD GGUFs, whose distilled values need not narrow exactly.
+  RoundToBfloat16
+};
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;

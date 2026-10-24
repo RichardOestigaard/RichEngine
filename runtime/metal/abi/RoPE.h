@@ -15,7 +15,10 @@ struct RopeTableParams {
   // dense and LFM2 targets' single position axis.
   uint32_t target_dims;
   uint32_t target_axes;
+  // Rotary pairs each draft row's table holds: the draft's head dimension
+  // over two. Hardcoded 64 broke the 64-dim DSpark drafts' context commits.
+  uint32_t draft_dims;
 };
 
-static_assert(sizeof(RopeTableParams) == 16,
-              "RoPE table parameters are 16 bytes on both sides");
+static_assert(sizeof(RopeTableParams) == 20,
+              "RoPE table parameters are 20 bytes on both sides");

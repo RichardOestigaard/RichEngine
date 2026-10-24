@@ -104,6 +104,26 @@ enum class DecodeTensor : uint32_t {
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,
+  // GPU-DFA constrained decode (kernels/decode/dfa.metal): one u32
+  // automaton state per state lane, indexed like PenaltyState — the state
+  // the lane's pending anchor walks from.
+  DfaState,
+  // Per dispatch lane, the automaton state behind each of the
+  // kDecodeRows + 1 mask rows, written by decode_dfa_chain for
+  // decode_dfa_mask.
+  DfaRowStates,
+  // Per dispatch lane, kDecodeRows + 1 rows of vocabulary int16 next-states
+  // written by decode_dfa_mask (-1 = not admitted) and read by the selection
+  // kernels in place of a constraint bitmask on dfaLanes lanes.
+  DfaNextStates,
+  // Per state lane, the next round's forced-token span the commit-stage
+  // decode_dfa_forced_* kernels derive (metal/abi/Dfa.h DfaForcedSpan).
+  DfaForced,
+  // Per dispatch lane, one u32 truncation row written by
+  // decode_dfa_truncate: the correction row of a greedy Full-mode DFA
+  // lane's round, read by the indexed mask, correction argmax and
+  // acceptance dispatches of the same commit.
+  DfaTrunc,
   VerifyPackedBase,
   VerifyMixedBase,
   VerifyDecayBase,
@@ -177,6 +197,11 @@ public:
     const metal::MetalBuffer arrivals =
         packed(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
+    // Forced spans start empty: a count is only ever produced by a commit's
+    // forced kernels.
+    if (const metal::MetalBuffer forced =
+            packed(DecodeTensor::DfaForced, kLaneCount))
+      std::memset(forced.contents(), 0, forced.sizeBytes());
     // Gemma's MoE combine residual: zeroed once at arena creation.
     if (const metal::MetalBuffer zero =
             packed(DecodeTensor::ZeroResidual, kLaneCount))

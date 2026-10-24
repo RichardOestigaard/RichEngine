@@ -230,6 +230,7 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
   metal::MetalBuffer contextKv;
+  metal::MetalBuffer contextQkv;
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   // RICHENGINE_PREFILL_FAST_INT8 operand buffers (empty when the flag is off).

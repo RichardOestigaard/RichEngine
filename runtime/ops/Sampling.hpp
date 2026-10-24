@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -76,6 +77,10 @@ struct SamplingBuffers final {
   metal::MetalBuffer vocabularyRows;
   metal::MetalBuffer uniforms;
   metal::MetalBuffer constraintMasks;
+  // The GPU-DFA lanes' admission rows (decode/dfa.metal's next-state table):
+  // a lane whose bit is set in dfaLanes reads its selected row's record here
+  // instead of constraintMasks.
+  metal::MetalBuffer dfaNextStates;
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
@@ -97,6 +102,12 @@ struct SamplingBuffers final {
   // fused; empty otherwise.
   metal::MetalBuffer headArgmaxValues;
   metal::MetalBuffer headArgmaxIndices;
+  // Lanes whose constraint admission comes from dfaNextStates.
+  uint32_t dfaLanes = 0;
+  // Constrained lanes the selection nonetheless argmaxes unmasked (a
+  // greedy GPU-DFA lane's proposal check): their constrained_mask bit is
+  // cleared for the pass while exclude-stop still applies.
+  uint32_t unmaskedLanes = 0;
 };
 
 struct AcceptanceBuffers final {
@@ -108,6 +119,10 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  // Greedy GPU-DFA lanes' truncation rows (decode_dfa_truncate): lanes in
+  // truncLanes cap their accepted prefix there.
+  metal::MetalBuffer truncRows;
+  uint32_t truncLanes = 0;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,
@@ -186,6 +201,17 @@ public:
       uint32_t stopToken1, std::span<const uint32_t> proposals = {},
       uint32_t draftCandidateStride = RICHENGINE_DRAFT_CANDIDATES,
       uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
+  // The greedy GPU-DFA lanes' correction pass: one masked argmax at each
+  // lane's truncation row (decode_dfa_truncate's per-lane index), written
+  // over that row's unmasked selection. buffers.dfaLanes names the lanes;
+  // nothing dispatches when it is zero.
+  void addDfaCorrections(metal::CommandGraph &graph,
+                       std::span<const SamplingPolicy> policies,
+                       const SamplingBuffers &buffers,
+                       metal::MetalBuffer truncRows, uint32_t stopToken0,
+                       uint32_t stopToken1,
+                       std::span<const uint32_t> liveRows,
+                       uint32_t verifyStride) const;
   // Greedy acceptance over the lanes' verify trees: the walk emits the
   // retained path's tokens and its emitted-row indices for the KV, GDN and
   // captured-hidden commits.
@@ -235,6 +261,15 @@ private:
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify,
                     uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
+  // The selection kernels' scalar payload for one rows layout
+  // (metal/abi/Sampling.h TargetSamplingParams): the policies' masks and
+  // per-lane fields, the lanes' live-row bounds, dfaLanes and
+  // unmaskedLanes applied from the buffers.
+  TargetSamplingParams targetParams(std::span<const SamplingPolicy> policies,
+                                    const SamplingBuffers &buffers,
+                                    const TargetRows &rows,
+                                    uint32_t stopToken0, uint32_t stopToken1,
+                                    std::span<const uint32_t> liveRows) const;
   // Selects the rows that rows names of every lane. liveRows bounds each
   // lane's selected rows; empty leaves every lane's full row count.
   void addSelection(metal::CommandGraph &graph,

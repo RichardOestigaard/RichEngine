@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace richengine::ops {
 
@@ -271,6 +273,14 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
 [[nodiscard]] inline MoeGgufTile moeGgufTile(const DevicePolicy &device, MoeShape shape) noexcept {
+  // RICHENGINE_MOE_GGUF_TILE=register|staged forces the tile for a family
+  // the policy has not measured (Apple10's staged K-quants).
+  const char *env = getenv("RICHENGINE_MOE_GGUF_TILE");
+  if (env && !strcmp(env, "staged"))
+    return MoeGgufTile::Staged;
+  if (env && !strcmp(env, "register") &&
+      !apple9StagesFormat(shape.expertFormat))
+    return MoeGgufTile::Register;
   return device.isApple9() && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
                                                                       : MoeGgufTile::Staged;
 }

@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
 from huggingface_hub.errors import IncompleteSnapshotError
+from huggingface_hub.utils import httpx
 
 from dev.tests.installer_fixtures import (
     DENSE,

@@ -55,7 +55,7 @@ management, and per-device kernel autotuning.
 
 ## 3. SolidJS web UI
 
-- `web/` — SolidJS + Vite + ApexCharts app: Chat, Models, Metrics, Disk,
+- `web/` — SolidJS + Vite + ResolvCharts app: Chat, Models, Metrics, Disk,
   Settings, Playground and Judge pages.
 - Builds into `server/webui/` (committed bundle), served at `/` by
   `FrontendHandler`; `make webui` target.

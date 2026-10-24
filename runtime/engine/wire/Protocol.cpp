@@ -26,6 +26,13 @@ std::string_view failureClassName(FailureClass failureClass);
 constexpr std::array<uint8_t, 4> kMagic{'R', 'I', 'C', 'H'};
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
+constexpr uint64_t kForcedTokensFixedBytes = 12;
+constexpr uint64_t kConstraintDfaFixedBytes = 16;
+constexpr uint64_t kVocabularyFixedBytes = 8;
+// The largest byte-DFA the wire admits: 32767 states x 256 i16 transitions.
+constexpr uint32_t kMaximumDfaStates = 32767;
+// Bound on the packed vocabulary's token count and total byte payload.
+constexpr uint32_t kMaximumVocabularyTokens = 1U << 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 9;
 constexpr uint64_t kStartFixedBytes = 16;
@@ -76,8 +83,31 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
       return std::nullopt;
     }
     return bounded(kMaskResponseFixedBytes, maximum);
+  case FrameType::ForcedTokens:
+    if (!checkedMultiply(limits.maxTokenBatch, sizeof(uint32_t), variable) ||
+        !checkedAdd(kForcedTokensFixedBytes, variable, maximum)) {
+      return std::nullopt;
+    }
+    return bounded(kForcedTokensFixedBytes, maximum);
   case FrameType::StatusRequest:
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
+  case FrameType::ConstraintDfa:
+    // nStates*256 i16 transitions plus ceil(nStates/8) accepting bytes,
+    // the eos list (u32 count + at most 8 ids) and the marker mask
+    // (u32 byte count + nStates*32 bytes).
+    if (!checkedMultiply(uint64_t{kMaximumDfaStates} * 256,
+                         sizeof(int16_t), variable) ||
+        !checkedAdd(variable, (kMaximumDfaStates + 7) / 8, variable) ||
+        !checkedAdd(variable, 4 + 8 * sizeof(uint32_t), variable) ||
+        !checkedAdd(variable, 4 + uint64_t{kMaximumDfaStates} * 32,
+                    variable) ||
+        !checkedAdd(kConstraintDfaFixedBytes, variable, maximum)) {
+      return std::nullopt;
+    }
+    return bounded(kConstraintDfaFixedBytes, maximum);
+  case FrameType::Vocabulary:
+    // Token bytes dominate the (vocab + 1) i32 offsets; the frame cap rules.
+    return bounded(kVocabularyFixedBytes, limits.maxFramePayloadBytes);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -116,6 +146,9 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::Cancel:
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
+  case FrameType::ForcedTokens:
+  case FrameType::ConstraintDfa:
+  case FrameType::Vocabulary:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -208,6 +241,14 @@ public:
     return true;
   }
 
+  bool u16(uint16_t &value) {
+    if (remaining() < 2)
+      return false;
+    value = loadU16(bytes_.data() + offset_);
+    offset_ += 2;
+    return true;
+  }
+
   bool u32(uint32_t &value) {
     if (remaining() < 4)
       return false;
@@ -236,6 +277,15 @@ public:
     if (count > remaining())
       return false;
     offset_ += static_cast<size_t>(count);
+    return true;
+  }
+
+  bool raw(uint64_t count, std::vector<uint8_t> &values) {
+    if (count > remaining())
+      return false;
+    const size_t at = offset_;
+    offset_ += static_cast<size_t>(count);
+    values.assign(bytes_.begin() + at, bytes_.begin() + offset_);
     return true;
   }
 
@@ -790,6 +840,162 @@ ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
   return success(ClientMessage{std::move(response)});
 }
 
+ProtocolResult<ClientMessage> decodeForcedTokens(const Frame &frame,
+                                                 const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  ForcedTokensFrame forced;
+  uint32_t count = 0;
+  if (!reader.u64(forced.requestId) || !reader.u32(count)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "forced tokens payload is truncated"));
+  }
+  if (!count || count > limits.maxTokenBatch) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::RequestError, IssueCode::InvalidCount, forced.requestId,
+        "forced token count is out of range"));
+  }
+  if (reader.remaining() != uint64_t{count} * sizeof(uint32_t) ||
+      !reader.words(count, forced.tokens)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  forced.requestId,
+                  "forced token count does not match the payload"));
+  }
+  if (!forced.requestId) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidRequestId, 0,
+                  "forced tokens request id must be non-zero"));
+  }
+  return success(ClientMessage{std::move(forced)});
+}
+
+ProtocolResult<ClientMessage> decodeConstraintDfa(const Frame &frame) {
+  Reader reader(frame.payload);
+  ConstraintDfaFrame dfa;
+  uint32_t nStates = 0;
+  uint32_t flags = 0;
+  if (!reader.u64(dfa.requestId) || !reader.u32(nStates) ||
+      !reader.u32(flags)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "constraint dfa fixed payload is truncated"));
+  }
+  if (!dfa.requestId) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidRequestId, 0,
+                  "constraint dfa request id must be non-zero"));
+  }
+  if (!nStates || nStates > kMaximumDfaStates) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
+                  dfa.requestId, "constraint dfa state count is out of range"));
+  }
+  const uint64_t entries = uint64_t{nStates} * 256;
+  const uint64_t acceptingBytes = (uint64_t{nStates} + 7) / 8;
+  const uint64_t markerBytes = uint64_t{nStates} * 32;
+  // The table and accepting bitset plus the eos-count and marker-length
+  // words are the payload's fixed floor; the lists they count follow.
+  uint64_t expectedBytes = 0;
+  if (!checkedMultiply(entries, sizeof(int16_t), expectedBytes) ||
+      !checkedAdd(expectedBytes, acceptingBytes, expectedBytes) ||
+      !checkedAdd(expectedBytes, 8, expectedBytes) ||
+      reader.remaining() < expectedBytes) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        dfa.requestId,
+        "constraint dfa state count does not match the payload"));
+  }
+  dfa.table.reserve(entries);
+  for (uint64_t index = 0; index < entries; ++index) {
+    uint16_t word = 0;
+    if (!reader.u16(word)) {
+      return failure<ClientMessage>(makeIssue(
+          FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+          dfa.requestId, "constraint dfa transition table is truncated"));
+    }
+    dfa.table.push_back(std::bit_cast<int16_t>(word));
+  }
+  if (!reader.raw(acceptingBytes, dfa.accepting)) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        dfa.requestId, "constraint dfa accepting set is truncated"));
+  }
+  uint32_t eosCount = 0;
+  if (!reader.u32(eosCount) || eosCount > 8 ||
+      !reader.words(eosCount, dfa.eosIds)) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        dfa.requestId, "constraint dfa eos set is truncated"));
+  }
+  uint32_t markerLen = 0;
+  if (!reader.u32(markerLen) || markerLen != markerBytes ||
+      !reader.raw(markerLen, dfa.marker) || reader.remaining() != 0) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        dfa.requestId, "constraint dfa marker mask is truncated"));
+  }
+  return success(ClientMessage{std::move(dfa)});
+}
+
+ProtocolResult<ClientMessage> decodeVocabulary(const Frame &frame,
+                                               const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  VocabularyFrame vocabulary;
+  uint32_t vocab = 0;
+  uint32_t tokenBytes = 0;
+  if (!reader.u32(vocab) || !reader.u32(tokenBytes)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "vocabulary fixed payload is truncated"));
+  }
+  // A vocabulary that cannot fit a mask row is malformed by definition.
+  if (!vocab || vocab > kMaximumVocabularyTokens ||
+      uint64_t{vocab} > uint64_t{limits.maxMaskWords} * 32) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidCount, 0,
+                  "vocabulary token count is out of range"));
+  }
+  uint64_t offsetBytes = 0;
+  uint64_t expectedBytes = 0;
+  if (!checkedMultiply(uint64_t{vocab} + 1, sizeof(int32_t), offsetBytes) ||
+      !checkedAdd(uint64_t{tokenBytes}, offsetBytes, expectedBytes) ||
+      !checkedAdd(expectedBytes, 4 + (uint64_t{vocab} + 7) / 8,
+                  expectedBytes) ||
+      reader.remaining() != expectedBytes) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0,
+                  "vocabulary counts do not match the binary payload"));
+  }
+  if (!reader.raw(tokenBytes, vocabulary.tokenBytes)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "vocabulary token bytes are truncated"));
+  }
+  vocabulary.tokenOffsets.reserve(vocab + 1);
+  for (uint32_t index = 0; index < vocab + 1; ++index) {
+    uint32_t word = 0;
+    if (!reader.u32(word)) {
+      return failure<ClientMessage>(makeIssue(
+          FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength, 0,
+          "vocabulary offsets are truncated"));
+    }
+    vocabulary.tokenOffsets.push_back(std::bit_cast<int32_t>(word));
+  }
+  // Bit t of the special-token bitset names token t special.
+  const uint64_t specBits = (uint64_t{vocab} + 7) / 8;
+  uint32_t specBitsLen = 0;
+  if (!reader.u32(specBitsLen) || specBitsLen != specBits ||
+      !reader.raw(specBitsLen, vocabulary.specialBits) ||
+      reader.remaining() != 0) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "vocabulary special-token bitset is truncated"));
+  }
+  return success(ClientMessage{std::move(vocabulary)});
+}
+
 ProtocolResult<ClientMessage> decodeStatusRequest(const Frame &frame) {
   Reader reader(frame.payload);
   StatusRequestFrame request;
@@ -819,6 +1025,12 @@ std::string_view frameTypeName(FrameType type) {
     return "start";
   case FrameType::Tokens:
     return "tokens";
+  case FrameType::ForcedTokens:
+    return "forced_tokens";
+  case FrameType::ConstraintDfa:
+    return "constraint_dfa";
+  case FrameType::Vocabulary:
+    return "vocabulary";
   case FrameType::MaskRequest:
     return "mask_request";
   case FrameType::Done:
@@ -946,6 +1158,12 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeCancel(frame);
     case FrameType::MaskResponse:
       return decodeMaskResponse(frame, limits);
+    case FrameType::ForcedTokens:
+      return decodeForcedTokens(frame, limits);
+    case FrameType::ConstraintDfa:
+      return decodeConstraintDfa(frame);
+    case FrameType::Vocabulary:
+      return decodeVocabulary(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
     default:

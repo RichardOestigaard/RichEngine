@@ -17,9 +17,8 @@ from dev.tests.engine.test_json_responses import (
 )
 from dev.tests.engine.test_launcher import keep_stop_signals, server_arguments
 from install import launcher
+from server import model_host, serve_options
 from server import protocol as native_wire
-from server import serve_options
-from server import model_host
 from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")

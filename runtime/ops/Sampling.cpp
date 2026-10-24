@@ -181,13 +181,15 @@ void Sampling::addVerifyTree(metal::CommandGraph &graph,
                stopToken0, stopToken1);
 }
 
-void Sampling::addSelection(metal::CommandGraph &graph,
-                            std::span<const SamplingPolicy> policies,
-                            const SamplingBuffers &buffers,
-                            const TargetRows &rows, uint32_t stopToken0,
-                            uint32_t stopToken1,
-                            std::span<const uint32_t> liveRows,
-                            uint32_t fusedHead) const {
+// The selection kernels' scalar payload for one rows layout: the policies'
+// masks and per-lane fields, with the lanes' live-row bounds. Greedy lanes
+// get a shared argmax pass; sampled lanes get the mass/search/draw passes.
+TargetSamplingParams
+Sampling::targetParams(std::span<const SamplingPolicy> policies,
+                       const SamplingBuffers &buffers,
+                       const TargetRows &rows, uint32_t stopToken0,
+                       uint32_t stopToken1,
+                       std::span<const uint32_t> liveRows) const {
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.logits_stride = logitsStride_;
@@ -202,7 +204,6 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                            : uint32_t{RICHENGINE_TARGET_VERIFY_ROWS};
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
-  bool greedy = false;
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPolicy &policy = policies[lane];
     if (policy.samples()) {
@@ -211,8 +212,6 @@ void Sampling::addSelection(metal::CommandGraph &graph,
       params.top_p[lane] = policy.topP;
       params.min_p[lane] = policy.minP;
       params.sampling_mask |= uint32_t{1} << lane;
-    } else {
-      greedy = true;
     }
     if (policy.constrained)
       params.constrained_mask |= uint32_t{1} << lane;
@@ -223,6 +222,26 @@ void Sampling::addSelection(metal::CommandGraph &graph,
             ? std::clamp(liveRows[lane], uint32_t{1}, rows.rows)
             : rows.rows;
   }
+  // GPU-DFA lanes read their next-state rows instead of the bitmask, and
+  // unmaskedLanes drop their constraint for the pass entirely (a greedy
+  // GPU-DFA lane's proposal check compares against the unmasked argmax).
+  params.dfa_mask = buffers.dfaLanes;
+  params.constrained_mask &= ~buffers.unmaskedLanes;
+  return params;
+}
+
+void Sampling::addSelection(metal::CommandGraph &graph,
+                            std::span<const SamplingPolicy> policies,
+                            const SamplingBuffers &buffers,
+                            const TargetRows &rows, uint32_t stopToken0,
+                            uint32_t stopToken1,
+                            std::span<const uint32_t> liveRows,
+                            uint32_t fusedHead) const {
+  const TargetSamplingParams params =
+      targetParams(policies, buffers, rows, stopToken0, stopToken1, liveRows);
+  bool greedy = false;
+  for (uint32_t lane = 0; lane < policies.size(); ++lane)
+    greedy = greedy || !policies[lane].samples();
   // Greedy and sampled lanes run their own kernels, each over the selected
   // rows of every lane; the groups of the other kind's lanes return at once.
   const uint64_t selected = uint64_t{policies.size()} * rows.rows;
@@ -238,7 +257,8 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                 params, {selected, 1, 1}, {32, 1, 1});
     } else {
       graph.add(std::string(kDecodeSampleArgmaxSharded),
-                {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
+                {buffers.logits, buffers.constraintMasks,
+                 buffers.dfaNextStates, buffers.argmaxValues,
                  buffers.argmaxIndices},
                 params, {selected * kTargetShards, 1, 1});
       graph.add(std::string(kDecodeSampleArgmaxReduce),
@@ -249,14 +269,17 @@ void Sampling::addSelection(metal::CommandGraph &graph,
   }
   if (params.sampling_mask) {
     graph.add(std::string(kDecodeSampleMassSharded),
-              {buffers.logits, buffers.constraintMasks, buffers.partialMasses},
+              {buffers.logits, buffers.constraintMasks,
+               buffers.dfaNextStates, buffers.partialMasses},
               params, {selected * kTargetShards, 1, 1});
     graph.add(std::string(kDecodeSampleVocabularySearch),
-              {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
+              {buffers.logits, buffers.constraintMasks,
+               buffers.dfaNextStates, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
     graph.add(std::string(kDecodeSampleVocabularyDraw),
-              {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
+              {buffers.logits, buffers.constraintMasks,
+               buffers.dfaNextStates, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges,
@@ -298,12 +321,38 @@ void Sampling::addAcceptance(
   }
   params.candidate_stride = draftCandidateStride;
   params.verify_stride = verifyStride;
+  params.trunc_mask = buffers.truncLanes;
   graph.add(std::string(kDecodeAcceptDflash),
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts},
+             buffers.acceptedCounts, buffers.truncRows},
             params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void Sampling::addDfaCorrections(
+    metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,
+    const SamplingBuffers &buffers, metal::MetalBuffer truncRows,
+    uint32_t stopToken0, uint32_t stopToken1,
+    std::span<const uint32_t> liveRows, uint32_t verifyStride) const {
+  if (!buffers.dfaLanes)
+    return;
+  const uint64_t lanes = policies.size();
+  const TargetSamplingParams params =
+      targetParams(policies, buffers,
+                   {verifyStride, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
+                    RICHENGINE_DRAFT_PROPOSAL_TOKENS, verifyStride},
+                   stopToken0, stopToken1, liveRows);
+  // One masked argmax per lane, at the lane's truncation row: the
+  // correction the round emits or, on a full pass, its bonus token.
+  graph.add(std::string(kDecodeDfaArgmaxSharded),
+            {buffers.logits, buffers.constraintMasks, buffers.dfaNextStates,
+             truncRows, buffers.argmaxValues, buffers.argmaxIndices},
+            params, {lanes * kTargetShards, 1, 1});
+  graph.add(std::string(kDecodeDfaArgmaxReduce),
+            {buffers.argmaxValues, buffers.argmaxIndices, truncRows,
+             buffers.outputTokens},
+            params, {lanes, 1, 1}, {32, 1, 1});
 }
 
 void Sampling::addTreeAcceptance(

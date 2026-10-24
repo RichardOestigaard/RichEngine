@@ -418,6 +418,9 @@ class FakeRuntime:
             "eval_ms_max": 0.0,
         }
 
+    def forced_stats(self):
+        return {"spans_pushed": 0, "tokens_pushed": 0}
+
     def status(self, timeout=5.0):
         if timeout <= 0:
             raise ValueError("status timeout must be positive")
@@ -766,7 +769,7 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value="executor"),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, executor, _contract: (matcher, executor),
+                side_effect=lambda *args, **_kwargs: (args[0], args[1]),
             ),
         ):
             factory = generation_constraints.ConstraintFactory(
@@ -818,7 +821,7 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _, _contract: matcher,
+                side_effect=lambda matcher, *_args, **_kwargs: matcher,
             ),
         ):
             factory = generation_constraints.ConstraintFactory(
@@ -861,7 +864,7 @@ class ServerTest(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _, _contract: matcher,
+                side_effect=lambda matcher, *_args, **_kwargs: matcher,
             ),
         ):
             factory = generation_constraints.ConstraintFactory(
@@ -3689,13 +3692,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(args.max_cache_disk, 0)
         disk_args = api.parse_args([*required, "--max-cache-disk", "5G"])
         self.assertEqual(disk_args.max_cache_disk, 5 * 1024**3)
-        self.assertEqual(hosting._native_command(disk_args)[-1], str(5 * 1024**3))
+        self.assertIn(str(5 * 1024**3), hosting._native_command(disk_args))
         # A persistent cache names its directory; the server picks the default.
         persistent_args = api.parse_args(
             [*required, "--max-cache-disk", "5G", "--persistent-cache"]
         )
         self.assertEqual(
-            hosting._native_command(persistent_args)[-3:],
+            hosting._native_command(persistent_args)[-5:-2],
             [str(5 * 1024**3), "--cache-dir", str(serve_options.DEFAULT_CACHE_DIR)],
         )
         directory_args = api.parse_args(
@@ -3703,10 +3706,12 @@ class ServerTest(unittest.TestCase):
             + ["--cache-dir", "/srv/cache"]
         )
         self.assertEqual(
-            hosting._native_command(directory_args)[-2:], ["--cache-dir", "/srv/cache"]
+            hosting._native_command(directory_args)[-4:-2], ["--cache-dir", "/srv/cache"]
         )
-        self.assertEqual(args.kv_format, "int4")
-        self.assertNotIn("--kv-format", hosting._native_command(args))
+        self.assertEqual(args.kv_format, "int8")
+        self.assertEqual(
+            hosting._native_command(args)[-2:], ["--kv-format", "int8"]
+        )
         bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
         self.assertEqual(
             hosting._native_command(bf16_args)[-2:], ["--kv-format", "bf16"]
@@ -3736,8 +3741,8 @@ class ServerTest(unittest.TestCase):
             [*required, "--max-cache-disk", "5G", "--decode-share", "0"]
         )
         self.assertEqual(
-            hosting._native_command(share_args)[-3:],
-            [str(5 * 1024**3), "--decode-share", "0.0"],
+            hosting._native_command(share_args)[-5:],
+            [str(5 * 1024**3), "--kv-format", "int8", "--decode-share", "0.0"],
         )
         # The engine's per-image patch limit follows the pixel cap: the most
         # patches a resized image can have, a whole number of merge units.
@@ -9591,6 +9596,57 @@ class MessageNormalizationTest(unittest.TestCase):
                 ],
                 vision=True,
                 deadline=FOREVER,
+            )
+
+    def test_volatile_system_fields_move_to_the_message_end(self):
+        content = (
+            "You are an agent.\n"
+            "Working directory: /repo\n"
+            "Rules: be brief.\n"
+            "<env>\nos: darwin\n</env>\n"
+            "More rules."
+        )
+        messages = [
+            {"role": "system", "content": content},
+            {"role": "user", "content": "hi"},
+        ]
+        moved = request_frontend.move_volatile_system_fields(messages)
+        self.assertIs(moved[1], messages[1])
+        self.assertEqual(
+            moved[0]["content"],
+            "You are an agent.\n"
+            "Rules: be brief.\n"
+            "More rules.\n"
+            "Working directory: /repo\n"
+            "<env>\nos: darwin\n</env>",
+        )
+
+    def test_prompt_normalization_is_conservative_and_toggleable(self):
+        stable = "You are an agent.\nRules: be brief."
+        for messages in (
+            [{"role": "system", "content": stable}, {"role": "user", "content": "x"}],
+            [{"role": "user", "content": "x"}],
+            [
+                {
+                    "role": "system",
+                    "content": "Code:\n```python\ndate: today\n```\nDone.",
+                },
+                {"role": "user", "content": "x"},
+            ],
+        ):
+            with self.subTest(messages=messages):
+                self.assertIs(
+                    request_frontend.move_volatile_system_fields(messages), messages
+                )
+        volatile = [
+            {"role": "system", "content": "Working directory: /repo\nBe brief."},
+            {"role": "user", "content": "x"},
+        ]
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_NO_PROMPT_NORMALIZE": "1"}
+        ):
+            self.assertIs(
+                request_frontend.move_volatile_system_fields(volatile), volatile
             )
 
 

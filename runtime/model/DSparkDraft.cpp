@@ -1,6 +1,7 @@
 #include "DSparkDraft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+#include "ops/RowCopy.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -46,6 +47,7 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   result.reserve(weights.layers.size());
   for (const DFlashV1DraftLayerWeights &layer : weights.layers) {
     const ops::AffineWeights &fused = layer.qkvProjection.affine();
+    // Decode commits use these slices of the fused QKV rows.
     const auto rows = [&](const metal::MetalBuffer &plane) {
       const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;
       return backend.view(plane, uint64_t{layout.attentionSize} * rowBytes,
@@ -95,6 +97,12 @@ void DSparkDraft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
+  if (getenv("RICHENGINE_DRAFT_DEBUG")) {
+    fprintf(stderr, "  ctxprefill rows=%u spans=[", rows);
+    for (const DFlashPrefillSpan &span : spans)
+      fprintf(stderr, "%u+%u@%u ", span.compactRow, span.rows, span.startPosition);
+    fprintf(stderr, "]\n");
+  }
   operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
                                      weights_.contextProjection, rows);
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
@@ -105,10 +113,28 @@ void DSparkDraft::addContextPrefill(
       buffers.projectionSums, layout.hiddenSize, rows);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addPrefill(graph, buffers.hidden,
-                      contextKvProjections_[layer],
-                      buffers.contextKv, buffers.projectionSums, rows,
-                      buffers.linearScratch);
+    // The affine prefill tile miscomputes these projections, so the context
+    // K/V runs through the decode plan — the commit path's proven kernel — in
+    // verify-row tiles.
+    for (uint32_t begin = 0; begin < rows; begin += layout.verifyRows()) {
+      // Decode tiles run verifyRows rows; the tail's extra rows write past
+      // the used span into the padded arena buffer.
+      const ops::LinearPlan plan = operators_.linear().decodePlan(
+          contextKvProjections_[layer], 1, ops::LinearEpilogue::None, nullptr,
+          layout.verifyRows());
+      operators_.linear().add(
+          graph,
+          {.input = backend_.view(buffers.hidden,
+                                  uint64_t{begin} * layout.hiddenSize * 2,
+                                  uint64_t{layout.verifyRows()} *
+                                      layout.hiddenSize * 2),
+           .output = backend_.view(buffers.contextKv,
+                                   uint64_t{begin} * layout.contextKvSize() * 2,
+                                   uint64_t{layout.verifyRows()} *
+                                       layout.contextKvSize() * 2),
+           .scratch = buffers.linearScratch},
+          contextKvProjections_[layer], plan);
+    }
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);

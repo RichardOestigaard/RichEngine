@@ -24,7 +24,7 @@ namespace richengine::model {
           std::move(targetCosAlt), std::move(targetSinAlt), draftCos,
           draftSin,
           {targetRows, 0, geometry.target.altRotaryPairs,
-           geometry.target.ropeAxes},
+           geometry.target.ropeAxes, geometry.draftRotaryPairs()},
           kPrefillRows);
     }
     ops::RoPE::addTables(
@@ -34,7 +34,7 @@ namespace richengine::model {
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
         {targetRows, draftRows, geometry.target.rotaryPairs,
-         geometry.target.ropeAxes},
+         geometry.target.ropeAxes, geometry.draftRotaryPairs()},
         kPrefillRows);
   }
 

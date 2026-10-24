@@ -20,6 +20,17 @@ inline constexpr std::string_view kDecodeSampleMassSharded = "decode_sample_mass
 inline constexpr std::string_view kDecodeSampleVocabularySearch = "decode_sample_vocabulary_search";
 inline constexpr std::string_view kDecodeSampleVocabularyDraw = "decode_sample_vocabulary_draw";
 inline constexpr std::string_view kDecodeAcceptDflash = "decode_accept_dflash";
+// GPU-DFA constraint admission (kernels/decode/dfa.metal): row-state chain,
+// token-walk next-state rows, committed-state advance and the commit-stage
+// forced-span pair.
+inline constexpr std::string_view kDecodeDfaMask = "decode_dfa_mask";
+inline constexpr std::string_view kDecodeDfaChain = "decode_dfa_chain";
+inline constexpr std::string_view kDecodeDfaTrunc = "decode_dfa_truncate";
+inline constexpr std::string_view kDecodeDfaArgmaxSharded = "decode_dfa_argmax_sharded";
+inline constexpr std::string_view kDecodeDfaArgmaxReduce = "decode_dfa_argmax_reduce";
+inline constexpr std::string_view kDecodeDfaAdvance = "decode_dfa_advance";
+inline constexpr std::string_view kDecodeDfaForcedBytes = "decode_dfa_forced_bytes";
+inline constexpr std::string_view kDecodeDfaForcedTokens = "decode_dfa_forced_tokens";
 inline constexpr std::string_view kDecodeAcceptTree = "decode_accept_tree";
 inline constexpr std::string_view kDecodeLogitSoftcap = "decode_logit_softcap";
 inline constexpr std::string_view kDecodeHeadArgmaxQ4 = "decode_head_argmax_q4";

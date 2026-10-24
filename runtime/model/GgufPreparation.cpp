@@ -82,6 +82,18 @@ void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const 
   }
 }
 
+// The rounding F32 -> bf16 narrow for the copies that opt into it (LFM2's
+// shortconv taps, whose QAD values do not narrow exactly).
+void roundToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to) {
+  for (uint64_t i = 0; i < count; ++i) {
+    uint32_t value;
+    std::memcpy(&value, values + 4 * i, 4);
+    const uint16_t narrowed = static_cast<uint16_t>(
+        (value + 0x8000u + ((value >> 16) & 1u)) >> 16);
+    std::memcpy(to + 2 * i, &narrowed, 2);
+  }
+}
+
 // Writes the F32 values `count` BF16 values equal.
 void widenToFloat32(const uint8_t *values, uint64_t count, uint8_t *to) {
   for (uint64_t i = 0; i < count; ++i) {
@@ -96,6 +108,7 @@ void widenToFloat32(const uint8_t *values, uint64_t count, uint8_t *to) {
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
   switch (copy.conversion) {
   case gguf::Conversion::NarrowToBfloat16: return sourceBytes / 2;
+  case gguf::Conversion::RoundToBfloat16: return sourceBytes / 2;
   case gguf::Conversion::WidenToFloat32: return sourceBytes * 2;
   case gguf::Conversion::None: break;
   }
@@ -130,6 +143,8 @@ void addCopyTasks(const WeightSource &source, uint8_t *image, const gguf::Copy &
         readRows(source, rows, first, count, column, width, staging.data());
         if (copy.conversion == gguf::Conversion::NarrowToBfloat16)
           narrowToBfloat16(staging.data(), count * width / 4, to, rows.name);
+        else if (copy.conversion == gguf::Conversion::RoundToBfloat16)
+          roundToBfloat16(staging.data(), count * width / 4, to);
         else
           widenToFloat32(staging.data(), count * width / 2, to);
       });

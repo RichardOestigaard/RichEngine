@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@solidjs/router": "^1.0.0",
-    "apexcharts": "^5.16.0",
+    "resolvcharts": "0.4.1",
     "solid-js": "^1.9.5",
     "terracotta": "^1.3.0"
   },

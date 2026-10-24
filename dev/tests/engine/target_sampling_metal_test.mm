@@ -156,6 +156,7 @@ Batch makeBatch(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes) {
               allocate(backend, uint64_t{lanes} * kUniforms * sizeof(float)),
               allocate(backend,
                        uint64_t{lanes} * (kRows + 1) * ((vocabulary + 31) / 32) * 4),
+              {},
               allocate(backend, uint64_t{rows} * sizeof(uint32_t)),
               allocate(backend, space.argmaxValuesBytes),
               allocate(backend, space.argmaxIndicesBytes),

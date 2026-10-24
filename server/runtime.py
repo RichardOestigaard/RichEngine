@@ -228,6 +228,18 @@ class RuntimeCall:
         self._client._cancel_call(self)
         return True
 
+    def send_forced_tokens(self, tokens) -> None:
+        """Pushes the grammar's fast-forward token span to the engine. The
+        first element anchors the span at the pending token; the rest verify
+        unconditionally. A no-op once the call is finished or cancelled."""
+        if self.done or self.cancel_requested:
+            return
+        encoded = wire.serialize_message(
+            wire.ForcedTokensFrame(self.request_id, tuple(tokens))
+        )
+        self._client._write_bytes(encoded, self.generation, call=self)
+        self._client._note_forced_push(len(tokens))
+
     def _emit(self, message: wire.EngineEvent) -> None:
         with self._lock:
             callback = self._on_event
@@ -472,6 +484,10 @@ class MultiplexedRuntime:
             "eval_ms_total": 0.0,
             "eval_ms_max": 0.0,
         }
+        # Host-pushed forced-token spans (FORCED_TOKENS frames): how many
+        # went out and the frame tokens they carried, span anchor included.
+        # The engine's applied/dropped counters live in its own status.
+        self._forced_counters = {"spans_pushed": 0, "tokens_pushed": 0}
 
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -562,6 +578,15 @@ class MultiplexedRuntime:
     def mask_stats(self) -> dict:
         with self._mask_timing_lock:
             return dict(self._mask_timing)
+
+    def _note_forced_push(self, tokens: int) -> None:
+        with self._state_lock:
+            self._forced_counters["spans_pushed"] += 1
+            self._forced_counters["tokens_pushed"] += tokens
+
+    def forced_stats(self) -> dict:
+        with self._state_lock:
+            return dict(self._forced_counters)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Start an engine unless one serves, and wait for its Ready.

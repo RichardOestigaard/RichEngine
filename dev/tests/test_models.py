@@ -16,8 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import httpx
 from huggingface_hub.hf_api import RepoSibling
+from huggingface_hub.utils import httpx
 
 from dev.tests.installer_fixtures import http_error
 from install import families, hub, legacy

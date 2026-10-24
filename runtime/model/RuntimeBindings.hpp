@@ -241,6 +241,7 @@ inline   ops::SamplingBuffers Runtime::Impl::samplingBuffers(uint32_t lanes) con
             d(DecodeTensor::TargetVocabularyRows),
             d(DecodeTensor::SamplingUniforms),
             d(DecodeTensor::ConstraintMasks),
+            d(DecodeTensor::DfaNextStates),
             d(DecodeTensor::OutputTokens),
             d(DecodeTensor::ArgmaxValues),
             d(DecodeTensor::ArgmaxIndices),

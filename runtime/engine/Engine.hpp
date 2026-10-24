@@ -148,6 +148,22 @@ public:
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
+  // Grammar-forced tokens pushed ahead of the next decode round; stale or
+  // unmatched spans are dropped by the model.
+  void provideForcedTokens(uint64_t requestId,
+                           std::span<const uint32_t> tokens);
+  // A compiled byte-DFA for one request's constraint; true when the model
+  // took it. Dropped frames keep the host-mask path.
+  [[nodiscard]] bool provideDfa(uint64_t requestId,
+                                std::span<const int16_t> table,
+                                std::span<const uint8_t> accepting,
+                                std::span<const uint8_t> marker,
+                                std::span<const uint32_t> eosIds);
+  // The process-wide packed token vocabulary for GPU-DFA masks; may be
+  // resent after a restart.
+  void setVocabulary(std::span<const uint8_t> bytes,
+                     std::span<const int32_t> offs,
+                     std::span<const uint8_t> specialBits);
   void setCompletionNotifier(std::function<void()> notifier);
 
   [[nodiscard]] bool tick(double nowMilliseconds);
@@ -264,6 +280,21 @@ private:
     // When the engine asked the server for this lane's token mask, until the
     // model takes one.
     std::optional<double> maskRequestedMilliseconds;
+    // The model took the request's byte-DFA: masks come from the GPU walk
+    // kernels, so the request never enters a host mask wait.
+    bool gpuMask = false;
+    // A CONSTRAINT_DFA frame that arrived while the request had no lane:
+    // the model's runtime request does not exist until admit() runs
+    // begin(), so the frame waits here and a fresh start offers it. Kept
+    // for the request's life — a start vacated before its first step
+    // erases the runtime request, and the retry offers it again.
+    struct PendingDfa final {
+      std::vector<int16_t> table;
+      std::vector<uint8_t> accepting;
+      std::vector<uint8_t> marker;
+      std::vector<uint32_t> eosIds;
+    };
+    std::optional<PendingDfa> pendingDfa;
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;

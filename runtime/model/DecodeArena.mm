@@ -1,5 +1,6 @@
 #include "model/DecodeArena.hpp"
 
+#include "metal/abi/Dfa.h"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
@@ -197,6 +198,15 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
+  put(DecodeTensor::DfaState, bytesFor<uint32_t>(1));
+  put(DecodeTensor::DfaRowStates, bytesFor<uint32_t>(kDecodeRows + 1));
+  // The DFA lane's admission record: kDecodeRows + 1 next-state rows of the
+  // unpadded vocabulary, int16 each (~8.4 MB/lane at V=248k).
+  put(DecodeTensor::DfaNextStates,
+      bytesFor<int16_t>(uint64_t{kDecodeRows + 1} *
+                        geometry.target.vocabularySize));
+  put(DecodeTensor::DfaForced, sizeof(DfaForcedSpan));
+  put(DecodeTensor::DfaTrunc, bytesFor<uint32_t>(1));
   put(DecodeTensor::VerifyPackedBase,
       uint64_t{geometry.target.stateLayout.layers} *
           gdnPackedStride(geometry));
@@ -244,7 +254,10 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // projections are affine.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+       {d.qkvSize, d.hiddenSize},
+       // A DSpark draft's context projections are dequantized float
+       // segments; every other draft's stay affine.
+       {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}}) {

@@ -49,8 +49,10 @@ from .pack_layouts import (
     SELF_CONDITIONING_TYPE,
     DraftLayout,
     Layout,
-    draft_layout as family_draft_layout,
     execution_geometry,
+)
+from .pack_layouts import (
+    draft_layout as family_draft_layout,
 )
 
 # The format constants the packed readers fix (runtime/model/WeightLayout.hpp,

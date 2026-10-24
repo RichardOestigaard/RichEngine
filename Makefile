@@ -1,3 +1,4 @@
+export HF_HUB_DISABLE_TELEMETRY := 1
 XCRUN := xcrun
 CXX := $(XCRUN) -sdk macosx clang++
 METAL := $(XCRUN) -sdk macosx metal

@@ -35,8 +35,14 @@ MAX_PROMPT_TOKENS = 1 << 20
 MAX_LOGICAL_OUTPUT_TOKENS = 1 << 20
 MAX_TOKEN_BATCH = 4096
 MAX_SIMULATION_TOKENS = 32
+MAX_FORCED_TOKENS = 4096
 MAX_IMAGE_SPANS = 64
 MAX_MASK_WORDS = 1 << 20
+# A shipped vocabulary names at most 4M tokens of at most 64 MiB of bytes.
+MAX_VOCABULARY_TOKENS = 1 << 22
+MAX_VOCABULARY_BYTES = 1 << 26
+# A shipped constraint DFA fits its states in a signed 15-bit id.
+MAX_DFA_STATES = 32767
 
 _MAGIC = b"RICH"
 _HEADER = struct.Struct("<4sHHHHQI")
@@ -47,6 +53,12 @@ _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
+_FORCED_TOKENS = struct.Struct("<QI")
+_VOCABULARY = struct.Struct("<II")
+_CONSTRAINT_DFA = struct.Struct("<QII")
+# The u32 length prefixes on the frames' variable tails (spec-bitset bytes,
+# eos ids, marker bytes).
+_SPEC_BITS_LEN = struct.Struct("<I")
 _READY = struct.Struct("<IIB")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
@@ -79,6 +91,9 @@ class FrameType(IntEnum):
     CANCEL = 0x0002
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
+    FORCED_TOKENS = 0x0005
+    CONSTRAINT_DFA = 0x0006
+    VOCABULARY = 0x0007
 
     READY = 0x0100
     START = 0x0101
@@ -276,6 +291,50 @@ class MaskResponseFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class ForcedTokensFrame:
+    """Grammar-forced tokens the next constrained decode may feed verbatim.
+
+    tokens[0] must equal the request's pending anchor for the span to
+    apply; the engine treats tokens[1:] as guaranteed proposals."""
+
+    request_id: int
+    tokens: tuple[int, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ConstraintDfaFrame:
+    """A compiled byte-level constraint DFA for one request.
+
+    table is n_states rows of 256 little-endian int16 next-state ids, -1 for
+    a dead transition (the host prunes edges that cannot reach an accepting
+    state, so a non-dead end always stays live); accepting is the
+    EOS-admitting bitset — the DFA's accepting ∪ free-text states; eos_ids
+    is the grammar's EOS set (≤ 8 ids), admitted from an EOS-admitting
+    state; marker is n_states*32 bytes, bit b of state s marking edge
+    (s, b) special-only."""
+
+    request_id: int
+    n_states: int
+    table: bytes
+    accepting: bytes
+    eos_ids: tuple
+    marker: bytes
+
+
+@dataclass(slots=True, frozen=True)
+class VocabularyFrame:
+    """Every token's raw bytes, in token-id order, once per engine generation.
+
+    Serialized as the concatenated bytes plus vocab+1 prefix offsets, so an
+    empty token reads as equal consecutive offsets, then the special-token
+    bitset — bit t of spec_bits names token t special for the marker rule.
+    special_tokens is the id set the bitset is packed from."""
+
+    vocab_tokens: tuple
+    special_tokens: tuple = ()
+
+
+@dataclass(slots=True, frozen=True)
 class StatusRequestFrame:
     correlation_id: int
 
@@ -366,7 +425,13 @@ class StatusJsonEvent:
 
 
 ClientMessage: TypeAlias = (
-    RequestFrame | CancelFrame | MaskResponseFrame | StatusRequestFrame
+    RequestFrame
+    | CancelFrame
+    | MaskResponseFrame
+    | StatusRequestFrame
+    | ForcedTokensFrame
+    | ConstraintDfaFrame
+    | VocabularyFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -501,6 +566,31 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_CANCEL.size, _CANCEL.size)
         case FrameType.MASK_RESPONSE:
             bounds = (_MASK_RESPONSE.size, _MASK_RESPONSE.size + MAX_MASK_WORDS * 4)
+        case FrameType.FORCED_TOKENS:
+            bounds = (
+                _FORCED_TOKENS.size,
+                _FORCED_TOKENS.size + MAX_FORCED_TOKENS * 4,
+            )
+        case FrameType.CONSTRAINT_DFA:
+            bounds = (
+                _CONSTRAINT_DFA.size,
+                _CONSTRAINT_DFA.size
+                + MAX_DFA_STATES * 512
+                + (MAX_DFA_STATES + 7) // 8
+                + 4
+                + 8 * 4
+                + 4
+                + MAX_DFA_STATES * 32,
+            )
+        case FrameType.VOCABULARY:
+            bounds = (
+                _VOCABULARY.size + 4 + 4,
+                _VOCABULARY.size
+                + MAX_VOCABULARY_BYTES
+                + (MAX_VOCABULARY_TOKENS + 1) * 4
+                + 4
+                + (MAX_VOCABULARY_TOKENS + 7) // 8,
+            )
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
         case FrameType.READY:
@@ -857,6 +947,153 @@ def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
     return frame
 
 
+def _forced_tokens_frame(forced: ForcedTokensFrame) -> bytearray:
+    request_id = forced.request_id if type(forced.request_id) is int else 0
+    try:
+        request_id = _u64(forced.request_id, "forced tokens request id")
+        if not request_id:
+            raise ValueError("forced tokens request id must be non-zero")
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_REQUEST_ID,
+            str(error),
+            request_id,
+        )
+    try:
+        packed = array.array("I", forced.tokens)
+        if not len(packed) or len(packed) > MAX_FORCED_TOKENS:
+            raise ValueError("forced token count exceeds its limit")
+    except (TypeError, ValueError, OverflowError) as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.LIMIT_EXCEEDED,
+            str(error),
+            request_id,
+        )
+    frame = _frame(FrameType.FORCED_TOKENS, _FORCED_TOKENS.size + 4 * len(packed))
+    _FORCED_TOKENS.pack_into(
+        frame, FRAME_HEADER_BYTES, request_id, len(packed)
+    )
+    frame[FRAME_HEADER_BYTES + _FORCED_TOKENS.size :] = packed.tobytes()
+    return frame
+
+
+def _vocabulary_frame(message: VocabularyFrame) -> bytearray:
+    try:
+        tokens = message.vocab_tokens
+        if type(tokens) is not tuple:
+            raise ValueError("vocabulary must be a tuple of token byte strings")
+        offsets = array.array("I")
+        offset = 0
+        chunks = []
+        for token in tokens:
+            if not isinstance(token, (bytes, bytearray)):
+                raise ValueError("vocabulary token must be bytes")
+            offsets.append(offset)
+            offset += len(token)
+            chunks.append(token)
+        offsets.append(offset)
+        if len(tokens) > MAX_VOCABULARY_TOKENS or offset > MAX_VOCABULARY_BYTES:
+            raise ValueError("vocabulary exceeds its wire limits")
+        special = message.special_tokens
+        if type(special) is not tuple or any(
+            type(token_id) is not int or not 0 <= token_id < len(tokens)
+            for token_id in special
+        ):
+            raise ValueError("vocabulary special tokens must be in-range ids")
+        spec_bits = bytearray((len(tokens) + 7) // 8)
+        for token_id in special:
+            spec_bits[token_id >> 3] |= 1 << (token_id & 7)
+    except (TypeError, ValueError, OverflowError) as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.LIMIT_EXCEEDED,
+            str(error),
+        )
+    tbytes = b"".join(chunks)
+    frame = _frame(
+        FrameType.VOCABULARY,
+        _VOCABULARY.size + len(tbytes) + 4 * len(offsets) + 4 + len(spec_bits),
+    )
+    _VOCABULARY.pack_into(frame, FRAME_HEADER_BYTES, len(tokens), len(tbytes))
+    offset = FRAME_HEADER_BYTES + _VOCABULARY.size
+    frame[offset : offset + len(tbytes)] = tbytes
+    offset += len(tbytes)
+    frame[offset : offset + 4 * len(offsets)] = offsets.tobytes()
+    offset += 4 * len(offsets)
+    _SPEC_BITS_LEN.pack_into(frame, offset, len(spec_bits))
+    offset += _SPEC_BITS_LEN.size
+    frame[offset:] = spec_bits
+    return frame
+
+
+def _constraint_dfa_frame(message: ConstraintDfaFrame) -> bytearray:
+    request_id = message.request_id if type(message.request_id) is int else 0
+    try:
+        request_id = _u64(message.request_id, "constraint DFA request id")
+        if not request_id:
+            raise ValueError("constraint DFA request id must be non-zero")
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_REQUEST_ID,
+            str(error),
+            request_id,
+        )
+    try:
+        n_states = _integer(message.n_states, 1, MAX_DFA_STATES, "DFA state count")
+        table = message.table
+        if isinstance(table, array.array):
+            if table.typecode != "h":
+                raise ValueError("DFA table must be an int16 array")
+            table = table.tobytes()
+        if not isinstance(table, (bytes, bytearray)) or len(table) != n_states * 512:
+            raise ValueError("DFA table must carry n_states*256 int16 entries")
+        accepting = bytes(message.accepting)
+        if len(accepting) != (n_states + 7) // 8:
+            raise ValueError("DFA accepting mask must have ceil(n_states/8) bytes")
+        eos_ids = array.array(
+            "I", (_u32(token_id, "DFA eos id") for token_id in message.eos_ids)
+        )
+        if len(eos_ids) > 8:
+            raise ValueError("DFA eos set exceeds its limit of 8")
+        marker = bytes(message.marker)
+        if len(marker) != n_states * 32:
+            raise ValueError("DFA marker mask must have n_states*32 bytes")
+    except (TypeError, ValueError, OverflowError) as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_CONSTRAINT,
+            str(error),
+            request_id,
+        )
+    payload_bytes = (
+        _CONSTRAINT_DFA.size
+        + len(table)
+        + len(accepting)
+        + 4
+        + 4 * len(eos_ids)
+        + 4
+        + len(marker)
+    )
+    frame = _frame(FrameType.CONSTRAINT_DFA, payload_bytes)
+    _CONSTRAINT_DFA.pack_into(frame, FRAME_HEADER_BYTES, request_id, n_states, 0)
+    offset = FRAME_HEADER_BYTES + _CONSTRAINT_DFA.size
+    frame[offset : offset + len(table)] = table
+    offset += len(table)
+    frame[offset : offset + len(accepting)] = accepting
+    offset += len(accepting)
+    _SPEC_BITS_LEN.pack_into(frame, offset, len(eos_ids))
+    offset += _SPEC_BITS_LEN.size
+    frame[offset : offset + 4 * len(eos_ids)] = eos_ids.tobytes()
+    offset += 4 * len(eos_ids)
+    _SPEC_BITS_LEN.pack_into(frame, offset, len(marker))
+    offset += _SPEC_BITS_LEN.size
+    frame[offset:] = marker
+    return frame
+
+
 def _status_request_frame(request: StatusRequestFrame) -> bytearray:
     try:
         correlation_id = _u64(request.correlation_id, "status correlation id")
@@ -877,6 +1114,12 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _cancel_frame(message)
         if isinstance(message, MaskResponseFrame):
             return _mask_response_frame(message)
+        if isinstance(message, ForcedTokensFrame):
+            return _forced_tokens_frame(message)
+        if isinstance(message, ConstraintDfaFrame):
+            return _constraint_dfa_frame(message)
+        if isinstance(message, VocabularyFrame):
+            return _vocabulary_frame(message)
         if isinstance(message, StatusRequestFrame):
             return _status_request_frame(message)
     except MemoryError as error:

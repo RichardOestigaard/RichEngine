@@ -23,7 +23,7 @@ void RoPE::addTables(
   }
   const uint64_t elements =
       std::max<uint64_t>(uint64_t{rows.target_rows} * rows.target_dims,
-                         uint64_t{rows.draft_rows} * 64);
+                         uint64_t{rows.draft_rows} * rows.draft_dims);
   graph.add(std::string(kRopeBuildTables),
             {std::move(targetPositions), std::move(draftPositions),
              std::move(targetInverseFrequencies),

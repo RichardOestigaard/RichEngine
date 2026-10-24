@@ -149,9 +149,9 @@ def formula(version, url, checksum, macos_min):
   end
 end
 
-class RichEngine < Formula
+class Richengine < Formula
   desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/incoai/richengine"
+  homepage "https://github.com/richardoestigaard/richengine"
   url {quote(url)}
   sha256 {quote(checksum)}
   license "Apache-2.0"
@@ -277,7 +277,7 @@ def main(argv=None):
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (
         args.url
-        or f"https://github.com/incoai/richengine/releases/download/{args.version}/{archive.name}"
+        or f"https://github.com/richardoestigaard/richengine/releases/download/{args.version}/{archive.name}"
     )
     (dist / "richengine.rb").write_text(
         formula(args.version, url, checksum, args.macos_min)

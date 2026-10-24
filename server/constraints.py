@@ -1,6 +1,8 @@
 """Tokenizer contract and cached token-level output constraints."""
 
+import array
 import json
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, wait
@@ -15,6 +17,7 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
+from . import dfa as dfa_compiler
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
 from .tool_schema import (
@@ -24,6 +27,17 @@ from .tool_schema import (
     TOOL_CALL_OPEN_ALT,
     dialect_named,
 )
+
+
+def dfa_mode():
+    """The engine's RICHENGINE_DFA_MODE tri-state, read the same way there:
+    "full" computes a DFA lane's masks and forced spans on the GPU,
+    "forced" keeps the host mask round trip and only derives forced spans
+    and the automaton state on-device, "off" leaves the DFA unused.
+    Anything unset or unrecognized is "off"."""
+    mode = os.environ.get("RICHENGINE_DFA_MODE", "off").strip().lower()
+    return mode if mode in ("full", "forced", "off") else "off"
+
 
 # The think-block spellings the served families use, in preference order:
 # (close text, open text, leading special token of the open, system-turn
@@ -71,9 +85,10 @@ class TokenConstraint:
     # proposal table's 15 slots) and takes a mask before and after each.
     MAX_ROWS = 17
 
-    def __init__(self, matcher, executor, contract, initial_mask=None):
+    def __init__(self, matcher, executor, contract, initial_mask=None, encode=None):
         self.matcher = matcher
         self.executor = executor
+        self._encode = encode
         self.vocabulary = contract.vocabulary
         self.eos_tokens = contract.eos_tokens
         self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.vocabulary)
@@ -90,12 +105,61 @@ class TokenConstraint:
         # Whether generated tokens have advanced the grammar past its start
         # state; only then is a cached start-state mask no longer valid.
         self._advanced = False
+        # A second matcher confined to the reader thread, advanced eagerly by
+        # commit(). Its fast-forward tokens — the tokens the grammar forces
+        # next, anchored at the position the engine's pending token occupies —
+        # are pushed to the engine as guaranteed draft proposals.
+        self._ff_matcher = None if matcher is None else matcher.deep_copy()
+        self._ff_failed = False
+
+    def forced_tokens(self):
+        """The tokens the grammar forces at the reader thread's position, or
+        empty. tokens[0] occupies the pending anchor's slot.
+
+        llguidance's compute_ff_tokens only fires for canonical tokenizers;
+        when it is empty the forced byte span still applies — encode it and
+        validate the tokenization on a matcher copy so a span that cannot be
+        consumed is never pushed."""
+        if (
+            self._ff_matcher is None
+            or self._ff_failed
+            or not self._encode
+            or os.environ.get("RICHENGINE_DISABLE_FORCED_TOKENS")
+        ):
+            return ()
+        try:
+            tokens = tuple(self._ff_matcher.compute_ff_tokens())
+            if tokens:
+                return tokens
+            forced = self._ff_matcher.compute_ff_bytes()
+            if not forced:
+                return ()
+            try:
+                text = forced.decode("utf-8")
+            except UnicodeDecodeError:
+                return ()
+            candidate = tuple(self._encode(text, add_special_tokens=False))
+            if len(candidate) < 2 or not candidate:
+                return ()
+            copy = self._ff_matcher.deep_copy()
+            if not copy.consume_tokens(list(candidate)):
+                return ()
+            return candidate
+        except Exception:
+            self._ff_failed = True
+            return ()
 
     def commit(self, token_ids):
         if any(not 0 <= token < self.vocabulary for token in token_ids):
             raise ConstraintError("generated token is out of range")
         with self._lock:
             self._committed.append(tuple(token_ids))
+            if self._ff_matcher is not None and not self._ff_failed:
+                try:
+                    self._ff_matcher.consume_tokens(list(token_ids))
+                except Exception:
+                    self._ff_failed = True
+            return self.forced_tokens()
 
     def finish(self):
         """Checks the tokens generated after the last mask."""
@@ -165,6 +229,253 @@ class TokenConstraint:
                 raise ConstraintError(
                     error.splitlines()[0] if error else "invalid token"
                 )
+
+
+def _byte_char_inverse():
+    """The byte-level pretokenizer's codepoint-per-byte alphabet, inverted:
+    token text maps back to raw bytes."""
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(0xA1, 0xAD))
+        + list(range(0xAE, 0x100))
+    )
+    mapping = {}
+    extra = 0
+    for value in range(256):
+        codepoint = value if value in printable else 256 + extra
+        extra += value not in printable
+        mapping[chr(codepoint)] = value
+    return mapping
+
+
+_BYTE_CHAR_INVERSE = _byte_char_inverse()
+
+
+def _vocab_token_bytes(tokenizer, vocabulary):
+    """Every token's raw bytes in token-id order, for a byte-level
+    tokenizer; ids whose spelling is unknown get empty (dead) bytes."""
+    backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
+    id_to_token = getattr(backend, "id_to_token", None)
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    decode = getattr(tokenizer, "decode", None) or getattr(backend, "decode", None)
+
+    def text_of(token_id):
+        if id_to_token is not None:
+            try:
+                return id_to_token(token_id)
+            except Exception:
+                pass
+        if convert is not None:
+            try:
+                return convert(token_id)
+            except Exception:
+                pass
+        return None
+
+    def decoded_bytes(token_id):
+        if decode is None:
+            return b""
+        for kwargs in ({"skip_special_tokens": False}, {}):
+            try:
+                return decode([token_id], **kwargs).encode("utf-8")
+            except (TypeError, Exception):
+                continue
+        return b""
+
+    out = []
+    for token_id in range(vocabulary):
+        text = text_of(token_id)
+        if text is not None:
+            try:
+                out.append(bytes(_BYTE_CHAR_INVERSE[char] for char in text))
+                continue
+            except KeyError:
+                pass
+        out.append(decoded_bytes(token_id))
+    return tuple(out)
+
+
+class DfaConstraint:
+    """A TokenConstraint-shaped constraint backed by a compiled byte DFA.
+
+    The mirror state tracks generated tokens for fast-forward pushes exactly
+    as TokenConstraint's fast-forward matcher does. `inner`, a
+    TokenConstraint over the same grammar, serves masks(), commit
+    validation and finish(); without one the constraint walks the DFA's
+    token bytes itself — adequate for tests, too slow to serve traffic."""
+
+    MAX_ROWS = TokenConstraint.MAX_ROWS
+
+    def __init__(
+        self, dfa, vocab_tokens, special_tokens, contract, encode=None, inner=None
+    ):
+        self.dfa = dfa
+        self._inner = inner
+        self.vocab_tokens = vocab_tokens
+        self.special_tokens = frozenset(special_tokens)
+        self.vocabulary = contract.vocabulary
+        self.eos_tokens = contract.eos_tokens
+        self._eos = frozenset(contract.eos_tokens)
+        self._encode = encode
+        self._words = (self.vocabulary + 31) // 32
+        # The constraint's consuming state and the reader thread's mirror.
+        self._state = 0
+        self._mirror = 0
+        self._stopped = False
+        self._mirror_stopped = False
+        self._ff_failed = False
+        self._advanced = False
+        self._initial_mask = None
+        self._lock = threading.Lock()
+        self._committed: list[tuple[int, ...]] = []
+
+    def _advance(self, state, token_id):
+        return self.dfa.advance_token(
+            state, token_id, self.vocab_tokens, self._eos, self.special_tokens
+        )
+
+    def forced_tokens(self):
+        """The tokens the DFA forces at the mirror position, anchored like
+        TokenConstraint.forced_tokens: tokens[0] fills the pending slot. A
+        span the byte walk does not derive falls back to the delegate
+        matcher's fast-forward tokens."""
+        tokens = ()
+        if (
+            not self._ff_failed
+            and not self._mirror_stopped
+            and self._encode
+            and not os.environ.get("RICHENGINE_DISABLE_FORCED_TOKENS")
+        ):
+            try:
+                tokens = self.dfa.forced_tokens_after(
+                    self._mirror,
+                    self.vocab_tokens,
+                    self._encode,
+                    self._eos,
+                    self.special_tokens,
+                )
+            except Exception:
+                self._ff_failed = True
+        if not tokens and self._inner is not None:
+            return self._inner.forced_tokens()
+        return tokens
+
+    def commit(self, token_ids):
+        if any(not 0 <= token < self.vocabulary for token in token_ids):
+            raise ConstraintError("generated token is out of range")
+        # The delegate consumes the same tokens for its mask bookkeeping;
+        # its own forced-token answer is superseded by the DFA mirror's.
+        if self._inner is not None:
+            self._inner.commit(token_ids)
+        with self._lock:
+            if self._inner is None:
+                self._committed.append(tuple(token_ids))
+            if not self._ff_failed:
+                try:
+                    self._advance_mirror(token_ids)
+                except Exception:
+                    self._ff_failed = True
+            return self.forced_tokens()
+
+    def _foreign_stop(self, state, token_id):
+        """A special token the DFA cannot consume at an EOS-admitting state:
+        the engine's own stop set can drift from the grammar's eos list
+        (engine stop spellings are always special tokens), so the mirror
+        maps the token to the stop state rather than erroring."""
+        if (
+            token_id in self.special_tokens
+            and state < self.dfa.n_states
+            and (self.dfa.is_accepting(state) or self.dfa._eos_ok(state))
+        ):
+            return self.dfa.n_states
+        return -1
+
+    def _advance_mirror(self, token_ids):
+        for token_id in token_ids:
+            if self._mirror_stopped:
+                raise ConstraintError("token after end of output")
+            state = self._advance(self._mirror, token_id)
+            if state < 0:
+                state = self._foreign_stop(self._mirror, token_id)
+            if state < 0:
+                raise ConstraintError("invalid token")
+            if state == self.dfa.n_states:
+                self._mirror_stopped = True
+            else:
+                self._mirror = state
+
+    def finish(self):
+        """Checks the tokens generated after the last mask reached an
+        accepting state."""
+        if self._inner is not None:
+            self._inner.finish()
+            return
+        self._consume_committed()
+        if not self._stopped and not self.dfa.is_accepting(self._state):
+            raise ConstraintError("output grammar did not reach an accepting state")
+
+    def masks(self, simulation_tokens):
+        if self._inner is not None:
+            return self._inner.masks(simulation_tokens)
+        self._consume_committed()
+        if (
+            not simulation_tokens
+            and not self._advanced
+            and self._initial_mask is not None
+        ):
+            return self._initial_mask
+        if len(simulation_tokens) >= self.MAX_ROWS:
+            raise ConstraintError("too many simulation tokens")
+        rows = len(simulation_tokens) + 1
+        words = self._words
+        mask = array.array("I", [0] * (rows * words))
+        # Rows before and after each simulated token; simulation stops at
+        # the first invalid token and its row repeats for the rest.
+        states = [self._state]
+        cursor = self._state
+        for token_id in simulation_tokens:
+            if not 0 <= token_id < self.vocabulary:
+                break
+            cursor = self._advance(cursor, token_id)
+            if cursor < 0:
+                break
+            states.append(cursor)
+        for row in range(len(states)):
+            state = states[row]
+            allowed = (
+                self.dfa.masks_for_state(
+                    state, self.vocab_tokens, self._eos, self.special_tokens
+                )
+                if state < self.dfa.n_states
+                else []
+            )
+            if not allowed:
+                raise ConstraintError("output grammar has no valid token")
+            base = row * words
+            for token_id in allowed:
+                mask[base + (token_id >> 5)] |= 1 << (token_id & 31)
+        if len(states) < rows:
+            mask[len(states) * words :] = mask[(len(states) - 1) * words : len(states) * words]
+        return mask.tobytes()
+
+    def _consume_committed(self):
+        with self._lock:
+            batches, self._committed = self._committed, []
+        if batches:
+            self._advanced = True
+        for token_ids in batches:
+            for token_id in token_ids:
+                if self._stopped:
+                    raise ConstraintError("token after end of output")
+                state = self._advance(self._state, token_id)
+                if state < 0:
+                    state = self._foreign_stop(self._state, token_id)
+                if state < 0:
+                    raise ConstraintError("invalid token")
+                if state == self.dfa.n_states:
+                    self._stopped = True
+                else:
+                    self._state = state
 
 
 def validate_tokenizer(tokenizer, config, serving=None):
@@ -334,6 +645,7 @@ class ConstraintFactory:
 
     def __init__(self, tokenizer, contract):
         self.contract = contract
+        self.hf_tokenizer = tokenizer
         self.tokenizer = guidance_tokenizer(
             tokenizer,
             n_vocab=contract.vocabulary,
@@ -347,6 +659,94 @@ class ConstraintFactory:
         self.pending = {}
         self.hits = 0
         self.misses = 0
+        # Compiled DFAs keyed by the grammar string (a deterministic product
+        # of the spec); False marks a spec outside the DFA-compilable subset
+        # so fallback requests do not pay the compiler each time.
+        self._dfa_cache = OrderedDict()
+        # The vocabulary's token bytes and special-token ids, for DFA
+        # constraints; computed once, on first use.
+        self._vocab = None
+
+    def _vocabulary(self):
+        if self._vocab is None:
+            vocab_tokens = _vocab_token_bytes(
+                self.hf_tokenizer, self.contract.vocabulary
+            )
+            special = frozenset(
+                token_id
+                for token_id in range(self.contract.vocabulary)
+                if self.tokenizer.is_special_token(token_id)
+            )
+            self._vocab = vocab_tokens, special
+        return self._vocab
+
+    def create_dfa(self, spec, grammar, *, timeout=None, prefixes=None):
+        """A DFA constraint for `spec`, or None where the spec is outside the
+        DFA-compilable subset — the caller then takes the grammar path.
+
+        The compiled DFA rides to the engine as a CONSTRAINT_DFA sidecar
+        for on-device forced spans (and, under RICHENGINE_DFA_MODE=full,
+        masks); the constraint itself serves masks(), commits and the
+        finishing check through a TokenConstraint on `grammar`, the same
+        grammar the llguidance path would compile."""
+        if os.environ.get("RICHENGINE_DISABLE_DFA") or dfa_mode() == "off":
+            return None
+        with self.lock:
+            cached = self._dfa_cache.get(grammar)
+            if cached is not None:
+                self._dfa_cache.move_to_end(grammar)
+        if cached is None:
+            vocab_tokens, special = self._vocabulary()
+            markers = tuple(
+                bytes
+                for token_id, bytes in enumerate(vocab_tokens)
+                if token_id in special and bytes
+            )
+            compiled = dfa_compiler.compile_dfa(spec, markers)
+            with self.lock:
+                existing = self._dfa_cache.setdefault(grammar, compiled or False)
+                self._dfa_cache.move_to_end(grammar)
+                while len(self._dfa_cache) > self.CACHE_SIZE:
+                    self._dfa_cache.popitem(last=False)
+            cached = existing
+        if cached is False:
+            return None
+        compiled = cached
+        vocab_tokens, special = self._vocabulary()
+        try:
+            matcher, initial_mask = self._matcher(grammar, timeout, prefixes)
+        except Exception:
+            # No DFA ships without its delegate: the grammar path the
+            # caller falls back to compiles it and reports the real error.
+            return None
+        for tokens, _message in prefixes() if prefixes else ():
+            state = 0
+            for token_id in tokens:
+                state = compiled.advance_token(
+                    state, token_id, vocab_tokens, self.contract.eos_tokens, special
+                )
+                if state < 0:
+                    break
+            if state < 0:
+                # The delegate grammar accepted this opening, so the DFA is
+                # the stricter read; the caller's grammar fallback validates
+                # the real capability rather than refusing on a mismatch.
+                return None
+        encode = getattr(self.hf_tokenizer, "encode", None)
+        return DfaConstraint(
+            compiled,
+            vocab_tokens,
+            special,
+            self.contract,
+            encode=encode,
+            inner=TokenConstraint(
+                matcher.deep_copy(),
+                self.executor,
+                self.contract,
+                initial_mask,
+                encode=encode,
+            ),
+        )
 
     def create(self, grammar, *, timeout=None, prefixes=None):
         """`prefixes`, called when the grammar is compiled, returns pairs of
@@ -356,7 +756,11 @@ class ConstraintFactory:
         prompt has been processed."""
         matcher, initial_mask = self._matcher(grammar, timeout, prefixes)
         return TokenConstraint(
-            matcher.deep_copy(), self.executor, self.contract, initial_mask
+            matcher.deep_copy(),
+            self.executor,
+            self.contract,
+            initial_mask,
+            encode=getattr(self.hf_tokenizer, "encode", None),
         )
 
     def _compile_initial_mask(self, matcher):
@@ -401,8 +805,28 @@ class ConstraintFactory:
             if matcher.is_error():
                 raise _grammar_error(matcher.get_error())
             for tokens, message in prefixes() if prefixes else ():
-                if not matcher.deep_copy().consume_tokens(tokens):
-                    raise APIError(400, message)
+                if matcher.deep_copy().consume_tokens(tokens):
+                    continue
+                # Name the token the grammar refuses, so the caller's
+                # generic message says where consumption stopped.
+                probe = matcher.deep_copy()
+                bad = next(
+                    (
+                        token_id
+                        for token_id in tokens
+                        if not probe.consume_tokens([token_id])
+                    ),
+                    None,
+                )
+                detail = ""
+                if bad is not None:
+                    spelling = self._vocabulary()[0][bad]
+                    detail = (
+                        f" at token {bad} {spelling!r}"
+                        if spelling
+                        else f" at token {bad}"
+                    )
+                raise APIError(400, f"{message}{detail}")
             initial_mask = self._compile_initial_mask(matcher)
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.

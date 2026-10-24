@@ -55,6 +55,11 @@ ModelDescriptor lfm2moe24BDescriptor(std::string name) {
   // the chain's wins without the tail's dead rows.
   descriptor.tuning.treeVerify = ModelTuning::TreeVerify::On;
   descriptor.tuning.proposalCap = 6;
+  // The 0.15 break-even was measured on a dense 2B draft. On this sparse-MoE
+  // target a 16-row verify saturates the 64-expert union — the drafted step
+  // costs ~6x an anchor step — so a lane whose acceptance EWMA can't promise
+  // at least ~2 tokens decodes anchor-only (exact greedy) instead.
+  descriptor.tuning.draftBypassExpect = 2.0;
   return descriptor;
 }
 

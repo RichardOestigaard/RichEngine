@@ -66,6 +66,11 @@ struct Tuning {
   bool ngramPredraft = true;        // RICHENGINE_NGRAM_PREDRAFT, =0 disables
   bool draftBypass = true;          // RICHENGINE_DRAFT_BYPASS, =0 disables
   bool gpuPredraft = true;          // RICHENGINE_GPU_PREDRAFT, =0 disables
+  // GPU-DFA constraint scope (model/RuntimeImpl.hpp): "full" computes the
+  // lane's masks and forced spans on the GPU, "forced" keeps the host mask
+  // round trip and only derives forced spans and the automaton state
+  // on-device, "off" drops every DFA. Anything else is "full".
+  std::string_view dfaMode;         // RICHENGINE_DFA_MODE
   double draftBypassExpect = 0.15;  // RICHENGINE_DRAFT_BYPASS_EXPECT
   double ngramDraftExpect = 4.0;    // RICHENGINE_NGRAM_DRAFT_EXPECT
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
@@ -193,6 +198,7 @@ inline Tuning makeTuning() {
   t.ngramPredraft = unlessZero("RICHENGINE_NGRAM_PREDRAFT");
   t.draftBypass = unlessZero("RICHENGINE_DRAFT_BYPASS");
   t.gpuPredraft = unlessZero("RICHENGINE_GPU_PREDRAFT");
+  t.dfaMode = stringOrEmpty("RICHENGINE_DFA_MODE");
   t.draftBypassExpectSet = envFlag("RICHENGINE_DRAFT_BYPASS_EXPECT");
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
   t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");

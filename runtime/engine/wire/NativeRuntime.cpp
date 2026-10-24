@@ -229,6 +229,12 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleCancel(typed);
         } else if constexpr (std::is_same_v<T, protocol::MaskResponseFrame>) {
           return handleMask(typed);
+        } else if constexpr (std::is_same_v<T, protocol::ForcedTokensFrame>) {
+          return handleForcedTokens(typed);
+        } else if constexpr (std::is_same_v<T, protocol::ConstraintDfaFrame>) {
+          return handleConstraintDfa(typed);
+        } else if constexpr (std::is_same_v<T, protocol::VocabularyFrame>) {
+          return handleVocabulary(typed);
         } else {
           return handleStatus(typed);
         }
@@ -305,6 +311,10 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
     // A CPU mask calculation can finish after the request ends.
     return true;
   }
+  if (gpuMaskRequests_.contains(mask.requestId)) {
+    // The GPU computes this request's masks now; a stale response is noise.
+    return true;
+  }
   auto found = pendingMasks_.find(mask.requestId);
   if (found == pendingMasks_.end() ||
       found->second.maskRequestId != mask.maskRequestId ||
@@ -317,6 +327,35 @@ bool NativeRuntime::handleMask(const protocol::MaskResponseFrame &mask) {
   // request there, and its failure event erases the same entry.
   pendingMasks_.erase(found);
   core_.provideMask(mask.requestId, mask.maskWords);
+  return true;
+}
+
+bool NativeRuntime::handleForcedTokens(
+    const protocol::ForcedTokensFrame &forced) {
+  // A span arriving after its request ended is stale; drop it silently.
+  if (!telemetry_.contains(forced.requestId))
+    return true;
+  core_.provideForcedTokens(forced.requestId, forced.tokens);
+  return true;
+}
+
+bool NativeRuntime::handleConstraintDfa(
+    const protocol::ConstraintDfaFrame &dfa) {
+  // A DFA arriving after its request ended is stale; drop it silently and
+  // the host-mask fallback continues.
+  if (!telemetry_.contains(dfa.requestId))
+    return true;
+  if (core_.provideDfa(dfa.requestId, dfa.table, dfa.accepting, dfa.marker,
+                        dfa.eosIds))
+    gpuMaskRequests_.insert(dfa.requestId);
+  return true;
+}
+
+bool NativeRuntime::handleVocabulary(
+    const protocol::VocabularyFrame &vocabulary) {
+  // Process-wide: resent after a restart, applied to whatever runs next.
+  core_.setVocabulary(vocabulary.tokenBytes, vocabulary.tokenOffsets,
+                      vocabulary.specialBits);
   return true;
 }
 
@@ -519,6 +558,7 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
 
 void NativeRuntime::ended(uint64_t requestId, double now) {
   pendingMasks_.erase(requestId);
+  gpuMaskRequests_.erase(requestId);
   telemetry_.erase(requestId);
   idleSinceMilliseconds_ = now;
   if (telemetry_.empty() && config_.holdingRequests)

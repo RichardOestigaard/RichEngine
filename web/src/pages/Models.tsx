@@ -3,6 +3,7 @@ import type { JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { api, apiPost, authorization, curlExample, errorText, storageGet, storageSet } from "../api";
 import { Chart } from "../Chart";
+import type { ChartAppend } from "../Chart";
 import { fmtBytes, fmtInt, fmtMs, fmtTokens, pct, rate } from "../format";
 import { installJob, onInstallDone, pollInstall, setInstallJob } from "../install";
 import type { InstallJob } from "../install";
@@ -298,6 +299,10 @@ const [history, setHistory] = createSignal<{
   prefill: number[];
   memory: number[];
 }>({ decode: [], prefill: [], memory: [] });
+let historyIndex = 0;
+
+const indexRange = (length: number) =>
+  Array.from({ length }, (_, i) => historyIndex - length + i + 1);
 
 /* ---- page ---- */
 
@@ -307,6 +312,10 @@ export default function Models() {
   const [error, setError] = createSignal<string | null>(null);
   const [modelsError, setModelsError] = createSignal<string | null>(null);
   const [paused, setPaused] = createSignal(false);
+  const [performanceAppend, setPerformanceAppend] =
+    createSignal<ChartAppend | null>(null);
+  const [memoryAppend, setMemoryAppend] =
+    createSignal<ChartAppend | null>(null);
   const [metricsText, setMetricsText] = createSignal<string | null>(null);
   const [available, setAvailable] = createSignal<AvailableModel[] | null>(null);
   const [availableError, setAvailableError] = createSignal<string | null>(null);
@@ -339,11 +348,17 @@ export default function Models() {
       setStatus(next);
       setError(null);
       markOk();
+      const decode = next.metrics?.decode_tokens_per_second ?? 0;
+      const prefill = next.metrics?.prefill_tokens_per_second ?? 0;
+      const memory = next.memory_actual?.current_bytes ?? 0;
+      historyIndex++;
       setHistory((h) => ({
-        decode: [...h.decode, next.metrics?.decode_tokens_per_second ?? 0].slice(-60),
-        prefill: [...h.prefill, next.metrics?.prefill_tokens_per_second ?? 0].slice(-60),
-        memory: [...h.memory, next.memory_actual?.current_bytes ?? 0].slice(-60),
+        decode: [...h.decode, decode].slice(-60),
+        prefill: [...h.prefill, prefill].slice(-60),
+        memory: [...h.memory, memory].slice(-60),
       }));
+      setPerformanceAppend({ x: historyIndex, y: [decode, prefill] });
+      setMemoryAppend({ x: historyIndex, y: memory });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -1263,17 +1278,19 @@ export default function Models() {
                 <Chart
                   type="area"
                   height={140}
-                  series={[
-                    { name: "decode tok/s", data: history().decode },
-                    { name: "prefill tok/s", data: history().prefill },
-                  ]}
+                  data={{
+                    x: indexRange(history().decode.length),
+                    series: [
+                      { label: "decode tok/s", y: history().decode },
+                      { label: "prefill tok/s", y: history().prefill },
+                    ],
+                  }}
+                  append={performanceAppend()}
                   options={{
-                    legend: { show: true, position: "top", horizontalAlign: "right" },
-                    xaxis: { labels: { show: false } },
-                    yaxis: {
-                      min: 0,
-                      labels: { formatter: (v: number) => fmtInt(v) },
-                    },
+                    legend: true,
+                    labels: { x: () => "", y: fmtInt },
+                    window: 60,
+                    yMin: 0,
                   }}
                 />
               </div>
@@ -1293,33 +1310,29 @@ export default function Models() {
                 <Chart
                   type="bar"
                   height={110}
-                  series={[
-                    {
-                      name: "p50",
-                      data: [
-                        s().metrics?.ttft_ms?.p50 ?? 0,
-                        s().metrics?.itl_ms?.p50 ?? 0,
-                      ],
-                    },
-                    {
-                      name: "p95",
-                      data: [
-                        s().metrics?.ttft_ms?.p95 ?? 0,
-                        s().metrics?.itl_ms?.p95 ?? 0,
-                      ],
-                    },
-                  ]}
+                  data={{
+                    categories: ["TTFT", "ITL"],
+                    series: [
+                      {
+                        label: "p50",
+                        values: [
+                          s().metrics?.ttft_ms?.p50 ?? 0,
+                          s().metrics?.itl_ms?.p50 ?? 0,
+                        ],
+                      },
+                      {
+                        label: "p95",
+                        values: [
+                          s().metrics?.ttft_ms?.p95 ?? 0,
+                          s().metrics?.itl_ms?.p95 ?? 0,
+                        ],
+                      },
+                    ],
+                  }}
                   options={{
-                    plotOptions: {
-                      bar: { horizontal: true, borderRadius: 3, barHeight: "60%" },
-                    },
-                    fill: { opacity: 0.9 },
-                    legend: { show: true, position: "top", horizontalAlign: "right" },
-                    xaxis: {
-                      categories: ["TTFT", "ITL"],
-                      labels: { formatter: (v: string) => fmtMs(Number(v)) },
-                    },
-                    tooltip: { y: { formatter: (v: number) => fmtMs(v) } },
+                    legend: true,
+                    labels: { y: fmtMs },
+                    yMin: 0,
                   }}
                 />
               </div>
@@ -1351,26 +1364,21 @@ export default function Models() {
                 <Chart
                   type="bar"
                   height={90}
-                  series={[
-                    {
-                      name: "batches",
-                      data: [
-                        s().scheduler?.decode_batches_by_width?.b1 ?? 0,
-                        s().scheduler?.decode_batches_by_width?.b2 ?? 0,
-                        s().scheduler?.decode_batches_by_width?.b3 ?? 0,
-                        s().scheduler?.decode_batches_by_width?.b4 ?? 0,
-                      ],
-                    },
-                  ]}
-                  options={{
-                    plotOptions: { bar: { borderRadius: 3, columnWidth: "55%" } },
-                    fill: { opacity: 0.9 },
-                    xaxis: { categories: ["b1", "b2", "b3", "b4"] },
-                    yaxis: {
-                      min: 0,
-                      labels: { formatter: (v: number) => fmtInt(v) },
-                    },
+                  data={{
+                    categories: ["b1", "b2", "b3", "b4"],
+                    series: [
+                      {
+                        label: "batches",
+                        values: [
+                          s().scheduler?.decode_batches_by_width?.b1 ?? 0,
+                          s().scheduler?.decode_batches_by_width?.b2 ?? 0,
+                          s().scheduler?.decode_batches_by_width?.b3 ?? 0,
+                          s().scheduler?.decode_batches_by_width?.b4 ?? 0,
+                        ],
+                      },
+                    ],
                   }}
+                  options={{ labels: { y: fmtInt }, yMin: 0 }}
                 />
               </div>
             </Show>
@@ -1436,14 +1444,15 @@ export default function Models() {
                 <Chart
                   type="area"
                   height={120}
-                  series={[{ name: "bytes", data: history().memory }]}
+                  data={{
+                    x: indexRange(history().memory.length),
+                    series: [{ label: "bytes", y: history().memory }],
+                  }}
+                  append={memoryAppend()}
                   options={{
-                    xaxis: { labels: { show: false } },
-                    yaxis: {
-                      min: 0,
-                      labels: { formatter: (v: number) => fmtBytes(v) },
-                    },
-                    tooltip: { y: { formatter: (v: number) => fmtBytes(v) } },
+                    labels: { x: () => "", y: fmtBytes },
+                    window: 60,
+                    yMin: 0,
                   }}
                 />
               </div>
@@ -1579,18 +1588,11 @@ export default function Models() {
                     <Chart
                       type="bar"
                       height={80}
-                      series={[{ name: stage.name, data: stage.data }]}
-                      options={{
-                        plotOptions: {
-                          bar: { borderRadius: 2, columnWidth: "60%" },
-                        },
-                        fill: { opacity: 0.9 },
-                        xaxis: { categories: stage.cats },
-                        yaxis: {
-                          min: 0,
-                          labels: { formatter: (v: number) => fmtInt(v) },
-                        },
+                      data={{
+                        categories: stage.cats,
+                        series: [{ label: stage.name, values: stage.data }],
                       }}
+                      options={{ labels: { y: fmtInt }, yMin: 0 }}
                     />
                   </div>
                 </div>

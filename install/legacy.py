@@ -385,8 +385,8 @@ def resolve_snapshot(repo_id: str):
         raise models.ModelError(
             "missing dependency huggingface_hub; reinstall RichEngine"
         ) from error
-    import httpx
     from huggingface_hub.errors import OfflineModeIsEnabled
+    from huggingface_hub.utils import httpx
 
     try:
         return _download_snapshot(repo_id, token)

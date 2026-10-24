@@ -134,6 +134,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::ContextKv,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.draft.contextKvSize()));
+  put(PrefillTensor::ContextQkv,
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.qkvSize));
   put(PrefillTensor::DraftRopeCos,
       bytesFor<float>(uint64_t{kPrefillRows} *
                       geometry.draftRotaryPairs()));
@@ -155,6 +157,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::LinearRotated, linear.rotated);
     put(PrefillTensor::LinearPacked, linear.input);
     put(PrefillTensor::LinearExponents, linear.sums);
+  }
+  // The draft's context K/V commits run decode plans (DSparkDraft::addContextPrefill).
+  if (geometry.draft.contextKvSize()) {
+    const ops::LinearScratchSize draft = operators.linear().decodeScratchSize(
+        {geometry.draft.contextKvSize(), geometry.draft.hiddenSize});
+    put(PrefillTensor::LinearPartials, draft.partials);
+    put(PrefillTensor::LinearCounters, draft.counters);
+    put(PrefillTensor::LinearPacked, draft.input);
+    put(PrefillTensor::LinearExponents, draft.sums);
   }
   if (modelPolicy().prefillFastInt8) {
     const uint64_t inputWidth =

@@ -19,7 +19,9 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/Dfa.h"
 #include "ops/Embedding.hpp"
+#include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
@@ -236,6 +238,17 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // Every state lane's penalty words, bound whole: a batch lane reads the row
   // of its request's state lane, which need not be its own.
   MetalBuffer penaltyTable;
+  // The process-wide packed token vocabulary (VOCABULARY frame) the GPU-DFA
+  // walk kernels index; a request's DFA is dropped while this is absent.
+  struct PackedVocab final {
+    MetalBuffer bytes;
+    MetalBuffer offsets;
+    // Bit t names token t special: the marker rule requires its walk to
+    // take a marked edge and forbids a regular token from taking one.
+    MetalBuffer special;
+    uint32_t vocab = 0;
+  };
+  std::optional<PackedVocab> packedVocab_;
   std::unordered_map<uint64_t, Request> requests;
   // Allocated for images that need an encode, sized for the largest one the
   // start that built it staged, and reclaimable once no image waits for one
@@ -857,6 +870,147 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::ranges::fill(constraintMasks(lane),
                       std::numeric_limits<uint32_t>::max());
   }
+  // The whole DfaState table: one u32 automaton state per state lane.
+  std::span<uint32_t> dfaStateTable() const {
+    const MetalBuffer table =
+        decodeArena->packed(DecodeTensor::DfaState, kLaneCount);
+    return {contents<uint32_t>(table, "dfa states"), kLaneCount};
+  }
+  // Uploads a DFA lane's host-mirrored automaton state to its state-lane
+  // slot when the mirror is newer (at provideDfa and after a suspension);
+  // between those moments decode_dfa_advance keeps the slot authoritative.
+  void syncDfaState(Request &entry) const {
+    if (!entry.dfaStateDirty)
+      return;
+    dfaStateTable()[entry.stateLane] = entry.dfaState;
+    entry.dfaStateDirty = false;
+  }
+  // suspend()'s readback: the GPU slot becomes the host mirror's value for
+  // whatever lane the resume lands on. A mirror already newer than the slot
+  // (the DFA never ran a round on this lane) is kept instead.
+  void readbackDfaState(Request &entry) const {
+    if (!entry.dfaStateDirty)
+      entry.dfaState = dfaStateTable()[entry.stateLane];
+    entry.dfaStateDirty = true;
+  }
+  // Bit i set for each dispatch lane whose request carries a GPU DFA.
+  [[nodiscard]] uint32_t
+  dfaLaneMask(std::span<Request *const> entries) const {
+    uint32_t mask = 0;
+    for (uint32_t lane = 0; lane < entries.size(); ++lane)
+      if (entries[lane]->dfa)
+        mask |= uint32_t{1} << lane;
+    return mask;
+  }
+  // RICHENGINE_DFA_MODE scopes what an installed DFA drives: Full computes
+  // the lane's masks and forced spans on the GPU, Forced keeps the host
+  // mask round trip and only derives forced spans and the automaton state
+  // on-device, Off drops every DFA in provideDfa and stays on the host
+  // path entirely.
+  enum class DfaMode : uint8_t { Off, Forced, Full };
+  static DfaMode dfaModeFromEnv() {
+    const std::string_view mode = tuning().dfaMode;
+    // Opt-in: GPU masks lose to the host round trip inside a 16-row verify
+    // loop, so DFA lanes stay on the host path unless asked.
+    if (mode == "forced")
+      return DfaMode::Forced;
+    if (mode == "full")
+      return DfaMode::Full;
+    return DfaMode::Off;
+  }
+  const DfaMode dfaMode_ = dfaModeFromEnv();
+  // Whether the entry's masks come from the DFA walk kernels rather than a
+  // host mask request: only a Full-mode DFA lane skips the round trip.
+  bool gpuDfaMasks(const Request &entry) const noexcept {
+    return dfaMode_ == DfaMode::Full && entry.dfa.has_value();
+  }
+  // gpuDfaMasks over a dispatch: the lanes whose DfaNextStates rows the
+  // selection kernels read instead of a constraint bitmask.
+  [[nodiscard]] uint32_t
+  gpuDfaLaneMask(std::span<Request *const> entries) const {
+    return dfaMode_ == DfaMode::Full ? dfaLaneMask(entries) : 0;
+  }
+  // The greedy lanes of gpuDfaLaneMask, minus any skipped ones: their
+  // rounds run the truncation/correction pipeline — an unmasked argmax
+  // pass, one truncation row per lane, one masked correction row — while
+  // a sampled DFA lane keeps the full next-state rows.
+  [[nodiscard]] uint32_t
+  greedyDfaLaneMask(std::span<Request *const> entries,
+                    uint32_t skip = 0) const {
+    const uint32_t mask = gpuDfaLaneMask(entries) & ~skip;
+    uint32_t result = 0;
+    for (uint32_t lane = 0; lane < entries.size(); ++lane)
+      if ((mask & (uint32_t{1} << lane)) &&
+          !samplingPolicy(*entries[lane]).samples())
+        result |= uint32_t{1} << lane;
+    return result;
+  }
+  // Which per-lane DFA buffer a kernel binds.
+  enum class DfaBufferKind : uint8_t { Table, Accept, Marker };
+  // Each dispatch lane's DFA table, accepting bitset or marker mask
+  // buffer; lanes without one rebind the first DFA lane's and are masked
+  // out. Call only while dfaLaneMask is nonzero.
+  [[nodiscard]] std::array<MetalBuffer, kLaneCount>
+  dfaBuffers(std::span<Request *const> entries, DfaBufferKind kind);
+  // Drops a state lane's pending GPU-forced span (suspend/end/DFA replace):
+  // it was derived from the state that lane's request then held.
+  void clearDfaForced(uint32_t stateLane) const {
+    contents<DfaForcedSpan>(
+        decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
+        "dfa forced spans")[stateLane]
+        .tokens = 0;
+  }
+  // A state lane's GPU-forced span for the next round, written by the commit
+  // stage's decode_dfa_forced_* kernels and consumed by the next constrained
+  // batch's draft stage.
+  DfaForcedSpan &dfaForcedSpan(uint32_t stateLane) const {
+    return contents<DfaForcedSpan>(
+        decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
+        "dfa forced spans")[stateLane];
+  }
+  // The DFA lanes' chain + mask dispatches, encoded after the verify-input
+  // tokens pass of the same graph: chain walks the packed InputTokens into
+  // DfaRowStates and mask fills the lanes' DfaNextStates rows — each token's
+  // post-walk state or -1, one row per live verify row plus the anchor's.
+  void encodeDfaMasks(CommandGraph &graph, std::span<Request *const> entries,
+                      uint32_t lanes, std::span<const uint32_t> liveRows);
+  // The greedy DFA lanes' truncation pass (decode_dfa_truncate), encoded
+  // after the unmasked selection: names each lane's correction row and
+  // patches its GPU forced-span prefix into the selected tokens.
+  // proposals caps each lane's compare at the acceptance limit and
+  // gpuForced is its GPU-span forced prefix length (0 when the round's
+  // proposals did not come from a DfaForcedSpan).
+  void encodeDfaTruncation(CommandGraph &graph, uint32_t lanes,
+                           uint32_t laneMask,
+                           std::span<const uint32_t> proposals,
+                           std::span<const uint32_t> gpuForced);
+  // The single next-state row each greedy DFA lane's correction needs:
+  // decode_dfa_mask in indexed mode writes only mask row trunc+1.
+  void encodeDfaCorrectionMasks(CommandGraph &graph,
+                                std::span<Request *const> entries,
+                                uint32_t lanes, uint32_t laneMask);
+  // The masked argmax at each greedy DFA lane's truncation row, the
+  // round's correction or bonus token (decode_dfa_argmax_*).
+  void encodeDfaCorrections(CommandGraph &graph,
+                            std::span<Request *const> entries,
+                            uint32_t lanes, uint32_t laneMask,
+                            std::span<const uint32_t> liveRows);
+  // After acceptance: each DFA lane's persistent automaton state advances
+  // by its committed tokens (the anchor plus retained outputs minus the new
+  // anchor), ready for the next round's row-0 state.
+  void encodeDfaAdvance(CommandGraph &graph,
+                        std::span<Request *const> entries, uint32_t lanes);
+  // After the state advance, each DFA lane's threadgroup derives the next
+  // round's forced-token span on-device into the state lane's DfaForcedSpan
+  // (and the dispatch lane's ProposedTokens).
+  void encodeDfaForced(CommandGraph &graph,
+                       std::span<Request *const> entries, uint32_t lanes);
+  // The initial selection's row-0 mask for each DFA lane: the host writes
+  // the lane's mirrored state into its DfaRowStates row 0 first, then the
+  // mask dispatch produces one next-state row.
+  void encodeDfaInitialMasks(CommandGraph &graph,
+                             std::span<Request *const> entries,
+                             uint32_t lanes);
   static ops::SamplingPenalties samplingPenalties(const Request &entry) noexcept {
     return {entry.sampling.repetitionPenalty, entry.sampling.presencePenalty,
             entry.sampling.frequencyPenalty};
@@ -1008,14 +1162,19 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       return;
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
+    ops::SamplingBuffers buffers = samplingBuffers(width);
     for (const InitialSelection &lane : lanes) {
       if (!lane.select)
         continue;
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
+      // A GPU-masked DFA lane's row-0 admission lives in its next-state
+      // table; other lanes read a constraint bitmask.
+      if (gpuDfaMasks(*lane.entry))
+        buffers.dfaLanes |= uint32_t{1} << lane.lane;
     }
     sampling.addInitial(graph, std::span(policies).first(width),
-                        samplingBuffers(width), 0,
+                        buffers, 0,
                         geometry.target.stopTokens[0],
                         geometry.target.stopTokens[1],
                         {penaltyTable, std::span(stateLanes).first(width)});
@@ -1035,11 +1194,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                          std::function<void()> completion) {
     const uint32_t width = static_cast<uint32_t>(items.size());
     std::array<InitialSelection, kLaneCount> selections{};
+    std::array<Request *, kLaneCount> entries{};
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = request(items[lane].requestId);
+      const bool gpuMask = gpuDfaMasks(entry);
       if (entry.decodeStage != DecodeStage::ApplyInitialMask ||
           entry.pendingToken ||
-          entry.maskWords.size() != geometry.maskWords() ||
+          (gpuMask ? !entry.maskWords.empty()
+                   : entry.maskWords.size() != geometry.maskWords()) ||
           entry.finalTargetHidden.size() != geometry.target.hiddenSize) {
         throw std::logic_error("initial selection state is invalid");
       }
@@ -1049,10 +1211,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                             "final prompt hidden"));
       if (samplingEnabled(entry))
         uploadInitialUniform(entry, lane);
-      uploadConstraintMasks(lane, entry.maskWords);
+      if (!gpuMask)
+        uploadConstraintMasks(lane, entry.maskWords);
       selections[lane] = {&entry, lane, true};
+      entries[lane] = &entry;
     }
     CommandGraph graph;
+    // GPU-DFA lanes' row-0 masks come from the walk kernels, concurrent
+    // with the head's forward in the same command.
+    encodeDfaInitialMasks(graph, {entries.data(), width}, width);
     encodeInitialSelections(graph, std::span(selections).first(width), width);
     CommandTicket command =
         backend.submitCommandAsync(graph.dispatches(), std::move(completion));
@@ -1228,9 +1395,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         graph,
         {p(PrefillTensor::Captured), p(PrefillTensor::ProjectionSums),
          p(PrefillTensor::ContextProjected), p(PrefillTensor::ContextHidden),
-         p(PrefillTensor::ContextKv), p(PrefillTensor::DraftRopeCos),
+         p(PrefillTensor::ContextKv), p(PrefillTensor::ContextQkv),
+         p(PrefillTensor::DraftRopeCos),
          p(PrefillTensor::DraftRopeSin),
-         {.i8codes = p(PrefillTensor::I8Codes),
+         {.partials = p(PrefillTensor::LinearPartials),
+          .counters = p(PrefillTensor::LinearCounters),
+          .i8codes = p(PrefillTensor::I8Codes),
           .i8codesLo = p(PrefillTensor::I8CodesLo),
           .i8params = p(PrefillTensor::I8Params),
           .i8paramsLo = p(PrefillTensor::I8ParamsLo)}},
@@ -1448,7 +1618,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
                                      std::span<Request *const> entries,
                                      bool tree = false,
-                                     std::span<const uint32_t> liveRows = {});
+                                     std::span<const uint32_t> liveRows = {},
+                                     uint32_t dfaLaneSkip = 0);
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items,
@@ -1457,7 +1628,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                              std::span<Request *const> lanes,
                              std::span<const uint32_t> maximumRetained,
                              bool tree = false,
-                             std::span<const uint32_t> proposals = {});
+                             std::span<const uint32_t> proposals = {},
+                             uint32_t truncLanes = 0);
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes,
                             uint32_t rowFactor = 1,
@@ -1577,6 +1749,109 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                 lane, static_cast<unsigned long long>(items[lane].logicalPosition), p.c_str(),
                 laneResult.retained, laneResult.accepted, t.c_str(),
                 static_cast<unsigned long long>(h0));
+        if (lane == 0) {
+          const uint16_t *cap = contents<uint16_t>(
+              d(DecodeTensor::CapturedTargetHidden), "captured hidden");
+          const auto bf2f = [](uint16_t b) {
+            uint32_t u = uint32_t(b) << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+          };
+          const uint16_t *dfh = contents<uint16_t>(
+              d(DecodeTensor::DraftFinalHidden), "draft final hidden");
+          uint32_t nans = 0;
+          for (uint32_t e = 0; e < 2048; ++e)
+            nans += !std::isfinite(bf2f(dfh[e]));
+          fprintf(stderr,
+                  "  cap0=[%.3f %.3f %.3f %.3f] dfh=[%.4f %.4f %.4f %.4f] nans=%u\n",
+                  bf2f(cap[0]), bf2f(cap[1]), bf2f(cap[2]), bf2f(cap[3]),
+                  bf2f(dfh[0]), bf2f(dfh[1]), bf2f(dfh[2]), bf2f(dfh[3]),
+                  nans);
+          Request &rq = request(items[lane].requestId);
+          const auto &ring = states.draft(rq.stateLane)[0];
+          const uint16_t *rk = contents<uint16_t>(ring.keys, "draft ring keys");
+          const uint64_t slot =
+              items[lane].logicalPosition > 0
+                  ? items[lane].logicalPosition - 1
+                  : 0;
+          const uint16_t *kv = rk + slot * 64;
+          fprintf(stderr, "  ring@%llu=[%.3f %.3f %.3f %.3f %.3f %.3f]\n",
+                  static_cast<unsigned long long>(slot), bf2f(kv[0]),
+                  bf2f(kv[1]), bf2f(kv[2]), bf2f(kv[3]), bf2f(kv[4]),
+                  bf2f(kv[5]));
+          const uint16_t *att = contents<uint16_t>(
+              d(DecodeTensor::DraftAttention), "draft attention out");
+          fprintf(stderr, "  att0=[%.3f %.3f %.3f %.3f]\n",
+                  bf2f(att[0]), bf2f(att[1]), bf2f(att[2]), bf2f(att[3]));
+          const uint32_t *tops = contents<uint32_t>(
+              d(DecodeTensor::TopPartialIds), "top partial ids");
+          const float *tps = contents<float>(
+              d(DecodeTensor::ProposalProbs), "proposal probs");
+          fprintf(stderr, "  tops=[%u %u %u %u %u %u] probs=[%.3f %.3f %.3f %.3f]\n",
+                  tops[0], tops[1], tops[2], tops[3], tops[4], tops[5],
+                  tps[0], tps[1], tps[2], tps[3]);
+          const uint16_t *pcap = contents<uint16_t>(
+              prefillArena->get(PrefillTensor::Captured), "prefill captured");
+          const uint32_t cw = geometry.target.capturedHiddenSize();
+          const uint16_t *r16 = pcap + size_t(slot) * cw;
+          fprintf(stderr, "  pcap@%llu=[%.4f %.4f %.4f %.4f] pcap@0=[%.4f %.4f %.4f %.4f]\n",
+                  static_cast<unsigned long long>(slot), bf2f(r16[0]),
+                  bf2f(r16[1]), bf2f(r16[2]), bf2f(r16[3]), bf2f(pcap[0]),
+                  bf2f(pcap[1]), bf2f(pcap[2]), bf2f(pcap[3]));
+          const uint16_t *pproj = contents<uint16_t>(
+              prefillArena->get(PrefillTensor::ContextProjected),
+              "prefill projected");
+          const uint16_t *pj = pproj + size_t(slot) * 2048;
+          fprintf(stderr, "  proj@%llu=[%.3f %.3f %.3f %.3f] proj@0=[%.3f %.3f %.3f %.3f]\n",
+                  static_cast<unsigned long long>(slot), bf2f(pj[0]),
+                  bf2f(pj[1]), bf2f(pj[2]), bf2f(pj[3]), bf2f(pproj[0]),
+                  bf2f(pproj[1]), bf2f(pproj[2]), bf2f(pproj[3]));
+          const uint16_t *pkv = contents<uint16_t>(
+              prefillArena->get(PrefillTensor::ContextKv), "prefill ctxkv");
+          const uint16_t *phid = contents<uint16_t>(
+              prefillArena->get(PrefillTensor::ContextHidden),
+              "prefill ctx hidden");
+          const uint16_t *kv16 = pkv + size_t(slot) * 1024;
+          const uint16_t *hd16 = phid + size_t(slot) * 2048;
+          fprintf(stderr, "  ctxhid@%llu=[%.3f %.3f %.3f %.3f] ctxkv@%llu=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]\n",
+                  static_cast<unsigned long long>(slot), bf2f(hd16[0]),
+                  bf2f(hd16[1]), bf2f(hd16[2]), bf2f(hd16[3]),
+                  static_cast<unsigned long long>(slot), bf2f(kv16[0]),
+                  bf2f(kv16[1]), bf2f(kv16[2]), bf2f(kv16[3]),
+                  bf2f(kv16[512]), bf2f(kv16[513]), bf2f(kv16[514]),
+                  bf2f(kv16[515]));
+          if (slot == 16) {
+            for (int what = 0; what < 3; ++what) {
+              const uint16_t *src = what == 2 ? r16 : (what ? hd16 : pj);
+              const uint32_t width = what == 2 ? cw : 2048;
+              char path[128];
+              snprintf(path, sizeof(path), "/tmp/engine_%s_%llu.bin",
+                       what == 2 ? "pcap" : (what ? "ctxhid" : "proj"),
+                       static_cast<unsigned long long>(slot));
+              FILE *f = fopen(path, "wb");
+              if (f) {
+                for (uint32_t i = 0; i < width; ++i) {
+                  float v = bf2f(src[i]);
+                  fwrite(&v, 4, 1, f);
+                }
+                fclose(f);
+              }
+            }
+            const float *rcos = contents<float>(
+                prefillArena->get(PrefillTensor::DraftRopeCos),
+                "draft rope cos");
+            const float *rsin = contents<float>(
+                prefillArena->get(PrefillTensor::DraftRopeSin),
+                "draft rope sin");
+            FILE *fr = fopen("/tmp/engine_rope_16.bin", "wb");
+            if (fr) {
+              fwrite(rcos + slot * 32, 4, 32, fr);
+              fwrite(rsin + slot * 32, 4, 32, fr);
+              fclose(fr);
+            }
+          }
+        }
       }
       // RICHENGINE_DRAFT_CONF: the confidence head ships loaded but unscored.
       // Score each emitted proposal three ways — its own markov_w1 and w2
@@ -1819,6 +2094,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         entry.maskWords.clear();
         entry.ngramInFlight = false;
         entry.verifyMaskInFlight = false;
+        entry.gpuMaskInFlight = false;
         results.push_back({.requestId = entry.id,
                            .failure = std::move(laneResult.failure)});
         continue;
@@ -1886,6 +2162,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
+      entry.gpuMaskInFlight = false;
       results.push_back(
           {entry.id, 0, std::move(output), false, DecodeStage::Regular,
            // A chain lane's drafted count is what verify could actually
@@ -1934,14 +2211,76 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
-          const uint32_t *proposed = contents<uint32_t>(
+          uint32_t *proposed = contents<uint32_t>(
               impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
               "constrained draft proposals");
           entry.maskWords.clear();
-          entry.verifyMaskInFlight = true;
+          // A Full-mode DFA lane's masks come from the walk kernels: no
+          // mask request goes out and verifyMaskInFlight stays clear, so
+          // stale host responses cannot corrupt it. A Forced-mode lane
+          // still takes the host round trip — verifyMaskInFlight — while
+          // gpuMaskInFlight guards suspension against the commit stage's
+          // automaton-state and forced-span writes either mode encodes.
+          gpuMask_[lane] = impl_.gpuDfaMasks(entry);
+          entry.gpuMaskInFlight = entry.dfa.has_value();
+          entry.verifyMaskInFlight = !gpuMask_[lane];
           entries[lane] = &entry;
 
-          if (!abandoned_[lane]) {
+          // A DFA lane's forced span comes from the commit stage's
+          // on-device derivation (Full and Forced modes alike): the state
+          // lane's DfaForcedSpan, written from the committed state itself —
+          // no anchor check applies — and consumed once. Host-pushed spans
+          // serve host-constrained lanes: its first token anchors it at the
+          // pending token, so a span whose anchor no longer matches is
+          // dropped unused.
+          forced_[lane] = 0;
+          gpuForced_[lane] = 0;
+          bool gpuSpan = false;
+          if (entry.dfa) {
+            DfaForcedSpan &span = impl_.dfaForcedSpan(entry.stateLane);
+            if (!abandoned_[lane] && entry.pendingToken && span.tokens) {
+              gpuSpan = true;
+              forced_[lane] = std::min<uint32_t>(
+                  span.tokens,
+                  std::min<uint32_t>(kDraftProposalTokens,
+                                     laneResult.maximumRetained - 1));
+              std::copy_n(span.token_ids, forced_[lane], proposed);
+              span.tokens = 0;
+              ++impl_.counters.gpuForcedSpansApplied;
+              impl_.counters.forcedTokensEmitted += forced_[lane];
+            }
+          }
+          // A span from the on-device derivation is byte-forced: the
+          // truncation pass auto-accepts its rows. A host-pushed span
+          // keeps the argmax check even on a DFA lane.
+          if (gpuSpan)
+            gpuForced_[lane] = forced_[lane];
+          if (!entry.forcedTokens.empty()) {
+            if (gpuSpan) {
+              // A host span racing the on-device derivation loses to it.
+              entry.forcedTokens.clear();
+              ++impl_.counters.forcedSpansDroppedStale;
+            } else {
+              // A DFA lane whose round produced no span still takes a host
+              // push; host-constrained lanes are served as before.
+              std::vector<uint32_t> span = std::move(entry.forcedTokens);
+              entry.forcedTokens.clear();
+              if (!abandoned_[lane] && entry.pendingToken && span.size() > 1 &&
+                  span.front() == *entry.pendingToken) {
+                forced_[lane] = std::min<uint32_t>(
+                    span.size() - 1,
+                    std::min<uint32_t>(kDraftProposalTokens,
+                                       laneResult.maximumRetained - 1));
+                std::copy_n(span.begin() + 1, forced_[lane], proposed);
+                ++impl_.counters.forcedSpansApplied;
+                impl_.counters.forcedTokensEmitted += forced_[lane];
+              } else {
+                ++impl_.counters.forcedSpansDroppedStale;
+              }
+            }
+          }
+
+          if (!abandoned_[lane] && !gpuMask_[lane]) {
             // The mask response is a fixed kDecodeRows+1 rows whatever the
             // live budget, so the simulation sends the table's full proposal
             // stride; slots a short-block draft never emitted are stale
@@ -1965,12 +2304,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         const uint32_t cap =
             modelPolicy().proposalCap.value_or(
                 impl_.geometry.draft.proposalLimit());
-        std::array<uint32_t, kLaneCount> liveRows{};
         for (uint32_t lane = 0; lane < width; ++lane) {
-          liveRows[lane] =
-              std::min(cap, lanes_[lane].maximumRetained - 1) + 1;
+          liveRows_[lane] = forced_[lane]
+                                ? forced_[lane] + 1
+                                : std::min(cap, lanes_[lane].maximumRetained - 1) +
+                                      1;
         }
-        impl_.encodeBatchVerifyInput(target, width, {liveRows.data(), width});
+        impl_.encodeBatchVerifyInput(target, width, {liveRows_.data(), width});
+        impl_.encodeDfaMasks(target, {entries.data(), width}, width,
+                             {liveRows_.data(), width});
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    DecodeTensor::Hidden0, width, 1,
                                    impl_.geometry.draft.verifyRows());
@@ -1991,8 +2333,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       if (stage_ == Stage::WaitingMask) {
         bool masksReady = true;
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
-          masksReady = masksReady && (abandoned_[lane] ||
-                                      !lanes_[lane].request->maskWords.empty());
+          masksReady = masksReady &&
+                       (abandoned_[lane] || gpuMask_[lane] ||
+                        !lanes_[lane].request->maskWords.empty());
         }
         if (masksReady) {
           maskWaitSeconds_ +=
@@ -2003,6 +2346,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           std::array<Request *, kLaneCount> entries{};
           std::array<uint32_t, kLaneCount> maximumRetained{};
           std::array<uint32_t, kLaneCount> proposals{};
+          uint32_t dfaSkip = 0;
           const uint32_t cap =
               modelPolicy().proposalCap.value_or(
                   impl_.geometry.draft.proposalLimit());
@@ -2014,22 +2358,49 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             // Rows past a lane's live budget carry anchor duplicates; they
             // must never be retained, or the draft context commits a row
             // whose token its hidden state never saw.
-            proposals[lane] =
-                std::min(cap, laneResult.maximumRetained - 1);
+            proposals[lane] = forced_[lane]
+                                  ? forced_[lane]
+                                  : std::min(cap, laneResult.maximumRetained - 1);
             laneResult.proposals = proposals[lane];
             if (abandoned_[lane])
               impl_.admitEveryToken(lane);
-            else
+            else if (!gpuMask_[lane])
               impl_.uploadConstraintMasks(lane, entry.maskWords);
+            // An abandoned DFA lane falls back to the filled bitmask: the
+            // selection reads its next-state rows only while dfaLanes holds.
+            if (abandoned_[lane] && gpuMask_[lane])
+              dfaSkip |= uint32_t{1} << lane;
           }
 
           CommandGraph commit;
-          impl_.encodeTargetVerifyBatchPolicy(commit,
-                                              {entries.data(), lanes_.size()});
+          impl_.encodeTargetVerifyBatchPolicy(
+              commit, {entries.data(), lanes_.size()}, false,
+              {liveRows_.data(), lanes_.size()}, dfaSkip);
+          // Greedy Full-mode DFA lanes ran the unmasked pass: name each
+          // lane's correction row, write its single next-state row and
+          // take the masked argmax there; their accepted prefixes cap at
+          // the truncation rows in acceptance.
+          const uint32_t truncMask = impl_.greedyDfaLaneMask(
+              {entries.data(), lanes_.size()}, dfaSkip);
+          const uint32_t width =
+              static_cast<uint32_t>(lanes_.size());
+          impl_.encodeDfaTruncation(commit, width, truncMask,
+                                    {proposals.data(), lanes_.size()},
+                                    {gpuForced_.data(), lanes_.size()});
+          impl_.encodeDfaCorrectionMasks(
+              commit, {entries.data(), lanes_.size()}, width, truncMask);
+          impl_.encodeDfaCorrections(
+              commit, {entries.data(), lanes_.size()}, width, truncMask,
+              {liveRows_.data(), lanes_.size()});
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
                                       {maximumRetained.data(), lanes_.size()},
                                       false,
-                                      {proposals.data(), lanes_.size()});
+                                      {proposals.data(), lanes_.size()},
+                                      truncMask);
+          impl_.encodeDfaAdvance(commit, {entries.data(), lanes_.size()},
+                                 static_cast<uint32_t>(lanes_.size()));
+          impl_.encodeDfaForced(commit, {entries.data(), lanes_.size()},
+                                static_cast<uint32_t>(lanes_.size()));
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_);
@@ -2039,6 +2410,22 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
       return requests;
     }
+
+    // Forced tokens fed as proposals this cycle, per lane; zero means the
+    // lane runs the draft's own proposals.
+    std::array<uint32_t, kLaneCount> forced_{};
+    // Each lane's GPU-DfaForcedSpan prefix length — the rows the
+    // truncation pass auto-accepts — or zero when the lane's proposals
+    // did not come from the on-device derivation.
+    std::array<uint32_t, kLaneCount> gpuForced_{};
+    // Lanes whose masks the GPU-DFA kernels compute (Full mode): they
+    // never emit a ModelMaskRequest, and WaitingMask treats them as
+    // satisfied. A Forced-mode DFA lane keeps this clear: its masks still
+    // come from the host.
+    std::array<bool, kLaneCount> gpuMask_{};
+    // Each lane's live verify rows, computed in the Draft stage from its
+    // forced span or proposal budget and reused by the policy commit.
+    std::array<uint32_t, kLaneCount> liveRows_{};
 
     bool ownsMaskWait(uint64_t requestId) const noexcept override {
       if (stage_ == Stage::Draft || stage_ == Stage::Done)

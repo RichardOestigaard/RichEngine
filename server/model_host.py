@@ -19,8 +19,7 @@ from transformers import AutoTokenizer
 
 from . import images as image_input
 from . import runtime as engine_runtime
-from . import serve_options
-from . import serving
+from . import serve_options, serving
 from .backend import NativeBackend
 from .chat_templates import ChatTemplates
 from .constraints import ConstraintFactory, validate_tokenizer

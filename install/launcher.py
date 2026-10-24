@@ -1992,6 +1992,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     args = parse_args(argv)
     try:
         if args.command == "serve":

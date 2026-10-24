@@ -469,6 +469,15 @@ struct ModelTelemetry final {
   uint32_t lastDecodeWidth = 0;
   uint64_t constrainedMaskOverlapBatches = 0;
   uint64_t constrainedMaskOverlapRequests = 0;
+  // Forced-token spans consumed by the constrained decode ticket
+  // (ConstrainedDecodeTicket::takeMaskRequests): host-pushed FORCED_TOKENS
+  // spans that anchored and fed, spans dropped because their anchor no
+  // longer matched the pending token, the forced tokens fed as proposals
+  // across both sources, and GPU-derived DfaForcedSpan applications.
+  uint64_t forcedSpansApplied = 0;
+  uint64_t forcedSpansDroppedStale = 0;
+  uint64_t forcedTokensEmitted = 0;
+  uint64_t gpuForcedSpansApplied = 0;
   // Prefill chunks the GPU ran again alone once the Neural Engine split's
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
@@ -593,6 +602,32 @@ public:
   // Why this request's mask is unusable, or nothing when the model took it.
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;
+  // Grammar-forced tokens anchored at the lane's pending token; the model
+  // drops a stale or unmatched span. Default: unsupported, drops everything.
+  virtual void provideForcedTokens(uint64_t,
+                                   std::span<const uint32_t>) {}
+  // A compiled byte-DFA for one request's constraint: while the model holds
+  // it, decode derives the lane's automaton state and forced spans on the
+  // GPU — and under RICHENGINE_DFA_MODE=full its masks too. accepting is
+  // the EOS-admitting bitset (accepting ∪ free-text states), marker the
+  // per-state 256-bit special-only edge masks (32 bytes a state), eosIds
+  // the grammar's EOS token ids (≤ 8). True when the lane's masks are
+  // GPU-computed and no mask request may go to the host; a false return
+  // keeps the host-mask path (forced mode installs the DFA but reports
+  // false). Default: unsupported, drops it.
+  [[nodiscard]] virtual bool provideDfa(uint64_t, std::span<const int16_t>,
+                                        std::span<const uint8_t>,
+                                        std::span<const uint8_t>,
+                                        std::span<const uint32_t>) {
+    return false;
+  }
+  // The process-wide packed token vocabulary the DFA walk kernels index
+  // (VOCABULARY frame): token bytes behind vocabulary + 1 prefix offsets,
+  // and the special-token bitset (bit t = token t is special). May be
+  // resent after an engine restart; invalid payloads are dropped.
+  virtual void setVocabulary(std::span<const uint8_t>,
+                             std::span<const int32_t>,
+                             std::span<const uint8_t>) {}
   virtual void end(uint64_t requestId) = 0;
 };
 

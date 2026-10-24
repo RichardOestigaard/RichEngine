@@ -24,6 +24,10 @@
 struct TargetRow {
   device const float *logits;
   device const uint *mask;
+  // A GPU-DFA lane's admission row: the byte-walk's next state per token, -1
+  // where the token is not admitted (decode/dfa.metal). Null on host lanes,
+  // which read mask instead.
+  device const short *next_states;
   bool constrained;
   bool exclude_stop;
   uint stop_token_0;
@@ -33,8 +37,14 @@ struct TargetRow {
   float maximum;
 
   bool admits(uint token) const {
-    if (constrained && (mask[token / 32] & (1u << (token % 32))) == 0)
-      return false;
+    if (constrained) {
+      const bool allowed =
+          next_states
+              ? next_states[token] >= 0
+              : (mask[token / 32] & (1u << (token % 32))) != 0u;
+      if (!allowed)
+        return false;
+    }
     return !exclude_stop || (token != stop_token_0 && token != stop_token_1);
   }
   float weight(float value) const {
@@ -56,16 +66,36 @@ inline bool row_dead(constant TargetSamplingParams &params, uint s) {
   return live && s % params.rows >= live;
 }
 
+// A GPU-DFA lane's selected row past the first dead proposal: the verify
+// mask pass wrote RICHENGINE_DFA_ROW_DISABLED at its mask row's first slot
+// (decode/dfa.metal — the accept walk stops at the first dead proposal, so
+// the row is unreachable), and the selection skips it like a dead row.
+inline bool dfa_row_disabled(device const short *dfa_next,
+                             constant TargetSamplingParams &params, uint s) {
+  const uint lane = selected_lane(params, s);
+  if (!(params.dfa_mask & (1u << lane)))
+    return false;
+  return dfa_next[(ulong(lane) * (RICHENGINE_TARGET_VERIFY_ROWS + 1) +
+                   params.mask_row + s % params.rows) *
+                  params.vocabulary] == RICHENGINE_DFA_ROW_DISABLED;
+}
+
 // Selected row s of a dispatch (TargetSamplingParams). The per-lane stride of
 // the logits and mask buffers is the larger of the chain's eight rows and
 // the dispatch's rows, which a tree batch widens to
 // RICHENGINE_TREE_VERIFY_NODES.
 inline TargetRow selected_row(device const float *logits,
                               device const uint *token_mask,
+                              device const short *dfa_next,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
   const uint stride = params.lane_stride;
+  // The next-state rows carry the mask layout exactly: row 0 is the anchor's
+  // row and verify row r reads row mask_row + r (mask_row is 1), so a DFA
+  // lane's admission sits at the same row index as its bitmask row, on a
+  // vocabulary-stride table of RICHENGINE_TARGET_VERIFY_ROWS + 1 rows.
+  const bool dfa = (params.dfa_mask & (1u << lane)) != 0;
   // The mask rows keep the full verify capacity's stride (a live row's mask
   // plus the constraint row); the logits pack at the draft's verify stride.
   return {logits + (ulong(lane) * stride + params.logits_row + index) *
@@ -74,6 +104,11 @@ inline TargetRow selected_row(device const float *logits,
               (ulong(lane) * (RICHENGINE_TARGET_VERIFY_ROWS + 1) +
                params.mask_row + index) *
                   params.mask_words,
+          dfa ? dfa_next +
+                    (ulong(lane) * (RICHENGINE_TARGET_VERIFY_ROWS + 1) +
+                     params.mask_row + index) *
+                        params.vocabulary
+              : nullptr,
           (params.constrained_mask & (1u << lane)) != 0,
           (params.exclude_stop_mask & (1u << lane)) != 0,
           params.stop_token_0,
@@ -144,17 +179,19 @@ inline void shard_mass(TargetRow row, uint shard,
 kernel void decode_sample_mass_sharded(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device TargetShardMass *partial_masses [[buffer(2)]],
-    constant TargetSamplingParams &params [[buffer(3)]],
+    device const short *dfa_next [[buffer(2)]],
+    device TargetShardMass *partial_masses [[buffer(3)]],
+    constant TargetSamplingParams &params [[buffer(4)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup TargetShardMass group_masses[8];
   const uint s = group / RICHENGINE_TARGET_SAMPLING_SHARDS;
-  if (!lane_samples(params, s) || row_dead(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s) ||
+      dfa_row_disabled(dfa_next, params, s))
     return;
-  shard_mass(selected_row(logits, token_mask, params, s),
+  shard_mass(selected_row(logits, token_mask, dfa_next, params, s),
              group % RICHENGINE_TARGET_SAMPLING_SHARDS, partial_masses[group],
              group_masses, thread_index, lane, simd_group);
 }
@@ -866,18 +903,20 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
 kernel void decode_sample_vocabulary_search(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device const TargetShardMass *partial_masses [[buffer(2)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
-    constant TargetSamplingParams &params [[buffer(4)]],
+    device const short *dfa_next [[buffer(2)]],
+    device const TargetShardMass *partial_masses [[buffer(3)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(4)]],
+    constant TargetSamplingParams &params [[buffer(5)]],
     uint s [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup VocabularyScratch scratch;
-  if (!lane_samples(params, s) || row_dead(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s) ||
+      dfa_row_disabled(dfa_next, params, s))
     return;
   const uint batch = selected_lane(params, s);
-  search_row(selected_row(logits, token_mask, params, s),
+  search_row(selected_row(logits, token_mask, dfa_next, params, s),
              partial_masses + ulong(s) * RICHENGINE_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
              vocabulary_rows[s], scratch, thread_index, lane, simd_group);
@@ -890,27 +929,29 @@ kernel void decode_sample_vocabulary_search(
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    device const uint *input_tokens [[buffer(3)]],
-    device const uint *draft_ids [[buffer(4)]],
-    device const float *draft_probabilities [[buffer(5)]],
-    device const float *uniforms [[buffer(6)]],
-    device uint *tokens [[buffer(7)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
-    device atomic_uint *arrivals [[buffer(9)]],
-    constant TargetSamplingParams &params [[buffer(10)]],
+    device const short *dfa_next [[buffer(2)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
+    device const uint *input_tokens [[buffer(4)]],
+    device const uint *draft_ids [[buffer(5)]],
+    device const float *draft_probabilities [[buffer(6)]],
+    device const float *uniforms [[buffer(7)]],
+    device uint *tokens [[buffer(8)]],
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(9)]],
+    device atomic_uint *arrivals [[buffer(10)]],
+    constant TargetSamplingParams &params [[buffer(11)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
   const uint s = group / kVocabularyGroups;
-  if (!lane_samples(params, s) || row_dead(params, s))
+  if (!lane_samples(params, s) || row_dead(params, s) ||
+      dfa_row_disabled(dfa_next, params, s))
     return;
   const uint batch = selected_lane(params, s);
   const uint index = s % params.rows;
   device TargetVocabularyRow &record = vocabulary_rows[s];
-  TargetRow row = selected_row(logits, token_mask, params, s);
+  TargetRow row = selected_row(logits, token_mask, dfa_next, params, s);
   row.maximum = record.maximum;
   // A drafted row follows its draft token, the next verify input row. The
   // lane's last live row is never drafted: its draw is the bonus a full
@@ -1321,9 +1362,10 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
 kernel void decode_sample_argmax_sharded(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
-    device float *partial_values [[buffer(2)]],
-    device uint *partial_indices [[buffer(3)]],
-    constant TargetSamplingParams &params [[buffer(4)]],
+    device const short *dfa_next [[buffer(2)]],
+    device float *partial_values [[buffer(3)]],
+    device uint *partial_indices [[buffer(4)]],
+    constant TargetSamplingParams &params [[buffer(5)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float group_values[8];
@@ -1331,7 +1373,7 @@ kernel void decode_sample_argmax_sharded(
   const uint s = group / RICHENGINE_TARGET_SAMPLING_SHARDS;
   if (lane_samples(params, s) || row_dead(params, s))
     return;
-  argmax_shard(selected_row(logits, token_mask, params, s),
+  argmax_shard(selected_row(logits, token_mask, dfa_next, params, s),
                group % RICHENGINE_TARGET_SAMPLING_SHARDS, partial_values[group],
                partial_indices[group], group_values, group_indices,
                thread_index);
@@ -1365,6 +1407,55 @@ kernel void decode_sample_argmax_reduce(
     tokens[s] = token;
 }
 
+// The greedy GPU-DFA correction passes (decode_dfa_truncate names each
+// lane's truncation row): the same sharded argmax and reduce as the
+// verify selection, over one selected row per lane — the row holding the
+// masked correction the round emits, or its bonus when every proposal
+// passed. params.dfa_mask names the lanes; a sampled DFA lane's rows were
+// already selected by the full-mask pass, so its groups return at once.
+kernel void decode_dfa_argmax_sharded(
+    device const float *logits [[buffer(0)]],
+    device const uint *token_mask [[buffer(1)]],
+    device const short *dfa_next [[buffer(2)]],
+    device const uint *trunc_rows [[buffer(3)]],
+    device float *partial_values [[buffer(4)]],
+    device uint *partial_indices [[buffer(5)]],
+    constant TargetSamplingParams &params [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint Shards = RICHENGINE_TARGET_SAMPLING_SHARDS;
+  threadgroup float group_values[8];
+  threadgroup uint group_indices[8];
+  const uint lane = group / Shards;
+  if (!(params.dfa_mask & (1u << lane)) ||
+      (params.sampling_mask & (1u << lane)))
+    return;
+  const uint s =
+      lane * params.rows + min(trunc_rows[lane], params.rows - 1);
+  argmax_shard(selected_row(logits, token_mask, dfa_next, params, s),
+               group % Shards, partial_values[group],
+               partial_indices[group], group_values, group_indices,
+               thread_index);
+}
+
+kernel void decode_dfa_argmax_reduce(
+    device const float *partial_values [[buffer(0)]],
+    device const uint *partial_indices [[buffer(1)]],
+    device const uint *trunc_rows [[buffer(2)]],
+    device uint *tokens [[buffer(3)]],
+    constant TargetSamplingParams &params [[buffer(4)]],
+    uint lane [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+  if (!(params.dfa_mask & (1u << lane)) ||
+      (params.sampling_mask & (1u << lane)))
+    return;
+  const uint token =
+      argmax_reduce(partial_values, partial_indices, lane, simd_lane);
+  if (simd_lane == 0)
+    tokens[lane * params.rows +
+           min(trunc_rows[lane], params.rows - 1)] = token;
+}
+
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
@@ -1388,7 +1479,11 @@ kernel void decode_accept_dflash(
     device uint *target_tokens [[buffer(5)]],
     device uint *retained [[buffer(6)]],
     device uint *accepted_count [[buffer(7)]],
-    constant AcceptBatchParams &params [[buffer(8)]],
+    // Greedy GPU-DFA lanes' truncation rows: the accepted prefix stops at
+    // the row holding the masked correction even when that token equals
+    // the proposal, so the correction never passes as an acceptance.
+    device const uint *trunc_rows [[buffer(8)]],
+    constant AcceptBatchParams &params [[buffer(9)]],
     uint batch [[threadgroup_position_in_grid]]) {
   uint remaining = params.remaining[batch];
   // The host's uncapped sentinel is the proposal table's own width: a lane
@@ -1401,6 +1496,8 @@ kernel void decode_accept_dflash(
           min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
               params.verify_stride - 1)),
       params.candidate_stride};
+  if (params.trunc_mask & (1u << batch))
+    lane_params.limit = min(lane_params.limit, trunc_rows[batch]);
   device const uint *lane_draft =
       draft_tokens + batch * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =

@@ -77,6 +77,12 @@ def select_gguf(files, variant):
     if variant is None:
         if len(candidates) == 1:
             return candidates[0], False
+        # A Quantization-Aware Distillation build is the default where the
+        # repository ships exactly one: its distilled weights preserve the
+        # logit margins a draft was trained against, which plain quants lose.
+        qad = [n for n in candidates if "-qad-" in Path(n).stem.lower()]
+        if len(qad) == 1:
+            return qad[0], True
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         parts = [Path(name).stem.split("-") for name in candidates]

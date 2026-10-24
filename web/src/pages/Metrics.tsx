@@ -1,6 +1,7 @@
 import { createMemo, createSignal, onCleanup, For, Show } from "solid-js";
 import { authorization, errorText, noteAuthStatus } from "../api";
 import { Chart } from "../Chart";
+import type { ChartAppend } from "../Chart";
 import { useCopied } from "../clipboard";
 import { useFreshness } from "../fresh";
 import { fmtInt, fmtMs } from "../format";
@@ -114,6 +115,7 @@ function collapseToggle(event: Event) {
 /* Series history lives at module scope: navigating away and back keeps the
    collected points instead of restarting every chart empty. */
 const seriesHistory = new Map<string, number[]>();
+let scrapeIndex = 0;
 
 /* Compact series rendering: ints localized, long tails in exponential. */
 function fmtValue(v: number): string {
@@ -135,8 +137,11 @@ export default function Metrics() {
   const [selected, setSelected] = createSignal<string | null>(null);
   const { markOk, updatedAgo, stale } = useFreshness();
   const [durationMs, setDurationMs] = createSignal<number | null>(null);
-  /* Bumped so chartSeries re-reads the module-level seriesHistory. */
+  /* Bumped so chartData re-reads the module-level seriesHistory. */
   const [historyTick, setHistoryTick] = createSignal(0);
+  const [chartAppend, setChartAppend] = createSignal<
+    (ChartAppend & { signature: string }) | null
+  >(null);
   const { copied, copy } = useCopied();
 
   const seriesKey = (family: string, s: MetricSample) =>
@@ -148,6 +153,27 @@ export default function Metrics() {
     const labels = s.labels ? `{${s.labels}}` : "";
     return `${suffix}${labels}` || "value";
   };
+
+  /* Buckets chart poorly — skip them, but _sum/_count still draw. */
+  const chartable = (f: MetricFamily, s: MetricSample) =>
+    f.type === "histogram" || f.type === "summary"
+      ? !s.name.endsWith("_bucket")
+      : true;
+
+  const chartSeries = (f: MetricFamily) =>
+    f.samples
+      .filter((s) => chartable(f, s))
+      .slice(0, 8)
+      .map((s) => {
+        const key = seriesKey(f.name, s);
+        return {
+          key,
+          label: seriesLabel(f, s),
+          value: s.value,
+          y: seriesHistory.get(key) ?? [],
+        };
+      })
+      .filter((s) => s.y.length >= 2);
 
   async function refresh() {
     /* poll() already serializes, but a manual click can overlap it. */
@@ -172,7 +198,21 @@ export default function Metrics() {
             [...(seriesHistory.get(key) ?? []), s.value].slice(-60)
           );
         }
+      scrapeIndex++;
+      const selectedFamily = parsed.families.find(
+        (f) => f.name === selected()
+      );
+      const series = selectedFamily ? chartSeries(selectedFamily) : [];
       setHistoryTick((t) => t + 1);
+      setChartAppend(
+        selectedFamily && series.length
+          ? {
+              signature: series.map((s) => s.key).join("\n"),
+              x: scrapeIndex,
+              y: series.map((s) => s.y[s.y.length - 1] ?? s.value),
+            }
+          : null
+      );
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -209,24 +249,18 @@ export default function Metrics() {
       : { text: raw, more: 0 };
   });
 
-  /* Buckets chart poorly — skip them, but _sum/_count still draw. */
-  const chartable = (f: MetricFamily, s: MetricSample) =>
-    f.type === "histogram" || f.type === "summary"
-      ? !s.name.endsWith("_bucket")
-      : true;
-
-  const chartSeries = () => {
+  const chartData = () => {
     const f = selectedFamily();
-    if (!f) return [];
+    if (!f) return null;
     historyTick();
-    return f.samples
-      .filter((s) => chartable(f, s))
-      .slice(0, 8)
-      .map((s) => ({
-        name: seriesLabel(f, s),
-        data: seriesHistory.get(seriesKey(f.name, s)) ?? [],
-      }))
-      .filter((s) => s.data.length >= 2);
+    const series = chartSeries(f);
+    if (!series.length) return null;
+    const n = Math.max(...series.map((s) => s.y.length));
+    return {
+      signature: series.map((s) => s.key).join("\n"),
+      x: Array.from({ length: n }, (_, i) => scrapeIndex - n + i + 1),
+      series: series.map(({ label, y }) => ({ label, y })),
+    };
   };
 
   async function copyRaw() {
@@ -397,26 +431,34 @@ export default function Metrics() {
                             </div>
                           )}
                         </For>
-                        <Show when={chartSeries().length > 0}>
-                          <div class="panel-row chart-row">
-                            <div>
-                              <span class="chart-label">
-                                history · last 60 scrapes
-                              </span>
-                              <Chart
-                                type="area"
-                                height={140}
-                                series={chartSeries()}
-                                options={{
-                                  yaxis: {
-                                    labels: {
-                                      formatter: (v: number) => fmtValue(v),
-                                    },
-                                  },
-                                }}
-                              />
+                        <Show when={chartData()}>
+                          {(data) => (
+                            <div class="panel-row chart-row">
+                              <div>
+                                <span class="chart-label">
+                                  history · last 60 scrapes
+                                </span>
+                                <Chart
+                                  type="area"
+                                  height={140}
+                                  data={{
+                                    x: data().x,
+                                    series: data().series,
+                                  }}
+                                  append={
+                                    chartAppend()?.signature ===
+                                    data().signature
+                                      ? chartAppend()
+                                      : null
+                                  }
+                                  options={{
+                                    labels: { y: fmtValue },
+                                    window: 60,
+                                  }}
+                                />
+                              </div>
                             </div>
-                          </div>
+                          )}
                         </Show>
                       </div>
                     </Show>

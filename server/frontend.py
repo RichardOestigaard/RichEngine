@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import re
 import secrets
 import threading
 from collections import OrderedDict
@@ -11,8 +13,9 @@ from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
+from . import constraints, json_codec, judgments
+from . import dfa as dfa_compiler
 from . import images as image_input
-from . import json_codec, judgments
 from . import protocol as wire
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
@@ -38,8 +41,9 @@ from .tool_schema import (
     QWEN3_XML,
     THINK_END,
     THINK_END_TOKEN_ID,
-    dialect_named,
     ToolPolicy,
+    bind_dialect,
+    dialect_named,
     json_grammar,
     normalize_response_format,
     normalize_tools,
@@ -115,6 +119,167 @@ def _drop_nulls(body, extras):
 # Text completions' output budget when max_tokens is omitted: OpenAI's
 # default for the endpoint, which vLLM and SGLang also use.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
+
+
+# Volatile-field prompt normalization: agent harnesses put session-volatile
+# values (working directory, dates, environment details) early in the system
+# prompt, which ends the shared prefix the KV cache can reuse there. Moving
+# the detected lines and tagged blocks to the end of the system message keeps
+# the stable prefix contiguous. RICHENGINE_NO_PROMPT_NORMALIZE=1 restores the
+# request's original order.
+_VOLATILE_FIELD_MARKERS = (
+    "working directory",
+    "current directory",
+    "cwd",
+    "today's date",
+    "current date",
+    "date:",
+    "timestamp",
+    "session",
+    "environment",
+    "os:",
+    "platform:",
+    "runtime",
+    "model:",
+)
+
+# A word marker is a field only where punctuation, space or the line's end
+# follows it; the ":" markers spell their own boundary.
+_VOLATILE_FIELD_BOUNDARY = frozenset(" \t:=(-")
+
+# XML-ish blocks agents wrap volatile context in.
+_VOLATILE_TAGS = ("env", "environment", "context", "session", "runtime")
+_VOLATILE_TAG_OPEN = re.compile(r"<([a-z_]+)[\s>/]")
+
+# Fenced blocks are volatile only when their info string says they hold
+# volatile values; any other fence is stable as a whole, so a volatile-looking
+# line inside quoted code never moves.
+_VOLATILE_FENCE_INFO = frozenset((*_VOLATILE_TAGS, "dotenv"))
+
+
+def _volatile_label(stripped):
+    """Whether a stripped, lowercased line opens a volatile field, allowing a
+    markdown header's leading '#'s."""
+    text = stripped.lstrip("#").lstrip()
+    for marker in _VOLATILE_FIELD_MARKERS:
+        if text.startswith(marker) and (
+            marker[-1] in ":"
+            or len(text) == len(marker)
+            or text[len(marker)] in _VOLATILE_FIELD_BOUNDARY
+        ):
+            return True
+    return False
+
+
+def _volatile_tag(stripped):
+    """The tag whose block `stripped` opens, when it is a volatile one."""
+    match = _VOLATILE_TAG_OPEN.match(stripped)
+    return match.group(1) if match and match.group(1) in _VOLATILE_TAGS else None
+
+
+def _fence(stripped):
+    return stripped[:3] if stripped[:3] in ("```", "~~~") else None
+
+
+def _volatile_continuation(line):
+    """Whether `line` continues a volatile field's value: an indented or
+    bulleted line."""
+    stripped = line.strip()
+    return bool(stripped) and (
+        line[0] in " \t" or stripped.startswith(("-", "*", "•"))
+    )
+
+
+def _absorb_block(lines, index, out, close):
+    """Append the tagged block opening at `index` to `out`, through its close
+    or the text's end."""
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        index += 1
+        if close in line.lower():
+            break
+    return index
+
+
+def _absorb_fence(lines, index, out, fence):
+    """Append the fenced block opening at `index` to `out`, through its
+    closing fence or the text's end."""
+    out.append(lines[index])
+    index += 1
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        index += 1
+        if _fence(line.strip()) == fence:
+            break
+    return index
+
+
+def _move_volatile_lines(content):
+    """`content` with its volatile lines and blocks moved to the end, order
+    preserved; `content` itself when nothing matches or nothing stays."""
+    if not content.strip():
+        return content
+    trailing = content.endswith("\n")
+    lines = content.split("\n")
+    if trailing:
+        lines.pop()
+    stable, volatile = [], []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip().lower()
+        tag = _volatile_tag(stripped)
+        if tag is not None:
+            index = _absorb_block(lines, index, volatile, f"</{tag}>")
+            continue
+        fence = _fence(stripped)
+        if fence is not None:
+            info = stripped[3:].strip()
+            index = _absorb_fence(
+                lines,
+                index,
+                volatile
+                if info and info.split(maxsplit=1)[0] in _VOLATILE_FENCE_INFO
+                else stable,
+                fence,
+            )
+            continue
+        if _volatile_label(stripped):
+            volatile.append(line)
+            index += 1
+            while index < len(lines) and _volatile_continuation(lines[index]):
+                volatile.append(lines[index])
+                index += 1
+            continue
+        stable.append(line)
+        index += 1
+    if not stable or not volatile:
+        return content
+    result = "\n".join(stable + volatile)
+    return result + "\n" if trailing else result
+
+
+def move_volatile_system_fields(messages):
+    """`messages` with detected session-volatile blocks moved to the end of
+    each system message, so the stable prompt prefix stays contiguous for the
+    KV cache. The same list when nothing matches or normalization is off."""
+    if os.environ.get("RICHENGINE_NO_PROMPT_NORMALIZE") == "1":
+        return messages
+    moved = None
+    for index, message in enumerate(messages):
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        normalized = _move_volatile_lines(content)
+        if normalized != content:
+            if moved is None:
+                moved = list(messages)
+            moved[index] = {**message, "content": normalized}
+    return messages if moved is None else moved
 
 
 # What follows the leading system prompt and tools in the probe that finds
@@ -368,6 +533,9 @@ class Frontend:
         self.serving_dialect = (
             dialect_named(serving.tool_dialect) if serving is not None else None
         )
+        # Bound tool dialects by name, resolved on first use: marker spellings
+        # get their token ids from this model's vocabulary (bind_dialect).
+        self._dialect_bindings = {}
         self.prompt_tokenizer = PromptTokenizer(
             tokenizer, None if contract is None else contract.marker
         )
@@ -440,6 +608,7 @@ class Frontend:
                 "waiting": self.preparation_waiting,
             }
         status["grammar_cache"] = self.constraint_factory.stats()
+        status["dfa_mode"] = constraints.dfa_mode()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
@@ -929,9 +1098,11 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
-        messages = template_messages(
-            normalize_messages(
-                body.get("messages"), vision=self.vision, deadline=deadline
+        messages = move_volatile_system_fields(
+            template_messages(
+                normalize_messages(
+                    body.get("messages"), vision=self.vision, deadline=deadline
+                )
             )
         )
         tools, tool_policy = normalize_tools(
@@ -939,8 +1110,9 @@ class Frontend:
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
-            self.chat_templates.select(body.get("tools")).dialect
-            or self.serving_dialect,
+            self._tool_dialect(
+                self.chat_templates.select(body.get("tools")).dialect
+            ),
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
@@ -1196,27 +1368,59 @@ class Frontend:
         remaining_request_time(deadline)
         if constrained:
             with self.latencies.measure("grammar"):
+                # The DFA path compiles the regular subset; anything else
+                # keeps the llguidance grammar.
+                create_dfa = getattr(
+                    self.constraint_factory, "create_dfa", None
+                )
                 if tool_constrained:
-                    constraint = self.constraint_factory.create(
-                        tool_grammar(
+                    # The grammar is built either way: the DFA path keeps a
+                    # llguidance delegate on it for masks and checks, and a
+                    # spec outside the DFA subset compiles it outright.
+                    grammar = tool_grammar(
+                        tool_policy,
+                        thinking,
+                        response_schema,
+                        think_end_id=self.think_end_id,
+                    )
+                    constraint = create_dfa and create_dfa(
+                        dfa_compiler.tool_spec(
                             tool_policy,
                             thinking,
                             response_schema,
-                            think_end_id=self.think_end_id,
+                            think_end=self.think_end,
                         ),
+                        grammar,
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
+                    if constraint is None:
+                        constraint = self.constraint_factory.create(
+                            grammar,
+                            timeout=remaining_request_time(deadline),
+                            prefixes=lambda: self._call_openings(
+                                tool_policy, thinking
+                            ),
+                        )
                 else:
-                    constraint = self.constraint_factory.create(
-                        json_grammar(
-                            response_schema,
-                            thinking,
-                            think_end_id=self.think_end_id,
-                            think_end_text=self.think_end,
+                    grammar = json_grammar(
+                        response_schema,
+                        thinking,
+                        think_end_id=self.think_end_id,
+                        think_end_text=self.think_end,
+                    )
+                    constraint = create_dfa and create_dfa(
+                        dfa_compiler.json_spec(
+                            response_schema, thinking, think_end=self.think_end
                         ),
+                        grammar,
                         timeout=remaining_request_time(deadline),
                     )
+                    if constraint is None:
+                        constraint = self.constraint_factory.create(
+                            grammar,
+                            timeout=remaining_request_time(deadline),
+                        )
         remaining_request_time(deadline)
         tools_signature = None
         if tools:
@@ -1256,10 +1460,28 @@ class Frontend:
             image_pixels=image_pixels,
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
+            reply_memory=self.prompt_tokenizer,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
             shared_prefix_tokens=rendered.shared_prefix_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
+
+    def _tool_dialect(self, detected):
+        """The request's tool dialect — the template probe's, else the
+        serving contract's — with its marker spellings' token ids bound, so
+        a marker with no `<name>` atom form (minicpm5's `<function`) writes
+        as `<[id]>`, the special token the template spells it as."""
+        dialect = detected or self.serving_dialect
+        if dialect is None:
+            return None
+        bindings = getattr(self, "_dialect_bindings", None)
+        if bindings is None:
+            return bind_dialect(dialect, self.tokenizer.get_vocab())
+        bound = bindings.get(dialect.name)
+        if bound is None:
+            bound = bind_dialect(dialect, self.tokenizer.get_vocab())
+            bindings[dialect.name] = bound
+        return bound
 
     def _call_openings(self, policy, thinking):
         """The tokens that begin each strict tool's call. Its parameter names

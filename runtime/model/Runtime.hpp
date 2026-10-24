@@ -48,6 +48,16 @@ public:
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
+  void provideForcedTokens(uint64_t requestId,
+                           std::span<const uint32_t> tokens) override;
+  [[nodiscard]] bool provideDfa(uint64_t requestId,
+                                std::span<const int16_t> table,
+                                std::span<const uint8_t> accepting,
+                                std::span<const uint8_t> marker,
+                                std::span<const uint32_t> eosIds) override;
+  void setVocabulary(std::span<const uint8_t> bytes,
+                     std::span<const int32_t> offs,
+                     std::span<const uint8_t> specialBits) override;
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;

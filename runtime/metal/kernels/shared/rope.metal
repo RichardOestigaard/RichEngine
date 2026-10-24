@@ -24,10 +24,10 @@ kernel void rope_build_tables(
     target_cosine[element] = cos(angle);
     target_sine[element] = sin(angle);
   }
-  const uint draft_elements = params.draft_rows * 64;
+  const uint draft_elements = params.draft_rows * params.draft_dims;
   for (uint element = index; element < draft_elements; element += grid_size) {
-    const uint row = element / 64;
-    const uint dim = element % 64;
+    const uint row = element / params.draft_dims;
+    const uint dim = element % params.draft_dims;
     const float angle =
         float(draft_positions[row]) * draft_inverse_frequencies[dim];
     draft_cosine[element] = cos(angle);

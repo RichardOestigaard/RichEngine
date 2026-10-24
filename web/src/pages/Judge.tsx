@@ -806,15 +806,16 @@ export default function Judge() {
                     <Chart
                       type="bar"
                       height={170}
-                      series={[
-                        { name: "p", data: res().probabilities ?? [] },
-                      ]}
+                      data={{
+                        categories: res().option_ids ?? [],
+                        series: [
+                          { label: "p", values: res().probabilities ?? [] },
+                        ],
+                      }}
                       options={{
-                        xaxis: { categories: res().option_ids ?? [] },
-                        yaxis: { min: 0, max: 1, tickAmount: 5 },
-                        tooltip: {
-                          y: { formatter: (v: number) => pct(v) },
-                        },
+                        yMin: 0,
+                        yMax: 1,
+                        labels: { y: pct },
                       }}
                     />
                   </div>

@@ -88,12 +88,19 @@ StateAdmission Runtime::begin(const ModelRequest &request) {
 
 void Runtime::suspend(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident || entry.verifyMaskInFlight) {
+  if (!entry.resident || entry.verifyMaskInFlight || entry.gpuMaskInFlight) {
     throw std::logic_error("request cannot be suspended");
   }
   // A speculative draft still in flight reads the lane's rings; it drains
   // before the lane's buffers pool.
   impl_->settleGpuPredraft();
+  // The automaton state survives in the host mirror: suspend() reads the
+  // GPU slot back before the state lane goes away, resume() rewrites it.
+  if (entry.dfa) {
+    impl_->readbackDfaState(entry);
+    // Its pending forced span stays with the lane it was derived on.
+    impl_->clearDfaForced(entry.stateLane);
+  }
   impl_->states.releaseLane(entry.stateLane, requestId);
   impl_->pageTableBindings[entry.stateLane] = {};
   impl_->releaseImages(entry);
@@ -796,6 +803,9 @@ uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
 std::optional<std::string>
 Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   Impl::Request &entry = impl_->request(requestId);
+  // A Full-mode DFA lane never waits on the host: drop stale responses.
+  if (impl_->gpuDfaMasks(entry))
+    return std::nullopt;
   const bool acceptsMask =
       waitsForMask(entry.decodeStage) || entry.verifyMaskInFlight;
   // Initial-mask replies can race resource preemption. They belong to the
@@ -830,6 +840,104 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   return std::nullopt;
 }
 
+void Runtime::provideForcedTokens(uint64_t requestId,
+                                  std::span<const uint32_t> tokens) {
+  auto found = impl_->requests.find(requestId);
+  if (found == impl_->requests.end())
+    return;
+  found->second.forcedTokens.assign(tokens.begin(), tokens.end());
+}
+
+void Runtime::setVocabulary(std::span<const uint8_t> bytes,
+                            std::span<const int32_t> offs,
+                            std::span<const uint8_t> specialBits) {
+  // The offsets must cover exactly the target's vocabulary, run from 0 to
+  // the byte count and never decrease (equal entries mark a dead token),
+  // and the special-token bitset must cover it too.
+  const uint64_t vocabSize = impl_->geometry.target.vocabularySize;
+  if (offs.size() != size_t{vocabSize} + 1 ||
+      offs.front() != 0 || uint64_t(offs.back()) != bytes.size() ||
+      !std::is_sorted(offs.begin(), offs.end()) ||
+      specialBits.size() != (vocabSize + 7) / 8) {
+    return;
+  }
+  try {
+    Impl::PackedVocab vocabulary;
+    vocabulary.bytes = impl_->backend.allocateBuffer(
+        std::max<uint64_t>(bytes.size(), 1), BufferStorage::Shared,
+        "dfa-token-bytes");
+    vocabulary.offsets = impl_->backend.allocateBuffer(
+        bytesFor<int32_t>(offs.size()), BufferStorage::Shared,
+        "dfa-token-offsets");
+    vocabulary.special = impl_->backend.allocateBuffer(
+        std::max<uint64_t>(specialBits.size(), 1), BufferStorage::Shared,
+        "dfa-token-special");
+    std::memcpy(vocabulary.bytes.contents(), bytes.data(), bytes.size());
+    std::memcpy(vocabulary.offsets.contents(), offs.data(),
+                bytesFor<int32_t>(offs.size()));
+    std::memcpy(vocabulary.special.contents(), specialBits.data(),
+                specialBits.size());
+    vocabulary.vocab = vocabSize;
+    impl_->packedVocab_ = std::move(vocabulary);
+  } catch (const metal::MetalAllocationError &) {
+    // Without a packed vocabulary every DFA stays on the host-mask path.
+  }
+}
+
+bool Runtime::provideDfa(uint64_t requestId,
+                         std::span<const int16_t> table,
+                         std::span<const uint8_t> accepting,
+                         std::span<const uint8_t> marker,
+                         std::span<const uint32_t> eosIds) {
+  // RICHENGINE_DFA_MODE=off leaves every constraint on the host path.
+  if (impl_->dfaMode_ == Impl::DfaMode::Off)
+    return false;
+  auto found = impl_->requests.find(requestId);
+  if (found == impl_->requests.end() || !impl_->packedVocab_ ||
+      table.empty() || table.size() % 256 || eosIds.size() > 8) {
+    return false;
+  }
+  const uint64_t states = table.size() / 256;
+  if (states > 32767 || accepting.size() != (states + 7) / 8 ||
+      marker.size() != states * 32) {
+    return false;
+  }
+  Impl::Request &entry = found->second;
+  try {
+    RequestDfa dfa;
+    dfa.table.assign(table.begin(), table.end());
+    dfa.accepting.assign(accepting.begin(), accepting.end());
+    dfa.marker.assign(marker.begin(), marker.end());
+    dfa.tableBuffer = impl_->backend.allocateBuffer(
+        bytesFor<int16_t>(table.size()), BufferStorage::Shared, "dfa-table");
+    dfa.acceptBuffer = impl_->backend.allocateBuffer(
+        accepting.size(), BufferStorage::Shared, "dfa-accepting");
+    dfa.markerBuffer = impl_->backend.allocateBuffer(
+        marker.size(), BufferStorage::Shared, "dfa-marker");
+    std::memcpy(dfa.tableBuffer.contents(), table.data(),
+                bytesFor<int16_t>(table.size()));
+    std::memcpy(dfa.acceptBuffer.contents(), accepting.data(),
+                accepting.size());
+    std::memcpy(dfa.markerBuffer.contents(), marker.data(), marker.size());
+    std::copy(eosIds.begin(), eosIds.end(), dfa.eosIds.begin());
+    dfa.eosCount = static_cast<uint32_t>(eosIds.size());
+    dfa.states = static_cast<uint32_t>(states);
+    entry.dfa = std::move(dfa);
+    // The automaton restarts at state 0; the next chain encode uploads it.
+    entry.dfaState = 0;
+    entry.dfaStateDirty = true;
+    // A replaced automaton invalidates any span the previous one left.
+    if (entry.resident)
+      impl_->clearDfaForced(entry.stateLane);
+  } catch (const metal::MetalAllocationError &) {
+    return false;
+  }
+  // The return advertises GPU masks: a Forced-mode DFA is installed — its
+  // state and forced spans run on-device — but the caller keeps the
+  // host-mask path, so the lane reports as not GPU-masked.
+  return impl_->gpuDfaMasks(entry);
+}
+
 void Runtime::end(uint64_t requestId) {
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
@@ -842,6 +950,7 @@ void Runtime::end(uint64_t requestId) {
   if (found->second.resident) {
     impl_->states.releaseLane(found->second.stateLane, requestId);
     impl_->pageTableBindings[found->second.stateLane] = {};
+    impl_->clearDfaForced(found->second.stateLane);
   }
   impl_->requests.erase(found);
 }

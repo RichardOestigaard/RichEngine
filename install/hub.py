@@ -58,7 +58,7 @@ def reason(error, used_token=None) -> str:
 def as_model_errors(context: str):
     """Report a Hub, network or cache failure in the block as a ModelError,
     "context: reason", which callers print without a traceback."""
-    import httpx
+    from huggingface_hub.utils import httpx
 
     try:
         yield
@@ -256,8 +256,8 @@ class Repository:
         Hub did not answer for another repository this start, stands for its
         answer without a request. A different revision is never
         substituted."""
-        import httpx
         from huggingface_hub import HfApi, constants
+        from huggingface_hub.utils import httpx
 
         if Path(name).is_absolute():
             return cls.local_directory(name)

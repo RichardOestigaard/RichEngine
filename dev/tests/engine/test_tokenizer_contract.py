@@ -3,8 +3,7 @@ import unittest
 from unittest import mock
 
 from server import constraints as generation_constraints
-from server import model_host
-from server import server
+from server import model_host, server
 
 CONFIG = {
     "eos_token_id": [248046, 248044],

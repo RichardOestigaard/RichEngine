@@ -170,7 +170,8 @@ namespace richengine::model {
   void Runtime::Impl::encodeTargetVerifyBatchPolicy(CommandGraph &graph,
                                      std::span<Request *const> entries,
                                      bool tree,
-                                     std::span<const uint32_t> liveRows) {
+                                     std::span<const uint32_t> liveRows,
+                                     uint32_t dfaLaneSkip) {
     if (entries.empty() || entries.size() > kLaneCount)
       throw std::invalid_argument("invalid target policy batch");
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
@@ -215,6 +216,16 @@ namespace richengine::model {
       }
     }
     auto vBuffers = samplingBuffers(lanes);
+    // Full-mode DFA lanes read their next-state admission rows; a skipped
+    // lane (an abandoned mask wait) keeps the host-filled bitmask, as do
+    // all lanes under RICHENGINE_DFA_MODE=forced. A greedy DFA lane instead
+    // argmaxes unmasked here: its proposal check compares the proposal to
+    // that argmax, and the single masked correction row comes from the
+    // commit graph's truncation pass (decode_dfa_truncate).
+    const uint32_t unmasked = greedyDfaLaneMask(entries, dfaLaneSkip);
+    vBuffers.dfaLanes =
+        (gpuDfaLaneMask(entries) & ~dfaLaneSkip) & ~unmasked;
+    vBuffers.unmaskedLanes = unmasked;
     if (fusedHead) {
       vBuffers.headArgmaxValues =
           decodeArena->packed(DecodeTensor::HeadArgmaxValues,
@@ -234,7 +245,8 @@ namespace richengine::model {
                              std::span<Request *const> lanes,
                              std::span<const uint32_t> maximumRetained,
                              bool tree,
-                             std::span<const uint32_t> proposals) {
+                             std::span<const uint32_t> proposals,
+                             uint32_t truncLanes) {
     if (lanes.empty() || lanes.size() > kLaneCount ||
         lanes.size() != maximumRetained.size()) {
       throw std::invalid_argument("invalid DFlash acceptance batch");
@@ -276,7 +288,9 @@ namespace richengine::model {
          decodeArena->packed(DecodeTensor::SamplingUniforms, width),
          decodeArena->packed(DecodeTensor::OutputTokens, width),
          decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->packed(DecodeTensor::AcceptedCount, width)},
+         decodeArena->packed(DecodeTensor::AcceptedCount, width),
+         decodeArena->packed(DecodeTensor::DfaTrunc, width),
+         truncLanes},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1],
         proposals,
@@ -348,6 +362,340 @@ namespace richengine::model {
           std::span(chunks).first(lanes), lanes,
           geometry.target.kvLayout);
     }
+  }
+
+  // The DFA lanes' per-lane transition tables, accepting bitsets and
+  // marker masks: lanes without a DFA rebind the first one's buffers and
+  // are masked out.
+  std::array<MetalBuffer, kLaneCount>
+  Runtime::Impl::dfaBuffers(std::span<Request *const> entries,
+                            DfaBufferKind kind) {
+    const auto pick = [](const RequestDfa &dfa, DfaBufferKind kind)
+        -> const MetalBuffer & {
+      switch (kind) {
+      case DfaBufferKind::Table:
+        return dfa.tableBuffer;
+      case DfaBufferKind::Accept:
+        return dfa.acceptBuffer;
+      case DfaBufferKind::Marker:
+        return dfa.markerBuffer;
+      }
+      return dfa.tableBuffer;
+    };
+    std::array<MetalBuffer, kLaneCount> buffers{};
+    const RequestDfa *first = nullptr;
+    for (Request *const entry : entries)
+      if (entry->dfa)
+        first = &*entry->dfa;
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      const RequestDfa &dfa = entries[lane]->dfa ? *entries[lane]->dfa : *first;
+      buffers[lane] = pick(dfa, kind);
+    }
+    // The kernels take all four table slots; lanes past the live batch are
+    // masked out, so any valid buffer satisfies their bindings.
+    for (uint32_t lane = entries.size(); lane < kLaneCount; ++lane)
+      buffers[lane] = pick(*first, kind);
+    return buffers;
+  }
+
+  // A lane's grammar-EOS set into a params struct's per-lane fields.
+  template <class Params>
+  static void dfaLaneEos(Params &params, uint32_t lane,
+                         const RequestDfa &dfa) {
+    params.eos_count[lane] = dfa.eosCount;
+    std::copy(dfa.eosIds.begin(),
+              dfa.eosIds.begin() + dfa.eosCount,
+              params.eos_ids[lane]);
+  }
+
+  void Runtime::Impl::encodeDfaMasks(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes,
+      std::span<const uint32_t> liveRows) {
+    // Forced mode keeps the host mask round trip: the chain's row states
+    // feed only the mask kernel, so both stay unencoded.
+    if (dfaMode_ != DfaMode::Full)
+      return;
+    const uint32_t laneMask = dfaLaneMask(entries);
+    if (!laneMask)
+      return;
+    if (!packedVocab_)
+      throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+    const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
+    const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
+    const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    DfaWalkParams walk{};
+    walk.verify_stride = geometry.draft.verifyRows();
+    walk.lane_mask = laneMask;
+    walk.vocabulary = packedVocab_->vocab;
+    DfaMaskParams mask{};
+    mask.vocabulary = packedVocab_->vocab;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      // liveRows bounds the chain's input walk; the mask pass writes one
+      // next-state row per live row plus the anchor's row 0.
+      const uint32_t live =
+          lane < liveRows.size() ? liveRows[lane] : kDecodeRows;
+      walk.live_rows[lane] = live;
+      mask.live_rows[lane] =
+          std::min(live + 1, uint32_t{kDecodeRows + 1});
+      mask.rows = std::max(mask.rows, mask.live_rows[lane]);
+      if (entries[lane]->dfa) {
+        walk.states[lane] = entries[lane]->dfa->states;
+        mask.states[lane] = entries[lane]->dfa->states;
+        dfaLaneEos(walk, lane, *entries[lane]->dfa);
+        dfaLaneEos(mask, lane, *entries[lane]->dfa);
+        // A greedy lane's proposals validate against the unmasked argmax
+        // and its single correction row comes from the commit graph's
+        // truncation pass — only a sampled lane's selection still reads
+        // the full next-state rows this round.
+        if (samplingPolicy(*entries[lane]).samples())
+          mask.lane_mask |= uint32_t{1} << lane;
+      }
+      walk.state_lanes[lane] = entries[lane]->stateLane;
+      if (entries[lane]->dfa)
+        syncDfaState(*entries[lane]);
+    }
+    const MetalBuffer nextStates =
+        decodeArena->packed(DecodeTensor::DfaNextStates, lanes);
+    graph.add(std::string(ops::kDecodeDfaChain),
+              {tables[0], tables[1], tables[2], tables[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::InputTokens, lanes),
+               decodeArena->packed(DecodeTensor::DfaState, kLaneCount),
+               decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              walk, {lanes, 1, 1}, {1, 1, 1});
+    if (!mask.lane_mask)
+      return;
+    graph.add(std::string(ops::kDecodeDfaMask),
+              {tables[0], tables[1], tables[2], tables[3],
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+               nextStates,
+               decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              mask,
+              {(uint64_t{packedVocab_->vocab} + 255) / 256, mask.rows, lanes},
+              {256, 1, 1});
+  }
+
+  // The greedy DFA lanes' truncation pass, encoded between the unmasked
+  // selection and the correction mask of the same commit graph: each lane
+  // names the first proposal row the byte-walk or the argmax rejects and
+  // writes its GPU forced-span prefix over the unmasked picks.
+  void Runtime::Impl::encodeDfaTruncation(
+      CommandGraph &graph, uint32_t lanes, uint32_t laneMask,
+      std::span<const uint32_t> proposals,
+      std::span<const uint32_t> gpuForced) {
+    if (!laneMask)
+      return;
+    DfaTruncParams trunc{};
+    trunc.verify_stride = geometry.draft.verifyRows();
+    trunc.lane_mask = laneMask;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      trunc.proposals[lane] =
+          lane < proposals.size() ? proposals[lane]
+                                  : RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+      trunc.forced[lane] = lane < gpuForced.size() ? gpuForced[lane] : 0;
+    }
+    graph.add(std::string(ops::kDecodeDfaTrunc),
+              {decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+               decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
+               decodeArena->packed(DecodeTensor::OutputTokens, lanes),
+               decodeArena->packed(DecodeTensor::DfaTrunc, lanes)},
+              trunc, {lanes, 1, 1}, {1, 1, 1});
+  }
+
+  // The greedy DFA lanes' single next-state row each, written at the
+  // truncation row's mask row: the masked argmax over it is the round's
+  // correction (or bonus) token. Every other mask row stays unwritten —
+  // no selection reads it this round.
+  void Runtime::Impl::encodeDfaCorrectionMasks(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes,
+      uint32_t laneMask) {
+    if (!laneMask)
+      return;
+    if (!packedVocab_)
+      throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+    const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
+    const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
+    const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    DfaMaskParams mask{};
+    mask.vocabulary = packedVocab_->vocab;
+    mask.rows = 1;
+    mask.lane_mask = laneMask;
+    mask.indexed = 1;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      if (entries[lane]->dfa) {
+        mask.states[lane] = entries[lane]->dfa->states;
+        dfaLaneEos(mask, lane, *entries[lane]->dfa);
+      }
+    graph.add(std::string(ops::kDecodeDfaMask),
+              {tables[0], tables[1], tables[2], tables[3],
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+               decodeArena->packed(DecodeTensor::DfaNextStates, lanes),
+               decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              mask,
+              {(uint64_t{packedVocab_->vocab} + 255) / 256, 1, lanes},
+              {256, 1, 1});
+  }
+
+  // The masked argmax at each greedy DFA lane's truncation row, over the
+  // next-state row the correction mask just wrote: the selection kernels
+  // read it in place of a bitmask exactly as the full-mask path did.
+  void Runtime::Impl::encodeDfaCorrections(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes,
+      uint32_t laneMask, std::span<const uint32_t> liveRows) {
+    if (!laneMask)
+      return;
+    std::array<ops::SamplingPolicy, kLaneCount> policies{};
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      policies[lane] = samplingPolicy(*entries[lane]);
+    ops::SamplingBuffers buffers = samplingBuffers(lanes);
+    buffers.dfaLanes = laneMask;
+    sampling.addDfaCorrections(
+        graph, std::span(policies).first(lanes), buffers,
+        decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
+        geometry.target.stopTokens[0], geometry.target.stopTokens[1],
+        liveRows, geometry.draft.verifyRows());
+  }
+
+  void Runtime::Impl::encodeDfaAdvance(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes) {
+    const uint32_t laneMask = dfaLaneMask(entries);
+    if (!laneMask)
+      return;
+    if (!packedVocab_)
+      throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+    const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
+    const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
+    const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    DfaWalkParams walk{};
+    walk.verify_stride = geometry.draft.verifyRows();
+    walk.lane_mask = laneMask;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      if (entries[lane]->dfa) {
+        walk.states[lane] = entries[lane]->dfa->states;
+        dfaLaneEos(walk, lane, *entries[lane]->dfa);
+        // Forced mode runs no chain pass, so this is where a newer mirror
+        // (provideDfa, a resume) reaches the state-lane slot; in Full mode
+        // the mask encode already cleared the dirty flag.
+        syncDfaState(*entries[lane]);
+      }
+      walk.state_lanes[lane] = entries[lane]->stateLane;
+    }
+    graph.add(std::string(ops::kDecodeDfaAdvance),
+              {tables[0], tables[1], tables[2], tables[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::InputTokens, lanes),
+               decodeArena->packed(DecodeTensor::OutputTokens, lanes),
+               decodeArena->packed(DecodeTensor::RetainedCount, lanes),
+               decodeArena->packed(DecodeTensor::DfaState, kLaneCount),
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              walk, {lanes, 1, 1}, {1, 1, 1});
+  }
+
+  // The commit-stage forced-span derivation: after the state advanced, each
+  // DFA lane's threadgroup follows the single-live-byte chain from the new
+  // anchor's state into the state lane's DfaForcedSpan, then greedily
+  // tokenizes it into the next round's proposal tokens.
+  void Runtime::Impl::encodeDfaForced(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes) {
+    const uint32_t laneMask = dfaLaneMask(entries);
+    if (!laneMask)
+      return;
+    if (!packedVocab_)
+      throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+    const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
+    const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
+    const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    DfaWalkParams walk{};
+    walk.verify_stride = geometry.draft.verifyRows();
+    walk.lane_mask = laneMask;
+    walk.vocabulary = packedVocab_->vocab;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      if (entries[lane]->dfa) {
+        walk.states[lane] = entries[lane]->dfa->states;
+        dfaLaneEos(walk, lane, *entries[lane]->dfa);
+      }
+      walk.state_lanes[lane] = entries[lane]->stateLane;
+    }
+    const MetalBuffer forced =
+        decodeArena->packed(DecodeTensor::DfaForced, kLaneCount);
+    graph.add(std::string(ops::kDecodeDfaForcedBytes),
+              {tables[0], tables[1], tables[2], tables[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::OutputTokens, lanes),
+               decodeArena->packed(DecodeTensor::RetainedCount, lanes),
+               decodeArena->packed(DecodeTensor::DfaState, kLaneCount),
+               forced,
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              walk, {lanes, 1, 1}, {1024, 1, 1});
+    graph.add(std::string(ops::kDecodeDfaForcedTokens),
+              {tables[0], tables[1], tables[2], tables[3],
+               packedVocab_->bytes, packedVocab_->offsets, forced,
+               decodeArena->packed(DecodeTensor::ProposedTokens, lanes),
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              walk, {lanes, 1, 1}, {1024, 1, 1});
+  }
+
+  void Runtime::Impl::encodeDfaInitialMasks(
+      CommandGraph &graph, std::span<Request *const> entries, uint32_t lanes) {
+    // Forced mode's initial masks come from the host like any
+    // host-constrained lane's.
+    if (dfaMode_ != DfaMode::Full)
+      return;
+    const uint32_t laneMask = dfaLaneMask(entries);
+    if (!laneMask)
+      return;
+    if (!packedVocab_)
+      throw std::logic_error("GPU-DFA lane has no packed vocabulary");
+    // The chain kernel's row-0 input is the mirrored state; deeper rows are
+    // unused by the initial selection's single mask row.
+    uint32_t *rowStates = contents<uint32_t>(
+        decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+        "dfa row states");
+    const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
+    const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
+    const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    DfaMaskParams mask{};
+    mask.vocabulary = packedVocab_->vocab;
+    mask.rows = 1;
+    mask.lane_mask = laneMask;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      if (!entries[lane] || !entries[lane]->dfa)
+        continue;
+      mask.states[lane] = entries[lane]->dfa->states;
+      mask.live_rows[lane] = 1;
+      dfaLaneEos(mask, lane, *entries[lane]->dfa);
+      rowStates[lane * (kDecodeRows + 1)] = entries[lane]->dfaState;
+    }
+    const MetalBuffer nextStates =
+        decodeArena->packed(DecodeTensor::DfaNextStates, lanes);
+    graph.add(std::string(ops::kDecodeDfaMask),
+              {tables[0], tables[1], tables[2], tables[3],
+               accepts[0], accepts[1], accepts[2], accepts[3],
+               packedVocab_->bytes, packedVocab_->offsets,
+               decodeArena->packed(DecodeTensor::DfaRowStates, lanes),
+               nextStates,
+               decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
+               markers[0], markers[1], markers[2], markers[3],
+               packedVocab_->special},
+              mask,
+              {(uint64_t{packedVocab_->vocab} + 255) / 256, 1, lanes},
+              {256, 1, 1});
   }
 
   void Runtime::Impl::encodeBatchGdnCommit(CommandGraph &graph,

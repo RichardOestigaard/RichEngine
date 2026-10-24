@@ -77,6 +77,9 @@ class RequestLifetimeTests(unittest.TestCase):
                 if outcome == "callback_error":
 
                     class Constraint:
+                        def forced_tokens(self):
+                            return ()
+
                         def commit(self, _tokens):
                             raise api.APIError(400, "constraint callback failed")
 
@@ -211,6 +214,9 @@ class RequestLifetimeTests(unittest.TestCase):
         self.addCleanup(release.set)
 
         class Constraint:
+            def forced_tokens(self):
+                return ()
+
             def masks(self, tokens):
                 entered.set()
                 if not release.wait(2):
@@ -269,6 +275,9 @@ class RequestLifetimeTests(unittest.TestCase):
         self.addCleanup(release.set)
 
         class Constraint:
+            def forced_tokens(self):
+                return ()
+
             def commit(self, _tokens):
                 entered.set()
                 if not release.wait(2):

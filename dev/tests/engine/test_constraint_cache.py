@@ -23,9 +23,10 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(
-            side_effect=lambda matcher, executor, contract, initial_mask=None: matcher
-        )
+        def construct(matcher, executor, contract, initial_mask=None, encode=None):
+            return matcher
+
+        constraint = mock.Mock(side_effect=construct)
         import numpy
 
         for target, replacement in (

@@ -8,7 +8,7 @@ tools.
 ## Build and run
 
 ```sh
-git clone https://github.com/incoai/richengine.git
+git clone https://github.com/richardoestigaard/richengine.git
 cd richengine
 make -j4
 ./richengine serve --model mlx-community/Qwen3.8-27B-4bit
@@ -1837,14 +1837,14 @@ a temporary tap and remove their installation; they refuse to replace an existin
 RichEngine installation. The install check requires a poured bottle and runs the
 bundled launcher without a compiler or separate Python installation.
 
-To publish, tag the verified release commit in `incoai/richengine` with the
+To publish, tag the verified release commit in `richardoestigaard/richengine` with the
 version (no `v` prefix), preserving existing history and tags. Create a GitHub
 Release with the runtime archive, bottle, checksum files and `SHA256SUMS`.
-Open a pull request in `incoai/homebrew-tap` replacing `Formula/richengine.rb`
+Open a pull request in `richardoestigaard/homebrew-tap` replacing `Formula/richengine.rb`
 with `dist/richengine.rb`; its URLs must point to the published release assets.
 After the tap update merges, verify a fresh install and an upgrade from the
 previous release through the public tap, including a real model request and
-preservation of user data. Run `brew audit --strict --online incoai/tap/richengine`.
+preservation of user data. Run `brew audit --strict --online richardoestigaard/tap/richengine`.
 
 Before publishing, verify that default model and draft repositories are
 publicly accessible. Check the installed bottle on a supported Mac without

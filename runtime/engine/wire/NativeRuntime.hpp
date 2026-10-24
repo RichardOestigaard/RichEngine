@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace richengine::engine {
@@ -128,6 +129,9 @@ private:
   void restoreWeights();
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
+  bool handleForcedTokens(const protocol::ForcedTokensFrame &forced);
+  bool handleConstraintDfa(const protocol::ConstraintDfaFrame &dfa);
+  bool handleVocabulary(const protocol::VocabularyFrame &vocabulary);
   bool handleStatus(const protocol::StatusRequestFrame &status);
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
@@ -174,6 +178,9 @@ private:
   engine::Engine core_;
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
+  // Requests whose constraint masks are computed on the GPU: their stale
+  // host mask responses drop silently instead of failing the request.
+  std::unordered_set<uint64_t> gpuMaskRequests_;
   uint64_t nextMaskRequestId_ = 1;
   // When the engine's idle period began: at Ready, when a request ended, or
   // when the weights were restored for one.

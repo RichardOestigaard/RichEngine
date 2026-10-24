@@ -52,6 +52,7 @@ enum class PrefillTensor : uint32_t {
   ContextProjected,
   ContextHidden,
   ContextKv,
+  ContextQkv,
   DraftRopeCos,
   DraftRopeSin,
   // The alternate-geometry (Gemma global) layers' rope tables and inverse

@@ -263,6 +263,15 @@ std::string runtimeStatusJson(
       << executorTelemetry.lastConstrainedMaskWaitSeconds * 1000.0
       << ",\"total_residual_wait_ms\":"
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
+      // Engine-side forced-span counters; the server merges its
+      // spans_pushed/tokens_pushed into the same object.
+      << ",\"forced\":{\"spans_applied\":"
+      << executorTelemetry.forcedSpansApplied
+      << ",\"spans_dropped_stale\":"
+      << executorTelemetry.forcedSpansDroppedStale
+      << ",\"tokens_emitted\":" << executorTelemetry.forcedTokensEmitted
+      << ",\"gpu_spans_applied\":"
+      << executorTelemetry.gpuForcedSpansApplied << "}"
       << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
       << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes

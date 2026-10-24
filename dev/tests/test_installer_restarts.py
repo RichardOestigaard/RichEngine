@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
+from huggingface_hub.utils import httpx
 
 from dev.tests.installer_fixtures import DENSE, MODEL, fake_hub, mlx_target
 from dev.tools import installer_restarts as restarts

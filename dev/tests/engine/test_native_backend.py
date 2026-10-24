@@ -64,6 +64,9 @@ class FakeConstraint:
         words = tuple(range(1, rows * self.words_per_mask + 1))
         return struct.pack(f"<{len(words)}I", *words)
 
+    def forced_tokens(self):
+        return ()
+
     def commit(self, tokens):
         if self.commit_error is not None:
             raise self.commit_error
@@ -85,6 +88,11 @@ class FakeMatcher:
         self.consumed.append(tuple(tokens))
         return True
 
+    def deep_copy(self):
+        copy = FakeMatcher()
+        copy.consumed = list(self.consumed)
+        return copy
+
 
 class FakeCall:
     def __init__(self, request_id, request, on_event, on_complete):
@@ -98,10 +106,14 @@ class FakeCall:
         self._result = None
         self._error = None
         self._done = False
+        self.forced_sent = []
 
     @property
     def done(self):
         return self._done
+
+    def send_forced_tokens(self, tokens):
+        self.forced_sent.append(tuple(tokens))
 
     def emit(self, event):
         try:
@@ -163,6 +175,9 @@ class FakeRuntime:
             "eval_ms_total": 0.0,
             "eval_ms_max": 0.0,
         }
+
+    def forced_stats(self):
+        return {"spans_pushed": 0, "tokens_pushed": 0}
 
     def submit(self, request, *, on_event, on_complete):
         self.submit_attempts += 1

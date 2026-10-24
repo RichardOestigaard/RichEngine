@@ -145,6 +145,9 @@ void Engine::failRequest(uint64_t id, LaneOutcome outcome, std::string message) 
 
 void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
   Request &active = request(id);
+  // A GPU-DFA lane never asked the host: drop the stale response.
+  if (active.gpuMask)
+    return;
   const bool ownedByActiveBatch =
       std::any_of(pending_.begin(), pending_.end(), [&](const Pending &pending) {
         return pending.ticket->ownsMaskWait(id);
@@ -162,6 +165,49 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
   active.maskRequestedMilliseconds.reset();
   if (!ownedByActiveBatch)
     scheduler_.maskReady(id);
+}
+
+void Engine::provideForcedTokens(uint64_t id,
+                                 std::span<const uint32_t> tokens) {
+  auto found = requests_.find(id);
+  if (found == requests_.end() || found->second.finalized ||
+      found->second.pendingEnd)
+    return;
+  model_.provideForcedTokens(id, tokens);
+}
+
+bool Engine::provideDfa(uint64_t id, std::span<const int16_t> table,
+                        std::span<const uint8_t> accepting,
+                        std::span<const uint8_t> marker,
+                        std::span<const uint32_t> eosIds) {
+  auto found = requests_.find(id);
+  if (found == requests_.end() || found->second.finalized ||
+      found->second.pendingEnd)
+    return false;
+  Request &active = found->second;
+  // The frame outruns its lane: the model's runtime request exists only
+  // once admit() runs begin(), so a request still queued (or retrying a
+  // vacated start) keeps the frame for admission to deliver. A suspended
+  // lane's request lives on in the model and takes it directly. The queue
+  // copy always mirrors the latest frame so a retried start replays it.
+  active.pendingDfa =
+      Request::PendingDfa{std::vector<int16_t>(table.begin(), table.end()),
+                          std::vector<uint8_t>(accepting.begin(), accepting.end()),
+                          std::vector<uint8_t>(marker.begin(), marker.end()),
+                          std::vector<uint32_t>(eosIds.begin(), eosIds.end())};
+  if (!active.lane && !scheduler_.suspended(id))
+    return false;
+  active.gpuMask = model_.provideDfa(id, active.pendingDfa->table,
+                                     active.pendingDfa->accepting,
+                                     active.pendingDfa->marker,
+                                     active.pendingDfa->eosIds);
+  return active.gpuMask;
+}
+
+void Engine::setVocabulary(std::span<const uint8_t> bytes,
+                           std::span<const int32_t> offs,
+                           std::span<const uint8_t> specialBits) {
+  model_.setVocabulary(bytes, offs, specialBits);
 }
 
 void Engine::setCompletionNotifier(std::function<void()> notifier) {
@@ -738,6 +784,17 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(active.request.id);
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
+  // A CONSTRAINT_DFA frame that arrived while the request waited for a
+  // lane installs now that begin() created the runtime request. A resumed
+  // lane's request — and the DFA it already holds — survived the
+  // suspension; re-offering would restart its automaton mid-stream.
+  if (active.pendingDfa && !resuming) {
+    active.gpuMask =
+        model_.provideDfa(active.request.id, active.pendingDfa->table,
+                          active.pendingDfa->accepting,
+                          active.pendingDfa->marker,
+                          active.pendingDfa->eosIds);
+  }
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, active.request.images);
   const uint32_t resumeBoundary = lookup.resumeBoundary();
@@ -1629,6 +1686,7 @@ void Engine::apply(const BatchPlan &plan,
   uint32_t outputTokens = 0;
   uint32_t draftedTokens = 0;
   uint32_t acceptedDraftTokens = 0;
+  std::vector<uint64_t> gpuMaskReady;
   for (size_t index = 0; index < results.size(); ++index) {
     const ModelStepResult &result = results[index];
     const BatchItem &item = plan.items[index];
@@ -1744,12 +1802,21 @@ void Engine::apply(const BatchPlan &plan,
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
                                 complete, result.nextDecodeStage});
     if (waitsForMask(result.nextDecodeStage)) {
-      events_.maskRequested(active.request.id, {});
-      active.maskRequestedMilliseconds = now;
+      if (active.gpuMask) {
+        gpuMaskReady.push_back(active.request.id);
+      } else {
+        events_.maskRequested(active.request.id, {});
+        active.maskRequestedMilliseconds = now;
+      }
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
                       representativePrefillTiming);
+  // A GPU-DFA lane's first mask came from the walk kernels in this command:
+  // release its mask wait without the host round trip.
+  for (uint64_t id : gpuMaskReady)
+    if (scheduler_.phase(id) == Phase::WaitingMask)
+      scheduler_.maskReady(id);
   if (getenv("RICHENGINE_DENY_DEBUG") && plan.kind == WorkKind::Decode) {
     std::string ids;
     for (const BatchItem &item : plan.items)

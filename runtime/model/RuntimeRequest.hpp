@@ -69,6 +69,27 @@ struct RuntimeImageState final {
   std::shared_ptr<RuntimeImageRows> rows;
 };
 
+// A request's compiled byte-DFA constraint (CONSTRAINT_DFA frame): the
+// row-major states x 256 i16 transition table (-1 = dead) and its accepting
+// bitset, kept host-side for resend after a weight release and uploaded to
+// request-owned Metal buffers for the dfa walk kernels.
+struct RequestDfa final {
+  std::vector<int16_t> table;
+  // The EOS-admitting bitset (the grammar's accepting ∪ free-text states)
+  // and the marker mask — 32 bytes per state, bit b marking edge (s, b)
+  // special-only — from the CONSTRAINT_DFA frame.
+  std::vector<uint8_t> accepting;
+  std::vector<uint8_t> marker;
+  MetalBuffer tableBuffer;
+  MetalBuffer acceptBuffer;
+  MetalBuffer markerBuffer;
+  // The grammar's EOS ids (the contract's, not the engine's stop tokens);
+  // at an EOS-admitting state a member ends the walk at the stop state.
+  std::array<uint32_t, 8> eosIds{};
+  uint32_t eosCount = 0;
+  uint32_t states = 0;
+};
+
 struct RuntimeRequest final {
   uint64_t id = 0;
   uint32_t stateLane = 0;
@@ -102,6 +123,21 @@ struct RuntimeRequest final {
   // computation with target verification. This is model runtime state, not a
   // scheduler decode stage.
   bool verifyMaskInFlight = false;
+  // The request's GPU-DFA constraint: while set, decode computes the lane's
+  // masks with the dfa kernels and no host mask request goes out.
+  std::optional<RequestDfa> dfa;
+  // Host mirror of the lane's persistent automaton state — the state the
+  // pending anchor walks from. Authoritative while dfaStateDirty (set at
+  // provideDfa and across a suspension); otherwise the state lane's
+  // DecodeTensor::DfaState slot is authoritative and the mirror is stale.
+  uint32_t dfaState = 0;
+  bool dfaStateDirty = true;
+  // The DFA lane's verifyMaskInFlight: set while a constrained batch's GPU
+  // work may still write its DfaState slot, so suspend() waits it out.
+  bool gpuMaskInFlight = false;
+  // The host-pushed grammar-forced span: its first token anchors it at
+  // pendingToken, the rest replace draft proposals while they match.
+  std::vector<uint32_t> forcedTokens;
   uint64_t rngCounter = 0;
   // A bootstrap warmup request: the diffusion decode truncates its canvas
   // schedule — warmup needs one compiled pass over every kernel, not 48.

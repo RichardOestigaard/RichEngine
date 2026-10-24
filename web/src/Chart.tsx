@@ -1,21 +1,31 @@
-import { createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import type ApexCharts from "apexcharts";
-import type { ApexOptions } from "apexcharts";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  Show,
+  untrack,
+} from "solid-js";
+import { createChart } from "resolvcharts";
 import { theme } from "./theme";
+import "./chart.css";
 
-/* Shared ApexCharts wrapper. Apex wants literal colors, so the page
-   palette is read out of the CSS vars on <html>. Options rebuild when
-   the theme (or the OS scheme while theme is "auto") changes, which
-   triggers updateOptions — no remount needed.
+type ChartOptions = Parameters<typeof createChart>[1];
+type ChartData = ChartOptions["data"];
+type ChartType = ChartOptions["type"];
+type ChartInstance = ReturnType<typeof createChart>;
+type ExtraOptions = Omit<
+  ChartOptions,
+  "type" | "data" | "height" | "theme" | "animate"
+>;
+type ResolvedOptions = Omit<ChartOptions, "type" | "data">;
 
-   ApexCharts is imported dynamically so its ~600KB bundle stays a lazy
-   chunk; and the instance is driven directly rather than through
-   solid-apexcharts, whose deferred series/options effects can fire
-   before the chart exists. */
-
-const darkQuery = matchMedia("(prefers-color-scheme: dark)");
-const [osDark, setOsDark] = createSignal(darkQuery.matches);
-darkQuery.addEventListener("change", (e) => setOsDark(e.matches));
+/* Shared ResolvCharts wrapper. CSS vars become literal theme tokens; option
+   changes recreate the chart because only data can be patched in place. */
+const osDarkQuery = matchMedia("(prefers-color-scheme: dark)");
+const [osDark, setOsDark] = createSignal(osDarkQuery.matches);
+osDarkQuery.addEventListener("change", (e) => setOsDark(e.matches));
 
 const motionQuery = matchMedia("(prefers-reduced-motion: reduce)");
 const [noMotion, setNoMotion] = createSignal(motionQuery.matches);
@@ -25,11 +35,6 @@ motionQuery.addEventListener("change", (e) => setNoMotion(e.matches));
    after the signal, so the vars are only fresh by then. */
 const [paletteTick, setPaletteTick] = createSignal(0);
 
-function dark(): boolean {
-  const t = theme();
-  return t === "dark" || t === "black" || (t === "auto" && osDark());
-}
-
 function palette() {
   const css = getComputedStyle(document.documentElement);
   const v = (name: string, fallback: string) =>
@@ -38,43 +43,49 @@ function palette() {
     accent: v("--accent", "#4f46e5"),
     muted: v("--muted", "#83837d"),
     border: v("--border", "#e7e7e3"),
-    bg: v("--bg", "#fdfdfc"),
     text: v("--text", "#191917"),
-    bubble: v("--bubble", "#efefec"),
+    composer: v("--composer", "#ffffff"),
+    shadow: v("--shadow", "0 4px 14px rgba(0, 0, 0, 0.08)"),
     warn: v("--warn", "#b45309"),
     danger: v("--danger", "#dc2626"),
+    ok: v("--ok", "#16a34a"),
   };
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const seriesColors = (p: ReturnType<typeof palette>) => [
+  p.accent,
+  p.warn,
+  p.danger,
+  p.muted,
+];
 
-/* Caller options win; nested keys (chart, xaxis, …) merge instead of
-   clobbering the defaults. */
-function mergeOptions(base: ApexOptions, extra?: ApexOptions): ApexOptions {
-  if (!extra) return base;
-  const out: Record<string, unknown> = { ...base };
-  for (const [key, value] of Object.entries(extra)) {
-    const existing = out[key];
-    out[key] =
-      isObject(existing) && isObject(value)
-        ? mergeOptions(existing as ApexOptions, value as ApexOptions)
-        : value;
-  }
-  return out as ApexOptions;
+const appendTypes: ReadonlySet<ChartType> = new Set([
+  "line",
+  "area",
+  "scatter",
+  "bubble",
+  "rangearea",
+  "sparkline",
+  "baseline",
+]);
+
+export interface ChartAppend {
+  x: number;
+  y: number | number[];
 }
 
 export interface ChartProps {
-  type: NonNullable<NonNullable<ApexOptions["chart"]>["type"]>;
-  series: NonNullable<ApexOptions["series"]>;
-  options?: ApexOptions;
-  height?: number | string;
+  type: ChartType;
+  data: ChartData;
+  append?: ChartAppend | null;
+  options?: ExtraOptions;
+  height?: number;
 }
 
 export function Chart(props: ChartProps) {
   let el!: HTMLDivElement;
-  let chart: ApexCharts | undefined;
+  let chart: ChartInstance | undefined;
+  let lastAppend = props.append;
 
   createEffect(() => {
     theme();
@@ -82,94 +93,93 @@ export function Chart(props: ChartProps) {
     queueMicrotask(() => setPaletteTick((t) => t + 1));
   });
 
-  const options = createMemo<ApexOptions>(() => {
+  const options = createMemo<ResolvedOptions>(() => {
     paletteTick();
-    const mode: "dark" | "light" = dark() ? "dark" : "light";
     const p = palette();
-    const defaults: ApexOptions = {
-      chart: {
-        background: "transparent",
-        foreColor: p.muted,
-        fontFamily: "inherit",
-        toolbar: { show: false },
-        zoom: { enabled: false },
-        animations: {
-          enabled: !noMotion(),
-          speed: 200,
-          dynamicAnimation: { enabled: !noMotion(), speed: 200 },
-        },
+    return {
+      height: props.height,
+      accent: p.accent,
+      curve: "smooth",
+      animate: noMotion() ? false : 200,
+      theme: {
+        bg: p.composer,
+        text: p.text,
+        textMuted: p.muted,
+        grid: p.border,
+        axisBaseline: p.border,
+        crosshair: p.muted,
+        series: seriesColors(p),
+        contextGray: p.muted,
+        up: p.ok,
+        down: p.danger,
+        tooltipBg: p.composer,
+        tooltipText: p.text,
+        tooltipMuted: p.muted,
+        tooltipBorder: p.border,
+        tooltipShadow: p.shadow,
+        fontFamily: getComputedStyle(document.body).fontFamily,
       },
-      theme: { mode },
-      colors: [p.accent, p.warn, p.danger, p.muted],
-      grid: {
-        borderColor: p.border,
-        strokeDashArray: 3,
-        padding: { top: 0, right: 6, bottom: 0, left: 6 },
-      },
-      dataLabels: { enabled: false },
-      legend: { show: false },
-      stroke: { curve: "smooth", width: 1.5 },
-      fill: { opacity: 0.15 },
-      markers: { size: 0 },
-      tooltip: {
-        theme: mode,
-        style: { fontFamily: "inherit" },
-        x: { show: false },
-      },
-      xaxis: {
-        axisBorder: { show: false },
-        axisTicks: { show: false },
-        labels: { style: { colors: p.muted, fontFamily: "inherit" } },
-        tooltip: { enabled: false },
-      },
-      yaxis: {
-        labels: { style: { colors: p.muted, fontFamily: "inherit" } },
-      },
+      ...props.options,
     };
-    return mergeOptions(defaults, props.options);
   });
 
-  function apply() {
-    // Read the reactive inputs before the early return — bailing first
-    // would leave the effect with no tracked dependencies.
-    const opts = options();
-    const series = props.series;
-    const motion = noMotion();
-    const instance = chart;
-    if (!instance) return;
-    // updateOptions accepts a series key, so options and data flow
-    // through the one call.
-    void instance.updateOptions({ ...opts, series }, false, !motion);
-  }
+  const legendItems = createMemo(() => {
+    paletteTick();
+    const p = palette();
+    const colors = seriesColors(p);
+    const data = props.data;
+    const entries =
+      "series" in data ? data.series : "slices" in data ? data.slices : [];
+    return entries.map((entry, index) => ({
+      label: entry.label ?? `Series ${index + 1}`,
+      color: entry.color ?? colors[index % colors.length] ?? p.accent,
+    }));
+  });
 
-  onMount(async () => {
-    const Apex = (await import("apexcharts")).default;
-    // The page may have navigated away while the chunk loaded.
-    if (!el.isConnected) return;
-    const instance = new Apex(el, {
+  createEffect(() => {
+    const next = createChart(el, {
       ...options(),
-      chart: {
-        ...options().chart,
-        type: props.type,
-        height: props.height ?? 140,
-        width: "100%",
-      },
-      series: props.series,
+      type: props.type,
+      data: untrack(() => props.data),
     });
-    await instance.render();
-    chart = instance;
-    // Props that changed during the async init need one replay.
-    apply();
+    chart = next;
+    lastAppend = untrack(() => props.append);
+    onCleanup(() => {
+      if (chart === next) chart = undefined;
+      next.destroy();
+    });
   });
 
-  /* Skipped until the instance exists; updates during init are caught
-     by the apply() after render. */
-  createEffect(apply);
-
-  onCleanup(() => {
-    void chart?.destroy();
-    chart = undefined;
+  createEffect(() => {
+    const pending = props.append;
+    if (pending && appendTypes.has(props.type)) {
+      if (pending !== lastAppend) chart?.append(pending.x, pending.y);
+      lastAppend = pending;
+      return;
+    }
+    lastAppend = pending ?? null;
+    chart?.setData(props.data);
   });
 
-  return <div ref={el} />;
+  return (
+    <div class="chart-frame">
+      <Show when={props.options?.legend && legendItems().length > 0}>
+        <div class="chart-legend">
+          <For each={legendItems()}>
+            {(item) => (
+              <span class="chart-legend-item">
+                <i
+                  aria-hidden="true"
+                  class="chart-legend-swatch"
+                  style={{ background: item.color }}
+                />
+                {item.label}
+              </span>
+            )}
+          </For>
+        </div>
+      </Show>
+      <div ref={el} />
+    </div>
+  );
 }

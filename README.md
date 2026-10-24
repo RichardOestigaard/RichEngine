@@ -1,6 +1,6 @@
 # RichEngine
 
-[![CI](https://github.com/incoai/richengine/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/richengine/actions/workflows/ci.yml)
+[![CI](https://github.com/richardoestigaard/richengine/actions/workflows/ci.yml/badge.svg)](https://github.com/richardoestigaard/richengine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-black.svg)](#quick-start)
 
@@ -19,7 +19,7 @@ The 4-bit examples need at least 36 GB of unified memory (48 GB recommended);
 24 GB Macs can use [smaller GGUF variants](#models).
 
 ```bash
-brew install incoai/tap/richengine
+brew install richardoestigaard/tap/richengine
 richengine serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
@@ -312,7 +312,7 @@ ship precompiled, with no Xcode or local tuning required.
 ## More
 
 - [Development](DEVELOPMENT.md): build from source, architecture, tests, and releases.
-- [Issues and feedback](https://github.com/incoai/richengine/issues)
+- [Issues and feedback](https://github.com/richardoestigaard/richengine/issues)
 - [Apache-2.0](LICENSE). RichEngine descends from
   [Splash](https://github.com/incoai/splash) — see [NOTICE](NOTICE).
   GGUF kernels include MIT-licensed material from llama.cpp; see

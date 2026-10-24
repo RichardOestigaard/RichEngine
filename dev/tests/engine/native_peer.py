@@ -11,7 +11,11 @@ _HEADER = struct.Struct("<4sHHHHQI")
 _REQUEST = struct.Struct("<QBBQQIIIffIffffQBIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
+_FORCED_TOKENS = struct.Struct("<QI")
+_VOCABULARY = struct.Struct("<II")
+_CONSTRAINT_DFA = struct.Struct("<QII")
 _ID = struct.Struct("<Q")
+_LEN = struct.Struct("<I")
 
 
 def request_frame(**overrides) -> wire.RequestFrame:
@@ -204,6 +208,54 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             request_id, mask_request_id, count = _MASK_RESPONSE.unpack_from(payload)
             mask = payload[_MASK_RESPONSE.size : _MASK_RESPONSE.size + 4 * count]
             return wire.MaskResponseFrame(request_id, mask_request_id, bytes(mask))
+        case wire.FrameType.FORCED_TOKENS:
+            request_id, count = _FORCED_TOKENS.unpack_from(payload)
+            tokens = _words(payload, _FORCED_TOKENS.size, count)
+            return wire.ForcedTokensFrame(request_id, tokens)
+        case wire.FrameType.VOCABULARY:
+            vocab, tbytes_len = _VOCABULARY.unpack_from(payload)
+            tbytes = payload[
+                _VOCABULARY.size : _VOCABULARY.size + tbytes_len
+            ]
+            offset = _VOCABULARY.size + tbytes_len
+            offsets = _words(payload, offset, vocab + 1)
+            offset += 4 * (vocab + 1)
+            (spec_len,) = _LEN.unpack_from(payload, offset)
+            spec_bits = payload[offset + _LEN.size : offset + _LEN.size + spec_len]
+            special = tuple(
+                index * 8 + bit
+                for index, byte in enumerate(spec_bits)
+                for bit in range(8)
+                if byte >> bit & 1
+            )
+            tokens = tuple(
+                bytes(tbytes[offsets[index] : offsets[index + 1]])
+                for index in range(vocab)
+            )
+            return wire.VocabularyFrame(tokens, special)
+        case wire.FrameType.CONSTRAINT_DFA:
+            request_id, n_states, _flags = _CONSTRAINT_DFA.unpack_from(payload)
+            table_bytes = n_states * 256 * 2
+            offset = _CONSTRAINT_DFA.size
+            table = payload[offset : offset + table_bytes]
+            offset += table_bytes
+            accepting_bytes = (n_states + 7) // 8
+            accepting = payload[offset : offset + accepting_bytes]
+            offset += accepting_bytes
+            (eos_count,) = _LEN.unpack_from(payload, offset)
+            offset += _LEN.size
+            eos_ids = _words(payload, offset, eos_count)
+            offset += 4 * eos_count
+            (marker_len,) = _LEN.unpack_from(payload, offset)
+            marker = payload[offset + _LEN.size : offset + _LEN.size + marker_len]
+            return wire.ConstraintDfaFrame(
+                request_id,
+                n_states,
+                bytes(table),
+                bytes(accepting),
+                eos_ids,
+                bytes(marker),
+            )
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")

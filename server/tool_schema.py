@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property, lru_cache
 from urllib.parse import unquote
 
@@ -117,6 +117,11 @@ class ToolDialect:
     # family whose think blocks close differently says so (gemma4's
     # `<channel|>`).
     think_end: str = THINK_END
+    # The ids the served tokenizer gives the dialect's spellings that are
+    # special tokens but not `<name>` atoms (minicpm5's `<function`), bound
+    # per model by bind_dialect as (spelling, id) pairs. Grammar atoms for
+    # them spell `<[id]>`; empty where none is bound or needed.
+    marker_ids: tuple = ()
 
     def call_opening(self, name):
         """The tokens that begin a call of tool `name`, through the name."""
@@ -132,20 +137,34 @@ class ToolDialect:
             return _gemma4_argument_grammar(schema)
         return _argument_grammar(schema, self)
 
+    def token_markers(self):
+        """The spellings grammars write as special-token atoms: structural
+        markers named by their `<name>` spelling, plus every bound marker —
+        one whose spelling has no atom form writes as `<[id]>` instead."""
+        ids = {marker for marker, _id in self.marker_ids}
+        markers = dict.fromkeys([*self.structural, *ids])
+        return [
+            marker
+            for marker in markers
+            if marker and (re.fullmatch(r"<[^<>]*>", marker) or marker in ids)
+        ]
+
     def spelling(self, text):
         """`text` as lark atoms: a structural marker is a special token,
-        spelled by its name so generation emits that token rather than the
-        characters; other text is a JSON string."""
+        spelled by its name — or by `<[id]>` where the spelling has no name
+        form — so generation emits that token rather than the characters;
+        other text is a JSON string."""
         atoms = []
-        special = [
-            marker
-            for marker in self.structural
-            if marker and re.fullmatch(r"<[^<>]*>", marker)
-        ]
+        ids = dict(self.marker_ids)
+        special = self.token_markers()
         while text:
             marker = next((m for m in special if text.startswith(m)), None)
             if marker is not None:
-                atoms.append(marker)
+                atoms.append(
+                    marker
+                    if re.fullmatch(r"<[^<>]*>", marker)
+                    else f"<[{ids[marker]}]>"
+                )
                 text = text[len(marker) :]
                 continue
             ends = [text.find(m) for m in special]
@@ -162,7 +181,7 @@ class ToolDialect:
                 f"call_{index}: {json.dumps(name + '(')} @{arguments} {json.dumps(')')}"
             )
         separator = (
-            f"{json.dumps(self.call_separator)}? " if self.call_separator else ""
+            f"{self.spelling(self.call_separator)}? " if self.call_separator else ""
         )
         return (
             f"call_{index}: {separator}{self.spelling(self.call_opening(name))} "
@@ -186,15 +205,24 @@ class ToolDialect:
             return _PYTHON_FREE_ARGUMENTS
         if self.kind == "gemma4":
             return _GEMMA4_FREE_ARGUMENTS
-        name_open = json.dumps(self.param_open)
-        name_close = json.dumps(self.param_name_close)
-        closing = json.dumps(self.param_close)
+        name_open = self.spelling(self.param_open)
+        name_close = self.spelling(self.param_name_close)
+        closing = self.spelling(self.param_close)
+        if closing == json.dumps(self.param_close):
+            # A literal close is the raw value's stop suffix.
+            parameter = f"parameter: {name_open} NAME {name_close} value\n"
+            value = f"value[suffix={closing}]: {_RAW_VALUE}\n"
+        else:
+            # A close spelled as a token cannot be a literal suffix; the
+            # value lexeme excludes its bytes and the token follows it.
+            parameter = f"parameter: {name_open} NAME {name_close} VALUE {closing}\n"
+            value = (
+                f"VALUE: {_RAW_VALUE} "
+                f"& ~/(?s:.*){_regex_text(self.param_close)}(?s:.*)/\n"
+            )
         return (
             "%llguidance {}\n"
-            "start: parameter*\n"
-            f"parameter: {name_open} NAME {name_close} value\n"
-            f"value[suffix={closing}]: {_RAW_VALUE}\n"
-            f"NAME: {_name_regex(self)}\n"
+            "start: parameter*\n" + parameter + value + f"NAME: {_name_regex(self)}\n"
         )
 
 
@@ -502,9 +530,12 @@ def _gemma4_value_rules(rule, value_schema, root, ancestors):
     string_schema = raw_string_schema(schema, '<|"|>')
     if string_schema is not None and (kind is None or "string" in (kinds or ())):
         if string_schema[0] == "raw":
+            # Intersections are only legal on tokens; the body rule is
+            # named like one.
+            body_rule = f"{rule}_body".upper()
             return [
-                f"{rule}: " + _GEMMA4_QUOTE + f" {rule}_body " + _GEMMA4_QUOTE,
-                f"{rule}_body: " + _GEMMA4_STRING_BODY,
+                f"{rule}: " + _GEMMA4_QUOTE + f" {body_rule} " + _GEMMA4_QUOTE,
+                f"{body_rule}: " + _GEMMA4_STRING_BODY,
             ]
         return [
             f"{rule}: ("
@@ -650,6 +681,30 @@ def dialect_named(name):
     if name is None:
         return None
     return DIALECTS.get(name)
+
+
+def bind_dialect(dialect, vocabulary):
+    """`dialect` with its marker spellings' token ids bound from
+    `vocabulary` (a spelling → id map, e.g. the tokenizer's get_vocab()).
+
+    A marker a grammar cannot spell as a `<name>` atom — minicpm5's
+    `<function` and `<param` — writes as `<[id]>` so generation emits the
+    special token the template spells it as; a literal spelling would ask
+    llguidance to satisfy text with a special token, which its masks admit
+    but its consumer refuses. `call_separator` binds too, for tokenizers
+    that mark it special. Spellings the vocabulary lacks stay literal.
+    """
+    if dialect is None:
+        return None
+    spellings = list(dict.fromkeys([*dialect.structural, dialect.call_separator]))
+    ids = tuple(
+        (spelling, vocabulary[spelling])
+        for spelling in spellings
+        if spelling and vocabulary.get(spelling) is not None
+    )
+    if not ids:
+        return dialect
+    return replace(dialect, marker_ids=ids)
 
 
 def detect_tool_dialect(rendered):
@@ -829,10 +884,11 @@ PATTERN_CHECK_CACHE_SIZE = 1024
 # JSON and around tool calls, is bounded: a model that prefers whitespace to
 # every token the grammar allows next would otherwise write it until
 # max_tokens, as Qwen models do, most of all under speculative decoding (vLLM
-# #38696, #50989). llama.cpp and Outlines bound it more tightly; 64 characters
-# still take pretty printing 15 levels deep at four spaces. Whitespace inside
-# strings is content and unbounded.
-MAX_WHITESPACE = 64
+# #38696, #50989). llama.cpp and Outlines bound it more tightly. 16 characters
+# take pretty printing eight levels deep at two spaces — beyond that a bound
+# grammar should be compact anyway; greedy decoders otherwise flood the
+# whitespace budget. Whitespace inside strings is content and unbounded.
+MAX_WHITESPACE = 16
 WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
 
@@ -1502,7 +1558,7 @@ def _parameter_rules(rule, prefix, value_schema, dialect):
     one of the values each member of its union lists, or JSON of a member
     that lists none. None when no value is possible. Framing makes each
     parameter schema self-contained, so it is its own reference root."""
-    closing = json.dumps(dialect.param_close)
+    closing = dialect.spelling(dialect.param_close)
     if value_schema is False:
         return None
     rules, choices = [], []
@@ -1512,9 +1568,20 @@ def _parameter_rules(rule, prefix, value_schema, dialect):
             types = schema_types(member, value_schema)
             if types is None or "string" in types:
                 # Any text may be the value; the listed ones are among it.
+                if closing == json.dumps(dialect.param_close):
+                    # A literal close is the raw value's stop suffix.
+                    return [
+                        f"{rule}: {prefix} {rule}_value",
+                        f"{rule}_value[suffix={closing}]: {_RAW_VALUE}",
+                    ]
+                # A close spelled as a token cannot be a literal suffix;
+                # the value lexeme excludes its bytes and the token
+                # follows it.
+                value = f"{rule.upper()}_VALUE"
                 return [
-                    f"{rule}: {prefix} {rule}_value",
-                    f"{rule}_value[suffix={closing}]: {_RAW_VALUE}",
+                    f"{rule}: {prefix} {value} {closing}",
+                    f"{value}: {_RAW_VALUE} "
+                    f"& ~/(?s:.*){_regex_text(dialect.param_close)}(?s:.*)/",
                 ]
             if member is not value_schema:
                 # A member refers to the parameter schema's definitions.
@@ -1549,8 +1616,8 @@ def _argument_grammar(schema, dialect=None):
     sequence = []
     # A name is a lexeme of its own: one spanning "<parameter=url>" would win
     # over an extra name that starts like it, and lexing cannot back off.
-    name_open = json.dumps(dialect.param_open)
-    name_close = json.dumps(dialect.param_name_close)
+    name_open = dialect.spelling(dialect.param_open)
+    name_close = dialect.spelling(dialect.param_name_close)
     for index, (name, value_schema) in enumerate(properties.items()):
         rule = f"parameter_{index}"
         prefix = f"{name_open} {json.dumps(name)} {name_close}"
