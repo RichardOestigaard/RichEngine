@@ -204,7 +204,11 @@ export default function Composer(props: {
           rows="1"
           placeholder="Message RichEngine"
           aria-label="Message RichEngine"
-          title="Enter to send · Shift+Enter for a new line"
+          title={
+            props.running
+              ? "Enter queues the message · Shift+Enter for a new line"
+              : "Enter to send · Shift+Enter for a new line"
+          }
           autofocus
           ref={(el) => {
             inputEl = el;
@@ -223,7 +227,6 @@ export default function Composer(props: {
           aria-label="Add images or PDFs"
           title="Attach images or PDFs"
           hidden={!props.imagesAccepted && !props.pdfsAccepted}
-          disabled={props.running}
           onClick={() => fileInput?.click()}
         >
           <svg
@@ -320,7 +323,7 @@ export default function Composer(props: {
         </label>
         <div class="spacer" />
         <Show when={props.running}>
-          <span class="stop-hint muted">Esc to stop</span>
+          <span class="stop-hint muted">Esc to stop · Enter to queue</span>
         </Show>
         <Show when={props.tokenText}>
           <span
@@ -338,7 +341,7 @@ export default function Composer(props: {
           id="send"
           disabled={!props.running && !props.canSend}
           aria-label={props.running ? "Stop" : "Send"}
-          title={props.running ? "Esc to stop" : "Send"}
+          title={props.running ? "Stop — Enter queues a message" : "Send"}
         >
           {props.running ? "■" : "↑"}
         </button>

@@ -108,6 +108,9 @@ svg { display: block }
 .status-pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)) }
 .status-pill.down { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)) }
 .status-pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)) }
+.top-mem { padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; text-decoration: none; white-space: nowrap }
+.top-mem:hover { color: var(--text); background: var(--hover) }
+.top-mem.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)) }
 .api-key { width: 180px; padding: 6px 10px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 13px }
 .api-key:focus { border-color: var(--accent); outline: 0 }
 .api-key.invalid { border-color: var(--danger) }
@@ -162,6 +165,7 @@ svg { display: block }
 }
 @media (max-width: 900px) {
   .palette-trigger .kbd { display: none }
+  .top-mem { display: none }
 }
 @media (max-width: 720px) {
   .page { width: calc(100% - 24px) }

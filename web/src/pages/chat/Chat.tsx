@@ -69,6 +69,15 @@ interface StreamState {
   calls: (ToolCallDraft | undefined)[];
 }
 
+/* Enter during a run stashes the turn here instead of dropping it; queued
+   turns render as ghost bubbles under the live reply and drain in order
+   once it ends. */
+interface QueuedTurn {
+  content: MessageContent;
+  text: string;
+  attachments: Attachment[];
+}
+
 const ALLOWED_EFFORTS = new Set(["", "xhigh", "medium", "low", "none"]);
 /* A model still calling after this many rounds is stuck; the last streamed
    answer ends the turn without honoring further calls. */
@@ -118,6 +127,7 @@ export default function Chat() {
   const [lightbox, setLightbox] = createSignal<string | null>(null);
   const [dragging, setDragging] = createSignal(0);
   const [tokenCount, setTokenCount] = createSignal<number | null>(null);
+  const [queued, setQueued] = createSignal<QueuedTurn[]>([]);
   const running = () => controller() !== undefined;
 
   let inputEl: HTMLTextAreaElement | undefined;
@@ -324,8 +334,9 @@ export default function Chat() {
     setAttachments((list) => list.filter((value) => value !== attachment));
   }
 
-  async function complete() {
-    if (controller() || !canSend()) return;
+  /* The content a send carries: the draft text plus any attachments, in
+     the OpenAI multipart shape. */
+  function buildTurn(): QueuedTurn {
     const text = input().trim();
     const pending = attachments();
     const content: MessageContent = pending.length
@@ -344,26 +355,79 @@ export default function Chat() {
           ),
         ]
       : text;
+    return { content, text, attachments: pending };
+  }
+
+  async function complete() {
+    if (!canSend()) return;
+    const turn = buildTurn();
     setInput("");
     setAttachments([]);
+    // A reply in flight takes the turn into the queue instead of dropping it.
+    if (controller()) {
+      setQueued((list) => [...list, turn]);
+      announce("Message queued — it sends when this reply finishes");
+      pinAndScroll();
+      return;
+    }
+    await sendTurn(turn);
+    // Anything queued during this run drains next; a stop or a failed
+    // send already emptied it, so this is a no-op then.
+    void pumpQueue();
+  }
+
+  /* Append the turn as a user message and stream its reply. A failed send
+     rolls the message back and returns it — and anything still behind it —
+     to the composer so nothing typed is lost. */
+  async function sendTurn(turn: QueuedTurn) {
     pinned = true;
     if (toBottomEl) toBottomEl.hidden = true;
     setMessages((list) => [
       ...list,
-      { role: "user", content, created: Date.now() },
+      { role: "user", content: turn.content, created: Date.now() },
     ]);
     scrollTo(0, document.documentElement.scrollHeight);
     try {
-      await streamReply(text || pending[0]?.name || "Image");
+      await streamReply(turn.text || turn.attachments[0]?.name || "Image");
     } catch (error) {
       // A stopped stream keeps its partial output; other errors roll back.
       if (isAbort(error)) return;
       setMessages((list) => list.slice(0, -1));
-      if (input() === "") setInput(text);
-      // Restore the submitted entries alongside the next draft's pending reads.
-      setAttachments((list) => [...pending, ...list]);
+      setQueued((list) => [turn, ...list]);
+      restoreQueue();
       setErrorNote({ role: "assistant", content: errorText(error) });
     }
+  }
+
+  /* Queued turns drain in order once a run ends. A stop or a failed send
+     already emptied the queue back into the draft, ending the loop. */
+  async function pumpQueue() {
+    while (!controller() && queued().length) {
+      const [turn, ...rest] = queued();
+      setQueued(rest);
+      await sendTurn(turn);
+    }
+  }
+
+  /* A stopped run must not fire the queue behind the user's back: queued
+     turns merge back into the draft — oldest first, ahead of anything
+     typed meanwhile — and stay editable instead of being sent. */
+  function restoreQueue() {
+    const turns = queued();
+    if (!turns.length) return;
+    setQueued([]);
+    const draft = input().trim();
+    setInput(
+      [...turns.map((turn) => turn.text), draft].filter(Boolean).join("\n")
+    );
+    setAttachments((list) => [
+      ...turns.flatMap((turn) => turn.attachments),
+      ...list,
+    ]);
+  }
+
+  function removeQueued(turn: QueuedTurn) {
+    setQueued((list) => list.filter((item) => item !== turn));
   }
 
   function paintStats(box: HTMLElement, assistant: Message) {
@@ -836,6 +900,9 @@ export default function Chat() {
       window.clearTimeout(queueTimer);
       setController(undefined);
       liveBox = undefined;
+      // A deliberate stop parks the queue back in the draft instead of
+      // firing it behind the user's back.
+      if (ctrl.signal.aborted) restoreQueue();
       inputEl?.focus();
     }
   }
@@ -1263,6 +1330,47 @@ export default function Chat() {
           <Show when={errorNote()} keyed>
             {(note) => <MessageView msg={note} error />}
           </Show>
+          {/* Queued turns sit under the reply in flight, where they will
+              land once it ends; ghosted until their send starts. */}
+          <For each={queued()}>
+            {(turn) => {
+              const parts = userParts(turn.content);
+              return (
+                <div
+                  class="message user queued"
+                  title="Queued — sends when the current reply finishes"
+                >
+                  {parts.text ? <div class="user-text">{parts.text}</div> : null}
+                  {parts.images.length ? (
+                    <div class="user-images">
+                      {parts.images.map((url) => (
+                        <img src={url} alt="Attached image" />
+                      ))}
+                    </div>
+                  ) : null}
+                  {parts.files.length ? (
+                    <div class="user-files">
+                      {parts.files.map((file) => (
+                        <span class="file-chip" title={file.name}>
+                          📄 {file.name}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div class="queued-tag">Queued</div>
+                  <button
+                    class="queued-remove"
+                    type="button"
+                    aria-label="Remove queued message"
+                    title="Remove queued message"
+                    onClick={() => removeQueued(turn)}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            }}
+          </For>
         </div>
       </main>
       <Show when={dragging() > 0}>

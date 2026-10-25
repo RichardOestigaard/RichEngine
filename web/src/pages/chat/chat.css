@@ -38,6 +38,10 @@
 .chat-shell .message { margin: 32px 0; white-space: pre-wrap; overflow-wrap: anywhere }
 .chat-shell .user { position: relative; width: fit-content; max-width: 78%; margin-left: auto; padding: 9px 15px; border-radius: 18px 18px 4px 18px; background: var(--bubble) }
 .chat-shell .user .actions { position: absolute; top: calc(100% + 2px); right: 0; margin-top: 0 }
+.chat-shell .queued { opacity: .66; border: 1px dashed var(--border) }
+.chat-shell .queued-tag { margin-top: 8px; color: var(--muted); font-size: 11px }
+.chat-shell .queued-remove { position: absolute; top: -7px; right: -7px; display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: var(--composer); color: var(--muted); font-size: 13px; line-height: 1 }
+.chat-shell .queued-remove:hover { color: var(--text); border-color: var(--text) }
 .chat-shell .user-images { display: flex; flex-wrap: wrap; gap: 8px }
 .chat-shell .user-text + .user-images, .chat-shell .user-text + .user-files, .chat-shell .user-images + .user-files { margin-top: 9px }
 .chat-shell .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 10px; object-fit: cover; cursor: zoom-in }

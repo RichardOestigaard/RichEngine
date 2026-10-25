@@ -2,11 +2,24 @@ import { A, useLocation } from "@solidjs/router";
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { api, apiKey, setApiKey, authorization, noteAuthStatus, unauthorized } from "./api";
 import { decisionModel, setDecisionModel } from "./decision";
+import { fmtBytes } from "./format";
 import { installJob } from "./install";
 import { poll } from "./poll";
 import { togglePalette } from "./shortcuts";
 import { cycleTheme, theme, THEME_LABELS } from "./theme";
 import type { Theme } from "./theme";
+
+/* /ready answers one of these; "down" is the frontend's own verdict for an
+   unreachable server or an unrecognized state — "unloaded" is a reachable
+   server with no model, not an outage. */
+type ReadyState = "ready" | "loading" | "unloaded" | "down" | null;
+
+interface MemoryUse {
+  current: number;
+  peak?: number;
+  limit?: number;
+  pressure?: string;
+}
 
 const ICON_PROPS = {
   width: 16,
@@ -53,8 +66,9 @@ function ThemeIcon(props: { name: Theme }) {
 
 export default function TopBar() {
   const location = useLocation();
-  const [ready, setReady] = createSignal<boolean | null>(null);
+  const [ready, setReady] = createSignal<ReadyState>(null);
   const [servedModel, setServedModel] = createSignal<string | null>(null);
+  const [memory, setMemory] = createSignal<MemoryUse | null>(null);
 
   async function checkReady() {
     try {
@@ -63,10 +77,47 @@ export default function TopBar() {
         signal: AbortSignal.timeout(8000),
       });
       noteAuthStatus(response.status);
-      setReady(response.ok);
+      const body = (await response.json().catch(() => null)) as {
+        status?: string;
+      } | null;
+      const status = body?.status;
+      setReady(
+        response.ok
+          ? "ready"
+          : status === "loading" || status === "unloaded"
+            ? status
+            : "down"
+      );
       if (response.ok) void loadServedModel();
+      void loadStatus();
     } catch {
-      setReady(false);
+      setReady("down");
+      setMemory(null);
+    }
+  }
+
+  /* Model memory rides the ready poll: present only while an app is
+     loaded, so the chip hides itself when nothing is serving. */
+  async function loadStatus() {
+    try {
+      const res = await api<{
+        memory_actual?: { current_bytes?: number; peak_bytes?: number };
+        memory_governor?: { limit_bytes?: number };
+        memory_pressure?: string;
+      }>("/status");
+      const current = res.memory_actual?.current_bytes;
+      setMemory(
+        typeof current === "number"
+          ? {
+              current,
+              peak: res.memory_actual?.peak_bytes,
+              limit: res.memory_governor?.limit_bytes,
+              pressure: res.memory_pressure,
+            }
+          : null
+      );
+    } catch {
+      setMemory(null);
     }
   }
 
@@ -162,24 +213,59 @@ export default function TopBar() {
         </A>
       </Show>
       <div class="topright">
+        <Show when={memory()}>
+          {(mem) => (
+            <A
+              href="/metrics"
+              class="top-mem"
+              classList={{
+                warn:
+                  mem().pressure === "warning" ||
+                  mem().pressure === "critical",
+              }}
+              title={`Model memory in use — peak ${
+                mem().peak !== undefined ? fmtBytes(mem().peak) : "—"
+              }${
+                mem().limit !== undefined
+                  ? ` · limit ${fmtBytes(mem().limit)}`
+                  : ""
+              }${
+                mem().pressure ? ` · pressure ${mem().pressure}` : ""
+              } — open Metrics`}
+            >
+              {fmtBytes(mem().current)}
+              {mem().limit !== undefined ? ` / ${fmtBytes(mem().limit)}` : ""}
+            </A>
+          )}
+        </Show>
         <span
           class="status-pill"
           classList={{
-            ok: ready() === true && !unauthorized(),
-            down: ready() === false,
-            warn: unauthorized(),
+            ok: ready() === "ready" && !unauthorized(),
+            down: ready() === "down",
+            warn: unauthorized() || ready() === "loading",
           }}
           title={
             unauthorized()
               ? "API key required or rejected — enter it at right"
               : ready() === null
                 ? "Checking server"
-                : ready()
+                : ready() === "ready"
                   ? "Engine ready"
-                  : "Engine unavailable"
+                  : ready() === "loading"
+                    ? "Model is loading"
+                    : ready() === "unloaded"
+                      ? "Server up — no model loaded; open Models to load one"
+                      : "Engine unavailable"
           }
         >
-          {unauthorized() ? "auth" : ready() === null ? "…" : ready() ? "ready" : "down"}
+          {unauthorized()
+            ? "auth"
+            : ready() === null
+              ? "…"
+              : ready() === "unloaded"
+                ? "no model"
+                : ready()}
         </span>
         <input
           class="api-key"
