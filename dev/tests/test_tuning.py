@@ -100,6 +100,26 @@ class TestKnobTables(unittest.TestCase):
                 self.assertIn(env, by_env)
                 self.assertFalse(by_env[env].quality_sensitive)
 
+    def test_agentic_knobs_resolve_outside_family_tables(self):
+        # The constrained-decode knobs ride the agentic pass, not a family
+        # table: eligible like any knob but swept only under --agentic.
+        from install.tuning import agentic_knobs
+
+        knobs = agentic_knobs(_context())
+        self.assertTrue(knobs)
+        listed = {
+            knob.env for table in TUNING_TABLES.values() for knob in table.knobs
+        }
+        engine_vars = set(
+            re.findall(r"RICHENGINE_[A-Z_0-9]+", TUNING_HPP.read_text())
+        )
+        for knob in knobs:
+            with self.subTest(knob.env):
+                self.assertTrue(knob.agentic)
+                self.assertTrue(knob.values)
+                self.assertNotIn(knob.env, listed)
+                self.assertIn(knob.env, engine_vars)
+
     def test_batch_width_matches_the_engine(self):
         # measure() submits autotune.BATCH_WIDTH concurrent lanes for the
         # batched number; it must equal ExecutionLimits::maximumBatchWidth.

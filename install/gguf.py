@@ -657,6 +657,11 @@ def model_config(metadata, vision=None):
         model_type=entry.model_type,
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
+    decision_type = metadata.values.get(arch + ".decision.type") or metadata.values.get(
+        "general.decision_type"
+    )
+    if isinstance(decision_type, str):
+        text["decision_type"] = decision_type
     if entry.feed_forward:
         text["intermediate_size"] = metadata.positive(arch + ".feed_forward_length")
     if entry.fields is not None:

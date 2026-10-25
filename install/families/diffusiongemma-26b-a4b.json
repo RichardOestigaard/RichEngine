@@ -134,6 +134,8 @@
     "NO_FUSED_GATE",
     "MOE_UNION",
     "MOE_PACKED_OFF",
+    "MOE_GGUF_TILE",
+    "MOE_GGUF_FUSED",
     {
       "env": "RICHENGINE_CANVAS_PROFILE",
       "values": [

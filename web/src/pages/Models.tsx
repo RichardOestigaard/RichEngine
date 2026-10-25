@@ -202,6 +202,9 @@ interface AvailableModel {
      candidate verdict — kept, rejected, eliminated, pruned, pressured. */
   tune_mode?: string | null;
   tune_verdicts?: Record<string, number> | null;
+  /* The sweep's kept env as "NAME=value" strings — applied to the engine
+     on every load; shown under the tuned badge. */
+  tuned_env?: string[] | null;
   /* A tune finished after this model's engine spawned; its winners apply
      only on the next load. */
   requires_reload?: boolean;
@@ -878,19 +881,47 @@ export default function Models() {
                         (entry.tuned_knobs ?? 0) > 0 && entry.tuning === "tuned"
                       }
                     >
-                      <span
-                        class="badge ok"
-                        title={`${entry.tune_mode ? `${entry.tune_mode} sweep · ` : ""}${entry.tuned_knobs} engine knobs measured on this chip, applied on every load${
-                          entry.tune_verdicts
-                            ? ` · ${Object.entries(entry.tune_verdicts)
-                                .map(([v, n]) => `${n} ${v}`)
-                                .join(", ")}`
-                            : ""
-                        }`}
+                      <Show
+                        when={entry.tuned_env?.length}
+                        fallback={
+                          <span
+                            class="badge ok"
+                            title={`${entry.tune_mode ? `${entry.tune_mode} sweep · ` : ""}${entry.tuned_knobs} engine knobs measured on this chip, applied on every load${
+                              entry.tune_verdicts
+                                ? ` · ${Object.entries(entry.tune_verdicts)
+                                    .map(([v, n]) => `${n} ${v}`)
+                                    .join(", ")}`
+                                : ""
+                            }`}
+                          >
+                            tuned·{entry.tuned_knobs}
+                            {entry.tune_mode === "quick" ? "·quick" : ""}
+                          </span>
+                        }
                       >
-                        tuned·{entry.tuned_knobs}
-                        {entry.tune_mode === "quick" ? "·quick" : ""}
-                      </span>
+                        <details
+                          class="tuned-settings"
+                          title={`${entry.tune_mode ? `${entry.tune_mode} sweep · ` : ""}${entry.tuned_knobs} engine knobs measured on this chip, applied on every load${
+                            entry.tune_verdicts
+                              ? ` · ${Object.entries(entry.tune_verdicts)
+                                  .map(([v, n]) => `${n} ${v}`)
+                                  .join(", ")}`
+                              : ""
+                          }`}
+                        >
+                          <summary class="badge ok">
+                            tuned·{entry.tuned_knobs}
+                            {entry.tune_mode === "quick" ? "·quick" : ""}
+                          </summary>
+                          <span class="chips tuned-settings-list">
+                            <For each={entry.tuned_env}>
+                              {(setting) => (
+                                <span class="chip mono">{setting}</span>
+                              )}
+                            </For>
+                          </span>
+                        </details>
+                      </Show>
                     </Show>
                     <Show when={entry.serving && entry.requires_reload}>
                       <span
@@ -1097,11 +1128,47 @@ export default function Models() {
               </div>
             </Show>
             <Show when={tuneJob()?.done && (tuneJob()?.results?.length ?? 0) > 0}>
-              <div class="panel-row">
-                <span class="grow muted mono" style="white-space: normal">
-                  {tuneJob()?.results?.join("  ·  ")}
-                </span>
-              </div>
+              {(() => {
+                /* Results arrive as "KNOB=value decode +4.1% @b4" strings,
+                   biggest swing first — split them into kept winners and
+                   the measured rest instead of one run-on line. */
+                const results = tuneJob()?.results ?? [];
+                const kept = new Set(tuneJob()?.kept ?? []);
+                const knobOf = (line: string) => line.split(" ")[0];
+                const winners = results.filter((line) => kept.has(knobOf(line)));
+                const rest = results.filter((line) => !kept.has(knobOf(line)));
+                return (
+                  <>
+                    <Show when={winners.length > 0}>
+                      <div class="panel-row">
+                        <div class="chips tune-results">
+                          <For each={winners}>
+                            {(line) => <span class="chip mono">{line}</span>}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
+                    <Show when={rest.length > 0}>
+                      <div class="panel-row">
+                        <details class="tune-results-details">
+                          <summary>
+                            {rest.length} other{" "}
+                            {rest.length === 1 ? "setting" : "settings"}{" "}
+                            measured — none paid off
+                          </summary>
+                          <div class="chips tune-results">
+                            <For each={rest}>
+                              {(line) => (
+                                <span class="chip mono muted">{line}</span>
+                              )}
+                            </For>
+                          </div>
+                        </details>
+                      </div>
+                    </Show>
+                  </>
+                );
+              })()}
             </Show>
             <Show when={(tuneJob()?.tail?.length ?? 0) > 0}>
               <details

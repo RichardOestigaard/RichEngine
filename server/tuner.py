@@ -25,14 +25,14 @@ STATUS_LINES = 60
 
 # A measured candidate's output line: "RICHENGINE_X=v · {...}" — first-pass
 # and recheck measurements log the same shape, and the elimination pass's
-# "-RICHENGINE_X=v · {...}" too. "sweep · N", "recheck · N" and "prune · N"
-# announce each phase's workload.
+# "-RICHENGINE_X=v · {...}" too. "sweep · N", "recheck · N", "prune · N"
+# and "agentic · N" announce each phase's workload.
 _CANDIDATE_LINE = re.compile(r"^\S*RICHENGINE_[A-Z_0-9]*=")
-_TOTAL_LINE = re.compile(r"(?:sweep|recheck|prune) · (\d+)")
+_TOTAL_LINE = re.compile(r"(?:sweep|recheck|prune|agentic) · (\d+)")
 # "baseline · {...}", "kernels · ...", "sweep · N", "recheck · N", "prune · N"
-# mark the sweep's phases; "  kept" and "priors · N" annotate the candidate
-# just measured.
-_PHASE_LINE = re.compile(r"^(baseline|kernels|sweep|recheck|prune) ·")
+# and "agentic · N" mark the sweep's phases; "  kept" and "priors · N"
+# annotate the candidate just measured.
+_PHASE_LINE = re.compile(r"^(baseline|kernels|sweep|recheck|prune|agentic) ·")
 _SAVED_LINE = re.compile(r"^priors · (\d+)")
 # "trying RICHENGINE_X=v" marks the launch in flight — the candidate
 # line that follows completes it; "trying -RICHENGINE_X=v" is the
@@ -51,6 +51,7 @@ def _command(
     selection=None,
     include_quality=False,
     interactions=None,
+    agentic=False,
     allow_loaded=False,
 ):
     """The launcher's tune CLI, spelled like the installer's models.py call:
@@ -87,6 +88,8 @@ def _command(
         command.append("--interaction-pass")
     elif interactions is False:
         command.append("--no-interaction-pass")
+    if agentic:
+        command.append("--agentic")
     if allow_loaded:
         command.append("--allow-loaded")
     return command, paths.ROOT
@@ -123,7 +126,7 @@ def _deltas(candidate_metrics, baseline_metrics):
     rows = []
     if not isinstance(candidate_metrics, dict):
         return rows
-    for width in ("4", "1"):
+    for width in ("4", "2", "1"):
         cand = candidate_metrics.get(width)
         base = (
             baseline_metrics.get(width) if isinstance(baseline_metrics, dict) else None
@@ -159,20 +162,30 @@ def _results(job):
         return []
     baseline = measured.get("baseline")
     base_metrics = baseline.get("metrics") if isinstance(baseline, dict) else None
+    agentic_base = measured.get("agentic:baseline")
+    agentic_metrics = (
+        agentic_base.get("metrics") if isinstance(agentic_base, dict) else None
+    )
     rows = []
     for key, candidate in measured.items():
         if (
             key == "baseline"
+            or key == "agentic:baseline"
             or key.startswith("eliminate:")
             or not isinstance(candidate, dict)
             or candidate.get("pressured")
         ):
             continue
-        deltas = _deltas(candidate.get("metrics"), base_metrics)
+        deltas = _deltas(
+            candidate.get("metrics"),
+            agentic_metrics if key.startswith("agentic:") else base_metrics,
+        )
         if not deltas:
             continue
         label, delta, width = max(deltas, key=lambda row: abs(row[1]))
-        name = key.removeprefix("recheck:").removeprefix("RICHENGINE_")
+        name = key.removeprefix("recheck:").removeprefix("agentic:").removeprefix(
+            "RICHENGINE_"
+        )
         rows.append((abs(delta), f"{name} {label} {delta:+.1%} @b{width}"))
     rows.sort(key=lambda row: -row[0])
     return [text for _, text in rows[:12]]
@@ -275,6 +288,7 @@ class Tuner:
         selection=None,
         include_quality=False,
         interaction_pass=None,
+        agentic=False,
         allow_loaded=False,
         serving=False,
     ):
@@ -335,6 +349,7 @@ class Tuner:
                 selection=selection,
                 include_quality=include_quality,
                 interactions=interaction_pass,
+                agentic=agentic,
                 allow_loaded=allow_loaded,
             )
             try:

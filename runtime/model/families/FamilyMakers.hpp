@@ -40,6 +40,7 @@ namespace richengine::model {
 
 // LFM2.5-2.6B and LFM2.5-8B-A1B.
 [[nodiscard]] ModelDescriptor lfm2Descriptor(std::string name);
+[[nodiscard]] ModelDescriptor d1Descriptor(std::string name);
 [[nodiscard]] ModelDescriptor lfm2moeDescriptor(std::string name);
 [[nodiscard]] DFlashDraftLayout lfm2DraftLayout();
 [[nodiscard]] DFlashDraftLayout lfm2moeDraftLayout();

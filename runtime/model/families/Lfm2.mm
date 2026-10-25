@@ -41,6 +41,41 @@ ModelDescriptor lfm2Descriptor(std::string name) {
   return descriptor;
 }
 
+// d1-3B is a decision model: it never decodes, so no DSpark draft is
+// installed; the Null layout satisfies the geometry contract while the
+// n-gram predraft supplies proposals.
+static DFlashDraftLayout d1NullDraftLayout() {
+  const Lfm2Layout target;
+  DFlashDraftLayout layout;
+  layout.kind = DraftKind::Null;
+  layout.layers = 1;
+  layout.hiddenSize = target.hiddenSize;
+  layout.vocabularySize = target.vocabularySize;
+  layout.dynamicSize = 1280;
+  layout.qkvSize = 6144;
+  layout.attentionSize = 4096;
+  layout.intermediateSize = 17408;
+  layout.attentionHeadDimension = 128;
+  layout.targetHiddenSize = target.capturedHiddenSize();
+  layout.selectorRank = 256;
+  layout.kvHeads = 8;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
+  layout.rotaryTheta = 5'000'000.0F;
+  return layout;
+}
+
+ModelDescriptor d1Descriptor(std::string name) {
+  ops::VisionLayout vision;
+  vision.outputHiddenSize = Lfm2Layout{}.hiddenSize;
+  // The d1-3B GGUF declares rope.freq_base 1e6, not LFM2.5's 1e7.
+  Lfm2Layout target;
+  target.rotaryTheta = 1'000'000.0F;
+  ModelDescriptor descriptor = makeModelDescriptor(
+      std::move(name), target, d1NullDraftLayout(), vision);
+  descriptor.visionSource = VisionSource::None;
+  return descriptor;
+}
+
 ModelDescriptor lfm2moeDescriptor(std::string name) {
   ops::VisionLayout vision;
   vision.outputHiddenSize = Lfm2MoeLayout{}.hiddenSize;

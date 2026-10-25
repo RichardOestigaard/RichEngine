@@ -30,6 +30,9 @@ READOUT = (
     "native full-vocabulary last-position logits max-pooled over each "
     "option's surface forms"
 )
+# "Calibrated" is a property of the weights (d1's post-training), not a
+# locally measured guarantee: the readout reports the model's own option
+# distribution, vs SemIf's conditional letter score.
 PROBABILITY_STATUS = "calibrated decision distribution over declared options"
 
 # The wire protocol carries at most this many distinct score tokens per

@@ -1019,6 +1019,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 language_only = body.get("language_only", False)
                 include_quality = body.get("include_quality", False)
                 no_interaction = body.get("no_interaction_pass", False)
+                agentic = body.get("agentic", False)
                 allow_loaded = body.get("allow_loaded", False)
                 mode = body.get("mode", "quick")
                 selection = body.get("selection")
@@ -1033,6 +1034,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     raise APIError(400, '"include_quality" must be a boolean')
                 if not isinstance(no_interaction, bool):
                     raise APIError(400, '"no_interaction_pass" must be a boolean')
+                if not isinstance(agentic, bool):
+                    raise APIError(400, '"agentic" must be a boolean')
                 if not isinstance(allow_loaded, bool):
                     raise APIError(400, '"allow_loaded" must be a boolean')
                 if not isinstance(mode, str) or mode not in ("quick", "complete"):
@@ -1066,6 +1069,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         selection=selection,
                         include_quality=include_quality,
                         interaction_pass=interaction_pass,
+                        agentic=agentic,
                         allow_loaded=allow_loaded,
                         serving=self.app is not None
                         or getattr(host, "state", None) == "loading",

@@ -222,9 +222,16 @@ def _installed_details(models_root=None):
         # A partial record's winners already apply, so the knob count is
         # real even while the sweep still runs.
         state = autotune.tuning_state(link, chip=chip, binary=binary)
-        knobs = len(autotune.load_tuning(link, chip=chip, binary=binary))
+        tuned = autotune.load_tuning(link, chip=chip, binary=binary)
         entry = autotune._entry(link, chip) or {}
-        details = {"tuning": state, "tuned_knobs": knobs}
+        details = {"tuning": state, "tuned_knobs": len(tuned)}
+        if tuned:
+            # The applied env as "NAME=value" strings, so the UI can show
+            # which settings the engine actually runs with on every load.
+            details["tuned_env"] = [
+                f"{name.removeprefix('RICHENGINE_')}={value}"
+                for name, value in sorted(tuned.items())
+            ]
         if entry.get("mode"):
             details["tune_mode"] = entry["mode"]
         verdicts = entry.get("verdicts")
@@ -470,6 +477,7 @@ def tune(args):
                 interactions=(args.complete or args.interaction_pass)
                 and not args.no_interaction_pass,
                 kernel_pass=not args.no_kernel_pass,
+                agentic=args.agentic,
                 priors_path=models_root / autotune.PRIORS_NAME,
                 mode="complete" if args.complete else "quick",
                 contaminated=contaminated,
@@ -1781,7 +1789,10 @@ def _build_parser():
             "Quick is the default: quality-trading knobs stay out and the "
             "interaction recheck pass is skipped. --complete runs both. "
             "--include-quality-knobs and --interaction-pass enable each "
-            "half on its own."
+            "half on its own. --agentic adds a constrained-decode pass "
+            "that sweeps the GPU-DFA knobs against a JSON-grammar "
+            "workload at batch widths 2 and the full batch — the "
+            "unconstrained workload cannot reach them."
         ),
         formatter_class=_HelpFormatter,
         **_PARSER_OPTIONS,
@@ -1848,6 +1859,13 @@ def _build_parser():
         "--no-interaction-pass",
         action="store_true",
         help="skip the recheck pass even under --complete",
+    )
+    tune_command.add_argument(
+        "--agentic",
+        action="store_true",
+        help="also sweep the GPU-DFA constrained-decode knobs "
+        "(RICHENGINE_DFA_MODE and friends) against a JSON-grammar "
+        "workload at batch widths 2 and 4",
     )
     tune_command.add_argument(
         "--allow-loaded",

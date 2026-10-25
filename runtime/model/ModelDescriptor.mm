@@ -900,6 +900,7 @@ constexpr FamilyDescriptor kModelFamilies[] = {
     // MiniCPM5's early releases stated model_type "minicpm".
     {"MiniCPM5-2B", "llama", "minicpm", denseDescriptor},
     {"LFM2.5-2.6B", "lfm2", nullptr, lfm2Descriptor},
+    {"d1-3B", "lfm2", nullptr, d1Descriptor},
     {"LFM2.5-8B-A1B", "lfm2_moe", nullptr, lfm2moeDescriptor},
     {"LFM2.5-24B-A2B", "lfm2_moe", nullptr, lfm2moe24BDescriptor},
     {"Granite-4.2-3B", "granite", nullptr, granite3BDescriptor},

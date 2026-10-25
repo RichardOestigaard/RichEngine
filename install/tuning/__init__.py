@@ -30,6 +30,8 @@ def _shared_knobs() -> dict[str, Knob]:
             tuple(spec.get("requires_env", ())),
             spec.get("quality_sensitive", False),
             spec.get("ordered", False),
+            spec.get("may_diverge", False),
+            spec.get("agentic", False),
         )
         for name, spec in json.loads(_KNOBS_PATH.read_text()).items()
     }
@@ -53,6 +55,8 @@ def _knob(entry, shared: dict[str, Knob]) -> Knob:
         tuple(entry.get("requires_env", ())),
         entry.get("quality_sensitive", False),
         entry.get("ordered", False),
+        entry.get("may_diverge", False),
+        entry.get("agentic", False),
     )
 
 
@@ -76,11 +80,23 @@ def knobs_for(family: str) -> TunableKnobs | None:
     return TUNING_TABLES.get(family)
 
 
+def agentic_knobs(context: TuneContext) -> tuple[Knob, ...]:
+    """The shared library's constrained-decode knobs this install can run —
+    eligible the same way a family table's are, but swept only by the
+    agentic pass, never listed on a family's table."""
+    return tuple(
+        knob
+        for knob in _shared_knobs().values()
+        if knob.agentic and knob.applies(context)
+    )
+
+
 __all__ = [
     "TUNING_TABLES",
     "Knob",
     "TunableKnobs",
     "TuneContext",
+    "agentic_knobs",
     "eligible",
     "knobs_for",
 ]

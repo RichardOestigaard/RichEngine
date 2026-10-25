@@ -93,7 +93,8 @@
     "reason": "packed GGUF decode operands; off by default",
     "formats": [
       "gguf"
-    ]
+    ],
+    "may_diverge": true
   },
   "HEAD_FUSED": {
     "env": "RICHENGINE_HEAD_FUSED_OFF",
@@ -189,7 +190,8 @@
     "values": [
       "1"
     ],
-    "reason": "the split int8 prefill operand path; off by default"
+    "reason": "the split int8 prefill operand path; off by default",
+    "may_diverge": true
   },
   "PREPARED_CACHE_OFF": {
     "env": "RICHENGINE_PREPARED_CACHE_OFF",
@@ -248,5 +250,117 @@
       "1"
     ],
     "reason": "separate conv output-projection prepare vs the mixer's fused Table16 emission; fused on by default"
+  },
+  "GPU_PREDRAFT": {
+    "env": "RICHENGINE_GPU_PREDRAFT",
+    "values": [
+      "0"
+    ],
+    "reason": "the device-side packing of next-step draft inputs; on by default",
+    "draft_kinds": [
+      "dflash2",
+      "dflash",
+      "dspark"
+    ]
+  },
+  "VERIFY_ALL_LIVE": {
+    "env": "RICHENGINE_VERIFY_ALL_LIVE",
+    "values": [
+      "1"
+    ],
+    "reason": "every verify row treated live vs the anchor-fill routing; anchor-fill on by default",
+    "diffusion": false
+  },
+  "VERIFY_SPLITS_MAX": {
+    "env": "RICHENGINE_VERIFY_SPLITS_MAX",
+    "values": [
+      "16",
+      "8"
+    ],
+    "reason": "verify attention split ceiling vs the compiled 128; lower caps only",
+    "ordered": true
+  },
+  "PREFILL_SPLITS_MAX": {
+    "env": "RICHENGINE_PREFILL_SPLITS_MAX",
+    "values": [
+      "16",
+      "8"
+    ],
+    "reason": "prefill attention split ceiling vs the compiled 32; lower caps only",
+    "ordered": true
+  },
+  "TREE_ACCEPT_MIN": {
+    "env": "RICHENGINE_TREE_ACCEPT_MIN",
+    "values": [
+      "0.3",
+      "0.6"
+    ],
+    "reason": "the acceptance EWMA below which the batch stops treeing vs the default 0",
+    "diffusion": false,
+    "ordered": true
+  },
+  "TREE_ACCEPT_MAX": {
+    "env": "RICHENGINE_TREE_ACCEPT_MAX",
+    "values": [
+      "3.0",
+      "1.5"
+    ],
+    "reason": "the acceptance EWMA above which the batch stops treeing vs the default 6",
+    "diffusion": false,
+    "ordered": true
+  },
+  "MOE_GGUF_FUSED": {
+    "env": "RICHENGINE_MOE_GGUF_FUSED",
+    "values": [
+      "1"
+    ],
+    "reason": "the fused gate+up GGUF expert kernel vs the split pair; off by default",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "MOE_GGUF_TILE": {
+    "env": "RICHENGINE_MOE_GGUF_TILE",
+    "values": [
+      "register",
+      "staged"
+    ],
+    "reason": "forced GGUF expert tile vs the device policy's pick",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "DFA_MODE": {
+    "env": "RICHENGINE_DFA_MODE",
+    "values": [
+      "forced",
+      "off"
+    ],
+    "reason": "host mask round trip with device forced spans, or every constraint on the host path; the unset default is full",
+    "agentic": true
+  },
+  "DFA_MERGE_OFF": {
+    "env": "RICHENGINE_DFA_MERGE_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "the three-command split vs the merged draft+verify+commit command for full-DFA batches; merged on by default",
+    "agentic": true
+  },
+  "DFA_SPAN_SKIP_DRAFT_OFF": {
+    "env": "RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "draft and forward encodes under a fully-covered forced span vs skipping them; skipping on by default",
+    "agentic": true
+  },
+  "GPU_DECODE_GRID_OFF": {
+    "env": "RICHENGINE_GPU_DECODE_GRID_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "host-written verify mask grid vs the device-written indirect grid; device grid on by default",
+    "agentic": true
   }
 }

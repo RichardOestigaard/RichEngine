@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Tuning.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 namespace richengine::ops {
 
@@ -275,10 +277,10 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 [[nodiscard]] inline MoeGgufTile moeGgufTile(const DevicePolicy &device, MoeShape shape) noexcept {
   // RICHENGINE_MOE_GGUF_TILE=register|staged forces the tile for a family
   // the policy has not measured (Apple10's staged K-quants).
-  const char *env = getenv("RICHENGINE_MOE_GGUF_TILE");
-  if (env && !strcmp(env, "staged"))
+  const std::string_view env = tuning().moeGgufTile;
+  if (env == "staged")
     return MoeGgufTile::Staged;
-  if (env && !strcmp(env, "register") &&
+  if (env == "register" &&
       !apple9StagesFormat(shape.expertFormat))
     return MoeGgufTile::Register;
   return device.isApple9() && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register

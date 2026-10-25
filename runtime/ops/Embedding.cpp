@@ -1,5 +1,7 @@
 #include "ops/Embedding.hpp"
 
+#include "Tuning.hpp"
+
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -95,7 +97,7 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
   params.draft_stride = draftStride;
   // A/B kill switch: treating every row as live restores the pre-anchor-fill
   // routing for measurement.
-  static const bool allLive = std::getenv("RICHENGINE_VERIFY_ALL_LIVE") != nullptr;
+  static const bool allLive = tuning().verifyAllLive;
   for (uint32_t lane = 0; lane < lanes; ++lane)
     params.live_rows[lane] =
         !allLive && lane < liveRows.size()
@@ -132,7 +134,7 @@ void Embedding::addVerifyInputDevice(
   params.device_lanes = deviceLanes & ((uint32_t{1} << lanes) - 1);
   // A/B kill switch parity with addVerifyInput: treating every row as live
   // restores the pre-anchor-fill routing for measurement.
-  static const bool allLive = std::getenv("RICHENGINE_VERIFY_ALL_LIVE") != nullptr;
+  static const bool allLive = tuning().verifyAllLive;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.verify.live_rows[lane] =
         !allLive && lane < liveRows.size()

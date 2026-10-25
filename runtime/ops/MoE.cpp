@@ -382,7 +382,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
   // opt-in. The register and packed tiles always keep the split passes
   // (the packed MXFP4 tile's K split has no fused variant).
   const bool fusedGu =
-      !table16 && !packed && std::getenv("RICHENGINE_MOE_GGUF_FUSED") != nullptr;
+      !table16 && !packed && tuning().moeGgufFused;
   if (fusedGu) {
     const QuantizedSegment &sharedGate =
         shape.sharedExpert ? weights.gate.shared : weights.gate.routed;

@@ -586,7 +586,9 @@ class Frontend:
         # A d1-family checkpoint answers /v1/systemone through its own
         # prompt and grouped readout; every other model keeps the SemIf
         # letter-slot pathway. Nothing else changes: same score-only jobs.
-        self.decision_pathway = decisions.is_decision_model(model)
+        self.decision_pathway = decisions.is_decision_model(model) or (
+            self.serving is not None and self.serving.decision
+        )
         # Agents repeat a few system prompts and tool sets.
         self._shared_prefix_probe = lru_cache(maxsize=8)(
             self._render_shared_prefix_probe

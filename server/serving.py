@@ -65,6 +65,9 @@ class ServingContract:
     # Extra names the model serves under beyond its package id and the
     # command line's --served-model-name list.
     served_names: tuple = ()
+    # A decision model (Liquid d1 family): /v1/systemone and /v1/judgments
+    # run the native decision pathway, not the SemIf emulation.
+    decision: bool = False
 
     @classmethod
     def of(cls, doc, family=None):
@@ -103,6 +106,7 @@ class ServingContract:
             sampling=dict(doc.get("sampling", {})),
             reasoning_effort=doc.get("reasoning_effort"),
             served_names=tuple(doc.get("served_names", ())),
+            decision=bool(doc.get("decision", False)),
         )
 
 

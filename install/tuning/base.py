@@ -72,6 +72,14 @@ class Knob:
     first loses beyond the sweep's prune depth, the sweep assumes the rest
     deviate more and lose worse — set it only where the knob's effect is
     monotone in its deviation from the default.
+    may_diverge knobs may legitimately change the emitted token stream —
+    the int8 prefill path's documented near-tie flips, or the packed GGUF
+    operands' rare one-ulp divergences — so the sweep's token-parity veto
+    does not apply to them. Quality-sensitive knobs imply it.
+    agentic knobs only move the engine's constrained-decode (DFA) path:
+    inert under the sweep's unconstrained workload, they are measured by
+    the agentic pass — a DFA-constrained workload — instead of a family
+    table's list, and only when the sweep is asked for it.
     """
 
     env: str
@@ -86,6 +94,8 @@ class Knob:
     requires_env: tuple[str, ...] = ()
     quality_sensitive: bool = False
     ordered: bool = False
+    may_diverge: bool = False
+    agentic: bool = False
 
     def applies(self, context: TuneContext) -> bool:
         return (

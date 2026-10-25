@@ -24,6 +24,9 @@ struct Tuning {
   bool moePackedOff = false;  // RICHENGINE_MOE_PACKED_OFF (presence)
   uint32_t moeUnionCap = 0;   // RICHENGINE_MOE_UNION
   uint32_t moeTopK = 0;       // RICHENGINE_MOE_TOPK
+  // ops/MoE.cpp, ops/MoE.hpp
+  bool moeGgufFused = false;      // RICHENGINE_MOE_GGUF_FUSED (presence)
+  std::string_view moeGgufTile;   // RICHENGINE_MOE_GGUF_TILE=register|staged
   // ops/GDN.cpp, model/RuntimeArenas.mm
   uint32_t gdnChunked = 0;    // RICHENGINE_GDN_CHUNKED
   // ops/Linear.cpp, ops/LinearGguf.cpp
@@ -57,6 +60,9 @@ struct Tuning {
   // the span, so when every lane of a batch qualifies the draft embedding
   // and forward encode nothing the verify stage reads and are skipped.
   bool dfaSpanSkipDraft = false;  // RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF disables (default on)
+  // ops/Embedding.cpp: a presence flag restores the pre-anchor-fill verify
+  // routing (every row live), the A/B kill switch for the anchor-fill path.
+  bool verifyAllLive = false;   // RICHENGINE_VERIFY_ALL_LIVE (presence)
   // metal/CommandGraph.hpp
   bool patchableOff = false;    // RICHENGINE_PATCHABLE_OFF (presence)
   // model/TargetModelGemma.cpp
@@ -175,6 +181,8 @@ inline Tuning makeTuning() {
   t.moePackedOff = envFlag("RICHENGINE_MOE_PACKED_OFF");
   t.moeUnionCap = envUint("RICHENGINE_MOE_UNION", 0);
   t.moeTopK = envUint("RICHENGINE_MOE_TOPK", 0);
+  t.moeGgufFused = envFlag("RICHENGINE_MOE_GGUF_FUSED");
+  t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
@@ -189,6 +197,7 @@ inline Tuning makeTuning() {
   t.deviceVerifyParams = !envFlag("RICHENGINE_DEVICE_VERIFY_PARAMS_OFF");
   t.dfaMerge = !envFlag("RICHENGINE_DFA_MERGE_OFF");
   t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
+  t.verifyAllLive = envFlag("RICHENGINE_VERIFY_ALL_LIVE");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");

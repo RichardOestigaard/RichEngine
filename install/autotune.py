@@ -18,6 +18,7 @@ stamped with the engine binary it ran on; server/model_host.py applies it
 as the engine's environment on every load while that binary is unchanged.
 """
 
+import array
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +53,23 @@ WARMUP_OUTPUT_TOKENS = 64
 # The engine's lane count (ExecutionLimits::maximumBatchWidth) — the batched
 # measurement submits a full batch.
 BATCH_WIDTH = 4
+# The agentic pass's constrained workload decodes at these widths: a
+# mid-batch and the full batch, the shapes agentic traffic actually
+# drives the GPU-DFA path under.
+AGENTIC_WIDTHS = (2, BATCH_WIDTH)
+# The agentic pass's grammar: a flat JSON object the byte-DFA subset
+# compiles, with enough required fields to fill a decode's output budget.
+_AGENTIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "count": {"type": "integer"},
+        "ok": {"type": "boolean"},
+        "mode": {"enum": ["fast", "slow", 2, None]},
+    },
+    "required": ["answer", "count", "ok", "mode"],
+    "additionalProperties": False,
+}
 # A candidate must move a metric by more than this share to count as an
 # improvement — or as a regression; smaller deltas are run-to-run noise.
 IMPROVEMENT = 0.015
@@ -388,19 +407,291 @@ def _request(prompt: tuple[int, ...], output_tokens: int):
     )
 
 
-def _run_batch(runtime, prompts, output_tokens: int) -> dict:
-    """Submit one generation per prompt; report aggregated decode and
-    per-lane prefill throughput from the DoneEvents."""
-    from server import runtime as engine_runtime
+def _dfa_request(prompt: tuple[int, ...], output_tokens: int):
+    """The agentic pass's generation frame: a token-mask constraint and no
+    IGNORE_END_OF_SEQUENCE — the wire reserves that flag for unconstrained
+    generation."""
+    from server import protocol as wire
 
-    calls = [
-        runtime.submit(
-            engine_runtime.GenerationRequest(
-                _request(prompt, output_tokens), math.inf, None, None
+    return wire.RequestFrame(
+        request_id=0,
+        priority=wire.RequestPriority.NORMAL,
+        absolute_deadline_unix_micros=0,
+        remaining_deadline_micros=0,
+        logical_max_output_tokens=output_tokens,
+        prompt_tokens=prompt,
+        sampling=wire.SamplingParameters(),
+        seed=0,
+        constraint=wire.ConstraintMode.TOKEN_MASK,
+        image_spans=(),
+        image_pixels=b"",
+        return_progress=False,
+        score_tokens=(),
+        generation_prompt_tokens=0,
+        flags=wire.RequestFlag(0),
+    )
+
+
+class _AgenticWorkload:
+    """What every request of the agentic pass shares: the compiled
+    constraint DFA, the vocabulary frame the engine needs once per
+    generation, and the per-state allowed-token rows the mask provider
+    memoizes into. eos stays empty — no id is ever admitted, so every
+    constrained request decodes the full output budget like the
+    unconstrained ones."""
+
+    def __init__(self, compiled, vocab_tokens, specials, encode):
+        self.compiled = compiled
+        self.vocab_tokens = vocab_tokens
+        self.specials = specials
+        self.encode = encode
+        self.eos = ()
+        self.vocabulary = len(vocab_tokens)
+        self.words = (self.vocabulary + 31) // 32
+        self.vocab_frame = None  # serialized on first constrained batch
+        self.eos_states = bytes(
+            acc | ok for acc, ok in zip(compiled.accepting, compiled.eos_ok)
+        )
+        self.marker = b"".join(m.to_bytes(32, "little") for m in compiled.marker)
+        self._rows = {}
+        self._rows_lock = threading.Lock()
+        self.vocab_generations = set()
+        # Whether the host pushes forced-token spans: only a DFA_MODE=off
+        # candidate — both GPU modes derive the span on-device, where a
+        # host push would only race it.
+        self.pushes_forced = False
+
+    def allowed(self, state):
+        """The state's sorted allowed token ids, walked once ever."""
+        if state >= self.compiled.n_states:
+            return ()
+        with self._rows_lock:
+            cached = self._rows.get(state)
+        if cached is None:
+            cached = tuple(
+                self.compiled.masks_for_state(
+                    state, self.vocab_tokens, self.eos, self.specials
+                )
+            )
+            with self._rows_lock:
+                self._rows[state] = cached
+        return cached
+
+    def frame(self, request_id):
+        """The serialized ConstraintDfaFrame for one request."""
+        from server import protocol as wire
+
+        return wire.serialize_message(
+            wire.ConstraintDfaFrame(
+                request_id,
+                self.compiled.n_states,
+                self.compiled.table.tobytes(),
+                self.eos_states,
+                self.eos,
+                self.marker,
             )
         )
-        for prompt in prompts
-    ]
+
+
+class _AgenticConstraint:
+    """One constrained request's mask provider and forced-span mirror — a
+    DfaConstraint with no llguidance delegate, plus the shared per-state
+    row memoization the serving constraint leaves opt-in. Rows a finished
+    grammar cannot answer allow every token: the sweep wants the engine's
+    mask plumbing exercised for the whole budget, not the grammar
+    enforced to the last token."""
+
+    MAX_ROWS = 17  # TokenConstraint.MAX_ROWS — the engine's verify rows + 1
+
+    def __init__(self, workload):
+        self._w = workload
+        self._state = 0
+        self._stopped = False
+        self._mirror = 0
+        self._mirror_stopped = False
+        self._ff_failed = False
+        self._committed = []
+        self._lock = threading.Lock()
+
+    def _advance(self, state, token_id):
+        w = self._w
+        return w.compiled.advance_token(
+            state, token_id, w.vocab_tokens, w.eos, w.specials
+        )
+
+    def _consume(self):
+        for token_ids in self._committed:
+            for token_id in token_ids:
+                if self._stopped:
+                    break
+                state = self._advance(self._state, token_id)
+                if state < 0 or state == self._w.compiled.n_states:
+                    self._stopped = True
+                else:
+                    self._state = state
+        self._committed.clear()
+
+    def masks(self, simulation_tokens):
+        """Mask rows for the engine's simulated tokens — the no-delegate
+        branch of DfaConstraint.masks over the shared row cache."""
+        with self._lock:
+            self._consume()
+            rows = min(len(simulation_tokens) + 1, self.MAX_ROWS)
+            words = self._w.words
+            mask = array.array("I", [0] * (rows * words))
+            states = [self._state]
+            cursor = self._state
+            for token_id in simulation_tokens[: rows - 1]:
+                if not 0 <= token_id < self._w.vocabulary:
+                    break
+                cursor = self._advance(cursor, token_id)
+                if cursor < 0:
+                    break
+                states.append(cursor)
+            for row, state in enumerate(states):
+                allowed = self._w.allowed(state)
+                base = row * words
+                if not allowed:
+                    for i in range(words):
+                        mask[base + i] = 0xFFFFFFFF
+                    continue
+                for token_id in allowed:
+                    mask[base + (token_id >> 5)] |= 1 << (token_id & 31)
+            if len(states) < rows:
+                mask[len(states) * words :] = mask[
+                    (len(states) - 1) * words : len(states) * words
+                ]
+            return mask.tobytes()
+
+    def commit(self, token_ids, *, forced=True):
+        """Consume generated tokens and answer the forced span at the
+        mirror position, like DfaConstraint.commit."""
+        with self._lock:
+            self._committed.append(tuple(token_ids))
+            if not self._ff_failed:
+                try:
+                    self._advance_mirror(token_ids)
+                except Exception:
+                    self._ff_failed = True
+            return self.forced_tokens() if forced else ()
+
+    def _advance_mirror(self, token_ids):
+        for token_id in token_ids:
+            if self._mirror_stopped:
+                return
+            state = self._advance(self._mirror, token_id)
+            if state < 0 or state == self._w.compiled.n_states:
+                self._mirror_stopped = True
+            else:
+                self._mirror = state
+
+    def forced_tokens(self):
+        if self._ff_failed or self._mirror_stopped:
+            return ()
+        try:
+            return self._w.compiled.forced_tokens_after(
+                self._mirror,
+                self._w.vocab_tokens,
+                self._w.encode,
+                self._w.eos,
+                self._w.specials,
+            )
+        except Exception:
+            self._ff_failed = True
+            return ()
+
+
+def _agentic_workload(assembly_dir: Path):
+    """The agentic pass's compiled constraint over this install's
+    vocabulary; None when the tokenizer cannot spell it — the pass then
+    skips rather than measuring a different workload."""
+    try:
+        from server import constraints, dfa
+        from tokenizers import Tokenizer
+
+        path = assembly_dir / layout.TOKENIZER / "tokenizer.json"
+        doc = json.loads(path.read_text())
+        tokenizer = Tokenizer.from_file(str(path))
+        vocab_tokens = constraints._vocab_token_bytes(
+            tokenizer, tokenizer.get_vocab_size(with_added_tokens=True)
+        )
+        specials = frozenset(
+            entry["id"]
+            for entry in doc.get("added_tokens") or ()
+            if entry.get("special")
+        )
+        markers = tuple(
+            data
+            for token_id, data in enumerate(vocab_tokens)
+            if token_id in specials and data
+        )
+        compiled = dfa.compile_dfa(dfa.json_spec(_AGENTIC_SCHEMA, False), markers)
+    except Exception:
+        return None
+    if compiled is None:
+        return None
+
+    def encode(text, **kw):
+        return tuple(tokenizer.encode(text, **kw).ids)
+
+    return _AgenticWorkload(compiled, vocab_tokens, specials, encode)
+
+
+def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
+    """Submit one generation per prompt; report aggregated decode and
+    per-lane prefill throughput from the DoneEvents. With `dfa` every
+    request rides the constraint: a mask provider, the per-generation
+    vocabulary frame and the request's own ConstraintDfaFrame, with
+    forced-token pushes only where the candidate's mode leaves them on
+    the host."""
+    from server import protocol as wire
+    from server import runtime as engine_runtime
+
+    calls = []
+    for prompt in prompts:
+        if dfa is None:
+            calls.append(
+                runtime.submit(
+                    engine_runtime.GenerationRequest(
+                        _request(prompt, output_tokens), math.inf, None, None
+                    )
+                )
+            )
+            continue
+        constraint = _AgenticConstraint(dfa)
+
+        def on_event(call, event, c=constraint):
+            if not isinstance(event, wire.TokensEvent):
+                return
+            try:
+                forced = c.commit(event.tokens, forced=dfa.pushes_forced)
+            except Exception:
+                return
+            if forced:
+                call.send_forced_tokens(forced)
+
+        call = runtime.submit(
+            engine_runtime.GenerationRequest(
+                _dfa_request(prompt, output_tokens),
+                math.inf,
+                constraint.masks,
+                None,
+            ),
+            on_event=on_event,
+        )
+        # The vocabulary rides once per engine generation; the request's
+        # DFA follows it on the stream before the engine can mask.
+        if call.generation not in dfa.vocab_generations:
+            if dfa.vocab_frame is None:
+                dfa.vocab_frame = wire.serialize_message(
+                    wire.VocabularyFrame(
+                        dfa.vocab_tokens, tuple(sorted(dfa.specials))
+                    )
+                )
+            dfa.vocab_generations.add(call.generation)
+            runtime._write_bytes(dfa.vocab_frame, call.generation, call=call)
+        runtime._write_bytes(dfa.frame(call.request_id), call.generation, call=call)
+        calls.append(call)
     prompt_tokens = 0
     completion_tokens = 0
     decode_micros = 0
@@ -452,6 +743,7 @@ def measure(
     widths=(1, BATCH_WIDTH),
     repetitions: int = REPETITIONS,
     incumbent: dict | None = None,
+    dfa: "_AgenticWorkload | None" = None,
 ) -> tuple[dict, dict]:
     """One engine under `env`: a warmup pass, then REPETITIONS batches at
     each width, merged to medians: {width: metrics}. `prompts` is a pool of
@@ -478,13 +770,19 @@ def measure(
         if not runtime.wait_ready():
             raise RuntimeError("the tuning engine did not become ready")
         cursor = 0
+        if dfa is not None:
+            # Host forced-token pushes belong to the host-DFA mode only;
+            # the GPU modes derive the span on-device.
+            dfa.pushes_forced = (
+                str(env.get("RICHENGINE_DFA_MODE", "")).strip().lower() == "off"
+            )
 
         def batch(width: int, output_tokens: int) -> dict:
             nonlocal cursor
             window = prompts[cursor : cursor + width]
             assert len(window) == width, "prompt pool exhausted"
             cursor += width
-            return _run_batch(runtime, window, output_tokens)
+            return _run_batch(runtime, window, output_tokens, dfa)
 
         batch(max(widths), WARMUP_OUTPUT_TOKENS)
         merged = {}
@@ -671,7 +969,9 @@ def _update_priors(
             or entry.get("pressured")
         ):
             continue
-        name, _, value = key.removeprefix("recheck:").partition("=")
+        name, _, value = (
+            key.removeprefix("recheck:").removeprefix("agentic:").partition("=")
+        )
         if not name or not value:
             continue
         slot = stats.setdefault(f"{name}={value}", {"wins": 0, "losses": 0})
@@ -855,12 +1155,12 @@ def _kernel_pass(
 
 
 def _token_parity(
-    binary: Path, assembly_dir: Path, spec: str, log=print
+    binary: Path, assembly_dir: Path, before_env: dict, after_env: dict, log=print
 ) -> bool | None:
-    """Emit decode-profile's token stream with and without the fitted
-    plans and compare bytes: True on identical output, False when the spec
-    changed what the model emits, None when the check cannot run (no
-    profile binary, or a run failed)."""
+    """Emit decode-profile's token stream under `before_env` and
+    `after_env` and compare bytes: True on identical output, False when
+    the env difference changed what the model emits, None when the check
+    cannot run (no profile binary, or a run failed)."""
     from . import paths
 
     profile = paths.PROFILE_BINARY
@@ -869,7 +1169,7 @@ def _token_parity(
         return None
     dumps = []
     try:
-        for tag, extra in (("baseline", {}), ("fitted", {KERNEL_PLANS_ENV: spec})):
+        for tag, extra in (("baseline", before_env), ("fitted", after_env)):
             dump = tuning_path(assembly_dir).with_name(
                 f"tuning.{tag}-tokens"
             )
@@ -906,6 +1206,7 @@ def tune(
     include_quality: bool = False,
     interactions: bool = True,
     kernel_pass: bool = True,
+    agentic: bool = False,
     priors_path: Path | None = None,
     mode: str | None = None,
     contaminated: str | None = None,
@@ -919,10 +1220,15 @@ def tune(
     resumes where it stopped — and returns the tuned env. With
     `priors_path`, a finished sweep folds its verdicts into the chip's
     shared priors; a flagless (Quick) sweep also consults them and skips
-    candidates that have never won on this chip. `contaminated` names a
+    candidates that have never won on this chip. `agentic` adds a last
+    pass sweeping the constrained-decode (DFA) knobs against a
+    JSON-grammar workload at widths 2 and the full batch — the standard
+    workload cannot reach them. `contaminated` names a
     condition that invalidates every measurement for keeping purposes — a
     loaded engine sharing the GPU; entries still record what ran, flagged,
     but nothing can win and nothing reaches the priors."""
+    from .tuning import agentic_knobs
+
     context = context_for(assembly_dir)
     tuning = knobs_for(context.family)
     if tuning is None:
@@ -932,12 +1238,22 @@ def tune(
     # A variable the user exported reaches every measurement, and at serve
     # time model_host's setdefault keeps it over any tuned winner — a kept
     # value could never apply, so the knob is not swept at all.
-    user_set = {knob.env for knob in all_eligible if knob.env in os.environ}
+    # The constrained-decode knobs ride their own workload: inert under the
+    # unconstrained one, they join the candidate list only when the sweep
+    # is asked for the agentic pass — and still sit out when the user
+    # armed a value.
+    dfa_eligible = agentic_knobs(context) if agentic else ()
+    user_set = {
+        knob.env
+        for knob in (*all_eligible, *dfa_eligible)
+        if knob.env in os.environ
+    }
     knobs = tuple(
         knob
         for knob in all_eligible
         if (include_quality or not knob.quality_sensitive) and knob.env not in user_set
     )
+    dfa_knobs = tuple(knob for knob in dfa_eligible if knob.env not in user_set)
     log(
         f"chip {context.chip} · family {context.gpu_family} · "
         f"{context.bandwidth_gbps} GB/s · {len(knobs)} of "
@@ -970,8 +1286,10 @@ def tune(
         )
 
     widths = (1, BATCH_WIDTH)
+    width_sets = [widths] + ([AGENTIC_WIDTHS] if dfa_knobs else [])
     prompts, real_prompts = _prompts(
-        assembly_dir, max(widths) + REPETITIONS * sum(widths)
+        assembly_dir,
+        max(max(w) + REPETITIONS * sum(w) for w in width_sets),
     )
     if not real_prompts and any(knob.draft_kinds for knob in knobs):
         # Synthetic ids decode to text no draft predicts: acceptance sits
@@ -983,7 +1301,7 @@ def tune(
             "stay out, they would measure near-zero acceptance"
         )
     fingerprint = engine_fingerprint(binary)
-    signature = _knobs_signature(knobs)
+    signature = _knobs_signature(knobs + dfa_knobs)
 
     record = _read_record(assembly_dir)
     prior = record.get(context.chip)
@@ -1116,10 +1434,23 @@ def tune(
                 results[key]["pressured"] = pressured
                 verdicts[candidate_key] = "pressured"
             elif _keeps(measured, best_metrics, sigma):
-                best_env[knob.env] = value
-                best_metrics = measured
-                verdicts[candidate_key] = "kept"
-                log("  kept")
+                parity = (
+                    None
+                    if knob.quality_sensitive or knob.may_diverge
+                    else _token_parity(binary, assembly_dir, best_env, env, log)
+                )
+                if parity is False:
+                    # A faster path that reassociates reductions can flip
+                    # near-tie tokens — the hazard DeviceTuning.cpp's
+                    # rejected rows document — so the throughput keep gate
+                    # alone cannot be trusted; token parity vetoes.
+                    verdicts[candidate_key] = "rejected"
+                    log("  rejected — the knob changed the emitted tokens")
+                else:
+                    best_env[knob.env] = value
+                    best_metrics = measured
+                    verdicts[candidate_key] = "kept"
+                    log("  kept")
             elif knob.ordered and _deep_loss(measured, baseline_metrics, PRUNE_DEPTH):
                 dead.add(knob.env)
                 verdicts[candidate_key] = "rejected"
@@ -1178,7 +1509,9 @@ def tune(
                 results["kernels"]["pressured"] = pressured
                 verdicts["kernels"] = "pressured"
             elif _keeps(kernel_metrics, best_metrics, sigma):
-                if _token_parity(binary, assembly_dir, plans["spec"], log) is False:
+                if _token_parity(
+                    binary, assembly_dir, {}, {KERNEL_PLANS_ENV: plans["spec"]}, log
+                ) is False:
                     # A faster plan that reassociates the reductions can
                     # flip draft-accepted tokens (DeviceTuning.cpp rejects
                     # such splits for the same reason) — the throughput
@@ -1303,6 +1636,91 @@ def tune(
         verdicts[f"{name}={value}"] = "eliminated"
         log("  removed — the final env pays without it")
         write()
+
+    # The agentic pass: the constrained-decode knobs are inert under the
+    # sweep's unconstrained workload, so they measure against a JSON-DFA
+    # workload at widths 2 and the full batch — and they run last, after
+    # elimination, since their winners could never pay on the standard
+    # workload the eliminations measure.
+    if dfa_knobs:
+        workload = _agentic_workload(assembly_dir)
+        if workload is None:
+            log(
+                "agentic · no compilable constraint for this install — "
+                "pass skipped"
+            )
+        else:
+            pressured = contaminated or _wait_for_pressure(log)
+            dfa_metrics, dfa_samples = measure(
+                binary,
+                assembly_dir,
+                dict(best_env),
+                prompts=prompts,
+                widths=AGENTIC_WIDTHS,
+                dfa=workload,
+            )
+            results["agentic:baseline"] = {
+                "env": dict(best_env),
+                "metrics": dfa_metrics,
+                "samples": dfa_samples,
+            }
+            if pressured:
+                results["agentic:baseline"]["pressured"] = pressured
+            dfa_sigma = _baseline_sigma(dfa_samples)
+            log(f"agentic baseline · {dfa_metrics}")
+            pending = [
+                (knob, value)
+                for knob in dfa_knobs
+                for value in knob.values
+                if best_env.get(knob.env) != value
+                and f"agentic:{knob.env}={value}" not in results
+            ]
+            if priors_path is not None and not include_quality and not interactions:
+                # The same Quick-sweep rule as the first pass: candidates
+                # that never won on this chip measure anyway under
+                # --complete, skip under Quick.
+                pending = [
+                    (knob, value)
+                    for knob, value in pending
+                    if not _prior_skips(stats, knob, value)
+                ]
+            log(f"agentic · {len(pending)} candidates")
+            for knob, value in pending:
+                candidate_key = f"{knob.env}={value}"
+                key = "agentic:" + candidate_key
+                env = dict(best_env)
+                env[knob.env] = value
+                pressured = contaminated or _wait_for_pressure(log)
+                log(f"trying {knob.env}={value}")
+                try:
+                    measured, _ = measure(
+                        binary,
+                        assembly_dir,
+                        env,
+                        prompts=prompts,
+                        widths=AGENTIC_WIDTHS,
+                        incumbent=dfa_metrics,
+                        dfa=workload,
+                    )
+                except (OSError, RuntimeError) as error:
+                    log(f"{knob.env}={value} · failed ({error})")
+                    verdicts[candidate_key] = "failed"
+                    continue
+                log(f"{knob.env}={value} · {measured}")
+                results[key] = {"env": env, "metrics": measured}
+                if pressured:
+                    results[key]["pressured"] = pressured
+                    verdicts[candidate_key] = "pressured"
+                elif _keeps(measured, dfa_metrics, dfa_sigma):
+                    best_env[knob.env] = value
+                    dfa_metrics = measured
+                    verdicts[candidate_key] = "kept"
+                    log("  kept")
+                else:
+                    verdicts[candidate_key] = "rejected"
+                write()
+    elif agentic:
+        log("agentic · no constrained-decode knobs eligible — pass skipped")
 
     record[context.chip]["complete"] = True
     _write_record(assembly_dir, record)

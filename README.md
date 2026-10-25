@@ -69,6 +69,13 @@ automatically (Granite has none and speculates with n-grams instead):
 | LFM2.5-2.6B | `LiquidAI/LFM2.5-2.6B-GGUF:MXFP4` | — |
 | Granite-4.2-3B | `ibm-granite/granite-4.2-3b-GGUF:Q4_K_M` | — |
 | Granite-4.2-8B | `ibm-granite/granite-4.2-8b-GGUF:Q4_K_M` | — |
+| d1-3B (decision) | `LiquidAI/d1-3B-GGUF:Q8_0` | — |
+
+d1-family decision models (Liquid's `lfm2-d1` checkpoints) serve
+`/v1/systemone` and `/v1/judgments` natively: typed yes/no, choice and
+score answers from a single forward pass — no chat, no generation, no
+draft. Text-only for now; the SigLIP2 vision tower ships in the repo's
+mmproj files but is not yet enabled.
 
 Gemma 4 models install from safetensors and are packed to the runtime's Q4
 format at install time (~14.5 GB for 26B-A4B; GGUF/MLX sources are not
