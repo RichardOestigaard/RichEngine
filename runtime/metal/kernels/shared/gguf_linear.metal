@@ -25,7 +25,7 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
   auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
   gguf_zero(acc);
   gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
-                                                              simd_group * 32 + simd_lane, 0, input_size / KS, owns_rows,
+                                                              simd_group * 32 + simd_lane, 0, input_size / KS, 0, owns_rows,
                                                               acc);
   if (!owns_rows) return;
 #pragma unroll
@@ -62,7 +62,7 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
   auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);
   gguf_zero(acc);
   staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, group.y * per,
-                                          (group.y + 1) * per, acc);
+                                          (group.y + 1) * per, group.y * per, acc);
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0,
                         simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
     const ulong o = ulong(row) * p.out_stride + column0 + column;
@@ -127,7 +127,7 @@ kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w
   auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, hp.decode.input_size, my);
   gguf_zero(acc);
   staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, hp.decode.input_size, origin, my,
-                                                                  tl, simd_lane, group.y * per, (group.y + 1) * per, acc);
+                                                                  tl, simd_lane, group.y * per, (group.y + 1) * per, group.y * per, acc);
   // The thread's per-row best within its own fragment columns; the argmax
   // reducer folds the threads' pairs after the barrier.
   float best[Rows];
@@ -288,6 +288,77 @@ GGUF_DECODE_PACKED_FORMAT(FmtPQ20, pq20, uint2b_format)
 #undef GGUF_DECODE_PACKED
 #endif
 
+// Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
+// (32-column tiles, K partitions), threadgroups of one simdgroup that stages the gate's and the up's same 32 columns
+// (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. Each walks from the step its
+// 64-column tile walks from in the two passes, so at the same K split gate and up are the bits of the gate pass's and
+// of the up pass's sums, and the output is bf16(up) * silu(bf16(gate)) as the up pass writes it. Split partials
+// [split][Rows][2 * out_stride]: the gate's columns, then the up's at out_stride on; one counter per 32 columns.
+template <class F, ushort Rows>
+kernel void gguf_decode_gate_up(device bfloat *input [[buffer(0)]], device uchar *gw0 [[buffer(1)]],
+                                device uchar *gw1 [[buffer(2)]], device uchar *gmeta [[buffer(3)]],
+                                device uchar *uw0 [[buffer(4)]], device uchar *uw1 [[buffer(5)]],
+                                device uchar *umeta [[buffer(6)]], device bfloat *output [[buffer(7)]],
+                                device coherent(device) float *partials [[buffer(8)]],
+                                device atomic_uint *counters [[buffer(9)]], constant GgufDecodeParams &p [[buffer(10)]],
+                                uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];
+  quant_pair_table<F>(tl, lane, GGUF_GATE_UP_THREADS);
+  threadgroup half stage[2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  threadgroup uint arrival;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  auto gate = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+  auto up = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+  gguf_zero(gate);
+  gguf_zero(up);
+  gguf_staged_pair_steps<F, Rows>(input, gw0, gw1, gmeta, uw0, uw1, umeta, p.input_size, origin, stage, tl, lane, sb,
+                                  se, staged_first_step(group.x / 2, sb, se, p.spread), gate, up);
+  const auto value = [](float g, float u) { return bfloat(float(bfloat(u)) * richengine_silu(float(bfloat(g)))); };
+  const auto out = [&](uint row, uint column) { return ulong(row) * p.out_stride + column0 + column; };
+  if (p.splits == 1) {
+#pragma unroll
+    for (ushort i = 0; i < gate.get_capacity(); ++i) {
+      if (!gate.is_valid_element(i)) continue;
+      const auto index = gate.get_multidimensional_index(i);
+      output[out(index[1], index[0])] = value(gate[i], up[i]);
+    }
+    return;
+  }
+  const auto at = [&](uint s, uint row, uint column) {
+    return (ulong(s) * Rows + row) * (2 * p.out_stride) + column0 + column;
+  };
+#pragma unroll
+  for (ushort i = 0; i < gate.get_capacity(); ++i) {
+    if (!gate.is_valid_element(i)) continue;
+    const auto index = gate.get_multidimensional_index(i);
+    partials[at(group.y, index[1], index[0])] = gate[i];
+    partials[at(group.y, index[1], index[0]) + p.out_stride] = up[i];
+  }
+  device atomic_uint *counter = counters + p.out_offset / GGUF_STAGED_COLUMNS + group.x;
+  if (!split_arrive_last(counter, p.splits, lane, &arrival)) return;
+#pragma unroll
+  for (ushort i = 0; i < gate.get_capacity(); ++i) {
+    if (!gate.is_valid_element(i)) continue;
+    const auto index = gate.get_multidimensional_index(i);
+    const uint row = index[1], column = index[0];
+    const float g = split_sum(float(gate[i]), group.y, p.splits, [&](uint s) { return partials[at(s, row, column)]; });
+    const float u = split_sum(float(up[i]), group.y, p.splits,
+                              [&](uint s) { return partials[at(s, row, column) + p.out_stride]; });
+    output[out(row, column)] = value(g, u);
+  }
+  split_release(counter, lane);
+}
+using GgufDecodeGateUpKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                    device uchar *, device uchar *, device bfloat *, device coherent(device) float *,
+                                    device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
+#define GGUF_DECODE_GATE_UP(F, f, R) \
+  template [[host_name("gguf_decode_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpKernel gguf_decode_gate_up<F, R>;
+#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32)
+QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
+#undef GGUF_DECODE_GATE_UP_FORMAT
+#undef GGUF_DECODE_GATE_UP
+
 // Fused projections (qkv|z|ab, q|k|v): up to three column segments of any formats in one dispatch, so the small
 // segments do not run as dispatches of their own. The threadgroup's tile picks its segment, and the segment's format
 // picks the decode; every segment takes the same K splits. The fused and prefill kernels stay plain kernels: as
@@ -325,8 +396,8 @@ GGUF_DECODE_PACKED_FORMAT(FmtPQ20, pq20, uint2b_format)
     threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;                                            \
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);                                         \
     gguf_zero(acc);                                                                                               \
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NATIVE>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
-                                            simd_group * 32 + simd_lane, simd_lane, group.y * per, (group.y + 1) * per, acc); \
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NATIVE>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
+                                            simd_group * 32 + simd_lane, simd_lane, group.y * per, (group.y + 1) * per, staged_first_step(local, group.y * per, (group.y + 1) * per, p.spread), acc); \
     gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \

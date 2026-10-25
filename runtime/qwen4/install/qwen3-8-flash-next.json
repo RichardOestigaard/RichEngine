@@ -1,0 +1,102 @@
+{
+  "name": "Qwen3.8-Flash-Next",
+  "repos": [
+    "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
+  ],
+  "signature": {
+    "model_type": "qwen4_exp_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 2560,
+    "num_hidden_layers": 48,
+    "vocab_size": 248320,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "num_experts": 512
+  },
+  "draft": {
+    "repo": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "base": "dflash2",
+    "signature": {
+      "num_hidden_layers": 3,
+      "hidden_size": 2560,
+      "vocab_size": 248320,
+      "intermediate_size": 5120,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "rope_parameters.rope_theta": 1000000,
+      "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention"
+      ],
+      "dflash_config.selector_rank": 256,
+      "dflash_config.mask_token_id": 248077,
+      "dflash_config.target_hidden_reduction": "stream_mean",
+      "dflash_config.target_layer_ids": [
+        3,
+        17,
+        31,
+        47
+      ]
+    }
+  },
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "qwen3-xml",
+    "vision": {
+      "pad_token": "<|image_pad|>",
+      "patch_size": 16,
+      "temporal_patch_size": 2,
+      "merge_size": 2,
+      "image_mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "image_std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "VERIFY_ALL_LIVE",
+    "DFLASH_POOL",
+    "GDN_CHUNKED",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "GPU_PREDRAFT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "PREFILL_SPLITS_MAX",
+    "VERIFY_SPLITS_MAX",
+    "VERIFY_SPLIT_R2",
+    "HEAD_FUSED",
+    "MTL4",
+    "GGUF_PACKED",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "TREE_ACCEPT_MAX",
+    "TREE_ACCEPT_MIN",
+    "ANE_WAIT",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS"
+  ]
+}

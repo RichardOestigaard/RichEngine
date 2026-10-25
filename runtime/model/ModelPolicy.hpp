@@ -71,6 +71,9 @@ struct ModelPolicy final {
   bool canvasPrefixExit = true;    // RICHENGINE_CANVAS_PREFIX_EXIT
   bool canvasCommitTail = true;    // RICHENGINE_CANVAS_COMMIT_TAIL
   bool canvasSpecPrefill = true;   // RICHENGINE_CANVAS_SPECULATIVE_PREFILL
+  // model/RuntimeImpl.hpp: the constrained-decode (DFA) scope — "off",
+  // "forced" or "full"; empty keeps the host path.
+  std::string dfaMode;            // RICHENGINE_DFA_MODE
 };
 
 namespace detail {
@@ -170,6 +173,8 @@ namespace detail {
   p.canvasSpecPrefill = std::getenv("RICHENGINE_CANVAS_SPECULATIVE_PREFILL")
                             ? env.canvasSpeculativePrefill
                             : maker.canvasSpeculativePrefill.value_or(true);
+  p.dfaMode = env.dfaMode.empty() ? maker.dfaMode.value_or(std::string{})
+                                : std::string(env.dfaMode);
   return p;
 }
 

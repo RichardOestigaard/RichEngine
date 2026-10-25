@@ -762,8 +762,19 @@ struct MetalBackend::Impl {
             std::vector<BufferSnapshot> buffers;
             std::vector<BytesSnapshot> bytes;
         };
-        __strong id<MTLIndirectCommandBuffer> icb = nil;
-        std::shared_ptr<MetalAllocation> paramsAllocation;
+        // Two banks, selected by submission parity: a replay may run while
+        // the previous command is still reading its parameter arena, so each
+        // bank has its own arena and its own ICB binding it. Bank 1 is built
+        // on first use — a backend that never overlaps never pays for it.
+        mutable __strong id<MTLIndirectCommandBuffer> icb[2] = {nil, nil};
+        mutable std::shared_ptr<MetalAllocation> paramsAllocation[2];
+        // The run's staged payload bytes, so a bank built later can size and
+        // fill its arena from the snapshot alone.
+        uint64_t paramsBytes = 0;
+        // The highest buffer index any command binds plus one.
+        uint32_t maxBindCount = 0;
+        // The barrier each command needs, from the run's byte ranges.
+        std::vector<uint8_t> barrierPlan;
         std::vector<DispatchSnapshot> dispatches;
         // The distinct buffers the span binds: the encoder declares their
         // usage at replay so its hazard tracking sees the span's accesses.
@@ -883,6 +894,12 @@ struct MetalBackend::Impl {
     // every BytesBinding payload is staged here, 256-byte aligned, and bound
     // as an address into this buffer. Grown to a submission's total.
     std::shared_ptr<MetalAllocation> staging4[2];
+    // RICHENGINE_OP_TIMINGS on Metal 4: a timestamp pair brackets each
+    // encoded unit of a submission and resolves in the final commit's
+    // feedback. Banked like the allocator: a submission's heap is resolved
+    // before the bank's next reuse. Grown to 2 entries per dispatch.
+    __strong id<MTL4CounterHeap> counterHeap4[2] = {nil, nil};
+    NSUInteger counterHeap4Count[2] = {0, 0};
 #endif
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
@@ -908,6 +925,10 @@ struct MetalBackend::Impl {
                        std::vector<std::unique_ptr<CachedCommand>>>
         preparedCache;
     uint64_t bakedClock = 0;
+    // The baked-span bank the last submission used. A replay while that
+    // command is still in flight takes the other bank, so bank 1 exists only
+    // once something overlaps; with nothing in flight the bank is reused.
+    uint32_t lastSpanBank = 0;
     // Epoch counters stamping allocations once per pass: retained-set
     // dedupe and snapshot identity checks.
     uint64_t submitEpoch = 0;
@@ -1007,6 +1028,20 @@ struct MetalBackend::Impl {
     bakeSpan(std::span<const ComputeDispatch> run);
 
 
+    // The barrier each command of a span run needs, from the byte ranges it
+    // binds: commit4's frontier rule, resolved once at bake time.
+    static std::vector<uint8_t>
+    spanBarrierPlan(std::span<const ComputeDispatch> run);
+
+
+    // Builds one bank of a baked span: its parameter arena (staged from the
+    // run's current payloads) and the indirect command buffer binding it.
+    // Bank 0 is built by bakeSpan; bank 1 the first time a replay needs it,
+    // which is the first submission that overlaps another.
+    void encodeBank(const BakedSpan &span, uint32_t bank,
+                    std::span<const ComputeDispatch> run);
+
+
     // Identity of a run against a gpu span's snapshot: same checks as
     // snapshotMatches except payload contents — every bytes payload is
     // restaged on replay, so contents never participate.
@@ -1043,11 +1078,12 @@ struct MetalBackend::Impl {
 
     // Rewrites a span's staged parameters from the run's current patchable
     // payloads: the indirect commands bind the parameter arena by address,
-    // so the same commands replay with the new parameters. One command in
-    // flight means the GPU finished reading the arena of the previous
-    // submission before this patch runs.
+    // so the same commands replay with the new parameters. The arena is the
+    // submission's parity bank, which the command two submissions back (the
+    // one that used it) has finished reading.
     static void patchSpanParams(const BakedSpan &span,
-                                std::span<const PreparedDispatch> run);
+                                std::span<const PreparedDispatch> run,
+                                uint32_t bank);
 
 
     // Finds a baked span matching this run or bakes a new one. Returns

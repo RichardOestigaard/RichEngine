@@ -223,7 +223,8 @@ kernel void draft_select_dflash(
     device const float *partial_values [[buffer(2)]],
     device const float *uniforms [[buffer(3)]],
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
+    device float *confidence [[buffer(6)]],
+    constant SelectorBatchParams &params [[buffer(7)]],
     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
@@ -236,6 +237,7 @@ kernel void draft_select_dflash(
   uniforms += batch * RICHENGINE_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
+  confidence += batch * Positions;
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   uint predecessor_index = 0;
@@ -245,6 +247,15 @@ kernel void draft_select_dflash(
     float scores[Candidates];
     for (uint i = 0; i < Candidates; ++i)
       scores[i] = unary[position * Candidates + i] + edges[i];
+    // The largest of the position's candidate probabilities at temperature
+    // 1, before the lane chooses among them (VerifyRowsParams).
+    float best = scores[0];
+    for (uint i = 1; i < Candidates; ++i)
+      best = max(best, scores[i]);
+    float mass = 0.0f;
+    for (uint i = 0; i < Candidates; ++i)
+      mass += exp(scores[i] - best);
+    confidence[position] = 1.0f / mass;
     uint selected = 0;
     if (sampling) {
       float maximum = scores[0];

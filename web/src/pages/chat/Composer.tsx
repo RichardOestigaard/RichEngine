@@ -2,7 +2,7 @@ import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid
 import { storageGet } from "../../api";
 import { MODEL_KEY } from "./storage";
 import { setToolEnabled, TOOL_HINTS, TOOL_IDS, TOOL_LABELS, toolsEnabled } from "./tools";
-import type { Attachment, ModelInfo } from "./types";
+import type { Attachment, ModelInfo, QueuedTurn } from "./types";
 
 // field-sizing grows the textarea in CSS; the manual measure is the fallback.
 const canFieldSize =
@@ -11,6 +11,8 @@ const canFieldSize =
 export default function Composer(props: {
   running: boolean;
   canSend: boolean;
+  queued: QueuedTurn[];
+  onRemoveQueued(turn: QueuedTurn): void;
   attachments: Attachment[];
   attachmentsVersion: number;
   imagesAccepted: boolean;
@@ -138,6 +140,56 @@ export default function Composer(props: {
           event.currentTarget.value = "";
         }}
       />
+      {/* Queued turns wait here, anchored to the box's top edge — out of
+          the message log — and send in order once the reply ends. */}
+      <Show when={props.queued.length}>
+        <div class="queue-tray" role="status" aria-label="Queued messages">
+          <For each={props.queued}>
+            {(turn, i) => (
+              <div
+                class="queue-row"
+                title="Queued — sends when the current reply finishes"
+              >
+                <span class="queue-pos">
+                  {i() === 0 ? "Next" : `#${i() + 1}`}
+                </span>
+                <span class="queue-text">
+                  {turn.text ||
+                    turn.attachments.map((a) => a.name).join(", ") ||
+                    "Attachment"}
+                </span>
+                <Show when={turn.attachments.length}>
+                  <span class="queue-atts">
+                    <For each={turn.attachments}>
+                      {(attachment) =>
+                        attachment.kind === "image" && attachment.url ? (
+                          <img
+                            src={attachment.url}
+                            alt={attachment.name || "Attached image"}
+                          />
+                        ) : (
+                          <span class="queue-file" title={attachment.name}>
+                            📄 {attachment.name}
+                          </span>
+                        )
+                      }
+                    </For>
+                  </span>
+                </Show>
+                <button
+                  type="button"
+                  class="queue-remove"
+                  aria-label="Remove queued message"
+                  title="Remove queued message"
+                  onClick={() => props.onRemoveQueued(turn)}
+                >
+                  ×
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <div class="composer">
         <div id="attachments" aria-label="Attachments">
           <For each={props.attachments}>

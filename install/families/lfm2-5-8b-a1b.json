@@ -93,6 +93,7 @@
     "DRAFT_SPLITS",
     "PREFILL_SPLITS_MAX",
     "VERIFY_SPLITS_MAX",
+    "VERIFY_SPLIT_R2",
     "HEAD_FUSED",
     "MTL4",
     "GGUF_PACKED",

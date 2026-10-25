@@ -36,6 +36,7 @@ enum class FrameType : uint16_t {
   ForcedTokens = 0x0005,
   ConstraintDfa = 0x0006,
   Vocabulary = 0x0007,
+  ScoreBatch = 0x0008,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -346,10 +347,37 @@ struct StatusJsonEvent {
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
+// A batch of score-only requests sharing one prompt prefix — the decision
+// pathway's questions over one state. Each item expands to a score request
+// with prompt = prefixTokens + suffixTokens, sharedPrefixTokens =
+// prefixTokens.size(), greedy unconstrained sampling and no output budget.
+// Wire layout: u64 absolute deadline, u64 remaining deadline, u8 priority,
+// u8 flags, u32 item count, u32 prefix token count, u32 prefix tokens; then
+// per item u64 requestId, u32 suffix count, u32 score count, u32 suffix
+// tokens, u32 score tokens.
+struct ScoreBatchFrame {
+  struct Item {
+    uint64_t requestId = 0;
+    std::vector<uint32_t> suffixTokens;
+    std::vector<uint32_t> scoreTokens;
+
+    bool operator==(const Item &) const = default;
+  };
+
+  uint64_t absoluteDeadlineUnixMicros = 0;
+  uint64_t remainingDeadlineMicros = 0;
+  engine::RequestPriority priority = engine::RequestPriority::Normal;
+  uint8_t flags = 0;
+  std::vector<uint32_t> prefixTokens;
+  std::vector<Item> items;
+
+  bool operator==(const ScoreBatchFrame &) const = default;
+};
+
 using ClientMessage =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                  StatusRequestFrame, ForcedTokensFrame, ConstraintDfaFrame,
-                 VocabularyFrame>;
+                 VocabularyFrame, ScoreBatchFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;

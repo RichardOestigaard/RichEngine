@@ -30,6 +30,12 @@ struct GdnDecodeShared {
   bfloat rows[Rows * HeadDim];
   float decay[Rows];
   bfloat beta[Rows];
+  // The previous step's retained rows, read from the lane's tape when the
+  // commit is folded into this scan (GDNDecodeBatchParams' pending_*).
+  bfloat pending_keys[Rows * HeadDim];
+  bfloat pending_values[Rows * HeadDim];
+  float pending_decay[Rows];
+  bfloat pending_beta[Rows];
 };
 
 // Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
@@ -45,6 +51,7 @@ inline void gdn_decode_prologue(
     device const bfloat *conv_state_in, device bfloat *conv_state_out,
     device bfloat *mixed_qkv, device const float *a_scale,
     device const bfloat *dt_bias, device float *decay, device bfloat *beta,
+    device const bfloat *tape_conv, uint pending, device uchar *step_tape,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group, uint tokens) {
   const uint Tokens = tokens;
@@ -67,18 +74,31 @@ inline void gdn_decode_prologue(
   const uint q_channel = key_head * HeadDim + lane;
   const uint k_channel = KeyWidth + q_channel;
   const uint v_channel = 2 * KeyWidth + value_head * HeadDim + lane;
+  constexpr uint KvWidth = KeyWidth + ValueWidth;
+  const uint k_column = key_head * HeadDim + lane;
+  const uint v_column = KeyWidth + value_head * HeadDim + lane;
+  // The lane's tape row layout: ConvDim conv inputs, then KvWidth k|v
+  // columns, then ValueHeads decay (f32) and beta (bf16) runs.
+  constexpr ulong TapeRowSpan = ConvDim + KvWidth;
+  constexpr ulong TapeDecayOffset =
+      ulong(RICHENGINE_TARGET_VERIFY_ROWS) * TapeRowSpan;
+  constexpr ulong TapeBetaOffset =
+      TapeDecayOffset + ulong(RICHENGINE_TARGET_VERIFY_ROWS) * ValueHeads * 2;
 
   for (uint token = simd_group; token < Tokens; token += kDecodeSimdgroups) {
     float q[Groups], k[Groups];
     bfloat v[Groups];
     for (uint g = 0; g < Groups; ++g) {
-      q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+      q[g] = float(gdn_conv_silu_pending(packed, conv_state_in, tape_conv, pending,
+                                 conv_weights,
                                  PackedWidth, ConvDim, token,
                                  q_channel + 32 * g));
-      k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+      k[g] = float(gdn_conv_silu_pending(packed, conv_state_in, tape_conv, pending,
+                                 conv_weights,
                                  PackedWidth, ConvDim, token,
                                  k_channel + 32 * g));
-      v[g] = gdn_conv_silu(packed, conv_state_in, conv_weights, PackedWidth,
+      v[g] = gdn_conv_silu_pending(packed, conv_state_in, tape_conv, pending,
+                           conv_weights, PackedWidth,
                            ConvDim, token, v_channel + 32 * g);
     }
     GdnGates gates{};
@@ -110,19 +130,51 @@ inline void gdn_decode_prologue(
       shared.beta[token] = gates.beta;
       shared.decay[token] = gates.decay;
     }
+    // The step's tape row: conv inputs and this head's k/v columns — the
+    // next step's pending prefix replays the rows it retains.
+    if (step_tape) {
+      device bfloat *row =
+          reinterpret_cast<device bfloat *>(step_tape) +
+          ulong(token) * TapeRowSpan;
+      for (uint g = 0; g < Groups; ++g) {
+        row[v_channel + 32 * g] =
+            packed[token * PackedWidth + v_channel + 32 * g];
+        row[ConvDim + v_column + 32 * g] =
+            shared.values[token * HeadDim + 32 * g + lane];
+        if (shared_writer) {
+          row[q_channel + 32 * g] =
+              packed[token * PackedWidth + q_channel + 32 * g];
+          row[k_channel + 32 * g] =
+              packed[token * PackedWidth + k_channel + 32 * g];
+          row[ConvDim + k_column + 32 * g] =
+              shared.keys[token * HeadDim + 32 * g + lane];
+        }
+      }
+      if (lane == 0) {
+        reinterpret_cast<device float *>(
+            step_tape + TapeDecayOffset * 2)
+            [token * ValueHeads + value_head] = gates.decay;
+        reinterpret_cast<device bfloat *>(
+            step_tape + TapeBetaOffset * 2)
+            [token * ValueHeads + value_head] = gates.beta;
+      }
+    }
   }
   if (carrier) {
     const uint row = simd_group;
     for (uint g = 0; g < Groups; ++g) {
       conv_state_out[row * ConvDim + v_channel + 32 * g] =
-          gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+          gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
+                                PackedWidth, ConvDim, pending,
                          row, v_channel + 32 * g);
       if (shared_writer) {
         conv_state_out[row * ConvDim + q_channel + 32 * g] =
-            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+            gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
+                                PackedWidth, ConvDim, pending,
                            row, q_channel + 32 * g);
         conv_state_out[row * ConvDim + k_channel + 32 * g] =
-            gdn_conv_carry(packed, conv_state_in, PackedWidth, ConvDim, Tokens,
+            gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
+                                PackedWidth, ConvDim, pending,
                            row, k_channel + 32 * g);
       }
     }
@@ -139,7 +191,7 @@ inline void gdn_decode_scan(device const float *state_in,
                             device float *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
                             uint value_head, uint lane, uint simd_group,
-                            uint tokens) {
+                            uint tokens, uint pending) {
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -154,6 +206,41 @@ inline void gdn_decode_scan(device const float *state_in,
     uint value_dim[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
       value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
+    for (uint token = 0; token < pending; ++token) {
+      const float d = shared.pending_decay[token];
+      const float b = float(shared.pending_beta[token]);
+      threadgroup const bfloat *key =
+          shared.pending_keys + token * HeadDim + lane * 4;
+      float memory[RowsInFlight];
+      for (uint r = 0; r < RowsInFlight; ++r) {
+        memory[r] = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+          state[r][i] *= d;
+          memory[r] += state[r][i] * float(key[i]);
+        }
+        memory[r] = simd_sum(memory[r]);
+      }
+      for (uint r = 0; r < RowsInFlight; ++r) {
+        const float delta =
+            (float(shared.pending_values[token * HeadDim + value_dim[r]]) -
+             memory[r]) *
+            b;
+        for (uint i = 0; i < 4; ++i)
+          state[r][i] += float(key[i]) * delta;
+      }
+    }
+    float upcoming[RowsInFlight][4] = {};
+    if (batch + RowsInFlight < Batches) {
+      for (uint r = 0; r < RowsInFlight; ++r)
+        for (uint i = 0; i < 4; ++i)
+          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
+    }
+    // The committed state is the incoming state advanced over the pending
+    // rows only; the step's own rows emit but their advance waits on the
+    // next step (they may be trimmed there).
+    for (uint r = 0; r < RowsInFlight; ++r)
+      for (uint i = 0; i < 4; ++i)
+        state_out[base(batch, r) + i] = state[r][i];
     for (uint token = 0; token < tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
@@ -187,17 +274,9 @@ inline void gdn_decode_scan(device const float *state_in,
           shared.rows[token * HeadDim + value_dim[r]] = bfloat(result[r]);
       }
     }
-    float upcoming[RowsInFlight][4] = {};
-    if (batch + RowsInFlight < Batches) {
-      for (uint r = 0; r < RowsInFlight; ++r)
-        for (uint i = 0; i < 4; ++i)
-          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
-    }
     for (uint r = 0; r < RowsInFlight; ++r)
-      for (uint i = 0; i < 4; ++i) {
-        state_out[base(batch, r) + i] = state[r][i];
+      for (uint i = 0; i < 4; ++i)
         state[r][i] = upcoming[r][i];
-      }
   }
 }
 
@@ -561,7 +640,7 @@ inline void gdn_decode_batch_phase(
     constant GDNDecodeBatchParams &params,
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
-    TP *table, SP *sums) {
+    TP *table, SP *sums, device uchar *tape_out) {
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
   device const uchar *current = batch == 0
@@ -595,12 +674,50 @@ inline void gdn_decode_batch_phase(
   const uint live = params.live_rows[batch];
   const uint tokens =
       live && live < stride ? live : stride;
+  const uint pending = params.pending_rows[batch];
+  // The previous step's retained rows sit on the lane's tape: per token the
+  // conv inputs, then the kv row (key then value columns), then decay
+  // (fp32) and beta (bf16) runs.
+  device const uchar *tape = tape_out + params.pending_tape[batch];
+  device const bfloat *tape_conv =
+      reinterpret_cast<device const bfloat *>(tape);
+  if (pending) {
+    constexpr uint KvWidth = KeyHeads * HeadDim + ValueWidth;
+    // The tape's layout: rows' conv inputs, then their kv rows, then decay
+    // (fp32) and beta (bf16) — RICHENGINE_TARGET_VERIFY_ROWS rows each.
+    constexpr ulong TapeRows = RICHENGINE_TARGET_VERIFY_ROWS;
+    device const bfloat *tkv =
+        reinterpret_cast<device const bfloat *>(tape + TapeRows * ConvDim * 2);
+    device const float *td = reinterpret_cast<device const float *>(
+        tape + TapeRows * ConvDim * 2 + TapeRows * KvWidth * 2);
+    device const bfloat *tb = reinterpret_cast<device const bfloat *>(
+        tape + TapeRows * ConvDim * 2 + TapeRows * KvWidth * 2 +
+        TapeRows * ValueHeads * 4);
+    for (uint t = simd_group * 32 + lane; t < pending;
+         t += kDecodeSimdgroups * 32) {
+      shared.pending_decay[t] = td[t];
+      shared.pending_beta[t] = tb[t];
+    }
+    for (uint t = simd_group * 32 + lane; t < pending * KvWidth;
+         t += kDecodeSimdgroups * 32) {
+      const uint token = t / KvWidth, dim = t % KvWidth;
+      if (dim < KeyHeads * HeadDim)
+        shared.pending_keys[token * HeadDim + dim % HeadDim +
+                            HeadDim * (dim / HeadDim)] = tkv[t];
+      else
+        shared.pending_values[token * HeadDim + dim - KeyHeads * HeadDim] =
+            tkv[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
-      dt_bias, decay, beta, shared, group.x, lane, simd_group, tokens);
+      dt_bias, decay, beta, tape_conv, pending,
+      tape_out + params.step_tape[batch], shared, group.x, lane,
+      simd_group, tokens);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
-                                         lane, simd_group, tokens);
+                                         lane, simd_group, tokens, pending);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
@@ -647,11 +764,12 @@ inline void gdn_decode_batch_phase(
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
-        table, sums);
+        table, sums, tape);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(17)]], \
+      device uchar *tape [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, \
                     (device bfloat *)nullptr, (device float *)nullptr, q4sg::Table64) \
   }
@@ -659,7 +777,8 @@ inline void gdn_decode_batch_phase(
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
-      constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(19)]], \
+      device uchar *tape [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
   }
 
@@ -683,7 +802,8 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32, 16, 32, 128, 8192, 12544, 
 #define GDN_DECODE_PACKED_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device half *plane [[buffer(17)]], device uchar *exponents [[buffer(18)]], \
-      constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(19)]], \
+      device uchar *tape [[buffer(20)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, plane, exponents, gguf_sg::Packed) \
   }
 GDN_DECODE_PACKED_ENTRY(verify_gdn_fused_packed_f32, 16, 48, 128, 10240, 16640, float)

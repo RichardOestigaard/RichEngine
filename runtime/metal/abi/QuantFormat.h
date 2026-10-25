@@ -73,7 +73,11 @@
 #define GGUF_FMT_AF5G128 24u
 #define GGUF_FMT_AF6G128 25u
 #define GGUF_FMT_AF8G128 26u
-#define GGUF_FMT_COUNT 27u
+// The packed affine manifest's layout (WeightStore's affine planes): AF4's
+// dequant over 64-group codes and separate bf16 scale and bias planes,
+// bound as plane0, plane1 and meta.
+#define GGUF_FMT_AF4P 27u
+#define GGUF_FMT_COUNT 28u
 
 // The tensor type AF4 sections carry in a GgufTensorDescriptor (and
 // kQuantFormats' ggml_type column): a private id no GGUF file may use, not
@@ -90,6 +94,7 @@
 #define GGUF_PRIVATE_TYPE_AF5G128 0x80001af5u
 #define GGUF_PRIVATE_TYPE_AF6G128 0x80001af6u
 #define GGUF_PRIVATE_TYPE_AF8G128 0x80001af8u
+#define GGUF_PRIVATE_TYPE_AF4P 0x80020af4u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type
@@ -139,6 +144,9 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {GGUF_PRIVATE_TYPE_AF5G128, 128, 84, 20, 0, 4, 4, "af5g128"},
     {GGUF_PRIVATE_TYPE_AF6G128, 128, 100, 24, 0, 4, 4, "af6g128"},
     {GGUF_PRIVATE_TYPE_AF8G128, 128, 132, 32, 0, 4, 4, "af8g128"},
+    // AF4P: AF4 over the packed manifest's planes — 64-group codes as
+    // plane0, the bias plane as plane1, the scale plane as meta.
+    {GGUF_PRIVATE_TYPE_AF4P, 64, 36, 16, 1, 2, 2, "af4p"},
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.

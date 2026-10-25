@@ -84,7 +84,9 @@ accepted):
 | Model | Install |
 | --- | --- |
 | Gemma4-26B-A4B | `richengine install google/gemma-4-26B-A4B-it` (pairs the z-lab DFlash draft) |
-| DiffusionGemma-26B-A4B | `richengine install google/diffusiongemma-26B-A4B-it` |
+
+(DiffusionGemma-26B-A4B is disabled in this release — its denoising trunk
+emits incoherent output pending a numerics fix, docs/diffusion_issue.md.)
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats;
 `UD-Q8_K_XL` and BF16 targets are not supported.
@@ -202,25 +204,6 @@ A dense model's prefill also runs its FFN on the Apple Neural Engine when
 calibration finds that faster — on this Mac the 27B's split at share 0.41
 cuts a cold 14K prefill from 28.4 s to 22.5 s (1.26×), decode unchanged.
 `--disable-ane` keeps prefill on the GPU alone.
-
-DiffusionGemma-26B-A4B generates a 256-token canvas per block through
-iterative denoising instead of one token per step. Kernel-level numbers
-on this Mac (GPU-timestamped microbenchmarks; a real-model end-to-end
-benchmark is pending — see
-[docs/GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md](docs/GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md)):
-
-| Optimization measured | Before | After |
-| --- | ---: | ---: |
-| Canvas soft-embedding pass | ~91–155 ms | ~7–16 ms (~10–13×) |
-| Canvas logit statistics pass | 2.7 ms | 1.4 ms |
-| head_dim-512 attention (M-split, all KV formats) | — | 18–45% faster |
-| Softcap + temperature passes | ~4.0 ms/step | fused into the readers |
-
-Projected committed-throughput roofline after the bandwidth fixes (per
-256-token canvas at ~13–17 denoise steps): ~130–175 tok/s on M5,
-~260–350 on M5 Pro, ~380–690 on M5 Max — versus ~1,000+ tok/s reported
-upstream on H100/H200. Decode commits tokens in bursts of up to 256;
-streaming and tool calling work as with the other families.
 
 The same benchmark on the 2B-class GGUF installs on this Mac:
 

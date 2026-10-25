@@ -42,6 +42,11 @@ constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 45;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
+// u64 absolute deadline, u64 remaining deadline, u8 priority, u8 flags,
+// u32 item count, u32 prefix token count.
+constexpr uint64_t kScoreBatchFixedBytes = 28;
+// One batch covers a /v1/systemone request's question cap.
+constexpr uint32_t kScoreBatchMaximumItems = 64;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -108,6 +113,9 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   case FrameType::Vocabulary:
     // Token bytes dominate the (vocab + 1) i32 offsets; the frame cap rules.
     return bounded(kVocabularyFixedBytes, limits.maxFramePayloadBytes);
+  case FrameType::ScoreBatch:
+    // Prefix and suffix tokens dominate the items; the frame cap rules.
+    return bounded(kScoreBatchFixedBytes, limits.maxFramePayloadBytes);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -149,6 +157,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::ForcedTokens:
   case FrameType::ConstraintDfa:
   case FrameType::Vocabulary:
+  case FrameType::ScoreBatch:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -996,6 +1005,96 @@ ProtocolResult<ClientMessage> decodeVocabulary(const Frame &frame,
   return success(ClientMessage{std::move(vocabulary)});
 }
 
+ProtocolResult<ClientMessage> decodeScoreBatch(const Frame &frame,
+                                               const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  ScoreBatchFrame batch;
+  uint8_t priority = 0;
+  uint8_t flags = 0;
+  uint32_t count = 0;
+  uint32_t prefixCount = 0;
+  if (!reader.u64(batch.absoluteDeadlineUnixMicros) ||
+      !reader.u64(batch.remainingDeadlineMicros) || !reader.u8(priority) ||
+      !reader.u8(flags) || !reader.u32(count) || !reader.u32(prefixCount)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "score batch fixed payload is truncated"));
+  }
+  batch.priority = static_cast<RequestPriority>(priority);
+  batch.flags = flags;
+  if (!batch.absoluteDeadlineUnixMicros ||
+      !batch.remainingDeadlineMicros) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidDeadline, 0,
+                  "absolute and remaining deadlines must be non-zero"));
+  }
+  if (!count || count > kScoreBatchMaximumItems) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidCount, 0,
+                  "score batch item count is out of range"));
+  }
+  if (prefixCount > limits.maxPromptTokens) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded, 0,
+                  "prompt token count exceeds its limit"));
+  }
+  if (!reader.words(prefixCount, batch.prefixTokens)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "score batch prefix is truncated"));
+  }
+  batch.items.resize(count);
+  for (ScoreBatchFrame::Item &item : batch.items) {
+    uint32_t suffixCount = 0;
+    uint32_t scoreCount = 0;
+    if (!reader.u64(item.requestId) || !reader.u32(suffixCount) ||
+        !reader.u32(scoreCount)) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::ProtocolFatal,
+                    IssueCode::InvalidPayloadLength, item.requestId,
+                    "score batch item header is truncated"));
+    }
+    if (!item.requestId) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::RequestError, IssueCode::InvalidRequestId, 0,
+                    "request id must be non-zero"));
+    }
+    if (!suffixCount || prefixCount + suffixCount > limits.maxPromptTokens) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
+                    item.requestId, "prompt token count exceeds its limit"));
+    }
+    if (scoreCount < ExecutionLimits::minimumScoreOptions ||
+        scoreCount > ExecutionLimits::maximumScoreOptions) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
+                    item.requestId, "score option count must be in [2, 255]"));
+    }
+    if (!reader.words(suffixCount, item.suffixTokens) ||
+        !reader.words(scoreCount, item.scoreTokens)) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::ProtocolFatal,
+                    IssueCode::InvalidPayloadLength, item.requestId,
+                    "score batch item payload is truncated"));
+    }
+    std::vector<uint32_t> distinct(item.scoreTokens.begin(),
+                                   item.scoreTokens.end());
+    std::sort(distinct.begin(), distinct.end());
+    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
+        distinct.end()) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
+                    item.requestId, "score tokens must be distinct"));
+    }
+  }
+  if (reader.remaining() != 0) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "score batch payload has trailing bytes"));
+  }
+  return success(ClientMessage{std::move(batch)});
+}
+
 ProtocolResult<ClientMessage> decodeStatusRequest(const Frame &frame) {
   Reader reader(frame.payload);
   StatusRequestFrame request;
@@ -1031,6 +1130,8 @@ std::string_view frameTypeName(FrameType type) {
     return "constraint_dfa";
   case FrameType::Vocabulary:
     return "vocabulary";
+  case FrameType::ScoreBatch:
+    return "score_batch";
   case FrameType::MaskRequest:
     return "mask_request";
   case FrameType::Done:
@@ -1166,6 +1267,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeVocabulary(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
+    case FrameType::ScoreBatch:
+      return decodeScoreBatch(frame, limits);
     default:
       break;
     }

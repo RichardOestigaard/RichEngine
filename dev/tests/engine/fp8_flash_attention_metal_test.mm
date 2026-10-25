@@ -380,7 +380,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, 8, 8, 0});
+               data.params.kv, splits, splits, kRows, kRows, 0});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -421,6 +421,10 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
       device, slots * shape.fusedRows() * kFp8HeadDimension * sizeof(BFloat16Bits));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The kernels split the rows into eight-row tiles on the tile axis.
+  const uint32_t tiles =
+      (data.params.rows + RICHENGINE_PREFILL_ATTENTION_TILE_ROWS - 1) /
+      RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -431,14 +435,14 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:4];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, tiles, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
   [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), tiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -557,13 +561,32 @@ void benchmark(id<MTLDevice> device, id<MTLCommandQueue> queue,
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, 8, 8, 0});
+               data.params.kv, splits, splits, kRows, kRows, 0});
   const uint64_t kvBytes =
       uint64_t{committed + kRows} * shape.kvHeads * kFp8HeadDimension * 2;
-  for (const char *base : {richengine::ops::kVerifyAttentionQ8Split.data(),
-                            richengine::ops::kVerifyAttentionFp8Split.data()}) {
-    const std::string name = std::string(base) + shape.suffix;
-    id<MTLComputePipelineState> split = makePipeline(device, library, name);
+  // The production q8 pick is its _rP pass split, so the comparison lists
+  // every pipeline a layout could select: q8 base, its _rP variant where
+  // the per-pass MP stays a multiple of 8, and fp8 where the tile fits.
+  const uint32_t fused = shape.queryHeadsPerKvHead * kRows;
+  const uint32_t passes = fused >= 128 ? 4 : 2;
+  std::vector<std::pair<std::string, uint32_t>> names{
+      {std::string(richengine::ops::kVerifyAttentionQ8Split) + shape.suffix,
+       shape.kvHeads},
+      {std::string(richengine::ops::kVerifyAttentionFp8Split) + shape.suffix,
+       shape.kvHeads}};
+  if (shape.kvHeads != 2 || passes == 4)
+    names.insert(names.begin() + 1,
+                 {std::string(richengine::ops::kVerifyAttentionQ8Split) +
+                      shape.suffix + "_r" + std::to_string(passes),
+                  shape.kvHeads * passes});
+  for (const auto &[name, gridX] : names) {
+    id<MTLComputePipelineState> split =
+        tryMakePipeline(device, library, name);
+    if (!split) {
+      std::cout << "benchmark " << name << " committed=" << committed
+                << ": kernel exceeds the device's threadgroup memory\n";
+      continue;
+    }
     // Warm up once so the measurement excludes pipeline setup.
     for (uint32_t iteration = 0; iteration <= kIterations; ++iteration) {
       id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -579,7 +602,7 @@ void benchmark(id<MTLDevice> device, id<MTLCommandQueue> queue,
                  atIndex:7];
       for (id<MTLBuffer> extent : data.extents)
         [encoder useResource:extent usage:MTLResourceUsageRead];
-      [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
+      [encoder dispatchThreadgroups:MTLSizeMake(gridX, splits, width)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       [encoder endEncoding];
       if (iteration == 0) {
@@ -616,17 +639,20 @@ void run(const char *libraryPath) {
     const Pipelines pipelines = makePipelines(device, library, shape);
     if (pipelines.unsupported)
       continue;
+    // Verify cases carry the compiled sixteen rows; the prefill rows below
+    // stay under kRows, so the guard sends them to the prefill split.
     for (uint32_t width = 1; width <= 4; ++width)
-      runCase(device, queue, pipelines, shape, 127, 8, width);
-    runCase(device, queue, pipelines, shape, 0, 8, 4);
+      runCase(device, queue, pipelines, shape, 127, kRows, width);
+    runCase(device, queue, pipelines, shape, 0, kRows, 4);
     for (uint32_t activeRows = 1; activeRows < kRows; ++activeRows)
       runCase(device, queue, pipelines, shape, 127, activeRows, 1);
-    runCase(device, queue, pipelines, shape, 129, 8, 4);
+    runCase(device, queue, pipelines, shape, 129, kRows, 4);
     runCase(device, queue, pipelines, shape, 421, 3, 1);
-    runCase(device, queue, pipelines, shape, 1'100, 8, 2, false);
-    runCase(device, queue, pipelines, shape, 4'093, 8, 3, false, 65);
-    runCase(device, queue, pipelines, shape, 8'192, 8, 2, false, 65);
-    benchmark(device, queue, library, shape, 32'768);
+    runCase(device, queue, pipelines, shape, 1'100, kRows, 2, false);
+    runCase(device, queue, pipelines, shape, 4'093, kRows, 3, false, 65);
+    runCase(device, queue, pipelines, shape, 8'192, kRows, 2, false, 65);
+    for (const uint32_t committed : {4'096u, 32'768u, 131'072u})
+      benchmark(device, queue, library, shape, committed);
   }
   std::cout << "fp8_flash_attention_metal_test: ok\n";
 }

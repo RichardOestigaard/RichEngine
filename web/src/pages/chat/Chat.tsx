@@ -26,10 +26,11 @@ import {
   EFFORT_KEY,
   MODEL_KEY,
   SIDEBAR_KEY,
+  SYSTEM_KEY,
 } from "./storage";
 import { displayContent } from "./markdown";
 import { activeTools, runTool, toolDetail } from "./tools";
-import type { Attachment, Message, MessageContent, ModelInfo, ToolRun, Usage } from "./types";
+import type { Attachment, Message, MessageContent, ModelInfo, QueuedTurn, ToolRun, Usage } from "./types";
 import Sidebar from "./Sidebar";
 import Composer from "./Composer";
 import MessageView from "./Message";
@@ -67,15 +68,6 @@ interface StreamState {
   firstDeltaAt: number;
   finish: string | null;
   calls: (ToolCallDraft | undefined)[];
-}
-
-/* Enter during a run stashes the turn here instead of dropping it; queued
-   turns render as ghost bubbles under the live reply and drain in order
-   once it ends. */
-interface QueuedTurn {
-  content: MessageContent;
-  text: string;
-  attachments: Attachment[];
 }
 
 const ALLOWED_EFFORTS = new Set(["", "xhigh", "medium", "low", "none"]);
@@ -1102,9 +1094,11 @@ export default function Chat() {
     const draft = input();
     const history = messages();
     const picked = model() || modelData()[0]?.id;
+    const effortValue = effort();
     window.clearTimeout(tokenTimer);
-    // Nothing to count: an empty history and draft 400s on the server.
-    if (running() || (!draft.trim() && !history.length)) {
+    // Nothing to count: an empty history and draft 400s on the server;
+    // a missing model does the same, so count only once one resolves.
+    if (running() || !picked || (!draft.trim() && !history.length)) {
       setTokenCount(null);
       return;
     }
@@ -1115,15 +1109,9 @@ export default function Chat() {
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ...(picked ? { model: picked } : {}),
-              messages: [
-                ...requestMessages(history),
-                ...(draft.trim()
-                  ? [{ role: "user", content: draft }]
-                  : []),
-              ],
-            }),
+            /* The count endpoint speaks the Anthropic dialect: the same
+               messages OpenAI chat accepts need translation. */
+            body: countBody(picked, history, draft, effortValue),
           }
         );
         setTokenCount(
@@ -1218,6 +1206,7 @@ export default function Chat() {
       classList={{
         empty: !messages().length,
         "menu-open": menuOpen(),
+        "queue-open": queued().length > 0,
         dragging: dragging() > 0,
       }}
       onDragEnter={(event) => {
@@ -1330,47 +1319,6 @@ export default function Chat() {
           <Show when={errorNote()} keyed>
             {(note) => <MessageView msg={note} error />}
           </Show>
-          {/* Queued turns sit under the reply in flight, where they will
-              land once it ends; ghosted until their send starts. */}
-          <For each={queued()}>
-            {(turn) => {
-              const parts = userParts(turn.content);
-              return (
-                <div
-                  class="message user queued"
-                  title="Queued — sends when the current reply finishes"
-                >
-                  {parts.text ? <div class="user-text">{parts.text}</div> : null}
-                  {parts.images.length ? (
-                    <div class="user-images">
-                      {parts.images.map((url) => (
-                        <img src={url} alt="Attached image" />
-                      ))}
-                    </div>
-                  ) : null}
-                  {parts.files.length ? (
-                    <div class="user-files">
-                      {parts.files.map((file) => (
-                        <span class="file-chip" title={file.name}>
-                          📄 {file.name}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  <div class="queued-tag">Queued</div>
-                  <button
-                    class="queued-remove"
-                    type="button"
-                    aria-label="Remove queued message"
-                    title="Remove queued message"
-                    onClick={() => removeQueued(turn)}
-                  >
-                    ×
-                  </button>
-                </div>
-              );
-            }}
-          </For>
         </div>
       </main>
       <Show when={dragging() > 0}>
@@ -1402,6 +1350,8 @@ export default function Chat() {
       <Composer
         running={running()}
         canSend={canSend()}
+        queued={queued()}
+        onRemoveQueued={removeQueued}
         attachments={attachments()}
         attachmentsVersion={attachmentsVersion()}
         imagesAccepted={imagesAccepted()}
@@ -1428,4 +1378,69 @@ export default function Chat() {
       />
     </div>
   );
+}
+
+/* OpenAI data-URL parts → Anthropic base64 image/document sources; parts
+   that do not parse drop out rather than 400 the count. */
+function anthropicContent(content: MessageContent): unknown {
+  if (typeof content === "string") return content;
+  const blocks = content.flatMap((part): Record<string, unknown>[] => {
+    if (part.type === "text") return [{ type: "text", text: part.text }];
+    const url =
+      part.type === "image_url" ? part.image_url.url : part.file.file_data;
+    const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+    return match
+      ? [
+          {
+            type: part.type === "image_url" ? "image" : "document",
+            source: { type: "base64", media_type: match[1], data: match[2] },
+          },
+        ]
+      : [];
+  });
+  return blocks.length ? blocks : "";
+}
+
+/* The token meter's body in the Anthropic dialect the count endpoint
+   validates: model always present, assistant reasoning counted through a
+   thinking block, the draft appended as the final user turn, and thinking
+   mirroring the generation effort — an unset or "none" effort renders a
+   different prefix, and templates that always think (e.g. LFM) reject the
+   "none" the endpoint would otherwise assume. */
+function countBody(
+  picked: string,
+  history: Message[],
+  draft: string,
+  effort: string
+): string {
+  const system = storageGet(SYSTEM_KEY)?.trim();
+  return JSON.stringify({
+    model: picked,
+    ...(effort === "none"
+      ? { thinking: { type: "disabled" } }
+      : {
+          thinking: { type: "enabled" },
+          output_config: { effort: effort || "high" },
+        }),
+    messages: [
+      ...(system ? [{ role: "system", content: system }] : []),
+      ...history.map((m) => ({
+        role: m.role,
+        content:
+          m.role === "assistant" && m.reasoning_content
+            ? [
+                {
+                  type: "thinking",
+                  thinking: m.reasoning_content,
+                  signature: "",
+                },
+                ...(typeof m.content === "string" && m.content
+                  ? [{ type: "text", text: m.content }]
+                  : []),
+              ]
+            : anthropicContent(m.content),
+      })),
+      ...(draft.trim() ? [{ role: "user", content: draft }] : []),
+    ],
+  });
 }

@@ -401,11 +401,9 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   const RequestPriority selectedPriority = ready.front()->spec.priority;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
-  plan.constrained = ready.front()->spec.constrained;
   plan.decodeStage = decodeStage;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
-        request->spec.constrained != plan.constrained ||
         request->decodeStage != decodeStage) {
       if (getenv("RICHENGINE_DENY_DEBUG"))
         fprintf(stderr, "stage-split id=%llu stage=%d want=%d\n",

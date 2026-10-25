@@ -4,6 +4,7 @@
 #include "metal/MetalBackend.hpp"
 #include "ops/Sampling.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -28,12 +29,33 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer uniforms;
   metal::MetalBuffer proposedTokens;
   metal::MetalBuffer proposalProbabilities;
+  // fp32 [lanes][RICHENGINE_DRAFT_PROPOSAL_TOKENS]: each lane's confidence at
+  // each proposal position, the largest probability among the position's
+  // candidates (VerifyRowsParams in metal/abi/Sampling.h), which the verify
+  // row budget reads. The chain-mode select kernels write it; the tree
+  // variants do not.
+  metal::MetalBuffer confidence;
   // Tree-verify tables (draft_select_tree): per lane the node descriptors,
   // node tokens and node count of its verify tree
   // (RICHENGINE_TREE_VERIFY_NODES stride). Unused by chain-only selection.
   metal::MetalBuffer treeNodes;
   metal::MetalBuffer treeTokens;
   metal::MetalBuffer treeCounts;
+};
+
+// What a decode cycle's verify rows follow (DraftSelector::addVerifyRows,
+// VerifyRowsParams): the acceptance model logit(p) = slope *
+// logit(confidence) + intercepts[position], and costs[R], the cost of a
+// cycle whose lanes verify R rows in all, for R from the lane count to
+// sixteen rows a lane, in any unit. With everyRow, each lane verifies its
+// maximum instead.
+struct VerifyRowsModel final {
+  static constexpr uint32_t kCosts =
+      RICHENGINE_DRAFT_QUERY_ROWS * RICHENGINE_MAXIMUM_BATCH_WIDTH + 1;
+  float slope = 1.0F;
+  std::array<float, RICHENGINE_DRAFT_PROPOSAL_TOKENS> intercepts{};
+  std::array<float, kCosts> costs{};
+  bool everyRow = true;
 };
 
 // The draft's selector codebooks, which score the edge from a proposal
@@ -153,6 +175,17 @@ public:
                    uint32_t treeMask,
                    uint32_t queryRows =
                        RICHENGINE_DRAFT_QUERY_ROWS) const;
+  // After the selector: each lane's verify rows (a uint32 per lane in
+  // `verifyRows`) by `model` from its confidences, at most
+  // maximumRows[lane] of them (its live rows). confMin, when nonzero,
+  // additionally caps a lane at its confidence prefix (VerifyRowsParams's
+  // conf_min, RICHENGINE_DRAFT_CONF_MIN).
+  static void addVerifyRows(metal::CommandGraph &graph,
+                            const metal::MetalBuffer &confidence,
+                            const metal::MetalBuffer &verifyRows,
+                            const VerifyRowsModel &model,
+                            std::span<const uint32_t> maximumRows,
+                            float confMin = 0.0F);
 
 private:
   uint32_t vocabulary_ = 0;

@@ -123,6 +123,9 @@ struct AcceptanceBuffers final {
   // truncLanes cap their accepted prefix there.
   metal::MetalBuffer truncRows;
   uint32_t truncLanes = 0;
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which bound
+  // what it retains; empty verifies every row as before.
+  metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,

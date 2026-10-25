@@ -36,14 +36,13 @@ hardcoded constant, not computed — it never caught the change.
 - The WIP's parameterized 8-row verify path (~0% acceptance) is a
   separate, real bug — unrelated to the benchmark artifact. Fixing it
   restores the ~104 tok/s geometry.
-- The WIP GPU-predraft path crashes the benchmark: `cannot release a
-  KV extent while a command is in flight` at `evictAllCache` between
-  samples — a deferred predraft command holds an extent across
-  eviction. `RICHENGINE_GPU_PREDRAFT=0` avoids it.
+- The GPU-predraft crash found during this bisect is fixed:
+  `settleGpuPredraft()` now drains the deferred command on every
+  state/extent-freeing path before `evictAllCache` can run.
 
 ## Remaining work (ordered)
 
-1. **8-row verify bug** (`DFlashDraft.hpp:144-151` FIXME): the draft's
+1. **8-row verify bug** (`DFlashDraft.hpp` FIXME): the draft's
    `verifyRows()`/`queryRows()` is forced to `targetVerifyRows` (16)
    because block-8→8 rows gives ~0 acceptance — "proposals stop
    matching after the first committed step". Likely: the draft packs
@@ -51,13 +50,10 @@ hardcoded constant, not computed — it never caught the change.
    stride, captured-hidden index) still strides 16. Fix → verify
    ~87% + ~104 tok/s, then restore `verifyRows() =
    trained block rows` per the comment.
-2. **GPU-predraft crash** — deferred predraft command holds a KV
-   extent across `evictAllCache`; extend the extent's lifetime to the
-   ticket's completion or skip predraft when extents may be evicted.
-3. **Benchmark integrity** — `prompt_sha256` is hardcoded; compute it
+2. **Benchmark integrity** — `prompt_sha256` is hardcoded; compute it
    (or assert the built prompt hashes to it) so a remap can't
    silently change the measured content again.
-4. **DFlashTwo split** — baseline confirmed green (~104 tok/s): new
+3. **DFlashTwo split** — baseline confirmed green (~104 tok/s): new
    `DFlashTwoDraft.{hpp,cpp}` + `DraftKind::DFlashTwo`, migrate V2-only
    loader/conv/selector/tree code out of `DFlashDraft`, keep legacy
    DFlash/V1/DSpark/plain paths compiling.
@@ -180,13 +176,22 @@ went 8/7/8 → 16/15/16 somewhere in the Oct 6–12 pushes). Verify row
 count roughly doubled per step; the honest loss is smaller than the
 rate suggests (4.00 → 3.76 tok/batch). Needs its own bisect.
 
-### 3. WIP `verifyRows()`=8 parameterization — quarantined
+### 3. Verify geometry — resolved via a compiled 8/8/7 variant
 
-The uncommitted refactor parameterizes verify stride to the draft's
-trained block (8 rows for block-8). With it the draft's proposals stop
-matching after the first committed step → ~0% acceptance → 21.6 tok/s.
-Forced back to 16 in `runtime/model/DFlashDraft.hpp` (marked
-`FIXME(regression)`), recovering ~34% acceptance.
+Runtime-striding a 16-compiled build to 8 verify rows
+(`RICHENGINE_VERIFY_NARROW=1`) is NOT output-identical: it emits a
+different trajectory at ~27% acceptance (the fused-head m8 tile argmax
+and the unfused path agree with each other but not with the fused m16
+tile — the residual is a tile-variant numerics divergence, not stale
+state). The correct path is a compiled 8/8/7 geometry: `make verify8`
+produces `build8/richengine` + `build8/richengine.metallib`, verified
+oracle-identical at every width (hash 8845173885570541823, 88.7%
+acceptance, all eight transcripts token-identical). The server selects
+it automatically for drafts whose `block_size <= 8`
+(server/model_host.py `_engine_binary`).
+
+B4 decode on the 27B: 121.7 → 249.9 tok/s (upstream splash: 334.3;
+residual is kernel efficiency, not geometry).
 
 ## Reproducer
 

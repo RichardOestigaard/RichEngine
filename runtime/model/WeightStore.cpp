@@ -142,6 +142,20 @@ ops::Projection readAffineProjection(WeightFile &file, uint32_t outputSize, uint
     return {outputSize, inputSize, ops::AffineWeights{planes[0], planes[1], planes[2]}};
 }
 
+// The same three affine planes as an AF4P segment: plane0 the 64-group
+// codes, plane1 the biases, meta the scales (the staged tile's af4p format
+// reads its own order — kernels/common/quant_formats.h FmtAF4P).
+ops::Projection readAf4pProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                                   std::string_view label) {
+    validateQ4Layout(outputSize, inputSize);
+    const uint64_t elements = q4Elements(outputSize, inputSize);
+    const std::vector<metal::MetalBuffer> planes =
+        file.split({elements / 2, elements / 32, elements / 32}, label);
+    ops::QuantizedSegment segment =
+        ops::QuantizedSegment::planes(GGUF_FMT_AF4P, outputSize, inputSize, planes[0], planes[2], planes[1]);
+    return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
+}
+
 ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,
                                              uint32_t outputSize,
                                              uint32_t inputSize,

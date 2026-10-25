@@ -8,7 +8,7 @@
 // shared reduce the other tiers use.
 #if defined(__HAVE_METAL_FP8_E4M3_FORMAT_TYPE__)
 
-#define PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim)                    \
+#define PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim, VRows)             \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
@@ -20,7 +20,7 @@
       constant RichVerifyAttentionParams *params [[buffer(7)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr uint M = Group * RICHENGINE_TARGET_VERIFY_ROWS;                      \
+    constexpr uint M = Group * VRows;                      \
     constexpr uint MP = M / 2;                                                 \
     constexpr uint N = RichKvPageTokens;                                     \
     alignas(16) threadgroup float scores[MP * N];                              \
@@ -44,7 +44,7 @@
         batch == 0 ? page_table0                                               \
                    : (batch == 1 ? page_table1                                 \
                                  : (batch == 2 ? page_table2 : page_table3));  \
-    richengine_paged_attention_tile_fp8<Heads, Group, RICHENGINE_TARGET_VERIFY_ROWS,   \
+    richengine_paged_attention_tile_fp8<Heads, Group, VRows,   \
                                     HeadDim>(                                  \
         queries + (ulong(batch) * Heads + kv_head) * group_stride,             \
         page_table, lane_params.kv, kv_head, lane_params.committed_tokens,     \
@@ -55,13 +55,18 @@
         staged_queries, thread_index, lane_params.score_scale);                                         \
   }
 
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split, 4, 6, 256)
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split_kv4_g4, 4, 4, 256)
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split_kv2_g8, 2, 8, 256)
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split_hd128, 2, 8, 128)
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split_hd64, 8, 4, 64)
+#define PAGED_VERIFY_FP8_SPLIT_BOTH(Name, Name8, Heads, Group, HeadDim)           \
+  PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim,                      \
+                         RICHENGINE_TARGET_VERIFY_ROWS)                    \
+  PAGED_VERIFY_FP8_SPLIT(Name8, Heads, Group, HeadDim, 8)
+
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split, verify_attention_fp8_split_m8, 4, 6, 256)
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_kv4_g4, verify_attention_fp8_split_kv4_g4_m8, 4, 4, 256)
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_kv2_g8, verify_attention_fp8_split_kv2_g8_m8, 2, 8, 256)
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_hd128, verify_attention_fp8_split_hd128_m8, 2, 8, 128)
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_hd64, verify_attention_fp8_split_hd64_m8, 8, 4, 64)
 // Granite 3B's group-5 tile is not a valid fp8 matmul shape (M=20).
-PAGED_VERIFY_FP8_SPLIT(verify_attention_fp8_split_k8q4d128, 8, 4, 128)
+PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_k8q4d128, verify_attention_fp8_split_k8q4d128_m8, 8, 4, 128)
 #undef PAGED_VERIFY_FP8_SPLIT
 
 #endif // __HAVE_METAL_FP8_E4M3_FORMAT_TYPE__

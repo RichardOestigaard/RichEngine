@@ -16,9 +16,9 @@ namespace {
 using richengine::test::require;
 
 engine::RequestSpec
-request(uint64_t id, uint32_t prompt, bool constrained = false,
+request(uint64_t id, uint32_t prompt,
         RequestPriority priority = RequestPriority::Normal) {
-  return {id, priority, constrained, prompt, 10'000.0};
+  return {id, priority, prompt, 10'000.0};
 }
 
 void completePrefill(engine::Scheduler &scheduler,
@@ -103,7 +103,7 @@ void testAdmissionRespectsContendedBudgetAndDecodePriority() {
   require(scheduler.prefillAdmissionOrder(candidates) ==
               std::vector<uint64_t>({1, 2}),
           "admission ignored the contended actual-row budget");
-  scheduler.submit(request(5, 1, false, RequestPriority::Foreground));
+  scheduler.submit(request(5, 1, RequestPriority::Foreground));
   scheduler.resourcesReady(5, 1);
   require(scheduler.prefillAdmissionOrder(candidates).empty(),
           "lower-priority prefill reserved lanes ahead of runnable foreground decode");
@@ -117,14 +117,14 @@ void testAdmissionRespectsContendedBudgetAndDecodePriority() {
 void testHighestRunnablePriority() {
   Scheduler scheduler(0.0);
   require(!scheduler.highestRunnablePriority(), "an idle scheduler had a runnable tier");
-  scheduler.submit(request(1, 1, true, RequestPriority::Foreground));
+  scheduler.submit(request(1, 1, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
   awaitFirstMask(scheduler, 1);
-  scheduler.submit(request(2, 1, false, RequestPriority::Background));
+  scheduler.submit(request(2, 1, RequestPriority::Background));
   scheduler.resourcesReady(2, 1);
   scheduler.submit(request(3, 100));
   scheduler.resourcesReady(3, 0);
-  scheduler.submit(request(4, 100, false, RequestPriority::Foreground));
+  scheduler.submit(request(4, 100, RequestPriority::Foreground));
   require(scheduler.phase(1) == Phase::WaitingMask &&
               scheduler.highestRunnablePriority() == RequestPriority::Normal,
           "a mask wait or a queued request set the runnable tier");
@@ -423,7 +423,7 @@ void testUnconstrainedLanesShareDecode() {
     scheduler.resourcesReady(id, 1);
   }
   const BatchPlan plan = *scheduler.next({});
-  require(plan.width() == 4 && !plan.constrained,
+  require(plan.width() == 4,
           "unconstrained requests did not share one decode command");
 }
 
@@ -448,25 +448,32 @@ void testRejectedCommitCountsNothing() {
           "the remaining request's decode was not counted");
 }
 
-void testConstrainedDecodeRemainsSeparate() {
+// Once its first token is selected, a lane that waited for its first mask
+// decodes in the commands of the lanes that never did: two of each share one.
+void testMaskedLanesShareDecode() {
   Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, true));
-  scheduler.resourcesReady(1, 0);
-  awaitFirstMask(scheduler, 1);
+  for (uint64_t id : {1, 2}) {
+    scheduler.submit(request(id, 1));
+    scheduler.resourcesReady(id, 0);
+  }
+  const BatchPlan prompts = *scheduler.next({});
+  scheduler.commit(prompts, {});
+  const std::array promptResults{
+      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+      StepResult{2, 1, false, DecodeStage::ApplyInitialMask},
+  };
+  scheduler.complete(prompts, promptResults, 0.0, true);
   scheduler.maskReady(1);
+  scheduler.maskReady(2);
   completeDecode(scheduler);
-  scheduler.submit(request(2, 1));
-  scheduler.submit(request(3, 1));
-  scheduler.resourcesReady(2, 1);
-  scheduler.resourcesReady(3, 1);
-  const BatchPlan unconstrained = *scheduler.next({});
-  require(unconstrained.width() == 2 && !unconstrained.constrained,
-          "unconstrained decode included a constrained lane");
-  completeDecode(scheduler);
-  const BatchPlan constrained = *scheduler.next({});
-  require(constrained.width() == 1 && constrained.items[0].requestId == 1 &&
-              constrained.constrained,
-          "constrained decode lost its independent mask pipeline");
+  for (uint64_t id : {3, 4}) {
+    scheduler.submit(request(id, 1));
+    scheduler.resourcesReady(id, 1);
+  }
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Decode && plan.width() == 4 &&
+              plan.decodeStage == DecodeStage::Regular,
+          "lanes that waited for their first masks decoded apart from the others");
 }
 
 void testPrefillAndDecodeAlternateWithoutStarvation() {
@@ -528,7 +535,7 @@ void testDecodeRepaysItsShareOfContendedPrefill() {
 // the kinds alternate without banked debt.
 void testMaskWaitAccruesNoDecodeDebt() {
   engine::Scheduler scheduler(0.5);
-  scheduler.submit(request(1, 1, true));
+  scheduler.submit(request(1, 1));
   scheduler.resourcesReady(1, 0);
   awaitFirstMask(scheduler, 1);
   scheduler.submit(request(2, 20'000));
@@ -607,7 +614,7 @@ void testDecodeDebtLeavesWithTheLastDecoder() {
 void testHigherPriorityPrefillPrecedesDecodeDebt() {
   engine::Scheduler scheduler(0.5);
   runContendedPrefill(scheduler);
-  scheduler.submit(request(3, 20'000, false, RequestPriority::Foreground));
+  scheduler.submit(request(3, 20'000, RequestPriority::Foreground));
   scheduler.resourcesReady(3, 0);
   const BatchPlan plan = *scheduler.next({});
   require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 3,
@@ -674,17 +681,17 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
 
 void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 20'000, false, RequestPriority::Foreground));
+  scheduler.submit(request(1, 20'000, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
-  scheduler.submit(request(2, 1, false, RequestPriority::Background));
+  scheduler.submit(request(2, 1, RequestPriority::Background));
   scheduler.resourcesReady(2, 1);
   require(scheduler.next({})->items[0].tokenCount == 2048,
           "lower-priority work reduced foreground throughput");
 
-  scheduler.submit(request(3, 20'000, false, RequestPriority::Foreground));
+  scheduler.submit(request(3, 20'000, RequestPriority::Foreground));
   scheduler.resourcesReady(3, 0);
-  scheduler.submit(request(4, 1, false, RequestPriority::Foreground));
+  scheduler.submit(request(4, 1, RequestPriority::Foreground));
   scheduler.resourcesReady(4, 1);
   completeDecode(scheduler);
   scheduler.setPrefillBoundary(1, 2080);
@@ -765,7 +772,7 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
     completePrefill(scheduler, *scheduler.next({}), 4096.0);
-    scheduler.submit(request(2, 31, false, priority));
+    scheduler.submit(request(2, 31, priority));
     scheduler.resourcesReady(2, 0);
     const BatchPlan plan = *scheduler.next({});
     if (priority == RequestPriority::Background) {
@@ -855,8 +862,8 @@ void testMeasuredBudgetRetainsOvertakingBound() {
 
 void testPriorityPrecedesWorkKindAlternation() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, false, RequestPriority::Background));
-  scheduler.submit(request(2, 100, false, RequestPriority::Foreground));
+  scheduler.submit(request(1, 1, RequestPriority::Background));
+  scheduler.submit(request(2, 100, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 1);
   scheduler.resourcesReady(2, 0);
 
@@ -868,8 +875,8 @@ void testPriorityPrecedesWorkKindAlternation() {
 
 void testPrefillCommandContainsOnePriorityTier() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 4096, false, RequestPriority::Foreground));
-  scheduler.submit(request(2, 4096, false, RequestPriority::Background));
+  scheduler.submit(request(1, 4096, RequestPriority::Foreground));
+  scheduler.submit(request(2, 4096, RequestPriority::Background));
   scheduler.resourcesReady(1, 0);
   scheduler.resourcesReady(2, 0);
 
@@ -883,8 +890,8 @@ void testPrefillCommandContainsOnePriorityTier() {
 
 void testDecodeCommandContainsOnePriorityTier() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, false, RequestPriority::Foreground));
-  scheduler.submit(request(2, 1, false, RequestPriority::Background));
+  scheduler.submit(request(1, 1, RequestPriority::Foreground));
+  scheduler.submit(request(2, 1, RequestPriority::Background));
   scheduler.resourcesReady(1, 1);
   scheduler.resourcesReady(2, 1);
 
@@ -911,8 +918,7 @@ void testDecodeLanesRotate() {
   }
 
   BatchPlan first = *scheduler.next({});
-  require(first.kind == WorkKind::Decode && first.width() == 4 &&
-              !first.constrained,
+  require(first.kind == WorkKind::Decode && first.width() == 4,
           "the first unconstrained decode did not use the real B4 graph");
   scheduler.commit(first, {});
   std::vector<StepResult> firstResults;
@@ -930,8 +936,8 @@ void testDecodeLanesRotate() {
 
 void testMaskStagesNeverMix() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, true));
-  scheduler.submit(request(2, 1, true));
+  scheduler.submit(request(1, 1));
+  scheduler.submit(request(2, 1));
   scheduler.resourcesReady(1, 0);
   scheduler.resourcesReady(2, 0);
 
@@ -982,7 +988,7 @@ void testMaskStagesNeverMix() {
 void testInitialSelectionsBatch() {
   engine::Scheduler scheduler(0.0);
   for (uint64_t id : {1, 2}) {
-    scheduler.submit(request(id, 1, true));
+    scheduler.submit(request(id, 1));
     scheduler.resourcesReady(id, 0);
   }
   const BatchPlan prompts = *scheduler.next({});
@@ -996,14 +1002,13 @@ void testInitialSelectionsBatch() {
   scheduler.maskReady(2);
   const BatchPlan selection = *scheduler.next({});
   require(selection.kind == WorkKind::Decode && selection.width() == 2 &&
-              selection.decodeStage == DecodeStage::ApplyInitialMask &&
-              selection.constrained,
+              selection.decodeStage == DecodeStage::ApplyInitialMask,
           "first-token selections of one priority did not share a plan");
 }
 
 void testWaitingMaskExpiresAtRequestDeadline() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(1, 1, true));
+  scheduler.submit(request(1, 1));
   scheduler.resourcesReady(1, 0);
   awaitFirstMask(scheduler, 1);
   require(scheduler.expireDeadlines(10'000.0) &&
@@ -1025,7 +1030,7 @@ void testWaitingMaskBoundsPeerPrefill() {
                                          RequestPriority::Background}) {
     Scheduler scheduler(0.0);
     scheduler.observePrefill(2048, 4096.0);
-    scheduler.submit(request(1, 1, true, priority));
+    scheduler.submit(request(1, 1, priority));
     scheduler.resourcesReady(1, 0);
     awaitFirstMask(scheduler, 1);
 
@@ -1090,7 +1095,7 @@ void testResourceSuspensionReplaysFromCache() {
 // replay's prefill reports no mask wait.
 void testReplayKeepsHeldInitialMask() {
   engine::Scheduler scheduler(0.0);
-  scheduler.submit(request(2, 1, true));
+  scheduler.submit(request(2, 1));
   scheduler.resourcesReady(2, 0);
   awaitFirstMask(scheduler, 2);
   scheduler.maskReady(2);
@@ -1131,7 +1136,7 @@ int main() {
     testRealDecodeWidths();
     testUnconstrainedLanesShareDecode();
     testRejectedCommitCountsNothing();
-    testConstrainedDecodeRemainsSeparate();
+    testMaskedLanesShareDecode();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testDecodeRepaysItsShareOfContendedPrefill();
     testMaskWaitAccruesNoDecodeDebt();

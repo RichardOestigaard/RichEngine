@@ -356,7 +356,19 @@ def tokenizer_files(metadata):
             raise ModelError("invalid GGUF special token: " + key)
         return tokens[index]
 
-    template = metadata.require("tokenizer.chat_template", str)
+    # A GGUF that states only named templates (d1-omni ships the systemone
+    # decision template, no default) derives it under its own name — a
+    # decision model has no chat template to ship under chat_template's.
+    template = metadata.values.get("tokenizer.chat_template")
+    names = metadata.values.get("tokenizer.chat_templates")
+    template_file = "chat_template.jinja"
+    if template is None and isinstance(names, list) and names:
+        template = metadata.values.get(
+            "tokenizer.chat_template." + str(names[0])
+        )
+        template_file = str(names[0]) + "_template.jinja"
+    if type(template) is not str:
+        raise ModelError("missing or invalid GGUF metadata: tokenizer.chat_template")
     if not template.strip():
         raise ModelError("GGUF chat template is empty")
     config = {
@@ -383,7 +395,7 @@ def tokenizer_files(metadata):
     return {
         layout.TOKENIZER + "/tokenizer.json": backend.to_str().encode(),
         layout.TOKENIZER + "/tokenizer_config.json": models.json_bytes(config),
-        layout.TOKENIZER + "/chat_template.jinja": template.encode(),
+        layout.TOKENIZER + "/" + template_file: template.encode(),
     }
 
 
@@ -458,6 +470,13 @@ def _lfm2_fields(arch, text, metadata):
         text["layer_types"] = [
             "conv" if count == 0 else "full_attention" for count in kv
         ]
+        # Attention layers whose counts differ state each layer's own.
+        if len({count for count in kv if count}) > 1:
+            text["layer_kv_heads"] = kv
+    # The d1-omni decision model is encoder-only: bidirectional attention,
+    # no causal decode.
+    if metadata.values.get(arch + ".decision.type") == "lfm2-d1-omni":
+        text["encoder"] = True
     text["conv_dim"] = text["hidden_size"]
     text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
 
@@ -619,8 +638,8 @@ def model_config(metadata, vision=None):
             # Only the architectures whose layers differ in kind state
             # head_count_kv per layer: lfm2's conv layers state 0, gemma4's
             # two attention kinds state their own count (separated in its
-            # fields handler). Any other array, and any lfm2 attention
-            # layers that disagree, is a geometry the runtime does not serve.
+            # fields handler). Any other array is a geometry the runtime
+            # does not serve.
             if (
                 key != "attention.head_count_kv"
                 or not entry.kv_per_layer
@@ -631,14 +650,15 @@ def model_config(metadata, vision=None):
             if entry.kv_max:
                 value = max(value)
             else:
-                counts = {item for item in value if item}
-                if len(counts) != 1:
+                counts = collections.Counter(item for item in value if item)
+                if not counts:
                     raise ModelError(
-                        "unsupported GGUF metadata: "
-                        + arch
-                        + ".attention.head_count_kv differs between attention layers"
+                        "invalid GGUF metadata array: " + arch + "." + key
                     )
-                value = counts.pop()
+                # Attention layers may disagree on their count — d1-omni's
+                # last layers widen. The arch's fields handler emits the
+                # per-layer list; the flat count states its mode.
+                value = counts.most_common(1)[0][0]
         elif value is None and name == "head_dim" and entry.head_dim_derived:
             # lfm2 and granite state no key_length; their head width divides
             # the hidden size evenly across the attention heads.
@@ -663,7 +683,23 @@ def model_config(metadata, vision=None):
     if isinstance(decision_type, str):
         text["decision_type"] = decision_type
     if entry.feed_forward:
-        text["intermediate_size"] = metadata.positive(arch + ".feed_forward_length")
+        width = metadata.values.get(arch + ".feed_forward_length")
+        if isinstance(width, list):
+            # A per-layer list — d1-omni narrows its last layers. The flat
+            # intermediate_size states the mode, the per-layer list the
+            # actual widths.
+            if not width or not all(type(w) is int and w > 0 for w in width):
+                raise ModelError(
+                    "invalid GGUF metadata array: " + arch + ".feed_forward_length"
+                )
+            if len(set(width)) != 1:
+                text["layer_intermediate_sizes"] = width
+            width = collections.Counter(width).most_common(1)[0][0]
+        if type(width) is not int or width <= 0:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + ".feed_forward_length"
+            )
+        text["intermediate_size"] = width
     if entry.fields is not None:
         entry.fields(arch, text, metadata)
     for name in ("eos", "bos", "padding"):
@@ -877,6 +913,32 @@ LFM2_MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
     "token_embd_norm.weight": F32,
 }
+# The d1-omni decision blocks (the trailing lfm2.decision.block_count
+# layers): LayerNorms with bias, a fused biased QKV and an ungated biased
+# FFN — a different tensor set than the causal blocks state.
+LFM2_DECISION_TENSORS = {
+    "attn_norm.bias": F32,
+    "attn_qkv.weight": QUANTIZED_TYPES,
+    "attn_qkv.bias": F32,
+    "attn_output.weight": QUANTIZED_TYPES,
+    "attn_output.bias": F32,
+    "ffn_norm.bias": F32,
+    "ffn_up.weight": QUANTIZED_TYPES,
+    "ffn_up.bias": F32,
+    "ffn_down.weight": QUANTIZED_TYPES,
+    "ffn_down.bias": F32,
+}
+# d1-omni's model-level extras: token-type embeddings and the cls pooling
+# head the decision readout runs.
+LFM2_OMNI_MODEL_TENSORS = {
+    "token_types.weight": F32,
+    "cls.weight": QUANTIZED_TYPES | F32,
+    "cls.bias": F32,
+    "cls.norm.weight": F32,
+    "cls.norm.bias": F32,
+    "cls.output.weight": F32,
+    "cls.output.bias": F32,
+}
 # The lfm2moe MoE blocks: sigmoid router with an expert bias, no shared
 # experts, dense FFNs only on the leading dense layers.
 LFM2MOE_TENSORS = {
@@ -977,15 +1039,31 @@ def _lfm2_tensors(metadata, layers):
             "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
         )
     tensors = dict(LFM2_MODEL_TENSORS)
+    # d1-omni's trailing blocks are bespoke decision layers, and the model
+    # carries its token-type table and cls head beside the embeddings.
+    decision_blocks = 0
+    if metadata.values.get(arch + ".decision.type") == "lfm2-d1-omni":
+        decision_blocks = metadata.positive(arch + ".decision.block_count")
+        if decision_blocks > layers:
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".decision.block_count"
+            )
+        tensors.update(LFM2_OMNI_MODEL_TENSORS)
     dense_layers = (
         metadata.positive(arch + ".leading_dense_block_count")
         if arch == "lfm2moe"
         else layers
     )
     for layer in range(layers):
-        mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
-        ffn = DENSE_TENSORS if layer < dense_layers else LFM2MOE_TENSORS
-        for name, types in (LLAMA_LAYER_TENSORS | mixer | ffn).items():
+        if layer >= layers - decision_blocks:
+            expected = LLAMA_LAYER_TENSORS | LFM2_DECISION_TENSORS
+        else:
+            mixer = (
+                LFM2_CONV_TENSORS if kv[layer] == 0 else LFM2_ATTENTION_TENSORS
+            )
+            ffn = DENSE_TENSORS if layer < dense_layers else LFM2MOE_TENSORS
+            expected = LLAMA_LAYER_TENSORS | mixer | ffn
+        for name, types in expected.items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
 

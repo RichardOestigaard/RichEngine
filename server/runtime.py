@@ -176,7 +176,9 @@ class RuntimeCall:
         # The counts native events are checked against, not the request:
         # its pixels must not outlive the written frame.
         frame = request.frame
-        self._prompt_tokens = len(frame.prompt_tokens)
+        self._prompt_tokens = len(frame.prefix_tokens) + len(
+            frame.prompt_tokens
+        )
         self._logical_max = frame.logical_max_output_tokens
         self._score_tokens = len(frame.score_tokens)
         self._return_progress = frame.return_progress
@@ -661,6 +663,74 @@ class MultiplexedRuntime:
                     self._admission_slots.release()
             else:
                 self._admission_slots.release()
+            raise
+
+    def submit_batch(
+        self,
+        requests: list[GenerationRequest],
+        on_events: list,
+        on_completes: list,
+    ) -> list:
+        """Admit a batch of score-only requests as one wire frame: every
+        request's prompt is the shared prefix plus its own suffix, so the
+        prefix crosses the socket once. Returns one RuntimeCall per request,
+        in order. All requests share the first request's deadline and
+        priority and must carry identical prompt prefixes."""
+        deadline = requests[0].deadline
+        absolute, remaining = _wire_deadline(_remaining(deadline))
+        prefix = requests[0].frame.prefix_tokens
+        calls: list[RuntimeCall] = []
+        acquired = 0
+        try:
+            for _ in requests:
+                if not self._admission_slots.acquire(blocking=False):
+                    raise PendingLimitExceeded(
+                        f"pending request limit {self._pending_limit} is full"
+                    )
+                acquired += 1
+            ids = [next(self._request_ids) for _ in requests]
+            frame = wire.ScoreBatchFrame(
+                priority=requests[0].frame.priority,
+                absolute_deadline_unix_micros=absolute,
+                remaining_deadline_micros=remaining,
+                prefix_tokens=prefix,
+                items=tuple(
+                    wire.ScoreBatchItem(
+                        request_id=request_id,
+                        suffix_tokens=request.frame.prompt_tokens,
+                        score_tokens=tuple(request.frame.score_tokens),
+                    )
+                    for request_id, request in zip(ids, requests)
+                ),
+            )
+            try:
+                encoded = wire.serialize_message(frame)
+            except wire.ProtocolError as error:
+                raise self._request_protocol_error(ids[0], error.issue) from error
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeClosed("runtime is closed")
+                if not self.ready:
+                    raise EngineUnhealthy("native process is not ready")
+                generation = self._generation
+                for request_id, request, on_event, on_complete in zip(
+                    ids, requests, on_events, on_completes
+                ):
+                    call = RuntimeCall(
+                        self, request_id, generation, request, on_event, on_complete
+                    )
+                    self._pending[request_id] = call
+                    calls.append(call)
+                self._arm_liveness_probe_locked(generation)
+            self._write_bytes(encoded, generation, call=calls[0], deadline=deadline)
+            return calls
+        except BaseException:
+            with self._state_lock:
+                for call in calls:
+                    self._pending.pop(call.request_id, None)
+            while acquired:
+                self._admission_slots.release()
+                acquired -= 1
             raise
 
     def status(

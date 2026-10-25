@@ -81,28 +81,42 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
           "prefill slot orientation cases omitted unequal axes, partial tiles or splits");
 }
 
-// The production GQA geometries as (query heads, KV heads) pairs. kv4 carries
-// two group sizes, each its own kernel family.
-constexpr std::array<std::array<uint32_t, 2>, 3> kGeometries{
-    {{24, 4}, {16, 4}, {16, 2}}};
+// The production GQA geometries as (query heads, KV heads, head dimension)
+// triples. kv4 carries two group sizes, each its own kernel family; the
+// d64/d128 cores cover the LFM2, Granite and dense layouts.
+constexpr std::array<std::array<uint32_t, 3>, 7> kGeometries{
+    {{24, 4, 256}, {16, 4, 256}, {16, 2, 256}, {16, 2, 128},
+     {32, 8, 64}, {40, 8, 64}, {32, 8, 128}}};
 
 // The declared attention core each fixture geometry binds (the family
 // makers declare these; the fixtures mirror them).
 [[nodiscard]] constexpr kv::Core coreFor(uint32_t queryHeads,
-                                         uint32_t kvHeads) noexcept {
+                                         uint32_t kvHeads,
+                                         uint32_t headDim) noexcept {
+  if (headDim == 128) {
+    if (kvHeads == 2) return kv::Core::Kv2Group8D128;
+    return queryHeads == 32 ? kv::Core::Kv8Group4D128 : kv::Core::Unspecified;
+  }
+  if (headDim == 64)
+    return queryHeads == 32 ? kv::Core::Kv8Group4D64 : kv::Core::Kv8Group5D64;
   if (kvHeads == 4)
     return queryHeads == 24 ? kv::Core::Kv4Group6 : kv::Core::Kv4Group4;
   return kv::Core::Kv2Group8;
 }
 
 [[nodiscard]] kv::Layout testLayout(uint32_t queryHeads, uint32_t kvHeads,
+                                    uint32_t headDim,
                                     kv::Format format) noexcept {
-  kv::Layout layout{1, kvHeads, 256, format};
-  layout.attentionCore = coreFor(queryHeads, kvHeads);
+  kv::Layout layout{1, kvHeads, headDim, format};
+  layout.attentionCore = coreFor(queryHeads, kvHeads, headDim);
   return layout;
 }
 
 std::string geometrySuffix(uint32_t queryHeads, kv::Layout layout) {
+  if (layout.headDimension == 128)
+    return layout.kvHeads == 2 ? "_hd128" : "_k8q4d128";
+  if (layout.headDimension == 64)
+    return queryHeads == 32 ? "_hd64" : "_k8q5d64";
   return layout.kvHeads == 2    ? "_kv2_g8"
          : queryHeads == 16     ? "_kv4_g4"
                                 : "";
@@ -132,7 +146,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 plan.reduceGroups.z == tiles,
             "prefill split/reduce geometry disagrees");
     const uint64_t fused = uint64_t{tiles} * splits * 8 * queryHeads;
-    require(plan.workspace.partialsBytes == fused * 256 * 2 &&
+    require(plan.workspace.partialsBytes == fused * layout.headDimension * 2 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4,
             "prefill split dispatch and exact scratch disagree");
     const auto bound = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
@@ -140,16 +154,26 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 bound.statisticsBytes >= plan.workspace.statisticsBytes,
             "prefill arena omitted a valid shorter plan");
   }
-  // The plain-suffix kv4/g6 chain verify dispatches its two row passes as
-  // one split each: the _r2 pair-of-groups variant is disabled — it
-  // corrupted verify attention on the Qwen3.8-27B path (acceptance ~4%
-  // vs ~18-20%); PagedAttention.cpp's kill switch keeps it unreachable.
+  // At a wide chain stride the verify splits fused-row passes across
+  // threadgroups: _r2 pairs for the kv4 layouts (M=64/96 halve to ~8-13 KB
+  // scratch, three resident groups), the four-way _r4 for kv2/g8 whose
+  // M=128 tile still caps residency halved. An eight-row chain is the
+  // narrow _m8 tile.
+  const bool narrow = kv::kVerifyRows == 8;
+  const uint32_t splitPasses =
+      narrow ? 0
+      : (layout.attentionCore == kv::Core::Kv2Group8 ||
+         layout.attentionCore == kv::Core::Kv2Group8D128)
+          ? 4
+          : 2;
   const std::string verifySplit = std::string(
       layout.format == kv::Format::Int8      ? ops::kVerifyAttentionQ8Split
       : layout.format == kv::Format::Int4    ? ops::kVerifyAttentionInt4Split
                                              : ops::kVerifyAttentionBf16Split) +
-      geometrySuffix;
-  const std::string verifyReduce = std::string(ops::kVerifyAttentionReduce) + geometrySuffix;
+      geometrySuffix +
+      (narrow ? "_m8" : "_r" + std::to_string(splitPasses));
+  const std::string verifyReduce = std::string(ops::kVerifyAttentionReduce) +
+                                   geometrySuffix + (narrow ? "_m8" : "");
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
     const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
@@ -167,8 +191,9 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     const uint64_t fused =
         uint64_t{lanes} * kv::kVerifyRows * kv::kVerifyMaximumSplits * queryHeads;
     require(plan.splits == maximum &&
-                plan.workspace.partialsBytes == fused * 256 * 2 &&
+                plan.workspace.partialsBytes == fused * layout.headDimension * 2 &&
                 plan.workspace.statisticsBytes == fused * 2 * 4 &&
+                plan.splitGroups.x == layout.kvHeads * (splitPasses ? splitPasses : 1) &&
                 plan.splitGroups.y == plan.splits &&
                 plan.splitGroups.z == lanes &&
                 plan.reduceGroups.y == kv::kVerifyRows * queryHeads / layout.kvHeads &&
@@ -223,7 +248,7 @@ struct Case final {
     return (((uint64_t{lane} * layout.kvHeads + head / group) * stride + row) *
                 group +
             head % group) *
-               256 +
+               layout.headDimension +
            dimension;
   }
 
@@ -253,7 +278,9 @@ struct Case final {
   float keyCode(uint32_t lane, uint32_t head, uint32_t token,
                 uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = richengine_kv_key_element(head, token % 32, dimension);
+    const uint64_t index =
+        richengine_kv_key_element_dim(head, token % 32, dimension,
+                                      layout.headDimension);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_KEYS, id)[index]);
     if (layout.format == kv::Format::Int4)
@@ -266,12 +293,16 @@ struct Case final {
   float valueCode(uint32_t lane, uint32_t head, uint32_t token,
                   uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = richengine_kv_value_element(head, token % 32, dimension);
+    const uint64_t index =
+        richengine_kv_value_element_dim(head, token % 32, dimension,
+                                        layout.headDimension);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_VALUES, id)[index]);
     if (layout.format == kv::Format::Int4) {
       const uint64_t byte =
-          richengine_kv_key_element(head, token % 32, dimension) / 2;
+          richengine_kv_key_element_dim(head, token % 32, dimension,
+                                        layout.headDimension) /
+          2;
       return packed4Code(
           pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[byte], dimension & 1);
     }
@@ -281,7 +312,9 @@ struct Case final {
   float key(uint32_t lane, uint32_t head, uint32_t token,
              uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = richengine_kv_key_element(head, token % 32, dimension);
+    const uint64_t index =
+        richengine_kv_key_element_dim(head, token % 32, dimension,
+                                      layout.headDimension);
     const uint64_t scale = richengine_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_KEYS, id)[index]);
@@ -296,7 +329,9 @@ struct Case final {
   float value(uint32_t lane, uint32_t head, uint32_t token,
                uint32_t dimension) const {
     const uint32_t id = page(lane, token);
-    const uint64_t index = richengine_kv_value_element(head, token % 32, dimension);
+    const uint64_t index =
+        richengine_kv_value_element_dim(head, token % 32, dimension,
+                                        layout.headDimension);
     const uint64_t scale = richengine_kv_scale_element(head, token % 32);
     if (layout.format == kv::Format::BFloat16)
       return bf16ToFloat(pool.slab<uint16_t>(kLayer, RICHENGINE_KV_VALUES, id)[index]);
@@ -304,7 +339,9 @@ struct Case final {
       // Values pack dim pairs at one token, token-major like the keys:
       // byte [head][token][dim/2].
       const uint64_t byte =
-          richengine_kv_key_element(head, token % 32, dimension) / 2;
+          richengine_kv_key_element_dim(head, token % 32, dimension,
+                                        layout.headDimension) /
+          2;
       return packed4Code(pool.slab<uint8_t>(kLayer, RICHENGINE_KV_VALUES, id)[byte],
                          dimension & 1) *
              pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[scale];
@@ -349,9 +386,11 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                                             spread.extents),
             {}, {}, {}, {}, {}, {}, {}};
   data.layer = data.pool.layer(kLayer);
-  data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride * 256 * 2);
+  data.keys = allocate(backend, uint64_t{lanes} * layout.kvHeads * data.stride *
+                                    layout.headDimension * 2);
   data.values = allocate(backend, data.keys.sizeBytes());
-  data.queries = allocate(backend, uint64_t{lanes} * queryHeads * data.stride * 256 * 2);
+  data.queries = allocate(backend, uint64_t{lanes} * queryHeads * data.stride *
+                                      layout.headDimension * 2);
   uint32_t firstPage = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     data.pages[lane].assign(ids.begin() + firstPage,
@@ -377,7 +416,8 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
           data.pool.slab<float>(kLayer, RICHENGINE_KV_KEY_SCALES, id)[slot] = 0.006f;
           data.pool.slab<float>(kLayer, RICHENGINE_KV_VALUE_SCALES, id)[slot] = 0.007f;
         }
-        for (uint32_t dimension = 0; dimension < 256; dimension += 2) {
+        for (uint32_t dimension = 0; dimension < layout.headDimension;
+             dimension += 2) {
           const auto keyCode = [&](uint32_t d) {
             return layout.format == kv::Format::Int4
                        ? int((token * 37 + head * 101 + d * 17 + token * d * 3 +
@@ -394,9 +434,13 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
           };
           if (layout.format == kv::Format::Int4) {
             const uint64_t keyByte =
-                richengine_kv_key_element(head, token % 32, dimension) / 2;
+                richengine_kv_key_element_dim(head, token % 32, dimension,
+                                              layout.headDimension) /
+                2;
             const uint64_t valueByte =
-                richengine_kv_key_element(head, token % 32, dimension) / 2;
+                richengine_kv_key_element_dim(head, token % 32, dimension,
+                                              layout.headDimension) /
+                2;
             data.pool.slab<uint8_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyByte] =
                 uint8_t((keyCode(dimension) & 0xF) |
                         (keyCode(dimension + 1) & 0xF) << 4);
@@ -408,8 +452,12 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
           for (const uint32_t d : {dimension, dimension + 1}) {
             const int key = keyCode(d);
             const int value = valueCode(d);
-            const uint64_t keyIndex = richengine_kv_key_element(head, token % 32, d);
-            const uint64_t valueIndex = richengine_kv_value_element(head, token % 32, d);
+            const uint64_t keyIndex =
+                richengine_kv_key_element_dim(head, token % 32, d,
+                                              layout.headDimension);
+            const uint64_t valueIndex =
+                richengine_kv_value_element_dim(head, token % 32, d,
+                                                layout.headDimension);
             if (layout.format == kv::Format::Int8) {
               data.pool.slab<int8_t>(kLayer, RICHENGINE_KV_KEYS, id)[keyIndex] = key;
               data.pool.slab<int8_t>(kLayer, RICHENGINE_KV_VALUES, id)[valueIndex] = value;
@@ -425,16 +473,20 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
     }
     for (uint32_t row = 0; row < rows; ++row) {
       for (uint32_t head = 0; head < layout.kvHeads; ++head) {
-        const uint64_t base = (uint64_t{lane} * layout.kvHeads + head) * data.stride * 256;
-        for (uint32_t dimension = 0; dimension < 256; ++dimension) {
-          static_cast<uint16_t *>(data.keys.contents())[base + row * 256 + dimension] =
+        const uint64_t base = (uint64_t{lane} * layout.kvHeads + head) *
+                              data.stride * layout.headDimension;
+        for (uint32_t dimension = 0; dimension < layout.headDimension;
+             ++dimension) {
+          static_cast<uint16_t *>(data.keys.contents())
+              [base + row * layout.headDimension + dimension] =
               floatToBf16(float(int((row * 37 + head * 101 + dimension * 17) % 255) - 127) * 0.006f);
           static_cast<uint16_t *>(data.values.contents())[base + dimension * data.stride + row] =
               floatToBf16(float(int((row * 53 + head * 79 + dimension * 29) % 255) - 127) * 0.007f);
         }
       }
       for (uint32_t head = 0; head < queryHeads; ++head)
-        for (uint32_t dimension = 0; dimension < 256; ++dimension)
+        for (uint32_t dimension = 0; dimension < layout.headDimension;
+             ++dimension)
           static_cast<uint16_t *>(data.queries.contents())[
               data.queryIndex(lane, head, row, dimension)] =
               floatToBf16(float(int((row * 43 + head * 67 + dimension * 11 +
@@ -466,15 +518,21 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
       for (uint32_t head : {0U, data.queryHeads - 1}) {
         const uint32_t kvHead = head / (data.queryHeads / data.layout.kvHeads);
         const uint32_t tokens = data.stores[lane].committed_tokens + row + 1;
+        // The kernels' default qk scale when the layout carries none.
+        const float scoreScale =
+            data.layout.headDimension == 64    ? 0.125f
+            : data.layout.headDimension == 128 ? 0.08838834764831845f
+                                               : 0.0625f;
         std::vector<float> scores(tokens);
         float maximum = -std::numeric_limits<float>::infinity();
         for (uint32_t token = 0; token < tokens; ++token) {
           float score = 0;
-          for (uint32_t dimension = 0; dimension < 256; ++dimension)
+          for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+               ++dimension)
             score += bf16ToFloat(static_cast<const uint16_t *>(data.queries.contents())[
                               data.queryIndex(lane, head, row, dimension)]) *
                      data.keyCode(lane, kvHead, token, dimension);
-          scores[token] = score * data.keyScale(lane, kvHead, token) * 0.0625f;
+          scores[token] = score * data.keyScale(lane, kvHead, token) * scoreScale;
           maximum = std::max(maximum, scores[token]);
         }
         float denominator = 0;
@@ -482,7 +540,8 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
           score = std::exp(score - maximum);
           denominator += score;
         }
-        for (uint32_t dimension = 0; dimension < 256; ++dimension) {
+        for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+             ++dimension) {
           float expected = 0;
           for (uint32_t token = 0; token < tokens; ++token)
             expected += scores[token] * data.valueScale(lane, kvHead, token) *
@@ -529,7 +588,8 @@ void checkEquivalent(const Case &data, const std::vector<uint16_t> &baseline,
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     for (uint32_t head = 0; head < data.queryHeads; ++head)
       for (uint32_t row = 0; row < data.rows; ++row)
-        for (uint32_t dimension = 0; dimension < 256; ++dimension) {
+        for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+             ++dimension) {
           const uint64_t index = data.queryIndex(lane, head, row, dimension);
           const float left = bf16ToFloat(baseline[index]);
           const float right = bf16ToFloat(candidate[index]);
@@ -567,13 +627,19 @@ std::vector<std::vector<std::byte>> expectedBf16Store(const Case &data) {
             kLayer, tensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS, id);
         const uint32_t extent = id / data.pool.extentPages();
         for (uint32_t head = 0; head < data.layout.kvHeads; ++head)
-          for (uint32_t d = 0; d < 256; ++d) {
-            const uint64_t element = tensor ? richengine_kv_value_element(head, token % 32, d)
-                                            : richengine_kv_key_element(head, token % 32, d);
+          for (uint32_t d = 0; d < data.layout.headDimension; ++d) {
+            const uint64_t element =
+                tensor ? richengine_kv_value_element_dim(head, token % 32, d,
+                                                         data.layout.headDimension)
+                       : richengine_kv_key_element_dim(head, token % 32, d,
+                                                       data.layout.headDimension);
             const auto offset = reinterpret_cast<const std::byte *>(page + element) -
                                 data.pool.bytes(extent).data();
-            const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) * data.stride * 256;
-            const uint64_t input = base + (tensor ? d * data.stride + row : row * 256 + d);
+            const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) *
+                                  data.stride * data.layout.headDimension;
+            const uint64_t input =
+                base + (tensor ? d * data.stride + row
+                               : row * data.layout.headDimension + d);
             std::memcpy(result[extent].data() + offset, source + input, sizeof(uint16_t));
           }
       }
@@ -608,13 +674,14 @@ std::vector<std::vector<std::byte>> expectedInt4Store(const Case &data) {
         const uint32_t extent = id / data.pool.extentPages();
         for (uint32_t head = 0; head < data.layout.kvHeads; ++head) {
           const uint64_t base = (uint64_t{lane} * data.layout.kvHeads + head) *
-                                data.stride * 256;
+                                data.stride * data.layout.headDimension;
           const auto element = [&](uint32_t d) {
             return bf16ToFloat(
-                source[base + (tensor ? d * data.stride + row : row * 256 + d)]);
+                source[base + (tensor ? d * data.stride + row
+                                     : row * data.layout.headDimension + d)]);
           };
           float maximum = 0;
-          for (uint32_t d = 0; d < 256; ++d)
+          for (uint32_t d = 0; d < data.layout.headDimension; ++d)
             maximum = std::max(maximum, std::abs(element(d)));
           const float scale = maximum == 0.0f ? 0.0f : maximum / 7.0f;
           const auto code = [&](uint32_t d) {
@@ -630,9 +697,11 @@ std::vector<std::vector<std::byte>> expectedInt4Store(const Case &data) {
               reinterpret_cast<const std::byte *>(scalePage + scaleIndex) -
               data.pool.bytes(extent).data();
           std::memcpy(result[extent].data() + scaleOffset, &scale, sizeof(float));
-          for (uint32_t d = 0; d < 256; d += 2) {
+          for (uint32_t d = 0; d < data.layout.headDimension; d += 2) {
             const uint64_t element =
-                richengine_kv_key_element(head, token % 32, d) / 2;
+                richengine_kv_key_element_dim(head, token % 32, d,
+                                              data.layout.headDimension) /
+                2;
             const auto *page = data.pool.slab<uint8_t>(
                 kLayer, tensor ? RICHENGINE_KV_VALUES : RICHENGINE_KV_KEYS, id);
             const auto offset =
@@ -701,9 +770,11 @@ void checkInt4Store(const Case &data,
 }
 
 void checkBf16StoreEdges(metal::MetalBackend &backend) {
-  for (const auto &[heads, kvHeads] : kGeometries) {
-    auto data = makeCase(backend, heads, {1, kvHeads, 256,
-                                         kv::Format::BFloat16}, 1, 33, 31, false);
+  for (const auto &[heads, kvHeads, headDim] : kGeometries) {
+    auto data = makeCase(backend, heads,
+                         testLayout(heads, kvHeads, headDim,
+                                    kv::Format::BFloat16),
+                         1, 33, 31, false);
     // Signed zero, subnormals, large finite values, infinities and NaN payloads.
     constexpr std::array<uint16_t, 12> bits{0, 0x8000, 1, 0x8001, 0x007f, 0x0080,
                                           0x4960, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc3};
@@ -860,16 +931,18 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
       data.stores[0].chunk_tokens = chunk;
       for (uint32_t head = 0; head < layout.kvHeads; ++head)
         for (uint32_t row = 0; row < chunk; ++row)
-          for (uint32_t d = 0; d < 256; ++d) {
-            const uint64_t base = uint64_t{head} * data.stride * 256;
-            static_cast<uint16_t *>(data.keys.contents())[base + row * 256 + d] =
-                keys[base + (offset + row) * 256 + d];
+          for (uint32_t d = 0; d < layout.headDimension; ++d) {
+            const uint64_t base =
+                uint64_t{head} * data.stride * layout.headDimension;
+            static_cast<uint16_t *>(data.keys.contents())
+                [base + row * layout.headDimension + d] =
+                keys[base + (offset + row) * layout.headDimension + d];
             static_cast<uint16_t *>(data.values.contents())[base + d * data.stride + row] =
                 values[base + d * data.stride + offset + row];
           }
       for (uint32_t head = 0; head < heads; ++head)
         for (uint32_t row = 0; row < chunk; ++row)
-          for (uint32_t d = 0; d < 256; ++d)
+          for (uint32_t d = 0; d < layout.headDimension; ++d)
             static_cast<uint16_t *>(data.queries.contents())[data.queryIndex(0, head, row, d)] =
                 queries[data.queryIndex(0, head, offset + row, d)];
       const auto chunkOutput = run<Phase::Prefill>(backend, data, true);
@@ -1005,25 +1078,30 @@ int main(int argc, char **argv) {
   try {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
-      for (const auto &[heads, kvHeads] : kGeometries)
-        checkPlans(heads, testLayout(heads, kvHeads, format));
+      for (const auto &[heads, kvHeads, headDim] : kGeometries)
+        checkPlans(heads, testLayout(heads, kvHeads, headDim, format));
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
     checkBf16StoreEdges(backend);
-    // The prepare kernels do not depend on the KV format.
-    for (const auto &[heads, kvHeads] : kGeometries)
-      for (bool float32 : {false, true})
-        for (bool verify : {false, true})
-          checkProjection(backend, heads, testLayout(heads, kvHeads, kv::Format::Int8),
-                          float32, verify);
+    // The prepare kernels do not depend on the KV format; their rope pair
+    // count is the head dimension's, so only the d256 geometries exercise
+    // the projection reference.
+    for (const auto &[heads, kvHeads, headDim] : kGeometries)
+      if (headDim == 256)
+        for (bool float32 : {false, true})
+          for (bool verify : {false, true})
+            checkProjection(backend, heads,
+                            testLayout(heads, kvHeads, headDim,
+                                       kv::Format::Int8),
+                            float32, verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
       for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
-        for (const auto &[heads, kvHeads] : kGeometries)
+        for (const auto &[heads, kvHeads, headDim] : kGeometries)
           for (uint32_t history : {131072U, 260096U}) {
-            const kv::Layout layout = testLayout(heads, kvHeads, format);
+            const kv::Layout layout = testLayout(heads, kvHeads, headDim, format);
             auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
             checkReference(prefill, run<Phase::Prefill>(backend, prefill, true));
             auto verify = makeCase(backend, heads, layout, 4, kv::kVerifyRows, history, true);
@@ -1036,8 +1114,8 @@ int main(int argc, char **argv) {
     }
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
     for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
-    for (const auto &[heads, kvHeads] : kGeometries) {
-      const kv::Layout layout = testLayout(heads, kvHeads, format);
+    for (const auto &[heads, kvHeads, headDim] : kGeometries) {
+      const kv::Layout layout = testLayout(heads, kvHeads, headDim, format);
       for (const auto [history, rows] :
            std::array<std::array<uint32_t, 2>, 10>{{{0, 1}, {33, 7}, {255, 17},
                                                   {1023, 8}, {0, 2048},

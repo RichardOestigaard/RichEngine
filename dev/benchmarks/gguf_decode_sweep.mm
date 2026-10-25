@@ -256,7 +256,7 @@ void run(const std::string &metallibPath) {
             {0, input},  {1, image.plane0}, {2, packedInput ? exponents : plane1},
             {3, image.meta}, {4, output}, {5, partials}, {6, counters},
             {7, output}};
-        GgufDecodeParams params{shape.inputSize, splits, shape.outputSize, 0};
+        GgufDecodeParams params{shape.inputSize, splits, shape.outputSize, 0, 1};
         dispatch.bytes = {{8, &params, sizeof(params)}};
         dispatch.threadgroups = {columnTiles, splits, 1};
         dispatch.threadsPerThreadgroup = {GGUF_STAGED_THREADS, 1, 1};
@@ -321,7 +321,7 @@ void run(const std::string &metallibPath) {
         GgufDecodeFusedParams params{fusedShape.inputSize, splits, totalCols,
                                      {fusedShape.cols[0], fusedShape.cols[1], fusedShape.cols[2]},
                                      {fusedShape.formatId, fusedShape.formatId, fusedShape.formatId},
-                                     {0, fusedShape.cols[0], fusedShape.cols[0] + fusedShape.cols[1]}};
+                                     {0, fusedShape.cols[0], fusedShape.cols[0] + fusedShape.cols[1]}, 1};
         dispatch.bytes = {{13, &params, sizeof(params)}};
         dispatch.threadgroups = {totalCols / GGUF_TILE_COLUMNS, splits, 1};
         dispatch.threadsPerThreadgroup = {GGUF_STAGED_THREADS, 1, 1};

@@ -5,6 +5,7 @@
 #include "model/Runtime.hpp"
 #include "model/WeightStore.hpp"
 #include "PrefillWork.hpp"
+#include "TranscriptPrompts.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -815,10 +816,13 @@ struct BenchmarkScenarios final {
   bool shortPrompts = false;
   bool context = true;
   bool exact = false;
+  // Greedy answers to the transcript prompts (TranscriptPrompts.hpp) —
+  // their tokens move with any change in the target's arithmetic.
+  bool transcripts = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -827,6 +831,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "short"   ? &selected.shortPrompts
                      : name == "context" ? &selected.context
                      : name == "exact"   ? &selected.exact
+                     : name == "transcripts" ? &selected.transcripts
                                          : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -909,10 +914,10 @@ int main(int argc, char **argv) {
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
     const uint32_t draftWindow = config.model.draft.draftWindow();
-    // Prompt token ids stay inside the model's vocabulary; above 200,100 the
-    // ids are exactly the historical ones.
-    const uint32_t promptVocabulary =
-        std::min<uint32_t>(capabilities.vocabularySize, 200100);
+    // Prompt token ids stay inside the model's vocabulary; the verbatim
+    // decode prompt's chat tokens (248045+) must reach the model unchanged
+    // or the remap produces a different, harder decode task than upstream's.
+    const uint32_t promptVocabulary = capabilities.vocabularySize;
     // Complete production warmup and memory audit before measuring. Retry
     // host-capacity refusals while memory from the previous engine settles.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
@@ -1084,6 +1089,30 @@ int main(int argc, char **argv) {
     std::vector<Measurement> measurements;
     // Lengths the memory plan cannot hold, on a Mac with less memory.
     std::vector<uint32_t> skippedLengths;
+    // Greedy answers to the transcript requests (TranscriptPrompts.hpp):
+    // their tokens move with any arithmetic change, so the scenarios print
+    // each case's output hash and tokens for a comparison across builds.
+    if (selected.transcripts) {
+      constexpr std::array<std::pair<uint32_t, uint32_t>, 8> transcriptCases{
+          {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {0, 8192}, {3, 16384}}};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t index = 0; index < transcriptCases.size(); ++index) {
+          const auto [request, context] = transcriptCases[index];
+          std::vector<uint32_t> tokens = prompt(context, uint64_t{index} << 32 | 0x5452414e53ULL);
+          const std::span<const uint32_t> question = benchmark::kTranscriptPrompts[request];
+          tokens.insert(tokens.end(), question.begin(), question.end());
+          evictAllCache(resources->cache());
+          Measurement result =
+              runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                         "transcript_" + std::to_string(index), sample, std::move(tokens), 512);
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("transcript request " + std::to_string(index) +
+                                     " was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
     for (uint32_t length : selected.context || selected.exact
                                ? std::span<const uint32_t>{lengths}
                                : std::span<const uint32_t>{}) {

@@ -233,6 +233,8 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleForcedTokens(typed);
         } else if constexpr (std::is_same_v<T, protocol::ConstraintDfaFrame>) {
           return handleConstraintDfa(typed);
+        } else if constexpr (std::is_same_v<T, protocol::ScoreBatchFrame>) {
+          return handleScoreBatch(typed);
         } else if constexpr (std::is_same_v<T, protocol::VocabularyFrame>) {
           return handleVocabulary(typed);
         } else {
@@ -240,6 +242,30 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
         }
       },
       message);
+}
+
+bool NativeRuntime::handleScoreBatch(protocol::ScoreBatchFrame &batch) {
+  // Each item expands to the score request the batch encodes it as; the
+  // shared prefix crosses the wire once and still becomes every request's
+  // sharedPrefixTokens junction hint.
+  for (protocol::ScoreBatchFrame::Item &item : batch.items) {
+    protocol::RequestFrame request;
+    request.requestId = item.requestId;
+    request.priority = batch.priority;
+    request.absoluteDeadlineUnixMicros = batch.absoluteDeadlineUnixMicros;
+    request.remainingDeadlineMicros = batch.remainingDeadlineMicros;
+    request.logicalMaxOutputTokens = 0;
+    request.promptTokens = batch.prefixTokens;
+    request.promptTokens.insert(request.promptTokens.end(),
+                                item.suffixTokens.begin(),
+                                item.suffixTokens.end());
+    request.scoreTokens = std::move(item.scoreTokens);
+    request.sharedPrefixTokens =
+        static_cast<uint32_t>(batch.prefixTokens.size());
+    if (!handleRequest(request))
+      return false;
+  }
+  return true;
 }
 
 bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {

@@ -3,7 +3,7 @@
   "repos": [
     "google/diffusiongemma-26B-A4B-it"
   ],
-  "note": "DiffusionGemma's text_config states bidirectional attention where Gemma 4's states attention_k_eq_v. A global layer every sixth, as config.json's layer_types states them. No draft \u2014 the packed manifest keeps the Null predraft's magic; its encoder's vision tower is not served.",
+  "note": "DISABLED for v1.0.0: the denoising trunk ships incoherent output pending the numerics bisect in docs/diffusion_issue.md; the underscore name keeps the loader from serving it. DiffusionGemma's text_config states bidirectional attention where Gemma 4's states attention_k_eq_v. A global layer every sixth, as config.json's layer_types states them. No draft \u2014 the packed manifest keeps the Null predraft's magic; its encoder's vision tower is not served.",
   "signature": {
     "model_type": "diffusion_gemma_text",
     "max_position_embeddings": 262144,

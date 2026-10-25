@@ -1,5 +1,7 @@
 #include "PagedAttention.hpp"
 
+#include "Env.hpp"
+
 #include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
@@ -223,7 +225,8 @@ using KernelLayout = kv::Core;
 // overflows threadgroup memory and they take the two-pass _m2 variants.
 [[nodiscard]] std::string splitPipeline(std::string_view stem,
                                         const kv::Layout &layout,
-                                        KernelLayout kernel) {
+                                        KernelLayout kernel,
+                                        bool chainR2 = false) {
   if (kernel == KernelLayout::GemmaKv8H256 ||
       kernel == KernelLayout::GemmaKv2H512)
     return gemmaSplitKernel(stem, layout.format, kernel, layout.windowTokens);
@@ -232,16 +235,43 @@ using KernelLayout = kv::Core;
       (kernel == KernelLayout::Kv2Group8 ||
        kernel == KernelLayout::Kv2Group8D128))
     name += "_m2";
-  // The kv4/g6 chain tile's 96 fused rows at 16 verify rows halve core
-  // residency; its _r2 splits run the two fused-row passes on two groups.
-  // Kill switch: the _r2 kernels corrupt verify attention — draft
-  // acceptance fell to ~4% from ~18-20% on the Qwen3.8-27B decode
-  // benchmark — so selection stays off until the pass-split partial
-  // writes are fixed and the plan test re-pins the name.
-  constexpr bool kVerifySplitR2 = false;
-  if (kVerifySplitR2 && stem == kVerifyAttention &&
-      kernel == KernelLayout::Kv4Group6)
-    name += "_r2";
+  // The chain tile's fused M rows at 16 verify rows cap residency at one
+  // threadgroup per core; the _rP splits run the tile's P fused-row passes
+  // on P threadgroups at 1/P the footprint. kv4/g6's _r2 pair measured
+  // 1.06 → 0.75 ms at 4K history, 5.43 → 4.00 ms at 32K, 20.8 → 16.8 ms at
+  // 131K on the q8 harness, outputs identical or within one bf16 ULP; the
+  // M=128 layouts (kv2_g8, hd128) split four ways — an _r2 pair would keep
+  // their ~17 KB pass scratch at one group per core. The kernels compile
+  // only where the per-pass MP stays a multiple of 8 (the PV matmul), so a
+  // group/passes pair the tile cannot express never gets selected. Only the
+  // 16-row chain selects an _rP variant: the block-8 draft's _r2_m8 twin is
+  // untested and tree verify keeps its own _m2 pass split.
+  // RICHENGINE_VERIFY_SPLIT_R2_OFF restores the single-group split for a
+  // model that disagrees.
+  if (chainR2 && stem == kVerifyAttention) {
+    const uint32_t group = [kernel] {
+      switch (kernel) {
+      case KernelLayout::Kv4Group6:
+        return 6u;
+      case KernelLayout::Kv4Group4:
+        return 4u;
+      case KernelLayout::Kv2Group8:
+      case KernelLayout::Kv2Group8D128:
+        return 8u;
+      case KernelLayout::Kv8Group4D64:
+      case KernelLayout::Kv8Group4D128:
+        return 4u;
+      case KernelLayout::Kv8Group5D64:
+        return 5u;
+      default:
+        return 0u;
+      }
+    }();
+    const uint32_t fused = group * kv::kVerifyRows;
+    const uint32_t passes = fused >= 128 ? 4 : 2;
+    if (group && fused % passes == 0 && (fused / passes) % 8 == 0)
+      name += passes == 4 ? "_r4" : "_r2";
+  }
   return name;
 }
 
@@ -413,11 +443,20 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                              queryHeads,
                          kernelLayoutHeadDim(kernelLayout));
   // The _rP splits fold P fused-row passes into group.x with the KV heads.
-  const std::string split = splitPipeline(
-      tree ? kVerifyTreeAttention : kVerifyAttention, layout, kernelLayout);
+  // A chain verify at the block-8 draft's native eight rows runs its
+  // upstream-shaped _m8 fused-M variants; every wider stride keeps the
+  // compiled sixteen. Tree nodes always take the 16-node tile.
+  const bool narrow = !tree && rows == 8 &&
+                      !envFlag("RICHENGINE_VERIFY_M8_OFF");
+  const bool chainR2 = !tree && !narrow && !tuning().verifySplitR2Off;
+  std::string split = splitPipeline(
+      tree ? kVerifyTreeAttention : kVerifyAttention, layout, kernelLayout,
+      chainR2);
   uint32_t splitGroupX = layout.kvHeads;
   if (split.size() >= 3 && split.compare(split.size() - 3, 2, "_r") == 0)
     splitGroupX *= split.back() - '0';
+  if (narrow)
+    split += "_m8";
   return {lanes,
           laneSplits,
           splits,
@@ -425,7 +464,8 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           split,
           reduceKernel(tree ? kVerifyTreeAttentionReduce
                             : kVerifyAttentionReduce,
-                       kernelLayout),
+                       kernelLayout) +
+              (narrow ? "_m8" : ""),
           {splitGroupX, splits, lanes},
           {layout.kvHeads, rows * (queryHeads / layout.kvHeads), lanes},
           // The verify stores are row-count generic; only the emitted rows

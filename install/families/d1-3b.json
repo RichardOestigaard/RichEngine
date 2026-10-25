@@ -58,16 +58,8 @@
     "tool_dialect": "lfm25-python"
   },
   "tuning": [
-    "VERIFY_TREE",
-    "VERIFY_ALL_LIVE",
     "PREFILL_FAST_INT8",
-    "ADAPTIVE_PROPOSALS",
-    "DRAFT_BYPASS",
-    "DRAFT_BYPASS_EXPECT",
-    "PROPOSAL_CAP",
-    "DRAFT_SPLITS",
     "PREFILL_SPLITS_MAX",
-    "VERIFY_SPLITS_MAX",
     "HEAD_FUSED",
     "MTL4",
     "GGUF_PACKED",
@@ -75,15 +67,13 @@
     "ICB_OFF",
     "PREPARED_CACHE_OFF",
     "PATCHABLE_OFF",
-    "NO_FUSED_GATE",
-    "NGRAM_DRAFT_EXPECT",
-    "NGRAM_WARMUP",
-    "NGRAM_TREE_MIN",
-    "TREE_ACCEPT_MAX",
-    "TREE_ACCEPT_MIN",
     "ANE_WAIT",
-    "DECODE_RING2",
-    "DEVICE_VERIFY_PARAMS",
-    "CONV_FUSE"
+    "CONV_FUSE",
+    "SCORE_GATHER",
+    "SCORE_TENSOR",
+    "SCORE_FUSED",
+    "SCORE_TENSOR_PREFILL",
+    "SYSTEMONE_WINDOW",
+    "VERIFY_SPLIT_R2"
   ]
 }

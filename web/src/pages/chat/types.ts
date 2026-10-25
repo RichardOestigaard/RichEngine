@@ -40,6 +40,14 @@ export interface Attachment {
   error: boolean;
   kind: "image" | "pdf";
 }
+/* Enter during a run stashes the turn here instead of dropping it; queued
+   turns stack in a tray above the composer and drain in order once the
+   reply ends — becoming real messages only when their send starts. */
+export interface QueuedTurn {
+  content: MessageContent;
+  text: string;
+  attachments: Attachment[];
+}
 export interface ModelInfo {
   id: string;
   context_length?: number;

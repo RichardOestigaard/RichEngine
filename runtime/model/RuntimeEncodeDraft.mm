@@ -122,11 +122,33 @@ namespace richengine::model {
            d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
            d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
            d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-           d(DecodeTensor::ProposalProbs), d(DecodeTensor::TreeNodes),
+           d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence),
+           d(DecodeTensor::TreeNodes),
            d(DecodeTensor::TreeTokens), d(DecodeTensor::TreeCounts)},
           std::span(anchors).first(lanes), std::span(policies).first(lanes),
           treeMask);
     }, draftModel);
+    // RICHENGINE_DRAFT_CONF_MIN: the DSpark confidence head rewrites the
+    // lane's proposal confidences from the selector's top-candidate mass
+    // to the head's own sigmoid, which draft_verify_rows's conf_min
+    // prunes on. The GPU predraft's graph scores its proposals the same
+    // way, so an adopted predraft's confidences stay valid.
+    if (tuning().draftConfMin > 0.0) {
+      if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+        const DSparkDraftWeights &w = dspark->weights();
+        graph.add(
+            std::string(ops::kDraftConfScore),
+            {d(DecodeTensor::DraftFinalHidden), d(DecodeTensor::ProposedTokens),
+             d(DecodeTensor::DraftInputTokens), w.markovEmbedding,
+             w.confidenceWeight, w.confidenceBias,
+             d(DecodeTensor::VerifyConfidence)},
+            DraftConfScoreParams{lanes, w.layout.hiddenSize, w.layout.markovRank,
+                                 w.layout.vocabularySize,
+                                 w.layout.queryRows()},
+            {uint64_t{lanes} * RICHENGINE_DRAFT_PROPOSAL_TOKENS, 1, 1},
+            {32, 1, 1});
+      }
+    }
   }
 
   // The speculative next-step draft: the step's own commit has already run,

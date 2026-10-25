@@ -49,8 +49,10 @@ struct DfaForcedSpan {
   uint32_t token_ids[RICHENGINE_DRAFT_PROPOSAL_TOKENS];
 };
 
-static_assert(sizeof(DfaForcedSpan) == 140,
-              "DFA forced span is 140 bytes on both sides");
+static_assert(sizeof(DfaForcedSpan) ==
+                  16 + RICHENGINE_DFA_FORCED_BYTES +
+                      4 * RICHENGINE_DRAFT_PROPOSAL_TOKENS,
+              "DFA forced span differs across the ABI");
 
 // Per-dispatch scalars of decode_dfa_mask (kernels/decode/dfa.metal). The
 // grid is (tokens, rows, lanes); lane_mask gates the work to the lanes that

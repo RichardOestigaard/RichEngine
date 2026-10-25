@@ -37,9 +37,28 @@ struct Tuning {
   // metal/MetalEncode.mm
   bool icbOff = false;          // RICHENGINE_ICB_OFF (presence)
   bool mtl4 = false;            // RICHENGINE_MTL4_OFF disables (default on)
+  // Baked spans replay while another command is in flight: the parameter
+  // arena and ICB of the submission's parity bank are built on first use, so
+  // a backend that never overlaps pays nothing for the second bank. Off
+  // restores the GPU-idle-only replay.
+  bool spanBankOff = false;     // RICHENGINE_SPAN_BANK_OFF (presence)
+  // A baked span barriers a command only where its bytes overlap an earlier
+  // command's since the last barrier. Real spans are chains (N-1 of N
+  // barriers needed), so this is opt-in until a graph with independent
+  // branches shows a win.
+  bool spanBarriers = false;    // RICHENGINE_SPAN_BARRIERS (presence)
+  // Event-bearing commands on the Metal 4 encoder (queue-level signal/wait
+  // between the split's commits). Off keeps the Metal 3 encoder.
+  bool mtl4Events = false;      // RICHENGINE_MTL4_EVENTS (presence)
   bool preparedCacheOff = false; // RICHENGINE_PREPARED_CACHE_OFF (presence)
   bool opTimings = false;       // RICHENGINE_OP_TIMINGS=1
   bool gpuSpans = false;        // RICHENGINE_GPU_SPANS (presence)
+  // ops/PagedAttention.cpp: the kv4/g6 16-row chain verify splits its two
+  // fused-row passes across two threadgroups (the _r2 kernels), halving the
+  // tile's threadgroup footprint so two groups share a core. Measured 1.40x
+  // at 4K history, 1.36x at 32K, 1.24x at 131K on the q8 attention harness.
+  // Off restores the single-group split.
+  bool verifySplitR2Off = false; // RICHENGINE_VERIFY_SPLIT_R2_OFF (presence)
   // model/RuntimeEncodeVerify.mm: the verify round's GPU-DFA mask pass
   // launches through an indirect grid written on-device by
   // decode_dfa_mask_grid, which also consumes the lanes' GPU forced spans.
@@ -105,6 +124,11 @@ struct Tuning {
   std::string_view dfaMode;         // RICHENGINE_DFA_MODE
   double draftBypassExpect = 0.15;  // RICHENGINE_DRAFT_BYPASS_EXPECT
   double ngramDraftExpect = 4.0;    // RICHENGINE_NGRAM_DRAFT_EXPECT
+  // A DSpark draft's confidence head scores each emitted proposal when
+  // set; positions whose head sigmoid falls under it cut the lane's
+  // proposal suffix before verify (draft_conf_score + VerifyRowsParams's
+  // conf_min). 0 disables.
+  double draftConfMin = 0.0;        // RICHENGINE_DRAFT_CONF_MIN
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;        // RICHENGINE_NGRAM_TREE_MIN
   double treeAcceptMin = 0.0;       // RICHENGINE_TREE_ACCEPT_MIN
@@ -141,6 +165,22 @@ struct Tuning {
   bool proposalCapSet = false;      // RICHENGINE_PROPOSAL_CAP (presence) — model/Runtime.mm
   uint32_t proposalCap = 0;         // RICHENGINE_PROPOSAL_CAP — model/Runtime.mm
   bool denyDebug = false;           // RICHENGINE_DENY_DEBUG — engine/
+  // RICHENGINE_SYSTEMONE_WINDOW — server/frontend.py caps /v1/systemone's
+  // in-flight questions below the preparation bound; the runtime never
+  // reads it.
+  // ops/LinearGguf.cpp, model/TargetModel.cpp: an all-score batch's head
+  // dispatches only the quant tiles holding a wanted logit column.
+  bool scoreGather = false;         // RICHENGINE_SCORE_GATHER=1
+  // metal/kernels/shared/gguf_score.metal: the same restriction as one
+  // gather dispatch over the wanted columns, the fused variant folding the
+  // final RMS norm into it.
+  bool scoreTensor = false;         // RICHENGINE_SCORE_TENSOR=1
+  bool scoreFused = false;          // RICHENGINE_SCORE_FUSED=1
+  // ops/LinearGguf.cpp: GGUF decode tiles take their packed-operand
+  // (tensor-operand) variants for the formats that have one — the
+  // SCORE_GATHER head's dispatch among them. RICHENGINE_GGUF_PACKED_ON's
+  // enablement scoped to the score pathway's kernels.
+  bool scoreTensorPrefill = false;  // RICHENGINE_SCORE_TENSOR_PREFILL=1
   // Kernel geometry the registry can reshape at process start
   // (ExecutionGeometry.h's table). The draft split count reaches
   // draft.metal as the Metal function constant
@@ -190,7 +230,11 @@ inline Tuning makeTuning() {
   t.icbOff = envFlag("RICHENGINE_ICB_OFF");
   // A/B-measured winners default on; the *_OFF flag is the escape hatch.
   t.mtl4 = !envFlag("RICHENGINE_MTL4_OFF");
+  t.spanBankOff = envFlag("RICHENGINE_SPAN_BANK_OFF");
+  t.spanBarriers = envFlag("RICHENGINE_SPAN_BARRIERS");
+  t.mtl4Events = envFlag("RICHENGINE_MTL4_EVENTS");
   t.preparedCacheOff = envFlag("RICHENGINE_PREPARED_CACHE_OFF");
+  t.verifySplitR2Off = envFlag("RICHENGINE_VERIFY_SPLIT_R2_OFF");
   t.opTimings = envFlagOn("RICHENGINE_OP_TIMINGS");
   t.gpuSpans = envFlag("RICHENGINE_GPU_SPANS");
   t.gpuDecodeGrid = !envFlag("RICHENGINE_GPU_DECODE_GRID_OFF");
@@ -245,6 +289,7 @@ inline Tuning makeTuning() {
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
   t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");
   t.ngramDraftExpect = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
+  t.draftConfMin = envDouble("RICHENGINE_DRAFT_CONF_MIN", 0.0);
   t.ngramWarmupSet = envFlag("RICHENGINE_NGRAM_WARMUP");
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
@@ -273,6 +318,10 @@ inline Tuning makeTuning() {
   t.proposalCapSet = envFlag("RICHENGINE_PROPOSAL_CAP");
   t.proposalCap = envUint("RICHENGINE_PROPOSAL_CAP", 0);
   t.denyDebug = envFlag("RICHENGINE_DENY_DEBUG");
+  t.scoreGather = envFlagOn("RICHENGINE_SCORE_GATHER");
+  t.scoreTensor = envFlagOn("RICHENGINE_SCORE_TENSOR");
+  t.scoreFused = envFlagOn("RICHENGINE_SCORE_FUSED");
+  t.scoreTensorPrefill = envFlagOn("RICHENGINE_SCORE_TENSOR_PREFILL");
   t.draftAttentionSplits = std::clamp(
       envUint("RICHENGINE_DRAFT_SPLITS", RICHENGINE_DRAFT_ATTENTION_SPLITS),
       1u, RICHENGINE_DRAFT_SPLITS_MAXIMUM);

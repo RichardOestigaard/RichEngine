@@ -16,6 +16,10 @@ the final env, where a knob that only pays in combination can now win. The
 result is a tuning.json beside the model's record, keyed by chip and
 stamped with the engine binary it ran on; server/model_host.py applies it
 as the engine's environment on every load while that binary is unchanged.
+A decision family (serving.decision — Liquid d1) never decodes: its sweep
+measures a fixed score-only question batch instead of prompts and decodes,
+and answer digests stand in for token parity. An encoder decision model
+(serving.encoder — d1-omni) refuses outright: its kernels are not landed.
 """
 
 import array
@@ -171,6 +175,86 @@ _CORPUS = (
     "Explain the lifecycle policy we'd adopt to cap it, the trade-off "
     "against debuggability, and one sentence on why the growth is expected "
     "to flatten once sampling rolls out to the smaller tenants."
+)
+
+# The decision sweep's workload: one representative state block and the
+# three question kinds the decision pathway serves — a score-only job
+# each, submitted together. Fixed and small so sweeps stay fast and every
+# candidate scores identical prompts, which is what makes the per-rep
+# answer digests comparable positionally.
+_DECISION_STATE = {
+    "service": "checkout-api",
+    "region": "us-east-1",
+    "window": "2025-11-04T14:00Z/14:30Z",
+    "signals": {
+        "error_rate": "12.4% (baseline 0.3%)",
+        "p99_latency_ms": 4820,
+        "saturation": "connection pool at 98% for 11 minutes",
+        "traffic": "4.1k rps, inside the weekly envelope",
+    },
+    "recent_changes": [
+        "14:02Z deploy cb81f2e enabled the new cart serializer on all pods",
+        "13:55Z flag checkout_v2_routing rolled from 0% to 25%",
+        "13:40Z payments-gateway certificate rotated on schedule",
+    ],
+    "logs": [
+        "14:07Z pool.acquire timeout after 3000ms (repeated 411x)",
+        "14:09Z upstream payments-gateway returned 502 (x37)",
+        "14:12Z serializer WARN: unknown field 'cart_bundle' dropped (x58)",
+        "14:15Z health check flapping on pod checkout-api-6d9f",
+    ],
+    "notes": (
+        "On-call rolled checkout_v2_routing back to 0% at 14:18Z and the "
+        "error rate did not recover. Deploy cb81f2e remains live. The "
+        "payments-gateway errors began before its certificate rotation "
+        "window closed, and the serializer warnings start exactly at the "
+        "cb81f2e rollout marker."
+    ),
+}
+# (qid, kind, instructions, labels, descriptions) — the fields a
+# SystemOneQuestion carries; the score legend derives from its labels.
+_QUESTION_SET = (
+    (
+        "rollback",
+        "noul",
+        "Does the evidence support rolling back deploy cb81f2e?",
+        ("true", "false"),
+        (
+            "Yes — the deploy is the likely cause of the regression",
+            "No — another signal explains the error rate better",
+        ),
+    ),
+    (
+        "owner",
+        "choice",
+        "Which team should own the follow-up investigation?",
+        ("payments", "platform", "checkout", "sre", "release"),
+        (
+            "Payments integration and gateway behavior",
+            "Shared infrastructure and connection pooling",
+            "Checkout service code and deploys",
+            "Site reliability and incident response",
+            "Release tooling and rollout policy",
+        ),
+    ),
+    (
+        "severity",
+        "score",
+        "Rate the user-facing severity of this incident.",
+        tuple(str(index) for index in range(10)),
+        (
+            "No user impact",
+            "Cosmetic only",
+            "Minor annoyance",
+            "Degraded for a few users",
+            "Degraded for a segment",
+            "Noticeable feature loss",
+            "Feature down for a segment",
+            "Core flow impaired",
+            "Core flow down",
+            "Full outage",
+        ),
+    ),
 )
 
 
@@ -437,6 +521,31 @@ def _dfa_request(prompt: tuple[int, ...], output_tokens: int):
     )
 
 
+def _score_request(prompt: tuple[int, ...], score_tokens: tuple[int, ...]):
+    """One score-only frame: no output budget, the answer slot's ids in
+    score_tokens — the shape backend's _score_job submits; the DoneEvent
+    carries scoreLogits in requested token order."""
+    from server import protocol as wire
+
+    return wire.RequestFrame(
+        request_id=0,
+        priority=wire.RequestPriority.NORMAL,
+        absolute_deadline_unix_micros=0,
+        remaining_deadline_micros=0,
+        logical_max_output_tokens=0,
+        prompt_tokens=prompt,
+        sampling=wire.SamplingParameters(),
+        seed=0,
+        constraint=wire.ConstraintMode.NONE,
+        image_spans=(),
+        image_pixels=b"",
+        return_progress=False,
+        score_tokens=tuple(score_tokens),
+        generation_prompt_tokens=0,
+        flags=wire.RequestFlag(0),
+    )
+
+
 class _AgenticWorkload:
     """What every request of the agentic pass shares: the compiled
     constraint DFA, the vocabulary frame the engine needs once per
@@ -611,8 +720,9 @@ def _agentic_workload(assembly_dir: Path):
     vocabulary; None when the tokenizer cannot spell it — the pass then
     skips rather than measuring a different workload."""
     try:
-        from server import constraints, dfa
         from tokenizers import Tokenizer
+
+        from server import constraints, dfa
 
         path = assembly_dir / layout.TOKENIZER / "tokenizer.json"
         doc = json.loads(path.read_text())
@@ -640,6 +750,74 @@ def _agentic_workload(assembly_dir: Path):
         return tuple(tokenizer.encode(text, **kw).ids)
 
     return _AgenticWorkload(compiled, vocab_tokens, specials, encode)
+
+
+class _ScoreTokenizer:
+    """tokenizers.Tokenizer as the encode()->ids handle the decision
+    pathway takes: decisions.prepare_question probes surface forms and
+    frontend encodes prompts through a tokenizer whose encode returns the
+    id list itself, which Encoding.ids is."""
+
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def encode(self, text, add_special_tokens=False):
+        return self._tokenizer.encode(
+            text, add_special_tokens=add_special_tokens
+        ).ids
+
+
+def _decision_workload(assembly_dir: Path, contract) -> list:
+    """The decision sweep's prepared questions over the fixed state:
+    (qid, prompt token ids, Question) rows. Every rep submits the same
+    batch, so the score logits compare positionally under every env —
+    the parity the prompt windows' fixed slices give generation. A
+    decision model without a readable tokenizer cannot tune: its
+    questions have no score slots without it."""
+    from tokenizers import Tokenizer
+
+    from server import decisions, judgments
+
+    try:
+        raw = Tokenizer.from_file(
+            str(assembly_dir / layout.TOKENIZER / "tokenizer.json")
+        )
+    except Exception as error:
+        raise models.ModelError(
+            "a decision model's tokenizer.json is required to tune: "
+            f"{error}"
+        ) from error
+    tokenizer = _ScoreTokenizer(raw)
+    workload = []
+    for qid, kind, instructions, labels, descriptions in _QUESTION_SET:
+        spec = judgments.SystemOneQuestion(
+            kind=kind,
+            instructions=instructions,
+            labels=labels,
+            descriptions=descriptions,
+            # _question_spec derives the score legend the same way: the
+            # level text keyed by its digit.
+            legend=(
+                {
+                    str(index): text
+                    for index, text in enumerate(descriptions)
+                }
+                if kind == "score"
+                else None
+            ),
+            deterministic=False,
+        )
+        try:
+            question = decisions.prepare_question(
+                tokenizer, spec, contract.decision_temperatures
+            )
+        except decisions.DecisionUnsupported as error:
+            raise models.ModelError(str(error)) from error
+        tokens = tuple(
+            tokenizer.encode(decisions.prompt_text(_DECISION_STATE, question))
+        )
+        workload.append((qid, tokens, question))
+    return workload
 
 
 def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
@@ -740,19 +918,86 @@ def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
     }
 
 
+def _decision_batch(runtime, questions) -> dict:
+    """Submit every prepared question as one score-only batch — the
+    decision pathway's whole workload: prompt tokens plus the answer
+    slot's score tokens, a single forward, no decode. Reports the batch's
+    input-token throughput over the client-side wall, the mean
+    per-question rate, and `answers_sha`: a SHA-256 over (qid, winner,
+    probabilities rounded to 4 places) rows — the parity stream
+    `tokens_sha` gives the generative sweep, tolerant of the sub-1e-4
+    drift a faster path's reassociated reductions cause."""
+    from server import runtime as engine_runtime
+
+    started = time.monotonic()
+    calls = [
+        runtime.submit(
+            engine_runtime.GenerationRequest(
+                _score_request(prompt, question.score_tokens),
+                math.inf,
+                None,
+                None,
+            )
+        )
+        for _, prompt, question in questions
+    ]
+    prompt_tokens = 0
+    prefill_rates = []
+    answers = []
+    for (qid, _, question), call in zip(questions, calls):
+        event = call.result(timeout=600)
+        prompt_tokens += event.prompt_tokens
+        # A score job's whole forward is its prefill; its reported
+        # prefill (or wall) time is the per-question rate's denominator.
+        micros = event.prefill_micros or event.wall_micros
+        if micros:
+            prefill_rates.append(event.prompt_tokens / (micros / 1e6))
+        probabilities = question.probabilities(list(event.option_logits))
+        winner = max(range(len(probabilities)), key=probabilities.__getitem__)
+        answers.append(
+            (
+                qid,
+                question.spec.labels[winner],
+                [round(probability, 4) for probability in probabilities],
+            )
+        )
+    seconds = time.monotonic() - started
+    return {
+        "width": len(calls),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": 0,
+        # Score jobs never decode; the wire reports decode_micros 0.
+        "decode_micros": 0,
+        "wall_micros": int(seconds * 1e6),
+        # Input tokens per second over the batch's client-side wall.
+        "tokens_per_second": (
+            round(prompt_tokens / seconds, 2) if seconds else 0.0
+        ),
+        "prefill_tokens_per_second": (
+            round(statistics.fmean(prefill_rates), 2) if prefill_rates else 0.0
+        ),
+        "answers_sha": hashlib.sha256(
+            json.dumps(answers, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
 def _median_samples(samples: list[dict]) -> dict:
     """One width's repetitions merged to medians, repetition count kept."""
     merged = {
         "width": samples[0]["width"],
         "repetitions": len(samples),
     }
-    for key in (
+    keys = (
         "prompt_tokens",
         "completion_tokens",
         "decode_micros",
         "tokens_per_second",
         "prefill_tokens_per_second",
-    ):
+        # The decision batch's extra timing; a generation sample has none.
+        *(("wall_micros",) if "wall_micros" in samples[0] else ()),
+    )
+    for key in keys:
         merged[key] = statistics.median(sample[key] for sample in samples)
     return merged
 
@@ -768,6 +1013,7 @@ def measure(
     incumbent: dict | None = None,
     sigma: dict | None = None,
     dfa: "_AgenticWorkload | None" = None,
+    decision: list | None = None,
 ) -> tuple[dict, dict]:
     """One engine under `env`: a warmup pass, then REPETITIONS batches at
     each width, merged to medians: {width: metrics}. `prompts` is a pool of
@@ -784,9 +1030,17 @@ def measure(
     so the remaining batches are skipped in both directions. Returns
     (medians, samples), samples as {width: {metric: [per-rep values],
     "tokens_sha": [per-rep digests]}} — the baseline's samples seed the
-    keep rule's noise floor and the token-parity reference."""
+    keep rule's noise floor and the token-parity reference. `decision`
+    is the prepared question batch of a decision model — one score-only
+    workload replaces the generation windows entirely: a single width,
+    the question set every rep submits, `answers_sha` digests instead of
+    token streams."""
     from server import runtime as engine_runtime
 
+    if decision is not None:
+        # A decision model never decodes; the question batch is the whole
+        # workload at its single width.
+        widths = (len(decision),)
     runtime = engine_runtime.MultiplexedRuntime(
         _engine_command(binary, assembly_dir),
         # Popen replaces the child's whole environment; overlay the swept
@@ -816,18 +1070,25 @@ def measure(
             position += repetitions * width
 
         def batch(width: int, rep_index: int, output_tokens: int) -> dict:
+            if decision is not None:
+                return _decision_batch(runtime, decision)
             start = offsets[width] + rep_index * width
             window = prompts[start : start + width]
             assert len(window) == width, "prompt pool exhausted"
             return _run_batch(runtime, window, output_tokens, dfa)
 
-        warmup = _run_batch(
-            runtime, prompts[: max(widths)], WARMUP_OUTPUT_TOKENS, dfa
+        warmup = (
+            _decision_batch(runtime, decision)
+            if decision is not None
+            else _run_batch(
+                runtime, prompts[: max(widths)], WARMUP_OUTPUT_TOKENS, dfa
+            )
         )
         merged = {}
         # The warmup runs the same windows under every env — its digest
         # is token parity's determinism anchor alongside the timed reps.
-        samples = {"warmup": {"tokens_sha": [warmup["tokens_sha"]]}}
+        digest_key = "answers_sha" if decision is not None else "tokens_sha"
+        samples = {"warmup": {digest_key: [warmup[digest_key]]}}
         doomed = False
         for width in widths:
             reps = []
@@ -889,8 +1150,8 @@ def measure(
             samples[str(width)] = {
                 metric: [rep.get(metric, 0.0) for rep in reps] for metric in _METRICS
             }
-            samples[str(width)]["tokens_sha"] = [
-                rep.get("tokens_sha") for rep in reps
+            samples[str(width)][digest_key] = [
+                rep.get(digest_key) for rep in reps
             ]
             if doomed:
                 break
@@ -1245,13 +1506,28 @@ def _tokens_match(candidate: dict, incumbent: dict) -> bool | None:
     measurements) or exactly one rep diverged, which a stray
     nondeterministic run explains better than a numerics change that
     would show on every window."""
+    return _digests_match(candidate, incumbent, "tokens_sha")
+
+
+def _answers_match(candidate: dict, incumbent: dict) -> bool | None:
+    """The decision sweep's parity check: _tokens_match's same positional
+    verdict over each rep's answer digest — a flipped winner or a
+    probability moved past the digest's rounding rejects the candidate
+    the way a changed token stream does."""
+    return _digests_match(candidate, incumbent, "answers_sha")
+
+
+def _digests_match(candidate: dict, incumbent: dict, field: str) -> bool | None:
+    """Per-rep `field` digests of the candidate against the incumbent's
+    same (width, rep): False at two comparable mismatches, True when every
+    compared rep matches, None on one mismatch or nothing to compare."""
     compared = 0
     mismatched = 0
     for width, cand in candidate.items():
         if not isinstance(cand, dict):
             continue
-        base_reps = (incumbent.get(width) or {}).get("tokens_sha") or ()
-        for index, rep in enumerate(cand.get("tokens_sha") or ()):
+        base_reps = (incumbent.get(width) or {}).get(field) or ()
+        for index, rep in enumerate(cand.get(field) or ()):
             if not rep or index >= len(base_reps) or not base_reps[index]:
                 continue
             compared += 1
@@ -1291,9 +1567,19 @@ def tune(
     condition that invalidates every measurement for keeping purposes — a
     loaded engine sharing the GPU; entries still record what ran, flagged,
     but nothing can win and nothing reaches the priors."""
+    from server import serving
+
     from .tuning import agentic_knobs
 
     context = context_for(assembly_dir)
+    # An encoder decision model has no runnable kernels: refuse before
+    # any engine launch — its table is already empty, so name the reason.
+    contract = serving.load(assembly_dir)
+    if contract.encoder:
+        raise models.ModelError(
+            "encoder decision models are not tunable yet — "
+            "no runnable encoder kernels"
+        )
     tuning = knobs_for(context.family)
     if tuning is None:
         raise models.ModelError("no tunable-knob table for this model's family")
@@ -1306,7 +1592,9 @@ def tune(
     # unconstrained one, they join the candidate list only when the sweep
     # is asked for the agentic pass — and still sit out when the user
     # armed a value.
-    dfa_eligible = agentic_knobs(context) if agentic else ()
+    dfa_eligible = (
+        agentic_knobs(context) if agentic and not contract.decision else ()
+    )
     user_set = {
         knob.env
         for knob in (*all_eligible, *dfa_eligible)
@@ -1351,10 +1639,21 @@ def tune(
 
     widths = (1, BATCH_WIDTH)
     width_sets = [widths] + ([AGENTIC_WIDTHS] if dfa_knobs else [])
-    prompts, real_prompts = _prompts(
-        assembly_dir,
-        max(max(w) + REPETITIONS * sum(w) for w in width_sets),
-    )
+    decision = None
+    if contract.decision:
+        # The score-only workload replaces prompts × output_tokens
+        # entirely — a decision model never decodes.
+        decision = _decision_workload(assembly_dir, contract)
+        prompts, real_prompts = (), True
+        log(
+            f"decision · score-only sweep — {len(decision)} questions "
+            "replace the generation prompts"
+        )
+    else:
+        prompts, real_prompts = _prompts(
+            assembly_dir,
+            max(max(w) + REPETITIONS * sum(w) for w in width_sets),
+        )
     if not real_prompts and any(knob.draft_kinds for knob in knobs):
         # Synthetic ids decode to text no draft predicts: acceptance sits
         # near zero and every draft knob's verdict measures a workload
@@ -1488,6 +1787,7 @@ def tune(
                     prompts=prompts,
                     incumbent=best_metrics,
                     sigma=sigma,
+                    decision=decision,
                 )
             except (OSError, RuntimeError) as error:
                 log(f"{knob.env}={value} · failed ({error})")
@@ -1502,7 +1802,7 @@ def tune(
                 parity = (
                     None
                     if knob.quality_sensitive or knob.may_diverge
-                    else _tokens_match(cand_samples, incumbent_samples)
+                    else parity_of(cand_samples, incumbent_samples)
                 )
                 if parity is False:
                     # A faster path that reassociates reductions can flip
@@ -1531,7 +1831,7 @@ def tune(
     if best_metrics is None:
         pressured = contaminated or _wait_for_pressure(log)
         best_metrics, baseline_samples = measure(
-            binary, assembly_dir, {}, prompts=prompts
+            binary, assembly_dir, {}, prompts=prompts, decision=decision
         )
         sigma = _baseline_sigma(baseline_samples)
         log(f"baseline · {best_metrics}")
@@ -1548,6 +1848,9 @@ def tune(
     # incumbent env's per-rep digests — the baseline's until a winner's
     # own measurement replaces them with the new best env's.
     incumbent_samples = (results.get("baseline") or {}).get("samples") or {}
+    # The parity check a kept-or-rejected verdict runs: answer digests for
+    # a decision model, emitted-token digests for generative families.
+    parity_of = _answers_match if decision is not None else _tokens_match
 
     # The kernel pass's winners as candidate zero: measured once
     # whole-model against the baseline, kept only when the keep rule says
@@ -1568,6 +1871,7 @@ def tune(
                 prompts=prompts,
                 incumbent=best_metrics,
                 sigma=sigma,
+                decision=decision,
             )
         except (OSError, RuntimeError) as error:
             log(f"kernels · fitted env failed ({error})")
@@ -1582,7 +1886,7 @@ def tune(
                 results["kernels"]["pressured"] = pressured
                 verdicts["kernels"] = "pressured"
             elif _keeps(kernel_metrics, best_metrics, sigma):
-                if _tokens_match(kernel_samples, incumbent_samples) is False:
+                if parity_of(kernel_samples, incumbent_samples) is False:
                     # A faster plan that reassociates the reductions can
                     # flip draft-accepted tokens (DeviceTuning.cpp rejects
                     # such splits for the same reason) — the throughput
@@ -1692,6 +1996,7 @@ def tune(
                 prompts=prompts,
                 incumbent=best_metrics,
                 sigma=sigma,
+                decision=decision,
             )
         except (OSError, RuntimeError) as error:
             log(f"-{name}={value} · failed ({error}) — kept")
@@ -1797,7 +2102,11 @@ def tune(
                     verdicts[candidate_key] = "rejected"
                 write()
     elif agentic:
-        log("agentic · no constrained-decode knobs eligible — pass skipped")
+        log(
+            "agentic · decision models never decode — pass skipped"
+            if decision is not None
+            else "agentic · no constrained-decode knobs eligible — pass skipped"
+        )
 
     record[context.chip]["complete"] = True
     _write_record(assembly_dir, record)

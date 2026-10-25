@@ -118,6 +118,14 @@ class Job:
     tools_signature: tuple | None = None
     response_previous_id: str | None = None
     response_history_items: list | None = None
+    # Request fields the response object echoes back to the client.
+    response_metadata: dict | None = None
+    response_tools: list | None = None
+    response_tool_choice: object = "auto"
+    response_instructions: object = None
+    response_reasoning: dict | None = None
+    response_max_output_tokens: object = None
+    response_top_logprobs: object = None
     return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
@@ -128,6 +136,10 @@ class Job:
     # Leading prompt tokens that later requests are expected to share (the
     # system prompt and tools); zero when unknown.
     shared_prefix_tokens: int = 0
+    # A shared prompt prefix held outside prompt_tokens so score batches
+    # reference it instead of copying it per job; the prompt on the wire is
+    # prefix_tokens + prompt_tokens.
+    prefix_tokens: tuple = ()
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
     output_clamped_to_context: bool = False
@@ -143,6 +155,12 @@ class Job:
         """Whether the output may call a tool: tools are offered under a
         choice other than none."""
         return self.tool_policy is not None and bool(self.tool_policy.schemas)
+
+    @property
+    def prompt_total(self):
+        """The whole prompt's length: the shared prefix plus the job's own
+        tokens."""
+        return len(self.prefix_tokens) + len(self.prompt_tokens)
 
 
 class CallbackStreamer:
@@ -544,7 +562,7 @@ class NativeBackend:
 
     @staticmethod
     def _decode_status_event(event):
-        snapshot = json_codec.loads(event.json)
+        snapshot = json_codec.loads_compact(event.json)
         if (
             not isinstance(snapshot, dict)
             or snapshot.get("schema_version") != wire.STATUS_SCHEMA_VERSION
@@ -684,6 +702,7 @@ class NativeBackend:
             remaining_deadline_micros=0,
             logical_max_output_tokens=job.max_new_tokens,
             prompt_tokens=tuple(job.prompt_tokens),
+            prefix_tokens=job.prefix_tokens,
             sampling=job.sampling,
             seed=job.seed,
             constraint=constraint,
@@ -699,7 +718,10 @@ class NativeBackend:
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
 
-    def submit(self, job):
+    def _register(self, job):
+        """The job's streamer, event state and callbacks, registered under
+        `self.active`; (state, request, on_event, on_complete) or None when
+        the backend is closing."""
         state = None
 
         def stop_matched():
@@ -772,8 +794,15 @@ class NativeBackend:
                         ),
                     )
                 )
-                return
+                return None
             self.active[job.request_id] = state
+        return state, request, on_event, on_complete
+
+    def submit(self, job):
+        registered = self._register(job)
+        if registered is None:
+            return
+        state, request, on_event, on_complete = registered
         try:
             call = self.runtime.submit(
                 request, on_event=on_event, on_complete=on_complete
@@ -807,6 +836,73 @@ class NativeBackend:
                     refusal = self.refusal()
                 job.events.put(("error", refusal or self._api_error(error)))
 
+    def submit_score_batch(self, jobs):
+        """One wire frame for score-only jobs sharing a prompt prefix; jobs
+        that do not share it, or a runtime without batch support, fall back
+        to per-request submission."""
+        shared = jobs[0].shared_prefix_tokens if jobs else 0
+        prefix = jobs[0].prefix_tokens if jobs else ()
+        batchable = shared > 0 and all(
+            job.score_tokens
+            and job.shared_prefix_tokens == shared
+            and job.prefix_tokens == prefix
+            for job in jobs
+        )
+        submit_batch = getattr(self.runtime, "submit_batch", None)
+        if len(jobs) < 2 or not batchable or submit_batch is None:
+            for job in jobs:
+                self.submit(job)
+            return
+        registered = []
+        for job in jobs:
+            entry = self._register(job)
+            if entry is not None:
+                registered.append((job, *entry))
+        if not registered:
+            return
+        try:
+            calls = submit_batch(
+                [entry[2] for entry in registered],
+                [entry[3] for entry in registered],
+                [entry[4] for entry in registered],
+            )
+            with self.lock:
+                for (_, state, _request, _ev, _done), call in zip(
+                    registered, calls
+                ):
+                    if not state.detached:
+                        state.call = call
+            for (job, state, _request, _ev, _done), call in zip(
+                registered, calls
+            ):
+                if (
+                    state.detached
+                    or self.closing
+                    or job.cancelled.is_set()
+                ):
+                    call.cancel()
+        except Exception as error:
+            for job, state, _request, _ev, _done in registered:
+                with self.lock:
+                    deliver = (
+                        not state.detached and not state.terminal_enqueued
+                    )
+                    if deliver:
+                        self._detach_locked(state)
+                if deliver:
+                    refusal = None
+                    if isinstance(
+                        error,
+                        (
+                            engine_runtime.EngineUnhealthy,
+                            engine_runtime.RuntimeClosed,
+                        ),
+                    ):
+                        refusal = self.refusal()
+                    job.events.put(
+                        ("error", refusal or self._api_error(error))
+                    )
+
     @staticmethod
     def _pushes_forced(constraint):
         """Whether the host pushes this constraint's forced-token spans. A
@@ -838,9 +934,9 @@ class NativeBackend:
         # the engine's own stop tokens; past the frame's limit the host-mask
         # path serves the request instead.
         if len(constraint.eos_tokens) > 8:
-            logger.info(
-                "constraint dfa skipped: %d grammar eos ids over frame limit",
-                len(constraint.eos_tokens),
+            print_status(
+                f"Constraint · grammar eos ids {len(constraint.eos_tokens)} "
+                "over frame limit; host-mask path serves"
             )
             return
         compiled = constraint.dfa
@@ -888,7 +984,7 @@ class NativeBackend:
                 (
                     "progress",
                     {
-                        "total": len(job.prompt_tokens),
+                        "total": job.prompt_total,
                         "cache": job.cache.matched_tokens,
                         "processed": event.processed_tokens,
                         "time_ms": event.elapsed_micros / 1000.0,
@@ -1102,7 +1198,7 @@ class NativeBackend:
     def _record(self, job, result=None, error=None):
         record = {
             "outcome": result.reason if result else "error",
-            "prompt_tokens": len(job.prompt_tokens),
+            "prompt_tokens": job.prompt_total,
         }
         if result:
             record["completion_tokens"] = result.completion_tokens

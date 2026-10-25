@@ -463,14 +463,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // A pending speculative draft holds the one in-flight command slot.
   impl_->settleGpuPredraft();
   const auto encodeStart = std::chrono::steady_clock::now();
-  const bool constrained = plan.constrained;
-  if (plan.decodeStage != DecodeStage::Regular) {
-    if (!constrained) {
-      throw std::invalid_argument(
-          "only constrained decode uses a specialized decode stage");
-    }
+  if (plan.decodeStage != DecodeStage::Regular)
     return impl_->submitInitialSelection(items, std::move(completion));
-  }
   // DiffusionGemma's decode is the whole canvas denoising loop, synchronous
   // and single-lane: it selects no anchors and commits up to a canvas of
   // tokens per step (RuntimeDiffusion.mm).
@@ -486,13 +480,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::array<uint32_t, kLaneCount> proposals{};
   std::array<uint32_t, kLaneCount> liveRows{};
   std::array<uint32_t, kLaneCount> budgets{};
+  // A cycle holding a constrained lane waits for the host's masks between
+  // its commands (ConstrainedDecodeTicket); free lanes run the same
+  // commands and ask for no mask.
+  bool constrained = false;
+  for (const ModelBatchItem &item : items)
+    constrained = constrained ||
+                  impl_->request(item.requestId).constraint ==
+                      ConstraintMode::TokenMask;
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
-    if ((entry.constraint == ConstraintMode::TokenMask) != constrained) {
-      throw std::invalid_argument(
-          "request does not belong to the batch's constraint mode");
-    }
     if (entry.decodeStage != DecodeStage::Regular) {
       throw std::logic_error("request decode stage does not match decode plan");
     }
@@ -505,7 +503,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       throw std::logic_error("terminal anchor was not emitted on selection");
     }
 
-    if (constrained && !entry.maskWords.empty())
+    if (!entry.maskWords.empty())
       throw std::logic_error("constrained request has stale mask state");
     if (Impl::samplingEnabled(entry)) {
       Impl::stageSamplingCycle(entry);
@@ -518,7 +516,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     Impl::DecodeLaneResult &laneResult = lanes[lane];
     laneResult.request = &entry;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.maximumRetained =
+        std::min(remaining, impl_->geometry.draft.verifyRows());
 
     // The lane's proposal budget caps acceptance at one row below its
     // retention limit anyway; a lane near its output cap verifies only the
@@ -527,7 +526,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     const uint32_t proposalCap =
         modelPolicy().proposalCap.value_or(impl_->geometry.draft.proposalLimit());
     const uint32_t budget =
-        impl_->adaptiveProposals_ && !constrained
+        impl_->adaptiveProposals_ &&
+                entry.constraint != ConstraintMode::TokenMask
             ? std::clamp(entry.proposalBudget,
                          std::min<uint32_t>(1, proposalCap), proposalCap)
             : proposalCap;
@@ -564,10 +564,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // proposals; there is no tree table, so it stays a chain. The n-gram
   // predraft does emit comb tables for a tree-eligible Null draft batch.
   impl_->ngram_.predraftedTree_ = false;
+  const bool gpuPredrafted =
+      (!constrained || nullDraft) &&
+      impl_->adoptGpuPredraft(entries, items, width, !treeBatch);
   const bool predrafted =
       (!constrained || nullDraft) &&
-      (impl_->adoptGpuPredraft(entries, items, width, !treeBatch) ||
-       impl_->applyAnePredraft(entries, items, width) ||
+      (gpuPredrafted || impl_->applyAnePredraft(entries, items, width) ||
        impl_->applyNgramPredraft(entries, width, nullDraft && treeBatch));
   // Adaptive draft bypass: when every lane's acceptance EWMA sits below the
   // draft's break-even cost, the batch decodes anchor-only — the draft
@@ -596,7 +598,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
         // emits real verified tokens. All verify rows stay live so a
         // matched row never emits a dead row's stale argmax.
         proposals[lane] = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
-        liveRows[lane] = kDecodeRows;
+        liveRows[lane] = impl_->geometry.draft.verifyRows();
         lanes[lane].proposals = proposals[lane];
         entry.draftBypassed = true;
         std::fill_n(
@@ -665,6 +667,41 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 impl_->geometry.draft.queryRows());
     impl_->encodeDraftBatchGraph(commandGraph, entries,
                                  {logicalPositions.data(), width});
+  }
+  // Every chain batch chooses its verify rows: a MoE target's by expected
+  // tokens per cost (model::VerifyBudget, the selector's confidences), every
+  // other cycle's to its live rows (every_row), which keeps dead rows out of
+  // the expert groups and bounds acceptance. A tree batch routes its live
+  // nodes instead — its acceptance kernel reads no verify rows.
+  if (!tree) {
+    const bool drafted =
+        !predrafted && !draftBypassed && !spanSkipDraft && !nullDraft;
+    ops::VerifyRowsModel verify;
+    if (drafted && !impl_->everyVerifyRow_ &&
+        impl_->geometry.target.ffnKind == FfnKind::SparseMoe &&
+        !impl_->verifyBudget_.explores(width, constrained)) {
+      const VerifyBudget::Acceptance &acceptance =
+          impl_->verifyBudget_.acceptance();
+      verify = {acceptance.slope, acceptance.intercepts,
+                impl_->verifyBudget_.costs(width, constrained), false};
+    }
+    for (uint32_t lane = 0; lane < width; ++lane)
+      lanes[lane].verifyLabels = drafted;
+    // RICHENGINE_DRAFT_CONF_MIN prunes to a lane's confidence-head prefix
+    // — valid only on a cycle whose draft graph just scored it (this
+    // step's or an adopted GPU predraft's). Constrained lanes can replace
+    // the proposals the score described with a forced span, so they keep
+    // the unpruned rows. Other predrafts leave stale confidences.
+    const float confMin =
+        std::holds_alternative<DSparkDraft>(impl_->draftModel) &&
+                !constrained && (drafted || gpuPredrafted)
+            ? static_cast<float>(tuning().draftConfMin)
+            : 0.0F;
+    ops::DraftSelector::addVerifyRows(
+        commandGraph,
+        impl_->decodeArena->packed(DecodeTensor::VerifyConfidence, width),
+        impl_->decodeArena->packed(DecodeTensor::VerifyRows, width), verify,
+        {liveRows.data(), width}, confMin);
   }
   if (constrained) {
     // RICHENGINE_DFA_MERGE: a Full-mode batch whose lanes all carry a GPU
@@ -786,6 +823,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                                std::move(finish));
 }
 
+void Runtime::verifyEveryRow(bool every) noexcept {
+  impl_->everyVerifyRow_ = every;
+}
+
 uint32_t Runtime::residentLane(uint64_t requestId) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
@@ -858,7 +899,8 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
   const uint64_t expected =
       entry.verifyMaskInFlight
           ? uint64_t{entry.verifyMaskRows ? entry.verifyMaskRows
-                                         : kDecodeRows + 1} *
+                                         : impl_->geometry.draft.verifyRows() +
+                                               1} *
                 maskWords
           : maskWords;
   // The native loop matches each response's word count to its request.

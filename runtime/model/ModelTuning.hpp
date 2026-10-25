@@ -87,6 +87,10 @@ struct ModelTuning final {
   std::optional<bool> canvasPrefixExit;               // RICHENGINE_CANVAS_PREFIX_EXIT
   std::optional<bool> canvasCommitTail;               // RICHENGINE_CANVAS_COMMIT_TAIL
   std::optional<bool> canvasSpeculativePrefill;       // RICHENGINE_CANVAS_SPECULATIVE_PREFILL
+  // The constrained-decode (DFA) scope: "off" keeps every constraint on the
+  // host path, "forced" adds on-device forced spans, "full" computes masks
+  // and spans on the GPU. RICHENGINE_DFA_MODE overrides.
+  std::optional<std::string> dfaMode;
 };
 
 } // namespace richengine::model

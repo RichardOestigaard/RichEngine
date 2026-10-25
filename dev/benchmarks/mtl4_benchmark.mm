@@ -112,6 +112,39 @@ GraphResult runGraph(metal::MetalBackend &backend,
   return result;
 }
 
+// Two submissions in flight, as the engine's decode ring keeps them: the
+// first is submitted on a GPU-idle backend, the second while the first runs.
+// The second is the one a span replay has to survive, so its encode time is
+// what the banked-arena change buys.
+GraphResult runRing(metal::MetalBackend &backend,
+                    std::span<const metal::ComputeDispatch> graph,
+                    int rounds) {
+  GraphResult result;
+  for (int round = 0; round < rounds; ++round) {
+    const auto firstStart = Clock::now();
+    auto first = backend.submitCommandAsync(graph);
+    const auto secondStart = Clock::now();
+    auto second = backend.submitCommandAsync(graph);
+    const auto secondEnd = Clock::now();
+    static_cast<void>(first.wait());
+    const metal::CommandTiming timing = second.wait();
+    const auto end = Clock::now();
+    result.stats.submitMs += milliseconds(secondEnd - secondStart);
+    result.stats.waitMs += milliseconds(end - secondEnd);
+    result.stats.gpuMs += timing.gpuSeconds * 1e3;
+    static_cast<void>(firstStart);
+    if (round == rounds - 1) {
+      const auto *words = static_cast<const uint32_t *>(
+          graph.front().buffers.front().buffer.contents());
+      result.checksum = words ? words[0] : 0;
+    }
+  }
+  result.stats.submitMs /= rounds;
+  result.stats.waitMs /= rounds;
+  result.stats.gpuMs /= rounds;
+  return result;
+}
+
 struct NamedResult {
   const char *name;
   GraphResult result;
@@ -120,7 +153,7 @@ struct NamedResult {
 // One full measurement pass over the three graphs; emit prints the
 // machine-readable STATS lines --compare parses.
 std::vector<NamedResult> measure(const char *metallib, size_t dispatches,
-                                 int rounds) {
+                                 int rounds, bool ring) {
   metal::MetalBackend backend(metallib);
   const uint32_t count = 64;
   const uint32_t increment = 1;
@@ -155,9 +188,13 @@ std::vector<NamedResult> measure(const char *metallib, size_t dispatches,
       backend.submitCommand(icb);
   static_cast<void>(backend.submitCommand(gpuspan));
 
-  return {{"direct", runGraph(backend, direct, rounds)},
-          {"icb", runGraph(backend, icb, rounds)},
-          {"gpuspan", runGraph(backend, gpuspan, rounds)}};
+  const auto run = [&](std::span<const metal::ComputeDispatch> graph) {
+    return ring ? runRing(backend, graph, rounds)
+                : runGraph(backend, graph, rounds);
+  };
+  return {{"direct", run(direct)},
+          {"icb", run(icb)},
+          {"gpuspan", run(gpuspan)}};
 }
 
 void report(const char *name, const RunStats &stats, size_t dispatches,
@@ -283,7 +320,8 @@ int compare(const char *self, const char *metallib, size_t dispatches,
 int main(int argc, char **argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: %s METALLIB [dispatches] [rounds] [--emit|--compare]\n",
+                 "usage: %s METALLIB [dispatches] [rounds] "
+                 "[--emit|--compare|--ring]\n",
                  argv[0]);
     return 2;
   }
@@ -291,14 +329,16 @@ int main(int argc, char **argv) {
   const int rounds = argc > 3 ? std::atoi(argv[3]) : 40;
   bool emit = false;
   bool compare = false;
+  bool ring = false;
   for (int i = 4; i < argc; ++i) {
     emit |= std::strcmp(argv[i], "--emit") == 0;
     compare |= std::strcmp(argv[i], "--compare") == 0;
+    ring |= std::strcmp(argv[i], "--ring") == 0;
   }
   if (compare) return ::compare(argv[0], argv[1], dispatches, rounds);
 
   try {
-    for (const NamedResult &row : measure(argv[1], dispatches, rounds)) {
+    for (const NamedResult &row : measure(argv[1], dispatches, rounds, ring)) {
       if (emit) {
         ::emit(row, dispatches);
       } else {

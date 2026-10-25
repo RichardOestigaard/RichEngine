@@ -31,6 +31,7 @@ namespace richengine::model {
     std::vector<MetalBuffer> chunkValues(attentionLayers);
     TargetModelVerifyBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
+    buffers.gdnTape = gdnTape_;
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
     buffers.gdnHidden = d(DecodeTensor::GdnHidden);
@@ -105,6 +106,10 @@ namespace richengine::model {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    // A chain batch's verify rows, which a sparse-MoE target's steps route
+    // alone; a tree batch routes every live node.
+    if (!tree)
+      buffers.verifyRows = decodeArena->packed(DecodeTensor::VerifyRows, lanes);
     if (tree) {
       buffers.treeNodes = decodeArena->packed(DecodeTensor::TreeNodes, lanes);
       buffers.treeCounts =
@@ -290,7 +295,8 @@ namespace richengine::model {
          decodeArena->packed(DecodeTensor::RetainedCount, width),
          decodeArena->packed(DecodeTensor::AcceptedCount, width),
          decodeArena->packed(DecodeTensor::DfaTrunc, width),
-         truncLanes},
+         truncLanes,
+         decodeArena->packed(DecodeTensor::VerifyRows, width)},
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1],
         proposals,
@@ -351,7 +357,7 @@ namespace richengine::model {
     DecodeStepPackParams params{};
     params.lanes = lanes;
     params.output_stride = outputStride;
-    params.decode_rows = kDecodeRows;
+    params.decode_rows = geometry.draft.verifyRows();
     params.verify_stride = geometry.draft.verifyRows();
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const Request &entry = *entries[lane];
@@ -491,7 +497,8 @@ namespace richengine::model {
         gridParams.state_lanes[lane] = entries[lane]->stateLane;
         gridParams.maximum_retained[lane] = grid->maximumRetained[lane];
         gridParams.live_rows[lane] =
-            lane < liveRows.size() ? liveRows[lane] : kDecodeRows;
+            lane < liveRows.size() ? liveRows[lane]
+                                   : geometry.draft.verifyRows();
       }
       graph.add(std::string(ops::kDecodeDfaMaskGrid),
                 {decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),
@@ -520,10 +527,11 @@ namespace richengine::model {
       // liveRows bounds the chain's input walk; the mask pass writes one
       // next-state row per live row plus the anchor's row 0.
       const uint32_t live =
-          lane < liveRows.size() ? liveRows[lane] : kDecodeRows;
+          lane < liveRows.size() ? liveRows[lane]
+                                 : geometry.draft.verifyRows();
       walk.live_rows[lane] = live;
       mask.live_rows[lane] =
-          std::min(live + 1, uint32_t{kDecodeRows + 1});
+          std::min(live + 1, geometry.draft.verifyRows() + 1);
       mask.rows = std::max(mask.rows, mask.live_rows[lane]);
       if (entries[lane]->dfa) {
         walk.states[lane] = entries[lane]->dfa->states;
@@ -762,7 +770,7 @@ namespace richengine::model {
       params.state_lanes[lane] = entries[lane]->stateLane;
       params.maximum_retained[lane] =
           lane < maximumRetained.size() ? maximumRetained[lane]
-                                        : kDecodeRows;
+                                        : geometry.draft.verifyRows();
     }
     graph.add(std::string(ops::kDecodeDfaSpanApply),
               {decodeArena->packed(DecodeTensor::DfaForced, kLaneCount),

@@ -55,7 +55,7 @@ gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout) {
   geometry.hiddenSize = layout.hiddenSize;
   geometry.vocabularySize = layout.vocabularySize;
   geometry.intermediateSize = layout.intermediateSize;
-  geometry.attentionMask = Lfm2Layout::attentionMask;
+  geometry.attentionMask = layout.attentionMask;
   geometry.convolutionDimension = layout.convolutionDimension;
   geometry.convolutionTaps = Lfm2Layout::convolutionTaps;
   geometry.rmsEpsilon = layout.rmsEpsilon;

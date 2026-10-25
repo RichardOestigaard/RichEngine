@@ -1,7 +1,6 @@
 """JSON Schema validation with bounded regular-expression evaluation."""
 
 import copy
-import json
 import threading
 from collections import OrderedDict
 from functools import lru_cache
@@ -12,6 +11,7 @@ from jsonschema import ValidationError, validators
 from jsonschema.exceptions import UndefinedTypeCheck
 from referencing import Registry
 
+from . import json_codec
 from .errors import APIError
 
 
@@ -193,8 +193,7 @@ def check_schema(schema):
     A tool's schema needs no other check, as its calls are not validated, and
     a client sends its tools on every turn, so those that pass are kept."""
     global _checked_schemas_bytes
-    # json.dumps uses ASCII escapes, so character count equals source bytes.
-    key = json.dumps(schema, sort_keys=True)
+    key = json_codec.encode_compact(schema, sort_keys=True)
     with _checked_schemas_lock:
         if key in _checked_schemas:
             _checked_schemas.move_to_end(key)
@@ -221,8 +220,7 @@ def build_validator(schema):
     # check_schema walks the whole JSON Schema meta-schema; a response_format
     # schema is the same on every turn of a conversation, so cache the built
     # validator instead of re-validating and rebuilding it.
-    # json.dumps uses ASCII escapes, so character count equals source bytes.
-    key = json.dumps(schema, sort_keys=True)
+    key = json_codec.encode_compact(schema, sort_keys=True)
     with _validator_cache_lock:
         cached = _validator_cache.get(key)
         if cached is not None:

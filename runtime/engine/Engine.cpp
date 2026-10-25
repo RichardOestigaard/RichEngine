@@ -128,7 +128,6 @@ void Engine::submit(EngineRequest value) {
   scheduler_.submit(
       {.id = id,
        .priority = stored.request.priority,
-       .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
        .deadlineMilliseconds = stored.request.deadlineMilliseconds});
   ++counters_.submitted;
@@ -1014,27 +1013,51 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   }
 
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
-  // Plan draft windows before prefill; arbitrary chunk ends do not carry a
-  // complete draft state. Progress points remain disposable after restoration.
-  for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, checkpointTokens_)) {
-    addStateBoundary(active, stateBoundary, checkpoint, true);
+  // A score-only lane dies at its readout: it decodes nothing, resumes
+  // nobody mid-prompt, and its suffix state serves no later request, so the
+  // checkpoints and the replay-state publication each only cost a command
+  // split and a snapshot. Junctions still arm — later questions resume
+  // from them.
+  const bool scoreOnly = !active.request.scoreTokens.empty();
+  if (!scoreOnly) {
+    // Plan draft windows before prefill; arbitrary chunk ends do not carry a
+    // complete draft state. Progress points remain disposable after
+    // restoration.
+    for (const uint32_t checkpoint : plannedCheckpoints(
+             stateBoundary, latestReplayBoundary, checkpointTokens_)) {
+      addStateBoundary(active, stateBoundary, checkpoint, true);
+    }
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  // A score-only request replays nothing but its prompt, so a decision
+  // batch's questions share a state prefix of any size: their junctions
+  // clear a page, not the draft-scale gain that bounds ordinary junction
+  // cost.
+  const uint32_t junctionGain =
+      scoreOnly ? KvCache::pageTokens : kMinimumJunctionGain;
+  if (junctionBoundary >= stateBoundary + junctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false);
   // A prefix other requests will share is a junction they have not reached
   // yet: keeping its state now spares the first of them recomputing it.
   const uint32_t sharedJunction = active.request.sharedPrefixTokens /
                                   KvCache::pageTokens * KvCache::pageTokens;
-  if (sharedJunction >= stateBoundary + kMinimumJunctionGain)
+  if (sharedJunction >= stateBoundary + junctionGain)
     addStateBoundary(active, stateBoundary, sharedJunction, false);
-  addStateBoundary(active, stateBoundary, latestReplayBoundary,
-                   latestReplayBoundary != promptReplayBoundary(active));
-  // A resumed lane below its prompt's replay point lost that state; it
-  // rebuilds the one its conversation's next turn resumes from on the way.
-  addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false);
+  if (!scoreOnly) {
+    addStateBoundary(active, stateBoundary, latestReplayBoundary,
+                     latestReplayBoundary != promptReplayBoundary(active));
+    // A resumed lane below its prompt's replay point lost that state; it
+    // rebuilds the one its conversation's next turn resumes from on the
+    // way.
+    addStateBoundary(active, stateBoundary, promptReplayBoundary(active),
+                     false);
+  }
 
-  static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
+  // A score-only lane publishes no state, so boundaries armed on it for a
+  // peer's divergence can never materialize: its shared prefix's junction
+  // is the only boundary its batch needs, and scanning every live request
+  // per admission is O(batch²) prompt compares for nothing.
+  if (!scoreOnly)
+    static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
   return pendingDraftStatePlan(active, stateBoundary);
 }
 
@@ -1393,9 +1416,17 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
   // command; the scheduler's active window and the backend's ring both
   // hold at most two. The AR decode contract is the only one the ring
   // covers: a canvas decode runs its whole schedule inside submit() and a
-  // constrained batch exchanges masks with the host between commands.
+  // batch holding a constrained lane exchanges masks with the host
+  // between commands.
+  const auto anyConstrained = [this](const BatchPlan &plan) {
+    return std::any_of(
+        plan.items.begin(), plan.items.end(), [this](const BatchItem &item) {
+          return request(item.requestId).request.constraint ==
+                 ConstraintMode::TokenMask;
+        });
+  };
   if (!enabled || !pending_.empty() ||
-      retired.plan.kind != WorkKind::Decode || retired.plan.constrained ||
+      retired.plan.kind != WorkKind::Decode || anyConstrained(retired.plan) ||
       retired.plan.decodeStage != DecodeStage::Regular ||
       retired.plan.items.size() != results.size() ||
       model_.decodeAdmissionTokens() !=
@@ -1442,7 +1473,7 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
   // plan and the scheduler's commit both read the pre-completion state
   // correctly; complete() then records the same phases the plan assumed.
   std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
-  if (!plan || plan->kind != WorkKind::Decode || plan->constrained ||
+  if (!plan || plan->kind != WorkKind::Decode || anyConstrained(*plan) ||
       plan->decodeStage != DecodeStage::Regular || plan->empty()) {
     return false;
   }

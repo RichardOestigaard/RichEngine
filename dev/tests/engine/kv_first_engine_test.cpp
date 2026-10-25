@@ -212,6 +212,9 @@ public:
             request.id,
             Request{.lane = lane,
                     .resident = true,
+                    .scoring = !request.scoreTokens.empty(),
+                    .scoreCount =
+                        static_cast<uint32_t>(request.scoreTokens.size()),
                     .constrained =
                         request.constraint == ConstraintMode::TokenMask});
         prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
@@ -307,6 +310,14 @@ public:
         step.outputTokensWithoutKv = 1;
         step.finished = *prefillAnchor;
       }
+      // A score-only request ends on its last prompt chunk: the option
+      // logits, never a generated token.
+      if (state.scoring &&
+          item.logicalPosition + item.tokenCount ==
+              prompts.at(item.requestId).size()) {
+        step.finished = true;
+        step.scoreLogits.assign(state.scoreCount, 0.5f);
+      }
       result.push_back(std::move(step));
     }
     return result;
@@ -370,7 +381,12 @@ public:
     checkPageTables(items);
     // Every constrained cycle after the first token waits for its mask
     // inside the ticket, as the production constrained ticket does.
-    if (plan.kind == WorkKind::Decode && plan.constrained &&
+    const bool anyConstrained = std::any_of(
+        plan.items.begin(), plan.items.end(), [&](const BatchItem &item) {
+          const auto found = requests.find(item.requestId);
+          return found != requests.end() && found->second.constrained;
+        });
+    if (plan.kind == WorkKind::Decode && anyConstrained &&
         plan.decodeStage == DecodeStage::Regular) {
       overlap = std::make_shared<MaskOverlapState>();
       overlap->requestId = items.front().requestId;
@@ -488,6 +504,8 @@ public:
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;
+    bool scoring = false;
+    uint32_t scoreCount = 0;
     bool constrained = false;
   };
   std::unordered_map<uint64_t, Request> requests;
@@ -1298,6 +1316,74 @@ void testSharedPrefixStateServesTheFirstReuse() {
     rejected = true;
   }
   require(rejected, "a shared prefix beyond the prompt was admitted");
+}
+
+// Score-only requests are the decision pathway's batch shape: every
+// question shares the whole state prefix and each is its own replay, so a
+// shared junction pays at any size — the draft-scale gain only bounds
+// junctions for generation.
+void testScoreSharedPrefixJunctionBelowGain() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> head(161);
+  std::iota(head.begin(), head.end(), 1);
+  const auto score = [](uint64_t id, const std::vector<uint32_t> &prompt) {
+    EngineRequest value = request(id, prompt);
+    value.maxNewTokens = 0;
+    value.scoreTokens = {10, 20, 30};
+    value.sharedPrefixTokens = 70;
+    return value;
+  };
+  engine.submit(score(1, head));
+  runUntilIdle(engine);
+  head.resize(64);
+  head.resize(161, 500);
+  engine.submit(score(2, head));
+  runUntilIdle(engine);
+  require(events.starts.size() == 2 && events.starts[1] == 64,
+          "a score request's small shared prefix kept no junction");
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "score requests did not complete cleanly");
+}
+
+void benchScoreBatchPacking() {
+  test::TestKvStorage storage(4096, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+  constexpr uint32_t kItems = 8;
+  const auto score = [](uint64_t id, const std::vector<uint32_t> &prompt) {
+    EngineRequest value = request(id, prompt);
+    value.maxNewTokens = 0;
+    value.scoreTokens = {10, 20, 30};
+    value.sharedPrefixTokens = 70;
+    return value;
+  };
+  for (uint32_t id = 1; id <= kItems; ++id) {
+    std::vector<uint32_t> prompt(161, 7);
+    std::fill(prompt.begin() + 70, prompt.end(), id + 10);
+    engine.submit(score(id, prompt));
+  }
+  runUntilIdle(engine);
+  std::fprintf(stderr,
+               "bench score-batch packing: commands=%zu widths=",
+               model.prefillWidths.size());
+  for (uint32_t width : model.prefillWidths)
+    std::fprintf(stderr, "%u,", width);
+  std::fprintf(stderr,
+               " rows=%u restored=%u completed=%u starts=%zu states=%u\n",
+               model.prefillRows, model.restored, events.completedCount,
+               events.starts.size(), cache.snapshot().stateCache.entries);
+  require(events.completedCount == kItems && events.failedCount == 0,
+          "score batch did not complete cleanly");
 }
 
 void testImageSpansKeyPrefixIdentity() {
@@ -9089,6 +9175,8 @@ int main() {
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testSharedPrefixStateServesTheFirstReuse();
+    testScoreSharedPrefixJunctionBelowGain();
+    benchScoreBatchPacking();
     testImageSpansKeyPrefixIdentity();
     testSharedPrefillBoundaryStopsAtTheFirstDifferentImage();
     testOneRequestPublishesJunctionAndLatestReplayState();

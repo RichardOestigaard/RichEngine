@@ -58,10 +58,21 @@ struct GDNDecodeBatchParams {
   // The packed lane stride of the verify tensors: RICHENGINE_TARGET_VERIFY_ROWS
   // unless the draft's trained block is shorter (draft.verifyRows()).
   uint32_t verify_stride;
+  // The committed-state fold: per lane, the byte offset of the previous
+  // step's retained rows in the tape buffer (their k/v columns, decay and
+  // beta as the decode tensors pack them) and how many the lane kept. The
+  // scan advances the state over them without emitting; a lane with zero
+  // retains none. GDN_TAPE_FOLD keeps the standalone commit when off.
+  uint64_t pending_tape[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t pending_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // The lane's current-step tape region: the fused kernel's prologue leaves
+  // the step's rows (conv inputs, kv, decay, beta) there for the next step's
+  // pending prefix. Parity alternates with the state slots.
+  uint64_t step_tape[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 56,
-              "GDN decode parameters are 56 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 136,
+              "GDN decode parameters are 136 bytes on both sides");
 
 struct GDNBatchCommitParams {
   uint64_t conv_layer_bytes;

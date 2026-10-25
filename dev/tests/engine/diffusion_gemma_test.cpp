@@ -462,6 +462,10 @@ void writeFile(const std::filesystem::path &path, std::string_view text) {
   require(bool(out), "unable to write the fixture");
 }
 
+// DiffusionGemma is disabled for v1.0.0 (its trunk emits incoherent text,
+// docs/diffusion_issue.md): the family table and the packed-format branch
+// in ModelDescriptor.mm no longer accept it. These checks pin the refusal
+// so a re-enable is a deliberate act.
 void checkDescriptor() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
@@ -539,65 +543,15 @@ void checkDescriptor() {
     }
   })json");
 
-  const model::ModelDescriptor descriptor = model::inspectModelPackage(root);
-  require(descriptor.name == "google/diffusiongemma-26B-A4B-it",
-          "the descriptor lost the model name");
-  const auto *diffusionLayout =
-      std::get_if<model::DiffusionGemmaLayout>(&descriptor.target);
-  require(diffusionLayout, "the descriptor did not pick the diffusion layout");
-  require(diffusionLayout->diffusion.canvasLength == 256 &&
-              diffusionLayout->diffusion.stabilityThreshold == 1,
-          "the manifest's diffusion block did not reach the layout");
-  require(descriptor.targetSource == model::TargetSource::Packed &&
-              descriptor.draft.kind == model::DraftKind::Null &&
-              descriptor.visionSource == model::VisionSource::None,
-          "a diffusion package is a packed text-only, draftless target");
-  require(descriptor.capabilities.vocabularySize == 262144 &&
-              descriptor.targetKvLayout.valid(),
-          "the descriptor's capabilities or KV layout are wrong");
-
-  // A declared draft or a missing diffusion block must reject.
-  writeFile(root / "tokenizer" / "config.json", R"json({
-    "model_type": "diffusion_gemma",
-    "text_config": {
-      "model_type": "diffusion_gemma_text",
-      "hidden_size": 2816,
-      "vocab_size": 262144,
-      "max_position_embeddings": 131072
-    }
-  })json");
-  std::ifstream manifest(root / "manifest.json");
-  std::string text((std::istreambuf_iterator<char>(manifest)),
-                   std::istreambuf_iterator<char>());
-  const size_t offset = text.find("\"diffusion\"");
-  require(offset != std::string::npos, "fixture manifest lacks diffusion");
-  const std::string original = text.substr(offset);
-  // Draft declaration rejection.
-  writeFile(root / "manifest.draft.json",
-            text.substr(0, offset) +
-                "\"draft\": {\"kind\": \"plain\"},\n" + original);
-  std::filesystem::rename(root / "manifest.draft.json",
-                          root / "manifest.json");
+  // The packed manifest refuses at the format gate while the family is
+  // disabled; every shape of the package follows it out.
   bool threw = false;
   try {
     static_cast<void>(model::inspectModelPackage(root));
   } catch (const std::invalid_argument &) {
     threw = true;
   }
-  require(threw, "a diffusion manifest with a draft was accepted");
-  // A foreign target architecture rejects.
-  const size_t architecture = text.find("diffusion_gemma_text");
-  require(architecture != std::string::npos, "fixture lacks architecture");
-  writeFile(root / "manifest.json",
-            text.substr(0, architecture) + "gemma4_text" +
-                text.substr(architecture + 20));
-  threw = false;
-  try {
-    static_cast<void>(model::inspectModelPackage(root));
-  } catch (const std::invalid_argument &) {
-    threw = true;
-  }
-  require(threw, "a wrong architecture was accepted");
+  require(threw, "a disabled diffusion package was accepted");
 
   std::filesystem::remove_all(root, ec);
 }

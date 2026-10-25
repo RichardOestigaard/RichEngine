@@ -80,7 +80,7 @@ loadDFlashDraftWeights(metal::MetalBackend &backend, const DraftFiles &files,
 // Builds the draft layer graph and its proposal selection
 // (ops::DraftSelector) from packed buffers and persistent context; the
 // target's sampling and acceptance policy remain outside the model.
-class DFlashDraft final {
+class DFlashDraft {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators);

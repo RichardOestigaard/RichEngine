@@ -190,6 +190,60 @@ struct SelectorBatchParams {
 static_assert(sizeof(SelectorBatchParams) == 52,
               "Draft selector parameters are 52 bytes on both sides");
 
+// The rows of its block each lane of a decode cycle verifies (its verify
+// rows, draft_verify_rows), chosen for the whole batch by expected accepted
+// tokens per unit of the cycle's cost (model::VerifyBudget). The selector
+// writes each lane's confidence at each position: the largest probability
+// among the position's candidates (the softmax at temperature 1 of their
+// scores), which does not depend on the candidate the lane draws there.
+// Once the proposals before it are accepted, a proposal is accepted with
+// probability p, where logit(p) = slope * logit(confidence) +
+// intercept[position]; a lane's survival at a position, the product of p up
+// to it, is the probability that its proposals up to it are all accepted,
+// and verifying one more row adds that much to the lane's expected tokens.
+// Every lane verifies its anchor; the rows past it go to the largest
+// survivals over all lanes, as many as maximize the expected tokens over
+// cost[the rows verified in all], none past a lane's maximum (its live
+// rows). With every_row, each lane verifies its maximum. The verify's MoE
+// steps route the verify rows alone (moe_group_routes_verified), and
+// acceptance retains at most that many tokens.
+// conf_min, when nonzero, additionally caps a lane's rows at its
+// confidence prefix: the first position whose confidence head sigmoid
+// (draft_conf_score, RICHENGINE_DRAFT_CONF_MIN) falls under conf_min cuts
+// the proposal suffix there — the DSpark confidence-scheduled prune.
+struct VerifyRowsParams {
+  float slope;
+  float intercept[RICHENGINE_DRAFT_PROPOSAL_TOKENS];
+  float cost[RICHENGINE_DRAFT_QUERY_ROWS * RICHENGINE_MAXIMUM_BATCH_WIDTH + 1];
+  uint32_t lanes;
+  uint32_t every_row;
+  uint32_t maximum[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  float conf_min;
+};
+
+static_assert(sizeof(VerifyRowsParams) ==
+                  16 + 4 * RICHENGINE_DRAFT_PROPOSAL_TOKENS +
+                      4 * (RICHENGINE_DRAFT_QUERY_ROWS *
+                               RICHENGINE_MAXIMUM_BATCH_WIDTH +
+                           1) +
+                      4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
+              "Verify rows parameters differ across the ABI");
+
+// draft_conf_score's payload: the DSpark confidence head's operand
+// geometry — the lanes, the draft's final-hidden width, the Markov rank
+// whose W1 predecessor feature the head appends, the proposal table's
+// token bound and the draft block's packed query-row stride.
+struct DraftConfScoreParams {
+  uint32_t lanes;
+  uint32_t hidden_size;
+  uint32_t rank;
+  uint32_t vocabulary;
+  uint32_t query_rows;
+};
+
+static_assert(sizeof(DraftConfScoreParams) == 20,
+              "Draft confidence score parameters are 20 bytes on both sides");
+
 // The draft top-16 shard kernels' scalar payload (draft_select_top16_sharded,
 // dspark_select_top16_sharded): the token bound and the logits row stride,
 // which differ on a padded-vocabulary target.

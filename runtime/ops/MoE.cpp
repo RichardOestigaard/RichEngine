@@ -426,7 +426,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                scratch.groupedSums, scratch.expertIntermediate,
                scratch.expertIntermediate, scratch.expertIntermediate,
                scratch.expertIntermediate, scratch.expertIntermediate},
-              GgufDecodeParams{intermediate, 1, hidden, 0},
+              GgufDecodeParams{intermediate, 1, hidden, 0, 0},
               {uint64_t{tiles} * plan.tileRows() * intermediate / 32, 1, 1},
               {32, 1, 1});
   }
@@ -500,8 +500,12 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // The stats generation makes the dispatch's record slot unique across the
   // process; the baked span replays it through addPatchable below.
   const uint32_t stats = statsEnabled() ? ++statsSequence() : 0;
+  if (buffers.verifyRows &&
+      plan.phase() != MoePhase::Decode)
+    throw std::invalid_argument("only a verify step's MoE routes its verify rows");
   const MoeGroupParams groupParams{rows, shape.expertsPerToken, tileRows,
-                                   shape.experts, shape.sharedExpert, stats};
+                                   shape.experts, shape.sharedExpert, stats,
+                                   buffers.verifyRows ? plan.laneRows() : 0};
   // The union cap runs between select and grouping; it needs the separate
   // select even where the fused route-group would apply. The plan's value
   // (serve-native --moe-union) wins; RICHENGINE_MOE_UNION covers callers
@@ -522,7 +526,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // B4).
   const bool fusedRoute =
       !shape.sharedExpert && plan.phase() == MoePhase::Decode &&
-      plan.rows() <= 8 && !cap;
+      plan.rows() <= 8 && !cap && !buffers.verifyRows;
   metal::MetalBuffer expertBias;
   const bool block = weights.layout() == WeightLayout::Block32;
   if (block) {
@@ -593,16 +597,24 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   } else {
     // The counting and scatter loops stride by the threadgroup width; a
     // 1024-thread group quadruples both while threads past the 256 experts
-    // skip the per-expert bookkeeping between them.
+    // skip the per-expert bookkeeping between them. A verify step's grouping
+    // routes each lane's verify rows alone (MoeGroupParams::lane_rows).
+    std::vector<metal::MetalBuffer> grouping{
+        scratch.selectedExperts, scratch.tileDescriptors,
+        scratch.tileCount, scratch.groupedRoutes, scratch.routeRows};
+    if (buffers.verifyRows) {
+      if (buffers.verifyRows.sizeBytes() <
+          uint64_t{rows / plan.laneRows()} * sizeof(uint32_t))
+        throw std::invalid_argument("invalid MoE verify rows");
+      grouping.push_back(buffers.verifyRows);
+    }
+    const auto groupingKernel =
+        buffers.verifyRows ? kMoeGroupRoutesVerified : kMoeGroupRoutes;
     if (stats)
-      graph.addPatchable(std::string(kMoeGroupRoutes),
-                         {scratch.selectedExperts, scratch.tileDescriptors,
-                          scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
+      graph.addPatchable(std::string(groupingKernel), std::move(grouping),
                          groupParams, {1, 1, 1}, {1024, 1, 1});
     else
-      graph.add(std::string(kMoeGroupRoutes),
-                {scratch.selectedExperts, scratch.tileDescriptors,
-                 scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
+      graph.add(std::string(groupingKernel), std::move(grouping),
                 groupParams, {1, 1, 1}, {1024, 1, 1});
   }
   // The packed path (packsDecode's MoE analog): a plan on the `_n` kernels
@@ -722,11 +734,16 @@ void MoE::addGemma(metal::CommandGraph &graph, const MoeBuffers &buffers,
             routeParams, {rows, 1, 1}, {256, 1, 1});
   const uint32_t stats = statsEnabled() ? ++statsSequence() : 0;
   const MoeGroupParams groupParams{rows, shape.expertsPerToken, tileRows,
-                                   shape.experts, 0, stats};
-  graph.add(std::string(kMoeGroupRoutes),
-            {scratch.selectedExperts, scratch.tileDescriptors,
-             scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            groupParams, {1, 1, 1}, {1024, 1, 1});
+                                   shape.experts, 0, stats,
+                                   buffers.verifyRows ? plan.laneRows() : 0};
+  std::vector<metal::MetalBuffer> grouping{
+      scratch.selectedExperts, scratch.tileDescriptors,
+      scratch.tileCount, scratch.groupedRoutes, scratch.routeRows};
+  if (buffers.verifyRows)
+    grouping.push_back(buffers.verifyRows);
+  graph.add(std::string(buffers.verifyRows ? kMoeGroupRoutesVerified
+                                          : kMoeGroupRoutes),
+            std::move(grouping), groupParams, {1, 1, 1}, {1024, 1, 1});
   const uint32_t routesPerRow = shape.routesPerToken();
   const MoeExpertParams gate{shape.hiddenSize, shape.expertIntermediateSize,
                              shape.experts, routesPerRow,
@@ -862,7 +879,9 @@ MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, uint32_t verifyRows,
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !verifyRows ||
       verifyRows > RICHENGINE_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid MoE decode batch width");
-  return MoePlan(shape, lanes * verifyRows, config, MoePhase::Decode);
+  MoePlan plan(shape, lanes * verifyRows, config, MoePhase::Decode);
+  plan.laneRows_ = verifyRows;
+  return plan;
 }
 
 } // namespace richengine::ops

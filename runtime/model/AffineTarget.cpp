@@ -489,7 +489,7 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Lfm2Layout
   for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
   source.requireConfigNumberAtMost("max_position_embeddings", layout.maximumContextTokens);
   source.requireConfigString("model_type", "lfm2");
-  source.requireLayerTypeMask(layout.layers, Lfm2Layout::attentionMask, "full_attention", "conv");
+  source.requireLayerTypeMask(layout.layers, layout.attentionMask, "full_attention", "conv");
 }
 
 // The dense target's layer image (model.layers.N.): q/k/v fused, no norms.

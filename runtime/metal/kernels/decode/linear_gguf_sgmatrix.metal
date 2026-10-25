@@ -353,7 +353,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
   device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
-  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
+  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
   const auto pick = [&](auto body) {
     if constexpr (NativeMxfp4) quant_format_switch_native(p.fmt[s], body);
@@ -417,7 +417,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
   const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
-  const GgufDecodeParams q{K, 1, N, 0};
+  const GgufDecodeParams q{K, 1, N, 0, 0};
   const auto pick = [&](auto body) {
     if constexpr (NativeMxfp4) quant_format_switch_native(s.format, body);
     else quant_format_switch(s.format, body);

@@ -1,10 +1,10 @@
-import { createMemo, createSignal, onCleanup, For, Show } from "solid-js";
+import { createMemo, createSignal, onCleanup, Index, Show } from "solid-js";
 import { authorization, errorText, noteAuthStatus } from "../api";
 import { Chart, fmtTooltipRows } from "../Chart";
 import type { ChartAppend } from "../Chart";
 import { useCopied } from "../clipboard";
 import { useFreshness } from "../fresh";
-import { fmtInt, fmtMs } from "../format";
+import { fmtBytes, fmtInt, fmtMs, pct } from "../format";
 import { poll } from "../poll";
 import "./metrics.css";
 
@@ -113,13 +113,98 @@ function collapseToggle(event: Event) {
 }
 
 /* Series history lives at module scope: navigating away and back keeps the
-   collected points instead of restarting every chart empty. */
-const seriesHistory = new Map<string, number[]>();
-const scrapeTimes: number[] = [];
+   collected points instead of restarting every chart empty. Each point
+   carries its own scrape time, so a series that appears mid-session never
+   borrows a shared clock. richengine_info's instance label keys the map —
+   a restarted engine clears it. */
+const seriesHistory = new Map<string, { t: number; v: number }[]>();
+let instanceId: string | undefined;
 
-function pushScrapeTime(t: number) {
-  scrapeTimes.push(t);
-  if (scrapeTimes.length > 60) scrapeTimes.splice(0, scrapeTimes.length - 60);
+type Unit = "ms" | "s" | "bytes" | "ratio" | "count" | "none";
+
+/* Unit conventions from the metric name: *_seconds and *_milliseconds are
+   times, *_bytes sizes, *_ratio/_rate fractions. */
+function baseUnit(name: string): Unit {
+  if (name.endsWith("_milliseconds")) return "ms";
+  if (name.endsWith("_seconds")) return "s";
+  if (name.endsWith("_bytes")) return "bytes";
+  if (name.endsWith("_ratio") || name.endsWith("_rate")) return "ratio";
+  return "none";
+}
+
+/* A sample's unit: histogram/summary _sum keeps the family unit while
+   _count and _bucket are plain counts. */
+function unitOf(f: MetricFamily, s?: MetricSample): Unit {
+  if (s && s.name !== f.name)
+    return s.name.endsWith("_sum") ? baseUnit(f.name) : "count";
+  return baseUnit(f.name);
+}
+
+function fmtUnit(unit: Unit | undefined, v: number): string {
+  switch (unit) {
+    case "ms":
+      return fmtMs(v);
+    case "s":
+      return fmtMs(v * 1000);
+    case "bytes":
+      return fmtBytes(v);
+    case "ratio":
+      return pct(v);
+    default:
+      return fmtValue(v);
+  }
+}
+
+/* Families render under section heads; *_seconds histograms always land
+   in Latency, the rest group by the name's second token. */
+const SECTION_ORDER = [
+  "Throughput",
+  "Requests & scheduler",
+  "Latency",
+  "KV & cache",
+  "Memory & hardware",
+  "Masks & constraints",
+  "Images",
+  "Other",
+] as const;
+
+function sectionOf(name: string): string {
+  if (name.endsWith("_seconds")) return "Latency";
+  switch (name.replace(/^richengine_/, "").split("_")[0]) {
+    case "ttft":
+    case "itl":
+    case "prefill":
+    case "decode":
+    case "drafted":
+    case "accepted":
+    case "draft":
+    case "capacity":
+      return "Throughput";
+    case "requests":
+    case "frontend":
+    case "transport":
+    case "scheduler":
+    case "admission":
+      return "Requests & scheduler";
+    case "kv":
+    case "state":
+    case "cache":
+    case "response":
+      return "KV & cache";
+    case "memory":
+    case "metal":
+    case "thermal":
+      return "Memory & hardware";
+    case "mask":
+    case "masks":
+    case "constraint":
+      return "Masks & constraints";
+    case "image":
+    case "images":
+      return "Images";
+    default:
+      return "Other";
+  }
 }
 
 /* Compact series rendering: ints localized, long tails in exponential. */
@@ -144,9 +229,13 @@ export default function Metrics() {
   const [durationMs, setDurationMs] = createSignal<number | null>(null);
   /* Bumped so chartData re-reads the module-level seriesHistory. */
   const [historyTick, setHistoryTick] = createSignal(0);
-  const [chartAppend, setChartAppend] = createSignal<
-    (ChartAppend & { signature: string }) | null
-  >(null);
+  /* Rate view for cumulative families: a counter's ever-rising total says
+     little — the per-scrape Δv/Δt is the interesting shape. */
+  const [rateMode, setRateMode] = createSignal(false);
+  const [chartAppend, setChartAppend] = createSignal<{
+    signature: string;
+    append: ChartAppend;
+  } | null>(null);
   const { copied, copy } = useCopied();
 
   const seriesKey = (family: string, s: MetricSample) =>
@@ -165,20 +254,46 @@ export default function Metrics() {
       ? !s.name.endsWith("_bucket")
       : true;
 
+  /* Cumulative families: declared counters/histograms/summaries, plus the
+     _total convention for metrics the exposition leaves untyped. */
+  const rateable = (f: MetricFamily) =>
+    f.type === "counter" ||
+    f.type === "histogram" ||
+    f.type === "summary" ||
+    (f.samples.length > 0 &&
+      f.samples.every(
+        (s) => s.name === f.name && f.name.endsWith("_total")
+      ));
+
   const chartSeries = (f: MetricFamily) =>
     f.samples
       .filter((s) => chartable(f, s))
-      .slice(0, 8)
       .map((s) => {
         const key = seriesKey(f.name, s);
         return {
           key,
           label: seriesLabel(f, s),
-          value: s.value,
-          y: seriesHistory.get(key) ?? [],
+          unit: unitOf(f, s),
+          pts: seriesHistory.get(key) ?? [],
         };
       })
-      .filter((s) => s.y.length >= 2);
+      .filter((s) => s.pts.length >= 2)
+      .slice(0, 8);
+
+  const chartableCount = (f: MetricFamily) =>
+    f.samples.filter((s) => chartable(f, s)).length;
+
+  /* The next chart point for a series: its value, or its per-scrape rate
+     in rate mode. */
+  const appendY = (pts: { t: number; v: number }[], rate: boolean) => {
+    const n = pts.length;
+    if (!n) return NaN;
+    if (!rate) return pts[n - 1].v;
+    if (n < 2) return NaN;
+    const dt = (pts[n - 1].t - pts[n - 2].t) / 1000;
+    const dv = pts[n - 1].v - pts[n - 2].v;
+    return Number.isFinite(dv) && dv >= 0 && dt > 0 ? dv / dt : NaN;
+  };
 
   async function refresh() {
     /* poll() already serializes, but a manual click can overlap it. */
@@ -196,26 +311,39 @@ export default function Metrics() {
       setError(null);
       markOk();
       const now = Date.now();
+      /* A new engine instance invalidates every collected series. */
+      const inst = parsed.families
+        .find((f) => f.name === "richengine_info")
+        ?.samples[0]?.labels.match(/instance="([^"]*)"/)?.[1];
+      if (inst !== instanceId) {
+        instanceId = inst;
+        seriesHistory.clear();
+      }
       for (const f of parsed.families)
         for (const s of f.samples) {
           const key = seriesKey(f.name, s);
           seriesHistory.set(
             key,
-            [...(seriesHistory.get(key) ?? []), s.value].slice(-60)
+            [
+              ...(seriesHistory.get(key) ?? []),
+              { t: now, v: s.value },
+            ].slice(-60)
           );
         }
-      pushScrapeTime(now);
       const selectedFamily = parsed.families.find(
         (f) => f.name === selected()
       );
       const series = selectedFamily ? chartSeries(selectedFamily) : [];
+      const rate = rateMode() && !!selectedFamily && rateable(selectedFamily);
       setHistoryTick((t) => t + 1);
       setChartAppend(
         selectedFamily && series.length
           ? {
               signature: series.map((s) => s.key).join("\n"),
-              x: now,
-              y: series.map((s) => s.y[s.y.length - 1] ?? s.value),
+              append: {
+                x: now,
+                y: series.map((s) => appendY(s.pts, rate)),
+              },
             }
           : null
       );
@@ -224,9 +352,8 @@ export default function Metrics() {
       /* A failed scrape still advances the timeline: NaN samples draw as
          gaps instead of a line connecting across the outage. */
       const now = Date.now();
-      pushScrapeTime(now);
       for (const [key, ys] of seriesHistory)
-        seriesHistory.set(key, [...ys, NaN].slice(-60));
+        seriesHistory.set(key, [...ys, { t: now, v: NaN }].slice(-60));
       const f = selectedFamily();
       const series = f ? chartSeries(f) : [];
       setHistoryTick((t) => t + 1);
@@ -234,8 +361,7 @@ export default function Metrics() {
         f && series.length
           ? {
               signature: series.map((s) => s.key).join("\n"),
-              x: now,
-              y: series.map(() => NaN),
+              append: { x: now, y: series.map(() => NaN) },
             }
           : null
       );
@@ -259,8 +385,53 @@ export default function Metrics() {
       : all;
   };
 
+  const grouped = () => {
+    const groups = new Map<string, MetricFamily[]>();
+    for (const f of filtered()) {
+      const section = sectionOf(f.name);
+      const list = groups.get(section) ?? [];
+      list.push(f);
+      groups.set(section, list);
+    }
+    return SECTION_ORDER.filter((title) => groups.has(title)).map(
+      (title) => ({ title, families: groups.get(title)! })
+    );
+  };
+
   const selectedFamily = () =>
     scrape()?.families.find((f) => f.name === selected()) ?? null;
+
+  const selectFamily = (name: string) => {
+    setSelected(selected() === name ? null : name);
+    setRateMode(false);
+  };
+
+  /* Key indicators, read straight out of the latest scrape. */
+  const metricValue = (name: string) =>
+    scrape()?.families.find((f) => f.name === name)?.samples[0]?.value;
+
+  const liveRate = (name: string) => {
+    const v = metricValue(name);
+    return v === undefined ? "—" : `${fmtInt(v)} tok/s`;
+  };
+
+  const liveMemory = () => {
+    const current = metricValue("richengine_memory_current_bytes");
+    const limit = metricValue("richengine_memory_limit_bytes");
+    if (current === undefined) return "—";
+    return limit !== undefined
+      ? `${fmtBytes(current)} / ${fmtBytes(limit)}`
+      : fmtBytes(current);
+  };
+
+  /* Y-axis/tooltip formatter for the open family's chart: units resolve
+     per call so selection and rate toggles stay right without a rebuild. */
+  const fmtChartValue = (v: number, label?: string) => {
+    const d = chartData();
+    const unit =
+      d?.units.get(label ?? d?.series[0]?.label ?? "") ?? "none";
+    return `${fmtUnit(unit, v)}${rateMode() ? "/s" : ""}`;
+  };
 
   /* The exposition can run tens of thousands of lines; render a cap and
      report the rest — Copy raw still hands over the full text. */
@@ -273,17 +444,48 @@ export default function Metrics() {
       : { text: raw, more: 0 };
   });
 
+  /* The chart needs a reactive yes/no once any series reaches 2 points —
+     tracked via historyTick. chartData itself stays untracked by the
+     scrape clock: the data prop holds a mount/rebuild snapshot while the
+     stream flows through append(). */
+  const chartReady = () => {
+    const f = selectedFamily();
+    if (!f) return false;
+    historyTick();
+    return chartSeries(f).length > 0;
+  };
+
   const chartData = () => {
     const f = selectedFamily();
     if (!f) return null;
-    historyTick();
     const series = chartSeries(f);
     if (!series.length) return null;
-    const n = Math.max(...series.map((s) => s.y.length));
+    /* Shared x axis = the union of every charted series' scrape times;
+       points a series missed pad with NaN gaps instead of shifting. */
+    const times = [
+      ...new Set(series.flatMap((s) => s.pts.map((p) => p.t))),
+    ].sort((a, b) => a - b);
+    const rate = rateMode() && rateable(f);
     return {
       signature: series.map((s) => s.key).join("\n"),
-      x: scrapeTimes.slice(-n),
-      series: series.map(({ label, y }) => ({ label, y })),
+      units: new Map(series.map((s) => [s.label, s.unit])),
+      x: times,
+      series: series.map(({ label, pts }) => {
+        if (!rate) {
+          const at = new Map(pts.map((p) => [p.t, p.v]));
+          return { label, y: times.map((t) => at.get(t) ?? NaN) };
+        }
+        /* Δv/Δt between this series' own scrapes; counter resets and
+           failed scrapes draw as gaps. */
+        const y = new Map<number, number>();
+        for (let i = 1; i < pts.length; i++) {
+          const dt = (pts[i].t - pts[i - 1].t) / 1000;
+          const dv = pts[i].v - pts[i - 1].v;
+          if (Number.isFinite(dv) && dv >= 0 && dt > 0)
+            y.set(pts[i].t, dv / dt);
+        }
+        return { label, y: times.map((t) => y.get(t) ?? NaN) };
+      }),
     };
   };
 
@@ -362,6 +564,32 @@ export default function Metrics() {
 
       <div class="cards">
         <div class="card">
+          <div class="card-label">Decode</div>
+          <div class="card-value">
+            {liveRate("richengine_decode_tokens_per_second")}
+          </div>
+          <div class="card-sub">current throughput</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Prefill</div>
+          <div class="card-value">
+            {liveRate("richengine_prefill_tokens_per_second")}
+          </div>
+          <div class="card-sub">current throughput</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Memory</div>
+          <div class="card-value">{liveMemory()}</div>
+          <div class="card-sub">resident in use / limit</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Queued</div>
+          <div class="card-value">
+            {fmtInt(metricValue("richengine_scheduler_queued"))}
+          </div>
+          <div class="card-sub">requests waiting</div>
+        </div>
+        <div class="card">
           <div class="card-label">Metric families</div>
           <div class="card-value">{fmtInt(scrape()?.families.length)}</div>
           <div class="card-sub">HELP/TYPE groups</div>
@@ -385,118 +613,192 @@ export default function Metrics() {
         </Show>
       </div>
 
-      <Show when={scrape()} fallback={<p class="muted">Fetch to load.</p>}>
-        {/* Family table: click a row for its series + history. */}
-        <section class="section">
-          <div class="panel">
-            <Show
-              when={filtered().length > 0}
-              fallback={
-                <div class="panel-row metric-empty">
-                  No metrics match “{query().trim()}”.
-                </div>
-              }
-            >
-              <For each={filtered()}>
-                {(f) => (
-                  <>
-                    <button
-                      class={`panel-row metric-row${
-                        selected() === f.name ? " sel" : ""
-                      }`}
-                      title={
-                        selected() === f.name
-                          ? "Hide detail"
-                          : "Show series and history"
-                      }
-                      onClick={() =>
-                        setSelected(selected() === f.name ? null : f.name)
-                      }
-                    >
-                      <span class="grow">{f.name}</span>
-                      <span class="badge">{f.type}</span>
-                      <span class="num help" title={f.help}>
-                        {f.help}
-                      </span>
-                      <span class="num">{f.samples.length} series</span>
-                      <span class="num metric-value">
-                        {f.samples.length === 1
-                          ? fmtValue(f.samples[0].value)
-                          : ""}
-                      </span>
-                    </button>
-                    {/* Detail expands in place so it stays visible wherever
-                        the row sits in a long family list. */}
-                    <Show when={selected() === f.name}>
-                      <div class="metric-detail">
-                        <div class="panel-row">
-                          <span class="grow mono">{f.name}</span>
-                          <span class="badge">{f.type}</span>
-                          <span class="num">{f.samples.length} series</span>
-                          <button
-                            class="btn small"
-                            title="Close"
-                            aria-label="Close metric detail"
-                            onClick={() => setSelected(null)}
-                          >
-                            close
-                          </button>
-                        </div>
-                        <Show when={f.help}>
-                          <div class="panel-row">
-                            <span class="grow muted">{f.help}</span>
+      <Show when={scrape()} fallback={<p class="muted">Loading…</p>}>
+        {/* Family table grouped by subsystem: click a row for its series +
+            history. */}
+        <Show
+          when={filtered().length > 0}
+          fallback={
+            <div class="panel">
+              <div class="panel-row metric-empty">
+                No metrics match “{query().trim()}”.
+              </div>
+            </div>
+          }
+        >
+          {/* Index, not For: each scrape parses fresh family objects, so
+              reference-keyed rows would remount — and the open detail's
+              Chart with them — every 2s. Index keeps DOM by position and
+              re-reads items through accessors. */}
+          <Index each={grouped()}>
+            {(group) => (
+              <section class="section">
+                <h2>{group().title}</h2>
+                <div class="panel">
+                  <Index each={group().families}>
+                    {(f) => (
+                      <>
+                        <button
+                          class={`panel-row metric-row${
+                            selected() === f().name ? " sel" : ""
+                          }`}
+                          title={
+                            selected() === f().name
+                              ? "Hide detail"
+                              : "Show series and history"
+                          }
+                          onClick={() => selectFamily(f().name)}
+                        >
+                          <span class="grow">{f().name}</span>
+                          <span class="badge">{f().type}</span>
+                          <span class="num help" title={f().help}>
+                            {f().help}
+                          </span>
+                          <span class="num">{f().samples.length} series</span>
+                          <span class="num metric-value">
+                            {f().samples.length === 1
+                              ? fmtUnit(unitOf(f()), f().samples[0].value)
+                              : ""}
+                          </span>
+                        </button>
+                        {/* Detail expands in place so it stays visible
+                            wherever the row sits in a long family list. */}
+                        <Show when={selected() === f().name}>
+                          <div class="metric-detail">
+                            <div class="panel-row">
+                              <span class="grow mono">{f().name}</span>
+                              <span class="badge">{f().type}</span>
+                              <span class="num">
+                                {f().samples.length} series
+                              </span>
+                              <Show when={rateable(f())}>
+                                <div
+                                  class="segmented"
+                                  role="radiogroup"
+                                  aria-label="Chart mode"
+                                >
+                                  <button
+                                    type="button"
+                                    role="radio"
+                                    aria-checked={!rateMode()}
+                                    classList={{ active: !rateMode() }}
+                                    title="Cumulative totals"
+                                    onClick={() => setRateMode(false)}
+                                  >
+                                    total
+                                  </button>
+                                  <button
+                                    type="button"
+                                    role="radio"
+                                    aria-checked={rateMode()}
+                                    classList={{ active: rateMode() }}
+                                    title="Per-second rate between scrapes"
+                                    onClick={() => setRateMode(true)}
+                                  >
+                                    rate
+                                  </button>
+                                </div>
+                              </Show>
+                              <button
+                                class="btn small"
+                                title="Close"
+                                aria-label="Close metric detail"
+                                onClick={() => setSelected(null)}
+                              >
+                                close
+                              </button>
+                            </div>
+                            <Show when={f().help}>
+                              <div class="panel-row">
+                                <span class="grow muted">{f().help}</span>
+                              </div>
+                            </Show>
+                            <Index each={f().samples}>
+                              {(s) => (
+                                <div class="panel-row series-row">
+                                  <span class="grow mono">
+                                    {seriesLabel(f(), s())}
+                                  </span>
+                                  <span class="num mono">
+                                    {fmtUnit(unitOf(f(), s()), s().value)}
+                                  </span>
+                                </div>
+                              )}
+                            </Index>
+                            <Show
+                              when={chartReady()}
+                              fallback={
+                                <Show
+                                  when={f().samples.some((s) =>
+                                    chartable(f(), s)
+                                  )}
+                                >
+                                  <div class="panel-row">
+                                    <span class="grow muted">
+                                      Collecting history — the chart appears
+                                      after 2 scrapes.
+                                    </span>
+                                  </div>
+                                </Show>
+                              }
+                            >
+                              <Show when={chartData()}>
+                                {(data) => (
+                                  <div class="panel-row chart-row">
+                                    <div>
+                                      <span class="chart-label">
+                                        {rateMode()
+                                          ? "rate per second"
+                                          : "history"}{" "}
+                                        · last 60 scrapes
+                                        {chartableCount(f()) > 8 &&
+                                          ` · first 8 of ${chartableCount(
+                                            f()
+                                          )} series`}
+                                      </span>
+                                      <Chart
+                                        type="area"
+                                        height={140}
+                                        data={{
+                                          x: data().x,
+                                          series: data().series,
+                                        }}
+                                        append={
+                                          chartAppend()?.signature ===
+                                          data().signature
+                                            ? chartAppend()?.append
+                                            : null
+                                        }
+                                        options={{
+                                          legend: { position: "top" },
+                                          labels: {
+                                            y: (v) => fmtChartValue(v),
+                                          },
+                                          window: 60,
+                                          xScale: "time",
+                                          zoom: { wheel: false },
+                                          tooltip: {
+                                            format:
+                                              fmtTooltipRows(fmtChartValue),
+                                          },
+                                          yMin: 0,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </Show>
+                            </Show>
                           </div>
                         </Show>
-                        <For each={f.samples}>
-                          {(s) => (
-                            <div class="panel-row series-row">
-                              <span class="grow mono">{seriesLabel(f, s)}</span>
-                              <span class="num mono">{fmtValue(s.value)}</span>
-                            </div>
-                          )}
-                        </For>
-                        <Show when={chartData()}>
-                          {(data) => (
-                            <div class="panel-row chart-row">
-                              <div>
-                                <span class="chart-label">
-                                  history · last 60 scrapes
-                                </span>
-                                <Chart
-                                  type="area"
-                                  height={140}
-                                  data={{
-                                    x: data().x,
-                                    series: data().series,
-                                  }}
-                                  append={
-                                    chartAppend()?.signature ===
-                                    data().signature
-                                      ? chartAppend()
-                                      : null
-                                  }
-                                  options={{
-                                    labels: { y: fmtValue },
-                                    window: 60,
-                                    xScale: "time",
-                                    zoom: true,
-                                    tooltip: {
-                                      format: fmtTooltipRows(fmtValue),
-                                    },
-                                  }}
-                                />
-                              </div>
-                            </div>
-                          )}
-                        </Show>
-                      </div>
-                    </Show>
-                  </>
-                )}
-              </For>
-            </Show>
-          </div>
-        </section>
+                      </>
+                    )}
+                  </Index>
+                </div>
+              </section>
+            )}
+          </Index>
+        </Show>
 
         {/* Raw exposition, for copy/paste debugging. */}
         <section class="section">

@@ -150,7 +150,7 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
   // gdnOutput.
   if (!skipMoe)
     ops::MoE::addGemma(step.graph,
-                     {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput},
+                     {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, {}},
                      {layer.routerWeights, layer.perExpertScale, layer.expertGate,
                       layer.expertUp, layer.expertDown},
                      *step.moe);
@@ -270,7 +270,7 @@ void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeig
                              b.gdnHidden, hidden, step.rows);
   // Routed experts: raw sum into fullPacked, post-normed into gdnOutput.
   ops::MoE::addGemma(step.graph,
-                     {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput},
+                     {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, b.verifyRows},
                      {layer.routerWeights, layer.perExpertScale, layer.expertGate,
                       layer.expertUp, layer.expertDown},
                      *step.moe);

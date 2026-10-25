@@ -41,11 +41,10 @@ ModelDescriptor lfm2Descriptor(std::string name) {
   return descriptor;
 }
 
-// d1-3B is a decision model: it never decodes, so no DSpark draft is
-// installed; the Null layout satisfies the geometry contract while the
-// n-gram predraft supplies proposals.
-static DFlashDraftLayout d1NullDraftLayout() {
-  const Lfm2Layout target;
+// The d1 decision models never decode, so no DSpark draft is installed;
+// the Null layout satisfies the geometry contract while the n-gram
+// predraft supplies proposals.
+static DFlashDraftLayout d1NullDraftLayout(const Lfm2Layout &target) {
   DFlashDraftLayout layout;
   layout.kind = DraftKind::Null;
   layout.layers = 1;
@@ -71,7 +70,50 @@ ModelDescriptor d1Descriptor(std::string name) {
   Lfm2Layout target;
   target.rotaryTheta = 1'000'000.0F;
   ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), target, d1NullDraftLayout(), vision);
+      std::move(name), target, d1NullDraftLayout(target), vision);
+  descriptor.visionSource = VisionSource::None;
+  return descriptor;
+}
+
+// d1-omni-600M (LiquidAI/d1-omni-600M-GGUF): the LFM2.5-Encoder-350M
+// backbone post-trained for the System One readout — 18 blocks over
+// embedding 1024 and vocab 65536 at rope base 1e6: 10 convs, 6 attention
+// layers of 16x8 heads of 64, then two decision blocks of 16x16 heads with
+// a narrower ungated FFN, finished by token-type embeddings and a cls
+// pooling head. Bidirectional: it never decodes. The descriptor records
+// the geometry the assembly validates against; loading still refuses —
+// the encoder's attention geometry, its full-prompt mask and the decision
+// blocks' fused biased layers have no compiled kernels.
+ModelDescriptor d1omniDescriptor(std::string name) {
+  ops::VisionLayout vision;
+  Lfm2Layout target;
+  vision.outputHiddenSize = target.hiddenSize = 1024;
+  target.maximumContextTokens = 128000;
+  target.layers = 18;
+  target.vocabularySize = 65536;
+  target.packedGdnWidth = 3 * target.hiddenSize;
+  // 1024 query rows + 2*512 key/value; the decision blocks' fused QKV is a
+  // different tensor the loaders never reach.
+  target.packedFullWidth = 2048;
+  target.convolutionDimension = 1024;
+  target.attentionWidth = 1024;
+  target.attentionQueryHeads = 16;
+  target.attentionKvHeads = 8;
+  target.attentionMask = (uint64_t{1} << 2) | (uint64_t{1} << 5) |
+                         (uint64_t{1} << 8) | (uint64_t{1} << 10) |
+                         (uint64_t{1} << 12) | (uint64_t{1} << 14) |
+                         (uint64_t{1} << 16) | (uint64_t{1} << 17);
+  target.rotaryTheta = 1'000'000.0F;
+  target.maskToken = 7;
+  target.stopTokens = {7, 7};
+  target.hiddenCaptureLayers = {2, 5, 10, 14, 17};
+  target.intermediateSize = 4608;
+  target.encoder = true;
+  target.decisionBlocks = 2;
+  target.altAttentionKvHeads = 16;
+  target.altIntermediateSize = 4096;
+  ModelDescriptor descriptor = makeModelDescriptor(
+      std::move(name), target, d1NullDraftLayout(target), vision);
   descriptor.visionSource = VisionSource::None;
   return descriptor;
 }

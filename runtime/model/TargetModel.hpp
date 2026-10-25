@@ -430,6 +430,9 @@ struct TargetModelVerifyBuffers final {
   metal::MetalBuffer denseGateScratch;
   std::span<const metal::MetalBuffer> gdnPacked;
   std::span<const metal::MetalBuffer> gdnMixed;
+  // The lanes' GDN decode tape (folded commit): two parity slots per lane,
+  // each one step's rows of every GDN layer. Empty when the fold is off.
+  metal::MetalBuffer gdnTape;
   std::span<const metal::MetalBuffer> gdnDecay;
   std::span<const metal::MetalBuffer> gdnBeta;
   std::span<const metal::MetalBuffer> chunkKeys;
@@ -455,6 +458,10 @@ struct TargetModelVerifyBuffers final {
   metal::MetalBuffer treeMasks;
   metal::MetalBuffer capturedPath;
   ops::MoeScratch moe;
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a
+  // sparse-MoE target's steps route alone (ops::MoeBuffers::verifyRows).
+  // Empty on a dense target or a tree batch.
+  metal::MetalBuffer verifyRows;
 };
 
 struct TargetModelCommitBuffers final {
@@ -525,6 +532,25 @@ public:
                     uint32_t lanes, ops::LinearScratch scratch,
                     const TargetModelVerifyBuffers *fused = nullptr,
                     uint32_t verifyStride = ExecutionLimits::targetVerifyRows) const;
+  // The score-gather head (RICHENGINE_SCORE_GATHER): the final norm, then
+  // only the quant tiles of the vocabulary projection holding one of
+  // `quantTiles` (sorted, unique). Returns false — the caller encodes
+  // addHeadBatch — where the projection cannot take the restricted
+  // dispatch: an affine or rotated head, several segments, a logit softcap.
+  [[nodiscard]] bool addScoreHeadColumns(
+      metal::CommandGraph &graph, metal::MetalBuffer hidden,
+      metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+      uint32_t lanes, ops::LinearScratch scratch,
+      std::span<const uint32_t> quantTiles) const;
+  // The score head's single gather dispatch (RICHENGINE_SCORE_TENSOR and
+  // the fused RICHENGINE_SCORE_FUSED): `columns` holds `columnCount`
+  // absolute vocabulary columns; the fused variant runs the final norm in
+  // the same dispatch. Same return contract as addScoreHeadColumns.
+  [[nodiscard]] bool addScoreHeadGather(
+      metal::CommandGraph &graph, metal::MetalBuffer hidden,
+      metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
+      uint32_t lanes, ops::LinearScratch scratch,
+      metal::MetalBuffer columns, uint32_t columnCount, bool fused) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals. liveRows[lane]
   // bounds the live rows (anchor included); rows past it repeat the anchor,

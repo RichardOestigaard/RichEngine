@@ -28,7 +28,6 @@ enum class Phase : uint8_t {
 struct RequestSpec final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
-  bool constrained = false;
   // Tokens to prefill: the prompt, and after resumeFromResources the
   // replayed history.
   uint32_t prefillTokens = 0;

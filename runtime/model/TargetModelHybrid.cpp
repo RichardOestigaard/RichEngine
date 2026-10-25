@@ -88,7 +88,7 @@ void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLay
   const TargetModelPrefillBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                              step.rows);
-  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}}, layer.ffn, *step.moe);
+  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}}, layer.ffn, *step.moe);
 }
 
 // LFM2-MoE's per-layer FFN: dense below denseLayers, the MoE block after.
@@ -110,7 +110,7 @@ void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const Lfm2Moe
         } else {
           ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized,
                                      geometry_.hiddenSize, step.rows);
-          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}}, ffn, *step.moe);
+          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}}, ffn, *step.moe);
         }
       },
       layer.ffn);
@@ -228,7 +228,7 @@ void TargetModel::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &l
   step.graph.beginBakedSpan();
   ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                              step.rows);
-  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}}, layer.ffn, *step.moe);
+  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows}, layer.ffn, *step.moe);
   step.graph.endBakedSpan();
 }
 
@@ -247,7 +247,7 @@ void TargetModel::addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &laye
           step.graph.beginBakedSpan();
           ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized,
                                      geometry_.hiddenSize, step.rows);
-          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}}, ffn, *step.moe);
+          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows}, ffn, *step.moe);
           step.graph.endBakedSpan();
         }
       },

@@ -470,6 +470,60 @@ struct FmtAF4 {
     return {float2(as_type<float>(mt << 16)), float2(as_type<float>(mt & 0xFFFF0000u))};
   }
 };
+// AF4P: AF4's dequantization over the packed manifest's planes — plane0 codes
+// in 64-group order (a group's 32 bytes hold its first 32-group's 16 then its
+// second's), the scale and bias planes separate (bound as meta and plane1).
+// The codes' linear nibble order (element e at nibble e) gathers into the
+// staged tile's slot words in chunk().
+struct FmtAF4P {
+  QUANT_FORMAT(GGUF_FMT_AF4P, QuantLinear, 0, 32, false);
+  struct Payload { uint4 a; }; typedef uint Chunk; typedef uint Meta;
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { return *((device uint *)m); }
+  // The bf16 scale at m and bias at m2, packed as AF4's meta.
+  static Meta loadMeta2(device uchar *m, device uchar *m2) {
+    return uint(*((device ushort *)m)) | (uint(*((device ushort *)m2)) << 16);
+  }
+  // The second meta plane's stride (the biases, bound as plane1).
+  static constexpr constant uint Meta2Bytes = 2;
+  // The plane0 byte of group32 g, column row of the tile: the packed
+  // manifest's [tile][64-group][row] 32-byte blocks hold the group's two
+  // 32-groups' 16 bytes adjacently.
+  static device uchar *code_at(device uchar *w0, ulong tile, uint row, ulong g, ulong groups) {
+    return w0 + (tile * (groups >> 1) + (g >> 1)) * (QUANT_TILE_ROWS * 32) + row * 32 + (g & 1) * 16;
+  }
+  // The slot word the staged dequant expects of chunk c: pair p's e0 at bits
+  // 4p and e1 at bits 16+4p, covering elements 4c..4c+3 (pairs 0, 1) and
+  // 16+4c..16+4c+3 (pairs 2, 3). Our byte order packs element e at nibble e,
+  // so the word gathers its nibbles: slot i of chunk c is at bits
+  // (i & 1) * 16 + 4 * (i >> 1) for the first 16-group's i and +8 for the
+  // second's (quant_slot).
+  static Chunk chunk(Payload w, ushort c) {
+    Chunk r = 0;
+    for (ushort i = 0; i < 4; ++i) {
+      const ushort e0 = 4 * c + i, e1 = 16 + 4 * c + i;
+      const ushort b0 = (i & 1) * 16 + 4 * (i >> 1);
+      r |= ((w.a[e0 / 8] >> (4 * (e0 & 7))) & 15u) << b0;
+      r |= ((w.a[e1 / 8] >> (4 * (e1 & 7))) & 15u) << (b0 + 8);
+    }
+    return r;
+  }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) {
+    Chunk r = 0;
+    for (ushort i = 0; i < 4; ++i) {
+      const ushort e0 = 4 * c + i, e1 = 16 + 4 * c + i;
+      const ushort b0 = (i & 1) * 16 + 4 * (i >> 1);
+      r |= ((p0[e0 / 2] >> (4 * (e0 & 1))) & 15u) << b0;
+      r |= ((p0[e1 / 2] >> (4 * (e1 & 1))) & 15u) << (b0 + 8);
+    }
+    return r;
+  }
+  static uint4 codes(Chunk q) { return quant_nibble_pairs(q); }
+  static QuantCoef coef(Meta mt, ushort) {
+    return {float2(as_type<float>(mt << 16)), float2(as_type<float>(mt & 0xFFFF0000u))};
+  }
+};
+
 // PQ2_0 (Prism ML's GGUFs, ggml type 142): plane0 2-bit codes as Q2_K's; meta the half d of the 128-element native
 // block, four groups. value = d * (q - 1).
 struct FmtPQ20 {
@@ -495,7 +549,8 @@ struct FmtPQ20 {
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
   X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
   X(FmtAF4, af4) X(FmtAF5, af5) X(FmtAF6, af6) X(FmtAF8, af8)                                                     \
-  X(FmtAF4G128, af4g128) X(FmtAF5G128, af5g128) X(FmtAF6G128, af6g128) X(FmtAF8G128, af8g128)
+  X(FmtAF4G128, af4g128) X(FmtAF5G128, af5g128) X(FmtAF6G128, af6g128) X(FmtAF8G128, af8g128)      \
+  X(FmtAF4P, af4p)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids

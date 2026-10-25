@@ -38,9 +38,13 @@ namespace richengine::model {
 [[nodiscard]] ModelDescriptor minicpmV47Descriptor(std::string name);
 [[nodiscard]] DFlashDraftLayout minicpmV47DraftLayout();
 
-// LFM2.5-2.6B and LFM2.5-8B-A1B.
+// LFM2.5-2.6B and LFM2.5-8B-A1B, the d1 decision models: d1-3B is the
+// causal LFM2 target post-trained for the decision readout; d1-omni is the
+// bidirectional LFM2.5-Encoder variant the loaders refuse (its bespoke
+// decision blocks and mask have no compiled kernels).
 [[nodiscard]] ModelDescriptor lfm2Descriptor(std::string name);
 [[nodiscard]] ModelDescriptor d1Descriptor(std::string name);
+[[nodiscard]] ModelDescriptor d1omniDescriptor(std::string name);
 [[nodiscard]] ModelDescriptor lfm2moeDescriptor(std::string name);
 [[nodiscard]] DFlashDraftLayout lfm2DraftLayout();
 [[nodiscard]] DFlashDraftLayout lfm2moeDraftLayout();

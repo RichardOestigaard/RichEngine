@@ -341,6 +341,7 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
 // The verify and prefill split of one geometry, each with its reduction.
 struct Pipelines {
   std::string splitName;
+  uint32_t splitGridX = 0;
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
   std::string prefillSplitName;
@@ -348,13 +349,29 @@ struct Pipelines {
   id<MTLComputePipelineState> prefillReduce;
 };
 
+// The production _rP pick per geometry: the kv4 layouts split two fused-row
+// passes across two threadgroups, kv2/g8's M=128 tile takes the four-way
+// split. An eight-row chain is the narrow _m8 tile; the escape hatch keeps
+// the single-group (or _m2) split reachable.
+std::pair<std::string, uint32_t> productionSplit(Shape shape) {
+  if (kVerifyRows == 8) return {"_m8", 1};
+  if (std::getenv("RICHENGINE_VERIFY_SPLIT_R2_OFF") != nullptr)
+    return {"", 1};
+  return shape.kvHeads == 2 ? std::pair{"_r4", 4u} : std::pair{"_r2", 2u};
+}
+
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
-  result.splitName = std::string(richengine::ops::kVerifyAttentionQ8Split) + shape.suffix;
+  const auto [rSuffix, rGroups] = productionSplit(shape);
+  result.splitName = std::string(richengine::ops::kVerifyAttentionQ8Split) +
+                     shape.suffix + rSuffix;
+  result.splitGridX = shape.kvHeads * rGroups;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
-      device, library, std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix);
+      device, library,
+      std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix +
+          (kVerifyRows == 8 ? "_m8" : ""));
   result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionQ8Split) + shape.suffix;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
@@ -389,7 +406,7 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   id<MTLComputePipelineState> split,
                   id<MTLComputePipelineState> reduce, const Case &data,
-                  uint32_t width) {
+                  uint32_t width, uint32_t splitGridX) {
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   require(data.params.rows == kRows, "a verify lane attends all its rows");
@@ -422,7 +439,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
+  [encoder dispatchThreadgroups:MTLSizeMake(splitGridX, splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -635,7 +652,8 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const bool verify = activeRows == kRows;
   const std::string &name = verify ? pipelines.splitName : pipelines.prefillSplitName;
   const auto run = [&](const Case &c) {
-    return verify ? dispatch(device, queue, pipelines.split, pipelines.reduce, c, width)
+    return verify ? dispatch(device, queue, pipelines.split, pipelines.reduce, c, width,
+                             pipelines.splitGridX)
                   : dispatchPrefill(device, queue, pipelines.prefillSplit,
                                     pipelines.prefillReduce, c);
   };
@@ -846,6 +864,113 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
+
+// A/B of the _r2 pair-of-groups split against the single-group split at the
+// same history, width and split count: identical bytes and arithmetic, twice
+// the threadgroup residency.
+void benchSplit(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                id<MTLLibrary> library, Shape shape, uint32_t committed,
+                uint32_t width, uint32_t splits) {
+  Case data = makeCase(device, shape, committed, kRows, splits);
+  fill(data);
+  const uint64_t laneBytes = data.queries.length;
+  id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
+  id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
+  const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
+  id<MTLBuffer> partials = makeBuffer(
+      device, slots * shape.fusedRows() * kHeadDimension * sizeof(BFloat16Bits));
+  id<MTLBuffer> statistics =
+      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  for (uint32_t lane = 0; lane < width; ++lane)
+    std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
+                data.queries.contents, laneBytes);
+  std::array<VerifyAttentionParams, 4> params{};
+  params.fill({data.params.committed_tokens, data.params.page_table_entries,
+               data.params.kv, splits, splits, kRows, kRows, 0});
+  id<MTLComputePipelineState> reduce = makePipeline(
+      device, library,
+      std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix +
+          (kVerifyRows == 8 ? "_m8" : ""));
+  const std::string base =
+      std::string(richengine::ops::kVerifyAttentionQ8Split) + shape.suffix;
+  // kv2/g8's M=128 tile only emits the _r4 split (its _r2 pass would keep
+  // one group per core); the smaller-M layouts carry both candidates. A
+  // pass split compiles only where its per-pass MP stays a multiple of 8.
+  std::vector<std::pair<std::string, uint32_t>> variants{
+      {base + (kVerifyRows == 8 ? "_m8" : ""), shape.kvHeads}};
+  for (const uint32_t passes : {2u, 4u}) {
+    const uint32_t fused = shape.queryHeadsPerKvHead * kVerifyRows;
+    const bool emitted = passes == 2 ? shape.kvHeads != 2 : true;
+    if (emitted && fused % passes == 0 && (fused / passes) % 8 == 0)
+      variants.push_back(
+          {base + "_r" + std::to_string(passes), shape.kvHeads * passes});
+  }
+  std::vector<uint8_t> firstOutput;
+  for (const auto &[name, gridX] : variants) {
+    id<MTLComputePipelineState> split = makePipeline(device, library, name);
+    const auto submit = [&] {
+      id<MTLCommandBuffer> command = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+      [encoder setComputePipelineState:split];
+      [encoder setBuffer:queries offset:0 atIndex:0];
+      [encoder setBuffer:partials offset:0 atIndex:1];
+      [encoder setBuffer:statistics offset:0 atIndex:2];
+      for (uint32_t index = 3; index < 7; ++index)
+        [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
+      [encoder setBytes:params.data()
+                  length:sizeof(VerifyAttentionParams) * params.size()
+                 atIndex:7];
+      for (id<MTLBuffer> extent : data.extents)
+        [encoder useResource:extent usage:MTLResourceUsageRead];
+      [encoder dispatchThreadgroups:MTLSizeMake(gridX, splits, width)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [encoder setComputePipelineState:reduce];
+      [encoder setBuffer:partials offset:0 atIndex:0];
+      [encoder setBuffer:statistics offset:0 atIndex:1];
+      [encoder setBuffer:output offset:0 atIndex:2];
+      [encoder setBytes:params.data()
+                  length:sizeof(VerifyAttentionParams) * params.size()
+                 atIndex:3];
+      [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [encoder endEncoding];
+      finish(command);
+    };
+    submit();
+    submit();
+    constexpr uint32_t kIterations = 30;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t iteration = 0; iteration < kIterations; ++iteration) submit();
+    const double ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count() / kIterations;
+    std::cout << "bench " << name << " committed=" << committed
+              << " width=" << width << " splits=" << splits << " ms=" << ms
+              << '\n';
+    std::vector<uint8_t> current = copyOf(output);
+    if (firstOutput.empty()) {
+      firstOutput = std::move(current);
+    } else {
+      size_t differing = 0;
+      float maximum = 0.0f;
+      for (size_t at = 0; at + 1 < current.size(); at += 2) {
+        const auto a = static_cast<BFloat16Bits>(firstOutput[at] |
+                                                 (firstOutput[at + 1] << 8));
+        const auto b =
+            static_cast<BFloat16Bits>(current[at] | (current[at + 1] << 8));
+        if (a != b) {
+          ++differing;
+          maximum = std::max(maximum, std::abs(bfloat16ToFloat(a) -
+                                               bfloat16ToFloat(b)));
+        }
+      }
+      std::cout << "bench outputs "
+                << (differing ? "DIFFER" : "identical")
+                << " elements=" << differing << " max_abs=" << maximum << '\n';
+    }
+  }
+}
+
 void run(const char *libraryPath) {
   testContract();
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -887,6 +1012,13 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
     runCase(device, queue, pipelines, shape, 32'768, kRows, 2, false, 65);
+  }
+  if (std::getenv("RICHENGINE_TEST_R2_BENCH")) {
+    for (const Shape shape : kShapes) {
+      benchSplit(device, queue, library, shape, 4'093, 4, 8);
+      benchSplit(device, queue, library, shape, 32'768, 4, 16);
+      benchSplit(device, queue, library, shape, 131'072, 4, 64);
+    }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";
 }

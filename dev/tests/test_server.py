@@ -25,6 +25,7 @@ from tokenizers import Tokenizer, decoders, models
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
+from install import families, gguf
 from server import (
     api_shapes,
     decisions,
@@ -33,6 +34,7 @@ from server import (
     images,
     judgments,
     serve_options,
+    serving,
     tool_schema,
     webfetch,
     websearch,
@@ -448,6 +450,31 @@ class FakeRuntime:
         thread.start()
         return call
 
+    def submit_batch(self, requests, on_events, on_completes):
+        """The score-batch contract: serialize one shared-prefix frame, then
+        admit each request through the ordinary submit path."""
+        frame = native_wire.ScoreBatchFrame(
+            priority=requests[0].frame.priority,
+            absolute_deadline_unix_micros=1,
+            remaining_deadline_micros=1,
+            prefix_tokens=requests[0].frame.prefix_tokens,
+            items=tuple(
+                native_wire.ScoreBatchItem(
+                    request_id=len(self.calls) + index + 1,
+                    suffix_tokens=request.frame.prompt_tokens,
+                    score_tokens=tuple(request.frame.score_tokens),
+                )
+                for index, request in enumerate(requests)
+            ),
+        )
+        native_wire.serialize_message(frame)
+        return [
+            self.submit(request, on_event=on_event, on_complete=on_complete)
+            for request, on_event, on_complete in zip(
+                requests, on_events, on_completes
+            )
+        ]
+
     def _run(self, call):
         plan = call.plan
         request = call.request
@@ -489,7 +516,7 @@ class FakeRuntime:
         done = native_wire.DoneEvent(
             call.request_id,
             reason,
-            len(request.frame.prompt_tokens),
+            len(request.frame.prefix_tokens) + len(request.frame.prompt_tokens),
             completion,
             1_000,
             2_000,
@@ -1755,6 +1782,90 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(blocked.cancelled.is_set())
         self.assertEqual(runtime.cancel_count, 1)
 
+    def test_systemone_window_env_parses_on_the_frontend(self):
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_SYSTEMONE_WINDOW": "2"}
+        ):
+            app = make_frontend(
+                FakeTokenizer(), None, "test-model", 128, 10, 4, vision=True
+            )
+        self.assertEqual(app.systemone_window, 2)
+        app = make_frontend(
+            FakeTokenizer(), None, "test-model", 128, 10, 4, vision=True
+        )
+        self.assertEqual(app.systemone_window, 0)
+
+    def test_systemone_window_env_caps_in_flight_questions(self):
+        # With the window capped at one, the second question's job waits for
+        # the first's done event: while the first blocks, only its request
+        # is submitted.
+        blocked = Plan(logits=(0.0, 1.0), block=True)
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_SYSTEMONE_WINDOW": "1"}
+        ):
+            runtime = FakeRuntime(blocked, Plan(logits=(1.0, 0.0)))
+            harness = self.harness(
+                runtime, tokenizer=self.CharTokenizer(), max_context=8192
+            )
+        self.assertEqual(harness.app.systemone_window, 1)
+        body = {
+            "model": "test-model",
+            "state": "Some evidence",
+            "questions": {
+                "first": {"type": "noul"},
+                "second": {"type": "noul"},
+            },
+        }
+        result = []
+
+        def send():
+            result.append(harness.request("POST", "/v1/systemone", body))
+
+        thread = threading.Thread(target=send, daemon=True)
+        thread.start()
+        self.assertTrue(blocked.started.wait(3))
+        self.assertEqual(len(runtime.requests), 1)
+        blocked.release.set()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertEqual(result[0][0], 200, result[0][2])
+
+    def test_systemone_decision_shared_prefix_state(self):
+        # shared_prefix_states names the state's token prefix on each job:
+        # the engine keeps its junction state and the next request over the
+        # same state resumes past it.
+        runtime = FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            shared_prefix_states=True,
+        )
+        state = "I was charged twice this month"
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": state,
+                "questions": {"refund": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        request = runtime.requests[0].frame
+        prefix = list(
+            harness.tokenizer.encode(decisions.prompt_prefix(state))
+        )
+        self.assertEqual(request.shared_prefix_tokens, len(prefix))
+        self.assertEqual(list(request.prefix_tokens), prefix)
+        prompt = harness.tokenizer.decode(
+            list(request.prefix_tokens) + list(request.prompt_tokens)
+        )
+        self.assertIn("I was charged twice this month", prompt)
+        self.assertIn(decisions.IM_START + "assistant\n", prompt)
+
     def test_models_routes_use_normalized_paths(self):
         harness = self.harness(FakeRuntime())
 
@@ -1944,7 +2055,9 @@ class ServerTest(unittest.TestCase):
         )
         request = runtime.requests[0].frame
         self.assertEqual(list(request.score_tokens), [400, 401, 402, 403, 404, 405])
-        prompt = harness.tokenizer.decode(request.prompt_tokens)
+        prompt = harness.tokenizer.decode(
+            list(request.prefix_tokens) + list(request.prompt_tokens)
+        )
         self.assertIn("QUESTION:", prompt)
         self.assertIn("Reply with yes or no only.", prompt)
         self.assertIn(decisions.IM_START + "assistant\n", prompt)
@@ -2104,6 +2217,166 @@ class ServerTest(unittest.TestCase):
         self.assertIn("supported", prompt)
         self.assertNotIn(judgments.DIRECT_SYSTEM, prompt)
 
+    def test_decision_temperature_scales_the_softmax(self):
+        # noul.2 halves the gap: pooled (2.0, 4.0) readout softmaxes (1.0, 2.0).
+        contract = serving.ServingContract.of(
+            {
+                "decision": True,
+                "decision_temperatures": {"noul.2": 2.0},
+            }
+        )
+        runtime = FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            serving=contract,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "I was charged twice",
+                "questions": {
+                    "refund": {
+                        "type": "noul",
+                        "instructions": "Refund asked?",
+                    }
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["refund"]
+        expected = math.exp(1.0) / (math.exp(1.0) + math.exp(2.0))
+        self.assertAlmostEqual(answer["noul"], expected)
+
+    def test_decision_temperature_buckets_by_option_count(self):
+        # Three options read choice.3_5; a two-sided key must not apply.
+        contract = serving.ServingContract.of(
+            {
+                "decision": True,
+                "decision_temperatures": {
+                    "choice.2": 100.0,
+                    "choice.3_5": 2.0,
+                },
+            }
+        )
+        runtime = FakeRuntime(Plan(logits=(0.5, 3.0, 1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            serving=contract,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "production is down",
+                "questions": {
+                    "team": {
+                        "type": "choice",
+                        "criteria": {"a": "x", "b": "y", "c": "z"},
+                    }
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["team"]
+        scaled = (0.25, 1.5, 0.5)
+        total = sum(math.exp(score) for score in scaled)
+        self.assertAlmostEqual(
+            answer["probabilities"]["b"], math.exp(1.5) / total
+        )
+
+    def test_decision_temperature_absent_keeps_the_readout(self):
+        # A decision contract without temperatures is the d1-3B readout.
+        contract = serving.ServingContract.of({"decision": True})
+        runtime = FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            serving=contract,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "charged twice",
+                "questions": {"q": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["q"]
+        expected = math.exp(2.0) / (math.exp(2.0) + math.exp(4.0))
+        self.assertAlmostEqual(answer["noul"], expected)
+
+    def test_judgments_decision_temperature_scales_probabilities(self):
+        # option_logits stay the raw pooled scores; the choice.2 temperature
+        # scales only the softmax.
+        contract = serving.ServingContract.of(
+            {
+                "decision": True,
+                "decision_temperatures": {"choice.2": 2.0},
+            }
+        )
+        runtime = FakeRuntime(Plan(logits=(0.5, 3.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            serving=contract,
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["option_logits"], [0.5, 3.0])
+        expected = math.exp(1.5) / (math.exp(0.25) + math.exp(1.5))
+        self.assertAlmostEqual(response["probabilities"][1], expected)
+
+    def test_encoder_model_refuses_generation(self):
+        contract = serving.ServingContract.of(
+            {"decision": True, "encoder": True}
+        )
+        runtime = FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+            serving=contract,
+        )
+        for path, body in (
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi"}]},
+            ),
+            ("/v1/completions", {"prompt": "hi"}),
+        ):
+            status, _, payload = harness.request("POST", path, body)
+            self.assertEqual(status, 422, (path, payload))
+        # The decision endpoints still answer.
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "charged twice",
+                "questions": {"q": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+
     def _pool(self, *apps, max_residents=2):
         """A HostPool of stub hosts around real Frontends — routing is what
         the pool owns; host.load/unload stay each model's real lifecycle."""
@@ -2119,6 +2392,9 @@ class ServerTest(unittest.TestCase):
                 note_request=lambda *a, **k: None,
                 unload=lambda **k: app.model,
                 close=lambda: None,
+                tuning_requires_reload=lambda: False,
+                assembly_dir=None,
+                weight_layout=None,
             )
             for app in apps
         ]
@@ -2239,6 +2515,47 @@ class ServerTest(unittest.TestCase):
         pool.load("a")
         self.assertEqual(called, [("a",)])
 
+    def test_pool_empty_default_still_routes(self):
+        # `--max-residents N` with no --model: the default slot stays empty
+        # while later loads fill extras. Requests must reach the loaded
+        # residents — the empty slot is not "no model loaded".
+        generative = self.harness(
+            FakeRuntime(Plan([[1], [2], [3]])), model="gen-test"
+        )
+        pool = self._pool(generative.app, max_residents=3)
+        empty = SimpleNamespace(
+            app=None,
+            state="unloaded",
+            error=None,
+            note_request=lambda *a, **k: None,
+        )
+        pool.hosts = [empty, *pool.hosts]
+        generative.server.host = pool
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "gen-test",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["model"], "gen-test")
+        # model-less routing lands on the primary — the first loaded
+        # resident — not the empty default slot.
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 200, payload)
+        # And load() fills the free default slot before minting new hosts.
+        loaded = []
+        empty.load = lambda *a, **k: loaded.append(a)
+        empty.state = "loading"
+        pool.load("new/model")
+        self.assertEqual(loaded, [("new/model",)])
+
     def test_pool_unload_names_the_resident(self):
         app_a = SimpleNamespace(model_names=("a",), model="a")
         app_b = SimpleNamespace(model_names=("b",), model="b")
@@ -2254,6 +2571,51 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(released, ["b"])
         with self.assertRaisesRegex(api.APIError, "not loaded"):
             pool.unload("c")
+
+    def test_status_reports_resident_memory_and_pool_capacity(self):
+        generative = self.harness(FakeRuntime(), model="gen-test")
+        decision = self.harness(
+            FakeRuntime(),
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        generative.backend.runtime.status_event = native_peer.status_event(
+            memory_actual={"current_bytes": 700, "peak_bytes": 800}
+        )
+        generative.server.host = self._pool(generative.app, decision.app)
+        status, _, payload = generative.request("GET", "/status")
+        self.assertEqual(status, 200)
+        snapshot = json.loads(payload)
+        self.assertEqual(snapshot["pool"], {"max_residents": 2, "slots": 2, "free": 0})
+        resident = snapshot["residents"]["gen-test"]
+        self.assertEqual(resident["memory_bytes"], 700)
+        self.assertEqual(resident["memory_peak_bytes"], 800)
+        # An engine without memory_actual reports no memory.
+        self.assertIsNone(snapshot["residents"]["d1-test"]["memory_bytes"])
+        # An app-less host is a free slot on top of unallocated capacity.
+        generative.server.host.hosts[1].app = None
+        status, _, payload = generative.request("GET", "/status")
+        snapshot = json.loads(payload)
+        self.assertEqual(snapshot["pool"], {"max_residents": 2, "slots": 2, "free": 1})
+        self.assertNotIn("d1-test", snapshot["residents"])
+
+    def test_ready_counts_residents_by_state(self):
+        generative = self.harness(FakeRuntime(), model="gen-test")
+        pool = self._pool(generative.app)
+        pool.hosts += [
+            SimpleNamespace(app=None, state=state, error=None)
+            for state in ("loading", "unloaded", "failed")
+        ]
+        generative.server.host = pool
+        status, _, payload = generative.request("GET", "/ready")
+        self.assertEqual(status, 200)
+        body = json.loads(payload)
+        self.assertEqual(body["status"], "ready")
+        self.assertEqual(
+            body["residents"],
+            {"total": 4, "loaded": 1, "loading": 1, "unloaded": 1, "failed": 1},
+        )
 
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned
@@ -7778,7 +8140,11 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(response.getheader("Connection"), "close")
                 self.assertEqual(
                     json.loads(response.read())["error"]["type"],
-                    "overloaded_error" if path == "/v1/messages" else "server_error",
+                    (
+                        "overloaded_error"
+                        if path == "/v1/messages"
+                        else "service_unavailable"
+                    ),
                 )
                 connection.close()
         self.assertEqual(runtime.requests, [])
@@ -7849,7 +8215,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(response.status, 503)
         self.assertEqual(response.getheader("Retry-After"), "1")
         error = json.loads(response.read())["error"]
-        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["type"], "service_unavailable")
         self.assertEqual(error["code"], "frontend_overloaded")
         self.assertEqual(connection.recv(1), b"")
 
@@ -7982,7 +8348,7 @@ class ServerTest(unittest.TestCase):
         response.begin()
         self.assertEqual(response.status, 503)
         error = json.loads(response.read())["error"]
-        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["type"], "service_unavailable")
         self.assertEqual(error["code"], "frontend_overloaded")
         self.assertEqual(response.getheader("Retry-After"), "1")
         self.assertEqual(harness.server.connections.stats()["active"], 3)
@@ -9640,6 +10006,7 @@ class ServerTest(unittest.TestCase):
         missing_parent = {
             "message": "previous response not found",
             "type": "invalid_request_error",
+            "param": None,
             "code": "previous_response_not_found",
         }
         self.assertEqual((status, json.loads(payload)["error"]), (404, missing_parent))
@@ -9893,6 +10260,196 @@ class ServerTest(unittest.TestCase):
             {"role": "tool", "tool_call_id": call["call_id"], "content": "sunny"},
         )
 
+    def test_pool_response_lookup_spans_residents(self):
+        primary = self.harness(FakeRuntime(Plan([[4]])), model="gen-a")
+        secondary = self.harness(FakeRuntime(Plan([[4]])), model="gen-b")
+        primary.server.host = self._pool(primary.app, secondary.app)
+        status, _, payload = primary.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(model="gen-b", reasoning={"effort": "none"}),
+        )
+        response = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        # The record lives on resident B's store; GET and DELETE find it
+        # through the pool, and no model name is needed to resolve it.
+        status, _, stored = primary.request(
+            "GET", f"/v1/responses/{response['id']}"
+        )
+        self.assertEqual((status, json.loads(stored)), (200, response))
+        status, _, payload = primary.request(
+            "DELETE", f"/v1/responses/{response['id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {"id": response["id"], "object": "response", "deleted": True},
+        )
+        status, _, _ = primary.request("GET", f"/v1/responses/{response['id']}")
+        self.assertEqual(status, 404)
+
+    def test_pool_previous_response_id_spans_residents(self):
+        primary = self.harness(FakeRuntime(Plan([[4]])), model="gen-a")
+        secondary = self.harness(FakeRuntime(Plan([[4]])), model="gen-b")
+        primary.server.host = self._pool(primary.app, secondary.app)
+        status, _, payload = primary.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(model="gen-b", reasoning={"effort": "none"}),
+        )
+        first = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        # The follow-up names no model: it lands on the default resident but
+        # still resumes B's conversation through the pool-wide lookup.
+        status, _, payload = primary.request(
+            "POST",
+            "/v1/responses",
+            {
+                "input": "again",
+                "previous_response_id": first["id"],
+                "reasoning": {"effort": "none"},
+            },
+        )
+        second = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(second["previous_response_id"], first["id"])
+        rendered, _ = primary.tokenizer.templates[-1]
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in rendered],
+            [
+                ("user", "hello"),
+                ("assistant", "plain answer\n"),
+                ("user", "again"),
+            ],
+        )
+
+    def test_pool_models_retrieve_uses_the_union(self):
+        primary = self.harness(FakeRuntime(), model="gen-a")
+        secondary = self.harness(FakeRuntime(), model="gen-b")
+        primary.server.host = self._pool(primary.app, secondary.app)
+        status, _, payload = primary.request("GET", "/v1/models/gen-b")
+        model = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual((model["id"], model["object"]), ("gen-b", "model"))
+        self.assertIn("created", model)
+        self.assertIn("owned_by", model)
+        status, _, payload = primary.request("GET", "/v1/models/missing")
+        self.assertEqual(status, 404)
+        error = json.loads(payload)["error"]
+        self.assertEqual(
+            (error["type"], error["param"], error["code"]),
+            ("invalid_request_error", None, "model_not_found"),
+        )
+
+    def test_error_envelope_carries_openai_types_and_param(self):
+        harness = self.harness(FakeRuntime(), api_key="secret")
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 401)
+        self.assertEqual(
+            (error["type"], error["param"], error["code"]),
+            ("authentication_error", None, "authentication_error"),
+        )
+
+        harness = self.harness(FakeRuntime())
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(n=2)
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertIsNone(error["param"])
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(logprobs=True)
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("logprobs", json.loads(payload)["error"]["message"])
+        status, _, payload = harness.request(
+            "POST", "/v1/embeddings", {"model": "test-model", "input": "x"}
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 404)
+        self.assertEqual(error["code"], "model_not_found")
+
+        with mock.patch.object(
+            harness.backend,
+            "refusal",
+            return_value=api_errors.APIError(503, "full", "frontend_overloaded"),
+        ):
+            status, _, payload = harness.request(
+                "POST", "/v1/chat/completions", self.body()
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(payload)["error"]["type"], "service_unavailable"
+        )
+
+    def test_metadata_echoes_in_chat_and_responses(self):
+        harness = self.harness(FakeRuntime(Plan([[4]]), Plan([[4]])))
+        body = self.body(metadata={"turn": "one"}, reasoning_effort="none")
+        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        response = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(response["metadata"], {"turn": "one"})
+        self.assertIsNone(response["choices"][0]["logprobs"])
+        self.assertIsNone(response["choices"][0]["message"]["refusal"])
+
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(
+                metadata={"turn": "two"}, reasoning={"effort": "none"}
+            ),
+        )
+        response = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(response["metadata"], {"turn": "two"})
+        status, _, stored = harness.request(
+            "GET", f"/v1/responses/{response['id']}"
+        )
+        self.assertEqual(json.loads(stored)["metadata"], {"turn": "two"})
+
+        for bad in ("yes", {"k": 1}, {str(i): "v" for i in range(17)}):
+            status, _, _ = harness.request(
+                "POST",
+                "/v1/responses",
+                self.responses_body(metadata=bad),
+            )
+            self.assertEqual(status, 400, bad)
+
+    def test_responses_echoes_request_fields(self):
+        tool = {
+            "type": "function",
+            "name": "weather",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        harness = self.harness(FakeRuntime(Plan([[4]])))
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(
+                instructions="Be concise.",
+                tools=[tool],
+                tool_choice="auto",
+                reasoning={"effort": "none"},
+                max_output_tokens=8,
+            ),
+        )
+        response = json.loads(payload)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(response["tools"], [tool])
+        self.assertEqual(response["tool_choice"], "auto")
+        self.assertEqual(response["truncation"], "disabled")
+        self.assertEqual(response["instructions"], "Be concise.")
+        self.assertEqual(response["reasoning"], {"effort": "none"})
+        self.assertEqual(response["max_output_tokens"], 8)
+        self.assertIsNone(response["top_logprobs"])
+        self.assertEqual(
+            (response["temperature"], response["top_p"]), (0, 0.95)
+        )
+
 
 class MessageNormalizationTest(unittest.TestCase):
     def test_unfinished_tool_call_arguments_stay_history_text(self):
@@ -10137,6 +10694,156 @@ class DiagnosticsTests(unittest.TestCase):
         ):
             diagnostics.log_unexpected(error)
         self.assertIn("server/errors.py:42", stream.getvalue())
+
+
+class D1OmniTests(unittest.TestCase):
+    """d1-omni's Phase 1 surface: its GGUF header derives a config the
+    family signature resolves, and its serving block parses."""
+
+    KV_HEADS = [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0, 16, 16]
+    FFN_WIDTHS = [4608] * 16 + [4096, 4096]
+
+    @staticmethod
+    def _metadata(values):
+        metadata = object.__new__(gguf.Metadata)
+        metadata.values = values
+        return metadata
+
+    @classmethod
+    def _omni_values(cls):
+        """The fields LiquidAI/d1-omni-600M-GGUF's header states."""
+        return {
+            "general.architecture": "lfm2",
+            "general.name": "d1-omni-600M",
+            "lfm2.embedding_length": 1024,
+            "lfm2.block_count": 18,
+            "lfm2.context_length": 128000,
+            "lfm2.attention.head_count": 16,
+            "lfm2.attention.head_count_kv": list(cls.KV_HEADS),
+            "lfm2.feed_forward_length": list(cls.FFN_WIDTHS),
+            "lfm2.rope.freq_base": 1000000.0,
+            "lfm2.shortconv.l_cache": 3,
+            "lfm2.decision.type": "lfm2-d1-omni",
+            "lfm2.decision.block_count": 2,
+            "tokenizer.ggml.tokens": [f"[token{i}]" for i in range(65536)],
+            "tokenizer.ggml.bos_token_id": 1,
+            "tokenizer.ggml.eos_token_id": 7,
+            "tokenizer.ggml.padding_token_id": 0,
+        }
+
+    def test_omni_header_derives_per_layer_geometry(self):
+        text = gguf.model_config(self._metadata(self._omni_values()))[
+            "text_config"
+        ]
+        # Differing per-layer KV head counts no longer fail: the flat
+        # count states the mode, the layer list the actual geometry.
+        self.assertEqual(text["num_key_value_heads"], 8)
+        self.assertEqual(text["layer_kv_heads"], self.KV_HEADS)
+        self.assertEqual(text["intermediate_size"], 4608)
+        self.assertEqual(text["layer_intermediate_sizes"], self.FFN_WIDTHS)
+        self.assertEqual(text["decision_type"], "lfm2-d1-omni")
+        self.assertIs(text["encoder"], True)
+        self.assertEqual(
+            text["layer_types"],
+            ["conv" if count == 0 else "full_attention" for count in self.KV_HEADS],
+        )
+        # A uniform per-layer count stays flat, as it always did.
+        values = self._omni_values()
+        values["lfm2.attention.head_count_kv"] = [8] * 18
+        values["lfm2.feed_forward_length"] = 4608
+        text = gguf.model_config(self._metadata(values))["text_config"]
+        self.assertEqual(text["num_key_value_heads"], 8)
+        self.assertNotIn("layer_kv_heads", text)
+        self.assertNotIn("layer_intermediate_sizes", text)
+        # Malformed lists still fail.
+        for bad in ([], [0] * 18, [8, "8"] + [8] * 16):
+            values["lfm2.attention.head_count_kv"] = bad
+            with self.subTest(kv=bad):
+                with self.assertRaises(gguf.ModelError):
+                    gguf.model_config(self._metadata(values))
+
+    def test_omni_config_identifies_the_family(self):
+        config = gguf.model_config(self._metadata(self._omni_values()))
+        family = families.family_for(
+            config, name="LiquidAI/d1-omni-600M-GGUF"
+        )
+        self.assertEqual(family.name, "d1-omni")
+
+    def test_serving_contract_parses_encoder_fields(self):
+        contract = serving.ServingContract.of(
+            {
+                "decision": True,
+                "encoder": True,
+                "decision_temperatures": {
+                    "noul": 1.0,
+                    "noul.2": 1.6663223505020142,
+                },
+            }
+        )
+        self.assertIs(contract.decision, True)
+        self.assertIs(contract.encoder, True)
+        self.assertEqual(
+            contract.decision_temperatures,
+            {"noul": 1.0, "noul.2": 1.6663223505020142},
+        )
+        # A serving block without the new fields keeps the defaults.
+        defaults = serving.ServingContract.of({})
+        self.assertIs(defaults.decision, False)
+        self.assertIs(defaults.encoder, False)
+        self.assertEqual(defaults.decision_temperatures, {})
+        # The family's own block round-trips through the contract.
+        family = families.named("d1-omni")
+        contract = serving.ServingContract.of(
+            family.serving, family=family.name
+        )
+        self.assertIs(contract.decision, True)
+        self.assertIs(contract.encoder, True)
+        self.assertEqual(
+            contract.decision_temperatures["choice.11"], 1.372515082359314
+        )
+        # The frontend exposes both, defaulting to off without a contract.
+        self.assertFalse(request_frontend.Frontend.encoder)
+        self.assertEqual(request_frontend.Frontend.decision_temperatures, {})
+
+    def test_omni_tensor_set_names_the_decision_blocks(self):
+        # The two decision blocks carry the fused biased set — not the
+        # causal attention split — and the model adds token types and the
+        # cls pooling head.
+        tensors = gguf.loaded_tensors(self._metadata(self._omni_values()))
+        for block in (16, 17):
+            for name in (
+                "attn_norm.bias",
+                "attn_qkv.weight",
+                "attn_qkv.bias",
+                "attn_output.weight",
+                "attn_output.bias",
+                "ffn_norm.bias",
+                "ffn_up.weight",
+                "ffn_up.bias",
+                "ffn_down.weight",
+                "ffn_down.bias",
+            ):
+                self.assertIn(f"blk.{block}.{name}", tensors, name)
+            self.assertNotIn(f"blk.{block}.attn_q.weight", tensors)
+            self.assertNotIn(f"blk.{block}.ffn_gate.weight", tensors)
+        self.assertIn("blk.14.attn_q.weight", tensors)
+        for name in (
+            "token_types.weight",
+            "cls.weight",
+            "cls.norm.weight",
+            "cls.output.weight",
+        ):
+            self.assertIn(name, tensors)
+        # The encoder type without a block count fails, as does a count
+        # past the layer count.
+        values = self._omni_values()
+        del values["lfm2.decision.block_count"]
+        with self.assertRaises(gguf.ModelError):
+            gguf.loaded_tensors(self._metadata(values))
+        values = self._omni_values()
+        values["lfm2.decision.block_count"] = 19
+        with self.assertRaises(gguf.ModelError):
+            gguf.loaded_tensors(self._metadata(values))
 
 
 if __name__ == "__main__":

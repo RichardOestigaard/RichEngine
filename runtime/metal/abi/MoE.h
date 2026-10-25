@@ -31,6 +31,12 @@ struct MoeTileDescriptor {
 static_assert(sizeof(MoeTileDescriptor) == 8,
               "MoE tile descriptors are 8 bytes on both sides");
 
+// A verify step's grouping (moe_group_routes_verified) routes only each
+// lane's verify rows (the draft selector's, VerifyRowsParams in abi/Sampling.h):
+// row r is row r % lane_rows of lane r / lane_rows, and the routed routes of
+// a row past its lane's verify rows stay out of every tile with the route row
+// ~0u, which the combine skips. The shared expert's tiles still hold every
+// row in order. The other groupings route every row and ignore lane_rows.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -43,10 +49,15 @@ struct MoeGroupParams {
   // writes the dispatch's record into ring slot (stats - 1) %
   // kMoeStatsLogSlots of the tile-count scratch.
   uint32_t stats;
+  // A verify step's packed lane stride (the draft's verify stride, at most
+  // RICHENGINE_TARGET_VERIFY_ROWS): lane l's block is rows
+  // [l * lane_rows, (l + 1) * lane_rows). Zero on a non-verify dispatch,
+  // which never runs the verified grouping.
+  uint32_t lane_rows;
 };
 
-static_assert(sizeof(MoeGroupParams) == 24,
-              "MoE grouping parameters are 24 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 28,
+              "MoE grouping parameters are 28 bytes on both sides");
 
 // RICHENGINE_MOE_STATS (ops/MoE.cpp): the grouping kernel's per-dispatch
 // record, appended to a ring in the tile-count scratch at
@@ -74,8 +85,8 @@ struct MoeRouteGroupParams {
   MoeGroupParams group;
 };
 
-static_assert(sizeof(MoeRouteGroupParams) == 40,
-              "MoE route-group parameters are 40 bytes on both sides");
+static_assert(sizeof(MoeRouteGroupParams) == 44,
+              "MoE route-group parameters are 44 bytes on both sides");
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp): the decode union cap keeps the
 // `budget` routed experts with the largest summed routing weight across the

@@ -19,3 +19,4 @@ install/download-token
 
 # The SolidJS build output the server serves; `make webui` regenerates it.
 server/webui/
+/build8

@@ -55,6 +55,9 @@ struct TargetModel::VerifyStep {
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
   std::span<const uint32_t> liveRows{};
+  // The lanes' GDN decode tape (folded commit): the previous step's retained
+  // rows the scan folds in. Null runs the standalone commit pass instead.
+  const ops::GdnTapeLanes *tapeLanes = nullptr;
 };
 
 namespace {

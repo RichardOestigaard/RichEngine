@@ -64,7 +64,8 @@ kernel void draft_select_plain(
     device uint *candidates [[buffer(3)]],
     device float *probabilities [[buffer(4)]],
     device uint *tokens [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
+    device float *confidence [[buffer(6)]],
+    constant SelectorBatchParams &params [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
@@ -86,6 +87,15 @@ kernel void draft_select_plain(
   const float probability = weight / simd_sum(weight);
   if (lane < Candidates)
     probabilities[row * Candidates + lane] = probability;
+
+  // The largest of the position's candidate probabilities at temperature 1
+  // (VerifyRowsParams): the top score's share of its softmax.
+  const float maximum_t1 =
+      simd_max(lane < Candidates ? value : -INFINITY);
+  const float weight_t1 =
+      lane < Candidates ? fast::exp(value - maximum_t1) : 0.0f;
+  if (lane == 0)
+    confidence[row] = 1.0f / simd_sum(weight_t1);
 
   uint selected = 0;
   if (sampling) {

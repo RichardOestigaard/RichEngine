@@ -213,10 +213,14 @@ def prometheus_metrics(status):
         "richengine_response_store_entries": ("response_store", "entries"),
         "richengine_response_store_bytes": ("response_store", "bytes"),
     }
+    instance = (status.get("instance") or {}).get("id")
+    info = 'runtime="native"' + (
+        f', instance="{instance}"' if instance else ""
+    )
     lines = [
         "# HELP richengine_info RichEngine runtime metrics.",
         "# TYPE richengine_info gauge",
-        'richengine_info{runtime="native"} 1',
+        f"richengine_info{{{info}}} 1",
     ]
     pressure = status.get("memory_pressure")
     for state in ("normal", "warning", "critical"):

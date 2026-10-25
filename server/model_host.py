@@ -8,6 +8,7 @@ stack. load() and unload() refuse while requests run, unless forced.
 """
 
 import argparse
+import json
 import math
 import os
 import threading
@@ -36,10 +37,31 @@ IDLE_WATCH_TICK = 30.0
 HostState = Literal["unloaded", "loading", "loaded", "failed"]
 
 
+def _engine_binary(binary: str, assembly_dir: Path) -> str:
+    """The block-8 verify build, when the model's draft trains at eight rows.
+
+    `make verify8` leaves a richengine binary in the sibling build8/ directory
+    (packaged installs: engine8/), compiled at the draft's native eight-row
+    verify geometry — roughly half the verify trunk's fused-M work. Models
+    whose draft declares a deeper block keep the default binary's frame.
+    """
+    try:
+        draft = json.loads((assembly_dir / "draft" / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return binary
+    block_size = draft.get("dflash_config", {}).get("block_size")
+    if not block_size or block_size > 8:
+        return binary
+    variant = (
+        Path(binary).parent.parent / (Path(binary).parent.name + "8") / "richengine"
+    )
+    return str(variant) if variant.is_file() else binary
+
+
 def _native_command(args):
     """The native engine's argv: the assembly directory plus serve options."""
     command = [
-        args.binary,
+        _engine_binary(args.binary, Path(args.assembly_dir)),
         "serve-native",
         str(args.assembly_dir),
         "auto" if args.max_context is None else str(args.max_context),
@@ -217,7 +239,12 @@ class ModelHost:
         # per server.
         serving_contract = serving.load(assembly_dir)
         contract = validate_tokenizer(tokenizer, str(tokenizer_path), serving_contract)
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(
+            tokenizer,
+            allow_missing=bool(
+                serving_contract.decision or serving_contract.encoder
+            ),
+        )
         print_status(f"Chat template · {chat_templates.describe()}")
         # Special tokens the output parser needs as text: the dialect's call
         # markup, and the think-close token where it is a special token.
@@ -598,6 +625,17 @@ class HostPool:
         """The primary resident: the first host, or None of an empty pool."""
         return self.hosts[0] if self.hosts else None
 
+    def _primary(self):
+        """The resident the pool answers as: the default host while it
+        serves, else the first loaded resident — an empty default slot
+        must not strand the residents that did load."""
+        if self.default is not None and self.default.app is not None:
+            return self.default
+        return next(
+            (host for host in self.hosts if host.app is not None),
+            self.default,
+        )
+
     def apps(self):
         """Every resident's live Frontend, default first."""
         return [host.app for host in self.hosts if host.app is not None]
@@ -622,7 +660,7 @@ class HostPool:
 
     def app_for(self, model, *, prefer_decision=False):
         """The app serving model across residents; None routes to the
-        decision host for decision endpoints, else the default."""
+        decision host for decision endpoints, else the primary."""
         if model is None:
             if prefer_decision:
                 host = self.decision_host()
@@ -636,49 +674,49 @@ class HostPool:
 
     def note_request(self, app=None):
         """A generation request arrived; reset the serving host's clock."""
-        host = self.host_for_app(app) if app is not None else self.default
+        host = self.host_for_app(app) if app is not None else self._primary()
         if host is not None:
             host.note_request()
 
-    # -- compat: the default resident's surface --------------------------
+    # -- compat: the primary resident's surface --------------------------
 
     @property
     def app(self):
-        host = self.default
+        host = self._primary()
         return host.app if host is not None else None
 
     @property
     def state(self):
-        host = self.default
+        host = self._primary()
         return host.state if host is not None else "unloaded"
 
     @property
     def error(self):
-        host = self.default
+        host = self._primary()
         return host.error if host is not None else None
 
     @property
     def backend(self):
-        host = self.default
+        host = self._primary()
         return host.backend if host is not None else None
 
     @property
     def runtime(self):
-        host = self.default
+        host = self._primary()
         return host.runtime if host is not None else None
 
     @property
     def assembly_dir(self):
-        host = self.default
+        host = self._primary()
         return host.assembly_dir if host is not None else None
 
     @property
     def weight_layout(self):
-        host = self.default
+        host = self._primary()
         return host.weight_layout if host is not None else None
 
     def tuning_requires_reload(self):
-        host = self.default
+        host = self._primary()
         return host is not None and host.tuning_requires_reload()
 
     def _models_root(self):
@@ -686,8 +724,14 @@ class HostPool:
 
     def residents_status(self):
         """Per-resident /status rows."""
-        return {
-            host.app.model: {
+        rows = {}
+        for host in self.hosts:
+            if host.app is None:
+                continue
+            # Each resident's engine answers its own status, as the
+            # default's does for the top-level row; memory_actual rides it.
+            memory = host.app.status().get("memory_actual") or {}
+            rows[host.app.model] = {
                 "state": host.state,
                 "model_state": host.state,
                 "error": host.error,
@@ -695,10 +739,36 @@ class HostPool:
                 "vision": host.app.vision,
                 "decision": host.app.decision_pathway,
                 "input_modalities": host.app.input_modalities,
+                "memory_bytes": memory.get("current_bytes"),
+                "memory_peak_bytes": memory.get("peak_bytes"),
             }
-            for host in self.hosts
-            if host.app is not None
+        return rows
+
+    def pool_status(self):
+        """/status's capacity summary: hosts in use plus the loads left
+        before load() refuses with its 409."""
+        return {
+            "max_residents": self.max_residents,
+            "slots": len(self.hosts),
+            "free": (
+                sum(host.app is None for host in self.hosts)
+                + self.max_residents
+                - len(self.hosts)
+            ),
         }
+
+    def residents_ready(self):
+        """/ready's resident counts by host state."""
+        counts = {
+            "total": len(self.hosts),
+            "loaded": 0,
+            "loading": 0,
+            "unloaded": 0,
+            "failed": 0,
+        }
+        for host in self.hosts:
+            counts[host.state] = counts.get(host.state, 0) + 1
+        return counts
 
     # -- lifecycle --------------------------------------------------------
 
@@ -734,11 +804,11 @@ class HostPool:
                     (candidate for candidate in self.hosts if candidate.app is None),
                     None,
                 )
-                if len(self.hosts) < self.max_residents:
+                if free is not None:
+                    host = free
+                elif len(self.hosts) < self.max_residents:
                     host = ModelHost(self.args)
                     self.hosts.append(host)
-                elif free is not None:
-                    host = free
                 elif self.max_residents == 1:
                     host = self.default
                 else:
@@ -760,7 +830,7 @@ class HostPool:
         """Unload one resident's stack; the slot stays for a later load."""
         with self.lock:
             if model_id is None:
-                host = self.default
+                host = self._primary()
             else:
                 host = next(
                     (

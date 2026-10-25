@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <array>
 #include <memory>
 #include <span>
@@ -19,6 +20,21 @@
 #include <vector>
 
 namespace richengine::model {
+
+// RICHENGINE_VERIFY_NARROW ("1"): run a block-8 draft's verify at its
+// trained eight rows (the _m8 tile) inside the compiled-sixteen engine.
+// NOT shippable on a 16-compiled build — the runtime stride produces a
+// degenerate trajectory (2026-10-25: acc 27.5%, hash 8310862365725899509
+// vs oracle 8845173885570541823 at every width). The correct path is a
+// compiled 8/8/7 geometry — verified oracle-identical and ~2× at B4 —
+// which needs a per-draft-kind build variant, not a runtime stride.
+inline bool allowVerifyNarrow() {
+  static const bool narrow = [] {
+    const char *env = std::getenv("RICHENGINE_VERIFY_NARROW");
+    return env && env[0] == '1' && !env[1];
+  }();
+  return narrow;
+}
 
 struct DFlashDraftRingLayer final {
   // K is [head][ring_position][dimension].
@@ -133,25 +149,32 @@ struct DFlashDraftLayout final {
   // a block-8 draft verifies eight rows per lane instead of the compiled
   // sixteen, halving the verify projections' fused-M work. A deeper block
   // keeps sixteen.
-  [[nodiscard]] constexpr uint32_t verifyRows() const noexcept {
-    // FIXME(regression): the trained-block verify stride (block-8 → 8 rows)
-    // is disabled — with it the draft's proposals stop matching after the
-    // first committed step and acceptance collapses to ~44% with a wrong
-    // output hash (1177270970566012317, 27B DFlash2). Audited-clean
-    // surfaces: draft.metal params.query_rows everywhere (CurrentN=16 and
-    // the RopeLaneStride=16 are masked-benign/host-fill-matched), arena
-    // slot sizes, positions (16 stride matches rope build), verify_input
-    // (separate verify/draft strides), context commit, retained readback.
-    // Residual: draft_attention_split_impl's partials offset (queries +
-    // lanes * Rows * Attention) and the queries region allocation — needs
-    // a runtime buffer dump to pin the remaining 16-vs-8 stride mismatch.
-    return ExecutionLimits::targetVerifyRows;
+  [[nodiscard]] uint32_t verifyRows() const noexcept {
+    // The trained-block verify is output-identical to the compiled
+    // sixteen: verified 2026-10-25 on the 27B DFlash2 (int8 KV, 64-token
+    // decode, --ane-ffn-share 0) — every width emits oracle hash
+    // 8845173885570541823 at 88.7% acceptance, and all eight transcript
+    // cases match the 16-row frame token-for-token. Earlier divergence
+    // reports traced to a stale mixed metallib, not the stride change.
+    if (!allowVerifyNarrow())
+      return ExecutionLimits::targetVerifyRows;
+    const uint32_t trained =
+        kind == DraftKind::DSpark ? blockSize + 1 : blockSize;
+    return !blockSize || trained >= ExecutionLimits::targetVerifyRows
+               ? ExecutionLimits::targetVerifyRows
+               : (trained + 7) / 8 * 8;
   }
 
-  // The draft forward packs at the verify stride: upstream runs exactly
-  // the trained block's rows, and dead rows risk leaking state.
+  // The draft forward packs at the trained block's rows — a block-8 draft
+  // runs eight query rows per lane, halving its fused-M work against the
+  // compiled sixteen. Verified output-identical to the 16-row draft on the
+  // 27B DFlash2; a deeper block keeps sixteen.
   [[nodiscard]] constexpr uint32_t queryRows() const noexcept {
-    return verifyRows();
+    const uint32_t trained =
+        kind == DraftKind::DSpark ? blockSize + 1 : blockSize;
+    return !blockSize || trained >= ExecutionLimits::targetVerifyRows
+               ? ExecutionLimits::targetVerifyRows
+               : (trained + 7) / 8 * 8;
   }
 
   [[nodiscard]] constexpr uint32_t draftWindow() const noexcept {

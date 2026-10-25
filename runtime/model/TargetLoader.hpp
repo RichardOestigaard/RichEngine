@@ -8,6 +8,9 @@
 #include "model/TargetFiles.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
+
+#include <cstdlib>
+#include <type_traits>
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -39,7 +42,11 @@ struct AffineTargetFormat final {
   }
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
-    return readAffineProjection(file, outputSize, inputSize, label);
+    // RICHENGINE_AF4P: read the affine planes as AF4P block segments, which
+    // route the staged gguf_decode tiles (gguf_decode_af4p_*).
+    static const bool af4p = std::getenv("RICHENGINE_AF4P") != nullptr;
+    return af4p ? readAf4pProjection(file, outputSize, inputSize, label)
+                : readAffineProjection(file, outputSize, inputSize, label);
   }
   // The tensor `label`; block images keep the projection as `tensors`.
   [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,

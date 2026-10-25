@@ -117,6 +117,14 @@ struct LinearConfig final {
   // least two); all other tiles use one.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 8;
+  // GgufStaged: each column tile starts its walk over its K partition at its
+  // own step (kernels/common/gguf_staged_tile.h) instead of every tile at the
+  // partition's first; no other tile spreads.
+  bool spread = false;
+  // GgufStaged gate/up decode: gate and up in one dispatch whose simdgroups
+  // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
+  // gate and up in one format), instead of a gate pass and an up pass.
+  bool oneGateUpPass = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -385,6 +393,38 @@ public:
                                        metal::MetalBuffer argmaxValues, metal::MetalBuffer argmaxIndices,
                                        const HeadArgmaxParams &headParams, LinearScratch scratch,
                                        uint32_t verifyRows = RICHENGINE_TARGET_VERIFY_ROWS) const;
+  // The score-gather head (RICHENGINE_SCORE_GATHER): the staged or register
+  // decode of the plan, dispatched once per contiguous run of the
+  // QUANT_TILE_ROWS-column quant tiles `quantTiles` names (sorted, unique)
+  // instead of over every column tile. Each run binds views of the weight
+  // planes shifted by whole quant tiles — the kernels read their tiles
+  // relative to the bound planes — while out_offset lands the run's absolute
+  // columns, so only the wanted columns of `output` are written. Returns
+  // false when the projection or plan cannot take it — several or float or
+  // MXFP4 segments, a segment tail not whole quant tiles, or more runs than
+  // the full head would cost — and the caller encodes it.
+  [[nodiscard]] bool addGgufHeadColumns(metal::CommandGraph &graph,
+                                        const metal::MetalBackend &backend,
+                                        const LinearBuffers &buffers, const Projection &projection,
+                                        const LinearPlan &plan,
+                                        std::span<const uint32_t> quantTiles) const;
+  // The score head's single-dispatch gather (RICHENGINE_SCORE_TENSOR;
+  // `fused` is RICHENGINE_SCORE_FUSED): gguf_decode_score_* in
+  // shared/gguf_score.metal computes only the `columns` columns of the
+  // fp32 logits of a `lanes`-lane batch — a lane's row is row lane *
+  // laneRows of `input` and of `output` — where addGgufHeadColumns
+  // dispatches once per contiguous quant-tile run. `fused` reads the raw
+  // hidden rows and runs its own RMS norm (weights `norm`) into `normed`
+  // inside the same dispatch; unfused reads normed rows from `input` and
+  // `normed`/`norm` go unused. Returns false when the projection or the
+  // arguments cannot take it and the caller encodes another path.
+  [[nodiscard]] bool addGgufHeadGather(
+      metal::CommandGraph &graph, metal::MetalBuffer input,
+      metal::MetalBuffer normed, metal::MetalBuffer normWeights,
+      bool normFloat32, float normEps, metal::MetalBuffer output,
+      metal::MetalBuffer columns, uint32_t columnCount,
+      const Projection &projection, uint32_t lanes, uint32_t laneRows,
+      bool fused) const;
 
 private:
   // The device's configuration of the workload; a block plan's tile may follow the formats of the projections it

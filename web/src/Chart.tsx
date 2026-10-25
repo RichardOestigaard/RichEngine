@@ -2,7 +2,6 @@ import {
   createEffect,
   createMemo,
   createSignal,
-  For,
   Show,
   untrack,
 } from "solid-js";
@@ -77,15 +76,16 @@ export interface ChartAppend {
   y: number | number[];
 }
 
+/* The fmt callback may take the series label for per-row units. */
 export const fmtTooltipRows =
-  (fmt: (v: number) => string): TooltipFormatter =>
+  (fmt: (v: number, label?: string) => string): TooltipFormatter =>
   (info: HoverInfo) => {
     if (info.kind === "point")
       return {
         rows: info.values.map((v) => ({
           color: v.color,
           label: v.label,
-          value: fmt(v.y),
+          value: fmt(v.y, v.label),
         })),
       };
     if (info.kind === "bar")
@@ -94,7 +94,7 @@ export const fmtTooltipRows =
           {
             color: info.color,
             label: `${info.category} ${info.label}`.trim(),
-            value: fmt(info.value),
+            value: fmt(info.value, info.label),
           },
         ],
       };
@@ -149,19 +149,6 @@ export function Chart(props: ChartProps) {
     };
   });
 
-  const legendItems = createMemo(() => {
-    paletteTick();
-    const p = palette();
-    const colors = seriesColors(p);
-    const data = props.data;
-    const entries =
-      "series" in data ? data.series : "slices" in data ? data.slices : [];
-    return entries.map((entry, index) => ({
-      label: entry.label ?? `Series ${index + 1}`,
-      color: entry.color ?? colors[index % colors.length] ?? p.accent,
-    }));
-  });
-
   createEffect(() => {
     const pending = props.append;
     if (pending && appendTypes.has(props.type)) {
@@ -174,29 +161,13 @@ export function Chart(props: ChartProps) {
 
   return (
     <div class="chart-frame">
-      <Show when={props.options?.legend && legendItems().length > 0}>
-        <div class="chart-legend">
-          <For each={legendItems()}>
-            {(item) => (
-              <span class="chart-legend-item">
-                <i
-                  aria-hidden="true"
-                  class="chart-legend-swatch"
-                  style={{ background: item.color }}
-                />
-                {item.label}
-              </span>
-            )}
-          </For>
-        </div>
-      </Show>
       <Show when={options()} keyed>
         {(opts) => {
           lastAppend = untrack(() => props.append);
           return (
             <RcChart
               {...opts}
-              legend={false}
+              legend={opts.legend ?? false}
               ref={(c) => (chart = c ?? undefined)}
               type={props.type}
               data={props.data}

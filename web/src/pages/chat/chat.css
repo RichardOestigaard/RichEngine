@@ -38,10 +38,20 @@
 .chat-shell .message { margin: 32px 0; white-space: pre-wrap; overflow-wrap: anywhere }
 .chat-shell .user { position: relative; width: fit-content; max-width: 78%; margin-left: auto; padding: 9px 15px; border-radius: 18px 18px 4px 18px; background: var(--bubble) }
 .chat-shell .user .actions { position: absolute; top: calc(100% + 2px); right: 0; margin-top: 0 }
-.chat-shell .queued { opacity: .66; border: 1px dashed var(--border) }
-.chat-shell .queued-tag { margin-top: 8px; color: var(--muted); font-size: 11px }
-.chat-shell .queued-remove { position: absolute; top: -7px; right: -7px; display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: var(--composer); color: var(--muted); font-size: 13px; line-height: 1 }
-.chat-shell .queued-remove:hover { color: var(--text); border-color: var(--text) }
+/* Queued turns wait in a tray on top of the composer — out of the message
+   log — in send order, first ("Next") at top. */
+.chat-shell .queue-tray { position: absolute; right: 0; bottom: calc(100% + 8px); left: 0; display: grid; gap: 6px; max-height: 168px; overflow-y: auto; scrollbar-width: thin }
+.chat-shell .queue-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border: 1px dashed var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); color: var(--muted); font-size: 12.5px }
+.chat-shell .queue-pos { flex: none; min-width: 26px; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
+.chat-shell .queue-text { overflow: hidden; flex: 1; min-width: 0; text-overflow: ellipsis; white-space: nowrap }
+.chat-shell .queue-atts { display: flex; flex: none; gap: 4px }
+.chat-shell .queue-atts img { width: 20px; height: 20px; border-radius: 5px; object-fit: cover }
+.chat-shell .queue-file { overflow: hidden; max-width: 140px; padding: 1px 7px; border-radius: 6px; background: var(--bubble); font-size: 11px; text-overflow: ellipsis; white-space: nowrap }
+.chat-shell .queue-remove { display: grid; width: 20px; height: 20px; flex: none; place-items: center; border-radius: 50%; color: var(--muted); font-size: 14px; line-height: 1 }
+.chat-shell .queue-remove:hover { color: var(--text); background: var(--hover) }
+/* The tray covers the tail of the log while it's up; make room for it. */
+.chat-shell.queue-open #chat { padding-bottom: 340px }
+.chat-shell.queue-open #to-bottom { bottom: 140px }
 .chat-shell .user-images { display: flex; flex-wrap: wrap; gap: 8px }
 .chat-shell .user-text + .user-images, .chat-shell .user-text + .user-files, .chat-shell .user-images + .user-files { margin-top: 9px }
 .chat-shell .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 10px; object-fit: cover; cursor: zoom-in }

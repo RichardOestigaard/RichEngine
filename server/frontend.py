@@ -116,6 +116,27 @@ def _drop_nulls(body, extras):
     }
 
 
+def _request_metadata(body):
+    """The request's metadata map for the response object to echo: at most
+    16 short string pairs, as the OpenAI APIs bound it."""
+    metadata = body.get("metadata")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or len(metadata) > 16
+        or any(
+            not isinstance(key, str)
+            or len(key) > 64
+            or not isinstance(value, str)
+            or len(value) > 512
+            for key, value in metadata.items()
+        )
+    ):
+        raise APIError(
+            400, "metadata must be an object of up to 16 short string pairs"
+        )
+    return metadata
+
+
 # Text completions' output budget when max_tokens is omitted: OpenAI's
 # default for the endpoint, which vLLM and SGLang also use.
 COMPLETION_DEFAULT_MAX_TOKENS = 16
@@ -336,7 +357,7 @@ class StoredResponse:
 
     @property
     def response(self):
-        return json_codec.loads(self.response_json)
+        return json_codec.loads_compact(self.response_json)
 
 
 class ResponseStore:
@@ -450,6 +471,8 @@ class Frontend:
     image_geometry = image_input.DEFAULT_GEOMETRY
     sampling_defaults: dict = {}
     serving_dialect = None
+    encoder = False
+    decision_temperatures: dict = {}
 
     def __init__(
         self,
@@ -576,6 +599,11 @@ class Frontend:
         self.images = image_input.ImageCache(self.image_geometry)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
+        # RICHENGINE_SYSTEMONE_WINDOW caps /v1/systemone's in-flight
+        # questions below preparation_capacity; 0 or unset keeps the bound.
+        self.systemone_window = max(
+            0, int(os.environ.get("RICHENGINE_SYSTEMONE_WINDOW", "0") or 0)
+        )
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
         self.preparation_lock = threading.Lock()
         self.preparation_active = 0
@@ -586,13 +614,39 @@ class Frontend:
         # A d1-family checkpoint answers /v1/systemone through its own
         # prompt and grouped readout; every other model keeps the SemIf
         # letter-slot pathway. Nothing else changes: same score-only jobs.
-        self.decision_pathway = decisions.is_decision_model(model) or (
+        # The contract's encoder flag and calibrated readout temperatures:
+        # the former refuses generation outright; the decision pathway's
+        # questions carry the latter into their softmax.
+        self.encoder = getattr(serving, "encoder", False)
+        self.decision_temperatures = (
+            getattr(serving, "decision_temperatures", None) or {}
+        )
+        # The score pathway decides how /v1/judgments and /v1/systemone
+        # prepare and read back: SemIf letter slots for generative models,
+        # the decision module's own markup and readout for d1.
+        decision = decisions.is_decision_model(model) or (
             self.serving is not None and self.serving.decision
+        )
+        self.pathway = (
+            decisions.DecisionPathway(self.decision_temperatures)
+            if decision
+            else judgments.SemIfPathway()
         )
         # Agents repeat a few system prompts and tool sets.
         self._shared_prefix_probe = lru_cache(maxsize=8)(
             self._render_shared_prefix_probe
         )
+
+    @property
+    def decision_pathway(self):
+        """Whether the resident's score pathway is the d1 decision one;
+        /v1/status reports it and the pool prefers it for score requests."""
+        return isinstance(self.pathway, decisions.DecisionPathway)
+
+    @staticmethod
+    def _deadline_checkpoint(deadline, disconnected):
+        """A pathway's preparation checkpoint callable."""
+        return _preparation_checkpoint(deadline, disconnected)
 
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
@@ -793,6 +847,14 @@ class Frontend:
     def prepare_completion(self, body, *, deadline):
         """A text completion: the prompt generates as given, with no chat
         template, reasoning split, tools or images."""
+        if self.encoder or not self.pathway.generates:
+            raise APIError(
+                422,
+                "this model is a decision "
+                + ("encoder" if self.encoder else "model")
+                + " and does not generate",
+                "encoder_no_generate" if self.encoder else "decision_no_generate",
+            )
         with self._preparation(deadline):
             body = _drop_nulls(
                 body, ("n", "best_of", "max_tokens", "suffix", "echo", "logprobs")
@@ -895,11 +957,19 @@ class Frontend:
         return _PRIORITIES[priority_name]
 
     def _score_job(
-        self, prompt_tokens, slot_ids, deadline, priority, prompt_sha256=None
+        self,
+        prompt_tokens,
+        slot_ids,
+        deadline,
+        priority,
+        prompt_sha256=None,
+        shared_prefix_tokens=0,
+        prefix_tokens=(),
     ):
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
+            prefix_tokens=prefix_tokens,
             max_new_tokens=0,
             seed=0,
             sampling=wire.SamplingParameters(),
@@ -908,6 +978,7 @@ class Frontend:
             score_tokens=tuple(slot_ids),
             public_id=secrets.token_hex(16),
             prompt_sha256=prompt_sha256,
+            shared_prefix_tokens=shared_prefix_tokens,
         )
 
     def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
@@ -931,102 +1002,10 @@ class Frontend:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
     def prepare_judgment(self, body, *, deadline, disconnected=None):
-        if self.decision_pathway:
-            return self._prepare_judgment_decision(
-                body, deadline=deadline, disconnected=disconnected
-            )
-        unknown = sorted(
-            set(body)
-            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+        """Prepare a judgment row through the resident's score pathway."""
+        return self.pathway.prepare_judgment(
+            self, body, deadline=deadline, disconnected=disconnected
         )
-        if unknown:
-            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if not self.accepts_model(body.get("model", self.model)):
-            raise APIError(404, f"model {body['model']} not found", "model_not_found")
-        try:
-            judgments.validate_row(body)
-        except ValueError as error:
-            raise APIError(400, str(error)) from error
-        priority = self._priority(body)
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-
-            def admit(prompt_tokens):
-                checkpoint()
-                if prompt_tokens > self.max_context:
-                    raise ContextLengthError(prompt_tokens, self.max_context)
-
-            tokens, slots, prompt = self._encode_score_prompt(
-                judgments.judgment_messages(body),
-                judgments.LETTERS[: len(body["options"])],
-                admit,
-                checkpoint,
-                "judgment",
-            )
-            checkpoint()
-            job = self._score_job(
-                tokens, slots, deadline, priority, judgments.digest(prompt)
-            )
-        return job, body
-
-    def _prepare_judgment_decision(self, body, *, deadline, disconnected=None):
-        """The d1 pathway's judgment prepare pass: the row's options become
-        one choice question in the decision prompt's own markup."""
-        unknown = sorted(
-            set(body)
-            - {"id", "state", "question", "options", "model", "timeout", "priority"}
-        )
-        if unknown:
-            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if not self.accepts_model(body.get("model", self.model)):
-            raise APIError(404, f"model {body['model']} not found", "model_not_found")
-        try:
-            judgments.validate_row(body)
-        except ValueError as error:
-            raise APIError(400, str(error)) from error
-        priority = self._priority(body)
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-            spec = judgments.SystemOneQuestion(
-                kind="choice",
-                instructions=body["question"],
-                labels=tuple(option["id"] for option in body["options"]),
-                descriptions=tuple(
-                    option["description"] for option in body["options"]
-                ),
-                legend=None,
-                deterministic=False,
-            )
-            try:
-                question = decisions.prepare_question(self.tokenizer, spec)
-            except decisions.DecisionUnsupported as error:
-                raise APIError(
-                    500, str(error), "decision_unsupported"
-                ) from error
-            bos = getattr(self.tokenizer, "bos_token", None)
-            bos = bos if isinstance(bos, str) else ""
-            try:
-                prompt = decisions.prompt_text(body["state"], question, bos)
-                tokens = list(
-                    self.tokenizer.encode(prompt, add_special_tokens=False)
-                )
-            except Exception as error:
-                raise APIError(
-                    400, "judgment prompt could not be rendered"
-                ) from error
-            checkpoint()
-            if not tokens:
-                raise APIError(400, "judgment prompt could not be rendered")
-            if len(tokens) > self.max_context:
-                raise ContextLengthError(len(tokens), self.max_context)
-            job = self._score_job(
-                tokens,
-                question.score_tokens,
-                deadline,
-                priority,
-                judgments.digest(prompt),
-            )
-        return job, decisions.Judgment(body, question)
 
     def judgment_response(self, row, job, result):
         """The judgment response for one prepared row. Entries carrying their
@@ -1039,174 +1018,14 @@ class Frontend:
 
     def systemone_metadata(self):
         """The prompt/readout identity /v1/systemone reports."""
-        if self.decision_pathway:
-            return {
-                "prompt_version": decisions.PROMPT_VERSION,
-                "readout": decisions.READOUT,
-                "probability_status": decisions.PROBABILITY_STATUS,
-            }
-        return {
-            "prompt_version": judgments.PROMPT_VERSION,
-            "readout": judgments.READOUT,
-            "probability_status": judgments.PROBABILITY_STATUS,
-        }
+        return self.pathway.systemone_metadata()
 
     def prepare_systemone(self, body, *, deadline, disconnected=None):
-        if self.decision_pathway:
-            return self._prepare_systemone_decision(
-                body, deadline=deadline, disconnected=disconnected
-            )
-        details = []
-        model = body.get("model")
-        if not isinstance(model, str) or not model:
-            details.append(judgments.detail(["model"], "field required", "missing"))
-        elif not self.accepts_model(model):
-            details.append(
-                judgments.detail(
-                    ["model"], f"model {model} is not served by this endpoint"
-                )
-            )
-        state, specs, question_details = judgments.validate_systemone(body)
-        details.extend(question_details)
-        try:
-            priority = self._priority(body)
-        except APIError as error:
-            details.append(judgments.detail(["priority"], error.message))
-        if details:
-            raise judgments.SystemOneError(details)
-        jobs = []
-        total_tokens = 0
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-            for qid, spec in specs:
-                if spec.deterministic:
-                    jobs.append((qid, spec, None))
-                    continue
-                slots = judgments.slot_labels(self.tokenizer)
-                if len(spec.labels) > len(slots):
-                    raise judgments.SystemOneError(
-                        [
-                            judgments.detail(
-                                ["questions", qid, "criteria"],
-                                f"the served tokenizer supports "
-                                f"{len(slots)} answer slots; "
-                                f"{len(spec.labels)} were requested",
-                            )
-                        ]
-                    )
-                labels = slots[: len(spec.labels)]
-
-                def admit(prompt_tokens, qid=qid, prepared=total_tokens):
-                    checkpoint()
-                    if prompt_tokens > self.max_context:
-                        raise ContextLengthError(prompt_tokens, self.max_context)
-                    if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
-                        raise judgments.SystemOneError(
-                            [
-                                judgments.detail(
-                                    ["questions", qid],
-                                    "total prepared question tokens exceed "
-                                    f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
-                                )
-                            ]
-                        )
-
-                tokens, slot_ids, _ = self._encode_score_prompt(
-                    judgments.systemone_messages(state, spec, labels),
-                    labels,
-                    admit,
-                    checkpoint,
-                    "question",
-                )
-                checkpoint()
-                total_tokens += len(tokens)
-                jobs.append(
-                    (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
-                )
-        return jobs
-
-    def _prepare_systemone_decision(self, body, *, deadline, disconnected=None):
-        """The d1 pathway's prepare pass: same validation, caps and job
-        shape as the SemIf one; the prompt markup and the grouped readout
-        are the decision model's own (server/decisions.py)."""
-        details = []
-        model = body.get("model")
-        if not isinstance(model, str) or not model:
-            details.append(judgments.detail(["model"], "field required", "missing"))
-        elif not self.accepts_model(model):
-            details.append(
-                judgments.detail(
-                    ["model"], f"model {model} is not served by this endpoint"
-                )
-            )
-        state, specs, question_details = judgments.validate_systemone(body)
-        details.extend(question_details)
-        try:
-            priority = self._priority(body)
-        except APIError as error:
-            details.append(judgments.detail(["priority"], error.message))
-        if details:
-            raise judgments.SystemOneError(details)
-        bos = getattr(self.tokenizer, "bos_token", None)
-        bos = bos if isinstance(bos, str) else ""
-        jobs = []
-        total_tokens = 0
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-            for qid, spec in specs:
-                try:
-                    question = decisions.prepare_question(self.tokenizer, spec)
-                except decisions.DecisionUnsupported as error:
-                    raise APIError(500, str(error), "decision_unsupported") from error
-                if question.deterministic:
-                    jobs.append((qid, question, None))
-                    continue
-                try:
-                    prompt = decisions.prompt_text(state, question, bos)
-                except Exception as error:
-                    raise APIError(
-                        400, "question prompt could not be rendered"
-                    ) from error
-                checkpoint()
-                try:
-                    tokens = list(
-                        self.tokenizer.encode(prompt, add_special_tokens=False)
-                    )
-                except Exception as error:
-                    raise APIError(
-                        400, "question prompt could not be rendered"
-                    ) from error
-                checkpoint()
-                if not tokens:
-                    raise APIError(
-                        400, "question prompt could not be rendered"
-                    )
-                if len(tokens) > self.max_context:
-                    raise ContextLengthError(len(tokens), self.max_context)
-                if (
-                    total_tokens + len(tokens)
-                    > judgments.MAX_SYSTEMONE_TOTAL_TOKENS
-                ):
-                    raise judgments.SystemOneError(
-                        [
-                            judgments.detail(
-                                ["questions", qid],
-                                "total prepared question tokens exceed "
-                                f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
-                            )
-                        ]
-                    )
-                total_tokens += len(tokens)
-                jobs.append(
-                    (
-                        qid,
-                        question,
-                        self._score_job(
-                            tokens, question.score_tokens, deadline, priority
-                        ),
-                    )
-                )
-        return jobs
+        """Prepare systemone questions through the resident's score
+        pathway."""
+        return self.pathway.prepare_systemone(
+            self, body, deadline=deadline, disconnected=disconnected
+        )
 
     def systemone_answer(self, spec, logits):
         """The typed answer for one prepared question. Prepared entries that
@@ -1349,7 +1168,7 @@ class Frontend:
             return ()
         # Key order is kept: templates render tools in the request's order.
         return self._shared_prefix_probe(
-            json.dumps([head, template], ensure_ascii=False)
+            json_codec.encode_compact([head, template])
         )
 
     def _render_prompt(
@@ -1500,6 +1319,16 @@ class Frontend:
         clamp_output_budget,
         thinking_display,
     ):
+        # A decision model scores only; every generation entry point
+        # (Chat, Messages, Responses) funnels here.
+        if self.encoder or not self.pathway.generates:
+            raise APIError(
+                422,
+                "this model is a decision "
+                + ("encoder" if self.encoder else "model")
+                + " and does not generate",
+                "encoder_no_generate" if self.encoder else "decision_no_generate",
+            )
         body = _drop_nulls(
             body,
             (
@@ -1514,14 +1343,14 @@ class Frontend:
         # can render documents and build validators.
         options = self._generation_options(body)
         n = body.get("n", 1)
+        if not isinstance(n, int) or isinstance(n, bool) or n != 1:
+            raise APIError(400, "n values other than 1 are not supported")
+        # TokensEvent carries token ids only, so per-token logprobs would
+        # need engine support.
         logprobs = body.get("logprobs")
-        if (
-            not isinstance(n, int)
-            or isinstance(n, bool)
-            or n != 1
-            or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
-        ):
-            raise APIError(400, "n and logprobs are not currently supported")
+        if logprobs is not None and (not isinstance(logprobs, bool) or logprobs):
+            raise APIError(400, "logprobs is not supported")
+        metadata = _request_metadata(body)
         prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
         tools, tool_policy = prompt.tools, prompt.tool_policy
         response_schema, response_validator = (
@@ -1615,7 +1444,7 @@ class Frontend:
         tools_signature = None
         if tools:
             digest = hashlib.sha1(
-                json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()
+                json_codec.encode_compact(tools, sort_keys=True)
             ).hexdigest()[:8]
             tools_signature = (len(tools), digest)
         image_spans, image_pixels = (), b""
@@ -1645,6 +1474,7 @@ class Frontend:
             tool_policy=tool_policy,
             response_validator=response_validator,
             response_format=body.get("response_format"),
+            response_metadata=metadata,
             constraint=constraint,
             image_spans=image_spans,
             image_pixels=image_pixels,
@@ -1787,20 +1617,25 @@ class Frontend:
             **fields,
         )
 
-    def prepare_responses(self, body, *, deadline, reserve_input=None):
+    def prepare_responses(
+        self, body, *, deadline, reserve_input=None, find_response=None
+    ):
         store = body.get("store")
         if store is not None and not isinstance(store, bool):
             raise APIError(400, "store must be a boolean")
         store = True if store is None else store
+        metadata = _request_metadata(body)
         previous_id = body.get("previous_response_id")
         if previous_id is not None and (
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
+        if find_response is None:
+            find_response = self.response_store.get
         with self._preparation(deadline):
             previous_items = []
             if previous_id is not None:
-                previous = self.response_store.get(previous_id)
+                previous = find_response(previous_id)
                 if previous is None:
                     # Clients key on this code to resend the full history.
                     raise APIError(
@@ -1812,7 +1647,7 @@ class Frontend:
                 # Reserve its input bytes before materializing the history.
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
-                previous_items = json_codec.loads(previous.history_json)
+                previous_items = json_codec.loads_compact(previous.history_json)
             items = [*previous_items, *canonical_responses_input(body.get("input"))]
             chat, namespaces = responses_to_chat_body(body, items)
             job = self._prepare(
@@ -1825,6 +1660,14 @@ class Frontend:
             )
             job.response_store = store
             job.response_previous_id = previous_id
+            # The fields the response object echoes from the request.
+            job.response_metadata = metadata
+            job.response_tools = body.get("tools")
+            job.response_tool_choice = body.get("tool_choice") or "auto"
+            job.response_instructions = body.get("instructions")
+            job.response_reasoning = body.get("reasoning")
+            job.response_max_output_tokens = body.get("max_output_tokens")
+            job.response_top_logprobs = body.get("top_logprobs")
             if store:
                 job.response_history_items = items
             return job

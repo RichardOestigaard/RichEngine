@@ -18,6 +18,8 @@
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
+// The one-simdgroup gate/up tile: each lane stages its own column.
+#define GGUF_GATE_UP_THREADS 32u
 // Prefill tile of the staged kernels: GGUF_PREFILL_SIMDGROUPS simdgroups of
 // GGUF_PREFILL_SIMDGROUP_ROWS rows share one stage of GGUF_PREFILL_STEP
 // inputs of the tile's columns, which all threads dequantize.
@@ -52,7 +54,7 @@ struct GgufPrefillParams {
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of this segment
 };
-static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
+static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 20 bytes on both sides");
 // The residual prefill kernels over a view of the leading inputs of wider weight rows
 // (gguf_prefill_<format>_r_leading_inputs): each row of the planes holds plane_input_size inputs, of which the
 // projection reads the first prefill.input_size.
@@ -71,8 +73,9 @@ struct GgufDecodeParams {
   uint32_t splits;      // K partitions; 1 = no cross-threadgroup reduction
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
+  uint32_t spread;      // staged tile: 1 = each column tile starts its K walk at its own step, 0 = lockstep
 };
-static_assert(sizeof(GgufDecodeParams) == 16, "GGUF decode parameters are 16 bytes on both sides");
+static_assert(sizeof(GgufDecodeParams) == 20, "GGUF decode parameters are 20 bytes on both sides");
 
 // The fused greedy head (gguf_decode_sg_*_l*_amax): the decode's parameters
 // plus the fused argmax's lane semantics, one payload for the kernel.
@@ -80,8 +83,8 @@ struct GgufHeadArgmaxParams {
   GgufDecodeParams decode;
   HeadArgmaxParams head;
 };
-static_assert(sizeof(GgufHeadArgmaxParams) == 60,
-              "GGUF head argmax parameters are 60 bytes on both sides");
+static_assert(sizeof(GgufHeadArgmaxParams) == 64,
+              "GGUF head argmax parameters are 64 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.
@@ -92,8 +95,24 @@ struct GgufDecodeFusedParams {
   uint32_t cols[3];     // columns per segment; 0 past the last
   uint32_t fmt[3];      // GGUF_FMT_* per segment
   uint32_t offset[3];   // first destination column per segment
+  uint32_t spread;      // as GgufDecodeParams', each segment's tiles from their index in it
 };
-static_assert(sizeof(GgufDecodeFusedParams) == 48, "GGUF fused decode parameters are 48 bytes on both sides");
+static_assert(sizeof(GgufDecodeFusedParams) == 52, "GGUF fused decode parameters are 52 bytes on both sides");
+
+// The score head's single-dispatch gather (gguf_decode_score_*): `columns`
+// names the wanted output columns of a `lanes`-lane batch (a lane's input
+// row is row lane * lane_rows of the packed input and its logits row the
+// same row of the packed destination). The fused variant's norm_eps is its
+// in-kernel RMS norm's epsilon.
+struct GgufScoreParams {
+  uint32_t input_size;  // K
+  uint32_t out_stride;  // columns of a destination row
+  uint32_t lane_rows;   // packed rows between lanes (the verify stride)
+  uint32_t lanes;       // live input/output rows
+  uint32_t columns;     // entries of the columns buffer
+  float norm_eps;
+};
+static_assert(sizeof(GgufScoreParams) == 24, "GGUF score parameters are 24 bytes on both sides");
 
 struct GgufEmbedParams {
   uint32_t rows;

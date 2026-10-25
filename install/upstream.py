@@ -71,18 +71,23 @@ def select_gguf(files, variant):
     then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
     only file whose name ends in -VARIANT. A repository of one GGUF names no
     variant apart from its model, so its one match needs no report. Without
-    :VARIANT, the only target GGUF. Anything else is an error listing the
+    :VARIANT, the preferred default. Anything else is an error listing the
     candidates."""
     candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
     if variant is None:
         if len(candidates) == 1:
             return candidates[0], False
         # A Quantization-Aware Distillation build is the default where the
-        # repository ships exactly one: its distilled weights preserve the
-        # logit margins a draft was trained against, which plain quants lose.
+        # repository ships one: its distilled weights preserve the logit
+        # margins a draft was trained against, which plain quants lose.
+        # QAD-Q4_0 is the preferred build; of several QADs it wins, and one
+        # of another kind still defaults.
         qad = [n for n in candidates if "-qad-" in Path(n).stem.lower()]
+        preferred = [n for n in qad if Path(n).stem.lower().endswith("-qad-q4_0")]
+        if len(preferred) == 1:
+            return preferred[0], False
         if len(qad) == 1:
-            return qad[0], True
+            return qad[0], False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         parts = [Path(name).stem.split("-") for name in candidates]
@@ -163,6 +168,14 @@ def _gguf_target(repo, variant, language_only):
         print(
             f"No GGUF is named for {models.accent(':' + variant)} alone; using "
             f"{models.accent(name)}, the only one whose name ends in -{variant}.",
+            flush=True,
+        )
+    if variant and variant.lower() == "q4_k_m" and any(
+        Path(n).stem.lower().endswith("-qad-q4_0") for n in _root_ggufs(repo.files)
+    ):
+        print(
+            "Note · Q4_K_M requested; QAD-Q4_0 offers the same class at "
+            f"better quality — {models.accent(repo.name + ':QAD-Q4_0')}",
             flush=True,
         )
     with repo.open(name) as stream:

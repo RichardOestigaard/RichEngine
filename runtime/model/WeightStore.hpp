@@ -80,6 +80,9 @@ private:
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
 
 [[nodiscard]] ops::Projection
+readAf4pProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
+                   std::string_view label);
+[[nodiscard]] ops::Projection
 readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                      std::string_view label);
 

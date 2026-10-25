@@ -68,6 +68,12 @@ class ServingContract:
     # A decision model (Liquid d1 family): /v1/systemone and /v1/judgments
     # run the native decision pathway, not the SemIf emulation.
     decision: bool = False
+    # An encoder decision model (d1-omni): bidirectional attention, no
+    # causal decode.
+    encoder: bool = False
+    # The model's decision readout temperatures by option group, as the
+    # GGUF's lfm2.decision.temperature.* table states them.
+    decision_temperatures: dict = field(default_factory=dict)
 
     @classmethod
     def of(cls, doc, family=None):
@@ -107,6 +113,8 @@ class ServingContract:
             reasoning_effort=doc.get("reasoning_effort"),
             served_names=tuple(doc.get("served_names", ())),
             decision=bool(doc.get("decision", False)),
+            encoder=bool(doc.get("encoder", False)),
+            decision_temperatures=dict(doc.get("decision_temperatures") or {}),
         )
 
 

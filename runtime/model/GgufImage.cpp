@@ -267,6 +267,14 @@ std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."
 // the file declares them.
 void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geometry,
                               const std::string &arch) {
+  // A bidirectional target — the d1-omni decision encoder states
+  // attention.causal false — has no compiled kernels: refuse by name
+  // rather than report its first differing field.
+  if (file.unsignedValue(arch + ".attention.causal") ==
+      std::optional<uint64_t>{0})
+    throw GgufError(
+        "this GGUF is a bidirectional encoder (attention.causal false); "
+        "RichEngine does not serve it");
   std::string mismatched;
   const auto expect = [&](const char *key, uint64_t value) {
     const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);

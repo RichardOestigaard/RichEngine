@@ -268,7 +268,7 @@ public:
         // nonzero like the degenerate rows below.
         ++degenerateRows;
         for (uint32_t id : pack_.eosIds)
-          setBit(words, row * maskWords_ + id / 32, id);
+          setBit(words, row * maskWords_, id);
         continue;
       }
       const std::vector<uint32_t> &mask = maskRow(uint64_t(states[row]));

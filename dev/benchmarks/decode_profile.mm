@@ -316,9 +316,16 @@ int main(int argc, char **argv) {
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
+      const auto prefillStart = std::chrono::steady_clock::now();
       prefill(executor, lanes[0], prompt);
+      const double prefillWall =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        prefillStart)
+              .count();
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
+      std::printf("prefill %u rows: fused gpu %.2f ms, wall %.2f ms\n",
+                  promptTokens, prefillFused * 1e3, prefillWall * 1e3);
       executor.end(lanes[0].id);
       BackendInstrumentation::setDispatchProfiling(backend, true);
       prefill(executor, lanes[0], prompt);

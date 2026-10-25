@@ -33,6 +33,10 @@ ModelDescriptor graniteDescriptor(std::string name, const GraniteLayout &target)
   ModelDescriptor descriptor = makeModelDescriptor(
       std::move(name), target, graniteNullDraftLayout(target), vision);
   descriptor.visionSource = VisionSource::None;
+  // No GPU draft means the host mask round trip never competes with a verify
+  // loop, and GPU masks + forced spans measured ~29% faster on the
+  // constrained request (dfa-benchmark, 694-state tool-call DFA, B1).
+  descriptor.tuning.dfaMode = "full";
   return descriptor;
 }
 

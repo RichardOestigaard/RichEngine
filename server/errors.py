@@ -17,7 +17,15 @@ class APIError(Exception):
 
     def protocol_type(self, anthropic=False):
         if not anthropic:
-            return "server_error" if self.status >= 500 else "invalid_request_error"
+            return {
+                401: "authentication_error",
+                429: "rate_limit_error",
+                503: "service_unavailable",
+                529: "service_unavailable",
+            }.get(
+                self.status,
+                "server_error" if self.status >= 500 else "invalid_request_error",
+            )
         return {
             401: "authentication_error",
             403: "permission_error",

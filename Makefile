@@ -67,6 +67,22 @@ LIB := $(BUILD)/richengine.metallib
 
 all: $(TARGET) $(TUNE_TOOL)
 
+# The block-8 verify geometry: DFlash2 drafts trained at an eight-row block
+# verify eight rows a lane instead of the compiled sixteen, halving the
+# verify trunk's fused-M work (~2x at width on the 27B). A separate build —
+# the engine binary is compiled against the matching ExecutionLimits and the
+# metallib against the matching kernel constants — so deeper-block drafts
+# keep the wide frame on the default build. The server picks
+# build8/richengine when a model's draft/config.json says block_size <= 8.
+VERIFY8_DEFINES := -DRICHENGINE_DRAFT_QUERY_ROWS=8u \
+	-DRICHENGINE_DRAFT_PROPOSAL_TOKENS=7u -DRICHENGINE_TARGET_VERIFY_ROWS=8u
+.PHONY: verify8
+verify8:
+	$(MAKE) --no-print-directory BUILD=build8 build8/richengine build8/engine-tests/backend-benchmark build8/engine-tests/decode-profile \
+		PROD_METALFLAGS="$(PROD_METALFLAGS) $(VERIFY8_DEFINES)" \
+		ENGINE_CXXFLAGS="$(ENGINE_CXXFLAGS) $(VERIFY8_DEFINES)" \
+		ENGINE_OBJCXXFLAGS="$(ENGINE_OBJCXXFLAGS) $(VERIFY8_DEFINES)"
+
 install: model-selection platform-check
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
 		-f "$(RICHENGINE_MAKEFILE)" _install
@@ -321,10 +337,13 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/TargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DFlashTwoDraft.cpp \
+	runtime/model/DFlashTwo8width.cpp \
+	runtime/model/DFlashTwo16width.cpp \
 	runtime/model/DSparkDraft.cpp \
 	runtime/model/DFlashV1Draft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/VerifyBudget.cpp \
 	runtime/model/CompositeStateStorage.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/AnePredictor.mm \

@@ -1,4 +1,4 @@
-import { createSignal, createEffect, onCleanup, onMount, For, Show } from "solid-js";
+import { createSignal, createEffect, onCleanup, onMount, For, Index, Show, untrack } from "solid-js";
 import type { JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { api, apiPost, authorization, curlExample, errorText, storageGet, storageSet } from "../api";
@@ -429,13 +429,18 @@ export default function Models() {
     void pollStatus();
   }
 
-  async function unloadModel() {
+  async function unloadModel(entry: AvailableModel) {
     if (modelBusy()) return;
     setConfirmUnload(null);
     setModelBusy(true);
     try {
-      await apiPost("/v1/models/unload", {});
-      pushToast("ok", "Model unloaded");
+      /* Naming the model unloads its resident only; with no name the
+         endpoint frees the default resident. */
+      await apiPost(
+        "/v1/models/unload",
+        entry.model ? { model: entry.model } : {}
+      );
+      pushToast("ok", `Unloaded ${entry.model ?? "model"}`);
     } catch (e) {
       pushToast("error", errorText(e));
     }
@@ -997,7 +1002,7 @@ export default function Models() {
                       <button
                         class="btn small danger"
                         disabled={modelWorking()}
-                        title="Free the served model; requests fail until one is loaded again"
+                        title={`Unload ${entry.model} — requests naming it fail until it's loaded again; other residents keep serving`}
                         onClick={() => setConfirmUnload(entry)}
                       >
                         Unload
@@ -1358,16 +1363,18 @@ export default function Models() {
                 <Chart
                   type="area"
                   height={140}
-                  data={{
+                  /* Untracked snapshot: new points flow through append();
+                     a rebuild (theme change) re-reads current history. */
+                  data={untrack(() => ({
                     x: history().t.slice(-history().decode.length),
                     series: [
                       { label: "decode tok/s", y: history().decode },
                       { label: "prefill tok/s", y: history().prefill },
                     ],
-                  }}
+                  }))}
                   append={performanceAppend()}
                   options={{
-                    legend: true,
+                    legend: { position: "top" },
                     labels: { y: fmtInt },
                     window: 60,
                     xScale: "time",
@@ -1415,7 +1422,7 @@ export default function Models() {
                     ],
                   }}
                   options={{
-                    legend: true,
+                    legend: { position: "top" },
                     labels: { y: fmtMs },
                     tooltip: { format: fmtTooltipRows(fmtMs) },
                     yMin: 0,
@@ -1534,10 +1541,11 @@ export default function Models() {
                 <Chart
                   type="area"
                   height={120}
-                  data={{
+                  /* Untracked snapshot like the throughput chart. */
+                  data={untrack(() => ({
                     x: history().t.slice(-history().memory.length),
                     series: [{ label: "bytes", y: history().memory }],
-                  }}
+                  }))}
                   append={memoryAppend()}
                   options={{
                     labels: { y: fmtBytes },
@@ -1662,28 +1670,30 @@ export default function Models() {
               <div class="panel-row">
                 <span class="grow">Latency</span>
                 <span class="chips">
-                  <For each={latencyChips()}>
+                  <Index each={latencyChips()}>
                     {(stage) => (
                       <span class="chip">
-                        {stage.name} ×{fmtInt(stage.count)} · {fmtMs(stage.avgMs)}
+                        {stage().name} ×{fmtInt(stage().count)} · {fmtMs(stage().avgMs)}
                       </span>
                     )}
-                  </For>
+                  </Index>
                 </span>
               </div>
             </Show>
-            {/* One compact histogram per stage that reports buckets. */}
-            <For each={latencyStages()}>
+            {/* One compact histogram per stage that reports buckets.
+                Index keeps each row's Chart mounted across polls — the
+                data prop updates through setData instead of a rebuild. */}
+            <Index each={latencyStages()}>
               {(stage) => (
                 <div class="panel-row chart-row">
                   <div>
-                    <span class="chart-label">{stage.name}</span>
+                    <span class="chart-label">{stage().name}</span>
                     <Chart
                       type="bar"
                       height={80}
                       data={{
-                        categories: stage.cats,
-                        series: [{ label: stage.name, values: stage.data }],
+                        categories: stage().cats,
+                        series: [{ label: stage().name, values: stage().data }],
                       }}
                       options={{
                         labels: { y: fmtInt },
@@ -1694,7 +1704,7 @@ export default function Models() {
                   </div>
                 </div>
               )}
-            </For>
+            </Index>
             </div>
           </details>
         </section>
@@ -1767,11 +1777,12 @@ export default function Models() {
         title={`Unload ${confirmUnload()?.model ?? "model"}?`}
         confirmLabel="Unload"
         busy={modelBusy()}
-        onConfirm={() => void unloadModel()}
+        onConfirm={() => void unloadModel(confirmUnload() ?? {})}
         onClose={() => setConfirmUnload(null)}
       >
-        The served model is freed and requests fail until another one is
-        loaded. In-flight requests may be interrupted.
+        This resident is freed and requests naming it fail until it's loaded
+        again; other residents keep serving. In-flight requests may be
+        interrupted.
       </Confirm>
 
       <Confirm

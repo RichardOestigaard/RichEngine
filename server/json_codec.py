@@ -4,6 +4,8 @@ import json
 import math
 import re
 
+import orjson
+
 
 class JSONEncodingError(RuntimeError):
     """A server-side value could not be serialized as JSON."""
@@ -44,6 +46,32 @@ def dumps(value):
 
 def encode(value):
     return dumps(value).encode("utf-8")
+
+
+def loads_compact(value):
+    """`loads` for trusted producers where a fast decode suffices.
+
+    orjson rejects what the strict reader accepts — escaped lone surrogates,
+    integers past u64 — so those documents take the strict reader instead."""
+    try:
+        return orjson.loads(value)
+    except ValueError:
+        return loads(value)
+
+
+def encode_compact(value, *, sort_keys=False):
+    """Compact UTF-8 bytes for in-process keys, digests and retained bytes.
+
+    Unlike `dumps`, the output never crosses a text-based stream boundary, so
+    the separator and surrogate escapes need not apply: orjson encodes what it
+    can, and the values it cannot — lone surrogates, integers past u64,
+    non-string keys — take the strict encoder instead. orjson writes
+    non-finite floats as null, so callers pass only values read through
+    `loads`, where such floats cannot occur."""
+    try:
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS if sort_keys else 0)
+    except (TypeError, ValueError, RecursionError):
+        return dumps(value).encode("utf-8")
 
 
 def encoded_size(value):

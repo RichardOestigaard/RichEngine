@@ -207,6 +207,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                         geometry.target.vocabularySize));
   put(DecodeTensor::DfaForced, sizeof(DfaForcedSpan));
   put(DecodeTensor::DfaTrunc, bytesFor<uint32_t>(1));
+  put(DecodeTensor::VerifyRows, bytesFor<uint32_t>(1));
+  put(DecodeTensor::VerifyConfidence, bytesFor<float>(kDraftProposalTokens));
   put(DecodeTensor::VerifyPackedBase,
       uint64_t{geometry.target.stateLayout.layers} *
           gdnPackedStride(geometry));

@@ -127,7 +127,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                              GdnShape shape, uint32_t lanes, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input,
                              std::span<const uint32_t> liveRows,
-                             uint32_t verifyStride) {
+                             uint32_t verifyStride,
+                             const GdnTapeLanes *tapeLanes) {
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
       !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
       (!liveRows.empty() && liveRows.size() != lanes))
@@ -139,7 +140,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
                         lanes * verifyStride);
-  bindings.reserve(prepare ? 19 : 17);
+  const bool folded = tapeLanes && buffers.tape && tapeLanes->layerBytes;
+  bindings.reserve(prepare ? 21 : 19);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
                   {buffers.mixed, buffers.decayWeights, buffers.timeBias,
@@ -147,18 +149,34 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                    buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
+  if (folded && !prepare)
+    bindings.insert(bindings.end(), {{}, {}});
+  bindings.push_back(folded ? buffers.tape : metal::MetalBuffer{});
   GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
                               layer,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
                               {},
-                              verifyStride};
+                              verifyStride,
+                              {},
+                              {},
+                              {}};
   for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] =
         lane < liveRows.size()
             ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
             : verifyStride;
+  if (folded) {
+    for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane) {
+      params.pending_tape[lane] =
+          tapeLanes->pending[lane] + uint64_t{layer} * tapeLanes->layerBytes;
+      params.step_tape[lane] =
+          tapeLanes->step[lane] + uint64_t{layer} * tapeLanes->layerBytes;
+      params.pending_rows[lane] =
+          lane < lanes ? tapeLanes->rows[lane] : 0;
+    }
+  }
   const std::string name = std::string(kVerifyGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
             {shape.valueHeads, lanes, 1});
@@ -197,7 +215,10 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                               state.recurrentLayerBytes,
                               state.convolutionStateBytes,
                               {},
-                              RICHENGINE_TARGET_VERIFY_ROWS};
+                              RICHENGINE_TARGET_VERIFY_ROWS,
+                              {},
+                              {},
+                              {}};
   for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
     params.live_rows[lane] = RICHENGINE_TARGET_VERIFY_ROWS;
   const std::string name = std::string(kVerifyTreeGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -97,7 +98,7 @@ WEBUI_ASSET_TYPES = {
 # its request is read. With no request path, no API dialect is known: a
 # generic server error with its stable diagnostic code.
 _CONNECTION_OVERLOADED_PAYLOAD = (
-    b'{"error":{"type":"server_error","code":"frontend_overloaded",'
+    b'{"error":{"type":"service_unavailable","code":"frontend_overloaded",'
     b'"message":"HTTP connection capacity is exhausted"}}'
 )
 CONNECTION_OVERLOADED_RESPONSE = (
@@ -297,6 +298,29 @@ class FrontendHandler(BaseHTTPRequestHandler):
             raise APIError(503, "no model is loaded", "model_not_loaded")
         return app
 
+    def _response_stores(self):
+        """Every resident's response store, the resolved app's first: a
+        response persists on the resident that served it, so lookups search
+        the pool, not only the default app."""
+        app = self.app
+        host = self.server.host
+        stores = [] if host is None else [
+            candidate.response_store
+            for candidate in host.apps()
+            if candidate is not app
+        ]
+        if app is not None:
+            stores.insert(0, app.response_store)
+        return stores
+
+    def _find_response(self, response_id):
+        """The stored response under `response_id` on any resident."""
+        for store in self._response_stores():
+            stored = store.get(response_id)
+            if stored is not None:
+                return stored
+        return None
+
     @property
     def route(self):
         """The request's path as routing, authentication and error dialects
@@ -368,6 +392,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "error": {
                     "message": error.message,
                     "type": error_type,
+                    "param": None,
                     "code": error.code,
                 }
             },
@@ -493,22 +518,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if path == "/ready":
             app = self.app
             ready = app is not None and app.backend.is_ready()
-            host_state = (
-                self.server.host.state if self.server.host is not None else None
+            host = self.server.host
+            host_state = host.state if host is not None else None
+            body = {
+                "status": (
+                    "ready"
+                    if ready
+                    else host_state
+                    if host_state in ("loading", "unloaded")
+                    else "unavailable"
+                )
+            }
+            residents_ready = (
+                getattr(host, "residents_ready", None) if host is not None else None
             )
-            self._json(
-                200 if ready else 503,
-                {
-                    "status": (
-                        "ready"
-                        if ready
-                        else host_state
-                        if host_state in ("loading", "unloaded")
-                        else "unavailable"
-                    )
-                },
-                retry_after=not ready,
-            )
+            if residents_ready is not None:
+                body["residents"] = residents_ready()
+            self._json(200 if ready else 503, body, retry_after=not ready)
             return
         if path == "/status":
             self._json(200, self.server.status())
@@ -525,17 +551,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:
-            app = self.app
-            if app is None:
+            stores = self._response_stores()
+            stored = None
+            for store in stores:
+                stored = store.get(response_match.group(1))
+                if stored is not None:
+                    break
+            if stored is not None:
+                self._json(200, stored.response)
+            elif stores:
+                self._safe_error(APIError(404, "response not found", "not_found_error"))
+            else:
                 self._safe_error(
                     APIError(503, "no model is loaded", "model_not_loaded")
                 )
-                return
-            stored = app.response_store.get(response_match.group(1))
-            if stored is None:
-                self._safe_error(APIError(404, "response not found", "not_found_error"))
-            else:
-                self._json(200, stored.response)
             return
         if path == "/v1/models/available":
             # Installed selections the load endpoint can serve; imported late,
@@ -656,8 +685,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         response_id = response_match.group(1)
-        app = self.app
-        if app is None or not app.response_store.delete(response_id):
+        if not any(
+            store.delete(response_id) for store in self._response_stores()
+        ):
             self._safe_error(APIError(404, "response not found", "not_found_error"))
             return
         self._json(
@@ -700,8 +730,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/models/tune/cancel",
             "/v1/tools/fetch",
             "/v1/tools/search",
+            "/v1/embeddings",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
+            return
+        if path == "/v1/embeddings":
+            # The engine has no embedding head; an OpenAI-style 404, not a
+            # fake vector.
+            self._safe_error(
+                APIError(404, "no embedding model is served", "model_not_found")
+            )
             return
         if (
             path.startswith("/v1/disk/")
@@ -853,6 +891,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     body,
                     deadline=deadline,
                     reserve_input=self._body_reservation.grow,
+                    find_response=self._find_response,
                 )
                 stream_options = None
             else:
@@ -1214,6 +1253,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _systemone(self, body, deadline):
         active_job = None
+        in_flight = deque()
+        started = time.monotonic()
+        forward_ms = 0.0
         try:
             entries = self.app.prepare_systemone(
                 body, deadline=deadline, disconnected=self._client_disconnected
@@ -1223,21 +1265,54 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 raise ConnectionResetError("client disconnected before submission")
             answers = {}
             input_tokens = 0
-            for qid, spec, job in entries:
-                if job is None:
-                    answers[qid] = self.app.systemone_answer(spec, None)
-                    continue
-                # One admitted job per HTTP request preserves the existing
-                # queue bound and lets later questions reuse the state prefix.
+            # The questions share the state prefix, so keep up to the engine
+            # bound in flight: the scheduler runs the shared prefill once
+            # and the suffixes batch instead of serializing.
+            window = max(
+                1, getattr(self.app, "preparation_capacity", 4) or 4
+            )
+            # RICHENGINE_SYSTEMONE_WINDOW narrows the shared-prefix batch
+            # width; the frontend parses it at load.
+            window_cap = getattr(self.app, "systemone_window", 0) or 0
+            if window_cap > 0:
+                window = min(window, window_cap)
+            pending = deque(entries)
+            # A batching pathway's questions share the state prefix: one
+            # wire frame submits them all, so the prefix crosses the socket
+            # once and the engine schedules every suffix itself.
+            if getattr(getattr(self.app, "pathway", None), "batches", False):
+                batch = [entry for entry in pending if entry[2] is not None]
+                for qid, spec, job in pending:
+                    if job is None:
+                        answers[qid] = self.app.systemone_answer(spec, None)
+                pending = []
+                if batch:
+                    self.app.backend.submit_score_batch(
+                        [job for _qid, _spec, job in batch]
+                    )
+                    in_flight.extend(batch)
+            while pending or in_flight:
+                while pending and len(in_flight) < window:
+                    qid, spec, job = pending.popleft()
+                    if job is None:
+                        answers[qid] = self.app.systemone_answer(spec, None)
+                        continue
+                    self.app.backend.submit(job)
+                    in_flight.append((qid, spec, job))
+                if not in_flight:
+                    break
+                qid, spec, job = in_flight.popleft()
                 active_job = job
-                self.app.backend.submit(job)
                 result = self._await_done(job)
+                active_job = None
                 input_tokens += result.prompt_tokens
+                forward_ms = max(forward_ms, result.start_to_first_token_ms)
                 answers[qid] = self.app.systemone_answer(
                     spec, list(result.option_logits)
                 )
-                active_job = None
         except BaseException:
+            for _qid, _spec, job in in_flight:
+                self.app.backend.cancel(job)
             if active_job is not None:
                 self.app.backend.cancel(active_job)
             raise
@@ -1247,6 +1322,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "model": self.app.response_model,
                 "answers": answers,
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                # A batch's forward is the slowest question's prefill; total
+                # is handler wall across prepare and every question.
+                "forward_seconds": forward_ms / 1000.0,
+                "total_seconds": time.monotonic() - started,
                 **self.app.systemone_metadata(),
             },
         )
@@ -1399,7 +1478,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _complete(self, job):
         collected = self._collect(job)
-        message = {"role": "assistant", "content": collected.content or None}
+        message = {
+            "role": "assistant",
+            "content": collected.content or None,
+            "refusal": None,
+        }
         if collected.reasoning:
             message["reasoning_content"] = collected.reasoning
         if collected.tool_calls:
@@ -1642,6 +1725,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "error": {
                     "message": error.message,
                     "type": error.protocol_type(),
+                    "param": None,
                     "code": error.code,
                 }
             }
@@ -2229,6 +2313,7 @@ class RequestBodyReservation:
         retained = (
             job.response_history_items,
             job.response_format,
+            job.response_tools,
             policy.schemas if policy else None,
             policy.namespaces if policy else None,
             job.stop_sequences,
@@ -2371,6 +2456,9 @@ class FrontendServer(ThreadingHTTPServer):
             residents_status = getattr(self.host, "residents_status", None)
             if residents_status is not None:
                 status["residents"] = residents_status()
+            pool_status = getattr(self.host, "pool_status", None)
+            if pool_status is not None:
+                status["pool"] = pool_status()
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
@@ -2567,12 +2655,19 @@ def main():
         # cleanup and interpreter teardown, including after this function
         # returns, except that a second Ctrl+C during cleanup stops the engine
         # without waiting for its graceful exit.
+        def _kill_engines(*_):
+            # A resident may already be torn down; only live runtimes die.
+            for resident in getattr(host, "hosts", [host]):
+                runtime = getattr(resident, "runtime", None)
+                if runtime is not None:
+                    runtime.kill()
+
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(
             signal.SIGINT,
             signal.SIG_IGN
             if host is None or host.runtime is None
-            else lambda *_: host.runtime.kill(),
+            else _kill_engines,
         )
         try:
             if host is not None:

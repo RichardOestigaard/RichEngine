@@ -124,6 +124,14 @@ enum class DecodeTensor : uint32_t {
   // lane's round, read by the indexed mask, correction argmax and
   // acceptance dispatches of the same commit.
   DfaTrunc,
+  // The lanes' verify rows (ops::DraftSelector::addVerifyRows), a uint32 per
+  // lane; a sparse-MoE target's verify steps route them alone, and
+  // acceptance retains at most that many tokens.
+  VerifyRows,
+  // fp32 per lane per proposal position: the draft selector's per-position
+  // confidence, which the verify-row budget's acceptance model reads
+  // (model::VerifyBudget).
+  VerifyConfidence,
   VerifyPackedBase,
   VerifyMixedBase,
   VerifyDecayBase,

@@ -50,6 +50,16 @@ MixerWeights readLfmConv(WeightFile &file, const Format &format,
 }
 
 void requireLfm2Layout(const Lfm2Layout &layout) {
+  // The d1-omni descriptor records the encoder's geometry so its assembly
+  // validates; it cannot run: no compiled attention kernels cover its
+  // kv8-group-2 and kv16-group-1 head geometry, the prefill tile masks
+  // causally where the encoder is bidirectional, and its two decision
+  // blocks — fused biased QKV, biased LayerNorms, an ungated biased FFN
+  // and the cls pooling head — are a different op set. Refuse by name.
+  if (layout.encoder)
+    throw WeightStoreError(
+        "d1-omni is a bidirectional decision encoder; this build does not "
+        "serve its attention or decision blocks");
   if (layout.layers != 30 || layout.hiddenSize != 2048 ||
       layout.vocabularySize != 128000 || layout.packedGdnWidth != 6144 ||
       layout.convolutionDimension != 2048 || layout.gdnKeyHeads ||

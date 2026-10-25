@@ -2,26 +2,6 @@
 
 .settings-page .badge.err { color: var(--danger) }
 
-/* Segmented theme picker: one bordered pill, active segment filled. */
-.segmented {
-  display: inline-flex;
-  gap: 2px;
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg);
-}
-.segmented button {
-  padding: 4px 12px;
-  border-radius: 7px;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-.segmented button:hover { color: var(--text) }
-.segmented button.active { color: var(--text); background: var(--bubble) }
-
 /* Inputs mirror .install-input / .store-search tokens. */
 .settings-input {
   width: 300px;

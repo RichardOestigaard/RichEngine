@@ -262,8 +262,8 @@ kernel void draft_select_dspark(
     device const float *partial_values [[buffer(1)]],
     device const float *uniforms [[buffer(2)]],
     device float *probabilities [[buffer(3)]],
-    device uint *tokens [[buffer(4)]],
-    constant SelectorBatchParams &params [[buffer(5)]],
+    device uint *tokens [[buffer(4)]], device float *confidence [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
@@ -310,6 +310,17 @@ kernel void draft_select_dspark(
       probabilities[row * Pool + slot] = weights[k] / total;
     }
 
+    // The largest of the position's candidate probabilities at temperature
+    // 1, before the lane chooses among them (VerifyRowsParams): the top
+    // biased score's share of its softmax.
+    const float top_score = simd_max(local_best);
+    float confidence_mass = 0.0f;
+    for (uint k = 0; k < Owned; ++k)
+      confidence_mass += fast::exp(biased[k] - top_score);
+    if (lane == 0)
+      confidence[batch * Positions + position] =
+          1.0f / simd_sum(confidence_mass);
+
     uint selected;
     if (sampling) {
       const float uniform =
@@ -338,6 +349,47 @@ kernel void draft_select_dspark(
       tokens[row] = partial_ids[row * Pool + selected];
     predecessor_index = selected;
   }
+}
+
+// The DSpark confidence head (draft_conf_score, dispatched only under
+// RICHENGINE_DRAFT_CONF_MIN): one simdgroup per (lane, position) scores
+// the position's emitted proposal the way the checkpoint's head does —
+// sigmoid of bias + weight . [final hidden | W1[predecessor]], the
+// predecessor the anchor at position zero — overwriting the selector's
+// top-candidate mass in the confidence block the verify-rows kernel
+// reads (VerifyRowsParams::conf_min).
+kernel void draft_conf_score(
+    device const bfloat *hidden [[buffer(0)]],
+    device const uint *proposals [[buffer(1)]],
+    device const uint *draft_input [[buffer(2)]],
+    device const bfloat *markov_w1 [[buffer(3)]],
+    device const bfloat *weight [[buffer(4)]],
+    device const bfloat *bias [[buffer(5)]],
+    device float *confidence [[buffer(6)]],
+    constant DraftConfScoreParams &params [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  const uint batch = group / Positions, position = group % Positions;
+  if (batch >= params.lanes)
+    return;
+  const uint previous =
+      position ? proposals[batch * Positions + position - 1]
+               : draft_input[batch * params.query_rows];
+  device const bfloat *h =
+      hidden +
+      (ulong(batch) * params.query_rows + position) * params.hidden_size;
+  device const bfloat *m =
+      markov_w1 + ulong(min(previous, params.vocabulary - 1)) * params.rank;
+  float sum = 0.0f;
+  for (uint i = simd_lane; i < params.hidden_size; i += 32)
+    sum += float(h[i]) * float(weight[i]);
+  for (uint i = simd_lane; i < params.rank; i += 32)
+    sum += float(m[i]) * float(weight[params.hidden_size + i]);
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    confidence[batch * Positions + position] =
+        1.0f / (1.0f + fast::exp(-(sum + float(*bias))));
 }
 
 // draft_select_dspark plus comb-tree emission: the same chain fills

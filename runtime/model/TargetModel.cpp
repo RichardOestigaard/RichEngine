@@ -892,6 +892,65 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
   graph.endBakedSpan();
 }
 
+bool TargetModel::addScoreHeadColumns(
+    metal::CommandGraph &graph, metal::MetalBuffer hidden,
+    metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
+    ops::LinearScratch scratch, std::span<const uint32_t> quantTiles) const {
+  const ops::Linear &linear = operators_.linear();
+  const ops::Projection &head = vocabularyProjection();
+  // The restricted dispatch covers whole quant tiles of one GGUF segment; a
+  // rotated head's input pass this path does not encode, and a softcap maps
+  // the materialized logits, which no uncovered column run would apply.
+  if (head.layout() != ops::WeightLayout::Block32 || head.rotation ||
+      geometry_.logitSoftcap > 0.0F || quantTiles.empty())
+    return false;
+  const ops::LinearPlan logitsPlan = linear.decodePlan(
+      head, lanes, ops::LinearEpilogue::None, nullptr,
+      ExecutionLimits::targetVerifyRows);
+  graph.beginBakedSpan();
+  const ops::PreparedInput normalized = ops::Normalization::addRms(
+      graph, std::move(hidden), weightsBase_.finalNorm, finalHidden,
+      geometry_.hiddenSize, lanes * ExecutionLimits::targetVerifyRows,
+      scratch, logitsPlan.input());
+  const bool done = linear.addGgufHeadColumns(
+      graph, backend_,
+      {.input = finalHidden,
+       .output = logits,
+       .scratch = scratch,
+       .prepared = normalized},
+      head, logitsPlan, quantTiles);
+  graph.endBakedSpan();
+  return done;
+}
+
+bool TargetModel::addScoreHeadGather(
+    metal::CommandGraph &graph, metal::MetalBuffer hidden,
+    metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
+    ops::LinearScratch scratch, metal::MetalBuffer columns,
+    uint32_t columnCount, bool fused) const {
+  const ops::Linear &linear = operators_.linear();
+  const ops::Projection &head = vocabularyProjection();
+  const ops::NormWeights &norm = weightsBase_.finalNorm;
+  if (head.layout() != ops::WeightLayout::Block32 || head.rotation ||
+      geometry_.logitSoftcap > 0.0F || !columnCount ||
+      (fused && !norm.buffer))
+    return false;
+  graph.beginBakedSpan();
+  // The fused kernel norms `hidden` in-dispatch; the unfused one takes the
+  // same norm as the restricted head, in plain rows it gathers from.
+  if (!fused)
+    ops::Normalization::addRms(graph, hidden, norm, finalHidden,
+                               geometry_.hiddenSize,
+                               lanes * ExecutionLimits::targetVerifyRows,
+                               scratch, ops::LinearInput::Plain);
+  const bool done = linear.addGgufHeadGather(
+      graph, fused ? hidden : finalHidden, finalHidden, norm.buffer,
+      norm.float32, norm.rmsEpsilon, logits, columns, columnCount, head,
+      lanes, ExecutionLimits::targetVerifyRows, fused);
+  graph.endBakedSpan();
+  return done;
+}
+
 void TargetModel::addVerifyInput(metal::CommandGraph &graph,
                                 metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals,

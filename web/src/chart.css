@@ -1,4 +1,1 @@
 .chart-frame { width: 100%; min-width: 0 }
-.chart-legend { display: flex; justify-content: flex-end; gap: 12px; margin-bottom: 2px; color: var(--muted); font-size: 12.5px }
-.chart-legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap }
-.chart-legend-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50% }

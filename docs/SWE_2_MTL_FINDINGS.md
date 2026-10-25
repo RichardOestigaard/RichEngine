@@ -189,3 +189,69 @@ exist in the tree). Not worth it.
   (`draft_proposal_tokens` 7 package vs 15 runtime) and the GGUF path hits
   "physical width accounting mismatch" — bench harness is behind the
   draft-geometry change.
+
+## Session results — simd probes, imageblock, _rP splits, OP_TIMINGS (M5 Pro)
+
+### SIMD probe outcomes — measured, mostly dead ends
+
+- `simd_permute`/`simd_rot` do not exist as named ops. The available
+  primitives: `simd_shuffle` (dynamic index), `simd_shuffle_rotate_up/down`,
+  `simd_shuffle_xor`, `simd_sum`.
+- Dynamic-index `simd_shuffle`: **2.8× slower** than the xor chain — dead.
+- `simd_sum`: slower than the xor chain — dead.
+- `simd_shuffle_rotate_down`: **1.45× faster** than xor (671µs vs 973µs on
+  the probe loop) — but valid only for full-32-lane reductions; it wraps
+  values across sub-rows, which the attention softmax reductions cross.
+  Candidate only where the reduced span is a full simdgroup.
+- `simdgroup_matrix<int8_t>` / int8x8: **unsupported** — simdgroup matrix is
+  floating-point only. INT8 stays on `metal::tensor` / MPP matmul2d, which
+  already covers it.
+
+### MTL4 imageblock — works, exceeds 32 KB scratch
+
+`imageblock<T>` with explicit layout + `data()` compiles and runs under
+Metal 4.1. A 48 KB imageblock dispatch at 16×16 succeeded (~196 KB reported
+capacity) — an escape for the fp8 256-dim verify tile (34.4/45.8 KB) that
+the 32 KB threadgroup limit blocks today.
+
+### MTL4 OP_TIMINGS — shipped
+
+`RICHENGINE_OP_TIMINGS` now works on the Metal 4 path: `commit4` brackets
+each encoded unit with a `MTL4CounterHeap` timestamp pair
+(`writeTimestampWithGranularity:intoHeap:atIndex:`, precise granularity),
+resolved in the final commit's feedback handler. Unlike the MTL3 probe —
+one buffer per dispatch, ~138µs/op including commit gaps — MTL4 keeps one
+buffer: ~3.9µs/op on the probe graph, same serialized attribution
+(timestamps order against prior work). GPU-encoded spans stay direct under
+timings, matching commit(); baked span replays time as one unit under the
+head pipeline name. Heaps bank on submission parity like allocator4/staging4.
+
+### Verify `_rP` pass splits — measured winners per geometry
+
+The `_r2` idea generalized to `_r<P>`: the fused M-row tile splits its
+`Group×VRows` rows across P threadgroups (`group.x / P` selects KV head,
+`group.x % P` the pass), cutting scratch P-fold. Emitted for INT8, INT4 and
+BF16 wherever the per-pass MP stays a multiple of 8 (the PV matmul's M
+constraint). A/B on the q8 harness, width 4, M5 Pro:
+
+| geometry | history | base ms | _r2 ms | _r4 ms | winner |
+|---|---:|---:|---:|---:|---|
+| kv4/g6 (24/4/d256) | 4K | 1.026 | 0.746 | 0.991 | _r2 1.38× |
+| | 32K | 5.434 | 3.998 | 4.880 | _r2 1.36× |
+| | 131K | 20.72 | 16.65 | 22.43 | _r2 1.24× |
+| kv4/g4 (16/4/d256) | 4K | 0.634 | 0.487 | 0.769 | _r2 1.30× |
+| | 32K | 3.214 | 2.550 | 2.575 | _r2 1.26× |
+| | 131K | 13.04 | 12.58 | 17.75 | _r2 1.04× |
+| kv2/g8 (16/2/d256) | 4K | 0.601 | — | 0.476 | _r4 1.26× |
+| | 32K | 3.448 | — | 2.534 | _r4 1.36× |
+| | 131K | 12.63 | — | 11.60 | _r4 1.09× |
+
+Outputs identical everywhere except kv4/g6's known 8-element/1-bf16-ULP
+case at 4K. `_r4` loses at M≤96 — the extra same-page reads beat the
+occupancy gain; the M=128 tiles need it (their _r2 pass still caps at one
+group/core). Selected in `splitPipeline` from `fused = group×verifyRows`
+(≥128 → 4 passes, else 2), gated by the same MP%8 rule the kernels compile
+under. `RICHENGINE_VERIFY_SPLIT_R2_OFF` restores single-group splits;
+`VERIFY_SPLIT_R2` is in the tuning sweep for the affected families.
+Measured at VRows=16; at VRows=8 the chain is narrow (`_m8`) and the split
+is unreachable — the instantiations stay compile-guarded either way.

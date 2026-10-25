@@ -20,6 +20,12 @@ public:
   // Direct native-oracle entry point. Production admission uses
   // begin() and installs its cache-aware plan explicitly.
   void beginColdRequest(const ModelRequest &request, uint32_t stateLane);
+  // For the native oracle and backend benchmarks: whether a MoE target's
+  // cycles verify every live row of their blocks, as a dense target's do,
+  // instead of the rows model::VerifyBudget picks. Those follow the wall
+  // times and acceptance of the cycles before, so two runs of one schedule
+  // could verify other rows, whose MoE results differ by rounding.
+  void verifyEveryRow(bool every) noexcept;
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;

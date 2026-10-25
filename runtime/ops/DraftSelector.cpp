@@ -4,6 +4,7 @@
 #include "ops/KernelNames.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace richengine::ops {
@@ -75,7 +76,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add(std::string(kDraftSelectDflash),
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
-             buffers.proposalProbabilities},
+             buffers.proposalProbabilities, buffers.confidence},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 
@@ -147,7 +148,7 @@ void DraftSelector::addPlain(metal::CommandGraph &graph,
   graph.add(std::string(kDraftSelectPlain),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.candidates, buffers.proposalProbabilities,
-             buffers.proposedTokens},
+             buffers.proposedTokens, buffers.confidence},
             params, {uint64_t{lanes} * kPositions, 1, 1}, {32, 1, 1});
 }
 
@@ -214,7 +215,8 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
             {kEdgeThreads, 1, 1});
   graph.add(std::string(kDraftSelectDspark),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
-             buffers.proposalProbabilities, buffers.proposedTokens},
+             buffers.proposalProbabilities, buffers.proposedTokens,
+             buffers.confidence},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 
@@ -289,7 +291,8 @@ void DraftSelector::addPool(metal::CommandGraph &graph,
   // table unchanged.
   graph.add(std::string(kDraftSelectDspark),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
-             buffers.proposalProbabilities, buffers.proposedTokens},
+             buffers.proposalProbabilities, buffers.proposedTokens,
+             buffers.confidence},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 
@@ -328,6 +331,49 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
              buffers.proposalProbabilities, buffers.proposedTokens,
              buffers.treeTokens, buffers.treeNodes, buffers.treeCounts},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
+}
+
+void DraftSelector::addVerifyRows(metal::CommandGraph &graph,
+                                  const metal::MetalBuffer &confidence,
+                                  const metal::MetalBuffer &verifyRows,
+                                  const VerifyRowsModel &model,
+                                  std::span<const uint32_t> maximumRows,
+                                  float confMin) {
+  if (maximumRows.empty() || maximumRows.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft verify rows batch");
+  const uint32_t lanes = static_cast<uint32_t>(maximumRows.size());
+  VerifyRowsParams params{};
+  params.lanes = lanes;
+  params.every_row = model.everyRow ? 1 : 0;
+  params.conf_min = confMin;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (!maximumRows[lane] || maximumRows[lane] > RICHENGINE_DRAFT_QUERY_ROWS)
+      throw std::invalid_argument("invalid draft verify rows maximum");
+    params.maximum[lane] = maximumRows[lane];
+  }
+  if (!model.everyRow) {
+    if (!std::isfinite(model.slope))
+      throw std::invalid_argument("invalid draft verify rows model");
+    params.slope = model.slope;
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      if (!std::isfinite(model.intercepts[position]))
+        throw std::invalid_argument("invalid draft verify rows model");
+      params.intercept[position] = model.intercepts[position];
+    }
+    // The costs of every total the lanes may verify, from their anchors to
+    // sixteen rows each.
+    for (uint32_t rows = lanes; rows <= lanes * RICHENGINE_DRAFT_QUERY_ROWS; ++rows) {
+      if (!(std::isfinite(model.costs[rows]) && model.costs[rows] > 0.0F))
+        throw std::invalid_argument("invalid draft verify rows cost");
+      params.cost[rows] = model.costs[rows];
+    }
+  }
+  if (confidence.sizeBytes() < uint64_t{lanes} * kPositions * sizeof(float))
+    throw std::invalid_argument("invalid draft proposal confidence");
+  if (verifyRows.sizeBytes() < uint64_t{lanes} * sizeof(uint32_t))
+    throw std::invalid_argument("invalid draft verify rows buffer");
+  graph.add(std::string(kDraftVerifyRows), {confidence, verifyRows}, params,
+            {1, 1, 1}, {1, 1, 1});
 }
 
 } // namespace richengine::ops

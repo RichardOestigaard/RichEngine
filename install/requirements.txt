@@ -23,6 +23,7 @@ markdown-it-py==4.2.0
 MarkupSafe==3.0.4
 mdurl==0.1.2
 numpy==2.5.4
+orjson==3.13.0
 packaging==26.3
 Pillow==12.3.0
 pip==26.2.1

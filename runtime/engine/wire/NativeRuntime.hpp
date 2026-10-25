@@ -126,6 +126,7 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
+  bool handleScoreBatch(protocol::ScoreBatchFrame &batch);
   void restoreWeights();
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);

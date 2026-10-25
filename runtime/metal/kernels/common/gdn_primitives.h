@@ -4,6 +4,33 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
 
+// The pending variant: the retained rows' convolution inputs sit on the
+// lane's tape between the carried state and this step's packed rows, so the
+// window's sources are state for the last three, the tape for the pending
+// prefix and the packed rows after (the commit folded into the scan).
+inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
+                                    device const bfloat *conv_state_in,
+                                    device const bfloat *tape_conv,
+                                    uint pending,
+                                    device const bfloat *conv_weights,
+                                    uint packed_width, uint conv_dim,
+                                    uint token, uint channel) {
+  float value = 0.0f;
+  for (uint tap = 0; tap < 4; ++tap) {
+    uint position = token + tap;
+    bfloat input;
+    if (position < 3)
+      input = conv_state_in[position * conv_dim + channel];
+    else if (position < 3 + pending)
+      input = tape_conv[(position - 3) * conv_dim + channel];
+    else
+      input = packed[(position - 3 - pending) * packed_width + channel];
+    value += float(input) * float(conv_weights[channel * 4 + tap]);
+  }
+  value = float(bfloat(value));
+  return bfloat(richengine_silu(value));
+}
+
 // Four-tap causal convolution of one channel at one token of the command,
 // reading the three preceding tokens from the carried state, rounded to bf16
 // and gated by SiLU.
@@ -12,27 +39,37 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
                             device const bfloat *conv_weights,
                             uint packed_width, uint conv_dim, uint token,
                             uint channel) {
-  float value = 0.0f;
-  for (uint tap = 0; tap < 4; ++tap) {
-    uint position = token + tap;
-    bfloat input = position < 3
-                       ? conv_state_in[position * conv_dim + channel]
-                       : packed[(position - 3) * packed_width + channel];
-    value += float(input) * float(conv_weights[channel * 4 + tap]);
-  }
-  value = float(bfloat(value));
-  return bfloat(richengine_silu(value));
+  return gdn_conv_silu_pending(packed, conv_state_in, nullptr, 0,
+                               conv_weights, packed_width, conv_dim,
+                               token, channel);
 }
 
 // Row `row` of the carried state after consumed_tokens: the last three inputs
 // seen, still taken from the incoming state when fewer were consumed.
+// The pending variant: sources past the state's three rows come from the
+// pending rows' tape conv inputs first, then this step's packed rows. With
+// pending rows consumed, the carry's stored window ends at the last pending
+// input — pass consumed_tokens = pending for the committed carry.
+inline bfloat gdn_conv_carry_pending(device const bfloat *packed,
+                                     device const bfloat *conv_state_in,
+                                     device const bfloat *tape_conv,
+                                     uint pending, uint packed_width,
+                                     uint conv_dim, uint consumed_tokens,
+                                     uint row, uint channel) {
+  uint source = consumed_tokens + row;
+  return source < 3            ? conv_state_in[source * conv_dim + channel]
+         : source < 3 + pending ? tape_conv[(source - 3) * conv_dim + channel]
+                    : packed[(source - 3 - pending) * packed_width + channel];
+}
+
+// Row `row` of the carried state after consumed_tokens.
 inline bfloat gdn_conv_carry(device const bfloat *packed,
                              device const bfloat *conv_state_in,
                              uint packed_width, uint conv_dim,
                              uint consumed_tokens, uint row, uint channel) {
-  uint source = consumed_tokens + row;
-  return source < 3 ? conv_state_in[source * conv_dim + channel]
-                    : packed[(source - 3) * packed_width + channel];
+  return gdn_conv_carry_pending(packed, conv_state_in, nullptr, 0,
+                                packed_width, conv_dim, consumed_tokens,
+                                row, channel);
 }
 
 // The row `hops` parents above `row` in one lane's node table (tree verify):

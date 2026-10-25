@@ -420,18 +420,33 @@ kernel void moe_route_select_f32(
                    simd_group, row_scores, ordered, scalar_partials);
 }
 
+// Whether a verified grouping leaves routed route `route` out: its row is
+// past its lane's verify rows (MoeGroupParams). lane_rows zero means the
+// dispatch never ran the verified kernel.
+inline bool moe_unverified_route(device const uint *verify_rows,
+                                 constant MoeGroupParams &params,
+                                 uint routes_per_row, uint route) {
+  if (!verify_rows || !params.lane_rows)
+    return false;
+  const uint row = route / routes_per_row;
+  return row % params.lane_rows >= verify_rows[row / params.lane_rows];
+}
+
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
 // that expert's last route that its last tile's matmul reads
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
+// verify_rows is null but for the verified grouping, whose left-out routes
+// the combine skips.
 inline void moe_group_routes_run(
     device const uint *selected,
     device MoeTileDescriptor *tiles,
     device uint *tile_count,
     device uint *grouped_routes,
     device uint *route_rows,
+    device const uint *verify_rows,
     constant MoeGroupParams &params,
     threadgroup atomic_uint *counts,
     threadgroup atomic_uint *cursors,
@@ -451,8 +466,9 @@ inline void moe_group_routes_run(
     if (params.shared && route % routes_per_row == params.top_k)
       continue;
     const uint expert = selected[route];
-    if (expert == ~0u)
-      continue; // dead route: moe_route_cap dropped it over budget
+    if (expert == ~0u ||
+        moe_unverified_route(verify_rows, params, routes_per_row, route))
+      continue; // dead route: moe_route_cap or the verify rows dropped it
     atomic_fetch_add_explicit(&counts[expert], 1u, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -499,6 +515,11 @@ inline void moe_group_routes_run(
       // Dead routes get a valid row so moe_combine's weight-0 load is in
       // bounds.
       route_rows[route] = 0;
+      continue;
+    }
+    if (moe_unverified_route(verify_rows, params, routes_per_row, route)) {
+      // A route the verified grouping left out: the combine skips ~0u.
+      route_rows[route] = ~0u;
       continue;
     }
     uint slot =
@@ -571,9 +592,37 @@ kernel void moe_group_routes(
   threadgroup uint simd_totals[8];
   threadgroup uint routed_tiles;
   moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
-                       params, counts, cursors, tile_offsets, simd_totals,
-                       routed_tiles, thread_index, simd_lane, simd_group,
-                       tpg.x);
+                       nullptr, params, counts, cursors, tile_offsets,
+                       simd_totals, routed_tiles, thread_index, simd_lane,
+                       simd_group, tpg.x);
+}
+
+// A verify step's grouping: routes each lane's verify rows alone
+// (MoeGroupParams), the uint per lane draft_verify_rows wrote. The routed
+// routes of a row past its lane's verify rows keep the route row ~0u, which
+// the combine skips — no expert reads them.
+kernel void moe_group_routes_verified(
+    device const uint *selected [[buffer(0)]],
+    device MoeTileDescriptor *tiles [[buffer(1)]],
+    device uint *tile_count [[buffer(2)]],
+    device uint *grouped_routes [[buffer(3)]],
+    device uint *route_rows [[buffer(4)]],
+    device const uint *verify_rows [[buffer(5)]],
+    constant MoeGroupParams &params [[buffer(6)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]]) {
+  constexpr uint Experts = 256;
+  threadgroup atomic_uint counts[Experts];
+  threadgroup atomic_uint cursors[Experts];
+  threadgroup uint tile_offsets[Experts];
+  threadgroup uint simd_totals[8];
+  threadgroup uint routed_tiles;
+  moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
+                       verify_rows, params, counts, cursors, tile_offsets,
+                       simd_totals, routed_tiles, thread_index, simd_lane,
+                       simd_group, tpg.x);
 }
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp), decode plans only: keeps the `budget`
@@ -805,9 +854,9 @@ kernel void moe_route_group_sigmoid(
   threadgroup uint simd_totals[8];
   threadgroup uint routed_tiles;
   moe_group_routes_run(selected, tiles, tile_count, grouped_routes, route_rows,
-                       params.group, counts, cursors, tile_offsets, simd_totals,
-                       routed_tiles, thread_index, simd_lane, simd_group,
-                       tpg.x);
+                       nullptr, params.group, counts, cursors, tile_offsets,
+                       simd_totals, routed_tiles, thread_index, simd_lane,
+                       simd_group, tpg.x);
 }
 
 // The shared-expert select stays separate: fusing it into the grouping
@@ -817,7 +866,10 @@ kernel void moe_route_group_sigmoid(
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
 // over the rows its matmul reads (moe_matmul_rows): padding rows among them
-// are zero and their outputs are never read.
+// are zero and their outputs are never read. Threadgroup (tile, part) copies
+// the part's 256 columns of the tile's rows, eight rows at once, each thread
+// eight columns (16 bytes, rows of whole 256 columns starting 16-byte
+// aligned) of one row.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -828,16 +880,15 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             uint thread_index [[thread_index_in_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
-  uint column = group.y * 256 + thread_index;
+  const uint column = group.y * 256 + (thread_index % 32) * 8;
   const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
-  for (uint local = 0; local < rows; ++local) {
-    uint row = group.x * params.tile_rows + local;
-    uint route = grouped_routes[row];
-    grouped_input[ulong(row) * params.input_size + column] =
-        route == ~0u
-            ? bfloat(0.0f)
-            : input[ulong(route / params.routes_per_row) * params.input_size +
-                    column];
+  for (uint local = thread_index / 32; local < rows; local += 8) {
+    const uint row = group.x * params.tile_rows + local;
+    const uint route = grouped_routes[row];
+    *reinterpret_cast<device uint4 *>(grouped_input + ulong(row) * params.input_size + column) =
+        route == ~0u ? uint4(0)
+                     : *reinterpret_cast<device const uint4 *>(
+                           input + ulong(route / params.routes_per_row) * params.input_size + column);
   }
 }
 
@@ -1183,9 +1234,12 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    // A route a verified grouping left out (MoeGroupParams) adds nothing.
+    const uint grouped = route_rows[route + slot];
+    if (grouped == ~0u)
+      continue;
     value += routing_weights[route + slot] *
-             float(expert_output[ulong(route_rows[route + slot]) *
-                                     params.hidden_size +
+             float(expert_output[ulong(grouped) * params.hidden_size +
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);

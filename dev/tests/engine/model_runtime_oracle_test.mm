@@ -267,10 +267,8 @@ void prefillToken(model::Runtime &executor, uint64_t requestId,
 ModelStepResult decodeOne(model::Runtime &executor, uint64_t requestId,
                           uint64_t logicalPosition,
                           const std::vector<uint32_t> &pageTable,
-                          bool constrained = false,
                           DecodeStage decodeStage = DecodeStage::Regular) {
   BatchPlan plan{.kind = WorkKind::Decode,
-                 .constrained = constrained,
                  .items = {{requestId, 0}},
                  .decodeStage = decodeStage};
   ModelBatchItem item = withRevision({requestId, logicalPosition, 0, pageTable});
@@ -327,7 +325,6 @@ beginMaskedDecodeOne(model::Runtime &executor, uint64_t requestId,
                      uint64_t logicalPosition,
                      const std::vector<uint32_t> &pageTable) {
   BatchPlan plan{.kind = WorkKind::Decode,
-                 .constrained = true,
                  .items = {{requestId, 0}},
                  .decodeStage = DecodeStage::Regular};
   const std::array items{withRevision({requestId, logicalPosition, 0, pageTable})};
@@ -883,7 +880,7 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
           "the non-finite constrained fixture did not ask for its first mask");
   provideMask(executor, 204, std::vector<uint32_t>(kMaskWords, 0xFFFFFFFFU));
   const ModelStepResult selected =
-      decodeOne(executor, 204, 80, pagesC, true,
+      decodeOne(executor, 204, 80, pagesC,
                 DecodeStage::ApplyInitialMask);
   require(!selected.failure.empty() && selected.outputTokens.empty(),
           "a constrained selection from a non-finite hidden did not fail its lane");
@@ -1911,7 +1908,7 @@ int main(int argc, char **argv) {
     const std::array<uint32_t, 1> forcedMicroToken{106};
     provideMask(executor, 56, singletonMasks(forcedMicroToken));
     ModelStepResult forcedMicro =
-        decodeOne(executor, 56, prompt8.size(), constrainedPages, true,
+        decodeOne(executor, 56, prompt8.size(), constrainedPages,
                   DecodeStage::ApplyInitialMask);
     require(forcedMicro.outputTokens ==
                 std::vector<uint32_t>{forcedMicroToken.front()},
@@ -1967,7 +1964,7 @@ int main(int argc, char **argv) {
               "replay did not request its initial mask");
       const std::array<uint32_t, 1> firstAnchor{result.outputTokens.front()};
       provideMask(executor, replayId, singletonMasks(firstAnchor));
-      static_cast<void>(decodeOne(executor, replayId, 129, replayPages, true,
+      static_cast<void>(decodeOne(executor, replayId, 129, replayPages,
                                   DecodeStage::ApplyInitialMask));
       auto pending =
           beginMaskedDecodeOne(executor, replayId, 129, replayPages);
@@ -2119,7 +2116,7 @@ int main(int argc, char **argv) {
     // The first token's selection drafts nothing and, with budget left,
     // emits nothing: the first cycle emits it.
     const ModelStepResult anchorSelection =
-        decodeOne(executor, 40, 129, pageTable, true,
+        decodeOne(executor, 40, 129, pageTable,
                   DecodeStage::ApplyInitialMask);
     require(anchorSelection.outputTokens.empty() &&
                 anchorSelection.draftedTokens == 0 &&
@@ -2172,7 +2169,7 @@ int main(int argc, char **argv) {
     const uint32_t perfectAnchor = 120;
     std::array<uint32_t, 1> perfectInitialTokens{perfectAnchor};
     provideMask(executor, 44, singletonMasks(perfectInitialTokens));
-    static_cast<void>(decodeOne(executor, 44, 129, pageTable, true,
+    static_cast<void>(decodeOne(executor, 44, 129, pageTable,
                                 DecodeStage::ApplyInitialMask));
     PendingMaskedDecode perfectPending =
         beginMaskedDecodeOne(executor, 44, 129, pageTable);
@@ -2218,7 +2215,7 @@ int main(int argc, char **argv) {
     std::array<uint32_t, 1> alternateTokens{anchorC};
     provideMask(executor, 41, singletonMasks(alternateTokens));
     ModelStepResult alternateOutput =
-        decodeOne(executor, 41, 129, pageTable, true,
+        decodeOne(executor, 41, 129, pageTable,
                   DecodeStage::ApplyInitialMask);
     require(!alternateOutput.finished &&
                 alternateOutput.outputTokensWithoutKv == 1 &&
@@ -2271,7 +2268,6 @@ int main(int argc, char **argv) {
     provideMask(executor, 42, singletonMasks(std::span(crossAnchors).first(1)));
     provideMask(executor, 43, singletonMasks(std::span(crossAnchors).last(1)));
     const BatchPlan crossInitialPlan{.kind = WorkKind::Decode,
-                                     .constrained = true,
                                      .items = {{42, 0}, {43, 0}},
                                      .decodeStage = DecodeStage::ApplyInitialMask};
     const std::vector<ModelBatchItem> crossItems{
@@ -2307,7 +2303,6 @@ int main(int argc, char **argv) {
               "B1 initial constrained cycle did not keep only its anchor");
     }
     BatchPlan crossPlan{.kind = WorkKind::Decode,
-                        .constrained = true,
                         .items = {{42, 0}, {43, 0}},
                         .decodeStage = DecodeStage::Regular};
     const std::vector<ModelBatchItem> crossCycleItems{

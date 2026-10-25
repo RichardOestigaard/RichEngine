@@ -14,9 +14,12 @@
 #include "model/AnePredictor.hpp"
 #include "model/ModelPolicy.hpp"
 #include "model/NullDraft.hpp"
+#include "model/DFlashTwo8width.hpp"
+#include "model/DFlashTwo16width.hpp"
 #include "model/CompositeStateStorage.hpp"
 #include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/VerifyBudget.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Dfa.h"
@@ -169,7 +172,9 @@ inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
 
 // The draft variant Impl holds.
 using DraftModel =
-    std::variant<NullDraft, DFlashDraft, DFlashV1Draft, DSparkDraft>;
+    std::variant<NullDraft, DFlashDraft, DFlashTwo8width, DFlashTwo16width,
+                 DFlashV1Draft,
+                 DSparkDraft>;
 
 // The DraftModel alternative each draft weights type constructs. The
 // mapping is total: a weights type with no specialization fails to compile
@@ -201,6 +206,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // adaptive budget clamped by its retention limit (the bypass's uncapped
     // write keeps the buffer's full width for the acceptance clamp).
     uint32_t proposals = 0;
+    // The rows of its block the lane verified (draft_verify_rows).
+    uint32_t verifyRows = 0;
+    // Whether the lane's proposals came from the draft's own selector this
+    // step, so its confidences and accepted count label the verify budget's
+    // acceptance model (a predraft, bypass or forced span replaces them).
+    bool verifyLabels = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -239,6 +250,26 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // Every state lane's penalty words, bound whole: a batch lane reads the row
   // of its request's state lane, which need not be its own.
   MetalBuffer penaltyTable;
+  // The GDN decode tape (folded commit): per state lane, two parity slots of
+  // one step's retained rows per GDN layer — the next step's scan folds them
+  // in as its pending prefix. Empty for non-GDN targets.
+  MetalBuffer gdnTape_;
+  std::array<uint32_t, kLaneCount> gdnPendingRows_{};
+  std::array<uint8_t, kLaneCount> gdnTapeParity_{};
+  // The bytes of one layer's tape region: the step's rows of conv inputs,
+  // their k|v columns, then decay (fp32) and beta (bf16).
+  uint64_t gdnTapeLayerBytes() const {
+    const uint64_t rows = RICHENGINE_TARGET_VERIFY_ROWS;
+    const uint64_t kv =
+        (uint64_t{geometry.target.gdnKeyHeads} +
+         geometry.target.gdnValueHeads) *
+        geometry.target.gdnHeadDimension;
+    const uint64_t body =
+        rows * (geometry.target.convolutionDimension * 2 + kv * 2 +
+                uint64_t{geometry.target.gdnValueHeads} * 4 +
+                uint64_t{geometry.target.gdnValueHeads} * 2);
+    return (body + 255) / 256 * 256;
+  }
   // The process-wide packed token vocabulary (VOCABULARY frame) the GPU-DFA
   // walk kernels index; a request's DFA is dropped while this is absent.
   struct PackedVocab final {
@@ -281,6 +312,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
+  // The acceptance model and cycle costs a MoE target's verify rows follow
+  // (ops::DraftSelector::addVerifyRows); everyVerifyRow_ instead verifies
+  // every live row, as a dense target's cycles do, so a test's two runs of
+  // one schedule emit the same tokens.
+  VerifyBudget verifyBudget_;
+  bool everyVerifyRow_ = false;
   // DiffusionGemma: its package's target is a DiffusionGemmaWeights, its
   // decodes run the canvas denoising loop (RuntimeDiffusion.mm) instead of
   // draft/verify, single-lane and synchronous.
@@ -450,7 +487,28 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // dispatch lane — the device-side copy of what finalizeDecode's
   // readback feeds the next step's host encode. Allocated lazily.
   const bool deviceVerifyParams_ = tuning().deviceVerifyParams;
+  // RICHENGINE_SCORE_GATHER=1: an all-score batch's head dispatches only the
+  // quant tiles holding the union of its lanes' score columns
+  // (TargetModel::addScoreHeadColumns).
+  const bool scoreGather_ = tuning().scoreGather;
+  // RICHENGINE_SCORE_TENSOR=1 / RICHENGINE_SCORE_FUSED=1: the same
+  // restriction as one gather dispatch over the union's columns
+  // (TargetModel::addScoreHeadGather), the fused variant folding the final
+  // norm into it.
+  const bool scoreTensor_ = tuning().scoreTensor;
+  const bool scoreFused_ = tuning().scoreFused;
   MetalBuffer stepPack_;
+  // The lazily-allocated wanted-column list of a score batch's gather
+  // dispatch, sized for the union of a full batch's score options.
+  MetalBuffer scoreColumns_;
+  [[nodiscard]] const MetalBuffer &scoreColumnsBuffer() {
+    if (!scoreColumns_) {
+      scoreColumns_ = backend.allocateBuffer(
+          sizeof(uint32_t) * kLaneCount * ExecutionLimits::maximumScoreOptions,
+          BufferStorage::Shared, "score-columns");
+    }
+    return scoreColumns_;
+  }
   // The lazily-allocated pack block, zeroed so an unwritten lane's zero
   // request id can never match a live request's.
   [[nodiscard]] const MetalBuffer &stepPackBuffer() {
@@ -610,12 +668,35 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                        [&](const auto &weights) -> detail::DraftModel {
                          using Draft = typename detail::DraftModelFor<
                              std::decay_t<decltype(weights)>>::Type;
+                         // RICHENGINE_NO_DRAFT: force non-speculative
+                         // decode — the oracle for verify-stride hunts.
                          if constexpr (std::is_same_v<Draft, NullDraft>)
-                           return detail::DraftModel(std::in_place_type<Draft>);
-                         else
+                           return detail::DraftModel(
+                               std::in_place_type<NullDraft>);
+                         else {
+                           if (envFlag("RICHENGINE_NO_DRAFT"))
+                             return detail::DraftModel(
+                                 std::in_place_type<NullDraft>);
+                           // DFlash2 decoders take a dedicated width
+                           // pathway by trained block: block-8 runs the
+                           // upstream-native 8-row tile, wider blocks keep
+                           // the compiled sixteen.
+                           if constexpr (std::is_same_v<Draft, DFlashDraft>)
+                             return detail::DraftModel(
+                                 geometry.draft.blockSize <=
+                                         DFlashTwo8width::kTrainedVerifyWidth
+                                     ? detail::DraftModel(
+                                           std::in_place_type<
+                                               DFlashTwo8width>,
+                                           weights, value.backend, operators)
+                                     : detail::DraftModel(
+                                           std::in_place_type<
+                                               DFlashTwo16width>,
+                                           weights, value.backend, operators));
                            return detail::DraftModel(std::in_place_type<Draft>,
                                                      weights, value.backend,
                                                      operators);
+                         }
                        },
                        value.package.draft)),
         aneFfn(value.aneFfn) {
@@ -627,6 +708,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
+    if (geometry.target.stateLayout.layers && geometry.target.convolutionDimension) {
+      const uint64_t layerBytes = gdnTapeLayerBytes();
+      gdnTape_ = backend.allocateBuffer(
+          uint64_t{kLaneCount} * 2 * geometry.target.stateLayout.layers *
+              layerBytes,
+          BufferStorage::Shared, "gdn-decode-tape");
+    }
     preparePolicyPipelines();
     if (const char *path = tuning().aneMedusa) {
       std::string error;
@@ -947,17 +1035,20 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // on-device, Off drops every DFA in provideDfa and stays on the host
   // path entirely.
   enum class DfaMode : uint8_t { Off, Forced, Full };
-  static DfaMode dfaModeFromEnv() {
-    const std::string_view mode = tuning().dfaMode;
-    // Opt-in: GPU masks lose to the host round trip inside a 16-row verify
-    // loop, so DFA lanes stay on the host path unless asked.
+  static DfaMode dfaModeFromPolicy() {
+    // The resolved default: an explicit RICHENGINE_DFA_MODE wins, then the
+    // family maker's ModelTuning default, then Off — GPU masks lose to the
+    // host round trip inside a 16-row verify loop, so DFA lanes stay on the
+    // host path unless asked (a family without a GPU draft never runs that
+    // verify loop and may declare "full" itself).
+    const std::string_view mode = modelPolicy().dfaMode;
     if (mode == "forced")
       return DfaMode::Forced;
     if (mode == "full")
       return DfaMode::Full;
     return DfaMode::Off;
   }
-  const DfaMode dfaMode_ = dfaModeFromEnv();
+  const DfaMode dfaMode_ = dfaModeFromPolicy();
   // Whether the entry's masks come from the DFA walk kernels rather than a
   // host mask request: only a Full-mode DFA lane skips the round trip.
   bool gpuDfaMasks(const Request &entry) const noexcept {
@@ -1212,6 +1303,47 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, storage);
     };
+    // An all-score batch needs the logits at its lanes' score columns and
+    // nowhere else: gather just the quant tiles covering them
+    // (TargetModel::addScoreHeadColumns), or, with SCORE_TENSOR /
+    // SCORE_FUSED, the wanted columns in one dispatch
+    // (TargetModel::addScoreHeadGather). A lane that selects, or a head
+    // the restricted dispatch cannot take, keeps the full projection.
+    if ((scoreGather_ || scoreTensor_ || scoreFused_) &&
+        std::ranges::none_of(lanes, &InitialSelection::select)) {
+      std::vector<uint32_t> wanted;
+      for (const InitialSelection &selection : lanes)
+        for (uint32_t token : selection.entry->scoreTokens)
+          wanted.push_back(token);
+      std::ranges::sort(wanted);
+      const auto [first, last] = std::ranges::unique(wanted);
+      wanted.erase(first, last);
+      if (scoreTensor_ || scoreFused_) {
+        const MetalBuffer &buffer = scoreColumnsBuffer();
+        if (wanted.size() <= buffer.sizeBytes() / sizeof(uint32_t)) {
+          std::memcpy(buffer.contents(), wanted.data(),
+                      wanted.size() * sizeof(uint32_t));
+          if (targetModel.addScoreHeadGather(
+                  graph, d(DecodeTensor::Hidden0),
+                  d(DecodeTensor::FinalHidden), d(DecodeTensor::Logits),
+                  width, decodeArena->linearScratch(), buffer,
+                  static_cast<uint32_t>(wanted.size()), scoreFused_))
+            return;
+        }
+      }
+      if (scoreGather_) {
+        std::vector<uint32_t> tiles;
+        for (uint32_t token : wanted)
+          tiles.push_back(token / QUANT_TILE_ROWS);
+        const auto [tfirst, tlast] = std::ranges::unique(tiles);
+        tiles.erase(tfirst, tlast);
+        if (targetModel.addScoreHeadColumns(
+                graph, d(DecodeTensor::Hidden0), d(DecodeTensor::FinalHidden),
+                d(DecodeTensor::Logits), width, decodeArena->linearScratch(),
+                tiles))
+          return;
+      }
+    }
     targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
                              d(DecodeTensor::FinalHidden),
                              d(DecodeTensor::Logits), width,
@@ -1363,6 +1495,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
       if (item.logicalPosition == 0)
         states.clearForColdStart(entry.stateLane);
+        gdnPendingRows_[entry.stateLane] = 0;
       if (item.tokenCount > kPrefillRows - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }
@@ -1763,6 +1896,17 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),
                                                 "GPU accepted draft count");
+      // A chain batch's verify rows (draft_verify_rows) bound its retention;
+      // a tree batch's acceptance caps at its node count alone.
+      if (!tree) {
+        laneResult.verifyRows = *contents<uint32_t>(
+            d(DecodeTensor::VerifyRows), "GPU verify rows");
+        if (!laneResult.verifyRows ||
+            laneResult.verifyRows > laneResult.maximumRetained)
+          throw std::runtime_error("draft selector produced invalid verify rows");
+        if (laneResult.retained > laneResult.verifyRows)
+          throw std::runtime_error("target policy retained an unverified row");
+      }
       const uint32_t *outputTokens = packedOutputTokens + lane * rowStride;
       if (!laneResult.retained || laneResult.retained > kDecodeRows) {
         if (treeDebug_) {
@@ -1814,6 +1958,22 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                 flatIn[lane * rowStride],
                 outputTokens[0], outputTokens[1],
                 outputTokens[2], outputTokens[rowStride - 1]);
+        // Top-2 margin on the correction row (the logits the retained
+        // tail is sampled from): a near-tie flips on tiling noise; a wide
+        // gap means a genuinely different row.
+        {
+          const float *corr =
+              logits + laneResult.accepted * geometry.target.paddedVocabularySize;
+          float m1 = -INFINITY, m2 = -INFINITY;
+          uint32_t i1 = 0, i2 = 0;
+          for (uint32_t e = 0; e < geometry.target.vocabularySize; ++e) {
+            const float v = corr[e];
+            if (v > m1) { m2 = m1; i2 = i1; m1 = v; i1 = e; }
+            else if (v > m2) { m2 = v; i2 = e; }
+          }
+          fprintf(stderr, "  corr row=%u m1=%.4f@%u m2=%.4f@%u margin=%.4f\n",
+                  laneResult.accepted, m1, i1, m2, i2, m1 - m2);
+        }
         std::string p, t;
         for (uint32_t i = 0; i < kDraftProposalTokens; ++i)
           p += (i ? " " : "") + std::to_string(props[i]);
@@ -1823,6 +1983,111 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                 lane, static_cast<unsigned long long>(items[lane].logicalPosition), p.c_str(),
                 laneResult.retained, laneResult.accepted, t.c_str(),
                 static_cast<unsigned long long>(h0));
+        // RICHENGINE_VERIFY_DUMP: per-tensor FNV hashes for stride-mismatch
+        // hunts — lane N's hash should equal lane 0's at width 1 when the
+        // same prompt is replayed (B1 vs B2 lane 0 is the oracle).
+        if (envFlag("RICHENGINE_VERIFY_DUMP")) {
+          const auto fnv = [](const void *ptr, size_t bytes) {
+            uint64_t h = 1469598103934665603ULL;
+            const auto *b = static_cast<const uint8_t *>(ptr);
+            for (size_t i = 0; i < bytes; ++i)
+              h = (h ^ b[i]) * 1099511628211ULL;
+            return h;
+          };
+          const uint32_t vs = rowStride, qr = geometry.draft.queryRows();
+          const uint32_t ret = laneResult.retained;
+          const uint16_t *capAll = contents<uint16_t>(
+              decodeArena->packed(DecodeTensor::CapturedTargetHidden,
+                                  uint32_t(lanes.size())),
+              "captured hidden all");
+          const uint32_t cw = geometry.target.capturedHiddenSize();
+          const uint16_t *ckv = contents<uint16_t>(
+              decodeArena->packed(DecodeTensor::ContextKv,
+                                  uint32_t(lanes.size())),
+              "context kv");
+          const uint32_t *din = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::DraftInputTokens,
+                                  uint32_t(lanes.size())),
+              "draft input");
+          const uint16_t *dfhAll = contents<uint16_t>(
+              decodeArena->packed(DecodeTensor::DraftFinalHidden,
+                                  uint32_t(lanes.size())),
+              "draft final hidden all");
+          // Fused-head argmax partials for the correction row: the top-2
+          // tile maxima bound the margin that flipped the emitted token.
+          const uint32_t headTiles =
+              geometry.target.paddedVocabularySize / 64;
+          const float *hv = contents<float>(
+              decodeArena->packed(DecodeTensor::HeadArgmaxValues,
+                                  uint32_t(lanes.size())),
+              "head argmax values");
+          const uint32_t *hi = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::HeadArgmaxIndices,
+                                  uint32_t(lanes.size())),
+              "head argmax indices");
+          const uint32_t crow = laneResult.accepted;
+          const auto bf2s = [](uint16_t b) {
+            uint32_t u = uint32_t(b) << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+          };
+          const uint16_t *fh =
+              hidden + size_t(crow) * geometry.target.hiddenSize;
+          fprintf(stderr,
+                  "  fh lane=%u crow=%u [%.4f %.4f %.4f %.4f %.4f %.4f]\n",
+                  lane, crow, bf2s(fh[0]), bf2s(fh[1]), bf2s(fh[2]),
+                  bf2s(fh[3]), bf2s(fh[4]), bf2s(fh[5]));
+          float am1 = -INFINITY, am2 = -INFINITY;
+          uint32_t ai1 = 0, ai2 = 0;
+          for (uint32_t t = 0; t < headTiles; ++t) {
+            const float v = hv[size_t(lane) * vs * headTiles + crow * headTiles + t];
+            const uint32_t i = hi[size_t(lane) * vs * headTiles + crow * headTiles + t];
+            if (v > am1) { am2 = am1; ai2 = ai1; am1 = v; ai1 = i; }
+            else if (v > am2) { am2 = v; ai2 = i; }
+          }
+          fprintf(stderr,
+                  "  hax lane=%u crow=%u m1=%.4f@%u m2=%.4f@%u margin=%.4f "
+                  "ot=[%u %u %u %u %u %u %u %u]\n",
+                  lane, crow, am1, ai1, am2, ai2, am1 - am2,
+                  outputTokens[0], outputTokens[1], outputTokens[2],
+                  outputTokens[3], outputTokens[4], outputTokens[5],
+                  outputTokens[6], outputTokens[7]);
+          fprintf(stderr,
+                  "vdump lane=%u pos=%llu ret=%u acc=%u vin=%016llx log=%016llx "
+                  "cap=%016llx ctxkv=%016llx din=%016llx dfh=%016llx\n",
+                  lane,
+                  static_cast<unsigned long long>(items[lane].logicalPosition),
+                  ret, laneResult.accepted,
+                  static_cast<unsigned long long>(
+                      fnv(flatIn + lane * vs, vs * 4)),
+                  static_cast<unsigned long long>(
+                      fnv(logits, size_t(ret) *
+                                    geometry.target.paddedVocabularySize * 4)),
+                  static_cast<unsigned long long>(
+                      fnv(capAll + size_t(lane) * vs * cw,
+                          size_t(ret) * cw * 2)),
+                  static_cast<unsigned long long>(
+                      fnv(ckv + size_t(lane) * vs *
+                              geometry.draft.contextKvSize(),
+                          size_t(ret) * geometry.draft.contextKvSize() * 2)),
+                  static_cast<unsigned long long>(
+                      fnv(din + size_t(lane) * qr, qr * 4)),
+                  static_cast<unsigned long long>(
+                      fnv(dfhAll + size_t(lane) * qr * geometry.draft.hiddenSize,
+                          size_t(qr) * geometry.draft.hiddenSize * 2)));
+          std::string lr;
+          for (uint32_t r = 0; r < vs && r < 8; ++r) {
+            char tmp[24];
+            std::snprintf(tmp, sizeof(tmp), "%016llx ",
+                          static_cast<unsigned long long>(fnv(
+                              logits + size_t(r) *
+                                           geometry.target.paddedVocabularySize,
+                              geometry.target.paddedVocabularySize * 4)));
+            lr += tmp;
+          }
+          fprintf(stderr, "  lrow lane=%u %s\n", lane, lr.c_str());
+        }
         if (lane == 0) {
           const uint16_t *cap = contents<uint16_t>(
               d(DecodeTensor::CapturedTargetHidden), "captured hidden");
@@ -2157,6 +2422,36 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
     }
 
+    // The chain cycle teaches the verify budget its lanes' labels and its
+    // cost: proposals verified up to the first rejection, and the wall time
+    // at the rows the cycle verified in all.
+    if (!tree &&
+        geometry.target.ffnKind == FfnKind::SparseMoe &&
+        std::all_of(lanes.begin(),
+                    lanes.begin() + static_cast<std::ptrdiff_t>(items.size()),
+                    [](const DecodeLaneResult &laneResult) {
+                      return laneResult.failure.empty();
+                    })) {
+      const bool constrained = std::any_of(
+          lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(items.size()),
+          [](const DecodeLaneResult &laneResult) {
+            return laneResult.request->constraint == ConstraintMode::TokenMask;
+          });
+      std::array<VerifyBudget::Lane, kLaneCount> observed{};
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        const float *confidence = contents<float>(
+            decodeArena->get(lane, DecodeTensor::VerifyConfidence),
+            "draft proposal confidence");
+        std::copy_n(confidence, kDraftProposalTokens,
+                    observed[lane].confidence.begin());
+        observed[lane].verifyRows = lanes[lane].verifyRows;
+        observed[lane].accepted = lanes[lane].accepted;
+        observed[lane].labels = lanes[lane].verifyLabels;
+      }
+      verifyBudget_.observe(std::span(observed).first(items.size()),
+                            constrained, timing.wallSeconds * 1000.0);
+    }
+
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2183,6 +2478,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                     targetTokens + (laneResult.retained - 1));
 
       states.swapParity(entry.stateLane);
+      if (gdnTape_) {
+        gdnPendingRows_[entry.stateLane] = laneResult.retained;
+        gdnTapeParity_[entry.stateLane] ^= 1;
+      }
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
       states.updateLengths(
@@ -2241,12 +2540,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       entry.gpuMaskInFlight = false;
       results.push_back(
           {entry.id, 0, std::move(output), false, DecodeStage::Regular,
-           // A chain lane's drafted count is what verify could actually
-           // have accepted: the offered proposals clamped to its trained
-           // row stride. A tree's is the full comb width, as before.
+           // A chain lane's drafted count is the proposals it verified: the
+           // offered ones clamped to its verify rows, which the budget may
+           // have shortened below its trained row stride. A tree's is the
+           // full comb width, as before.
            tree ? kDraftProposalTokens
                 : std::min(laneResult.proposals,
-                           geometry.draft.verifyRows() - 1),
+                           laneResult.verifyRows - 1),
            std::min(laneResult.accepted, laneResult.retained - 1)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
@@ -2301,6 +2601,19 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
+          entries[lane] = &entry;
+          // A free lane asks for no mask and none of its selections read
+          // one: it keeps the live rows decodeAsync computed and clears
+          // every mask-inflight flag the suspension checks read.
+          if (!constrained(lane)) {
+            gpuMask_[lane] = false;
+            forced_[lane] = 0;
+            gpuForced_[lane] = 0;
+            entry.gpuMaskInFlight = false;
+            entry.verifyMaskInFlight = false;
+            liveRows_[lane] = laneResult.proposals + 1;
+            continue;
+          }
           uint32_t *proposed = contents<uint32_t>(
               impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
               "constrained draft proposals");
@@ -2314,7 +2627,6 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           gpuMask_[lane] = impl_.gpuDfaMasks(entry);
           entry.gpuMaskInFlight = entry.dfa.has_value();
           entry.verifyMaskInFlight = !gpuMask_[lane];
-          entries[lane] = &entry;
 
           // A DFA lane's forced span comes from the commit stage's
           // on-device derivation (Full and Forced modes alike): the state
@@ -2384,6 +2696,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
               forced_[lane]
                   ? forced_[lane] + 1
                   : std::min(cap, laneResult.maximumRetained - 1) + 1;
+          // A forced span replaced the lane's proposals: its confidences do
+          // not describe them, so it labels no acceptance for the budget.
+          if (forced_[lane])
+            laneResult.verifyLabels = false;
           if (!abandoned_[lane] && !gpuMask_[lane]) {
             // The mask response carries one row per simulated token plus
             // the pre-anchor row, so the simulation stops at the lane's
@@ -2442,7 +2758,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         bool masksReady = true;
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           masksReady = masksReady &&
-                       (abandoned_[lane] || gpuMask_[lane] ||
+                       (!constrained(lane) || abandoned_[lane] ||
+                        gpuMask_[lane] ||
                         !lanes_[lane].request->maskWords.empty());
         }
         if (masksReady) {
@@ -2466,10 +2783,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             // Rows past a lane's live budget carry anchor duplicates; they
             // must never be retained, or the draft context commits a row
             // whose token its hidden state never saw.
-            proposals[lane] = forced_[lane]
-                                  ? forced_[lane]
-                                  : std::min(cap, laneResult.maximumRetained - 1);
+            proposals[lane] =
+                constrained(lane)
+                    ? (forced_[lane] ? forced_[lane]
+                                     : std::min(
+                                           cap, laneResult.maximumRetained - 1))
+                    : laneResult.proposals;
             laneResult.proposals = proposals[lane];
+            if (!constrained(lane))
+              continue;
             if (abandoned_[lane])
               impl_.admitEveryToken(lane);
             else if (!gpuMask_[lane])
@@ -2512,10 +2834,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
           impl_.encodeDraftStateCommitBatch(
               commit, {entries.data(), lanes_.size()}, items_);
-          // Constrained lanes skip the adaptive budget, so the step pack
-          // gets the flat proposal cap as each lane's next-step budget.
+          // Constrained lanes skip the adaptive budget; free lanes keep
+          // the budget decodeAsync clamped for their step.
           std::array<uint32_t, kLaneCount> budgets{};
-          budgets.fill(cap);
+          for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+            budgets[lane] =
+                constrained(lane) || !impl_.adaptiveProposals_
+                    ? cap
+                    : std::clamp(lanes_[lane].request->proposalBudget,
+                                 std::min<uint32_t>(1, cap), cap);
           impl_.encodeBatchStepPack(
               commit, {entries.data(), lanes_.size()}, items_,
               {budgets.data(), lanes_.size()},
@@ -2546,10 +2873,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     bool ownsMaskWait(uint64_t requestId) const noexcept override {
       if (stage_ == Stage::Draft || stage_ == Stage::Done)
         return false;
-      return std::any_of(lanes_.begin(), lanes_.end(),
-                         [requestId](const DecodeLaneResult &lane) {
-                           return lane.request->id == requestId;
-                         });
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        if (lanes_[lane].request->id == requestId)
+          return constrained(lane);
+      return false;
     }
 
     void abandonMask(uint64_t requestId) noexcept override {
@@ -2575,7 +2902,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       stage_ = Stage::Done;
       ModelTelemetry &counters = impl_.counters;
       ++counters.constrainedMaskOverlapBatches;
-      counters.constrainedMaskOverlapRequests += lanes_.size();
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        counters.constrainedMaskOverlapRequests += constrained(lane);
       counters.lastConstrainedTargetForwardGpuSeconds =
           targetForwardGpuSeconds_;
       counters.totalConstrainedTargetForwardGpuSeconds +=
@@ -2600,6 +2928,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
 
     void submit(const CommandGraph &graph) {
       command_ = impl_.backend.submitCommandAsync(graph.dispatches(), wake_);
+    }
+
+    // Whether the lane's selections read a mask from the host or the GPU
+    // DFA walk.
+    bool constrained(uint32_t lane) const noexcept {
+      return lanes_[lane].request->constraint == ConstraintMode::TokenMask;
     }
 
     void addTiming(CommandTiming value) noexcept {

@@ -108,9 +108,9 @@ PACKAGE_FORMATS = {
         frozenset({"MDFD0004", DFLASH_V1_DRAFT_MAGIC}),
         draft_payload=False,
     ),
-    "richengine-packed-q4-diffusiongemma": PackageFormat(
-        1, "GEMM0001", "DiffusionGemma-26B-A4B", {}, draft_payload=False
-    ),
+    # "richengine-packed-q4-diffusiongemma" is gone while the family is
+    # disabled (docs/diffusion_issue.md); a manifest naming it no longer
+    # reads as a RichEngine package.
 }
 
 

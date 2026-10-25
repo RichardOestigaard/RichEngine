@@ -48,8 +48,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
 #endif
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc);
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
-                                            simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, acc);
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
+                                            simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
       output[o] = gguf_epilogue<Ep>(v, aux, o);
@@ -116,13 +116,13 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
     auto acc_u = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc_g);
     gguf_zero(acc_u);
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(gate.format, x, gate.w0, gate.w1, gate.meta,
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(gate.format, x, gate.w0, gate.w1, gate.meta,
                                             p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
-                                            p.input_size / GGUF_STAGED_STEP, acc_g);
+                                            p.input_size / GGUF_STAGED_STEP, 0, acc_g);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(up.format, x, up.w0, up.w1, up.meta,
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(up.format, x, up.w0, up.w1, up.meta,
                                             p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
-                                            p.input_size / GGUF_STAGED_STEP, acc_u);
+                                            p.input_size / GGUF_STAGED_STEP, 0, acc_u);
 #pragma unroll
     for (ushort i = 0; i < acc_g.get_capacity(); ++i) {
       if (!acc_g.is_valid_element(i)) continue;
@@ -210,9 +210,9 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
     if (split) return;
     auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
     gguf_zero(acc);
-    staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, true>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, true>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
                                             origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
-                                            p.input_size / GGUF_STAGED_STEP, acc);
+                                            p.input_size / GGUF_STAGED_STEP, 0, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
       output[o] = gguf_epilogue<Ep>(v, aux, o);

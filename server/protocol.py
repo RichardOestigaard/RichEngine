@@ -94,6 +94,7 @@ class FrameType(IntEnum):
     FORCED_TOKENS = 0x0005
     CONSTRAINT_DFA = 0x0006
     VOCABULARY = 0x0007
+    SCORE_BATCH = 0x0008
 
     READY = 0x0100
     START = 0x0101
@@ -275,6 +276,9 @@ class RequestFrame:
     # as the chat template's system prompt and tools; zero when unknown. It
     # must not exceed the prompt.
     shared_prefix_tokens: int = 0
+    # A shared prefix held outside prompt_tokens so batch jobs never copy it
+    # per request; the serialized prompt is prefix_tokens + prompt_tokens.
+    prefix_tokens: tuple = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -337,6 +341,33 @@ class VocabularyFrame:
 @dataclass(slots=True, frozen=True)
 class StatusRequestFrame:
     correlation_id: int
+
+
+@dataclass(slots=True, frozen=True)
+class ScoreBatchItem:
+    """One score-only request's own tokens within a ScoreBatchFrame: its
+    prompt is the batch prefix plus these suffix tokens."""
+
+    request_id: int
+    suffix_tokens: tuple[int, ...]
+    score_tokens: tuple[int, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ScoreBatchFrame:
+    """A batch of score-only requests sharing one prompt prefix — the
+    decision pathway's questions over one state. The engine expands each
+    item to a score request whose shared prefix is the prefix length."""
+
+    priority: RequestPriority
+    absolute_deadline_unix_micros: int
+    remaining_deadline_micros: int
+    prefix_tokens: tuple[int, ...]
+    items: tuple[ScoreBatchItem, ...]
+
+
+# A batch covers a /v1/systemone request's question cap.
+MAX_SCORE_BATCH_ITEMS = 64
 
 
 @dataclass(slots=True, frozen=True)
@@ -432,6 +463,7 @@ ClientMessage: TypeAlias = (
     | ForcedTokensFrame
     | ConstraintDfaFrame
     | VocabularyFrame
+    | ScoreBatchFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -718,7 +750,14 @@ def _validated_request(
         )
     try:
         output_tokens = _u32(request.logical_max_output_tokens, "logical max output")
-        prompt = _words(request.prompt_tokens, "prompt tokens")
+        prompt = _words(
+            (
+                request.prefix_tokens + request.prompt_tokens
+                if request.prefix_tokens
+                else request.prompt_tokens
+            ),
+            "prompt tokens",
+        )
         scores = _words(request.score_tokens, "score tokens")
         if scores:
             if output_tokens:
@@ -1104,6 +1143,82 @@ def _status_request_frame(request: StatusRequestFrame) -> bytearray:
     return frame
 
 
+_SCORE_BATCH_HEAD = struct.Struct("<QQBBII")
+_SCORE_BATCH_ITEM_HEAD = struct.Struct("<QII")
+
+
+def _score_batch_frame(batch: ScoreBatchFrame) -> bytearray:
+    """Validate and pack one score batch: the shared prefix once, then each
+    item's own suffix and score tokens."""
+    request_id = 0
+    try:
+        absolute = _u64(
+            batch.absolute_deadline_unix_micros, "absolute deadline"
+        )
+        remaining = _u64(batch.remaining_deadline_micros, "remaining deadline")
+        if not absolute or not remaining:
+            raise ValueError("absolute and remaining deadlines must be non-zero")
+        _enum_value(batch.priority, RequestPriority, "request priority")
+        prefix = _words(batch.prefix_tokens, "prefix tokens")
+        if not prefix:
+            raise ValueError("a score batch needs a nonempty prefix")
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_DEADLINE,
+            str(error),
+            request_id,
+        )
+    try:
+        count = _u32(len(batch.items), "score batch count")
+        if not count or count > MAX_SCORE_BATCH_ITEMS:
+            raise ValueError("score batch item count is out of range")
+        seen = set()
+        parts = []
+        for item in batch.items:
+            request_id = _u64(item.request_id, "request id")
+            if not request_id:
+                raise ValueError("request id must be non-zero")
+            if request_id in seen:
+                raise ValueError("score batch request ids must be distinct")
+            seen.add(request_id)
+            suffix = _words(item.suffix_tokens, "suffix tokens")
+            scores = _words(item.score_tokens, "score tokens")
+            if not suffix or len(prefix) + len(suffix) > MAX_PROMPT_TOKENS:
+                raise ValueError("prompt token count exceeds its limit")
+            if (
+                len(scores) < MIN_SCORE_TOKENS
+                or len(scores) > MAX_SCORE_TOKENS
+                or len(set(scores)) != len(scores)
+            ):
+                raise ValueError(
+                    f"score requests need {MIN_SCORE_TOKENS}..{MAX_SCORE_TOKENS} "
+                    "distinct option tokens"
+                )
+            parts.append(
+                _SCORE_BATCH_ITEM_HEAD.pack(request_id, len(suffix), len(scores))
+                + suffix.tobytes()
+                + scores.tobytes()
+            )
+    except ValueError as error:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COUNT,
+            str(error),
+            request_id,
+        )
+    payload = (
+        _SCORE_BATCH_HEAD.pack(
+            absolute, remaining, int(batch.priority), 0, count, len(prefix)
+        )
+        + prefix.tobytes()
+        + b"".join(parts)
+    )
+    frame = _frame(FrameType.SCORE_BATCH, len(payload))
+    frame[FRAME_HEADER_BYTES:] = payload
+    return frame
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -1122,6 +1237,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _vocabulary_frame(message)
         if isinstance(message, StatusRequestFrame):
             return _status_request_frame(message)
+        if isinstance(message, ScoreBatchFrame):
+            return _score_batch_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")

@@ -1,9 +1,10 @@
-import { A, useLocation } from "@solidjs/router";
+import { A, useLocation, useNavigate } from "@solidjs/router";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
-import { api, apiKey, setApiKey, authorization, noteAuthStatus, unauthorized } from "./api";
+import { api, apiKey, authorization, noteAuthStatus, storageSet, unauthorized } from "./api";
 import { decisionModel, setDecisionModel } from "./decision";
-import { fmtBytes } from "./format";
+import { fmtBytes, fmtTokens } from "./format";
 import { installJob } from "./install";
+import { MODEL_KEY } from "./pages/chat/storage";
 import { poll } from "./poll";
 import { togglePalette } from "./shortcuts";
 import { cycleTheme, theme, THEME_LABELS } from "./theme";
@@ -19,6 +20,49 @@ interface MemoryUse {
   peak?: number;
   limit?: number;
   pressure?: string;
+}
+
+/* One /v1/models entry: a served name. Entries with `root` are aliases of
+   the resident whose first name is root; entries without it are that
+   resident's primary name. */
+interface ServedEntry {
+  id: string;
+  root?: string;
+  decision?: boolean;
+  vision?: boolean;
+  context_length?: number;
+}
+
+/* One row of /status.residents, keyed by the loaded model id — always one
+   of the resident group's served names. */
+interface ResidentRow {
+  state?: string;
+  error?: string;
+  context_length?: number;
+  vision?: boolean;
+  decision?: boolean;
+  memory_bytes?: number;
+  memory_peak_bytes?: number;
+}
+
+/* /status.pool: resident capacity, present only on pooled servers. */
+interface PoolInfo {
+  max_residents?: number;
+  slots?: number;
+  free?: number;
+}
+
+/* A resident group: one engine process plus every name it answers to. */
+interface ResidentGroup {
+  id: string;
+  names: string[];
+  decision?: boolean;
+  vision?: boolean;
+  context?: number;
+  state?: string;
+  error?: string;
+  memoryBytes?: number;
+  memoryPeak?: number;
 }
 
 const ICON_PROPS = {
@@ -66,11 +110,23 @@ function ThemeIcon(props: { name: Theme }) {
 
 export default function TopBar() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [ready, setReady] = createSignal<ReadyState>(null);
-  const [servedModels, setServedModels] = createSignal<
-    { id: string; decision?: boolean }[]
-  >([]);
+  const [servedModels, setServedModels] = createSignal<ServedEntry[]>([]);
+  const [residentsMap, setResidentsMap] = createSignal<
+    Record<string, ResidentRow>
+  >({});
+  const [poolInfo, setPoolInfo] = createSignal<PoolInfo | null>(null);
   const [memory, setMemory] = createSignal<MemoryUse | null>(null);
+  /* /ready's residents tally counts hosts by lifecycle — including a
+     loading resident that has no app and no /v1/models entry yet. */
+  const [readyCounts, setReadyCounts] = createSignal<{
+    total?: number;
+    loading?: number;
+    failed?: number;
+  } | null>(null);
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  let menuEl: HTMLDivElement | undefined;
 
   async function checkReady() {
     try {
@@ -81,8 +137,10 @@ export default function TopBar() {
       noteAuthStatus(response.status);
       const body = (await response.json().catch(() => null)) as {
         status?: string;
+        residents?: { total?: number; loading?: number; failed?: number };
       } | null;
       const status = body?.status;
+      setReadyCounts(body?.residents ?? null);
       setReady(
         response.ok
           ? "ready"
@@ -95,17 +153,22 @@ export default function TopBar() {
     } catch {
       setReady("down");
       setMemory(null);
+      setResidentsMap({});
+      setPoolInfo(null);
     }
   }
 
-  /* Model memory rides the ready poll: present only while an app is
-     loaded, so the chip hides itself when nothing is serving. */
+  /* Resident state and pool capacity ride the ready poll: /status reports
+     the default resident's memory plus a residents map and a pool summary
+     on pooled servers. */
   async function loadStatus() {
     try {
       const res = await api<{
         memory_actual?: { current_bytes?: number; peak_bytes?: number };
         memory_governor?: { limit_bytes?: number };
         memory_pressure?: string;
+        residents?: Record<string, ResidentRow>;
+        pool?: PoolInfo;
       }>("/status");
       const current = res.memory_actual?.current_bytes;
       setMemory(
@@ -118,25 +181,30 @@ export default function TopBar() {
             }
           : null
       );
+      setResidentsMap(res.residents ?? {});
+      setPoolInfo(res.pool ?? null);
     } catch {
       setMemory(null);
+      setResidentsMap({});
+      setPoolInfo(null);
     }
   }
 
   async function loadServedModel() {
     try {
-      const res = await api<{ data?: { id?: string; decision?: boolean }[] }>(
-        "/v1/models"
+      const res = await api<{ data?: ServedEntry[] }>("/v1/models");
+      const list = (res.data ?? []).filter(
+        (entry): entry is ServedEntry => typeof entry.id === "string"
       );
-      const list = (res.data ?? [])
-        .filter((entry): entry is { id: string; decision?: boolean } =>
-          typeof entry.id === "string"
-        )
-        .map((entry) => ({ id: entry.id, decision: entry.decision }));
       setServedModels(list);
-      // Chat and Playground stay while any resident can generate text;
-      // an all-decision pool hides them.
-      setDecisionModel(list.length > 0 && list.every((m) => m.decision));
+      /* Chat and Playground stay while any resident can generate text; a
+         pool where every resident is a decision model hides them. Aliases
+         (entries with root) repeat their resident's flag — count only
+         primaries. */
+      const primaries = list.filter((m) => !m.root);
+      setDecisionModel(
+        primaries.length > 0 && primaries.every((m) => m.decision)
+      );
     } catch {
       setServedModels([]);
       setDecisionModel(false);
@@ -155,6 +223,172 @@ export default function TopBar() {
   );
 
   onCleanup(poll(checkReady, 5000));
+
+  /* A pointerdown outside the open menu closes it; clicks inside do not.
+     Escape closes it too, in the capture phase. */
+  createEffect(() => {
+    if (!menuOpen()) return;
+    const onDown = (event: PointerEvent) => {
+      if (!menuEl?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("keydown", onKey, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("keydown", onKey, true);
+    });
+  });
+
+  /* /v1/models order is default-resident-first; the residents map joins by
+     the loaded model id, which is always one of the group's names. */
+  const residents = (): ResidentGroup[] => {
+    const map = residentsMap();
+    const groups: ResidentGroup[] = [];
+    for (const entry of servedModels()) {
+      const key = entry.root ?? entry.id;
+      let group = groups.find((g) => g.id === key);
+      if (!group) {
+        group = {
+          id: key,
+          names: [],
+          decision: entry.decision,
+          vision: entry.vision,
+          context: entry.context_length,
+        };
+        groups.push(group);
+      }
+      group.names.push(entry.id);
+      const row = map[entry.id];
+      if (row) {
+        group.state = row.state;
+        group.error = row.error;
+        group.context = row.context_length ?? group.context;
+        group.vision = row.vision ?? group.vision;
+        group.decision = row.decision ?? group.decision;
+        group.memoryBytes = row.memory_bytes;
+        group.memoryPeak = row.memory_peak_bytes;
+      }
+    }
+    return groups;
+  };
+
+  /* Worst-case resident state drives the dot: failed, then loading, then
+     ready. A served name with no residents row counts as loaded; the
+     /ready tally adds app-less loading and failed hosts the groups can't
+     name. */
+  const aggregate = () => {
+    const groups = residents();
+    const counts = readyCounts();
+    if (!groups.length && !counts?.total) return "unloaded" as const;
+    if (groups.some((g) => g.state === "failed") || (counts?.failed ?? 0) > 0)
+      return "failed" as const;
+    if (groups.some((g) => g.state === "loading") || (counts?.loading ?? 0) > 0)
+      return "loading" as const;
+    if (!groups.length) return "unloaded" as const;
+    return "ready" as const;
+  };
+
+  const dotKind = () => {
+    if (unauthorized()) return "warn";
+    if (ready() === "down") return "err";
+    if (ready() === null) return "";
+    const agg = aggregate();
+    if (agg === "failed") return "err";
+    if (agg === "ready") return "ok";
+    return "warn";
+  };
+
+  const menuLabel = () => {
+    if (unauthorized()) return "auth";
+    const r = ready();
+    if (r === null) return "…";
+    if (r === "down") return "down";
+    const groups = residents();
+    if (!groups.length)
+      return r === "loading" || (readyCounts()?.loading ?? 0) > 0
+        ? "loading"
+        : "no model";
+    return groups[0].id;
+  };
+
+  const menuTitle = () => {
+    if (unauthorized()) return "API key required or rejected";
+    const r = ready();
+    if (r === null) return "Checking server";
+    if (r === "down") return "Engine unavailable";
+    const groups = residents();
+    if (!groups.length)
+      return "No model loaded — open Models to load one";
+    return groups
+      .map((g) => `${g.id}: ${g.state ?? "loaded"}`)
+      .join(" · ");
+  };
+
+  const residentSub = (g: ResidentGroup) => {
+    const parts: string[] = [];
+    if (g.state && g.state !== "loaded") parts.push(g.state);
+    if (g.context) parts.push(`${fmtTokens(g.context)} ctx`);
+    if (typeof g.memoryBytes === "number")
+      parts.push(fmtBytes(g.memoryBytes));
+    if (g.names.length > 1)
+      parts.push(`+${g.names.length - 1} name${g.names.length > 2 ? "s" : ""}`);
+    return parts.join(" · ");
+  };
+
+  const rowDot = (g: ResidentGroup) =>
+    g.state === "failed" ? "err" : g.state === "loading" ? "warn" : "ok";
+
+  /* Picking a resident points the chat composer at it. A decision resident
+     can't generate — its surface is Judge, so it navigates there instead. */
+  function pickResident(g: ResidentGroup) {
+    setMenuOpen(false);
+    if (g.decision) {
+      navigate("/judge");
+      return;
+    }
+    storageSet(MODEL_KEY, g.id);
+    window.dispatchEvent(
+      new CustomEvent("richengine:model-changed", { detail: g.id })
+    );
+    navigate("/");
+  }
+
+  /* Capacity reads only matter past the single-model default: a lone
+     resident at max_residents=1 would otherwise show "1/1 · 0 free" noise. */
+  const capacityText = () => {
+    const pool = poolInfo();
+    if (!pool?.max_residents || pool.max_residents <= 1) return "";
+    const used = pool.max_residents - (pool.free ?? 0);
+    return `${used}/${pool.max_residents} residents`;
+  };
+
+  const freeSlots = () => {
+    const pool = poolInfo();
+    return pool?.max_residents && pool.max_residents > 1 ? pool.free : undefined;
+  };
+
+  /* Per-resident memory when the server reports it, else the default
+     resident's memory_actual. */
+  const displayMemory = (): MemoryUse | null => {
+    const withMemory = residents().filter(
+      (g) => typeof g.memoryBytes === "number"
+    );
+    const base = memory();
+    if (!withMemory.length) return base;
+    return {
+      current: withMemory.reduce((t, g) => t + (g.memoryBytes ?? 0), 0),
+      peak:
+        withMemory.length === 1 ? withMemory[0].memoryPeak : undefined,
+      limit: base?.limit,
+      pressure: base?.pressure,
+    };
+  };
 
   const active = (path: string) =>
     path === "/" ? location.pathname === "/" : location.pathname.startsWith(path);
@@ -196,33 +430,108 @@ export default function TopBar() {
       >
         <ThemeIcon name={theme()} />
       </button>
-      <Show when={servedModels().length}>
-        <A
-          href="/models"
+      <div class="model-menu" ref={(el) => (menuEl = el)}>
+        <button
+          type="button"
           class="top-model"
-          title={`${servedModels()
-            .map((m) => m.id)
-            .join(", ")} — served models; open Models`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen()}
+          title={menuTitle()}
+          onClick={() => setMenuOpen(!menuOpen())}
         >
-          <For each={servedModels()}>
-            {(m, i) => (
-              <>
-                {i() > 0 && " · "}
-                {m.id}
-                <Show when={m.decision}>
-                  {" "}
-                  <span
-                    class="badge"
-                    title="Decision model — answers /v1/systemone and /v1/judgments in one forward pass; no text generation"
+          <span class={`dot ${dotKind()}`} aria-hidden="true" />
+          <span class="name">{menuLabel()}</span>
+          <Show when={residents().length > 1}>
+            <span class="count">+{residents().length - 1}</span>
+          </Show>
+          <svg
+            class="chev"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M6 9l6 6 6-6" />
+          </svg>
+        </button>
+        <Show when={menuOpen()}>
+          <div class="model-pop" role="menu" aria-label="Resident models">
+            <div class="model-pop-title">
+              <span>Resident models</span>
+              <Show when={capacityText()}>
+                <span>{capacityText()}</span>
+              </Show>
+            </div>
+            <Show
+              when={residents().length}
+              fallback={
+                <div class="model-row-empty">
+                  No model loaded — open Models to load one.
+                </div>
+              }
+            >
+              <For each={residents()}>
+                {(g, i) => (
+                  <button
+                    type="button"
+                    class="model-row"
+                    role="menuitem"
+                    title={
+                      g.decision
+                        ? `${g.id} — open Judge`
+                        : `Use ${g.id} in chat`
+                    }
+                    onClick={() => pickResident(g)}
                   >
-                    decision
-                  </span>
+                    <span class={`dot ${rowDot(g)}`} aria-hidden="true" />
+                    <span class="model-row-text">
+                      <span class="model-row-name">
+                        {g.id}
+                        <Show when={i() === 0}>
+                          {" "}
+                          <span class="badge">default</span>
+                        </Show>
+                        <Show when={g.decision}>
+                          {" "}
+                          <span
+                            class="badge"
+                            title="Decision model — answers /v1/systemone and /v1/judgments in one forward pass; no text generation"
+                          >
+                            decision
+                          </span>
+                        </Show>
+                      </span>
+                      <Show when={residentSub(g)}>
+                        <span
+                          class="model-row-sub"
+                          title={g.state === "failed" ? g.error : undefined}
+                        >
+                          {residentSub(g)}
+                        </span>
+                      </Show>
+                    </span>
+                  </button>
+                )}
+              </For>
+            </Show>
+            <div class="model-pop-foot">
+              <span class="muted">
+                <Show when={freeSlots() !== undefined}>
+                  {`${freeSlots()} slot${freeSlots() === 1 ? "" : "s"} free`}
                 </Show>
-              </>
-            )}
-          </For>
-        </A>
-      </Show>
+              </span>
+              <A href="/models" onClick={() => setMenuOpen(false)}>
+                Manage models
+              </A>
+            </div>
+          </div>
+        </Show>
+      </div>
       <Show when={installJob()?.running}>
         <A
           href="/models"
@@ -234,7 +543,7 @@ export default function TopBar() {
         </A>
       </Show>
       <div class="topright">
-        <Show when={memory()}>
+        <Show when={displayMemory()}>
           {(mem) => (
             <A
               href="/metrics"
@@ -244,7 +553,7 @@ export default function TopBar() {
                   mem().pressure === "warning" ||
                   mem().pressure === "critical",
               }}
-              title={`Model memory in use — peak ${
+              title={`Resident memory in use — peak ${
                 mem().peak !== undefined ? fmtBytes(mem().peak) : "—"
               }${
                 mem().limit !== undefined
@@ -259,48 +568,28 @@ export default function TopBar() {
             </A>
           )}
         </Show>
-        <span
-          class="status-pill"
-          classList={{
-            ok: ready() === "ready" && !unauthorized(),
-            down: ready() === "down",
-            warn: unauthorized() || ready() === "loading",
-          }}
-          title={
-            unauthorized()
-              ? "API key required or rejected — enter it at right"
-              : ready() === null
-                ? "Checking server"
-                : ready() === "ready"
-                  ? "Engine ready"
-                  : ready() === "loading"
-                    ? "Model is loading"
-                    : ready() === "unloaded"
-                      ? "Server up — no model loaded; open Models to load one"
-                      : "Engine unavailable"
-          }
-        >
-          {unauthorized()
-            ? "auth"
-            : ready() === null
-              ? "…"
-              : ready() === "unloaded"
-                ? "no model"
-                : ready()}
-        </span>
-        <input
-          class="api-key"
-          classList={{ invalid: unauthorized() }}
-          type="password"
-          autocomplete="off"
-          spellcheck={false}
-          placeholder="API key (if required)"
-          aria-label="API key"
-          aria-invalid={unauthorized()}
-          title="Sent as a Bearer token with every API request. Stored in localStorage."
-          value={apiKey()}
-          onInput={(event) => setApiKey(event.currentTarget.value)}
-        />
+        <Show when={unauthorized() || apiKey()}>
+          <A
+            href="/settings"
+            class="top-lock"
+            classList={{ warn: unauthorized() }}
+            title={
+              unauthorized()
+                ? "API key required or rejected — open Settings"
+                : "API key set — manage in Settings"
+            }
+            aria-label={
+              unauthorized()
+                ? "API key required or rejected — open Settings"
+                : "API key set — manage in Settings"
+            }
+          >
+            <svg {...ICON_PROPS}>
+              <rect x="5" y="11" width="14" height="9" rx="2" />
+              <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+            </svg>
+          </A>
+        </Show>
       </div>
     </header>
   );

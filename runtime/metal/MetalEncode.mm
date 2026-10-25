@@ -539,56 +539,67 @@ bool MetalBackend::Impl::useMtl4() const noexcept {
         return true;
     }
 
+// The barrier each command of a run needs, from the byte ranges it binds:
+// the same frontier rule commit4 applies to direct dispatches, resolved once
+// here because a span's bindings are fixed for its lifetime. A command whose
+// ranges are disjoint from every range since the last barrier encodes
+// without one, so independent branches of the run overlap.
+std::vector<uint8_t>
+MetalBackend::Impl::spanBarrierPlan(std::span<const ComputeDispatch> run) {
+    struct BoundRange {
+        id<MTLBuffer> buffer;
+        uint64_t begin;
+        uint64_t end;
+    };
+    std::vector<uint8_t> needsBarrier(run.size(), 0);
+    std::vector<BoundRange> frontier;
+    std::vector<BoundRange> ranges;
+    for (size_t index = 0; index < run.size(); ++index) {
+        ranges.clear();
+        for (const BufferBinding &binding : run[index].buffers) {
+            const MetalBuffer::Impl &view = *binding.buffer.impl_;
+            ranges.push_back({view.allocation->buffer, view.offsetBytes,
+                              view.offsetBytes + view.lengthBytes});
+        }
+        bool dependent = false;
+        for (const BoundRange &earlier : frontier) {
+            for (const BoundRange &range : ranges) {
+                if (earlier.buffer == range.buffer &&
+                    earlier.begin < range.end && range.begin < earlier.end) {
+                    dependent = true;
+                    break;
+                }
+            }
+            if (dependent) break;
+        }
+        if (dependent) {
+            needsBarrier[index] = 1;
+            frontier.clear();
+        }
+        frontier.insert(frontier.end(), ranges.begin(), ranges.end());
+    }
+    return needsBarrier;
+}
+
 // Bakes one validated run into an indirect command buffer. The commands
-    // carry their pipeline and buffer objects directly (nothing is
-    // inherited).
+// carry their pipeline and buffer objects directly (nothing is
+// inherited).
     std::shared_ptr<MetalBackend::Impl::BakedSpan>
     MetalBackend::Impl::bakeSpan(std::span<const ComputeDispatch> run) {
         auto span = std::make_shared<BakedSpan>();
         span->dispatches.reserve(run.size());
-        uint64_t paramsBytes = 0;
-        uint32_t maxBindCount = 0;
         for (const ComputeDispatch &dispatch : run) {
             for (const BufferBinding &binding : dispatch.buffers)
-                maxBindCount = std::max(maxBindCount, binding.index + 1);
+                span->maxBindCount =
+                    std::max(span->maxBindCount, binding.index + 1);
             for (const BytesBinding &binding : dispatch.bytes) {
-                maxBindCount = std::max(maxBindCount, binding.index + 1);
-                paramsBytes += (binding.sizeBytes + 255) & ~uint64_t{255};
+                span->maxBindCount =
+                    std::max(span->maxBindCount, binding.index + 1);
+                span->paramsBytes += (binding.sizeBytes + 255) & ~uint64_t{255};
             }
         }
-        id<MTLBuffer> params = nil;
-        if (paramsBytes) {
-            auto allocation = std::make_shared<MetalAllocation>();
-            allocation->accounting = accounting;
-            allocation->length = paramsBytes;
-            allocation->storage = BufferStorage::Shared;
-            allocation->label = @"baked-span-params";
-            allocation->residency = residency;
-            allocation->attach(
-                newBuffer(paramsBytes, BufferStorage::Shared,
-                          allocation->label));
-            span->paramsAllocation = std::move(allocation);
-            params = span->paramsAllocation->buffer;
-        }
-        MTLIndirectCommandBufferDescriptor *descriptor =
-            [MTLIndirectCommandBufferDescriptor new];
-        descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        descriptor.inheritPipelineState = NO;
-        descriptor.inheritBuffers = NO;
-        descriptor.maxKernelBufferBindCount = maxBindCount;
-        span->icb = [device
-            newIndirectCommandBufferWithDescriptor:descriptor
-                                   maxCommandCount:run.size()
-                                           options:0];
-        if (!span->icb)
-            throw MetalBackendError(
-                "unable to create a Metal indirect command buffer");
-        span->icb.label = @"baked-span";
-#if RICHENGINE_MTL4_AVAILABLE
-        // executeCommandsInBuffer requires the buffer itself resident on the
-        // Metal 4 path; the Metal 3 encoder declares its usage instead.
-        if (mtl4Enabled()) residency->add(span->icb);
-#endif
+        // Snapshot pass: record what each command binds, so every bank can
+        // be written from the snapshot alone.
         uint64_t cursor = 0;
         for (size_t i = 0; i < run.size(); ++i) {
             const ComputeDispatch &dispatch = run[i];
@@ -597,27 +608,14 @@ bool MetalBackend::Impl::useMtl4() const noexcept {
             snapshot.threadgroups = dispatch.threadgroups;
             snapshot.threadsPerThreadgroup = dispatch.threadsPerThreadgroup;
             snapshot.patchableBytes = dispatch.patchableBytes;
-            id<MTLIndirectComputeCommand> command =
-                [span->icb indirectComputeCommandAtIndex:i];
-            [command setComputePipelineState:indirectPipeline(
-                                                 dispatch.pipelineName)];
             for (const BufferBinding &binding : dispatch.buffers) {
                 const MetalBuffer::Impl &view = *binding.buffer.impl_;
-                [command setKernelBuffer:view.allocation->buffer
-                                  offset:view.offsetBytes
-                                 atIndex:binding.index];
                 snapshot.bufferIndices.push_back(binding.index);
                 snapshot.buffers.push_back(
                     {view.allocation, view.allocation->buffer,
                      view.offsetBytes, view.lengthBytes});
             }
             for (const BytesBinding &binding : dispatch.bytes) {
-                std::memcpy(
-                    static_cast<uint8_t *>(params.contents) + cursor,
-                    binding.data, binding.sizeBytes);
-                [command setKernelBuffer:params
-                                  offset:cursor
-                                 atIndex:binding.index];
                 BakedSpan::BytesSnapshot saved{binding.index, {}, cursor,
                                                binding.sizeBytes};
                 if (!dispatch.patchableBytes) {
@@ -628,19 +626,15 @@ bool MetalBackend::Impl::useMtl4() const noexcept {
                 snapshot.bytes.push_back(std::move(saved));
                 cursor += (binding.sizeBytes + 255) & ~uint64_t{255};
             }
-            // A barrier makes this command wait for all commands before it:
-            // set on every command but the first, it preserves the serial
-            // ordering the direct encoder's hazard tracking gives the run.
-            if (i) [command setBarrier];
-            [command concurrentDispatchThreadgroups:
-                MTLSizeMake(dispatch.threadgroups.x, dispatch.threadgroups.y,
-                            dispatch.threadgroups.z)
-                threadsPerThreadgroup:
-                    MTLSizeMake(dispatch.threadsPerThreadgroup.x,
-                                dispatch.threadsPerThreadgroup.y,
-                                dispatch.threadsPerThreadgroup.z)];
             span->dispatches.push_back(std::move(snapshot));
         }
+        // A barrier only where a later command's bytes overlap an earlier
+        // one's since the last barrier (RICHENGINE_SPAN_BARRIERS keeps the
+        // default serialize-everything bake otherwise).
+        span->barrierPlan =
+            tuning().spanBarriers ? spanBarrierPlan(run)
+                                  : std::vector<uint8_t>(run.size(), 1);
+        encodeBank(*span, 0, run);
         {
             std::vector<id<MTLBuffer>> bound;
             for (const BakedSpan::DispatchSnapshot &snapshot :
@@ -657,20 +651,98 @@ bool MetalBackend::Impl::useMtl4() const noexcept {
         return span;
     }
 
+// Builds one bank: its parameter arena, staged from the run's payloads, and
+// the indirect command buffer whose commands bind that arena's address. The
+// run's payloads are the ones the snapshot was validated against (identical
+// for non-patchable bindings by snapshotMatches, current for patchable ones),
+// so a later bank stages the same bytes the bake did.
+void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
+                                    std::span<const ComputeDispatch> run) {
+    if (span.icb[bank]) return;
+    if (span.paramsBytes && !span.paramsAllocation[bank]) {
+        auto allocation = std::make_shared<MetalAllocation>();
+        allocation->accounting = accounting;
+        allocation->length = span.paramsBytes;
+        allocation->storage = BufferStorage::Shared;
+        allocation->label = @"baked-span-params";
+        allocation->residency = residency;
+        allocation->attach(
+            newBuffer(span.paramsBytes, BufferStorage::Shared,
+                      allocation->label));
+        span.paramsAllocation[bank] = std::move(allocation);
+    }
+    id<MTLBuffer> params = span.paramsAllocation[bank]
+                               ? span.paramsAllocation[bank]->buffer
+                               : nil;
+    if (params) {
+        auto *contents = static_cast<uint8_t *>(params.contents);
+        for (size_t i = 0; i < run.size() && i < span.dispatches.size(); ++i) {
+            const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
+            for (size_t binding = 0; binding < snapshot.bytes.size();
+                 ++binding)
+                std::memcpy(contents + snapshot.bytes[binding].paramsOffset,
+                            run[i].bytes[binding].data,
+                            snapshot.bytes[binding].sizeBytes);
+        }
+    }
+    MTLIndirectCommandBufferDescriptor *descriptor =
+        [MTLIndirectCommandBufferDescriptor new];
+    descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    descriptor.inheritPipelineState = NO;
+    descriptor.inheritBuffers = NO;
+    descriptor.maxKernelBufferBindCount = span.maxBindCount;
+    id<MTLIndirectCommandBuffer> icb = [device
+        newIndirectCommandBufferWithDescriptor:descriptor
+                               maxCommandCount:span.dispatches.size()
+                                       options:0];
+    if (!icb)
+        throw MetalBackendError(
+            "unable to create a Metal indirect command buffer");
+    icb.label = @"baked-span";
+    span.icb[bank] = icb;
+#if RICHENGINE_MTL4_AVAILABLE
+    // executeCommandsInBuffer requires the buffer itself resident on the
+    // Metal 4 path; the Metal 3 encoder declares its usage.
+    if (mtl4Enabled()) residency->add(icb);
+#endif
+    for (size_t i = 0; i < span.dispatches.size(); ++i) {
+        const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
+        id<MTLIndirectComputeCommand> command =
+            [icb indirectComputeCommandAtIndex:i];
+        [command setComputePipelineState:
+                     indirectPipeline(snapshot.pipelineName)];
+        for (size_t bound = 0; bound < snapshot.buffers.size(); ++bound) {
+            const BakedSpan::BufferSnapshot &saved = snapshot.buffers[bound];
+            [command setKernelBuffer:saved.object
+                              offset:saved.offsetBytes
+                             atIndex:snapshot.bufferIndices[bound]];
+        }
+        for (const BakedSpan::BytesSnapshot &saved : snapshot.bytes)
+            [command setKernelBuffer:params
+                              offset:saved.paramsOffset
+                             atIndex:saved.index];
+        if (i && span.barrierPlan[i]) [command setBarrier];
+        [command concurrentDispatchThreadgroups:
+            MTLSizeMake(snapshot.threadgroups.x, snapshot.threadgroups.y,
+                        snapshot.threadgroups.z)
+            threadsPerThreadgroup:
+                MTLSizeMake(snapshot.threadsPerThreadgroup.x,
+                            snapshot.threadsPerThreadgroup.y,
+                            snapshot.threadsPerThreadgroup.z)];
+    }
+}
+
 // Rewrites a span's staged parameters from the run's current patchable
     // payloads: the indirect commands bind the parameter arena by address,
-    // so the same commands replay with the new parameters. One command in
-    // flight means the GPU finished reading the arena of the previous
-    // submission before this patch runs.
+    // so the same commands replay with the new parameters. The arena is the
+    // submission's parity bank: the only command that can still be reading
+    // an arena is the one two submissions back, which used the other bank.
     void MetalBackend::Impl::patchSpanParams(const BakedSpan &span,
-                                std::span<const PreparedDispatch> run) {
-        if (!span.paramsAllocation || !span.paramsAllocation->buffer) return;
-        // CONTRACT: callers must only reach here under replaySpans — no
-        // *prior* submission in flight (computed before beginSubmission
-        // pushes this one). The shared arena is CPU-rewritten; a prior
-        // in-flight replay could still be reading it.
-        auto *contents =
-            static_cast<uint8_t *>(span.paramsAllocation->buffer.contents);
+                                std::span<const PreparedDispatch> run,
+                                uint32_t bank) {
+        const auto &allocation = span.paramsAllocation[bank & 1];
+        if (!allocation || !allocation->buffer) return;
+        auto *contents = static_cast<uint8_t *>(allocation->buffer.contents);
         for (size_t i = 0; i < run.size(); ++i) {
             const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
             if (!snapshot.patchableBytes) continue;
@@ -1140,9 +1212,9 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 if (std::shared_ptr<const BakedSpan> span =
                         resolveBakedSpan(begin, run)) {
                     command.dispatches[begin].span = span.get();
-                    if (span->paramsAllocation)
-                        command.retainedAllocations.push_back(
-                            span->paramsAllocation);
+                    for (const auto &arena : span->paramsAllocation)
+                        if (arena)
+                            command.retainedAllocations.push_back(arena);
                     command.spanRefs.push_back(std::move(span));
                 }
                 begin = end;
@@ -1359,13 +1431,12 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             for (size_t i = 0; i < dispatches.size(); ++i)
                 command.dispatches[i].source = &dispatches[i];
             command.retainedAllocations.reserve(
-                candidate->boundBuffers + candidate->spanRefs.size() +
+                candidate->boundBuffers + 2 * candidate->spanRefs.size() +
                 3 * candidate->gpuSpanRefs.size());
             retainBound(dispatches, command.retainedAllocations);
             for (const auto &span : command.spanRefs)
-                if (span->paramsAllocation)
-                    command.retainedAllocations.push_back(
-                        span->paramsAllocation);
+                for (const auto &arena : span->paramsAllocation)
+                    if (arena) command.retainedAllocations.push_back(arena);
             for (const auto &span : command.gpuSpanRefs) {
                 command.retainedAllocations.push_back(span->argsAllocation);
                 command.retainedAllocations.push_back(span->descAllocation);
@@ -1396,20 +1467,31 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
         // A second command may be committed while this one is still in
-        // flight (the submit-ahead ring). Baked spans stay exclusive to the
-        // GPU-idle case: patchSpanParams rewrites the shared parameter arena
-        // an in-flight replay still reads, so a pipelined submission encodes
-        // every dispatch directly instead. A command with event steps also
-        // encodes directly: a replayed span would hide the dispatches its
-        // steps order against the other agent (EventStep).
+        // flight (the submit-ahead ring). Baked spans replay then: the bank
+        // they use is built on first use, so the arena this submission
+        // patches is never one an in-flight replay is reading. A command
+        // with event steps encodes directly: a replayed span would hide the
+        // dispatches its steps order against the other agent (EventStep).
+        const bool overlapping = asyncState->hasActiveSubmission();
         const bool replaySpans =
-            events.empty() && !asyncState->hasActiveSubmission();
+            events.empty() && (!tuning().spanBankOff || !overlapping);
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
         ticketState->retainedAllocations = std::move(retained);
         ticketState->sequence =
             asyncState->beginSubmission(dispatches.size(), 2);
+        // A baked span replays the bank the in-flight command is not using,
+        // and reuses the last bank when nothing is in flight, so bank 1 is
+        // built the first time a submission actually overlaps.
+        const uint32_t spanBank =
+            tuning().spanBankOff ? 0u
+                                 : (overlapping ? lastSpanBank ^ 1u
+                                                : lastSpanBank);
+        lastSpanBank = spanBank;
+        // GPU-encoded spans restage their one arena per submission, so they
+        // keep the GPU-idle requirement.
+        const bool replayGpuSpans = replaySpans && !overlapping;
 
         auto failBeforeCommit = [&](std::string message) {
             markUnhealthy(message);
@@ -1511,11 +1593,28 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 if (item.span && replaySpans &&
                     index + item.span->dispatches.size() <=
                         dispatches.size()) {
+                    // The run's dispatches are contiguous in the submitting
+                    // command, and `source` of the span's first one is its
+                    // head, so the bank builds from the same objects the
+                    // snapshot was validated against.
+                    const size_t spanLength = item.span->dispatches.size();
+                    if (!item.span->icb[spanBank]) {
+                        encodeBank(*item.span, spanBank,
+                                   {item.source, spanLength});
+                        if (const auto &arena =
+                                item.span->paramsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(arena);
+                    }
                     patchSpanParams(
-                        *item.span, dispatches.subspan(
-                                        index, item.span->dispatches.size()));
-                    [encoder useResource:item.span->icb
+                        *item.span, dispatches.subspan(index, spanLength),
+                        spanBank);
+                    id<MTLIndirectCommandBuffer> icb = item.span->icb[spanBank];
+                    [encoder useResource:icb
                                    usage:MTLResourceUsageRead];
+                    if (const auto &arena =
+                            item.span->paramsAllocation[spanBank])
+                        [encoder useResource:arena->buffer
+                                       usage:MTLResourceUsageRead];
                     for (__weak id<MTLBuffer> buffer :
                          item.span->usedBuffers) {
                         if (id<MTLBuffer> resource = buffer)
@@ -1528,11 +1627,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                             *item.source->indirectRange.impl_;
                         [encoder useResource:range.allocation->buffer
                                        usage:MTLResourceUsageRead];
-                        [encoder executeCommandsInBuffer:item.span->icb
+                        [encoder executeCommandsInBuffer:icb
                                           indirectBuffer:range.allocation->buffer
                                      indirectBufferOffset:range.offsetBytes];
                     } else {
-                        [encoder executeCommandsInBuffer:item.span->icb
+                        [encoder executeCommandsInBuffer:icb
                                                withRange:
                             NSMakeRange(0, item.span->dispatches.size())];
                     }
@@ -1544,7 +1643,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 // has written its commands on device: the descriptors it
                 // reads were staged at bake time, and every bytes payload
                 // is restaged into the span's parameter arena now.
-                if (item.gpuSpan && replaySpans && !opTimings &&
+                if (item.gpuSpan && replayGpuSpans && !opTimings &&
                     index + item.gpuSpan->dispatches.size() <=
                         dispatches.size()) {
                     const GpuSpan &span = *item.gpuSpan;
@@ -1674,23 +1773,41 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                           std::vector<std::shared_ptr<MetalAllocation>> retained,
                           CommandCompletion completion) {
         // The submit-ahead ring may commit a second command while this one
-        // runs. Baked spans stay exclusive to the GPU-idle case:
-        // patchSpanParams rewrites the shared parameter arena an in-flight
-        // replay still reads, so a pipelined submission encodes every
-        // dispatch directly instead. A command with event steps also
-        // encodes directly, as commit() does: a replayed span skips the
-        // encodeSteps calls of the indices it covers, and its steps would
-        // never order against the other agent (EventStep).
+        // runs. Baked spans replay then: the bank they use is built on first
+        // use, so the arena this submission patches is never one an in-flight
+        // replay is reading (RICHENGINE_SPAN_BANK_OFF restores the GPU-idle
+        // requirement). A command with event steps encodes directly, as
+        // commit() does: a replayed span skips the encodeSteps calls of the
+        // indices it covers, and its steps would never order against the
+        // other agent (EventStep).
+        const bool overlapping = asyncState->hasActiveSubmission();
         const bool replaySpans =
-            events.empty() && !asyncState->hasActiveSubmission();
+            events.empty() && (!tuning().spanBankOff || !overlapping);
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->completion = std::move(completion);
         ticketState->sequence =
             asyncState->beginSubmission(dispatches.size(), 2);
         // Submission parity selects the staging and allocator bank the
-        // in-flight command does not use.
+        // in-flight command does not use; a baked span's arena and ICB take
+        // the bank the in-flight command is not reading, or the last bank
+        // when nothing is in flight.
         const uint32_t bank = ticketState->sequence & 1;
+        const uint32_t spanBank =
+            tuning().spanBankOff ? 0u
+                                 : (overlapping ? lastSpanBank ^ 1u
+                                                : lastSpanBank);
+        lastSpanBank = spanBank;
+        // GPU-encoded spans restage their one arena per submission, so they
+        // keep the GPU-idle requirement.
+        const bool replayGpuSpans = replaySpans && !overlapping;
+        // RICHENGINE_OP_TIMINGS on Metal 4 brackets each encoded unit with a
+        // counter-heap timestamp pair, resolved in the final commit's
+        // feedback — the per-op probe commit() gets by committing every
+        // dispatch in its own buffer, except the buffer never splits here:
+        // a timestamp still orders against the work before it, so the
+        // serialized attribution is the same.
+        const bool opTimings = tuning().opTimings;
         auto &staging = staging4[bank];
         // Stage every BytesBinding payload: an argument table binds
         // addresses only. Each payload keeps the 256-byte alignment a
@@ -1773,6 +1890,50 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             const MTLGPUAddress stagingAddress =
                 staging ? staging->buffer.gpuAddress : 0;
             uint64_t stagingCursor = 0;
+            // Two heap entries per encoded unit; a span replay is one unit
+            // however many dispatches it covers. The heap is banked on
+            // submission parity like the allocator: its feedback resolves
+            // it before the bank's next reuse.
+            id<MTL4CounterHeap> timestamps4 = nil;
+            NSUInteger timingIndex = 0;
+            std::vector<std::string> timingNames;
+            if (opTimings && !dispatches.empty()) {
+                const NSUInteger needed = 2 * dispatches.size();
+                if (!counterHeap4[bank] ||
+                    counterHeap4Count[bank] < needed) {
+                    MTL4CounterHeapDescriptor *descriptor =
+                        [MTL4CounterHeapDescriptor new];
+                    descriptor.type = MTL4CounterHeapTypeTimestamp;
+                    descriptor.count = needed;
+                    NSError *error = nil;
+                    counterHeap4[bank] =
+                        [device newCounterHeapWithDescriptor:descriptor
+                                                       error:&error];
+                    counterHeap4Count[bank] =
+                        counterHeap4[bank] ? needed : 0;
+                    if (!counterHeap4[bank])
+                        failBeforeCommit(std::string(
+                            "unable to create MTL4 counter heap: ") +
+                            error.localizedDescription.UTF8String);
+                }
+                timestamps4 = counterHeap4[bank];
+            }
+            const auto timestampPair = [&](std::string_view name) {
+                if (!opTimings) return;
+                timingNames.emplace_back(name);
+                [encoder writeTimestampWithGranularity:
+                             MTL4TimestampGranularityPrecise
+                                              intoHeap:timestamps4
+                                               atIndex:timingIndex * 2];
+            };
+            const auto timestampPairEnd = [&] {
+                if (!opTimings) return;
+                [encoder writeTimestampWithGranularity:
+                             MTL4TimestampGranularityPrecise
+                                              intoHeap:timestamps4
+                                               atIndex:timingIndex * 2 + 1];
+                ++timingIndex;
+            };
             // Dependency-scoped ordering. Metal 4 issues no implicit hazard
             // tracking between the dispatches of an encoder, so a
             // dispatch-stage barrier must separate any unit that may touch
@@ -1807,7 +1968,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         index + item.span->dispatches.size() <=
                             dispatches.size();
                     const bool replaysGpuSpan =
-                        item.gpuSpan && replaySpans &&
+                        item.gpuSpan && replayGpuSpans &&
                         index + item.gpuSpan->dispatches.size() <=
                             dispatches.size();
                     ranges.clear();
@@ -1892,19 +2053,21 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                  visibilityOptions:MTL4VisibilityOptionDevice];
             };
             // An execute's span range: literal unless the run's first
-            // dispatch carries a GPU-written indirect range view.
-            const auto executeSpan = [&](const auto &span, size_t at) {
+            // dispatch carries a GPU-written indirect range view. `icb` is
+            // the span's bank: the arena the host patches is the one bound
+            // here.
+            const auto executeSpan = [&](id<MTLIndirectCommandBuffer> icb,
+                                         size_t count, size_t at) {
                 const MetalBuffer &range = dispatches[at].source->indirectRange;
                 if (range) {
                     const MetalBuffer::Impl &view = *range.impl_;
-                    [encoder executeCommandsInBuffer:span.icb
+                    [encoder executeCommandsInBuffer:icb
                                       indirectBuffer:
                         view.allocation->buffer.gpuAddress +
                             view.offsetBytes];
                 } else {
-                    [encoder executeCommandsInBuffer:span.icb
-                                           withRange:
-                        NSMakeRange(0, span.dispatches.size())];
+                    [encoder executeCommandsInBuffer:icb
+                                           withRange:NSMakeRange(0, count)];
                 }
             };
             // Encodes the event steps that follow the first `encoded`
@@ -1983,12 +2146,26 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 if (item.span && replaySpans &&
                     index + item.span->dispatches.size() <=
                         dispatches.size()) {
+                    // The run's dispatches are contiguous in the submitting
+                    // command, and `source` of the span's first one is its
+                    // head, so the bank builds from the same objects the
+                    // snapshot was validated against.
+                    const size_t spanLength = item.span->dispatches.size();
+                    if (!item.span->icb[spanBank]) {
+                        encodeBank(*item.span, spanBank,
+                                   {item.source, spanLength});
+                        if (const auto &arena =
+                                item.span->paramsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(arena);
+                    }
                     patchSpanParams(
-                        *item.span, dispatches.subspan(
-                                        index, item.span->dispatches.size()));
+                        *item.span, dispatches.subspan(index, spanLength),
+                        spanBank);
                     orderAfterPrevious(index);
-                    executeSpan(*item.span, index);
-                    index += item.span->dispatches.size() - 1;
+                    timestampPair(item.source->pipelineName);
+                    executeSpan(item.span->icb[spanBank], spanLength, index);
+                    timestampPairEnd();
+                    index += spanLength - 1;
                     continue;
                 }
                 // A GPU-encoded span replays like a baked one: gpu_encode
@@ -1996,7 +2173,10 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 // pure function of the span's static descriptor table), the
                 // dispatch-stage barrier orders the write before the replay,
                 // and every bytes payload restages into the span's arena.
-                if (item.gpuSpan && replaySpans &&
+                // GPU-encoded spans stay direct under opTimings, as in
+                // commit(): a gpu_encode + replay pair would attribute the
+                // whole run to the head pipeline.
+                if (item.gpuSpan && replayGpuSpans && !opTimings &&
                     index + item.gpuSpan->dispatches.size() <=
                         dispatches.size()) {
                     const GpuSpan &span = *item.gpuSpan;
@@ -2028,12 +2208,13 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                             MTL4VisibilityOptionDevice];
                         span.encoded = true;
                     }
-                    executeSpan(span, index);
+                    executeSpan(span.icb, count, index);
                     index += count - 1;
                     continue;
                 }
                 const ComputeDispatch &dispatch = *item.source;
                 orderAfterPrevious(index);
+                timestampPair(dispatch.pipelineName);
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
@@ -2064,6 +2245,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     [encoder dispatchThreadgroups:item.groups
                              threadsPerThreadgroup:item.threads];
                 }
+                timestampPairEnd();
             }
             encodeSteps(dispatches.size());
             if (encoder) [encoder endEncoding];
@@ -2080,6 +2262,30 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             MTL4CommitOptions *options = [MTL4CommitOptions new];
             [options addFeedbackHandler:
                 ^(id<MTL4CommitFeedback> feedback) {
+                    // Feedback runs after this commit's GPU work, and the
+                    // split commits of the same submission finished before
+                    // it, so every timestamp written for the submission is
+                    // resolvable here. Entries are nanoseconds; a missing or
+                    // unwritten pair (a failed commit resolves 0) is skipped.
+                    if (timestamps4 && timingIndex) {
+                        NSData *resolved = [timestamps4 resolveCounterRange:
+                            NSMakeRange(0, timingIndex * 2)];
+                        const auto *stamps = static_cast<
+                            const MTL4TimestampHeapEntry *>(resolved.bytes);
+                        const NSUInteger entries =
+                            resolved.length / sizeof(MTL4TimestampHeapEntry);
+                        for (NSUInteger unit = 0; unit < timingIndex; ++unit) {
+                            if (unit * 2 + 1 >= entries ||
+                                unit >= timingNames.size())
+                                break;
+                            const uint64_t begin = stamps[unit * 2].timestamp;
+                            const uint64_t end =
+                                stamps[unit * 2 + 1].timestamp;
+                            if (end > begin)
+                                recordOpTiming(timingNames[unit],
+                                               (end - begin) * 1e-9);
+                        }
+                    }
                     ticketState->finishCommand4(feedback);
                 }];
             asyncState->commitSubmission4(ticketState->sequence);
@@ -2152,10 +2358,11 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     checkEvents(command.events, command.dispatches.size());
     Impl::PreparedCommand prepared = impl_->prepared(command.dispatches);
 #if RICHENGINE_MTL4_AVAILABLE
-    // Event-bearing commands stay on the Metal 3 path: the commit4 event
-    // split misattributed GPU timing and regressed prefix-hit prefill
-    // output and wall time — gated off until the split is fixed.
-    if (impl_->useMtl4() && command.events.empty()) {
+    // Event-bearing commands stay on the Metal 3 path unless opted in: the
+    // commit4 event split misattributed GPU timing and regressed prefix-hit
+    // prefill output and wall time once. RICHENGINE_MTL4_EVENTS is the A/B
+    // switch that re-enables it.
+    if (impl_->useMtl4() && (command.events.empty() || tuning().mtl4Events)) {
         return impl_->commit4(prepared.dispatches, command.events,
                               std::move(prepared.retainedAllocations),
                               std::move(completion));

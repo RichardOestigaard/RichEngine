@@ -43,6 +43,8 @@ interface SystemOneResponse {
   model?: string;
   answers?: Record<string, SystemOneAnswer>;
   usage?: { input_tokens?: number; output_tokens?: number };
+  forward_seconds?: number;
+  total_seconds?: number;
 }
 
 /* A systemone 422 lists every bad field, FastAPI-style. */
@@ -1018,6 +1020,12 @@ export default function Judge() {
                     >
                       {copied() === "s-result" ? "copied ✓" : "Copy JSON"}
                     </button>
+                  </div>
+                  <div class="panel-row">
+                    <span class="grow muted meta-line">
+                      forward {fmtSecs(res().forward_seconds)} · total{" "}
+                      {fmtSecs(res().total_seconds)}
+                    </span>
                   </div>
                 </div>
                 <For each={answerEntries()}>

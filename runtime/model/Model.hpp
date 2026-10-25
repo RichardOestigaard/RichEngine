@@ -388,9 +388,9 @@ struct ExecutionLimits final {
   // pool allocates when it is built.
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
-  static constexpr uint32_t draftQueryRows = 16;
-  static constexpr uint32_t draftProposalTokens = 15;
-  static constexpr uint32_t targetVerifyRows = 16;
+  static constexpr uint32_t draftQueryRows = RICHENGINE_DRAFT_QUERY_ROWS;
+  static constexpr uint32_t draftProposalTokens = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  static constexpr uint32_t targetVerifyRows = RICHENGINE_TARGET_VERIFY_ROWS;
   // The default trained draft window, and the contract DFlash2/DSpark
   // checkpoints are checked against. Plain drafts may declare a wider
   // sliding_window up to the ring's physical capacity.

@@ -913,6 +913,26 @@ class GgufMetadataTests(unittest.TestCase):
             ),
         )
 
+    def test_a_qad_file_is_the_default_and_explicit_q4_k_m_is_noted(self):
+        fake = self.gguf_repository(vision=False)
+        values = fixture(native=True)
+        write_gguf(
+            fake.remote / GGUF_REPO / ("a" * 40) / "model-QAD-Q4_0.gguf",
+            values,
+            loadable_tensors(values, self.root).items(),
+        )
+        # Without :VARIANT the QAD build wins over Q4_K_M; asking for Q4_K_M
+        # installs it, with a note pointing at the better default.
+        output = self.prepare(selection(self.root, GGUF_REPO))
+        self.assertIn(f"Selected model-QAD-Q4_0.gguf from {GGUF_REPO}.", output)
+        output = self.prepare(selection(self.root, GGUF_REPO + ":Q4_K_M"))
+        self.assertIn(
+            "Note · Q4_K_M requested; QAD-Q4_0 offers the same class at "
+            f"better quality — {GGUF_REPO}:QAD-Q4_0",
+            output,
+        )
+        self.assertIn(f"Selected model-Q4_K_M.gguf from {GGUF_REPO}.", output)
+
     def test_a_layer_count_no_family_has_is_rejected_before_screening(self):
         # Screening lists every tensor of every layer a header claims; only
         # the family bounds the count.

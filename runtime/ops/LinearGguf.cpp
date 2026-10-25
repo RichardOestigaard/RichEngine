@@ -162,7 +162,7 @@ GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const Quan
   if (order.size() > kFusedSegments || w.epilogue != LinearEpilogue::None)
     throw std::invalid_argument("a fused block projection takes at most three segments and no epilogue");
   GgufDecodeFusedParams params{w.matrix.inputSize, plan.configuration().splits, w.matrix.outputSize,
-                               {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+                               {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0};
   for (size_t i = 0; i < kFusedSegments; ++i) {
     const QuantizedSegment &s = *order[std::min(i, order.size() - 1)];
     if (i < order.size()) {
@@ -172,7 +172,30 @@ GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const Quan
     }
     bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
   }
+  params.spread = plan.configuration().spread;
   return params;
+}
+
+// Whether the staged decode tiles on this device spread their K walks and
+// run a gate/up pair of one format in one pass: Apple10 and later from 16
+// cores (the split rule's world — below that the extra stage read loses).
+inline bool spreadsStagedDecode(const DevicePolicy &policy) noexcept {
+  return policy.family >= 10 && policy.cores >= 16;
+}
+// A gate/up pair of n x k tensors in one pass, its K split as one projection
+// of the pair's 2n columns.
+inline LinearConfig oneGateUpPassDecode(const DevicePolicy &policy, uint32_t n, uint32_t k) {
+  return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(policy, 2 * n, k, stagedTiers(policy)),
+          .spread = true, .oneGateUpPass = true};
+}
+// Whether a gate/up plan's projections, up then gate, are single tensors of
+// one format, which the one-pass kernels take.
+inline bool oneFormat(std::span<const Projection *const> projections) {
+  if (projections.size() != 2 || !projections[0] || !projections[1]) return false;
+  const std::vector<QuantizedSegment> &up = projections[0]->blocks().segments,
+                                      &gate = projections[1]->blocks().segments;
+  return up.size() == 1 && gate.size() == 1 && !up.front().isFloat() &&
+         up.front().formatId == gate.front().formatId;
 }
 
 // A single tensor's decode dispatches through `tensor(segment, epilogue
@@ -216,6 +239,11 @@ void LinearPlan::requireBlockConfiguration() const {
   // as in decode.
   if (!decode && workload_.rows > stagedTileRows(workload_.rows))
     throw std::invalid_argument("the staged block tile runs prefill chunks of up to 32 rows");
+  if (c.spread && c.tile != LinearTile::GgufStaged)
+    throw std::invalid_argument("only the staged block tile spreads its walks");
+  if (c.oneGateUpPass &&
+      (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
+    throw std::invalid_argument("the staged block tile alone runs a gate/up pair in one pass");
 }
 
 uint32_t LinearPlan::blockStorageRows() const noexcept {
@@ -236,13 +264,16 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : sizeof(float),
             config_.splits > 1 ? uint64_t{n / tileColumns()} * sizeof(uint32_t) : sizeof(uint32_t)};
   }
-  // Staged split-K: [split][row][column] fp32 partials over the tile's rows
-  // and one counter per 64-column tile (a tile covers every row of the
-  // dispatch). The prefill tile never splits.
+  // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
+  // a one-pass gate/up's of both tensors, and one counter per column tile (a
+  // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
+  // prefill tile never splits.
+  const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
+  const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS;
   LinearScratchSize size =
       config_.splits > 1
-          ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * n * sizeof(float),
-                              uint64_t{n / tileColumns()} * sizeof(uint32_t)}
+          ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * columns * sizeof(float),
+                              uint64_t{n / tile} * sizeof(uint32_t)}
           : LinearScratchSize{};
   // A prefill plan that may pack its activations (packsActivations): the
   // slot-permuted fp16 plane goes in scratch.input and its per-(row, group)
@@ -285,20 +316,29 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) native |= nativeDecodeFormat(s.formatId);
   }
-  LinearConfig config = {.tile = LinearTile::GgufStaged,
-                         .splits = decodeSplits(policy_, n, k,
-                                                native && policy_.nativeFormats() ? mxfp4Tiers()
-                                                                                  : stagedTiers(policy_))};
+  const bool spreads = spreadsStagedDecode(policy_);
+  const bool onePass =
+      spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
+  LinearConfig config =
+      onePass ? oneGateUpPassDecode(policy_, n, k)
+              : LinearConfig{.tile = LinearTile::GgufStaged,
+                             .splits = decodeSplits(policy_, n, k,
+                                                    native && policy_.nativeFormats() ? mxfp4Tiers()
+                                                                                      : stagedTiers(policy_)),
+                             .spread = spreads};
   // Measured per-shape splits scope themselves to the devices they name
   // (DeviceTuning.cpp).
-  if (const uint32_t splits = measuredGgufSplits(policy_, n, k, stagedTileRows(w.rows), native))
-    config.splits = splits;
+  if (!onePass)
+    if (const uint32_t splits = measuredGgufSplits(policy_, n, k, stagedTileRows(w.rows), native))
+      config.splits = splits;
   return config;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
+  if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(policy_))
+    size.include(LinearPlan(w, oneGateUpPassDecode(policy_, n, k)).scratchSize());
   if (policy_.isApple9()) {
     size.include(LinearPlan(w, stagedDecode(policy_, n, k)).scratchSize());
     // Decode steps wider than the staged tile run the register kernels
@@ -430,6 +470,13 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       if (packs && s.formatId == GGUF_FMT_MXFP4) return "mxfp4p";
       return decodeFormat(policy_, s, rows);
     }
+    // RICHENGINE_SCORE_TENSOR_PREFILL: a prefill chunk of decode-tile size
+    // takes the packed-operand tile (gguf_decode_packed: the codes enter
+    // matmul2d directly, the group's coefficient folds in the epilogue)
+    // where its format has one — the tensor-unit path the staged tile
+    // emulates through its dequantized stage.
+    if (tuning().scoreTensorPrefill && policy_.nativeFormats())
+      if (const char *packed = packedFormat(s.formatId)) return packed;
     return kernelFormat(policy_, s);
   };
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
@@ -438,7 +485,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add(kernelInstance(decodeKernel(format(s), rows, epilogue), plan.destination()),
               {packed ? b.scratch.input : b.input, s.plane0,
                packed ? b.scratch.sums : s.plane1Slot(), s.meta, output, partials, counters, aux},
-              GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
+              GgufDecodeParams{k, splits, n, s.columnOffset, config.spread}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
@@ -458,17 +505,32 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.add(std::string(kGgufPackHalf),
                 {b.input, b.scratch.input, b.scratch.sums,
                  b.input, b.input, b.input, b.input, b.input},
-                GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
+                GgufDecodeParams{k, 1, n, 0, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
     for (const QuantizedSegment &s : segments) {
       if (packs && s.formatId == GGUF_FMT_MXFP4) {
         graph.add(decodeKernel("mxfp4p", rows, epilogue),
                   {b.scratch.input, s.plane0, b.scratch.sums, s.meta, b.output, partials, counters, aux},
-                  GgufDecodeParams{k, splits, n, s.columnOffset},
+                  GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
                   {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
       } else {
         tensor(s, epilogue, b.output, aux);
       }
     }
+    return;
+  }
+  // Gate and up in one pass (LinearConfig::oneGateUpPass): one simdgroup
+  // stages both tensors' same 32 columns per step (gguf_decode_*_gate_up).
+  if (config.oneGateUpPass) {
+    const std::vector<QuantizedSegment> &gates = gate->blocks().segments;
+    if (segments.size() != 1 || gates.size() != 1 ||
+        gates.front().formatId != segments.front().formatId)
+      throw std::invalid_argument("a one-pass block gate/up takes single tensors of one format");
+    const QuantizedSegment &g = gates.front(), &u = segments.front();
+    graph.add(std::string("gguf_decode_") + u.name() + "_m" + std::to_string(rows) + "_gate_up",
+              {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output,
+               partials, counters},
+              GgufDecodeParams{k, splits, n, u.columnOffset, config.spread},
+              {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
     return;
   }
   if (segments.size() == 1) {
@@ -483,7 +545,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.add(std::string(kGgufPackHalf),
                 {b.input, b.scratch.input, b.scratch.sums,
                  b.input, b.input, b.input, b.input, b.input},
-                GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
+                GgufDecodeParams{k, 1, n, 0, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
     addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
@@ -539,8 +601,165 @@ bool Linear::addGgufHeadArgmax(metal::CommandGraph &graph, metal::MetalBuffer in
   const metal::MetalBuffer counters = config.splits > 1 ? scratch.counters : argmaxValues;
   graph.add(std::string(kGgufDecode) + kernelFormat(policy_, s) + "_m" + std::to_string(rows) + "_amax",
             {input, s.plane0, s.plane1Slot(), s.meta, argmaxValues, argmaxIndices, partials, counters},
-            GgufHeadArgmaxParams{{p.inputSize, config.splits, p.outputSize, s.columnOffset}, headParams},
+            GgufHeadArgmaxParams{{p.inputSize, config.splits, p.outputSize, s.columnOffset, 0}, headParams},
             {s.outputSize / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+  return true;
+}
+
+// The score-gather head: the single-segment decode's dispatch once per
+// contiguous run of the wanted quant tiles, the weight planes' views
+// shifted by whole QUANT_TILE_ROWS columns and out_offset moved to match.
+// The kernels' tile bases (group.x * GGUF_TILE_COLUMNS) then read the run's
+// weights and write its absolute output columns; the columns no run covers
+// are never computed.
+bool Linear::addGgufHeadColumns(metal::CommandGraph &graph,
+                                const metal::MetalBackend &backend,
+                                const LinearBuffers &b, const Projection &p,
+                                const LinearPlan &plan,
+                                std::span<const uint32_t> quantTiles) const {
+  const LinearWorkload w = plan.workload();
+  const LinearConfig config = plan.configuration();
+  const LinearTile tile = config.tile;
+  if (w.phase != LinearPhase::Decode || w.epilogue != LinearEpilogue::None ||
+      (tile != LinearTile::GgufStaged && tile != LinearTile::GgufRegister) ||
+      quantTiles.empty())
+    return false;
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (segments.size() != 1)
+    return false;
+  const QuantizedSegment &s = segments.front();
+  const uint32_t k = w.matrix.inputSize, rows = plan.storageRows(),
+                 splits = config.splits;
+  // A partial tail tile's run would read rows the plane does not hold; the
+  // MXFP4 and packed-operand tiles read their planes in another layout this
+  // path does not shift.
+  if (s.isFloat() || s.formatId == GGUF_FMT_MXFP4 ||
+      decodeFormat(policy_, s, rows) != kernelFormat(policy_, s) ||
+      s.outputSize % QUANT_TILE_ROWS)
+    return false;
+  const uint32_t bound = s.outputSize / QUANT_TILE_ROWS;
+  if (quantTiles.back() >= bound)
+    return false;
+  // One dispatch per contiguous run; past this bound the run overhead loses
+  // to the head's single sweep.
+  uint32_t runs = 1;
+  for (size_t i = 1; i < quantTiles.size(); ++i)
+    runs += quantTiles[i] != quantTiles[i - 1] + 1;
+  if (runs > 32)
+    return false;
+  const QuantFormat &f = s.format();
+  // Bytes one quant tile of output rows occupies of each plane: a tile is
+  // tile-major — [tile][input group][QUANT_TILE_ROWS rows] — so a view
+  // shifted by whole tiles re-bases the segment's weights at it.
+  const uint64_t groups = k / 32;
+  const uint64_t tileP0 = groups * QUANT_TILE_ROWS * f.plane0_bytes;
+  const uint64_t tileP1 = groups * QUANT_TILE_ROWS * f.plane1_bytes;
+  const uint64_t tileMeta =
+      groups / f.meta_groups * QUANT_TILE_ROWS * f.meta_bytes;
+  // The register tile's activations arrive as its Table16: emit the prepare
+  // exactly as addGgufRegister does unless the producer left it.
+  if (tile == LinearTile::GgufRegister &&
+      (b.prepared.layout != LinearInput::Table16 ||
+       !b.prepared.source.sameView(b.input))) {
+    const uint32_t lanes = w.rows / 8;
+    graph.add(std::string(kDecodeLinearGgufPrepare),
+              {b.input, b.scratch.input, b.scratch.sums}, k,
+              {k / 32, lanes, 1}, {128, 1, 1});
+  }
+  const metal::MetalBuffer partials =
+      splits > 1 || tile == LinearTile::GgufRegister ? b.scratch.partials
+                                                   : b.output;
+  const metal::MetalBuffer counters =
+      splits > 1 || tile == LinearTile::GgufRegister ? b.scratch.counters
+                                                   : b.output;
+  const std::string kernel = kernelInstance(
+      tile == LinearTile::GgufRegister
+          ? std::string(kGgufDecodeSg) + kernelFormat(policy_, s) + "_l" +
+                std::to_string(w.rows / 8) + "_a"
+          : decodeKernel(decodeFormat(policy_, s, rows), rows, 'a'),
+      plan.destination());
+  const metal::DispatchSize threads =
+      tile == LinearTile::GgufRegister
+          ? metal::DispatchSize{GGUF_REGISTER_THREADS, 1, 1}
+          : metal::DispatchSize{GGUF_STAGED_THREADS, 1, 1};
+  for (size_t i = 0; i < quantTiles.size();) {
+    const uint32_t t0 = quantTiles[i];
+    uint32_t t1 = t0;
+    while (++i < quantTiles.size() && quantTiles[i] == t1 + 1)
+      ++t1;
+    const uint32_t tiles = t1 - t0 + 1;
+    const metal::MetalBuffer w0 =
+        backend.view(s.plane0, t0 * tileP0, tiles * tileP0);
+    const metal::MetalBuffer meta =
+        backend.view(s.meta, t0 * tileMeta, tiles * tileMeta);
+    // A format without a second plane binds meta in its slot, which the
+    // kernel never reads as plane1.
+    const metal::MetalBuffer w1 =
+        s.plane1 ? backend.view(s.plane1, t0 * tileP1, tiles * tileP1) : meta;
+    const GgufDecodeParams params{k, splits, w.matrix.outputSize,
+                                  s.columnOffset + t0 * QUANT_TILE_ROWS, 0};
+    const metal::DispatchSize grid{
+        tiles * (QUANT_TILE_ROWS / GGUF_TILE_COLUMNS), splits, 1};
+    if (tile == LinearTile::GgufRegister) {
+      graph.add(kernel,
+                {b.scratch.input, b.scratch.sums, w0, w1, meta, b.output,
+                 partials, counters, b.output},
+                params, grid, threads);
+    } else {
+      graph.add(kernel, {b.input, w0, w1, meta, b.output, partials, counters,
+                         b.output},
+                params, grid, threads);
+    }
+  }
+  return true;
+}
+
+// The score gather's single dispatch: gguf_decode_score_* of
+// shared/gguf_score.metal reads the wanted columns straight out of the
+// planes' tile addressing, so no view arithmetic applies. The fused
+// variant's `input` is the raw hidden batch and `normed` the buffer its
+// in-kernel RMS norm writes `lanes` compact rows to; the unfused one's
+// `input` already holds the normed rows at `laneRows` stride.
+bool Linear::addGgufHeadGather(
+    metal::CommandGraph &graph, metal::MetalBuffer input,
+    metal::MetalBuffer normed, metal::MetalBuffer normWeights,
+    bool normFloat32, float normEps, metal::MetalBuffer output,
+    metal::MetalBuffer columns, uint32_t columnCount,
+    const Projection &p, uint32_t lanes, uint32_t laneRows, bool fused) const {
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (segments.size() != 1 || !lanes || lanes > 8 || !laneRows || !columnCount)
+    return false;
+  const QuantizedSegment &s = segments.front();
+  const uint32_t k = p.inputSize;
+  // The gather addresses rows of the planes directly, so the tile-shape
+  // restrictions of addGgufHeadColumns do not apply; a native-layout
+  // segment (MXFP4, whose packed rows the meta unit does not span as one
+  // coefficient) keeps its own kernels.
+  if (s.isFloat() || s.formatId == GGUF_FMT_MXFP4 || !s.meta || k % 32)
+    return false;
+  requireBytes(input, uint64_t{lanes} * laneRows * k * 2, "score input");
+  requireBytes(output, uint64_t{lanes} * laneRows * p.outputSize * sizeof(float),
+               "score logits");
+  requireBytes(columns, uint64_t{columnCount} * sizeof(uint32_t), "score columns");
+  if (fused) {
+    requireBytes(normed, uint64_t{lanes} * k * 2, "score normed");
+    requireBytes(normWeights, uint64_t{k} * (normFloat32 ? 4 : 2), "norm weights");
+  }
+  std::string kernel = "gguf_decode_score_";
+  kernel += s.name();
+  kernel += "_m8";
+  if (fused) kernel += normFloat32 ? "_fused_f32" : "_fused";
+  // The unfused variant binds its input in the two slots it never reads,
+  // as a format without a second plane binds meta.
+  const metal::MetalBuffer stage = fused ? normed : input;
+  const metal::MetalBuffer weights = fused ? normWeights : input;
+  graph.add(std::move(kernel),
+            {input, stage, weights, s.plane0, s.plane1Slot(), s.meta, output,
+             columns},
+            GgufScoreParams{k, p.outputSize, laneRows, lanes, columnCount,
+                            normEps},
+            {(columnCount + GGUF_TILE_COLUMNS - 1) / GGUF_TILE_COLUMNS, 1, 1},
+            {256, 1, 1});
   return true;
 }
 
@@ -570,7 +789,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add(std::string(kGgufPackHalf),
               {b.input, b.scratch.input, b.scratch.sums,
                b.input, b.input, b.input, b.input, b.input},
-              GgufDecodeParams{k, 1, n, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
+              GgufDecodeParams{k, 1, n, 0, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
   }
   for (const QuantizedSegment &s : segments) {
     std::vector<metal::MetalBuffer> bindings;
@@ -630,7 +849,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
-              GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {GGUF_REGISTER_THREADS, 1, 1});
+              GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
   };
   addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
 }

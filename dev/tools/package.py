@@ -132,7 +132,14 @@ def stage_runtime(destination, version):
     )
 
 
+# Homebrew's formula symbol for each --macos-min floor the Makefile can build.
+MACOS_SYMBOLS = {"26": "tahoe", "27": "golden_gate"}
+
+
 def formula(version, url, checksum, macos_min):
+    macos_symbol = MACOS_SYMBOLS.get(macos_min)
+    if macos_symbol is None:
+        raise ValueError(f"no Homebrew macOS symbol known for {macos_min}")
     # Inputs are encoded as Ruby double-quoted literals with the backslash,
     # the quote and the interpolation opener escaped, so no path or URL can
     # become executable Ruby; double quotes are what `brew audit` expects.
@@ -157,7 +164,7 @@ class Richengine < Formula
   license "Apache-2.0"
 
   depends_on arch: :arm64
-  depends_on macos: :tahoe
+  depends_on macos: :{macos_symbol}
   depends_on RichMacOSRequirement
 
   def install

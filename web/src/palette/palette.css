@@ -142,15 +142,6 @@
 }
 
 /* TopBar additions (TopBar.tsx is mine; styles.css is not). */
-.top-model {
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
 .palette-trigger {
   display: inline-flex;
   align-items: center;
@@ -183,9 +174,6 @@
 }
 
 @media (max-width: 720px) {
-  .top-model {
-    display: none;
-  }
   .palette-trigger {
     padding: 5px 6px;
   }

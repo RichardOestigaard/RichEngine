@@ -369,9 +369,10 @@ void applyManifestDraftKind(NSDictionary *format, ModelDescriptor &descriptor,
 void validateGemma4(NSDictionary *manifest,
                     const std::filesystem::path &root,
                     const ModelDescriptor &descriptor);
-void validateDiffusionGemma(NSDictionary *manifest,
-                            const std::filesystem::path &root,
-                            const ModelDescriptor &descriptor);
+// Unused while the packed diffusion format is refused below.
+[[maybe_unused]] void validateDiffusionGemma(
+    NSDictionary *manifest, const std::filesystem::path &root,
+    const ModelDescriptor &descriptor);
 
 void validateTokenizer(const std::filesystem::path &root,
                        const ModelDescriptor &descriptor,
@@ -901,12 +902,16 @@ constexpr FamilyDescriptor kModelFamilies[] = {
     {"MiniCPM5-2B", "llama", "minicpm", denseDescriptor},
     {"LFM2.5-2.6B", "lfm2", nullptr, lfm2Descriptor},
     {"d1-3B", "lfm2", nullptr, d1Descriptor},
+    {"d1-omni", "lfm2", nullptr, d1omniDescriptor},
     {"LFM2.5-8B-A1B", "lfm2_moe", nullptr, lfm2moeDescriptor},
     {"LFM2.5-24B-A2B", "lfm2_moe", nullptr, lfm2moe24BDescriptor},
     {"Granite-4.2-3B", "granite", nullptr, granite3BDescriptor},
     {"Granite-4.2-8B", "granite", nullptr, granite8BDescriptor},
     {"Gemma4-26B-A4B", "gemma4_text", nullptr, gemma4Descriptor},
-    {"DiffusionGemma-26B-A4B", "diffusion_gemma_text", nullptr, diffusionGemmaDescriptor},
+    // DiffusionGemma-26B-A4B is disabled: its denoising trunk ships
+    // incoherent output pending the numerics bisect in
+    // docs/diffusion_issue.md. Re-add its row and the packed-format branch
+    // below once the trunk matches the torch reference.
 };
 
 ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
@@ -980,6 +985,32 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         const char *actual = static_cast<NSString *>(value).UTF8String;
         requireEqual(actual ? actual : "", expected,
                      "target layer " + std::to_string(layer));
+      }
+      // An encoder decision model (d1-omni) states encoder plus the
+      // per-layer fields its non-uniform geometry needs; a causal target
+      // states none of them.
+      if (id encoder = text[@"encoder"];
+          encoder != nil &&
+          ![encoder isEqual:layout.encoder ? @YES : @NO])
+        throw std::invalid_argument(
+            "target encoder flag does not match the family's");
+      if (NSArray *kvs = text[@"layer_kv_heads"];
+          [kvs isKindOfClass:[NSArray class]]) {
+        requireEqual(kvs.count, layout.layers, "target layer_kv_heads count");
+        for (uint32_t layer = 0; layer < layout.layers; ++layer)
+          requireNumber(
+              kvs[layer],
+              layout.isFullAttentionLayer(layer) ? layout.kvHeadsAt(layer) : 0,
+              "target layer_kv_heads " + std::to_string(layer));
+      }
+      if (NSArray *widths = text[@"layer_intermediate_sizes"];
+          [widths isKindOfClass:[NSArray class]]) {
+        requireEqual(widths.count, layout.layers,
+                     "target layer_intermediate_sizes count");
+        for (uint32_t layer = 0; layer < layout.layers; ++layer)
+          requireNumber(widths[layer], layout.intermediateSizeAt(layer),
+                        "target layer_intermediate_sizes " +
+                            std::to_string(layer));
       }
     } else if constexpr (std::is_same_v<Layout, Lfm2MoeLayout>) {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
@@ -1597,12 +1628,10 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
                            gemma4DFlashV1DraftDefaults());
       }
       validateGemma4(manifest, root, descriptor);
-    } else if (canonicalFormat == "richengine-packed-q4-diffusiongemma") {
-      descriptor = diffusionGemmaDescriptor(model);
-      descriptor.family = "DiffusionGemma-26B-A4B";
-      descriptor.packedTiledEmbedding = true;
-      validateDiffusionGemma(manifest, root, descriptor);
     } else {
+      // "richengine-packed-q4-diffusiongemma" is refused here while the
+      // family is disabled; the branch and validateDiffusionGemma stay in
+      // the tree for the numerics fix.
       throw std::invalid_argument("unsupported weight format: " + format);
     }
     descriptor.sourceIdentity = std::move(sourceIdentity);

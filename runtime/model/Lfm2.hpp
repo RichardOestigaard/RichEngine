@@ -27,11 +27,13 @@ struct Lfm2Layout final {
   static constexpr uint32_t convolutionTaps = 3;
 
   // The full-attention layer indices {2,5,9,13,17,21,24,27} of the released
-  // LFM2.5-2.6B config's layer_types.
-  static constexpr uint64_t attentionMask =
+  // LFM2.5-2.6B config's layer_types; a family maker overrides the member
+  // for another schedule (d1-omni's {2,5,8,10,12,14,16,17}).
+  static constexpr uint64_t kDefaultAttentionMask =
       (uint64_t{1} << 2) | (uint64_t{1} << 5) | (uint64_t{1} << 9) |
       (uint64_t{1} << 13) | (uint64_t{1} << 17) | (uint64_t{1} << 21) |
       (uint64_t{1} << 24) | (uint64_t{1} << 27);
+  uint64_t attentionMask = kDefaultAttentionMask;
 
   uint32_t maximumContextTokens = 131072;
   uint32_t layers = 30;
@@ -59,9 +61,35 @@ struct Lfm2Layout final {
   // The norms' epsilon (norm_eps), which selects the _e5 kernel variants.
   float rmsEpsilon = 1e-5F;
 
+  // The d1-omni decision encoder's deviations from the causal LFM2 target,
+  // recorded so the assembly's per-layer fields validate; the loader refuses
+  // it — no compiled kernels cover its bidirectional attention, the widened
+  // decision blocks' KV head count or their fused-QKV LayerNorm structure:
+  //   encoder           — bidirectional attention (GGUF attention.causal
+  //                       false); the model never decodes.
+  //   decisionBlocks    — the trailing blocks that are bespoke decision
+  //                       layers (lfm2.decision.block_count).
+  //   altAttentionKvHeads — the decision blocks' KV head count where it
+  //                       differs from attentionKvHeads.
+  //   altIntermediateSize — the decision blocks' narrower FFN.
+  bool encoder = false;
+  uint32_t decisionBlocks = 0;
+  uint32_t altAttentionKvHeads = 0;
+  uint32_t altIntermediateSize = 0;
+
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
     return layer < 64 && (attentionMask >> layer) & 1;
+  }
+  // One of the trailing bespoke decision blocks (d1-omni).
+  [[nodiscard]] constexpr bool isDecisionLayer(uint32_t layer) const noexcept {
+    return decisionBlocks && layer < layers && layer >= layers - decisionBlocks;
+  }
+  [[nodiscard]] constexpr uint32_t kvHeadsAt(uint32_t layer) const noexcept {
+    return isDecisionLayer(layer) ? altAttentionKvHeads : attentionKvHeads;
+  }
+  [[nodiscard]] constexpr uint32_t intermediateSizeAt(uint32_t layer) const noexcept {
+    return isDecisionLayer(layer) ? altIntermediateSize : intermediateSize;
   }
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
     uint32_t count = 0;

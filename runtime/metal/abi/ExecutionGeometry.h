@@ -2,9 +2,15 @@
 
 // C/Metal ABI constants shared by host and shader compilation. Startup
 // static assertions check the corresponding model and operator contracts.
+#ifndef RICHENGINE_DRAFT_QUERY_ROWS
 #define RICHENGINE_DRAFT_QUERY_ROWS 16u
+#endif
+#ifndef RICHENGINE_DRAFT_PROPOSAL_TOKENS
 #define RICHENGINE_DRAFT_PROPOSAL_TOKENS 15u
+#endif
+#ifndef RICHENGINE_TARGET_VERIFY_ROWS
 #define RICHENGINE_TARGET_VERIFY_ROWS 16u
+#endif
 // Nodes of one lane's verify tree in tree-verify mode (docs/TREE_VERIFY_DESIGN.md):
 // the anchor plus the seven-node chain plus the seven second-best sibling
 // leaves emitted by draft_select_tree (rows 8..14, one per proposal

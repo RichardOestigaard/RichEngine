@@ -1,6 +1,7 @@
 #include "ops/Sampling.hpp"
 
 #include "metal/abi/Sampling.h"
+#include "ops/BufferExtent.hpp"
 #include "ops/KernelNames.hpp"
 
 #include <algorithm>
@@ -322,11 +323,14 @@ void Sampling::addAcceptance(
   params.candidate_stride = draftCandidateStride;
   params.verify_stride = verifyStride;
   params.trunc_mask = buffers.truncLanes;
+  if (buffers.verifyRows &&
+      buffers.verifyRows.sizeBytes() < lanes * sizeof(uint32_t))
+    throw std::invalid_argument("invalid verify rows buffer");
   graph.add(std::string(kDecodeAcceptDflash),
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts, buffers.truncRows},
+             buffers.acceptedCounts, buffers.truncRows, buffers.verifyRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 

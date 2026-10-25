@@ -40,6 +40,7 @@ import weakref
 from dataclasses import dataclass
 
 from .chat_templates import render_chat_template, template_options
+from .errors import APIError, ContextLengthError
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -476,3 +477,132 @@ def systemone_answer(spec, probabilities):
 def deterministic_answer(spec):
     """A singleton option domain has one certain answer; no inference."""
     return systemone_answer(spec, [1.0])
+
+
+class SemIfPathway:
+    """The generative pathway's score strategy: SemIf direct-options
+    prompts and letter-slot logits, run through the host frontend's shared
+    score services (tokenizer, _encode_score_prompt, _score_job,
+    _preparation, _priority, _deadline_checkpoint).
+
+    `generates` is True — the same model serves generation endpoints — and
+    `batches` is False: SemIf requests submit one score job at a time."""
+
+    generates = True
+    batches = False
+
+    def systemone_metadata(self):
+        """The prompt/readout identity /v1/systemone reports."""
+        return {
+            "prompt_version": PROMPT_VERSION,
+            "readout": READOUT,
+            "probability_status": PROBABILITY_STATUS,
+        }
+
+    def prepare_judgment(self, host, body, *, deadline, disconnected=None):
+        """A SemIf judgment row: one letter-slot score request."""
+        unknown = sorted(
+            set(body)
+            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+        )
+        if unknown:
+            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+        if not host.accepts_model(body.get("model", host.model)):
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        try:
+            validate_row(body)
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        priority = host._priority(body)
+        checkpoint = host._deadline_checkpoint(deadline, disconnected)
+        with host._preparation(deadline):
+
+            def admit(prompt_tokens):
+                checkpoint()
+                if prompt_tokens > host.max_context:
+                    raise ContextLengthError(prompt_tokens, host.max_context)
+
+            tokens, slots, prompt = host._encode_score_prompt(
+                judgment_messages(body),
+                LETTERS[: len(body["options"])],
+                admit,
+                checkpoint,
+                "judgment",
+            )
+            checkpoint()
+            job = host._score_job(
+                tokens, slots, deadline, priority, digest(prompt)
+            )
+        return job, body
+
+    def prepare_systemone(self, host, body, *, deadline, disconnected=None):
+        """SemIf systemone entries: (qid, spec, job); deterministic specs
+        carry no job and answer without inference."""
+        details = []
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            details.append(detail(["model"], "field required", "missing"))
+        elif not host.accepts_model(model):
+            details.append(
+                detail(
+                    ["model"], f"model {model} is not served by this endpoint"
+                )
+            )
+        state, specs, question_details = validate_systemone(body)
+        details.extend(question_details)
+        try:
+            priority = host._priority(body)
+        except APIError as error:
+            details.append(detail(["priority"], error.message))
+        if details:
+            raise SystemOneError(details)
+        jobs = []
+        total_tokens = 0
+        checkpoint = host._deadline_checkpoint(deadline, disconnected)
+        with host._preparation(deadline):
+            for qid, spec in specs:
+                if spec.deterministic:
+                    jobs.append((qid, spec, None))
+                    continue
+                slots = slot_labels(host.tokenizer)
+                if len(spec.labels) > len(slots):
+                    raise SystemOneError(
+                        [
+                            detail(
+                                ["questions", qid, "criteria"],
+                                f"the served tokenizer supports "
+                                f"{len(slots)} answer slots; "
+                                f"{len(spec.labels)} were requested",
+                            )
+                        ]
+                    )
+                labels = slots[: len(spec.labels)]
+
+                def admit(prompt_tokens, qid=qid, prepared=total_tokens):
+                    checkpoint()
+                    if prompt_tokens > host.max_context:
+                        raise ContextLengthError(prompt_tokens, host.max_context)
+                    if prepared + prompt_tokens > MAX_SYSTEMONE_TOTAL_TOKENS:
+                        raise SystemOneError(
+                            [
+                                detail(
+                                    ["questions", qid],
+                                    "total prepared question tokens exceed "
+                                    f"{MAX_SYSTEMONE_TOTAL_TOKENS}",
+                                )
+                            ]
+                        )
+
+                tokens, slot_ids, _ = host._encode_score_prompt(
+                    systemone_messages(state, spec, labels),
+                    labels,
+                    admit,
+                    checkpoint,
+                    "question",
+                )
+                checkpoint()
+                total_tokens += len(tokens)
+                jobs.append(
+                    (qid, spec, host._score_job(tokens, slot_ids, deadline, priority))
+                )
+        return jobs

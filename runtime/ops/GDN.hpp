@@ -4,6 +4,7 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -87,6 +88,20 @@ struct GdnDecodeBuffers final {
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   LinearScratch linearScratch{};
+  // The lanes' decode tape (folded commit): one buffer, per-lane slots for
+  // the previous step's retained rows and this step's — pending_tape and
+  // step_tape in the parameters carry the offsets. Empty disables the fold.
+  metal::MetalBuffer tape;
+};
+
+// One lane's tape offsets and previous retained count: pending/step are the
+// byte offsets of the two parity slots, rows the retained count the next
+// step folds in. layerBytes strides each layer's region inside the slot.
+struct GdnTapeLanes final {
+  std::array<uint64_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> pending{};
+  std::array<uint64_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> step{};
+  std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> rows{};
+  uint32_t layerBytes = 0;
 };
 
 struct GdnCommitBuffers final {
@@ -125,7 +140,8 @@ public:
                                  GdnHeadOrder order,
                                  LinearInput input,
                                  std::span<const uint32_t> liveRows = {},
-                                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS);
+                                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+                                 const GdnTapeLanes *tapeLanes = nullptr);
   // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.

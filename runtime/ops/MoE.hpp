@@ -346,6 +346,10 @@ public:
     return static_cast<uint32_t>(config_.expertTile);
   }
   [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
+  // A decode plan's packed verify row stride (a trained-block draft's verify
+  // depth, at most RICHENGINE_TARGET_VERIFY_ROWS); zero for prefill and
+  // canvas plans.
+  [[nodiscard]] uint32_t laneRows() const noexcept { return laneRows_; }
   [[nodiscard]] bool splitExperts() const noexcept { return splitExperts_; }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
@@ -360,6 +364,7 @@ private:
   uint32_t rows_;
   MoeConfig config_;
   MoePhase phase_;
+  uint32_t laneRows_ = 0;
   bool splitExperts_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
@@ -373,6 +378,10 @@ struct MoeBuffers final {
   // Gemma 4 routes from the post-attention residual, not the FFN input: the
   // rows the router reads, when different from `input`. Empty binds `input`.
   metal::MetalBuffer routerInput;
+  // A verify step's lanes' verify rows, a uint32 per lane
+  // (ops::DraftSelector::addVerifyRows): its grouping routes each lane's
+  // verify rows alone (moe_group_routes_verified). Empty, every row routes.
+  metal::MetalBuffer verifyRows;
 };
 
 // Routes and executes grouped experts from immutable weight views.

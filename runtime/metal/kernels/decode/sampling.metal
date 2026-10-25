@@ -1456,6 +1456,77 @@ kernel void decode_dfa_argmax_reduce(
            min(trunc_rows[lane], params.rows - 1)] = token;
 }
 
+// One thread chooses every lane's verify rows (VerifyRowsParams): it ranks
+// the survivals of the lanes' proposal positions, largest first, the earlier
+// position first among equal ones, so that a lane's chosen rows are always the
+// first of its block, and takes as many as maximize the expected tokens over
+// the cost of the rows verified in all.
+kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
+                              device uint *verify_rows [[buffer(1)]],
+                              constant VerifyRowsParams &params [[buffer(2)]],
+                              uint index [[thread_position_in_grid]]) {
+  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Lanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
+  if (index != 0)
+    return;
+  uint rows[Lanes];
+  uint total = 0;
+  for (uint lane = 0; lane < params.lanes; ++lane) {
+    rows[lane] = params.every_row != 0 ? params.maximum[lane] : 1;
+    total += rows[lane];
+  }
+  if (params.every_row == 0) {
+    float survivals[Lanes * Positions];
+    uint owners[Lanes * Positions];
+    uint count = 0;
+    for (uint lane = 0; lane < params.lanes; ++lane) {
+      float survival = 1.0f;
+      // Row position + 2 verifies the proposal at `position`.
+      for (uint position = 0; position + 1 < params.maximum[lane]; ++position) {
+        const float q = clamp(confidence[lane * Positions + position], 1.0e-6f,
+                              1.0f - 1.0e-6f);
+        const float z = params.slope * log(q / (1.0f - q)) +
+                        params.intercept[position];
+        survival *= 1.0f / (1.0f + exp(-z));
+        uint at = count++;
+        for (; at > 0 && survivals[at - 1] < survival; --at) {
+          survivals[at] = survivals[at - 1];
+          owners[at] = owners[at - 1];
+        }
+        survivals[at] = survival;
+        owners[at] = lane;
+      }
+    }
+    float expected = float(params.lanes);
+    float best = expected / params.cost[total];
+    uint taken = 0;
+    for (uint i = 0; i < count; ++i) {
+      expected += survivals[i];
+      const float value = expected / params.cost[total + i + 1];
+      if (value > best) {
+        best = value;
+        taken = i + 1;
+      }
+    }
+    for (uint i = 0; i < taken; ++i)
+      ++rows[owners[i]];
+  }
+  // The confidence-head prune (RICHENGINE_DRAFT_CONF_MIN): a lane's rows
+  // end at the first proposal position whose draft_conf_score sigmoid
+  // fell under the floor — the positions before it stay verified.
+  if (params.conf_min > 0.0f) {
+    for (uint lane = 0; lane < params.lanes; ++lane) {
+      uint kept = 1;
+      while (kept < rows[lane] &&
+             confidence[lane * Positions + kept - 1] >= params.conf_min)
+        ++kept;
+      rows[lane] = kept;
+    }
+  }
+  for (uint lane = 0; lane < params.lanes; ++lane)
+    verify_rows[lane] = rows[lane];
+}
+
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
@@ -1483,9 +1554,12 @@ kernel void decode_accept_dflash(
     // the row holding the masked correction even when that token equals
     // the proposal, so the correction never passes as an acceptance.
     device const uint *trunc_rows [[buffer(8)]],
-    constant AcceptBatchParams &params [[buffer(9)]],
+    // Each lane's verify rows (draft_verify_rows), which bound what it
+    // retains: a row its lane never verified must not be kept.
+    device const uint *verify_rows [[buffer(9)]],
+    constant AcceptBatchParams &params [[buffer(10)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  uint remaining = params.remaining[batch];
+  uint remaining = min(params.remaining[batch], verify_rows[batch]);
   // The host's uncapped sentinel is the proposal table's own width: a lane
   // can never accept more draft rows than its verify stride carries. Zero
   // proposals is a real zero — the anchor decodes alone.

@@ -1,0 +1,83 @@
+{
+  "name": "d1-omni",
+  "repos": [
+    "LiquidAI/d1-omni-600M-GGUF"
+  ],
+  "note": "Liquid's d1-omni decision model: the LFM2.5-Encoder-350M backbone post-trained to 600M for single-pass typed answers, distinguished from the generative and d1 checkpoints only by the GGUF's lfm2.decision.type=lfm2-d1-omni. Its last two attention layers widen to 16 KV heads where the rest state 8, and their FFN narrows to 4096 where the rest state 4608 \u2014 the flat signature fields state each mode, the layer lists the actual geometry. Served text-only: the mmproj ships but the runtime cannot drive its tower yet. No draft: a decision model never decodes, so speculative decode weights would install unused. No tuning list: the encoder kernels are not landed, so a sweep cannot run yet.",
+  "signature": {
+    "model_type": "lfm2",
+    "decision_type": "lfm2-d1-omni",
+    "encoder": true,
+    "hidden_size": 1024,
+    "num_hidden_layers": 18,
+    "vocab_size": 65536,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "intermediate_size": 4608,
+    "tie_word_embeddings": true,
+    "rope_theta": 1000000.0,
+    "layer_types": [
+      "conv",
+      "conv",
+      "full_attention",
+      "conv",
+      "conv",
+      "full_attention",
+      "conv",
+      "conv",
+      "full_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "full_attention",
+      "full_attention"
+    ],
+    "layer_kv_heads": [
+      0,
+      0,
+      8,
+      0,
+      0,
+      8,
+      0,
+      0,
+      8,
+      0,
+      8,
+      0,
+      8,
+      0,
+      8,
+      0,
+      16,
+      16
+    ]
+  },
+  "vision": false,
+  "serving": {
+    "decision": true,
+    "encoder": true,
+    "decision_temperatures": {
+      "noul": 1.0,
+      "noul.2": 1.6663223505020142,
+      "choice": 1.0,
+      "choice.2": 1.7465145587921143,
+      "choice.3_5": 1.3998981714248657,
+      "choice.6_10": 1.1751071214675903,
+      "choice.11": 1.372515082359314,
+      "score": 1.0,
+      "score.3_5": 1.7301132678985596,
+      "score.6_10": 1.0
+    },
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "lfm25-python"
+  }
+}

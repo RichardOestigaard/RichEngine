@@ -185,8 +185,13 @@ class ChatTemplate:
 class ChatTemplates:
     """The tokenizer's templates, probed and chosen once at startup."""
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, allow_missing=False):
         defined = tokenizer.chat_template
+        # A decision model ships no chat template — its generation paths
+        # are refused, so an empty registry is a valid startup state.
+        if defined is None and allow_missing:
+            self.templates = {}
+            return
         named = dict(defined) if isinstance(defined, dict) else {None: defined}
         if isinstance(defined, dict) and "default" not in named:
             raise ChatTemplateError(
@@ -203,6 +208,8 @@ class ChatTemplates:
 
     def select(self, tools):
         """The template the tokenizer itself would choose for this request."""
+        if not self.templates:
+            raise ChatTemplateError("this model defines no chat template")
         if None in self.templates:
             return self.templates[None]
         if tools and "tool_use" in self.templates:
@@ -220,6 +227,8 @@ class ChatTemplates:
 
     def describe(self):
         """One line for the startup log."""
+        if not self.templates:
+            return "none (decision model — no chat template)"
         return " · ".join(
             ("" if name is None else f"{name} ")
             + _DESCRIPTIONS[template.later_system].format(template.original)

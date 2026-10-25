@@ -271,10 +271,12 @@ class UpstreamTest(unittest.TestCase):
             ["draft/config.json", "draft/model.safetensors"],
         )
 
-    def test_diffusiongemma_family_matches_its_published_configuration(self):
-        # The text_config of google/diffusiongemma-26B-A4B-it's config.json,
-        # as published.
-        family = families.named("DiffusionGemma-26B-A4B")
+    def test_diffusiongemma_family_is_disabled(self):
+        # DiffusionGemma is disabled for v1.0.0 (docs/diffusion_issue.md):
+        # its family file sits loader-skipped as _diffusiongemma-26b-a4b.json,
+        # so neither name nor config resolves a family. Re-enable restores
+        # the published-configuration check this replaces.
+        self.assertIsNone(families.named("DiffusionGemma-26B-A4B"))
         text = {
             "model_type": "diffusion_gemma_text",
             "hidden_size": 2816,
@@ -318,10 +320,8 @@ class UpstreamTest(unittest.TestCase):
             "canvas_length": 256,
             "text_config": text,
         }
-        self.assertIs(families.family_for(config), family)
-        # No GPU draft; the n-gram predraft proposes for it.
-        self.assertIsNone(family.draft)
-        self.assertFalse(family.vision)
+        with self.assertRaises(models.ModelError):
+            families.family_for(config)
 
     def test_gguf_selection_is_exact_and_ignores_subfolders(self):
         files = {
@@ -381,6 +381,40 @@ class UpstreamTest(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, "repository root: none"),
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
+
+    def test_qad_is_the_default_variant(self):
+        files = {
+            "LFM2.5-2.6B-MXFP4.gguf",
+            "LFM2.5-2.6B-Q4_K_M.gguf",
+            "LFM2.5-2.6B-Q8_0.gguf",
+            "LFM2.5-2.6B-QAD-Q4_0.gguf",
+        }
+        # Without :VARIANT, the QAD build wins over every plain quant.
+        self.assertEqual(
+            upstream.select_gguf(files, None), ("LFM2.5-2.6B-QAD-Q4_0.gguf", False)
+        )
+        # An explicit variant resolves untouched.
+        self.assertEqual(
+            upstream.select_gguf(files, "Q4_K_M"),
+            ("LFM2.5-2.6B-Q4_K_M.gguf", False),
+        )
+        # Of several QAD builds QAD-Q4_0 is preferred; one of another kind
+        # still defaults, and several without it stay ambiguous.
+        several = files | {"LFM2.5-2.6B-QAD-Q8_0.gguf"}
+        self.assertEqual(
+            upstream.select_gguf(several, None), ("LFM2.5-2.6B-QAD-Q4_0.gguf", False)
+        )
+        self.assertEqual(
+            upstream.select_gguf(
+                {"Model-QAD-Q8_0.gguf", "Model-Q4_K_M.gguf"}, None
+            ),
+            ("Model-QAD-Q8_0.gguf", False),
+        )
+        with self.assertRaisesRegex(models.ModelError, "select a GGUF"):
+            upstream.select_gguf(
+                {"Model-QAD-Q8_0.gguf", "Model-QAD-F16.gguf", "Model-Q4_K_M.gguf"},
+                None,
+            )
 
     def test_architecture_is_checked_before_weight_downloads(self):
         fake = FakeHub(self, self.cache)

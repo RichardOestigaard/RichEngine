@@ -1021,6 +1021,16 @@ def responses_response(model, job, status, output, result=None, error=None):
         ),
         "store": job.response_store,
         "previous_response_id": job.response_previous_id,
+        "metadata": job.response_metadata or {},
+        "instructions": job.response_instructions,
+        "max_output_tokens": job.response_max_output_tokens,
+        "tools": job.response_tools or [],
+        "tool_choice": job.response_tool_choice,
+        "truncation": "disabled",
+        "temperature": job.sampling.temperature,
+        "top_p": job.sampling.top_p,
+        "top_logprobs": job.response_top_logprobs,
+        "reasoning": job.response_reasoning,
         "text": {"format": text_format},
         "usage": usage,
         "end_turn": result is not None
@@ -1046,12 +1056,14 @@ def completion_response(model, job, result, message, tool_calls):
             {
                 "index": 0,
                 "message": message,
+                "logprobs": None,
                 "finish_reason": finish_reason(result, tool_calls),
             }
         ],
         "usage": usage_dict(result, job),
         "metrics": result.metrics,
         "timings": timings_dict(result),
+        "metadata": job.response_metadata or {},
     }
 
 
@@ -1108,7 +1120,12 @@ def stream_chunk(
         f"chatcmpl-{request_id}",
         created,
         model,
-        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        {
+            "index": 0,
+            "delta": delta,
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        },
         usage,
         metrics,
         timings,

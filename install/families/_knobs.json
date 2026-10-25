@@ -59,6 +59,20 @@
       "dspark"
     ]
   },
+  "DRAFT_CONF_MIN": {
+    "env": "RICHENGINE_DRAFT_CONF_MIN",
+    "values": [
+      "0.3",
+      "0.5",
+      "0.7"
+    ],
+    "reason": "DSpark confidence-head suffix prune: verify rows end at the first proposal whose head sigmoid falls under the floor; 0 off",
+    "draft_kinds": [
+      "dspark"
+    ],
+    "may_diverge": true,
+    "ordered": true
+  },
   "DRAFT_SPLITS": {
     "env": "RICHENGINE_DRAFT_SPLITS",
     "values": [
@@ -214,12 +228,63 @@
     ],
     "ordered": true
   },
+  "SCORE_GATHER": {
+    "env": "RICHENGINE_SCORE_GATHER",
+    "values": [
+      "1"
+    ],
+    "reason": "all-score batches dispatch only the quant tiles of the head holding a wanted logit column; off by default",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "SCORE_TENSOR": {
+    "env": "RICHENGINE_SCORE_TENSOR",
+    "values": [
+      "1"
+    ],
+    "reason": "all-score batches gather the wanted logit columns in one gguf_decode_score dispatch instead of per-tile-run dispatches; off by default",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "SCORE_FUSED": {
+    "env": "RICHENGINE_SCORE_FUSED",
+    "values": [
+      "1"
+    ],
+    "reason": "the score gather's single dispatch also runs the final RMS norm in-kernel, removing the norm dispatch and its buffer round trip; off by default",
+    "formats": [
+      "gguf"
+    ]
+  },
+  "SCORE_TENSOR_PREFILL": {
+    "env": "RICHENGINE_SCORE_TENSOR_PREFILL",
+    "values": [
+      "1"
+    ],
+    "reason": "prefill chunks of decode-tile size take the packed-operand tensor kernels where the format has one; off by default",
+    "may_diverge": true,
+    "formats": [
+      "gguf"
+    ]
+  },
   "SUBMIT_AHEAD": {
     "env": "RICHENGINE_SUBMIT_AHEAD",
     "values": [
       "1"
     ],
     "reason": "a second prefill command overlapping the running one; off by default"
+  },
+  "SYSTEMONE_WINDOW": {
+    "env": "RICHENGINE_SYSTEMONE_WINDOW",
+    "values": [
+      "0",
+      "2",
+      "4",
+      "8"
+    ],
+    "reason": "in-flight questions the systemone preparation runs below its bound; the runtime never reads it"
   },
   "VERIFY_TREE": {
     "env": "RICHENGINE_VERIFY_TREE",
@@ -279,6 +344,14 @@
     ],
     "reason": "verify attention split ceiling vs the compiled 128; lower caps only",
     "ordered": true
+  },
+  "VERIFY_SPLIT_R2": {
+    "env": "RICHENGINE_VERIFY_SPLIT_R2_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "the kv4/g6 16-row chain verify's two fused-row passes across two threadgroups (_r2) vs one group; _r2 on by default (1.40x at 4K history, 1.24x at 131K)",
+    "min_gpu_family": 10
   },
   "PREFILL_SPLITS_MAX": {
     "env": "RICHENGINE_PREFILL_SPLITS_MAX",

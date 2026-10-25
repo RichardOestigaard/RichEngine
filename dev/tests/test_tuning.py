@@ -41,7 +41,12 @@ class TestKnobTables(unittest.TestCase):
         from install import families
 
         missing = [f.name for f in families.FAMILIES if knobs_for(f.name) is None]
-        self.assertEqual(missing, [])
+        # An encoder decision model has no runnable kernels to sweep yet —
+        # only encoder families may go without a table.
+        encoders = sorted(
+            f.name for f in families.FAMILIES if (f.serving or {}).get("encoder")
+        )
+        self.assertEqual(missing, encoders)
 
     def test_unknown_family_has_no_table(self):
         self.assertIsNone(knobs_for("No-Such-Family"))
@@ -1189,7 +1194,6 @@ class TestSweepRecording(unittest.TestCase):
                 env = autotune.tune(
                     Path("/nonexistent-engine"), directory, log=lambda line: None
                 )
-            record = autotune._read_record(directory)["M4 Max"]
         # Every candidate scored a win, but only knobs allowed to change
         # the token stream survive the veto; the rest read "rejected".
         from install.tuning import TUNING_TABLES
@@ -1246,6 +1250,166 @@ class TestTokensMatch(unittest.TestCase):
         incumbent = self._samples(("a", "a"))
         candidate = self._samples(("a", "a", "b"))
         self.assertIs(autotune._tokens_match(candidate, incumbent), True)
+
+
+class TestAnswersMatch(unittest.TestCase):
+    """_answers_match: the decision sweep's answer-digest parity verdict."""
+
+    def _samples(self, digests):
+        return {"3": {"answers_sha": list(digests)}}
+
+    def test_identical_answers_match(self):
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "a", "a"))
+        self.assertIs(autotune._answers_match(candidate, incumbent), True)
+
+    def test_diverged_reps_reject(self):
+        # A numerics change moves most questions' winners or scores, not
+        # one — the same two-mismatch veto as token parity.
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "b", "b"))
+        self.assertIs(autotune._answers_match(candidate, incumbent), False)
+
+    def test_missing_digests_are_undecided(self):
+        self.assertIsNone(
+            autotune._answers_match(
+                {"3": {"tokens_per_second": [1.0]}},
+                self._samples(("a", "a", "a")),
+            )
+        )
+        self.assertIsNone(autotune._answers_match(self._samples(("a",)), {}))
+
+    def test_one_diverged_rep_is_inconclusive(self):
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "b", "a"))
+        self.assertIsNone(autotune._answers_match(candidate, incumbent))
+
+
+class TestDecisionSweep(unittest.TestCase):
+    """The score-only sweep a decision family runs, and the encoder
+    family's refusal."""
+
+    def _assembly(self, root: Path, family: str) -> Path:
+        directory = root / "model"
+        directory.mkdir()
+        directory.joinpath("model.json").write_text(
+            json.dumps({"family": family, "target_format": "gguf"})
+        )
+        return directory
+
+    def _context_d1(self):
+        return _context(
+            family="d1-3B",
+            model_type="lfm2",
+            target_format="gguf",
+            draft_kind="none",
+        )
+
+    def test_encoder_family_refuses_before_launch(self):
+        # d1-omni's encoder kernels are not landed: tune() names that and
+        # never reaches an engine launch.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as td:
+            directory = self._assembly(Path(td), "d1-omni")
+            with mock.patch.object(autotune, "measure") as measure_mock:
+                with self.assertRaises(models.ModelError) as caught:
+                    autotune.tune(
+                        Path("/nonexistent-engine"),
+                        directory,
+                        log=lambda line: None,
+                    )
+            self.assertIn(
+                "encoder decision models are not tunable",
+                str(caught.exception),
+            )
+            measure_mock.assert_not_called()
+
+    def _run_decision(self, directory: Path, stub):
+        """tune() on a d1-3B assembly with measure and the workload stubbed
+        — returns (env, record, measure kwargs seen, logs)."""
+        import unittest.mock as mock
+
+        calls = []
+
+        def measure_stub(binary, assembly_dir, env, **kwargs):
+            calls.append(kwargs)
+            return stub(env)
+
+        workload = [
+            ("q1", (1, 2, 3), object()),
+            ("q2", (4, 5), object()),
+            ("q3", (6,), object()),
+        ]
+        logs = []
+        with (
+            mock.patch.object(
+                autotune, "context_for", return_value=self._context_d1()
+            ),
+            mock.patch.object(
+                autotune, "_decision_workload", return_value=workload
+            ),
+            mock.patch.object(autotune, "measure", side_effect=measure_stub),
+            mock.patch.object(autotune, "_wait_for_pressure", return_value=None),
+        ):
+            env = autotune.tune(
+                Path("/nonexistent-engine"), directory, log=logs.append
+            )
+        return env, autotune._read_record(directory)["M4 Max"], calls, logs
+
+    def _medians(self, tps: float):
+        return {
+            "3": {
+                "tokens_per_second": tps,
+                "prefill_tokens_per_second": tps * 10,
+            }
+        }
+
+    def _samples(self, digest: str):
+        return {
+            "warmup": {"answers_sha": [digest]},
+            "3": {
+                **{metric: [100.0] * 3 for metric in autotune._METRICS},
+                "answers_sha": [digest] * 3,
+            },
+        }
+
+    def test_decision_family_measures_the_question_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = self._assembly(Path(td), "d1-3B")
+            env, record, calls, logs = self._run_decision(
+                directory, lambda env: (self._medians(100.0), self._samples("same"))
+            )
+        self.assertTrue(calls)
+        # Every measurement ran the score-only workload — no prompt pool.
+        for call in calls:
+            self.assertIsNotNone(call["decision"])
+            self.assertEqual(call["prompts"], ())
+        self.assertTrue(any("score-only" in line for line in logs), logs)
+
+    def test_answer_divergence_vetoes_a_winner(self):
+        # A knob that scores faster but moves the answers is rejected, the
+        # same keep/veto semantics token parity gives generation.
+        def stub(env):
+            tps = 120.0 if env else 100.0
+            return self._medians(tps), self._samples(
+                "changed" if env else "plain"
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            directory = self._assembly(Path(td), "d1-3B")
+            env, record, calls, logs = self._run_decision(directory, stub)
+        # Only knobs allowed to move the answers survive the veto.
+        from install.tuning import TUNING_TABLES
+
+        exempt = {
+            knob.env
+            for knob in TUNING_TABLES["d1-3B"].knobs
+            if knob.may_diverge or knob.quality_sensitive
+        }
+        self.assertLessEqual(set(env), exempt)
+        self.assertTrue(env)  # an exempt winner still kept
+        self.assertIn("rejected", set(record["verdicts"].values()))
 
 
 class TestEnvGatesAndPhaseLines(unittest.TestCase):
