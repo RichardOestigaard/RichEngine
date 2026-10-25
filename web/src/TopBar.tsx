@@ -1,5 +1,5 @@
 import { A, useLocation } from "@solidjs/router";
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { api, apiKey, setApiKey, authorization, noteAuthStatus, unauthorized } from "./api";
 import { decisionModel, setDecisionModel } from "./decision";
 import { fmtBytes } from "./format";
@@ -67,7 +67,9 @@ function ThemeIcon(props: { name: Theme }) {
 export default function TopBar() {
   const location = useLocation();
   const [ready, setReady] = createSignal<ReadyState>(null);
-  const [servedModel, setServedModel] = createSignal<string | null>(null);
+  const [servedModels, setServedModels] = createSignal<
+    { id: string; decision?: boolean }[]
+  >([]);
   const [memory, setMemory] = createSignal<MemoryUse | null>(null);
 
   async function checkReady() {
@@ -126,10 +128,17 @@ export default function TopBar() {
       const res = await api<{ data?: { id?: string; decision?: boolean }[] }>(
         "/v1/models"
       );
-      setServedModel(res.data?.[0]?.id ?? null);
-      setDecisionModel(res.data?.[0]?.decision === true);
+      const list = (res.data ?? [])
+        .filter((entry): entry is { id: string; decision?: boolean } =>
+          typeof entry.id === "string"
+        )
+        .map((entry) => ({ id: entry.id, decision: entry.decision }));
+      setServedModels(list);
+      // Chat and Playground stay while any resident can generate text;
+      // an all-decision pool hides them.
+      setDecisionModel(list.length > 0 && list.every((m) => m.decision));
     } catch {
-      setServedModel(null);
+      setServedModels([]);
       setDecisionModel(false);
     }
   }
@@ -187,19 +196,31 @@ export default function TopBar() {
       >
         <ThemeIcon name={theme()} />
       </button>
-      <Show when={servedModel()}>
+      <Show when={servedModels().length}>
         <A
           href="/models"
           class="top-model"
-          title={`${servedModel()} — served model; open Models`}
+          title={`${servedModels()
+            .map((m) => m.id)
+            .join(", ")} — served models; open Models`}
         >
-          {servedModel()}
-          <Show when={decisionModel()}>
-            {" "}
-            <span class="badge" title="Decision model — answers /v1/systemone and /v1/judgments in one forward pass; no text generation">
-              decision
-            </span>
-          </Show>
+          <For each={servedModels()}>
+            {(m, i) => (
+              <>
+                {i() > 0 && " · "}
+                {m.id}
+                <Show when={m.decision}>
+                  {" "}
+                  <span
+                    class="badge"
+                    title="Decision model — answers /v1/systemone and /v1/judgments in one forward pass; no text generation"
+                  >
+                    decision
+                  </span>
+                </Show>
+              </>
+            )}
+          </For>
         </A>
       </Show>
       <Show when={installJob()?.running}>

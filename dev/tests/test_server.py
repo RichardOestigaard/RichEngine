@@ -2104,6 +2104,157 @@ class ServerTest(unittest.TestCase):
         self.assertIn("supported", prompt)
         self.assertNotIn(judgments.DIRECT_SYSTEM, prompt)
 
+    def _pool(self, *apps, max_residents=2):
+        """A HostPool of stub hosts around real Frontends — routing is what
+        the pool owns; host.load/unload stay each model's real lifecycle."""
+        pool = hosting.HostPool(
+            SimpleNamespace(unload_idle=None, models_dir=None),
+            max_residents,
+        )
+        pool.hosts = [
+            SimpleNamespace(
+                app=app,
+                state="loaded",
+                error=None,
+                note_request=lambda *a, **k: None,
+                unload=lambda **k: app.model,
+                close=lambda: None,
+            )
+            for app in apps
+        ]
+        return pool
+
+    def test_pool_routes_systemone_to_the_decision_resident(self):
+        generative = self.harness(FakeRuntime(Plan(logits=(0.0, 1.0))), model="gen-test")
+        decision = self.harness(
+            FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)), Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0))),
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        generative.server.host = self._pool(generative.app, decision.app)
+        # model named: d1's native pathway answers even though the default
+        # resident is generative.
+        body = {
+            "state": "I was charged twice this month",
+            "questions": {
+                "refund": {"type": "noul", "instructions": "Refund asked?"}
+            },
+        }
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/systemone",
+            {**body, "model": "d1-test"},
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["prompt_version"], decisions.PROMPT_VERSION)
+        # model omitted on /v1/judgments, where it is optional: the
+        # decision endpoint still lands on the d1 host.
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/judgments",
+            {
+                "id": "r1",
+                "state": {"charged": "twice"},
+                "question": "Best action?",
+                "options": [
+                    {"id": "refund", "description": "Issue refund"},
+                    {"id": "deny", "description": "Deny refund"},
+                ],
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            json.loads(payload)["prompt_version"], decisions.PROMPT_VERSION
+        )
+
+    def test_pool_routes_chat_to_the_named_generative_resident(self):
+        generative = self.harness(
+            FakeRuntime(Plan([[1], [2], [3]])), model="gen-test"
+        )
+        decision = self.harness(
+            FakeRuntime(Plan(logits=(0.5, 3.0))),
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        generative.server.host = self._pool(decision.app, generative.app)
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "gen-test",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(json.loads(payload)["model"], "gen-test")
+        # An unknown model is a 404, not the default resident.
+        status, _, payload = generative.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "nope",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(status, 404, payload)
+
+    def test_pool_models_lists_every_resident(self):
+        generative = self.harness(FakeRuntime(), model="gen-test")
+        decision = self.harness(
+            FakeRuntime(),
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        generative.server.host = self._pool(generative.app, decision.app)
+        status, _, payload = generative.request("GET", "/v1/models")
+        self.assertEqual(status, 200, payload)
+        models = {item["id"]: item for item in json.loads(payload)["data"]}
+        self.assertEqual(set(models), {"gen-test", "d1-test"})
+        self.assertTrue(models["d1-test"]["decision"])
+        self.assertFalse(models["gen-test"]["decision"])
+
+    def test_pool_load_refuses_past_max_residents(self):
+        # One slot: a different model swaps through it, as a lone host does.
+        app = SimpleNamespace(model_names=("a",), decision_pathway=False)
+        pool = self._pool(app, max_residents=1)
+        called = []
+        pool.hosts[0].load = lambda *a, **k: called.append(a)
+        pool.load("other/model")
+        self.assertEqual(called, [("other/model",)])
+        # Two full slots out of two: a third resident refuses.
+        pool = self._pool(app, max_residents=2)
+        pool.hosts = [
+            SimpleNamespace(app=app, state="loaded", error=None)
+            for _ in range(2)
+        ]
+        with self.assertRaisesRegex(api.APIError, "resident limit"):
+            pool.load("other/model")
+        # The resident the call names reloads through its own host.
+        called = []
+        pool.hosts[0].load = lambda *a, **k: called.append(a)
+        pool.load("a")
+        self.assertEqual(called, [("a",)])
+
+    def test_pool_unload_names_the_resident(self):
+        app_a = SimpleNamespace(model_names=("a",), model="a")
+        app_b = SimpleNamespace(model_names=("b",), model="b")
+        pool = self._pool(app_a, app_b)
+        released = []
+        for host, app in zip(pool.hosts, (app_a, app_b), strict=True):
+            def _unload(_app=app, **_kwargs):
+                released.append(_app.model)
+                return _app.model
+
+            host.unload = _unload
+        self.assertEqual(pool.unload("b"), "b")
+        self.assertEqual(released, ["b"])
+        with self.assertRaisesRegex(api.APIError, "not loaded"):
+            pool.unload("c")
+
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned
         Qwen template, with pad id 50."""

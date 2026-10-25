@@ -261,6 +261,27 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--extra-model",
+        dict(
+            action="append",
+            default=[],
+            metavar="OWNER/REPO[:VARIANT]",
+            help="additional installed model to serve alongside --model "
+            "(repeatable); each resident gets its own engine process and is "
+            "routed to by the request's model field",
+        ),
+    ),
+    ServeOption(
+        "--max-residents",
+        dict(
+            type=int,
+            default=None,
+            metavar="N",
+            help="cap on concurrently resident models (default: 1 plus each "
+            "--extra-model); POST /v1/models/load refuses past it",
+        ),
+    ),
+    ServeOption(
         "--announce-served-name",
         dict(
             action="store_true",

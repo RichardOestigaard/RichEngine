@@ -110,6 +110,11 @@ PRIORS_SKIP_BOUND = 0.15
 KERNEL_PLANS_ENV = "RICHENGINE_LINEAR_PLANS"
 KERNEL_PASS_SECONDS = {"quick": 5, "complete": 10}
 
+# Set on every tuning child's environment: the engine's bootstrap then
+# skips the serving warmups — the sweep's own warmup batch covers the
+# paths it times, and the memory audit still runs.
+_TUNE_CHILD_ENV = "RICHENGINE_TUNE_CHILD"
+
 # machdep.cpu.brand_string's chip → the Metal GPU family generation (Apple7
 # is M1 … Apple10+ is M4 and newer) and its unified-memory bandwidth in GB/s.
 _GPU_FAMILY = {"M1": 7, "M2": 8, "M3": 9, "M4": 10, "M5": 11}
@@ -643,26 +648,39 @@ def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
     request rides the constraint: a mask provider, the per-generation
     vocabulary frame and the request's own ConstraintDfaFrame, with
     forced-token pushes only where the candidate's mode leaves them on
-    the host."""
+    the host. Every lane's emitted tokens are hashed into `tokens_sha`:
+    lanes run on identical prompts across measurements, so the digest is
+    the token-parity check the decode-profile double-run used to give —
+    at no extra engine launches."""
     from server import protocol as wire
     from server import runtime as engine_runtime
 
     calls = []
+    lane_tokens = []
     for prompt in prompts:
+        tokens = array.array("I")
+        lane_tokens.append(tokens)
         if dfa is None:
+
+            def on_event(call, event, acc=tokens):
+                if isinstance(event, wire.TokensEvent):
+                    acc.extend(event.tokens)
+
             calls.append(
                 runtime.submit(
                     engine_runtime.GenerationRequest(
                         _request(prompt, output_tokens), math.inf, None, None
-                    )
+                    ),
+                    on_event=on_event,
                 )
             )
             continue
         constraint = _AgenticConstraint(dfa)
 
-        def on_event(call, event, c=constraint):
+        def on_event(call, event, c=constraint, acc=tokens):
             if not isinstance(event, wire.TokensEvent):
                 return
+            acc.extend(event.tokens)
             try:
                 forced = c.commit(event.tokens, forced=dfa.pushes_forced)
             except Exception:
@@ -704,6 +722,10 @@ def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
         if event.prefill_micros:
             prefill_rates.append(event.prompt_tokens / (event.prefill_micros / 1e6))
     seconds = decode_micros / 1e6 if decode_micros else 0.0
+    digest = hashlib.sha1()
+    for lane in lane_tokens:
+        digest.update(len(lane).to_bytes(4, "little"))
+        digest.update(lane.tobytes())
     return {
         "width": len(prompts),
         "prompt_tokens": prompt_tokens,
@@ -714,6 +736,7 @@ def _run_batch(runtime, prompts, output_tokens: int, dfa=None) -> dict:
         "prefill_tokens_per_second": (
             round(statistics.fmean(prefill_rates), 2) if prefill_rates else 0.0
         ),
+        "tokens_sha": digest.hexdigest(),
     }
 
 
@@ -743,25 +766,32 @@ def measure(
     widths=(1, BATCH_WIDTH),
     repetitions: int = REPETITIONS,
     incumbent: dict | None = None,
+    sigma: dict | None = None,
     dfa: "_AgenticWorkload | None" = None,
 ) -> tuple[dict, dict]:
     """One engine under `env`: a warmup pass, then REPETITIONS batches at
     each width, merged to medians: {width: metrics}. `prompts` is a pool of
-    distinct windows; every batch consumes `width` fresh ones so no timed
-    prefill rides the cache a warm-up or earlier repetition primed. Raises
-    on a failed start. With `incumbent` ({width: metrics}) the exact
-    early-kill applies: once a majority of a width's reps each regress past
-    IMPROVEMENT on one metric, the median must regress too — the candidate
-    can never be kept, so the rest of its batches are skipped. Returns
-    (medians, samples), samples as {width: {metric: [per-rep values]}} —
-    the baseline's samples seed the keep rule's noise floor."""
+    distinct windows; every (width, rep) owns a fixed slice, so no timed
+    prefill rides the cache a warm-up or earlier repetition primed — and
+    rep i at width w reads the same window under every env, which is what
+    makes the reps' token digests comparable. Raises on a failed start.
+    With `incumbent` ({width: metrics}) the exact early-exits apply, each
+    at the keep rule's floor (max of IMPROVEMENT and the baseline's 2σ per
+    (width, metric) when `sigma` is given): once a majority of a width's
+    reps each regress on one metric the median must regress — a guaranteed
+    loss — and once a majority each improve on one metric while no metric
+    can still majority-regress, the width's verdict is sealed either way,
+    so the remaining batches are skipped in both directions. Returns
+    (medians, samples), samples as {width: {metric: [per-rep values],
+    "tokens_sha": [per-rep digests]}} — the baseline's samples seed the
+    keep rule's noise floor and the token-parity reference."""
     from server import runtime as engine_runtime
 
     runtime = engine_runtime.MultiplexedRuntime(
         _engine_command(binary, assembly_dir),
         # Popen replaces the child's whole environment; overlay the swept
         # knobs on this process's.
-        env={**os.environ, **env},
+        env={**os.environ, _TUNE_CHILD_ENV: "1", **env},
         startup_timeout=600.0,
         pending_limit=max(widths),
         eager_start=True,
@@ -769,7 +799,6 @@ def measure(
     try:
         if not runtime.wait_ready():
             raise RuntimeError("the tuning engine did not become ready")
-        cursor = 0
         if dfa is not None:
             # Host forced-token pushes belong to the host-DFA mode only;
             # the GPU modes derive the span on-device.
@@ -777,40 +806,92 @@ def measure(
                 str(env.get("RICHENGINE_DFA_MODE", "")).strip().lower() == "off"
             )
 
-        def batch(width: int, output_tokens: int) -> dict:
-            nonlocal cursor
-            window = prompts[cursor : cursor + width]
+        # The warmup reads the widest slice first; each (width, rep) then
+        # owns a fixed slice — rep boundaries never shift with rep count,
+        # so token digests stay positionally comparable across candidates.
+        offsets = {}
+        position = max(widths)
+        for width in widths:
+            offsets[width] = position
+            position += repetitions * width
+
+        def batch(width: int, rep_index: int, output_tokens: int) -> dict:
+            start = offsets[width] + rep_index * width
+            window = prompts[start : start + width]
             assert len(window) == width, "prompt pool exhausted"
-            cursor += width
             return _run_batch(runtime, window, output_tokens, dfa)
 
-        batch(max(widths), WARMUP_OUTPUT_TOKENS)
+        warmup = _run_batch(
+            runtime, prompts[: max(widths)], WARMUP_OUTPUT_TOKENS, dfa
+        )
         merged = {}
-        samples = {}
+        # The warmup runs the same windows under every env — its digest
+        # is token parity's determinism anchor alongside the timed reps.
+        samples = {"warmup": {"tokens_sha": [warmup["tokens_sha"]]}}
         doomed = False
         for width in widths:
             reps = []
+            base = (incumbent or {}).get(str(width)) or {}
+            floor = {
+                metric: max(
+                    IMPROVEMENT, 2 * (sigma or {}).get((str(width), metric), 0.0)
+                )
+                for metric in _METRICS
+            }
+
+            def counts():
+                improved = {metric: 0 for metric in _METRICS}
+                regressed = {metric: 0 for metric in _METRICS}
+                for rep in reps:
+                    for metric in _METRICS:
+                        before = base.get(metric) or 0.0
+                        after = rep.get(metric) or 0.0
+                        if before <= 0 or after <= 0:
+                            continue
+                        delta = after / before - 1
+                        improved[metric] += delta > floor[metric]
+                        regressed[metric] += delta < -floor[metric]
+                return improved, regressed
+
+            comparable = incumbent is not None and any(
+                (base.get(metric) or 0.0) > 0 for metric in _METRICS
+            )
             while len(reps) < repetitions and not doomed:
-                reps.append(batch(width, OUTPUT_TOKENS))
-                base = (incumbent or {}).get(str(width)) or {}
-                # A majority of reps each regressing past IMPROVEMENT on the
-                # same metric means the median regresses — guaranteed loss.
-                if incumbent is not None and any(
-                    before > 0
-                    and sum(
-                        (rep.get(metric) or 0.0) / before - 1 < -IMPROVEMENT
-                        for rep in reps
-                    )
-                    * 2
-                    > repetitions
-                    for metric in _METRICS
-                    for before in [base.get(metric) or 0.0]
-                ):
+                reps.append(batch(width, len(reps), OUTPUT_TOKENS))
+                if not comparable:
+                    continue
+                improved, regressed = counts()
+                # A majority of reps each regressing past the floor on the
+                # same metric means the median regresses — guaranteed loss
+                # at every width, so the candidate is dead.
+                if any(regressed[metric] * 2 > repetitions for metric in _METRICS):
                     doomed = True
+                    break
+                # The width's verdict is sealed once every metric's median
+                # is decided — majority-improved, majority-regressed, or
+                # unable to reach either with the reps left — whether the
+                # seal is a win, a loss or a neutral run. The remaining
+                # reps cannot change it.
+                remaining = repetitions - len(reps)
+                if all(
+                    (
+                        improved[metric] * 2 > repetitions
+                        or (improved[metric] + remaining) * 2 <= repetitions
+                    )
+                    and (
+                        regressed[metric] * 2 > repetitions
+                        or (regressed[metric] + remaining) * 2 <= repetitions
+                    )
+                    for metric in _METRICS
+                ):
+                    break
             merged[str(width)] = _median_samples(reps)
             samples[str(width)] = {
                 metric: [rep.get(metric, 0.0) for rep in reps] for metric in _METRICS
             }
+            samples[str(width)]["tokens_sha"] = [
+                rep.get("tokens_sha") for rep in reps
+            ]
             if doomed:
                 break
         return merged, samples
@@ -1154,49 +1235,32 @@ def _kernel_pass(
     }
 
 
-def _token_parity(
-    binary: Path, assembly_dir: Path, before_env: dict, after_env: dict, log=print
-) -> bool | None:
-    """Emit decode-profile's token stream under `before_env` and
-    `after_env` and compare bytes: True on identical output, False when
-    the env difference changed what the model emits, None when the check
-    cannot run (no profile binary, or a run failed)."""
-    from . import paths
-
-    profile = paths.PROFILE_BINARY
-    if not profile.is_file():
-        log("kernels · no decode-profile binary — token parity unchecked")
+def _tokens_match(candidate: dict, incumbent: dict) -> bool | None:
+    """The token-parity check, in measurement form: each rep's emitted-
+    token digest against the incumbent env's same (width, rep) — rep i at
+    width w reads the same prompt window under every env, so the streams
+    compare positionally; the warmup batch's own digest compares too.
+    False when at least two comparable reps diverge, True when every one
+    matches, None otherwise — digests missing (older records, stubbed
+    measurements) or exactly one rep diverged, which a stray
+    nondeterministic run explains better than a numerics change that
+    would show on every window."""
+    compared = 0
+    mismatched = 0
+    for width, cand in candidate.items():
+        if not isinstance(cand, dict):
+            continue
+        base_reps = (incumbent.get(width) or {}).get("tokens_sha") or ()
+        for index, rep in enumerate(cand.get("tokens_sha") or ()):
+            if not rep or index >= len(base_reps) or not base_reps[index]:
+                continue
+            compared += 1
+            mismatched += rep != base_reps[index]
+    if mismatched >= 2:
+        return False
+    if mismatched == 1 or not compared:
         return None
-    dumps = []
-    try:
-        for tag, extra in (("baseline", before_env), ("fitted", after_env)):
-            dump = tuning_path(assembly_dir).with_name(
-                f"tuning.{tag}-tokens"
-            )
-            process = subprocess.run(
-                [
-                    str(profile),
-                    str(binary.parent / "richengine.metallib"),
-                    str(assembly_dir),
-                    "--dump-tokens",
-                    str(dump),
-                ],
-                env=dict(os.environ, **extra),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                timeout=900,
-            )
-            if process.returncode != 0 or not dump.is_file():
-                log(f"kernels · token parity run failed ({tag})")
-                return None
-            dumps.append(dump)
-        return dumps[0].read_bytes() == dumps[1].read_bytes()
-    except (OSError, subprocess.TimeoutExpired) as error:
-        log(f"kernels · token parity run failed ({error})")
-        return None
-    finally:
-        for dump in dumps:
-            dump.unlink(missing_ok=True)
+    return True
 
 
 def tune(
@@ -1399,7 +1463,7 @@ def tune(
         Candidates are contiguous per knob, so an ordered knob whose first
         value deep-loses prunes the rest of its values unmeasured — the
         verdict remembers them so no later pass re-asks the question."""
-        nonlocal best_env, best_metrics
+        nonlocal best_env, best_metrics, incumbent_samples
         baseline_metrics = (results.get("baseline") or {}).get("metrics") or {}
         dead: set[str] = set()
         for knob, value in candidates:
@@ -1417,19 +1481,20 @@ def tune(
             pressured = contaminated or _wait_for_pressure(log)
             log(f"trying {knob.env}={value}")
             try:
-                measured, _ = measure(
+                measured, cand_samples = measure(
                     binary,
                     assembly_dir,
                     env,
                     prompts=prompts,
                     incumbent=best_metrics,
+                    sigma=sigma,
                 )
             except (OSError, RuntimeError) as error:
                 log(f"{knob.env}={value} · failed ({error})")
                 verdicts[candidate_key] = "failed"
                 continue
             log(f"{knob.env}={value} · {measured}")
-            results[key] = {"env": env, "metrics": measured}
+            results[key] = {"env": env, "metrics": measured, "samples": cand_samples}
             if pressured:
                 results[key]["pressured"] = pressured
                 verdicts[candidate_key] = "pressured"
@@ -1437,7 +1502,7 @@ def tune(
                 parity = (
                     None
                     if knob.quality_sensitive or knob.may_diverge
-                    else _token_parity(binary, assembly_dir, best_env, env, log)
+                    else _tokens_match(cand_samples, incumbent_samples)
                 )
                 if parity is False:
                     # A faster path that reassociates reductions can flip
@@ -1449,6 +1514,7 @@ def tune(
                 else:
                     best_env[knob.env] = value
                     best_metrics = measured
+                    incumbent_samples = cand_samples
                     verdicts[candidate_key] = "kept"
                     log("  kept")
             elif knob.ordered and _deep_loss(measured, baseline_metrics, PRUNE_DEPTH):
@@ -1478,6 +1544,11 @@ def tune(
             results["baseline"]["pressured"] = pressured
         write()
 
+    # The stream each candidate's token parity is judged against: the
+    # incumbent env's per-rep digests — the baseline's until a winner's
+    # own measurement replaces them with the new best env's.
+    incumbent_samples = (results.get("baseline") or {}).get("samples") or {}
+
     # The kernel pass's winners as candidate zero: measured once
     # whole-model against the baseline, kept only when the keep rule says
     # the fitted plans pay end to end — the same A/B gate the shipped
@@ -1490,12 +1561,13 @@ def tune(
             "changed — measuring the fitted env"
         )
         try:
-            kernel_metrics, _ = measure(
+            kernel_metrics, kernel_samples = measure(
                 binary,
                 assembly_dir,
                 {KERNEL_PLANS_ENV: plans["spec"]},
                 prompts=prompts,
                 incumbent=best_metrics,
+                sigma=sigma,
             )
         except (OSError, RuntimeError) as error:
             log(f"kernels · fitted env failed ({error})")
@@ -1504,14 +1576,13 @@ def tune(
             results["kernels"] = {
                 "env": {KERNEL_PLANS_ENV: plans["spec"]},
                 "metrics": kernel_metrics,
+                "samples": kernel_samples,
             }
             if pressured:
                 results["kernels"]["pressured"] = pressured
                 verdicts["kernels"] = "pressured"
             elif _keeps(kernel_metrics, best_metrics, sigma):
-                if _token_parity(
-                    binary, assembly_dir, {}, {KERNEL_PLANS_ENV: plans["spec"]}, log
-                ) is False:
+                if _tokens_match(kernel_samples, incumbent_samples) is False:
                     # A faster plan that reassociates the reductions can
                     # flip draft-accepted tokens (DeviceTuning.cpp rejects
                     # such splits for the same reason) — the throughput
@@ -1521,6 +1592,7 @@ def tune(
                 else:
                     best_env[KERNEL_PLANS_ENV] = plans["spec"]
                     best_metrics = kernel_metrics
+                    incumbent_samples = kernel_samples
                     verdicts["kernels"] = "kept"
                     log("  kept")
             else:
@@ -1613,11 +1685,13 @@ def tune(
         pressured = contaminated or _wait_for_pressure(log)
         log(f"trying -{name}={value}")
         try:
-            measured, _ = measure(
+            measured, elim_samples = measure(
                 binary,
                 assembly_dir,
                 trial,
                 prompts=prompts,
+                incumbent=best_metrics,
+                sigma=sigma,
             )
         except (OSError, RuntimeError) as error:
             log(f"-{name}={value} · failed ({error}) — kept")
@@ -1626,6 +1700,7 @@ def tune(
         results[f"eliminate:{name}={value}"] = {
             "env": trial,
             "metrics": measured,
+            "samples": elim_samples,
         }
         # The env without the knob must lose to it for the knob to stay:
         # no meaningful win means the knob contributes nothing.
@@ -1633,6 +1708,7 @@ def tune(
             continue
         del best_env[name]
         best_metrics = measured
+        incumbent_samples = elim_samples
         verdicts[f"{name}={value}"] = "eliminated"
         log("  removed — the final env pays without it")
         write()
@@ -1700,6 +1776,7 @@ def tune(
                         prompts=prompts,
                         widths=AGENTIC_WIDTHS,
                         incumbent=dfa_metrics,
+                        sigma=dfa_sigma,
                         dfa=workload,
                     )
                 except (OSError, RuntimeError) as error:

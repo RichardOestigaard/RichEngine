@@ -47,7 +47,7 @@ from .errors import APIError, ContextLengthError
 from .http_security import OriginRefused, authenticate, validate_headers
 from .latency import LatencyMetrics, RequestLatency
 from .metrics import prometheus_metrics, timings_dict, usage_dict
-from .model_host import ModelHost
+from .model_host import HostPool, ModelHost
 from .origins import ANY_ORIGIN
 from .output import (
     BlockSequencer,
@@ -547,15 +547,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             except launcher.LauncherError as error:
                 self._safe_error(APIError(500, str(error)))
                 return
-            current = None if self.app is None else self.app.model
             host = self.server.host
+            served = (
+                {self.app.model}
+                if self.app is not None and host is None
+                else set() if host is None else set(host.models())
+            )
             reload_pending = (
                 host is not None
                 and host.assembly_dir is not None
                 and host.tuning_requires_reload()
             )
             for entry in installed:
-                entry["serving"] = entry["model"] == current
+                entry["serving"] = entry["model"] in served
                 if reload_pending and entry["serving"]:
                     # A finished tune changed the env after this engine
                     # spawned; the winners sit unapplied until a reload.
@@ -576,30 +580,32 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(200, self._tuner().status())
             return
         if path == "/v1/models" or path.startswith("/v1/models/"):
-            app = self.app
+            host = self.server.host
             models = (
-                []
-                if app is None
-                else [
-                    {
-                        "id": name,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "richengine",
-                        "max_model_len": app.max_context,
-                        "context_length": app.max_context,
-                        "vision": app.vision,
-                        "decision": app.decision_pathway,
-                        "input_modalities": app.input_modalities,
-                        **(
-                            {"root": app.response_model}
-                            if name != app.response_model
-                            else {}
-                        ),
-                    }
-                    for name in app.model_names
-                ]
+                [self.app]
+                if self.app is not None and host is None
+                else [] if host is None else host.apps()
             )
+            models = [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "richengine",
+                    "max_model_len": app.max_context,
+                    "context_length": app.max_context,
+                    "vision": app.vision,
+                    "decision": app.decision_pathway,
+                    "input_modalities": app.input_modalities,
+                    **(
+                        {"root": app.response_model}
+                        if name != app.response_model
+                        else {}
+                    ),
+                }
+                for app in models
+                for name in app.model_names
+            ]
             if path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
                 typed = [
@@ -716,8 +722,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         self._request_app = app
-        if not prompt_only and self.server.host is not None:
-            self.server.host.note_request()
         refusal = None if prompt_only else app.backend.refusal()
         if refusal is not None:
             if systemone and refusal.status == 503:
@@ -756,6 +760,32 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         [judgments.detail([], "request body must be an object")]
                     )
                 raise APIError(400, "request body must be an object")
+            # Route to the resident the body's model names; a request naming
+            # none lands on the decision resident for the decision endpoints,
+            # else the default — unchanged single-model behavior either way.
+            host = self.server.host
+            if host is not None:
+                resolved = host.app_for(
+                    body.get("model"),
+                    prefer_decision=systemone or path == "/v1/judgments",
+                )
+                if resolved is None:
+                    raise APIError(
+                        404, f"model {body['model']} not found", "model_not_found"
+                    )
+                if resolved is not app:
+                    self._request_app = resolved
+                    if not prompt_only:
+                        refusal = resolved.backend.refusal()
+                        if refusal is not None:
+                            if systemone and refusal.status == 503:
+                                refusal = APIError(
+                                    529, refusal.message, refusal.code
+                                )
+                            self._safe_error(refusal, anthropic, log=False)
+                            return
+                if not prompt_only:
+                    host.note_request(resolved)
             try:
                 deadline = self.app.request_deadline(body, started_at)
             except APIError as error:
@@ -957,7 +987,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     raise APIError(
                         503, "this server cannot unload models", "unsupported"
                     )
-                model = self.server.host.unload(force=body.get("force") is True)
+                model = self.server.host.unload(
+                    body.get("model"), force=body.get("force") is True
+                )
                 self._json(200, {"status": "unloaded", "model": model})
                 return
             if path == "/v1/disk/wipe":
@@ -2336,6 +2368,9 @@ class FrontendServer(ThreadingHTTPServer):
                 status["model_error"] = self.host.error
             if self.host.tuning_requires_reload():
                 status["model_requires_reload"] = True
+            residents_status = getattr(self.host, "residents_status", None)
+            if residents_status is not None:
+                status["residents"] = residents_status()
         status["instance"] = {
             "id": self.instance_id,
             "pid": os.getpid(),
@@ -2480,7 +2515,14 @@ def main():
                 "browser that reaches this server use it",
                 error=True,
             )
-        host = ModelHost(args)
+        host = HostPool(
+            args,
+            max(
+                getattr(args, "max_residents", None) or 0,
+                1 + len(getattr(args, "extra_model", None) or ()),
+            ),
+            default_host=ModelHost(args),
+        )
         server.host = host
         host.load_initial()
         server.server_activate()

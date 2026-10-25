@@ -952,7 +952,13 @@ class TestSweepRecording(unittest.TestCase):
             medians = self._medians(tps)
             samples = {
                 width: {
-                    metric: [medians[width][metric]] * 3 for metric in autotune._METRICS
+                    **{
+                        metric: [medians[width][metric]] * 3
+                        for metric in autotune._METRICS
+                    },
+                    # The stub emits the same stream under every env: the
+                    # parity check then passes every candidate it reaches.
+                    "tokens_sha": ["same-stream"] * 3,
                 }
                 for width in ("1", "4")
             }
@@ -1146,6 +1152,100 @@ class TestSweepRecording(unittest.TestCase):
             env, record, calls, logs = self._run(directory, {}, mode="quick")
         self.assertEqual(record["mode"], "quick")
         self.assertIsInstance(record["verdicts"], dict)
+
+    def test_token_divergence_vetoes_a_winner(self):
+        """A candidate that wins on throughput but emits different tokens
+        is rejected — the parity veto needs no separate decode run."""
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as td:
+            directory = self._assembly(Path(td))
+
+            def stub(binary, assembly_dir, env, **measure_kwargs):
+                tps = 120.0 if env else 100.0
+                medians = self._medians(tps)
+                samples = {
+                    width: {
+                        **{
+                            metric: [medians[width][metric]] * 3
+                            for metric in autotune._METRICS
+                        },
+                        "tokens_sha": ["changed" if env else "plain"] * 3,
+                    }
+                    for width in ("1", "4")
+                }
+                return medians, samples
+
+            with (
+                mock.patch.object(autotune, "context_for", return_value=_context()),
+                mock.patch.object(autotune, "measure", side_effect=stub),
+                mock.patch.object(autotune, "_wait_for_pressure", return_value=None),
+                mock.patch.object(
+                    autotune,
+                    "_prompts",
+                    return_value=([tuple([1] * autotune.PROMPT_TOKENS)] * 20, True),
+                ),
+            ):
+                env = autotune.tune(
+                    Path("/nonexistent-engine"), directory, log=lambda line: None
+                )
+            record = autotune._read_record(directory)["M4 Max"]
+        # Every candidate scored a win, but only knobs allowed to change
+        # the token stream survive the veto; the rest read "rejected".
+        from install.tuning import TUNING_TABLES
+
+        exempt = {
+            knob.env
+            for knob in TUNING_TABLES["Qwen3.8-27B"].knobs
+            if knob.may_diverge or knob.quality_sensitive
+        }
+        self.assertLessEqual(set(env), exempt)
+        self.assertTrue(env)  # the exempt winner still kept
+
+
+class TestTokensMatch(unittest.TestCase):
+    """_tokens_match: the in-measurement parity verdict."""
+
+    def _samples(self, digests, wide=None):
+        return {
+            "1": {"tokens_sha": list(digests)},
+            "4": {"tokens_sha": list(wide if wide is not None else digests)},
+        }
+
+    def test_identical_streams_match(self):
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "a", "a"))
+        self.assertIs(autotune._tokens_match(candidate, incumbent), True)
+
+    def test_diverged_reps_reject(self):
+        # Two diverging windows: a numerics change shows on most prompts,
+        # not one — so a pair of mismatches vetoes.
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "b", "b"))
+        self.assertIs(autotune._tokens_match(candidate, incumbent), False)
+
+    def test_missing_digests_are_undecided(self):
+        self.assertIsNone(
+            autotune._tokens_match(
+                {"1": {"tokens_per_second": [1.0]}},
+                self._samples(("a", "a", "a")),
+            )
+        )
+        self.assertIsNone(autotune._tokens_match(self._samples(("a",)), {}))
+
+    def test_one_diverged_rep_is_inconclusive(self):
+        # A single-window flip fits a stray nondeterministic run better
+        # than a real numerics change — no verdict either way.
+        incumbent = self._samples(("a", "a", "a"))
+        candidate = self._samples(("a", "b", "a"), wide=("a", "a", "a"))
+        self.assertIsNone(autotune._tokens_match(candidate, incumbent))
+
+    def test_extra_candidate_reps_beyond_the_incumbent_are_skipped(self):
+        # A sealed-keep incumbent measured fewer reps; the candidate's
+        # later reps have no same-window reference and stay unjudged.
+        incumbent = self._samples(("a", "a"))
+        candidate = self._samples(("a", "a", "b"))
+        self.assertIs(autotune._tokens_match(candidate, incumbent), True)
 
 
 class TestEnvGatesAndPhaseLines(unittest.TestCase):

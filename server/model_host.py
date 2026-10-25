@@ -111,9 +111,34 @@ class ModelHost:
 
     # -- state ---------------------------------------------------------
 
-    def note_request(self):
-        """A generation request arrived: it resets the idle-unload clock."""
+    def note_request(self, app=None):
+        """A generation request arrived: it resets the idle-unload clock.
+        The app argument keeps the pool's call shape; one host serves it."""
         self.last_request_at = time.monotonic()
+
+    # -- the pool protocol: a lone host answers for its one model ---------
+
+    def apps(self):
+        return [self.app] if self.app is not None else []
+
+    def models(self):
+        return list(self.app.model_names) if self.app is not None else []
+
+    def host_for_app(self, app):
+        return self if self.app is app else None
+
+    def decision_host(self):
+        if self.app is not None and self.app.decision_pathway:
+            return self
+        return None
+
+    def app_for(self, model, *, prefer_decision=False):
+        """Single-host routing: a name resolves here or nowhere."""
+        if model is None or (
+            self.app is not None and model in self.app.model_names
+        ):
+            return self.app
+        return None
 
     def _require_idle_locked(self, force):
         """Refuse a swap or unload while the engine still serves requests."""
@@ -486,8 +511,17 @@ class ModelHost:
         # The Ready line — with its address — is main()'s to print after the
         # HTTP listener activates.
 
-    def unload(self, *, force=False):
-        """Free the loaded model; its id, or None when none was loaded."""
+    def unload(self, model_id=None, *, force=False):
+        """Free the loaded model; its id, or None when none was loaded. A
+        named model must be this host's — the pool's uniform call shape."""
+        if (
+            model_id is not None
+            and self.app is not None
+            and model_id not in self.app.model_names
+        ):
+            raise APIError(
+                404, f"model {model_id} is not loaded", "model_not_found"
+            )
         with self.lock:
             if self.closed:
                 raise APIError(503, "server is shutting down", "server_shutdown")
@@ -534,3 +568,216 @@ class ModelHost:
             self._watchdog.join(timeout=1.0)
         with self.lock:
             self._unload_locked()
+
+
+class HostPool:
+    """Several resident ModelHost stacks behind one server.
+
+    The pool owns the resident set — one ModelHost per resident model, each
+    with its own native subprocess, KV pool and lifecycle — and routes by
+    model name. It also stands in for the host where the server's compat
+    surface only ever means "the default resident": ``app``, ``state``,
+    ``error``, ``assembly_dir``, ``weight_layout``,
+    ``tuning_requires_reload()`` and ``close()`` all read the first host's.
+    ``max_residents`` bounds the set; at 1, load() reuses the single host
+    and its in-place swap is exactly the old single-model behavior.
+    """
+
+    def __init__(self, args, max_residents=1, default_host=None):
+        self.args = args
+        self.max_residents = max(1, max_residents)
+        self.hosts = [default_host if default_host is not None else ModelHost(args)]
+        # Membership (the resident list) is rare to change; each host's own
+        # lock still orders its stack.
+        self.lock = threading.RLock()
+
+    # -- resident set ---------------------------------------------------
+
+    @property
+    def default(self):
+        """The primary resident: the first host, or None of an empty pool."""
+        return self.hosts[0] if self.hosts else None
+
+    def apps(self):
+        """Every resident's live Frontend, default first."""
+        return [host.app for host in self.hosts if host.app is not None]
+
+    def models(self):
+        """Every name any resident serves under, default first."""
+        return [name for app in self.apps() for name in app.model_names]
+
+    def host_for_app(self, app):
+        """The host owning app, or None."""
+        for host in self.hosts:
+            if host.app is app:
+                return host
+        return None
+
+    def decision_host(self):
+        """The resident running a decision pathway, if any."""
+        for host in self.hosts:
+            if host.app is not None and host.app.decision_pathway:
+                return host
+        return None
+
+    def app_for(self, model, *, prefer_decision=False):
+        """The app serving model across residents; None routes to the
+        decision host for decision endpoints, else the default."""
+        if model is None:
+            if prefer_decision:
+                host = self.decision_host()
+                if host is not None:
+                    return host.app
+            return self.app
+        for host in self.hosts:
+            if host.app is not None and model in host.app.model_names:
+                return host.app
+        return None
+
+    def note_request(self, app=None):
+        """A generation request arrived; reset the serving host's clock."""
+        host = self.host_for_app(app) if app is not None else self.default
+        if host is not None:
+            host.note_request()
+
+    # -- compat: the default resident's surface --------------------------
+
+    @property
+    def app(self):
+        host = self.default
+        return host.app if host is not None else None
+
+    @property
+    def state(self):
+        host = self.default
+        return host.state if host is not None else "unloaded"
+
+    @property
+    def error(self):
+        host = self.default
+        return host.error if host is not None else None
+
+    @property
+    def backend(self):
+        host = self.default
+        return host.backend if host is not None else None
+
+    @property
+    def runtime(self):
+        host = self.default
+        return host.runtime if host is not None else None
+
+    @property
+    def assembly_dir(self):
+        host = self.default
+        return host.assembly_dir if host is not None else None
+
+    @property
+    def weight_layout(self):
+        host = self.default
+        return host.weight_layout if host is not None else None
+
+    def tuning_requires_reload(self):
+        host = self.default
+        return host is not None and host.tuning_requires_reload()
+
+    def _models_root(self):
+        return self.default._models_root()
+
+    def residents_status(self):
+        """Per-resident /status rows."""
+        return {
+            host.app.model: {
+                "state": host.state,
+                "model_state": host.state,
+                "error": host.error,
+                "context_length": host.app.max_context,
+                "vision": host.app.vision,
+                "decision": host.app.decision_pathway,
+                "input_modalities": host.app.input_modalities,
+            }
+            for host in self.hosts
+            if host.app is not None
+        }
+
+    # -- lifecycle --------------------------------------------------------
+
+    def load_initial(self):
+        """The command line's models: the primary via its held assembly,
+        every --extra-model through the installed-selection path."""
+        self.default.load_initial()
+        for model_id in getattr(self.args, "extra_model", None) or ():
+            self.load(model_id)
+
+    def load(
+        self,
+        model_id,
+        *,
+        force=False,
+        revision=None,
+        draft_model=None,
+        language_only=False,
+    ):
+        """Load model_id as a resident: a free slot, a new one under
+        max_residents, or — at one resident — the host's own swap."""
+        with self.lock:
+            host = None
+            for candidate in self.hosts:
+                if (
+                    candidate.app is not None
+                    and model_id in candidate.app.model_names
+                ):
+                    host = candidate
+                    break
+            if host is None:
+                free = next(
+                    (candidate for candidate in self.hosts if candidate.app is None),
+                    None,
+                )
+                if len(self.hosts) < self.max_residents:
+                    host = ModelHost(self.args)
+                    self.hosts.append(host)
+                elif free is not None:
+                    host = free
+                elif self.max_residents == 1:
+                    host = self.default
+                else:
+                    raise APIError(
+                        409,
+                        f"resident limit {self.max_residents} reached; "
+                        "unload a model first",
+                        "engine_busy",
+                    )
+        return host.load(
+            model_id,
+            force=force,
+            revision=revision,
+            draft_model=draft_model,
+            language_only=language_only,
+        )
+
+    def unload(self, model_id=None, *, force=False):
+        """Unload one resident's stack; the slot stays for a later load."""
+        with self.lock:
+            if model_id is None:
+                host = self.default
+            else:
+                host = next(
+                    (
+                        candidate
+                        for candidate in self.hosts
+                        if candidate.app is not None
+                        and model_id in candidate.app.model_names
+                    ),
+                    None,
+                )
+            if host is None:
+                raise APIError(
+                    404, f"model {model_id} is not loaded", "model_not_found"
+                )
+        return host.unload(force=force)
+
+    def close(self):
+        """Server shutdown: release every resident."""
+        for host in list(self.hosts):
+            host.close()
