@@ -84,12 +84,14 @@ management, and per-device kernel autotuning.
   plans) replacing hardcoded shape-match overrides. `Linear.cpp` and
   `LinearGguf.cpp` shrank accordingly.
 
-## 8. Metal 4.1 decode pathways
+## 7. Metal 4.1 decode pathways
 
-Opt-in Metal 4.1 surface for decode. All flags default off; all verified
-byte-exact (identical `output_token_hash` and acceptance rates) in ABBA
-decode runs on MiniCPM5-2B-MLX, Ornith-1.5-9B-MLX-4bit and
-Qwen3.8-27B-4bit.
+Metal 4.1 surface for decode, measured A/B on MiniCPM5-2B-MLX,
+Ornith-1.5-9B-MLX-4bit, Qwen3.8-27B-4bit and
+LFM2.5-24B-A2B-GGUF:QAD-Q4_0 with byte-exact output (identical
+`output_token_hash` and acceptance rates). The measured winners are now
+default-on with `RICHENGINE_*_OFF` escape hatches; unproven or losing
+paths stay opt-in.
 
 - `ComputeDispatch::indirectGrid` / `indirectRange`
   (`MetalBackend.hpp`, `CommandGraph::addIndirect`/`setIndirectRange`,
@@ -99,10 +101,11 @@ Qwen3.8-27B-4bit.
   Substrate for device-driven decode; `decode_dfa_mask` is the first
   consumer under `RICHENGINE_GPU_DECODE_GRID` (`decode_dfa_mask_grid`
   kernel writes the grid, consuming `DfaForcedSpan` on-device).
-- `commit4` handles `EventStep` commands — queue-level
-  `signalEvent:`/`waitForEvent:` splits with per-commit
-  `MTL4CommitFeedback` merged via `SplitFeedback4`; event-bearing commands
-  no longer fall back to the Metal 3 encoder.
+- Event-bearing commands stay on the Metal 3 encoder: the commit4
+  `signalEvent:`/`waitForEvent:` split was implemented, benchmarked and
+  reverted — it misattributed GPU timing and regressed prefix-hit
+  prefill output (a `cold_output_match` failure) plus ~25–35% cold-prefill
+  wall. `commit4` requires `events.empty()` again.
 - GPU-encoded spans replay on the MTL4 path (`gpu_encode` +
   `executeCommandsInBuffer` through the argument table) — previously a
   silent scalar-encode no-op under `RICHENGINE_MTL4`.
@@ -122,11 +125,11 @@ Qwen3.8-27B-4bit.
   writes next-step `anchor`/`live_rows`/`position_base`/`cache_length`
   from `RetainedCount`/`AcceptedCount`/`OutputTokens`; verify-input
   tokens bind the pack buffer when provably identical to the staged
-  payload. Opt-in `RICHENGINE_DEVICE_VERIFY_PARAMS`.
-- `Engine.cpp` depth-2 decode submission ring behind
-  `RICHENGINE_DECODE_RING2`: `trySubmitAheadDecode` plans and submits the
-  next decode before the retiring plan's `apply()`, overlapping the host
-  turnaround with the ahead command's GPU execution.
+  payload. Default on; `RICHENGINE_DEVICE_VERIFY_PARAMS_OFF` disables.
+- `Engine.cpp` depth-2 decode submission ring: `trySubmitAheadDecode`
+  plans and submits the next decode before the retiring plan's `apply()`,
+  overlapping the host turnaround with the ahead command's GPU execution.
+  Default on; `RICHENGINE_DECODE_RING2_OFF` disables.
 - GGUF Q2_K native packed tile (`common/q2k_mpp_tile.h`,
   `decode/linear_gguf_q2k_sgmatrix.metal`, `gguf_decode_q2km_*`): matmul2d
   on `uint2b_format` packed data instead of staged dequant; routed under
@@ -139,7 +142,67 @@ Qwen3.8-27B-4bit.
   — fp8 right operands pair only with half or same-format fp8) and
   `resetCommandsInBuffer:` (the replay path never rewrites commands).
 
-## 9. Misc
+## 8. Constrained decode (DFA) fast path + conv fusion
+
+Agentic-workload (tool-call / JSON-schema) constrained decode, plus the
+LFM conv-layer fusion it led to. All verified with identical output
+hashes; measured via the new `benchmark-dfa` harness
+(`dev/benchmarks/dfa_pack.py` + `dfa_benchmark.mm` — drives real
+constrained decode in-process with a C++ DfaMirror answering mask
+requests; `make benchmark-dfa MODEL=...`).
+
+- Live-row mask requests: `simulationTokens` sends anchor + live
+  proposals only (was: all `kDraftProposalTokens`); `verifyMaskRows`
+  tracks the response row count. ~65% smaller mask responses on span
+  rounds (measured mask rows 218 → 174/step).
+- `decode_dfa_span_apply` kernel + merged constrained step
+  (`RICHENGINE_DFA_MERGE`, now default-on): a Full-mode batch whose
+  lanes all carry GPU DFAs encodes draft → target → commit as ONE
+  CommandGraph — zero host syncs per step (was: two). Default on;
+  `RICHENGINE_DFA_MERGE_OFF` disables.
+- `RICHENGINE_DFA_SPAN_SKIP_DRAFT` (default-on): skip the draft
+  embedding+forward when every lane's pending GPU forced span covers its
+  proposal budget; draft state is unaffected (state advances via
+  `addContextCommit`, never via draft decode). +2% on full-mode decode
+  wall in combination with the merge.
+- `RICHENGINE_GPU_DECODE_GRID` (default-on): `decode_dfa_mask` launches
+  via GPU-written indirect grid.
+- server/dfa.py bounds: `MAX_DFA_STATES` 4096 → 32766 (one below the
+  wire's 32767), `MAX_OPTIONAL_PROPERTIES` 4 → 64; `MAX_ARRAY_BOUND` and
+  `MAX_SCHEMA_DEPTH` kept (semantics / minimization blowup). More real
+  tool schemas now reach the DFA path.
+- Host-side: `commit(..., forced=False)` skips discarded forced-token
+  computation under GPU modes (`backend.py`); opt-in per-state mask-row
+  LRU under `RICHENGINE_DFA_MASK_CACHE` with `mask_stats()` counters
+  (off by default — pure-Python mask cost makes it a measurement hook).
+- Result on MiniCPM5-2B-MLX, 694-state tool-call DFA, width 2:
+  311.6 tok/s vs 297.2 host-mask baseline (+4.9%), and +14% over
+  unconstrained decode.
+- `RICHENGINE_DFA_MODE=full` stays opt-in: GPU-mask emission produced a
+  slightly different token stream in one position (unresolved parity
+  question); `forced` mode is parity-clean.
+
+## 9. LFM conv fusion (now default-on)
+
+- `verify_lfm_conv_v4_table16` (shared/lfm_conv.metal): the conv verify
+  mixer also writes the out-projection's Table16 operand (values +
+  seeds/sums32 in `write_input`'s exact xor-shuffle order), letting the
+  register-tile out_proj skip its `decode_linear_gguf_prepare` dispatch —
+  ~30 fewer dispatches/step at widths 3–4 on LFM2.5-24B.
+- Bug found in review: the fused sums differed a few ULP from the
+  reference — Metal fast-math reassociates the adds while
+  `linear_gguf_sgmatrix.metal` compiles `#pragma clang fp
+  reassociate(off)`. Fix: the same pragma scoped inside the `if
+  constexpr (Table16)` block; all widths now bitwise identical
+  (`/tmp/conv_table_test` harness).
+- Measured decode GPU: −1.9% (B1), −1.7% (B2), −0.8% (B3), −0.2% (B4);
+  byte-exact hash/acceptance. `RICHENGINE_CONV_FUSE_OFF` disables.
+- Related findings on LFM2.5-24B-A2B-GGUF:QAD-Q4_0: the packed `q40m`
+  native tile loses to staged dequant (−14…21% at B1–B2 — stays off);
+  MTL4 submission is ~1% slower than MTL3 on this conv-heavy model
+  (first MTL4 regression observed — noted for the device policy table).
+
+## 10. Misc
 
 - `model/NgramIndex.hpp` — n-gram predraft logic extracted into a pure,
   testable header.

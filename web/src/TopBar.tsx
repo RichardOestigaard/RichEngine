@@ -1,6 +1,7 @@
 import { A, useLocation } from "@solidjs/router";
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { api, apiKey, setApiKey, authorization, noteAuthStatus, unauthorized } from "./api";
+import { decisionModel, setDecisionModel } from "./decision";
 import { installJob } from "./install";
 import { poll } from "./poll";
 import { togglePalette } from "./shortcuts";
@@ -71,10 +72,14 @@ export default function TopBar() {
 
   async function loadServedModel() {
     try {
-      const res = await api<{ data?: { id?: string }[] }>("/v1/models");
+      const res = await api<{ data?: { id?: string; decision?: boolean }[] }>(
+        "/v1/models"
+      );
       setServedModel(res.data?.[0]?.id ?? null);
+      setDecisionModel(res.data?.[0]?.decision === true);
     } catch {
       setServedModel(null);
+      setDecisionModel(false);
     }
   }
 
@@ -101,10 +106,14 @@ export default function TopBar() {
         RichEngine
       </A>
       <nav class="topnav" aria-label="Pages">
-        <A href="/" class="navlink" classList={{ active: active("/") }} title="Chat (⌘1)">Chat</A>
+        <Show when={!decisionModel()}>
+          <A href="/" class="navlink" classList={{ active: active("/") }} title="Chat (⌘1)">Chat</A>
+        </Show>
         <A href="/models" class="navlink" classList={{ active: active("/models") }} title="Models (⌘2)">Models</A>
         <A href="/disk" class="navlink" classList={{ active: active("/disk") }} title="Disk (⌘3)">Disk</A>
-        <A href="/playground" class="navlink" classList={{ active: active("/playground") }} title="Playground (⌘4)">Playground</A>
+        <Show when={!decisionModel()}>
+          <A href="/playground" class="navlink" classList={{ active: active("/playground") }} title="Playground (⌘4)">Playground</A>
+        </Show>
         <A href="/judge" class="navlink" classList={{ active: active("/judge") }} title="Judge (⌘5)">Judge</A>
         <A href="/metrics" class="navlink" classList={{ active: active("/metrics") }} title="Metrics (⌘6)">Metrics</A>
         <A href="/settings" class="navlink" classList={{ active: active("/settings") }} title="Settings (⌘7)">Settings</A>
@@ -128,7 +137,19 @@ export default function TopBar() {
         <ThemeIcon name={theme()} />
       </button>
       <Show when={servedModel()}>
-        <A href="/models" class="top-model" title={`${servedModel()} — served model; open Models`}>{servedModel()}</A>
+        <A
+          href="/models"
+          class="top-model"
+          title={`${servedModel()} — served model; open Models`}
+        >
+          {servedModel()}
+          <Show when={decisionModel()}>
+            {" "}
+            <span class="badge" title="Decision model — answers /v1/systemone and /v1/judgments in one forward pass; no text generation">
+              decision
+            </span>
+          </Show>
+        </A>
       </Show>
       <Show when={installJob()?.running}>
         <A

@@ -1,6 +1,6 @@
 import { createMemo, createSignal, onCleanup, For, Show } from "solid-js";
 import { authorization, errorText, noteAuthStatus } from "../api";
-import { Chart } from "../Chart";
+import { Chart, fmtTooltipRows } from "../Chart";
 import type { ChartAppend } from "../Chart";
 import { useCopied } from "../clipboard";
 import { useFreshness } from "../fresh";
@@ -115,7 +115,12 @@ function collapseToggle(event: Event) {
 /* Series history lives at module scope: navigating away and back keeps the
    collected points instead of restarting every chart empty. */
 const seriesHistory = new Map<string, number[]>();
-let scrapeIndex = 0;
+const scrapeTimes: number[] = [];
+
+function pushScrapeTime(t: number) {
+  scrapeTimes.push(t);
+  if (scrapeTimes.length > 60) scrapeTimes.splice(0, scrapeTimes.length - 60);
+}
 
 /* Compact series rendering: ints localized, long tails in exponential. */
 function fmtValue(v: number): string {
@@ -190,6 +195,7 @@ export default function Metrics() {
       setScrape({ ...parsed, raw: text });
       setError(null);
       markOk();
+      const now = Date.now();
       for (const f of parsed.families)
         for (const s of f.samples) {
           const key = seriesKey(f.name, s);
@@ -198,7 +204,7 @@ export default function Metrics() {
             [...(seriesHistory.get(key) ?? []), s.value].slice(-60)
           );
         }
-      scrapeIndex++;
+      pushScrapeTime(now);
       const selectedFamily = parsed.families.find(
         (f) => f.name === selected()
       );
@@ -208,13 +214,31 @@ export default function Metrics() {
         selectedFamily && series.length
           ? {
               signature: series.map((s) => s.key).join("\n"),
-              x: scrapeIndex,
+              x: now,
               y: series.map((s) => s.y[s.y.length - 1] ?? s.value),
             }
           : null
       );
     } catch (e) {
       setError(errorText(e));
+      /* A failed scrape still advances the timeline: NaN samples draw as
+         gaps instead of a line connecting across the outage. */
+      const now = Date.now();
+      pushScrapeTime(now);
+      for (const [key, ys] of seriesHistory)
+        seriesHistory.set(key, [...ys, NaN].slice(-60));
+      const f = selectedFamily();
+      const series = f ? chartSeries(f) : [];
+      setHistoryTick((t) => t + 1);
+      setChartAppend(
+        f && series.length
+          ? {
+              signature: series.map((s) => s.key).join("\n"),
+              x: now,
+              y: series.map(() => NaN),
+            }
+          : null
+      );
     } finally {
       setFetching(false);
     }
@@ -258,7 +282,7 @@ export default function Metrics() {
     const n = Math.max(...series.map((s) => s.y.length));
     return {
       signature: series.map((s) => s.key).join("\n"),
-      x: Array.from({ length: n }, (_, i) => scrapeIndex - n + i + 1),
+      x: scrapeTimes.slice(-n),
       series: series.map(({ label, y }) => ({ label, y })),
     };
   };
@@ -454,6 +478,11 @@ export default function Metrics() {
                                   options={{
                                     labels: { y: fmtValue },
                                     window: 60,
+                                    xScale: "time",
+                                    zoom: true,
+                                    tooltip: {
+                                      format: fmtTooltipRows(fmtValue),
+                                    },
                                   }}
                                 />
                               </div>

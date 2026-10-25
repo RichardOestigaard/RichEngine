@@ -120,6 +120,7 @@ inline constexpr std::string_view kPrefillLfmConv = "prefill_lfm_conv";
 inline constexpr std::string_view kPrefillLfmConvV4 = "prefill_lfm_conv_v4";
 inline constexpr std::string_view kVerifyLfmConv = "verify_lfm_conv";
 inline constexpr std::string_view kVerifyLfmConvV4 = "verify_lfm_conv_v4";
+inline constexpr std::string_view kVerifyLfmConvV4Table16 = "verify_lfm_conv_v4_table16";
 inline constexpr std::string_view kVerifyLfmConvTree = "verify_lfm_conv_tree";
 inline constexpr std::string_view kCommitLfmConv = "commit_lfm_conv";
 inline constexpr std::string_view kCommitLfmConvV4 = "commit_lfm_conv_v4";

@@ -2,7 +2,7 @@ import { createSignal, createEffect, onCleanup, onMount, For, Show } from "solid
 import type { JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { api, apiPost, authorization, curlExample, errorText, storageGet, storageSet } from "../api";
-import { Chart } from "../Chart";
+import { Chart, fmtTooltipRows } from "../Chart";
 import type { ChartAppend } from "../Chart";
 import { fmtBytes, fmtInt, fmtMs, fmtTokens, pct, rate } from "../format";
 import { installJob, onInstallDone, pollInstall, setInstallJob } from "../install";
@@ -295,14 +295,11 @@ function collapseToggle(event: Event) {
    the collected points instead of restarting every chart empty (same
    pattern as the Metrics page's seriesHistory). */
 const [history, setHistory] = createSignal<{
+  t: number[];
   decode: number[];
   prefill: number[];
   memory: number[];
-}>({ decode: [], prefill: [], memory: [] });
-let historyIndex = 0;
-
-const indexRange = (length: number) =>
-  Array.from({ length }, (_, i) => historyIndex - length + i + 1);
+}>({ t: [], decode: [], prefill: [], memory: [] });
 
 /* ---- page ---- */
 
@@ -342,25 +339,41 @@ export default function Models() {
   let logPinned = true;
   let tuneLogPinned = true;
 
+  /* A failed poll still advances the timeline: NaN samples draw as gaps
+     instead of a line that pretends the outage never happened. */
+  function recordSample(sample: {
+    decode: number;
+    prefill: number;
+    memory: number;
+  } | null) {
+    const now = Date.now();
+    setHistory((h) => ({
+      t: [...h.t, now].slice(-60),
+      decode: [...h.decode, sample?.decode ?? NaN].slice(-60),
+      prefill: [...h.prefill, sample?.prefill ?? NaN].slice(-60),
+      memory: [...h.memory, sample?.memory ?? NaN].slice(-60),
+    }));
+    setPerformanceAppend({
+      x: now,
+      y: sample ? [sample.decode, sample.prefill] : [NaN, NaN],
+    });
+    setMemoryAppend({ x: now, y: sample?.memory ?? NaN });
+  }
+
   async function pollStatus() {
     try {
       const next = await api<Status>("/status");
       setStatus(next);
       setError(null);
       markOk();
-      const decode = next.metrics?.decode_tokens_per_second ?? 0;
-      const prefill = next.metrics?.prefill_tokens_per_second ?? 0;
-      const memory = next.memory_actual?.current_bytes ?? 0;
-      historyIndex++;
-      setHistory((h) => ({
-        decode: [...h.decode, decode].slice(-60),
-        prefill: [...h.prefill, prefill].slice(-60),
-        memory: [...h.memory, memory].slice(-60),
-      }));
-      setPerformanceAppend({ x: historyIndex, y: [decode, prefill] });
-      setMemoryAppend({ x: historyIndex, y: memory });
+      recordSample({
+        decode: next.metrics?.decode_tokens_per_second ?? 0,
+        prefill: next.metrics?.prefill_tokens_per_second ?? 0,
+        memory: next.memory_actual?.current_bytes ?? 0,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      recordSample(null);
     }
   }
 
@@ -1279,7 +1292,7 @@ export default function Models() {
                   type="area"
                   height={140}
                   data={{
-                    x: indexRange(history().decode.length),
+                    x: history().t.slice(-history().decode.length),
                     series: [
                       { label: "decode tok/s", y: history().decode },
                       { label: "prefill tok/s", y: history().prefill },
@@ -1288,8 +1301,13 @@ export default function Models() {
                   append={performanceAppend()}
                   options={{
                     legend: true,
-                    labels: { x: () => "", y: fmtInt },
+                    labels: { y: fmtInt },
                     window: 60,
+                    xScale: "time",
+                    zoom: { wheel: false },
+                    tooltip: {
+                      format: fmtTooltipRows((v) => `${fmtInt(v)} tok/s`),
+                    },
                     yMin: 0,
                   }}
                 />
@@ -1332,6 +1350,7 @@ export default function Models() {
                   options={{
                     legend: true,
                     labels: { y: fmtMs },
+                    tooltip: { format: fmtTooltipRows(fmtMs) },
                     yMin: 0,
                   }}
                 />
@@ -1378,7 +1397,11 @@ export default function Models() {
                       },
                     ],
                   }}
-                  options={{ labels: { y: fmtInt }, yMin: 0 }}
+                  options={{
+                    labels: { y: fmtInt },
+                    tooltip: { format: fmtTooltipRows(fmtInt) },
+                    yMin: 0,
+                  }}
                 />
               </div>
             </Show>
@@ -1445,13 +1468,16 @@ export default function Models() {
                   type="area"
                   height={120}
                   data={{
-                    x: indexRange(history().memory.length),
+                    x: history().t.slice(-history().memory.length),
                     series: [{ label: "bytes", y: history().memory }],
                   }}
                   append={memoryAppend()}
                   options={{
-                    labels: { x: () => "", y: fmtBytes },
+                    labels: { y: fmtBytes },
                     window: 60,
+                    xScale: "time",
+                    zoom: { wheel: false },
+                    tooltip: { format: fmtTooltipRows(fmtBytes) },
                     yMin: 0,
                   }}
                 />
@@ -1592,7 +1618,11 @@ export default function Models() {
                         categories: stage.cats,
                         series: [{ label: stage.name, values: stage.data }],
                       }}
-                      options={{ labels: { y: fmtInt }, yMin: 0 }}
+                      options={{
+                        labels: { y: fmtInt },
+                        tooltip: { format: fmtTooltipRows(fmtInt) },
+                        yMin: 0,
+                      }}
                     />
                   </div>
                 </div>

@@ -2,7 +2,7 @@ import { createSignal, onMount, For, Show } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import { Tab, TabGroup, TabList, TabPanel } from "terracotta";
 import { ApiError, api, authorization, errorText, noteAuthStatus } from "../api";
-import { Chart } from "../Chart";
+import { Chart, fmtTooltipRows } from "../Chart";
 import { useCopied } from "../clipboard";
 import { fmtInt, fmtMs, pct } from "../format";
 import { pushToast } from "../toast";
@@ -245,6 +245,7 @@ export default function Judge() {
   ]);
   const [jBusy, setJBusy] = createSignal(false);
   const [jResult, setJResult] = createSignal<JudgmentResponse | null>(null);
+  const [jSelected, setJSelected] = createSignal<string | null>(null);
   const [jController, setJController] = createSignal<AbortController>();
   const [jCancelled, setJCancelled] = createSignal(false);
 
@@ -816,6 +817,11 @@ export default function Judge() {
                         yMin: 0,
                         yMax: 1,
                         labels: { y: pct },
+                        tooltip: { format: fmtTooltipRows(pct) },
+                        onSelect: (info) =>
+                          setJSelected(
+                            info?.kind === "bar" ? info.category : null
+                          ),
                       }}
                     />
                   </div>
@@ -823,7 +829,11 @@ export default function Judge() {
                 <For each={judgmentRows()}>
                   {(row) => (
                     <>
-                      <div class="panel-row">
+                      <div
+                        class={`panel-row judge-row${
+                          jSelected() === row.id ? " sel" : ""
+                        }`}
+                      >
                         <span class="grow mono">{row.id}</span>
                         <span class="num">
                           {typeof row.logit === "number"

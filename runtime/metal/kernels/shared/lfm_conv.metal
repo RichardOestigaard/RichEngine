@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/LfmConv.h"
 #include "metal/abi/Sampling.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 
 // LFM2's short convolution mixer. The packed in_proj row is [B | C | x];
 // the layer computes bx = B*x, runs the causal depthwise convolution over
@@ -207,18 +208,15 @@ kernel void verify_lfm_conv(
 constant uint kLfmVerifyVecColumns = 32;       // bfloat4 lanes per row slice
 constant uint kLfmVerifyStage = 1024;          // rows*kLfmVerifyVecColumns max
 
-kernel void verify_lfm_conv_v4(
-    device const bfloat *packed [[buffer(0)]],
-    device const bfloat *weights [[buffer(1)]],
-    device const bfloat *state0 [[buffer(2)]],
-    device const bfloat *state1 [[buffer(3)]],
-    device const bfloat *state2 [[buffer(4)]],
-    device const bfloat *state3 [[buffer(5)]],
-    device bfloat *mixed [[buffer(6)]],
-    device bfloat *output [[buffer(7)]],
-    constant RichLfmConvParams &params [[buffer(8)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]) {
+template <bool Table16>
+static inline void verify_v4_impl(
+    device const bfloat *packed, device const bfloat *weights,
+    device const bfloat *state0, device const bfloat *state1,
+    device const bfloat *state2, device const bfloat *state3,
+    device bfloat *mixed, device bfloat *output,
+    device bfloat *table, device float *sums,
+    threadgroup bfloat4 *staged,
+    constant RichLfmConvParams &params, uint group, uint tid) {
   const uint dimension = params.dimension;
   const uint rows = params.rows;
   const uint taps = params.taps;
@@ -239,7 +237,6 @@ kernel void verify_lfm_conv_v4(
   const float4 c = LfmVec<4>::load(packed, base + dimension + channel);
   const float4 x = LfmVec<4>::load(packed, base + 2 * dimension + channel);
   const bfloat4 bx = bfloat4(b * x);
-  threadgroup bfloat4 staged[kLfmVerifyStage];
   staged[row * kLfmVerifyVecColumns + (tid % kLfmVerifyVecColumns)] = bx;
   *reinterpret_cast<device bfloat4 *>(
       mixed + (lane_base + row) * dimension + channel) = bx;
@@ -259,7 +256,98 @@ kernel void verify_lfm_conv_v4(
           staged[uint(p) * kLfmVerifyVecColumns + (tid % kLfmVerifyVecColumns)]);
     conv += w * source;
   }
-  LfmVec<4>::store(output, (lane_base + row) * dimension + channel, c * conv);
+  const bfloat4 result = bfloat4(c * conv);
+  *reinterpret_cast<device bfloat4 *>(output + (lane_base + row) * dimension +
+                                      channel) = result;
+  // The consumer's Table16 operand (RICHENGINE_CONV_FUSE): the same
+  // values `decode_linear_gguf_prepare` would emit, in its exact
+  // xor-shuffle reduction order — and under the same fp discipline:
+  // the prepare kernel's translation unit compiles with
+  // `fp reassociate(off)`, without which Metal's fast-math permutes
+  // these adds a few ULPs from the reference.
+  if constexpr (Table16) {
+#pragma clang fp reassociate(off)
+    // This simd lane holds the row's four
+    // channels 4m..4m+3 of one 64-input span — table lanes 2m and 2m+1 —
+    // so the pair sums, the -160*sum16 chain seeds and the sum32s rebuild
+    // the producer kernel's trees two table lanes per thread.
+    const uint m = column & 15;
+    const uint span = column >> 4;   // column is in bfloat4 units
+    const ulong tile_row = lane_base + row;
+    device bfloat *tile =
+        table + (tile_row / q4sg::kRows) * uint64_t(dimension) * q4sg::kRows;
+    device float *tile_sums =
+        sums + (tile_row / q4sg::kRows) * table16_sums_per_tile(dimension);
+    const uint row8 = uint(tile_row % q4sg::kRows);
+    const uint2 lo = gguf_sg::klogical(4 * m);
+    const uint2 hi = gguf_sg::klogical(4 * m + 2);
+    tile[span * GGUF_TABLE16_SPAN_VALUES +
+         q4sg::xt_offset(lo.x, lo.y, row8)] = result.x;
+    tile[span * GGUF_TABLE16_SPAN_VALUES +
+         q4sg::xt_offset(lo.x, lo.y + 1, row8)] = result.y;
+    tile[span * GGUF_TABLE16_SPAN_VALUES +
+         q4sg::xt_offset(hi.x, hi.y, row8)] = result.z;
+    tile[span * GGUF_TABLE16_SPAN_VALUES +
+         q4sg::xt_offset(hi.x, hi.y + 1, row8)] = result.w;
+    // Table lane t sums float(a) + float(b) of its pair; the xor ladder
+    // below walks bits 1, 2, 4 on those pairs the way the producer's
+    // xor 1, 2, 4 ladder walks its 32 table lanes (pairs stay inside the
+    // same 16-lane span half).
+    const float pair0 = float(result.x) + float(result.y);
+    const float pair1 = float(result.z) + float(result.w);
+    const float quad = pair0 + pair1;
+    const float eight = quad + simd_shuffle_xor(quad, 1u);
+    const float sum16 = eight + simd_shuffle_xor(eight, 2u);
+    if ((m & 3u) == 0u)
+      tile_sums[(span * (GGUF_TABLE16_SPAN_SEEDS / q4sg::kRows) + (m >> 2)) *
+                    q4sg::kRows + row8] = -float(gguf_sg::kZeroPointOffset) * sum16;
+    const float sum32 = sum16 + simd_shuffle_xor(sum16, 4u);
+    if ((m & 7u) == 0u)
+      tile_sums[table16_sums32_offset(dimension) +
+                (span * (GGUF_TABLE16_SPAN_SUMS / q4sg::kRows) + (m >> 3)) *
+                    q4sg::kRows + row8] = sum32;
+  }
+}
+
+kernel void verify_lfm_conv_v4(
+    device const bfloat *packed [[buffer(0)]],
+    device const bfloat *weights [[buffer(1)]],
+    device const bfloat *state0 [[buffer(2)]],
+    device const bfloat *state1 [[buffer(3)]],
+    device const bfloat *state2 [[buffer(4)]],
+    device const bfloat *state3 [[buffer(5)]],
+    device bfloat *mixed [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    constant RichLfmConvParams &params [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup bfloat4 staged[kLfmVerifyStage];
+  verify_v4_impl<false>(packed, weights, state0, state1, state2, state3,
+                        mixed, output, nullptr, nullptr, staged, params,
+                        group, tid);
+}
+
+// RICHENGINE_CONV_FUSE's fused variant: additionally writes the Table16
+// operand the register-tile out-projection reads, which then skips its
+// decode_linear_gguf_prepare dispatch (ops/LfmConv.cpp).
+kernel void verify_lfm_conv_v4_table16(
+    device const bfloat *packed [[buffer(0)]],
+    device const bfloat *weights [[buffer(1)]],
+    device const bfloat *state0 [[buffer(2)]],
+    device const bfloat *state1 [[buffer(3)]],
+    device const bfloat *state2 [[buffer(4)]],
+    device const bfloat *state3 [[buffer(5)]],
+    device bfloat *mixed [[buffer(6)]],
+    device bfloat *output [[buffer(7)]],
+    device bfloat *table [[buffer(8)]],
+    device float *sums [[buffer(9)]],
+    constant RichLfmConvParams &params [[buffer(10)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+  threadgroup bfloat4 staged[kLfmVerifyStage];
+  verify_v4_impl<true>(packed, weights, state0, state1, state2, state3,
+                       mixed, output, table, sums, staged, params, group,
+                       tid);
 }
 
 // Commit the conv states after acceptance: every lane's new FIFO is the

@@ -79,6 +79,12 @@ struct Tuning {
   uint32_t canvasMaxSteps = 0;      // RICHENGINE_CANVAS_MAX_STEPS (else profile default)
   std::string_view canvasProbe;     // RICHENGINE_CANVAS_PROBE
   bool canvasTiming = false;        // RICHENGINE_CANVAS_TIMING (presence)
+  // ops/LfmConv.cpp: the chain verify mixer writes the out-projection's
+  // Table16 operand itself (verify_lfm_conv_v4_table16) when the consumer's
+  // plan wants it — a register-tile out_proj then skips its
+  // decode_linear_gguf_prepare dispatch per conv layer. Measured −0.2…1.9%
+  // decode on LFM2.5-24B; bitwise-identical.
+  bool convFuse = false;            // RICHENGINE_CONV_FUSE_OFF disables (default on)
   // model/RuntimeImpl.hpp speculative-decode policy
   bool verifyTreeSet = false;       // RICHENGINE_VERIFY_TREE (presence)
   bool verifyTree = false;          // RICHENGINE_VERIFY_TREE=1
@@ -218,6 +224,7 @@ inline Tuning makeTuning() {
                                                        : 0u;
   t.canvasProbe = stringOrEmpty("RICHENGINE_CANVAS_PROBE");
   t.canvasTiming = envFlag("RICHENGINE_CANVAS_TIMING");
+  t.convFuse = !envFlag("RICHENGINE_CONV_FUSE_OFF");
   t.verifyTreeSet = envFlag("RICHENGINE_VERIFY_TREE");
   t.verifyTree = envFlagOn("RICHENGINE_VERIFY_TREE");
   t.adaptiveProposals = unlessZero("RICHENGINE_ADAPTIVE_PROPOSALS");

@@ -1,7 +1,8 @@
 import { createMemo, createSignal, onMount, For, Show } from "solid-js";
-import { useSearchParams } from "@solidjs/router";
+import { A, useSearchParams } from "@solidjs/router";
 import { Tab, TabGroup, TabList, TabPanel } from "terracotta";
 import { ApiError, api, authorization, errorText, noteAuthStatus } from "../api";
+import { decisionModel } from "../decision";
 import { useCopied } from "../clipboard";
 import { fmtInt } from "../format";
 import { pushToast } from "../toast";
@@ -495,6 +496,13 @@ export default function Playground() {
     <main class="page playground">
       <h1>Playground</h1>
       <p class="lede">Tokenizer and prompt workbench.</p>
+      <Show when={decisionModel()}>
+        <p class="notice">
+          The served model is a decision model — template rendering and
+          generation are unavailable; tokenize still works. Use{" "}
+          <A href="/judge">Judge</A> for decisions.
+        </p>
+      </Show>
 
       <TabGroup
         class="playground-tabs"

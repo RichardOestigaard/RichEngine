@@ -46,6 +46,8 @@
     "ICB_OFF",
     "PREPARED_CACHE_OFF",
     "PATCHABLE_OFF",
-    "NO_FUSED_GATE"
+    "NO_FUSED_GATE",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS"
   ]
 }

@@ -12,8 +12,11 @@ importers:
         specifier: ^1.0.0
         version: 1.0.0(solid-js@1.9.17)
       resolvcharts:
-        specifier: 0.4.1
-        version: 0.4.1
+        specifier: 0.6.0
+        version: 0.6.0
+      resolvcharts-solid:
+        specifier: ^0.6.0
+        version: 0.6.0(solid-js@1.9.17)
       solid-js:
         specifier: ^1.9.5
         version: 1.9.17
@@ -25,11 +28,11 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
       vite:
-        specifier: ^8.3.3
-        version: 8.3.4
+        specifier: ^8.3.5
+        version: 8.3.5
       vite-plugin-solid:
         specifier: ^2.11.8
-        version: 2.11.14(solid-js@1.9.17)(vite@8.3.4)
+        version: 2.11.14(solid-js@1.9.17)(vite@8.3.5)
 
 packages:
 
@@ -571,8 +574,13 @@ packages:
     resolution: {integrity: sha512-zkd+e9S1AQHhmaBKye9zlFHWjOwVgqXl1q3ECYy8561K7qxR2cREf/STLskulBFd78k6AOFeA+ff1TtEzk9bAA==}
     engines: {node: ^10 || ^12 || >=14}
 
-  resolvcharts@0.4.1:
-    resolution: {integrity: sha512-DPs1sxMrAhXPU/qLzgFz4wSN79DaItD+BUN8t05y5nwmY84bg2aB1ikVXQevaxu72jks/ZuakGIcmLm00hE4Xw==}
+  resolvcharts-solid@0.6.0:
+    resolution: {integrity: sha512-OjfTeAnuzoiZxvdJkIZgjUJN5QkE8sMDZFkgf1uexeWpzMfNf9C3d29Sdc2xy4du9orW2fjNHkdbQWPE8Bo1bg==}
+    peerDependencies:
+      solid-js: ^1.8.0
+
+  resolvcharts@0.6.0:
+    resolution: {integrity: sha512-R48g0/ZTHnsFAyamf4RuI6pF3XVYEK6l50kru8F8ZcdOooqijw8jNsnLvsy+vjBvE2YW+jet58W5vGrzgXyasg==}
     engines: {node: '>=24'}
 
   rolldown@1.2.14:
@@ -643,13 +651,13 @@ packages:
       '@testing-library/jest-dom':
         optional: true
 
-  vite@8.3.4:
-    resolution: {integrity: sha512-IftLE8phJhdNRIGNEV4JCCvfNScoZQVfcXaN8TQropWGJtOHcu+iAB9pHcuGvmEb/kddw0LBe/jS8ztdC6xdiQ==}
+  vite@8.3.5:
+    resolution: {integrity: sha512-z1YpjieJ9g0ebTmQpLBv/oq9E3F9EIlOe+7LahW8SrE3LTiG3udBRUXQOlYXP9b+IC2q2phHeVxj9xGlw34OEQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
     peerDependencies:
       '@types/node': ^20.19.0 || >=22.12.0
-      '@vitejs/devtools': ^0.7.1
+      '@vitejs/devtools': ^0.7.1 || ^0.8.0
       esbuild: ^0.27.0 || ^0.28.0
       jiti: '>=1.21.0'
       less: ^4.0.0
@@ -1103,7 +1111,12 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
-  resolvcharts@0.4.1: {}
+  resolvcharts-solid@0.6.0(solid-js@1.9.17):
+    dependencies:
+      resolvcharts: 0.6.0
+      solid-js: 1.9.17
+
+  resolvcharts@0.6.0: {}
 
   rolldown@1.2.14:
     dependencies:
@@ -1194,7 +1207,7 @@ snapshots:
       escalade: 3.2.0
       picocolors: 1.1.1
 
-  vite-plugin-solid@2.11.14(solid-js@1.9.17)(vite@8.3.4):
+  vite-plugin-solid@2.11.14(solid-js@1.9.17)(vite@8.3.5):
     dependencies:
       '@babel/core': 7.29.7
       '@types/babel__core': 7.20.5
@@ -1202,12 +1215,12 @@ snapshots:
       merge-anything: 5.1.7
       solid-js: 1.9.17
       solid-refresh: 0.6.3(solid-js@1.9.17)
-      vite: 8.3.4
-      vitefu: 1.1.3(vite@8.3.4)
+      vite: 8.3.5
+      vitefu: 1.1.3(vite@8.3.5)
     transitivePeerDependencies:
       - supports-color
 
-  vite@8.3.4:
+  vite@8.3.5:
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.7
@@ -1217,8 +1230,8 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
-  vitefu@1.1.3(vite@8.3.4):
+  vitefu@1.1.3(vite@8.3.5):
     optionalDependencies:
-      vite: 8.3.4
+      vite: 8.3.5
 
   yallist@3.1.1: {}

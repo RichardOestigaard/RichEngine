@@ -3,18 +3,21 @@ import {
   createMemo,
   createSignal,
   For,
-  onCleanup,
   Show,
   untrack,
 } from "solid-js";
-import { createChart } from "resolvcharts";
+import { Chart as RcChart } from "resolvcharts-solid";
+import type {
+  ChartInstance,
+  ChartOptions,
+  ChartType,
+  HoverInfo,
+} from "resolvcharts-solid";
+import type { TooltipFormatter } from "resolvcharts";
 import { theme } from "./theme";
 import "./chart.css";
 
-type ChartOptions = Parameters<typeof createChart>[1];
 type ChartData = ChartOptions["data"];
-type ChartType = ChartOptions["type"];
-type ChartInstance = ReturnType<typeof createChart>;
 type ExtraOptions = Omit<
   ChartOptions,
   "type" | "data" | "height" | "theme" | "animate"
@@ -74,6 +77,30 @@ export interface ChartAppend {
   y: number | number[];
 }
 
+export const fmtTooltipRows =
+  (fmt: (v: number) => string): TooltipFormatter =>
+  (info: HoverInfo) => {
+    if (info.kind === "point")
+      return {
+        rows: info.values.map((v) => ({
+          color: v.color,
+          label: v.label,
+          value: fmt(v.y),
+        })),
+      };
+    if (info.kind === "bar")
+      return {
+        rows: [
+          {
+            color: info.color,
+            label: `${info.category} ${info.label}`.trim(),
+            value: fmt(info.value),
+          },
+        ],
+      };
+    return null;
+  };
+
 export interface ChartProps {
   type: ChartType;
   data: ChartData;
@@ -83,7 +110,6 @@ export interface ChartProps {
 }
 
 export function Chart(props: ChartProps) {
-  let el!: HTMLDivElement;
   let chart: ChartInstance | undefined;
   let lastAppend = props.append;
 
@@ -137,20 +163,6 @@ export function Chart(props: ChartProps) {
   });
 
   createEffect(() => {
-    const next = createChart(el, {
-      ...options(),
-      type: props.type,
-      data: untrack(() => props.data),
-    });
-    chart = next;
-    lastAppend = untrack(() => props.append);
-    onCleanup(() => {
-      if (chart === next) chart = undefined;
-      next.destroy();
-    });
-  });
-
-  createEffect(() => {
     const pending = props.append;
     if (pending && appendTypes.has(props.type)) {
       if (pending !== lastAppend) chart?.append(pending.x, pending.y);
@@ -158,7 +170,6 @@ export function Chart(props: ChartProps) {
       return;
     }
     lastAppend = pending ?? null;
-    chart?.setData(props.data);
   });
 
   return (
@@ -179,7 +190,20 @@ export function Chart(props: ChartProps) {
           </For>
         </div>
       </Show>
-      <div ref={el} />
+      <Show when={options()} keyed>
+        {(opts) => {
+          lastAppend = untrack(() => props.append);
+          return (
+            <RcChart
+              {...opts}
+              legend={false}
+              ref={(c) => (chart = c ?? undefined)}
+              type={props.type}
+              data={props.data}
+            />
+          );
+        }}
+      </Show>
     </div>
   );
 }

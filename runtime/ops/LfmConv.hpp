@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/Linear.hpp"
 
 #include <cstdint>
 #include <span>
@@ -36,6 +37,9 @@ struct LfmConvVerifyBuffers final {
   std::span<const metal::MetalBuffer> currentStates;
   metal::MetalBuffer mixed;     // bx rows, lanes*rows*dim, for the commit
   metal::MetalBuffer output;    // [lanes*rows][dim]
+  // The scratch a fused verify writes the consumer's operand table into
+  // (only when `input` below is Table16 and the v4 tile applies).
+  LinearScratch linearScratch;
 };
 
 struct LfmConvCommitBuffers final {
@@ -73,11 +77,18 @@ public:
                          const LfmConvPrefillBuffers &buffers,
                          const LfmConvShape &shape, uint32_t rows,
                          bool tapsMajor);
-  static void addVerify(metal::CommandGraph &graph,
-                        const LfmConvVerifyBuffers &buffers,
-                        const LfmConvShape &shape, uint32_t lanes,
-                        uint32_t rows, uint32_t layer,
-                        uint64_t stateLayerBytes, bool tapsMajor);
+  // `input` is the out-projection plan's operand layout: under
+  // RICHENGINE_CONV_FUSE a Table16 consumer makes the vectorized kernel
+  // write the table itself (verify_lfm_conv_v4_table16), sparing the
+  // consumer's decode_linear_gguf_prepare dispatch, and the returned
+  // PreparedInput describes it. Any other layout (or a shape the v4 tile
+  // cannot run) keeps the plain path and returns {}.
+  static PreparedInput addVerify(metal::CommandGraph &graph,
+                                 const LfmConvVerifyBuffers &buffers,
+                                 const LfmConvShape &shape, uint32_t lanes,
+                                 uint32_t rows, uint32_t layer,
+                                 uint64_t stateLayerBytes, LinearInput input,
+                                 bool tapsMajor);
   // `layers` layers' states committed from the step's retained rows in one
   // dispatch: layer l's state slot is layer+l and its `mixed` block sits
   // l*mixedLayerStride bytes into the buffer.

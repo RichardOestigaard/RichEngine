@@ -113,8 +113,8 @@ class TestEligibility(unittest.TestCase):
         table = TUNING_TABLES["Qwen3.8-27B"]
         fast = {k.env for k in eligible(table, _context(gpu_family=10))}
         slow = {k.env for k in eligible(table, _context(gpu_family=8))}
-        self.assertIn("RICHENGINE_MTL4", fast)
-        self.assertNotIn("RICHENGINE_MTL4", slow)
+        self.assertIn("RICHENGINE_MTL4_OFF", fast)
+        self.assertNotIn("RICHENGINE_MTL4_OFF", slow)
 
     def test_bandwidth_gate(self):
         table = TUNING_TABLES["Qwen3.8-27B"]
@@ -429,19 +429,19 @@ class TestPersistence(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "M4 Max": self._record(env={"RICHENGINE_MTL4": "1"}),
-                        "M1": self._record(env={"RICHENGINE_MTL4": "0"}),
+                        "M4 Max": self._record(env={"RICHENGINE_MTL4_OFF": "1"}),
+                        "M1": self._record(env={"RICHENGINE_MTL4_OFF": "0"}),
                     }
                 )
             )
             tuned = autotune.load_tuning(Path(directory), chip="M4 Max")
-            self.assertEqual(tuned, {"RICHENGINE_MTL4": "1"})
+            self.assertEqual(tuned, {"RICHENGINE_MTL4_OFF": "1"})
             self.assertEqual(autotune.load_tuning(Path(directory), chip="M2"), {})
 
     def test_older_schema_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
             autotune.tuning_path(Path(directory)).write_text(
-                json.dumps({"M4": {"schema": 1, "env": {"RICHENGINE_MTL4": "1"}}})
+                json.dumps({"M4": {"schema": 1, "env": {"RICHENGINE_MTL4_OFF": "1"}}})
             )
             self.assertEqual(autotune.load_tuning(Path(directory), chip="M4"), {})
             self.assertEqual(
@@ -457,7 +457,7 @@ class TestPersistence(unittest.TestCase):
                 json.dumps(
                     {
                         "M4": self._record(
-                            env={"RICHENGINE_MTL4": "1"},
+                            env={"RICHENGINE_MTL4_OFF": "1"},
                             engine=autotune.engine_fingerprint(binary),
                         )
                     }
@@ -465,7 +465,7 @@ class TestPersistence(unittest.TestCase):
             )
             self.assertEqual(
                 autotune.load_tuning(Path(directory), chip="M4", binary=binary),
-                {"RICHENGINE_MTL4": "1"},
+                {"RICHENGINE_MTL4_OFF": "1"},
             )
             binary.write_bytes(b"engine-v2-rebuilt")
             self.assertEqual(
@@ -488,14 +488,14 @@ class TestPersistence(unittest.TestCase):
     def test_user_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             autotune.tuning_path(Path(directory)).write_text(
-                json.dumps({"X": self._record(env={"RICHENGINE_MTL4": "0"})})
+                json.dumps({"X": self._record(env={"RICHENGINE_MTL4_OFF": "0"})})
             )
-            os.environ["RICHENGINE_MTL4"] = "1"
+            os.environ["RICHENGINE_MTL4_OFF"] = "1"
             try:
                 env = autotune.tuned_environment(Path(directory), chip="X")
             finally:
-                del os.environ["RICHENGINE_MTL4"]
-            self.assertEqual(env["RICHENGINE_MTL4"], "1")
+                del os.environ["RICHENGINE_MTL4_OFF"]
+            self.assertEqual(env["RICHENGINE_MTL4_OFF"], "1")
 
 
 class _FakeProcess:
@@ -618,7 +618,7 @@ class TestTunerJob(unittest.TestCase):
                     {
                         chip: {
                             "schema": autotune.TUNING_SCHEMA,
-                            "env": {"RICHENGINE_MTL4": "1"},
+                            "env": {"RICHENGINE_MTL4_OFF": "1"},
                         }
                     }
                 )
@@ -640,7 +640,7 @@ class TestTunerJob(unittest.TestCase):
                 time.sleep(0.02)
             status = instance.status()
             self.assertTrue(status["ok"])
-            self.assertEqual(status["kept"], ["MTL4=1"])
+            self.assertEqual(status["kept"], ["MTL4_OFF=1"])
             self.assertEqual(status["tail"], ["kept MTL4=1"])
 
     def test_cancel_when_idle_is_false(self):
@@ -831,14 +831,14 @@ class TestPackageTuningPath(unittest.TestCase):
                     {
                         "M4": {
                             "schema": autotune.TUNING_SCHEMA,
-                            "env": {"RICHENGINE_MTL4": "1"},
+                            "env": {"RICHENGINE_MTL4_OFF": "1"},
                         }
                     }
                 )
             )
             self.assertEqual(
                 autotune.load_tuning(link, chip="M4"),
-                {"RICHENGINE_MTL4": "1"},
+                {"RICHENGINE_MTL4_OFF": "1"},
             )
 
     def test_installed_details_surfaces_mode_and_verdicts(self):
@@ -854,10 +854,10 @@ class TestPackageTuningPath(unittest.TestCase):
                         chip: {
                             "schema": autotune.TUNING_SCHEMA,
                             "mode": "complete",
-                            "env": {"RICHENGINE_MTL4": "1"},
+                            "env": {"RICHENGINE_MTL4_OFF": "1"},
                             "complete": True,
                             "verdicts": {
-                                "RICHENGINE_MTL4=1": "kept",
+                                "RICHENGINE_MTL4_OFF=1": "kept",
                                 "RICHENGINE_X=0": "eliminated",
                                 "RICHENGINE_Y=1": "rejected",
                             },
@@ -1009,7 +1009,7 @@ class TestSweepRecording(unittest.TestCase):
             directory = self._assembly(Path(td))
             env, record, calls, logs = self._run(
                 directory,
-                {frozenset({("RICHENGINE_MTL4", "1")}): 120.0},
+                {frozenset({("RICHENGINE_MTL4_OFF", "1")}): 120.0},
                 contaminated="a loaded engine shares the GPU",
             )
         self.assertEqual(env, {})
@@ -1024,23 +1024,23 @@ class TestSweepRecording(unittest.TestCase):
         )
 
     def test_user_set_env_excluded(self):
-        os.environ["RICHENGINE_MTL4"] = "1"
+        os.environ["RICHENGINE_MTL4_OFF"] = "1"
         try:
             with tempfile.TemporaryDirectory() as td:
                 directory = self._assembly(Path(td))
                 env, record, calls, logs = self._run(directory, {})
         finally:
-            del os.environ["RICHENGINE_MTL4"]
-        self.assertFalse(any("RICHENGINE_MTL4" in call for call in calls))
+            del os.environ["RICHENGINE_MTL4_OFF"]
+        self.assertFalse(any("RICHENGINE_MTL4_OFF" in call for call in calls))
         self.assertTrue(any("already set" in line for line in logs), logs)
 
     def test_backward_elimination_drops_dead_winners(self):
         scores = {
             frozenset(): 100.0,
-            frozenset({("RICHENGINE_MTL4", "1")}): 105.0,
+            frozenset({("RICHENGINE_MTL4_OFF", "1")}): 105.0,
             frozenset(
                 {
-                    ("RICHENGINE_MTL4", "1"),
+                    ("RICHENGINE_MTL4_OFF", "1"),
                     ("RICHENGINE_SUBMIT_AHEAD", "1"),
                 }
             ): 108.0,
@@ -1052,18 +1052,18 @@ class TestSweepRecording(unittest.TestCase):
             directory = self._assembly(Path(td))
             env, record, calls, logs = self._run(directory, scores)
         self.assertEqual(env, {"RICHENGINE_SUBMIT_AHEAD": "1"})
-        self.assertEqual(record["verdicts"]["RICHENGINE_MTL4=1"], "eliminated")
+        self.assertEqual(record["verdicts"]["RICHENGINE_MTL4_OFF=1"], "eliminated")
         self.assertEqual(record["verdicts"]["RICHENGINE_SUBMIT_AHEAD=1"], "kept")
 
     def test_ordered_prune_compares_against_baseline(self):
         scores = {
             frozenset(): 100.0,
-            frozenset({("RICHENGINE_MTL4", "1")}): 200.0,
+            frozenset({("RICHENGINE_MTL4_OFF", "1")}): 200.0,
             # A 2% loss against the baseline — deep only against the
             # running best — must not prune the ordered rest.
             frozenset(
                 {
-                    ("RICHENGINE_MTL4", "1"),
+                    ("RICHENGINE_MTL4_OFF", "1"),
                     ("RICHENGINE_PROPOSAL_CAP", "6"),
                 }
             ): 98.0,
@@ -1102,7 +1102,7 @@ class TestSweepRecording(unittest.TestCase):
                     {
                         "M4 Max": {
                             "Qwen3.8-27B": {
-                                "RICHENGINE_MTL4=1": {
+                                "RICHENGINE_MTL4_OFF=1": {
                                     "wins": 0,
                                     "losses": 20,
                                 }
@@ -1117,8 +1117,8 @@ class TestSweepRecording(unittest.TestCase):
                 priors_path=priors,
                 interactions=False,
             )
-        self.assertEqual(record["verdicts"]["RICHENGINE_MTL4=1"], "prior-skipped")
-        self.assertFalse(any("RICHENGINE_MTL4" in call for call in calls))
+        self.assertEqual(record["verdicts"]["RICHENGINE_MTL4_OFF=1"], "prior-skipped")
+        self.assertFalse(any("RICHENGINE_MTL4_OFF" in call for call in calls))
 
     def test_record_carries_mode_and_verdicts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1148,8 +1148,8 @@ class TestEnvGatesAndPhaseLines(unittest.TestCase):
 
         self.assertTrue(tuner._PHASE_LINE.match("prune · 3 winners"))
         self.assertEqual(tuner._TOTAL_LINE.search("prune · 3 winners").group(1), "3")
-        self.assertTrue(tuner._CANDIDATE_LINE.match("-RICHENGINE_MTL4=1 · {}"))
-        self.assertTrue(tuner._TRYING_LINE.match("trying -RICHENGINE_MTL4=1"))
+        self.assertTrue(tuner._CANDIDATE_LINE.match("-RICHENGINE_MTL4_OFF=1 · {}"))
+        self.assertTrue(tuner._TRYING_LINE.match("trying -RICHENGINE_MTL4_OFF=1"))
 
 
 if __name__ == "__main__":

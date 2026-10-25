@@ -1,9 +1,11 @@
 #include "ops/LfmConv.hpp"
 
+#include "Tuning.hpp"
 #include "metal/abi/LfmConv.h"
 #include "ops/KernelNames.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 namespace richengine::ops {
 namespace {
@@ -61,27 +63,44 @@ void LfmConv::addPrefill(metal::CommandGraph &graph, const LfmConvPrefillBuffers
   }
 }
 
-void LfmConv::addVerify(metal::CommandGraph &graph, const LfmConvVerifyBuffers &buffers,
-                        const LfmConvShape &shape, uint32_t lanes, uint32_t rows,
-                        uint32_t layer, uint64_t stateLayerBytes, bool tapsMajor) {
+PreparedInput LfmConv::addVerify(metal::CommandGraph &graph, const LfmConvVerifyBuffers &buffers,
+                                 const LfmConvShape &shape, uint32_t lanes, uint32_t rows,
+                                 uint32_t layer, uint64_t stateLayerBytes, LinearInput input,
+                                 bool tapsMajor) {
   if (!shape.valid() || !rows)
     throw std::invalid_argument("invalid conv shape");
   requireStateSet(buffers.currentStates, lanes);
   const auto p = params(rows, shape, tapsMajor, layer, stateLayerBytes, lanes);
-  const std::vector<metal::MetalBuffer> bindings =
+  std::vector<metal::MetalBuffer> bindings =
       {buffers.packed, buffers.weights, buffers.currentStates[0],
        buffers.currentStates[1], buffers.currentStates[2],
        buffers.currentStates[3], buffers.mixed, buffers.output};
+  const metal::DispatchSize vecGroups =
+      {static_cast<uint32_t>(uint64_t{lanes} * shape.dimension / kVerifyChannelBlock), 1, 1};
+  const metal::DispatchSize vecThreads =
+      {static_cast<uint32_t>(rows * kVerifyVecColumns), 1, 1};
   if (shape.dimension % kVerifyChannelBlock == 0 &&
       uint64_t{rows} * kVerifyVecColumns <= 1024) {
-    graph.addPatchable(
-        std::string(kVerifyLfmConvV4), bindings, p,
-        {static_cast<uint32_t>(uint64_t{lanes} * shape.dimension / kVerifyChannelBlock), 1, 1},
-        {static_cast<uint32_t>(rows * kVerifyVecColumns), 1, 1});
-    return;
+    // RICHENGINE_CONV_FUSE: the vectorized kernel also writes the
+    // consumer's Table16 operand (the layout decode_linear_gguf_prepare
+    // would emit), so a register-tile out-projection drops its prepare
+    // dispatch — one saved per conv layer per step.
+    if (input == LinearInput::Table16 && tuning().convFuse) {
+      requireTableScratch(buffers.linearScratch, input, shape.dimension,
+                          lanes * rows);
+      bindings.insert(bindings.end(), {buffers.linearScratch.input,
+                                       buffers.linearScratch.sums});
+      graph.addPatchable(std::string(kVerifyLfmConvV4Table16),
+                         std::move(bindings), p, vecGroups, vecThreads);
+      return {buffers.output, input};
+    }
+    graph.addPatchable(std::string(kVerifyLfmConvV4), std::move(bindings), p,
+                       vecGroups, vecThreads);
+    return {};
   }
-  graph.addPatchable(std::string(kVerifyLfmConv), bindings, p,
+  graph.addPatchable(std::string(kVerifyLfmConv), std::move(bindings), p,
                      groups(uint64_t{lanes} * rows * shape.dimension));
+  return {};
 }
 
 void LfmConv::addVerifyTree(metal::CommandGraph &graph, const LfmConvTreeVerifyBuffers &buffers,

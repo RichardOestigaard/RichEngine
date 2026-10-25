@@ -102,6 +102,9 @@
     "NGRAM_TREE_MIN",
     "ANE_WAIT",
     "MOE_UNION",
-    "MOE_PACKED_OFF"
+    "MOE_PACKED_OFF",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS",
+    "CONV_FUSE"
   ]
 }

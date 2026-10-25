@@ -27,6 +27,7 @@ from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
 from server import (
     api_shapes,
+    decisions,
     diagnostics,
     documents,
     images,
@@ -1862,6 +1863,246 @@ class ServerTest(unittest.TestCase):
         # Question a prepares and checks both slot boundaries; question b is
         # rejected on its prepare pass. Before the fix b also ran both checks.
         self.assertEqual(tokenizer.prompt_encodes, 4)
+
+    class DecisionTokenizer(CharTokenizer):
+        """Char-level ids plus single-token yes/no surface forms, so the
+        decision readout's noul groups exist on this tokenizer."""
+
+        FORMS = {
+            "yes": 400,
+            "Yes": 401,
+            "YES": 402,
+            "no": 403,
+            "No": 404,
+            "NO": 405,
+        }
+
+        def encode(self, text, **kwargs):
+            if text in self.FORMS:
+                return [self.FORMS[text]]
+            return super().encode(text, **kwargs)
+
+    def test_decision_model_detection(self):
+        with mock.patch.dict(os.environ, {"RICHENGINE_DECISION_MODEL": ""}):
+            self.assertTrue(decisions.is_decision_model("LiquidAI/d1-3B-GGUF"))
+            self.assertTrue(decisions.is_decision_model("d1"))
+            self.assertTrue(decisions.is_decision_model("LiquidAI/d1.1"))
+            self.assertTrue(
+                decisions.is_decision_model("/models/d1-omni-600M:Q8_0")
+            )
+            self.assertFalse(decisions.is_decision_model("test-model"))
+            self.assertFalse(
+                decisions.is_decision_model("unsloth/Qwen3.8-27B-GGUF")
+            )
+            self.assertFalse(decisions.is_decision_model(None))
+
+    def test_decision_model_detection_override(self):
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_DECISION_MODEL": "1"}
+        ):
+            self.assertTrue(decisions.is_decision_model("test-model"))
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_DECISION_MODEL": "0"}
+        ):
+            self.assertFalse(
+                decisions.is_decision_model("LiquidAI/d1-3B-GGUF")
+            )
+
+    def test_systemone_decision_noul_pools_surface_forms(self):
+        # yes=max(0.1, 2.0, 0.3)=2.0, no=max(4.0, 1.0, -1.0)=4.0.
+        runtime = FakeRuntime(Plan(logits=(0.1, 2.0, 0.3, 4.0, 1.0, -1.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "I was charged twice this month",
+                "questions": {
+                    "refund": {
+                        "type": "noul",
+                        "instructions": "Is the customer asking for a refund?",
+                    }
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["refund"]
+        self.assertEqual(answer["type"], "noul")
+        expected = math.exp(2.0) / (math.exp(2.0) + math.exp(4.0))
+        self.assertAlmostEqual(answer["noul"], expected)
+        response = json.loads(payload)
+        self.assertEqual(response["prompt_version"], decisions.PROMPT_VERSION)
+        self.assertEqual(response["readout"], decisions.READOUT)
+        self.assertEqual(
+            response["probability_status"], decisions.PROBABILITY_STATUS
+        )
+        request = runtime.requests[0].frame
+        self.assertEqual(list(request.score_tokens), [400, 401, 402, 403, 404, 405])
+        prompt = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertIn("QUESTION:", prompt)
+        self.assertIn("Reply with yes or no only.", prompt)
+        self.assertIn(decisions.IM_START + "assistant\n", prompt)
+        self.assertNotIn(judgments.SYSTEMONE_SYSTEM, prompt)
+        self.assertNotIn("Options:", prompt)
+
+    def test_systemone_decision_choice_uses_letter_codes(self):
+        # billing=max("A")=0.5, fraud=max("B")=3.0; " A" is not one token here.
+        runtime = FakeRuntime(Plan(logits=(0.5, 3.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "I was charged twice",
+                "questions": {
+                    "team": {
+                        "type": "choice",
+                        "instructions": "Which team?",
+                        "criteria": {
+                            "billing": "Charges, refunds, invoices",
+                            "fraud": "Suspected unauthorised use",
+                        },
+                    }
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["team"]
+        self.assertEqual(answer["type"], "choice")
+        self.assertEqual(answer["choice"], "fraud")
+        expected = math.exp(3.0) / (math.exp(0.5) + math.exp(3.0))
+        self.assertAlmostEqual(answer["probabilities"]["fraud"], expected)
+        request = runtime.requests[0].frame
+        self.assertEqual(list(request.score_tokens), [ord("A"), ord("B")])
+        prompt = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertIn("Options:\nA Charges, refunds, invoices", prompt)
+        self.assertIn("Reply with the option code only.", prompt)
+
+    def test_systemone_decision_score_readout(self):
+        runtime = FakeRuntime(Plan(logits=(0.0, 1.0, 2.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": "production is down",
+                "questions": {
+                    "urgency": {
+                        "type": "score",
+                        "instructions": "How urgent is this?",
+                        "criteria": ["Can wait", "Today", "Blocking now"],
+                    }
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["urgency"]
+        self.assertEqual(answer["type"], "score")
+        total = math.exp(0.0) + math.exp(1.0) + math.exp(2.0)
+        expected = (math.exp(1.0) + 2.0 * math.exp(2.0)) / total
+        self.assertAlmostEqual(answer["score"], expected)
+        request = runtime.requests[0].frame
+        self.assertEqual(
+            list(request.score_tokens), [ord("0"), ord("1"), ord("2")]
+        )
+        prompt = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertIn("Reply with a single digit 0-2 only.", prompt)
+
+    def test_systemone_decision_singleton_skips_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=self.DecisionTokenizer(), model="d1-test"
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "d1-test",
+                "state": [],
+                "questions": {
+                    "only": {"type": "choice", "criteria": {"yes": None}}
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        answer = json.loads(payload)["answers"]["only"]
+        self.assertEqual(answer["probabilities"], {"yes": 1.0})
+        self.assertEqual(runtime.requests, [])
+
+    def test_systemone_generative_model_keeps_semif_pathway(self):
+        runtime = FakeRuntime(Plan(logits=(1.0, 0.0)))
+        harness = self.harness(
+            runtime, tokenizer=self.DecisionTokenizer(), max_context=8192
+        )
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/systemone",
+            {
+                "model": "test-model",
+                "state": "Some evidence",
+                "questions": {"q": {"type": "noul"}},
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        # SemIf renders through the chat template with its own system turn
+        # and scores two letter slots, not the d1 surface-form groups.
+        messages = harness.tokenizer.templates[-1][0]
+        self.assertEqual(messages[0]["content"], judgments.SYSTEMONE_SYSTEM)
+        self.assertEqual(len(runtime.requests[0].frame.score_tokens), 2)
+        response = json.loads(payload)
+        self.assertEqual(response["prompt_version"], judgments.PROMPT_VERSION)
+
+    def test_judgments_decision_model_uses_choice_readout(self):
+        # yes="A", no="B" letter codes; pooled option scores are the logits.
+        runtime = FakeRuntime(Plan(logits=(0.5, 3.0)))
+        harness = self.harness(
+            runtime,
+            tokenizer=self.DecisionTokenizer(),
+            model="d1-test",
+            max_context=8192,
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/judgments", self.judgment_body()
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["id"], "row-1")
+        self.assertEqual(response["option_ids"], ["yes", "no"])
+        self.assertEqual(response["option_logits"], [0.5, 3.0])
+        expected = math.exp(3.0) / (math.exp(0.5) + math.exp(3.0))
+        self.assertAlmostEqual(response["probabilities"][1], expected)
+        self.assertEqual(response["prompt_version"], decisions.PROMPT_VERSION)
+        self.assertEqual(
+            response["probability_status"], decisions.PROBABILITY_STATUS
+        )
+        request = runtime.requests[0].frame
+        self.assertEqual(list(request.score_tokens), [ord("A"), ord("B")])
+        prompt = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertEqual(
+            response["prompt_sha256"],
+            hashlib.sha256(prompt.encode()).hexdigest(),
+        )
+        self.assertIn("Reply with the option code only.", prompt)
+        self.assertIn("supported", prompt)
+        self.assertNotIn(judgments.DIRECT_SYSTEM, prompt)
 
     class ImagePadTokenizer(FakeTokenizer):
         """Renders one image placeholder per image part like the pinned

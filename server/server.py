@@ -589,6 +589,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         "max_model_len": app.max_context,
                         "context_length": app.max_context,
                         "vision": app.vision,
+                        "decision": app.decision_pathway,
                         "input_modalities": app.input_modalities,
                         **(
                             {"root": app.response_model}
@@ -1173,10 +1174,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _judgment_complete(self, job, row):
         result = self._await_done(job)
-        self._json(
-            200,
-            judgments.judgment_response(self.app.response_model, row, job, result),
-        )
+        self._json(200, self.app.judgment_response(row, job, result))
 
     def _systemone(self, body, deadline):
         active_job = None
@@ -1191,7 +1189,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             input_tokens = 0
             for qid, spec, job in entries:
                 if job is None:
-                    answers[qid] = judgments.deterministic_answer(spec)
+                    answers[qid] = self.app.systemone_answer(spec, None)
                     continue
                 # One admitted job per HTTP request preserves the existing
                 # queue bound and lets later questions reuse the state prefix.
@@ -1199,8 +1197,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self.app.backend.submit(job)
                 result = self._await_done(job)
                 input_tokens += result.prompt_tokens
-                answers[qid] = judgments.systemone_answer(
-                    spec, judgments.softmax(list(result.option_logits))
+                answers[qid] = self.app.systemone_answer(
+                    spec, list(result.option_logits)
                 )
                 active_job = None
         except BaseException:
@@ -1213,6 +1211,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "model": self.app.response_model,
                 "answers": answers,
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                **self.app.systemone_metadata(),
             },
         )
 

@@ -222,6 +222,8 @@
       "reason": "the prefix-settled early exit vs the full schedule; on by default",
       "diffusion": true,
       "quality_sensitive": true
-    }
+    },
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS"
   ]
 }

@@ -10,6 +10,7 @@ import {
 } from "solid-js";
 import { A } from "@solidjs/router";
 import { api, apiKey, ApiError, authorization, errorText, storageGet, storageSet } from "../../api";
+import { decisionModel } from "../../decision";
 import { pushToast } from "../../toast";
 import { isEditableTarget } from "../../shortcuts";
 import {
@@ -1205,6 +1206,13 @@ export default function Chat() {
           aria-label="Conversation"
           onClick={onChatClick}
         >
+          <Show when={decisionModel()}>
+            <div class="down-banner" role="status">
+              The served model is a decision model — it answers typed
+              questions in one forward pass but does not generate text. Use{" "}
+              <A href="/judge" class="down-retry">Judge</A> instead.
+            </div>
+          </Show>
           <Show when={serverDown()}>
             <div class="down-banner" role="alert">
               Server unreachable — start one with

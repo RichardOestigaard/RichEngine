@@ -128,11 +128,11 @@
     "ordered": true
   },
   "MTL4": {
-    "env": "RICHENGINE_MTL4",
+    "env": "RICHENGINE_MTL4_OFF",
     "values": [
       "1"
     ],
-    "reason": "the Metal 4 command-graph path; off by default",
+    "reason": "the Metal 3 command-graph path vs the default Metal 4 one; MTL4 on by default",
     "min_gpu_family": 10
   },
   "NGRAM_DRAFT_EXPECT": {
@@ -227,5 +227,26 @@
     ],
     "reason": "comb-tree verify of draft proposals; off-by-default on GPU drafts",
     "diffusion": false
+  },
+  "DECODE_RING2": {
+    "env": "RICHENGINE_DECODE_RING2_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "single pending decode command vs the depth-2 submit-ahead ring; ring on by default"
+  },
+  "DEVICE_VERIFY_PARAMS": {
+    "env": "RICHENGINE_DEVICE_VERIFY_PARAMS_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "host-staged verify params vs the step-pack device buffer; device params on by default"
+  },
+  "CONV_FUSE": {
+    "env": "RICHENGINE_CONV_FUSE_OFF",
+    "values": [
+      "1"
+    ],
+    "reason": "separate conv output-projection prepare vs the mixer's fused Table16 emission; fused on by default"
   }
 }

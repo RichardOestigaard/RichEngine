@@ -69,6 +69,8 @@
     "NGRAM_DRAFT_EXPECT",
     "NGRAM_WARMUP",
     "NGRAM_TREE_MIN",
-    "ANE_WAIT"
+    "ANE_WAIT",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS"
   ]
 }

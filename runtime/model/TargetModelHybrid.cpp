@@ -191,9 +191,9 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   // The conv reads every lane's current state and writes its bx rows for the
-  // commit; its output is the out-projection's input. The consumer packs its
-  // own operand table, so no prepared input is passed. A tree step's taps
+  // commit; its output is the out-projection's input. A tree step's taps
   // follow the nodes' ancestor paths and commit through the retained path.
+  ops::PreparedInput hidden;
   if (step.tree) {
     ops::LfmConv::addVerifyTree(
         step.graph,
@@ -202,15 +202,19 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
         geometry_.convShape(), step.lanes, step.rowCapacity,
         layer, geometry_.stateLayout.convolutionLayerBytes(), mixer.convolutionTapsMajor);
   } else {
-    ops::LfmConv::addVerify(
+    // The conv may write the out-projection's operand table itself
+    // (RICHENGINE_CONV_FUSE); `hidden` then describes it.
+    hidden = ops::LfmConv::addVerify(
         step.graph,
         {b.gdnPacked[layer], mixer.convolutionWeights, b.currentGdnStates,
-         b.gdnMixed[layer], b.gdnHidden},
+         b.gdnMixed[layer], b.gdnHidden, b.linearScratch},
         geometry_.convShape(), step.lanes, step.rowCapacity,
-        layer, geometry_.stateLayout.convolutionLayerBytes(), mixer.convolutionTapsMajor);
+        layer, geometry_.stateLayout.convolutionLayerBytes(),
+        outputPlan.input(), mixer.convolutionTapsMajor);
   }
   linear.add(step.graph,
-             {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch},
+             {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
+              .prepared = hidden},
              mixer.outputProjection, outputPlan);
   step.graph.endBakedSpan();
   return b.gdnOutput;

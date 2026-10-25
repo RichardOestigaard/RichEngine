@@ -13,7 +13,7 @@ from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
-from . import constraints, json_codec, judgments
+from . import constraints, decisions, json_codec, judgments
 from . import dfa as dfa_compiler
 from . import images as image_input
 from . import protocol as wire
@@ -583,6 +583,10 @@ class Frontend:
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
         self.shared_prefix_states = shared_prefix_states
+        # A d1-family checkpoint answers /v1/systemone through its own
+        # prompt and grouped readout; every other model keeps the SemIf
+        # letter-slot pathway. Nothing else changes: same score-only jobs.
+        self.decision_pathway = decisions.is_decision_model(model)
         # Agents repeat a few system prompts and tool sets.
         self._shared_prefix_probe = lru_cache(maxsize=8)(
             self._render_shared_prefix_probe
@@ -925,6 +929,10 @@ class Frontend:
             raise APIError(400, f"{what} prompt could not be rendered") from error
 
     def prepare_judgment(self, body, *, deadline, disconnected=None):
+        if self.decision_pathway:
+            return self._prepare_judgment_decision(
+                body, deadline=deadline, disconnected=disconnected
+            )
         unknown = sorted(
             set(body)
             - {"id", "state", "question", "options", "model", "timeout", "priority"}
@@ -959,7 +967,93 @@ class Frontend:
             )
         return job, body
 
+    def _prepare_judgment_decision(self, body, *, deadline, disconnected=None):
+        """The d1 pathway's judgment prepare pass: the row's options become
+        one choice question in the decision prompt's own markup."""
+        unknown = sorted(
+            set(body)
+            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+        )
+        if unknown:
+            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+        if not self.accepts_model(body.get("model", self.model)):
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        try:
+            judgments.validate_row(body)
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        priority = self._priority(body)
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
+        with self._preparation(deadline):
+            spec = judgments.SystemOneQuestion(
+                kind="choice",
+                instructions=body["question"],
+                labels=tuple(option["id"] for option in body["options"]),
+                descriptions=tuple(
+                    option["description"] for option in body["options"]
+                ),
+                legend=None,
+                deterministic=False,
+            )
+            try:
+                question = decisions.prepare_question(self.tokenizer, spec)
+            except decisions.DecisionUnsupported as error:
+                raise APIError(
+                    500, str(error), "decision_unsupported"
+                ) from error
+            bos = getattr(self.tokenizer, "bos_token", None)
+            bos = bos if isinstance(bos, str) else ""
+            try:
+                prompt = decisions.prompt_text(body["state"], question, bos)
+                tokens = list(
+                    self.tokenizer.encode(prompt, add_special_tokens=False)
+                )
+            except Exception as error:
+                raise APIError(
+                    400, "judgment prompt could not be rendered"
+                ) from error
+            checkpoint()
+            if not tokens:
+                raise APIError(400, "judgment prompt could not be rendered")
+            if len(tokens) > self.max_context:
+                raise ContextLengthError(len(tokens), self.max_context)
+            job = self._score_job(
+                tokens,
+                question.score_tokens,
+                deadline,
+                priority,
+                judgments.digest(prompt),
+            )
+        return job, decisions.Judgment(body, question)
+
+    def judgment_response(self, row, job, result):
+        """The judgment response for one prepared row. Entries carrying their
+        own responder (the d1 pathway's Judgment) use it; SemIf rows keep the
+        letter-slot readout."""
+        responder = getattr(row, "judgment_response", None)
+        if responder is not None:
+            return responder(self.response_model, job, result)
+        return judgments.judgment_response(self.response_model, row, job, result)
+
+    def systemone_metadata(self):
+        """The prompt/readout identity /v1/systemone reports."""
+        if self.decision_pathway:
+            return {
+                "prompt_version": decisions.PROMPT_VERSION,
+                "readout": decisions.READOUT,
+                "probability_status": decisions.PROBABILITY_STATUS,
+            }
+        return {
+            "prompt_version": judgments.PROMPT_VERSION,
+            "readout": judgments.READOUT,
+            "probability_status": judgments.PROBABILITY_STATUS,
+        }
+
     def prepare_systemone(self, body, *, deadline, disconnected=None):
+        if self.decision_pathway:
+            return self._prepare_systemone_decision(
+                body, deadline=deadline, disconnected=disconnected
+            )
         details = []
         model = body.get("model")
         if not isinstance(model, str) or not model:
@@ -1028,6 +1122,100 @@ class Frontend:
                     (qid, spec, self._score_job(tokens, slot_ids, deadline, priority))
                 )
         return jobs
+
+    def _prepare_systemone_decision(self, body, *, deadline, disconnected=None):
+        """The d1 pathway's prepare pass: same validation, caps and job
+        shape as the SemIf one; the prompt markup and the grouped readout
+        are the decision model's own (server/decisions.py)."""
+        details = []
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            details.append(judgments.detail(["model"], "field required", "missing"))
+        elif not self.accepts_model(model):
+            details.append(
+                judgments.detail(
+                    ["model"], f"model {model} is not served by this endpoint"
+                )
+            )
+        state, specs, question_details = judgments.validate_systemone(body)
+        details.extend(question_details)
+        try:
+            priority = self._priority(body)
+        except APIError as error:
+            details.append(judgments.detail(["priority"], error.message))
+        if details:
+            raise judgments.SystemOneError(details)
+        bos = getattr(self.tokenizer, "bos_token", None)
+        bos = bos if isinstance(bos, str) else ""
+        jobs = []
+        total_tokens = 0
+        checkpoint = _preparation_checkpoint(deadline, disconnected)
+        with self._preparation(deadline):
+            for qid, spec in specs:
+                try:
+                    question = decisions.prepare_question(self.tokenizer, spec)
+                except decisions.DecisionUnsupported as error:
+                    raise APIError(500, str(error), "decision_unsupported") from error
+                if question.deterministic:
+                    jobs.append((qid, question, None))
+                    continue
+                try:
+                    prompt = decisions.prompt_text(state, question, bos)
+                except Exception as error:
+                    raise APIError(
+                        400, "question prompt could not be rendered"
+                    ) from error
+                checkpoint()
+                try:
+                    tokens = list(
+                        self.tokenizer.encode(prompt, add_special_tokens=False)
+                    )
+                except Exception as error:
+                    raise APIError(
+                        400, "question prompt could not be rendered"
+                    ) from error
+                checkpoint()
+                if not tokens:
+                    raise APIError(
+                        400, "question prompt could not be rendered"
+                    )
+                if len(tokens) > self.max_context:
+                    raise ContextLengthError(len(tokens), self.max_context)
+                if (
+                    total_tokens + len(tokens)
+                    > judgments.MAX_SYSTEMONE_TOTAL_TOKENS
+                ):
+                    raise judgments.SystemOneError(
+                        [
+                            judgments.detail(
+                                ["questions", qid],
+                                "total prepared question tokens exceed "
+                                f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
+                            )
+                        ]
+                    )
+                total_tokens += len(tokens)
+                jobs.append(
+                    (
+                        qid,
+                        question,
+                        self._score_job(
+                            tokens, question.score_tokens, deadline, priority
+                        ),
+                    )
+                )
+        return jobs
+
+    def systemone_answer(self, spec, logits):
+        """The typed answer for one prepared question. Prepared entries that
+        carry their own readout (the d1 pathway's Question) use it; SemIf
+        specs keep letter-slot softmax. `None` is the no-inference answer."""
+        answer = getattr(spec, "answer", None)
+        if answer is not None:
+            return answer(logits)
+        if logits is None:
+            return judgments.deterministic_answer(spec)
+        return judgments.systemone_answer(spec, judgments.softmax(list(logits)))
 
     def apply_template(self, body, *, deadline):
         add_generation_prompt = body.get("add_generation_prompt", True)
