@@ -104,7 +104,7 @@ def stage_runtime(destination, version):
         ("install/tuning", TUNING_FILES),
         ("install/completions", COMPLETION_FILES),
         ("server", SERVER_FILES),
-        ("engine", ("richengine", "richengine.metallib")),
+        ("engine", ("richengine", "richengine.metallib", "richengine8.metallib")),
     ):
         (destination / folder).mkdir()
         source = ROOT / ("build" if folder == "engine" else folder)

@@ -160,8 +160,25 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   }
   // The draft's context K/V commits run decode plans (DSparkDraft::addContextPrefill).
   if (geometry.draft.contextKvSize()) {
-    const ops::LinearScratchSize draft = operators.linear().decodeScratchSize(
-        {geometry.draft.contextKvSize(), geometry.draft.hiddenSize});
+    ops::ProjectionShape draftShape{geometry.draft.contextKvSize(),
+                                    geometry.draft.hiddenSize};
+    ops::LinearScratchSize draft =
+        operators.linear().decodeScratchSize(draftShape);
+    // The context K/V rows come off the fused QKV's AF4 block segment now:
+    // reserve the GGUF decode bound as well.
+    draftShape.layout = ops::WeightLayout::Block32;
+    draftShape.registerFormats = draftShape.fourBits = true;
+    draft.include(operators.linear().decodeScratchSize(draftShape));
+    // DFlash2's context prefill runs prefill plans on the same block
+    // segment (DFlashDraft::addContextPrefill).
+    draft.include(operators.linear().prefillScratchSize(draftShape));
+    // The context projection's prefill plan runs on the same block layout
+    // and is much wider than the context K/V rows.
+    ops::ProjectionShape contextBlock{geometry.draft.hiddenSize,
+                                      geometry.draft.targetHiddenSize};
+    contextBlock.layout = ops::WeightLayout::Block32;
+    contextBlock.registerFormats = contextBlock.fourBits = true;
+    draft.include(operators.linear().prefillScratchSize(contextBlock));
     put(PrefillTensor::LinearPartials, draft.partials);
     put(PrefillTensor::LinearCounters, draft.counters);
     put(PrefillTensor::LinearPacked, draft.input);

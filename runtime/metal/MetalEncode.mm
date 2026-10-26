@@ -2356,21 +2356,56 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
         return impl_->submitProfiled(command.dispatches, std::move(completion));
     }
     checkEvents(command.events, command.dispatches.size());
+    static const bool subTiming = envFlag("RICHENGINE_DECODE_TIMING");
+    const auto s0 = std::chrono::steady_clock::now();
     Impl::PreparedCommand prepared = impl_->prepared(command.dispatches);
+    const auto s1 = std::chrono::steady_clock::now();
 #if RICHENGINE_MTL4_AVAILABLE
     // Event-bearing commands stay on the Metal 3 path unless opted in: the
     // commit4 event split misattributed GPU timing and regressed prefix-hit
     // prefill output and wall time once. RICHENGINE_MTL4_EVENTS is the A/B
     // switch that re-enables it.
     if (impl_->useMtl4() && (command.events.empty() || tuning().mtl4Events)) {
-        return impl_->commit4(prepared.dispatches, command.events,
-                              std::move(prepared.retainedAllocations),
-                              std::move(completion));
+        auto ticket = impl_->commit4(prepared.dispatches, command.events,
+                                     std::move(prepared.retainedAllocations),
+                                     std::move(completion));
+        if (subTiming) {
+            const auto s2 = std::chrono::steady_clock::now();
+            fprintf(stderr, "submit-detail dispatches=%zu prepared=%.3fms commit4=%.3fms\n",
+                    command.dispatches.size(),
+                    std::chrono::duration<double, std::milli>(s1 - s0).count(),
+                    std::chrono::duration<double, std::milli>(s2 - s1).count());
+            if (command.dispatches.size() > 400) {
+                std::string names;
+                for (size_t i = 0; i < command.dispatches.size() && i < 14; ++i) {
+                    names += " ";
+                    names += command.dispatches[i].pipelineName;
+                }
+                fprintf(stderr, "  heads4:%s\n", names.c_str());
+            }
+        }
+        return ticket;
     }
 #endif
-    return impl_->commit(prepared.dispatches, command.events,
-                         std::move(prepared.retainedAllocations),
-                         std::move(completion));
+    auto ticket = impl_->commit(prepared.dispatches, command.events,
+                                std::move(prepared.retainedAllocations),
+                                std::move(completion));
+    if (subTiming) {
+        const auto s2 = std::chrono::steady_clock::now();
+        fprintf(stderr, "submit-detail dispatches=%zu prepared=%.3fms commit=%.3fms\n",
+                command.dispatches.size(),
+                std::chrono::duration<double, std::milli>(s1 - s0).count(),
+                std::chrono::duration<double, std::milli>(s2 - s1).count());
+        if (command.dispatches.size() > 400) {
+            std::string names;
+            for (size_t i = 0; i < command.dispatches.size() && i < 14; ++i) {
+                names += " ";
+                names += command.dispatches[i].pipelineName;
+            }
+            fprintf(stderr, "  heads:%s\n", names.c_str());
+        }
+    }
+    return ticket;
 }
 
 void MetalBackend::preparePipelines(

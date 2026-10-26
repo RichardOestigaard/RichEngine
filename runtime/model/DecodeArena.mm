@@ -101,13 +101,17 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::RopeSinAlt,
       bytesFor<float>(r * geometry.target.altRotaryPairs));
   put(DecodeTensor::ContextProjected,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{kLaneCount} * r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{kLaneCount} * r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextKv,
-      bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
+      bytesFor<uint16_t>(uint64_t{kLaneCount} * r * geometry.draft.contextKvSize()));
+  // Block (AF4) draft projections read the captured hidden as plain decode
+  // input rows — lanes × verifyRows rows — where the affine path staged it
+  // through the scratch input table instead.
   put(DecodeTensor::CapturedTargetHidden,
-      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
+      bytesFor<uint16_t>(uint64_t{kLaneCount} * r *
+                         geometry.draft.targetHiddenSize));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
   put(DecodeTensor::DraftQueryValues, draftWorkspace.queryValuesBytes);
   // Proposal attention and accepted target-hidden injection use the same
@@ -266,6 +270,21 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     // A plain draft's dynamic and selector projections are absent (size 0).
     if (!shape.outputSize || !shape.inputSize) continue;
     result.include(operators.linear().decodeScratchSize(shape));
+    // Draft checkpoint images load as AF4 blocks (affine::blockImages):
+    // the GGUF decode plans need their own, larger scratch bound.
+    ops::ProjectionShape block = shape;
+    block.layout = ops::WeightLayout::Block32;
+    block.registerFormats = block.fourBits = true;
+    result.include(operators.linear().decodeScratchSize(block));
+    // Small block projections take more decode splits than the tier bounds
+    // reach: reserve per-split sums flatly rather than missing the kernel's
+    // pick (ggufDecodeScratchSize only adds register tiers on Apple9).
+    ops::LinearScratchSize splits{};
+    splits.input = 32 /*staged rows*/ * uint64_t{shape.inputSize} * 2;
+    splits.rotated = splits.input;
+    splits.sums = 64 /*rows*/ * (shape.inputSize / 32) * 32 /*splits*/;
+    splits.partials = 64 /*rows*/ * uint64_t{shape.outputSize} * 4;
+    result.include(splits);
   }
   return result;
 }

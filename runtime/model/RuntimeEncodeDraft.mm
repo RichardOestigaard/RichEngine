@@ -187,6 +187,8 @@ namespace richengine::model {
       packDraftPredraftLane(lane, *entry.pendingToken,
                             predraft.positions[lane]);
     }
+    static const bool pdTiming = envFlag("RICHENGINE_DECODE_TIMING");
+    const auto p0 = std::chrono::steady_clock::now();
     CommandGraph graph;
     addRopeTables(
         graph, decodeArena->packed(DecodeTensor::Positions, width), 0,
@@ -201,9 +203,16 @@ namespace richengine::model {
                          geometry.draft.queryRows());
     encodeDraftBatchGraph(graph, {entries.data(), width},
                           {logicalPositions.data(), width});
+    const auto p1 = std::chrono::steady_clock::now();
     predraft.epoch = arenaEpoch_;
     predraft.lanes = width;
     predraft.ticket = backend.submitCommandAsync(graph.dispatches());
+    if (pdTiming) {
+      const auto p2 = std::chrono::steady_clock::now();
+      fprintf(stderr, "predraft-detail build=%.3fms submit=%.3fms\n",
+              std::chrono::duration<double, std::milli>(p1 - p0).count(),
+              std::chrono::duration<double, std::milli>(p2 - p1).count());
+    }
     predraft.submitted = true;
     gpuPredraft_ = std::move(predraft);
   }

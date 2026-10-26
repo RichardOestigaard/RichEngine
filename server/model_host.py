@@ -38,12 +38,12 @@ HostState = Literal["unloaded", "loading", "loaded", "failed"]
 
 
 def _engine_binary(binary: str, assembly_dir: Path) -> str:
-    """The block-8 verify build, when the model's draft trains at eight rows.
+    """The shipped binary: it carries both verify geometries now.
 
-    `make verify8` leaves a richengine binary in the sibling build8/ directory
-    (packaged installs: engine8/), compiled at the draft's native eight-row
-    verify geometry — roughly half the verify trunk's fused-M work. Models
-    whose draft declares a deeper block keep the default binary's frame.
+    Older builds kept a block-8 variant in a sibling build8/ directory
+    (packaged: engine8/) for drafts trained at eight rows; the unified
+    richengine's dispatch picks the variant itself from the model's draft
+    geometry. Keep returning one for trees still built that way.
     """
     try:
         draft = json.loads((assembly_dir / "draft" / "config.json").read_text())

@@ -795,6 +795,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  encodeStart, encodeEnd](CommandTiming timing) mutable {
     const auto t0 = std::chrono::steady_clock::now();
     auto result = impl->finalizeDecode(lanes, items, timing, tree);
+    const auto t1 = std::chrono::steady_clock::now();
     // The committed step's anchors and positions are host-known now: the
     // next block's draft forward runs on the GPU through the host's
     // result-handling gap. Tree steps predraft nothing — a tree-capable
@@ -807,12 +808,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
         }))
       metal::dumpOpTimings();
     if (decodeTiming) {
-      const auto t1 = std::chrono::steady_clock::now();
+      const auto t2 = std::chrono::steady_clock::now();
       fprintf(stderr,
-              "decode-timing encode=%.3fms finalize=%.3fms gpu=%.3fms "
-              "wall=%.3fms\n",
+              "decode-timing encode=%.3fms finalize=%.3fms predraft=%.3fms "
+              "gpu=%.3fms wall=%.3fms\n",
               std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count(),
               std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              std::chrono::duration<double, std::milli>(t2 - t1).count(),
               timing.gpuSeconds * 1e3, timing.wallSeconds * 1e3);
     }
     return result;

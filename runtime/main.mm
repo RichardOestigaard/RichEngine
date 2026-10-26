@@ -33,9 +33,9 @@
 #include <utility>
 #include <vector>
 
-#ifndef RICHENGINE_BUILD_ID
-#error "production build requires the generated BuildIdentity.hpp"
-#endif
+// The embedded build id, compiled once (dispatch.mm): both verify-geometry
+// variants share it so the binary records a single identity string.
+const char *richengineBuildId() noexcept;
 
 namespace richengine {
 namespace {
@@ -350,11 +350,19 @@ std::filesystem::path executablePath() {
 engine::RuntimeBootstrapConfig
 bootstrapConfig(const NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
+  // Each verify geometry ships its own metallib: the kernel ABI bakes the
+  // verify/draft row counts, so a build compiled at eight rows reads
+  // different parameter layouts and tile shapes than one at sixteen.
+#if RICHENGINE_TARGET_VERIFY_ROWS == 8
+  constexpr char kMetallibName[] = "richengine8.metallib";
+#else
+  constexpr char kMetallibName[] = "richengine.metallib";
+#endif
   config.resources.metallibPath =
-      executablePath().parent_path() / "richengine.metallib";
+      executablePath().parent_path() / kMetallibName;
   config.resources.modelRoot = arguments.modelRoot;
   config.resources.model = arguments.model;
-  config.resources.buildId = RICHENGINE_BUILD_ID;
+  config.resources.buildId = richengineBuildId();
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.persistentCacheRoot = arguments.persistentCacheRoot;
@@ -541,9 +549,11 @@ int checkDevice() {
 }
 
 } // namespace
-} // namespace richengine
 
-int main(int argc, char **argv) {
+// The variant's whole entry point: dispatch.mm's main() calls the namespace's
+// serveMain for the verify geometry the model's draft trains at, so each
+// process runs exactly one geometry.
+int serveMain(int argc, char **argv) {
   @autoreleasepool {
     try {
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
@@ -570,3 +580,5 @@ int main(int argc, char **argv) {
     }
   }
 }
+
+} // namespace richengine

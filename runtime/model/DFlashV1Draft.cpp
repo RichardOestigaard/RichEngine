@@ -43,6 +43,33 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   std::vector<ops::Projection> result;
   result.reserve(weights.layers.size());
   for (const DFlashV1DraftLayerWeights &layer : weights.layers) {
+    if (layer.qkvProjection.layout() == ops::WeightLayout::Block32) {
+      // The block (AF4) fused QKV's context K/V rows: a whole-tile row slice
+      // of the segment's planes — 256-row tiles of 16-byte plane0 units per
+      // 32-column group and 4-byte meta units per 64-column block.
+      const ops::QuantizedSegment &fused =
+          layer.qkvProjection.blocks().segments.at(0);
+      constexpr uint32_t kTileRows = 256;
+      if (layout.attentionSize % kTileRows ||
+          layout.contextKvSize() % kTileRows || fused.plane1)
+        throw std::invalid_argument(
+            "draft block QKV rows are not tile-aligned for the context slice");
+      const uint64_t tile0 = layout.attentionSize / kTileRows;
+      const uint64_t tiles = layout.contextKvSize() / kTileRows;
+      const uint64_t plane0Tile =
+          uint64_t(layout.hiddenSize / 32) * kTileRows * 16;
+      const uint64_t metaTile =
+          uint64_t(layout.hiddenSize / 64) * kTileRows * 4;
+      result.emplace_back(
+          layout.contextKvSize(), layout.hiddenSize,
+          ops::BlockWeights{{ops::QuantizedSegment::planes(
+              fused.formatId, layout.contextKvSize(), layout.hiddenSize,
+              backend.view(fused.plane0, tile0 * plane0Tile,
+                           tiles * plane0Tile),
+              {},
+              backend.view(fused.meta, tile0 * metaTile, tiles * metaTile))}});
+      continue;
+    }
     const ops::AffineWeights &fused = layer.qkvProjection.affine();
     const auto rows = [&](const metal::MetalBuffer &plane) {
       const uint64_t rowBytes = plane.sizeBytes() / layout.qkvSize;

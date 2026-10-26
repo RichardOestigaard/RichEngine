@@ -1,5 +1,6 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/AffinePlan.hpp"
+#include "model/AffineToBlock.hpp"
 #include "model/DFlashDraft.hpp"
 #include "model/DFlashTwoDraft.hpp"
 #include "model/DSparkDraft.hpp"
@@ -130,7 +131,7 @@ std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
 DFlash2CheckpointLoader::DFlash2CheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                                              const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
-  planned_->images = draftCheckpointImages(layout);
+  planned_->images = affine::blockImages(draftCheckpointImages(layout));
   for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
 DFlash2CheckpointLoader::~DFlash2CheckpointLoader() = default;
@@ -152,7 +153,7 @@ std::vector<Image> dflashV1DraftCheckpointImages(const DFlashDraftLayout &layout
 DFlashV1DraftCheckpointLoader::DFlashV1DraftCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                                                      const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
-  planned_->images = dflashV1DraftCheckpointImages(layout);
+  planned_->images = affine::blockImages(dflashV1DraftCheckpointImages(layout));
   for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
 DFlashV1DraftCheckpointLoader::~DFlashV1DraftCheckpointLoader() = default;
@@ -178,7 +179,7 @@ std::vector<Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout) 
 DSparkCheckpointLoader::DSparkCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
                                                const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
-  planned_->images = dsparkDraftCheckpointImages(layout);
+  planned_->images = affine::blockImages(dsparkDraftCheckpointImages(layout));
   for (Image &image : planned_->images) affine::bind(image, planned_->source);
 }
 DSparkCheckpointLoader::~DSparkCheckpointLoader() = default;

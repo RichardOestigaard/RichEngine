@@ -61,24 +61,31 @@ ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/richengine.metallib
+# The block-8 verify geometry ships inside the same binary: its objects are
+# compiled with the same defines the verify8 target passes plus
+# -Drichengine=richengine_8, so both archives link into one richengine whose
+# dispatch.mm picks a variant per model from the draft's geometry (what
+# server/model_host.py's binary switch did when these were two binaries).
+LIB8 := $(BUILD)/richengine8.metallib
+METAL8_BUILD := $(BUILD)/metal8
+VERIFY8_DEFINES := -DRICHENGINE_DRAFT_QUERY_ROWS=8u \
+	-DRICHENGINE_DRAFT_PROPOSAL_TOKENS=7u -DRICHENGINE_TARGET_VERIFY_ROWS=8u
+VERIFY8_NAMESPACE := -Drichengine=richengine_8
+VERIFY8_AIRS := $(addprefix $(METAL8_BUILD)/, \
+	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
 	platform-check model-selection preflight serve webui
 
 all: $(TARGET) $(TUNE_TOOL)
 
-# The block-8 verify geometry: DFlash2 drafts trained at an eight-row block
-# verify eight rows a lane instead of the compiled sixteen, halving the
-# verify trunk's fused-M work (~2x at width on the 27B). A separate build —
-# the engine binary is compiled against the matching ExecutionLimits and the
-# metallib against the matching kernel constants — so deeper-block drafts
-# keep the wide frame on the default build. The server picks
-# build8/richengine when a model's draft/config.json says block_size <= 8.
-VERIFY8_DEFINES := -DRICHENGINE_DRAFT_QUERY_ROWS=8u \
-	-DRICHENGINE_DRAFT_PROPOSAL_TOKENS=7u -DRICHENGINE_TARGET_VERIFY_ROWS=8u
+# The dev/bisection tree at the block-8 geometry: benchmark and profile
+# binaries linked against the 8-row archive. The shipped richengine already
+# carries both geometries; this target exists for the dev tools that link a
+# single-geometry library directly.
 .PHONY: verify8
 verify8:
-	$(MAKE) --no-print-directory BUILD=build8 build8/richengine build8/engine-tests/backend-benchmark build8/engine-tests/decode-profile \
+	$(MAKE) --no-print-directory BUILD=build8 build8/engine-tests/backend-benchmark build8/engine-tests/decode-profile \
 		PROD_METALFLAGS="$(PROD_METALFLAGS) $(VERIFY8_DEFINES)" \
 		ENGINE_CXXFLAGS="$(ENGINE_CXXFLAGS) $(VERIFY8_DEFINES)" \
 		ENGINE_OBJCXXFLAGS="$(ENGINE_OBJCXXFLAGS) $(VERIFY8_DEFINES)"
@@ -205,8 +212,19 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
+$(METAL8_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) $(VERIFY8_DEFINES) -c $< -o $@
+
+$(LIB8): $(VERIFY8_AIRS)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/librichengine.a
+# The block-8 variant's objects and archive: identical sources, compiled with
+# the geometry defines and the namespace rename.
+ENGINE8_BUILD := $(BUILD)/engine8
+ENGINE8_LIBRARY := $(ENGINE8_BUILD)/librichengine8.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
 	-framework CoreML -framework IOSurface
 # Static-init registrations only link when something references them —
@@ -229,6 +247,15 @@ CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(ENGINE_OBJCXXFLAGS)) $(call shell-quote,$(ENGINE_DEPFLAGS)) \
 	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
 	$(call shell-quote,$(METAL)) $(call shell-quote,$(PROD_METALFLAGS)) \
+	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
+VERIFY8_CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
+	$(call shell-quote,$(CXX)) \
+	$(call shell-quote,$(ENGINE_CXXFLAGS) $(VERIFY8_DEFINES) $(VERIFY8_NAMESPACE)) \
+	$(call shell-quote,$(ENGINE_OBJCXXFLAGS) $(VERIFY8_DEFINES) $(VERIFY8_NAMESPACE)) \
+	$(call shell-quote,$(ENGINE_DEPFLAGS)) \
+	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
+	$(call shell-quote,$(METAL)) \
+	$(call shell-quote,$(PROD_METALFLAGS) $(VERIFY8_DEFINES)) \
 	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
 RUN_CONFIGURED = $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) record \
 	--output $(call shell-quote,$@) --config $(BUILD_CONFIG) --
@@ -387,11 +414,25 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
+ENGINE8_OBJECTS := \
+	$(patsubst runtime/%.cpp,$(ENGINE8_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
+	$(patsubst runtime/%.mm,$(ENGINE8_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
+	$(ENGINE8_BUILD)/metal/MetalBackend.o
+ENGINE8_FAMILY_OBJECTS := $(patsubst runtime/model/families/%.mm,$(ENGINE8_BUILD)/model/families/%.o,$(ENGINE_FAMILY_SOURCES))
+ENGINE8_MAIN_OBJECT := $(ENGINE8_BUILD)/main.o
+# dispatch.mm's main() picks the variant; it owns the one embedded build id
+# both serveMain bodies read through richengineBuildId().
+DISPATCH_OBJECT := $(ENGINE_BUILD)/dispatch.o
+VERIFY8_CONFIG_TARGETS := $(ENGINE8_OBJECTS) $(ENGINE8_MAIN_OBJECT) \
+	$(ENGINE8_LIBRARY) $(VERIFY8_AIRS) $(LIB8)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 	$(TUNE_OBJECTS) $(TUNE_MAIN_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET) $(TUNE_TOOL)
-ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
+	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET) $(TUNE_TOOL) \
+	$(DISPATCH_OBJECT)
+ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE8_OBJECTS:.o=.d) \
+	$(ENGINE_MAIN_OBJECT:.o=.d) $(ENGINE8_MAIN_OBJECT:.o=.d) \
+	$(DISPATCH_OBJECT:.o=.d) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
 	$(TUNE_OBJECTS:.o=.d) $(TUNE_MAIN_OBJECT:.o=.d)
 
@@ -432,12 +473,36 @@ $(ENGINE_INSTRUMENTED_ANE_OBJECT): runtime/ane/Program.mm
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
 		-DRICHENGINE_ANE_INSTRUMENTATION=1 -c $< -o $@
 
-$(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
+$(ENGINE_MAIN_OBJECT): runtime/main.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(DISPATCH_OBJECT): runtime/dispatch.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
 		-include $(BUILD_ID_HEADER) -c $< -o $@
 
+$(ENGINE8_BUILD)/%.o: runtime/%.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(VERIFY8_DEFINES) \
+		$(VERIFY8_NAMESPACE) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(ENGINE8_BUILD)/%.o: runtime/%.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(VERIFY8_DEFINES) \
+		$(VERIFY8_NAMESPACE) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(ENGINE8_MAIN_OBJECT): runtime/main.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(VERIFY8_DEFINES) \
+		$(VERIFY8_NAMESPACE) $(ENGINE_DEPFLAGS) -c $< -o $@
+
 $(ENGINE_LIBRARY): $(ENGINE_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(RM) $@
+	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
+
+$(ENGINE8_LIBRARY): $(ENGINE8_OBJECTS)
 	@mkdir -p $(dir $@)
 	$(RM) $@
 	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
@@ -456,10 +521,12 @@ $(TUNE_TOOL): $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) $(ENGINE_LIBRARY) $(LIB) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) \
 		$(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
-$(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
-		| $(BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
-		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+$(TARGET): $(DISPATCH_OBJECT) $(ENGINE_MAIN_OBJECT) $(ENGINE8_MAIN_OBJECT) \
+		$(ENGINE_LIBRARY) $(ENGINE8_LIBRARY) $(LIB) $(LIB8) | $(BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(DISPATCH_OBJECT) \
+		$(ENGINE_MAIN_OBJECT) $(ENGINE8_MAIN_OBJECT) \
+		$(ENGINE_LIBRARY) $(ENGINE8_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE8_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD)
@@ -481,6 +548,8 @@ KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_S
 	| shasum -a 256 | cut -c1-16)
 PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
+VERIFY8_AIR_CONFIG := $(VERIFY8_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
+VERIFY8_LIB_CONFIG := $(VERIFY8_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
 	$(TEST_Q8_ATTENTION_LIB) $(TEST_FP8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
@@ -488,13 +557,18 @@ PRODUCTION_CONFIG_TARGETS := $(filter-out $(PRODUCTION_AIRS) $(LIB),$(PRODUCTION
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))
 
 $(PRODUCTION_CONFIG_TARGETS): BUILD_CONFIG := $(CONFIG_DIGEST)
+$(VERIFY8_CONFIG_TARGETS): BUILD_CONFIG := $(VERIFY8_CONFIG_DIGEST)
 $(TEST_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
 $(SANITIZER_CONFIG_TARGETS): BUILD_CONFIG := $(SANITIZER_CONFIG_DIGEST)
 $(PRODUCTION_AIRS): BUILD_CONFIG := $(PRODUCTION_AIR_CONFIG)
+$(VERIFY8_AIRS): BUILD_CONFIG := $(VERIFY8_AIR_CONFIG)
 $(LIB): BUILD_CONFIG := $(PRODUCTION_LIB_CONFIG)
+$(LIB8): BUILD_CONFIG := $(VERIFY8_LIB_CONFIG)
 $(TEST_KERNEL_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_KERNEL_CONFIG)
 STALE_CONFIG_TARGETS := $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	--config $(CONFIG_DIGEST) $(PRODUCTION_CONFIG_TARGETS)) \
+	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
+	--config $(VERIFY8_CONFIG_DIGEST) $(VERIFY8_CONFIG_TARGETS)) \
 	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	--config $(TEST_CONFIG_DIGEST) $(TEST_CONFIG_TARGETS)) \
 	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
@@ -502,7 +576,11 @@ STALE_CONFIG_TARGETS := $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	--config $(PRODUCTION_AIR_CONFIG) $(PRODUCTION_AIRS)) \
 	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
+	--config $(VERIFY8_AIR_CONFIG) $(VERIFY8_AIRS)) \
+	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	--config $(PRODUCTION_LIB_CONFIG) $(LIB)) \
+	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
+	--config $(VERIFY8_LIB_CONFIG) $(LIB8)) \
 	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
 	--config $(TEST_KERNEL_CONFIG) $(TEST_KERNEL_CONFIG_TARGETS))
 ifneq ($(strip $(STALE_CONFIG_TARGETS)),)

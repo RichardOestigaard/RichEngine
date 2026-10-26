@@ -1881,6 +1881,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // RICHENGINE_MOE_STATS: the step's MoE layers left a record each in the
     // shared tile-count scratch; this readback is why the flag is debug-only.
     ops::MoE::logStats(decodeArena->moeScratch(1).tileCount);
+    static const bool finTiming = envFlag("RICHENGINE_DECODE_TIMING");
+    const auto f0 = std::chrono::steady_clock::now();
     // The acceptance kernels pack a lane's emitted rows at the chain's
     // verify stride (the tree's at its node stride), not the lane's
     // capacity slot — reads follow the packed stride, never get(lane).
@@ -2456,6 +2458,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                             constrained, timing.wallSeconds * 1000.0);
     }
 
+    const auto f1 = std::chrono::steady_clock::now();
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2563,6 +2566,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     counters.lastDecodeWallSeconds = timing.wallSeconds;
     counters.totalDecodeWallSeconds += timing.wallSeconds;
     kickAnePredictors(lanes, items);
+    if (finTiming) {
+      const auto f2 = std::chrono::steady_clock::now();
+      fprintf(stderr, "finalize-detail loop=%.3fms tail=%.3fms\n",
+              std::chrono::duration<double, std::milli>(f1 - f0).count(),
+              std::chrono::duration<double, std::milli>(f2 - f1).count());
+    }
     return results;
   }
   // A constrained DFlash cycle has one host dependency between three Metal
