@@ -149,9 +149,13 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                    buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  if (folded && !prepare)
-    bindings.insert(bindings.end(), {{}, {}});
-  bindings.push_back(folded ? buffers.tape : metal::MetalBuffer{});
+  if (folded) {
+    // The tape binds at index 20 for every variant: the plain kernel's
+    // params sit at 17, so two unused but real buffers fill 18 and 19.
+    if (!prepare)
+      bindings.insert(bindings.end(), {buffers.hidden, buffers.hidden});
+    bindings.push_back(buffers.tape);
+  }
   GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
                               layer,
                               state.convolutionLayerBytes,
@@ -178,8 +182,13 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
     }
   }
   const std::string name = std::string(kVerifyGdnFused) + tableSuffix(input) + kernelName(kernel, "", "_vh32");
-  graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,
-            {shape.valueHeads, lanes, 1});
+  const std::string kernel_name = normKernel(name, buffers.mixerNorm, shape.headDimension);
+  if (folded)
+    graph.addParamsAt(kernel_name, std::move(bindings), params,
+                      prepare ? 19u : 17u, {shape.valueHeads, lanes, 1});
+  else
+    graph.add(kernel_name, std::move(bindings), params,
+              {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};
 }

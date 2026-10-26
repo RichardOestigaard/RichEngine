@@ -146,9 +146,11 @@ void Scheduler::setPrefillBoundary(uint64_t id,
                                          std::optional<uint32_t> boundary) {
   Request &request = get(id);
   // Submit-ahead may already have committed a chunk that stops at this
-  // boundary: equality is legal. Only a boundary behind planned rows is
-  // crossed without ever being published.
-  if (boundary && (*boundary < request.promptPlanned ||
+  // boundary: equality with planned rows is legal while the chunk is
+  // in flight, but a boundary the completed rows reached is stale. Only a
+  // boundary behind planned rows is crossed without ever being published.
+  if (boundary && (*boundary <= request.promptProcessed ||
+                   *boundary < request.promptPlanned ||
                    *boundary > request.spec.prefillTokens)) {
     throw std::invalid_argument("invalid prefill boundary");
   }

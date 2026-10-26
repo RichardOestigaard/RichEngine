@@ -133,6 +133,8 @@ const WeightFileRecord &WeightFile::record() const noexcept {
     return impl_->record;
 }
 
+metal::MetalBackend &WeightFile::backend() const noexcept { return *impl_->backend; }
+
 ops::Projection readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                      std::string_view label) {
     validateQ4Layout(outputSize, inputSize);
@@ -145,14 +147,97 @@ ops::Projection readAffineProjection(WeightFile &file, uint32_t outputSize, uint
 // The same three affine planes as an AF4P segment: plane0 the 64-group
 // codes, plane1 the biases, meta the scales (the staged tile's af4p format
 // reads its own order — kernels/common/quant_formats.h FmtAF4P).
+// af4p's 64-group-ordered linear-nibble plane0, repacked to af4's
+// per-group slot order, its scales and biases interleaved into af4's
+// packed meta (gguf-projection-benchmark: af4 runs ~15-20% faster than
+// af4p at every lane on the M5 Pro).
 ops::Projection readAf4pProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                    std::string_view label) {
     validateQ4Layout(outputSize, inputSize);
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const std::vector<metal::MetalBuffer> planes =
         file.split({elements / 2, elements / 32, elements / 32}, label);
+    const char *af4only = std::getenv("RICHENGINE_AF4_ONLY");
+    if (af4only && label.find(af4only) == std::string_view::npos)
+        return {outputSize, inputSize,
+                ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4P, outputSize, inputSize,
+                                                                 planes[0], planes[2], planes[1])}}};
+    // af4 is the default: RICHENGINE_AF4_OFF restores af4p outright,
+    // RICHENGINE_AF4_SKIP keeps a named projection on af4p.
+    const char *af4skip = std::getenv("RICHENGINE_AF4_SKIP");
+    if (std::getenv("RICHENGINE_AF4_OFF") ||
+        (af4skip && label.find(af4skip) != std::string_view::npos)) {
+        ops::QuantizedSegment segment =
+            ops::QuantizedSegment::planes(GGUF_FMT_AF4P, outputSize, inputSize, planes[0], planes[2], planes[1]);
+        return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
+    }
+    // Repack af4p -> af4: codes [tile][64-group][row][32B] -> af4's
+    // [tile][group][row][16B] deinterleaved to slot order; meta the scales
+    // and biases interleaved {scale, bias} per 64-group unit. Both planes are
+    // QUANT_TILE_ROWS-tiled — quant_tile_index maps (row, unit) for each.
+    metal::MetalBackend &backend = file.backend();
+    const uint32_t groups = inputSize / 32, units = groups / 2;
+    metal::MetalBuffer codes = backend.allocateBuffer(elements / 2, metal::BufferStorage::Shared, label);
+    metal::MetalBuffer meta = backend.allocateBuffer(elements / 16, metal::BufferStorage::Shared, label);
+    auto *dst = static_cast<uint8_t *>(codes.contents());
+    auto *md = static_cast<uint8_t *>(meta.contents());
+    const auto *cs = static_cast<const uint8_t *>(planes[0].contents());
+    const auto *sc = static_cast<const uint8_t *>(planes[1].contents());
+    const auto *bs = static_cast<const uint8_t *>(planes[2].contents());
+    for (uint64_t i = 0; i < uint64_t{outputSize} * units; ++i)
+        reinterpret_cast<uint32_t *>(md)[i] =
+            uint32_t(reinterpret_cast<const uint16_t *>(sc)[i]) |
+            (uint32_t(reinterpret_cast<const uint16_t *>(bs)[i]) << 16);
+    if (const char *dumpfile = std::getenv("RICHENGINE_AF4_PLANES")) {
+        if (std::string_view{label} == "mlp-down") {
+            FILE *fo = fopen(dumpfile, "wb");
+            if (fo) {
+                fwrite(cs, 1, elements / 2, fo);
+                fwrite(sc, 1, elements / 32, fo);
+                fwrite(bs, 1, elements / 32, fo);
+                fclose(fo);
+            }
+        }
+    }
+    if (std::getenv("RICHENGINE_AF4_DUMP")) {
+        fprintf(stderr, "af4 repack %s: out=%u in=%u elements=%llu\n", std::string(label).c_str(),
+                outputSize, inputSize, (unsigned long long)elements);
+        fprintf(stderr, "  plane0[0..31]:");
+        for (int i = 0; i < 32; ++i) fprintf(stderr, " %02x", cs[i]);
+        fprintf(stderr, "\n  scales[0..15]:");
+        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", sc[i]);
+        fprintf(stderr, "\n  biases[0..15]:");
+        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", bs[i]);
+        fprintf(stderr, "\n");
+    }
+    for (uint64_t n = 0; n < outputSize; ++n)
+        for (uint64_t u = 0; u < units; ++u) {
+            const uint8_t *src = cs + quant_tile_index(n, u, units) * 32;
+            for (uint64_t half = 0; half < 2; ++half) {
+                uint8_t *out = dst + quant_tile_index(n, 2 * u + half, groups) * 16;
+                const uint8_t *in = src + half * 16;
+                for (uint64_t c = 0; c < 4; ++c) {
+                    const uint32_t a = reinterpret_cast<const uint16_t *>(in)[c];
+                    const uint32_t b = reinterpret_cast<const uint16_t *>(in)[4 + c];
+                    const uint32_t ae = (a & 0xFu) | (((a >> 8) & 0xFu) << 4);
+                    const uint32_t be = (b & 0xFu) | (((b >> 8) & 0xFu) << 4);
+                    const uint32_t ao = ((a >> 4) & 0xFu) | (((a >> 12) & 0xFu) << 4);
+                    const uint32_t bo = ((b >> 4) & 0xFu) | (((b >> 12) & 0xFu) << 4);
+                    reinterpret_cast<uint32_t *>(out)[c] = ae | (be << 8) | (ao << 16) | (bo << 24);
+                }
+            }
+        }
+    if (std::getenv("RICHENGINE_AF4_PLANES") && std::string_view{label} == "mlp-down") {
+        FILE *fa = fopen("/tmp/af4mlp.bin", "wb");
+        if (fa) { fwrite(dst, 1, elements / 2, fa); fwrite(md, 1, elements / 16, fa); fclose(fa); }
+    }
+    if (std::getenv("RICHENGINE_AF4_RAW")) {
+        return {outputSize, inputSize,
+                ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4, outputSize, inputSize,
+                                                                 planes[0], {}, meta)}}};
+    }
     ops::QuantizedSegment segment =
-        ops::QuantizedSegment::planes(GGUF_FMT_AF4P, outputSize, inputSize, planes[0], planes[2], planes[1]);
+        ops::QuantizedSegment::planes(GGUF_FMT_AF4, outputSize, inputSize, std::move(codes), {}, std::move(meta));
     return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
 }
 

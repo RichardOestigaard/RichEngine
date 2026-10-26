@@ -1,33 +1,16 @@
 #pragma once
 
+#include "model/TargetLayout.hpp"
 #include "DFlashDraft.hpp"
-#include "Dense.hpp"
-#include "DiffusionGemma.hpp"
-#include "Gemma4Moe.hpp"
-#include "Granite.hpp"
-#include "Lfm2.hpp"
-#include "Lfm2Moe.hpp"
-#include "Lfm2Moe24B.hpp"
-#include "MiniCpmV47.hpp"
 #include "Model.hpp"
 #include "ModelTuning.hpp"
-#include "Ornith9B.hpp"
-#include "Qwen3_6Moe.hpp"
-#include "Qwen3_8.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <variant>
 
 namespace richengine::model {
-
-using TargetLayout =
-    std::variant<Qwen3_8Layout, Ornith9BLayout, Qwen3_6MoeLayout,
-                 MiniCpmV47MoeLayout, DenseLayout, Lfm2Layout, Lfm2MoeLayout,
-                 Lfm2Moe24BLayout, GraniteLayout, Gemma4MoeLayout,
-                 DiffusionGemmaLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX or GGUF checkpoint prepared into images when it loads. The vision
@@ -39,9 +22,9 @@ enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 // consumes capabilities; model loading consumes the concrete layouts.
 struct ModelDescriptor final {
   std::string name;
-  // The kModelFamilies entry name the model resolved to ("" when the
-  // package manifest predates family names): model-scoped measured tuning
-  // rows match on it.
+  // The registered family's name (ModelRegistry's registrations replaced
+  // kModelFamilies; "" when the package manifest predates family names):
+  // model-scoped measured tuning rows match on it.
   std::string family;
   TargetLayout target;
   DFlashDraftLayout draft;

@@ -1,7 +1,6 @@
 #pragma once
 
-#include "Qwen3_8.hpp"
-#include "QwenHybridLayout.hpp"
+#include "TargetLayout.hpp"
 #include "TargetModel.hpp"
 #include "TargetFiles.hpp"
 
@@ -15,78 +14,56 @@ namespace richengine::model {
 // no query gate and no per-head norms, and a gated FFN of intermediate
 // 6144. It carries no recurrent state; its packed files are the family's
 // own magics.
-struct DenseLayout final {
-  static constexpr std::string_view layerMagic = "MDFN0001";
-  static constexpr std::string_view headMagic = "MDFN0002";
-  static constexpr FfnKind ffnKind = FfnKind::Dense;
+[[nodiscard]] constexpr TargetLayout denseTargetLayout() noexcept {
+  TargetLayout layout;
+  layout.arch = "dense";
+  layout.ggufArch = "llama";
+  layout.layerMagic = "MDFN0001";
+  layout.headMagic = "MDFN0002";
+  layout.ffnKind = FfnKind::Dense;
   // The packed QKV rows hold the query heads alone (no interleaved gate).
-  static constexpr uint32_t attentionQueryStride = 1;
-  static constexpr bool attentionQkNorm = false;
+  layout.attentionQueryStride = 1;
+  layout.attentionQkNorm = false;
+  // MLX sources may load as block images under preferBlockWeights.
+  layout.mlxBlockWeights = true;
 
-  uint32_t maximumContextTokens = 131072;
-  uint32_t layers = 42;
-  uint32_t hiddenSize = 2048;
-  uint32_t vocabularySize = 130560;
-  uint32_t packedGdnWidth = 0;
-  uint32_t packedFullWidth = 2560;
-  uint32_t convolutionDimension = 0;
-  uint32_t gdnKeyHeads = 0;
-  uint32_t gdnValueHeads = 0;
-  uint32_t gdnHeadDimension = 0;
-  uint32_t attentionWidth = 2048;
-  uint32_t attentionQueryHeads = 16;
-  uint32_t attentionKvHeads = 2;
-  uint32_t attentionHeadDimension = 128;
-  uint32_t rotaryPairs = 64;
-  float rotaryTheta = 5'000'000.0F;
-  uint32_t fullAttentionPeriod = 1;
+  layout.maximumContextTokens = 131072;
+  layout.layers = 42;
+  layout.hiddenSize = 2048;
+  layout.vocabularySize = 130560;
+  layout.packedGdnWidth = 0;
+  layout.packedFullWidth = 2560;
+  layout.convolutionDimension = 0;
+  layout.gdnKeyHeads = 0;
+  layout.gdnValueHeads = 0;
+  layout.gdnHeadDimension = 0;
+  layout.attentionWidth = 2048;
+  layout.attentionQueryHeads = 16;
+  layout.attentionKvHeads = 2;
+  layout.attentionHeadDimension = 128;
+  layout.rotaryPairs = 64;
+  layout.rotaryTheta = 5'000'000.0F;
+  layout.fullAttentionPeriod = 1;
   // The DSpark draft's mask token id and hidden-state capture layers; the
   // draft config declares both (mask_token_id, target_layer_ids).
-  uint32_t maskToken = 75982;
-  std::array<uint32_t, 2> stopTokens = {1, 130073};
-  std::array<uint32_t, 5> hiddenCaptureLayers = {1, 10, 20, 30, 39};
-  uint32_t intermediateSize = 6144;
-
-  [[nodiscard]] constexpr bool
-  isFullAttentionLayer(uint32_t layer) const noexcept {
-    return layer < layers;
-  }
-  [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
-    return layers;
-  }
-  [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept { return 0; }
+  layout.maskToken = 75982;
+  layout.stopTokens = {1, 130073};
+  layout.hiddenCaptureLayers = {1, 10, 20, 30, 39};
+  layout.captureLayerCount = 5;
+  layout.intermediateSize = 6144;
   // The compiled attention kernel the layers bind (ops/PagedKv.hpp).
-  kv::Core attentionCore = kv::Core::Kv2Group8D128;
-  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    kv::Layout layout{attentionLayerCount(), attentionKvHeads,
-                      attentionHeadDimension};
-    layout.attentionCore = attentionCore;
-    return layout;
-  }
-  // No recurrent layers at all: the empty state layout.
-  [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
-    return {};
-  }
-  [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
-    return {hiddenSize, packedGdnWidth, packedFullWidth,
-            convolutionDimension, gdnValueHeads, gdnHeadDimension,
-            attentionWidth, attentionHeadDimension};
-  }
-  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * hiddenCaptureLayers.size();
-  }
-  bool operator==(const DenseLayout &) const = default;
-};
+  layout.attentionCore = kv::Core::Kv2Group8D128;
+  return layout;
+}
 
-using DenseWeights = TargetModelWeights<DenseLayout, DenseLayerWeights>;
+using DenseWeights = TargetModelWeights;
 
 // preferBlockWeights reads an MLX source's images as AF4 block sections
 // (AffineBlockTargetFormat); it must match the flag the AffineTargetLoader
 // the files came from was built with, and leaves packed and GGUF files
 // unchanged.
-[[nodiscard]] DenseWeights
-loadDenseWeights(metal::MetalBackend &backend, DenseLayout layout,
-                 const TargetFiles<DenseLayout> &files,
-                 bool preferBlockWeights = false);
+[[nodiscard]] TargetModelWeights
+loadDenseWeights(metal::MetalBackend &backend, const TargetLayout &layout,
+                 const TargetFiles &files, bool preferBlockWeights = false);
 
 } // namespace richengine::model

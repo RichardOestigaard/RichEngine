@@ -659,7 +659,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                       value.package.target) &&
                   !tuning().diffusionAr),
         targetModel(std::visit(
-                        [&](const auto &weights) {
+                        [&](const TargetModelWeights &weights) {
                           return TargetModel(weights, geometry.target,
                                             value.backend, operators);
                         },
@@ -708,7 +708,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
-    if (geometry.target.stateLayout.layers && geometry.target.convolutionDimension) {
+    // The folded-commit tape is GDN-only: LFM2's conv layers share the
+    // state layout but keep the standalone commit.
+    if (geometry.target.gdnLayers &&
+        !std::getenv("RICHENGINE_NO_GDN_FOLD")) {
       const uint64_t layerBytes = gdnTapeLayerBytes();
       gdnTape_ = backend.allocateBuffer(
           uint64_t{kLaneCount} * 2 * geometry.target.stateLayout.layers *
@@ -1493,9 +1496,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
               item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
-      if (item.logicalPosition == 0)
+      if (item.logicalPosition == 0) {
         states.clearForColdStart(entry.stateLane);
         gdnPendingRows_[entry.stateLane] = 0;
+      }
       if (item.tokenCount > kPrefillRows - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }

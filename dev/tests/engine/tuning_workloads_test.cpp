@@ -1,6 +1,9 @@
 #include "TestChecks.hpp"
 #include "tuning/TuningWorkloads.hpp"
 
+#include "model/Qwen3_6Moe.hpp"
+#include "model/Qwen3_8.hpp"
+
 #include "metal/BackendInstrumentation.hpp"
 #include "metal/abi/QuantFormat.h"
 
@@ -39,8 +42,8 @@ Projection projection(uint32_t output, uint32_t input) {
   return {output, input, AffineWeights{}};
 }
 
-template <class Weights, class Layout> Weights targetWeights(Layout layout) {
-  Weights target;
+TargetModelWeights targetWeights(const TargetLayout &layout) {
+  TargetModelWeights target;
   target.layout = layout;
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
   for (uint32_t index = 0; index < layout.layers; ++index) {
@@ -56,10 +59,11 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
       mixer.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = mixer;
     }
-    if constexpr (std::is_same_v<Weights, Qwen3_8Weights>) {
-      layer.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
-      layer.upProjection = layer.gateProjection;
-      layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+    if (layout.ffnKind == FfnKind::Dense) {
+      auto &ffn = layer.ffn.emplace<DenseFfnWeights>();
+      ffn.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
+      ffn.upProjection = ffn.gateProjection;
+      ffn.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     } else {
       const Q8Projection router{{}, 256, layout.hiddenSize};
       const ExpertProjection up{{}, layout.experts, layout.expertIntermediateSize,
@@ -69,7 +73,7 @@ template <class Weights, class Layout> Weights targetWeights(Layout layout) {
       auto sharedUp = up;
       auto sharedDown = down;
       sharedUp.experts = sharedDown.experts = 1;
-      layer.ffn = AffineMoeWeights{router, up, up, down, sharedUp, sharedUp, sharedDown, router};
+      layer.ffn = MoeWeights{AffineMoeWeights{router, up, up, down, sharedUp, sharedUp, sharedDown, router}};
     }
   }
   return target;
@@ -217,8 +221,8 @@ void checkPair(ModelPackage package) {
 // an untuned format (IQ1_S here) stays out.
 void blockTarget() {
   ModelPackage package;
-  const Qwen3_6MoeLayout layout;
-  auto target = targetWeights<Qwen3_6MoeWeights>(layout);
+  const TargetLayout layout = qwen36MoeTargetLayout();
+  auto target = targetWeights(layout);
   const auto block = [](const Projection &p, uint32_t format = GGUF_FMT_Q4K) {
     return Projection(p.outputSize, p.inputSize,
                       BlockWeights{{QuantizedSegment::planes(format, p.outputSize, p.inputSize, {}, {}, {})}});
@@ -231,7 +235,7 @@ void blockTarget() {
       mixer.inputProjection = block(mixer.inputProjection);
       mixer.outputProjection = block(mixer.outputProjection);
     }, layer.mixer);
-    layer.ffn = BlockMoeWeights{};
+    layer.ffn = MoeWeights{BlockMoeWeights{}};
   }
   package.target = std::move(target);
   DFlashDraftLayout draft;
@@ -254,12 +258,12 @@ void blockTarget() {
 
 void run() {
   ModelPackage dense;
-  dense.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
+  dense.target = targetWeights(qwen38TargetLayout());
   dense.draft = draftWeights(DFlashDraftLayout{});
   checkPair(dense);
 
   ModelPackage sparse;
-  sparse.target = targetWeights<Qwen3_6MoeWeights>(Qwen3_6MoeLayout{});
+  sparse.target = targetWeights(qwen36MoeTargetLayout());
   DFlashDraftLayout smallerDraft;
   smallerDraft.layers = 6;
   smallerDraft.hiddenSize = 2048;
@@ -269,7 +273,7 @@ void run() {
   sparse.draft = draftWeights(smallerDraft);
   checkPair(sparse);
 
-  Qwen3_8Layout alternateDense;
+  TargetLayout alternateDense = qwen38TargetLayout();
   alternateDense.hiddenSize = 4096;
   alternateDense.intermediateSize = 14336;
   DFlashDraftLayout alternateDraft;
@@ -277,11 +281,11 @@ void run() {
   alternateDraft.dynamicSize = 1024;
   alternateDraft.intermediateSize = 12288;
   alternateDraft.targetHiddenSize = 20480;
-  dense.target = targetWeights<Qwen3_8Weights>(alternateDense);
+  dense.target = targetWeights(alternateDense);
   dense.draft = draftWeights(alternateDraft);
   checkPair(dense);
 
-  Qwen3_6MoeLayout alternateSparse;
+  TargetLayout alternateSparse = qwen36MoeTargetLayout();
   alternateSparse.hiddenSize = 1024;
   alternateSparse.gdnKeyHeads = 8;
   alternateSparse.gdnValueHeads = 16;
@@ -297,7 +301,7 @@ void run() {
   smallerDraft.dynamicSize = 256;
   smallerDraft.intermediateSize = 4096;
   smallerDraft.targetHiddenSize = 8192;
-  sparse.target = targetWeights<Qwen3_6MoeWeights>(alternateSparse);
+  sparse.target = targetWeights(alternateSparse);
   sparse.draft = draftWeights(smallerDraft);
   checkPair(sparse);
 
@@ -316,7 +320,7 @@ void metadataViews(const char *metallib) {
   const auto backing = backend.allocateBuffer(32 * 1024, BufferStorage::Shared,
                                                "tuning-inventory-view-test");
   ModelPackage package;
-  package.target = targetWeights<Qwen3_8Weights>(Qwen3_8Layout{});
+  package.target = targetWeights(qwen38TargetLayout());
   package.draft = draftWeights(DFlashDraftLayout{});
   auto &target = std::get<Qwen3_8Weights>(package.target);
   const LinearWorkload key{{target.layout.intermediateSize, target.layout.hiddenSize},
@@ -335,21 +339,22 @@ void metadataViews(const char *metallib) {
       // Repeat each pair through freshly created view objects. Metadata, not
       // wrapper-object identity, must determine whether a tensor is tied.
       const uint32_t representative = index / 2;
-      auto &layer = target.layers[index];
-      layer.upProjection = view(variation == Variation::Distinct ? representative : 0, false);
-      layer.gateProjection = view(variation == Variation::Distinct ||
+      auto &ffn = std::get<DenseFfnWeights>(target.layers[index].ffn);
+      ffn.upProjection = view(variation == Variation::Distinct ? representative : 0, false);
+      ffn.gateProjection = view(variation == Variation::Distinct ||
                                      variation == Variation::GateOnly ? representative : 0, true);
       if (variation == Variation::ScaleOnly) {
-        AffineWeights planes = layer.upProjection.affine();
+        AffineWeights planes = ffn.upProjection.affine();
         planes.scales = view(representative, false).affine().scales;
-        layer.upProjection = Projection(key.matrix.outputSize, key.matrix.inputSize, planes);
+        ffn.upProjection = Projection(key.matrix.outputSize, key.matrix.inputSize, planes);
       }
     }
     // Target and draft execute the same GateUp shape in this pair. They also
     // share a representative here, so this must not add another measurement.
+    const auto &frontFfn = std::get<DenseFfnWeights>(target.layers.front().ffn);
     for (auto &layer : std::get<richengine::model::DFlashDraftWeights>(package.draft).layers) {
-      layer.upProjection = target.layers.front().upProjection;
-      layer.gateProjection = target.layers.front().gateProjection;
+      layer.upProjection = frontFfn.upProjection;
+      layer.gateProjection = frontFfn.gateProjection;
     }
     const auto bytes = backend.memoryStats().allocatedBytes;
     const auto inventory = collectTuningWorkloads(package, std::array{32U}, std::array{1U});
@@ -366,7 +371,7 @@ void metadataViews(const char *metallib) {
     constexpr std::array<size_t, 8> sourceLayers{0, 8, 16, 26, 34, 44, 52, 62};
     for (size_t index = 0; index < expected; ++index) {
       const auto &actual = found->weights[index];
-      const auto &source = target.layers[sourceLayers[index]];
+      const auto &source = std::get<DenseFfnWeights>(target.layers[sourceLayers[index]].ffn);
       require(actual.projection.affine().weights.sameView(source.upProjection.affine().weights) &&
                   actual.projection.affine().scales.sameView(source.upProjection.affine().scales) &&
                   actual.projection.affine().biases.sameView(source.upProjection.affine().biases) &&

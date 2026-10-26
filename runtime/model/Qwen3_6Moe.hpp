@@ -1,6 +1,6 @@
 #pragma once
 
-#include "QwenHybridLayout.hpp"
+#include "TargetLayout.hpp"
 #include "TargetModel.hpp"
 #include "TargetFiles.hpp"
 #include "ops/MoE.hpp"
@@ -11,50 +11,57 @@
 
 namespace richengine::model {
 
-struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
-  static constexpr std::string_view layerMagic = "MDFM0001";
-  static constexpr std::string_view headMagic = "MDFM0002";
-  static constexpr FfnKind ffnKind = FfnKind::SparseMoe;
+// The Qwen3.6-MoE target's canonical layout: a qwen3_5_moe hybrid of 40
+// layers over hidden 2048, a full-attention layer every fourth, over 256
+// routed experts plus a shared one. Its packed files carry the family's
+// MDFM magics.
+[[nodiscard]] constexpr TargetLayout qwen36MoeTargetLayout() noexcept {
+  TargetLayout layout;
+  layout.arch = "qwen3_6moe";
+  layout.layerMagic = "MDFM0001";
+  layout.headMagic = "MDFM0002";
+  layout.ffnKind = FfnKind::SparseMoe;
+  // The packed QKV rows interleave a gate row per query head ([q|gate]).
+  layout.attentionQueryStride = 2;
+  // The per-head RMS norms on the queries and keys.
+  layout.attentionQkNorm = true;
+  layout.packedOnly = false;
+  layout.convolutionTaps = kGdnConvolutionTaps;
+  layout.maximumContextTokens = kv::kMaximumLogicalTokens;
+  layout.layers = 40;
+  layout.hiddenSize = 2048;
+  layout.vocabularySize = 248320;
+  layout.packedGdnWidth = 12544;
+  layout.packedFullWidth = 9216;
+  layout.convolutionDimension = 8192;
+  layout.gdnKeyHeads = 16;
+  layout.gdnValueHeads = 32;
+  layout.gdnHeadDimension = 128;
+  layout.attentionWidth = 4096;
+  layout.attentionQueryHeads = 16;
+  layout.attentionKvHeads = 2;
+  layout.attentionHeadDimension = 256;
+  layout.rotaryPairs = 32;
+  layout.rotaryTheta = 10'000'000.0F;
+  layout.fullAttentionPeriod = 4;
+  layout.maskToken = 248077;
+  layout.stopTokens = {248044, 248046};
+  layout.hiddenCaptureLayers = {1, 6, 11, 16, 22, 27, 32, 37};
+  layout.captureLayerCount = 8;
+  layout.attentionCore = kv::Core::Kv2Group8;
+  layout.experts = 256;
+  layout.expertsPerToken = 8;
+  layout.expertIntermediateSize = 512;
+  // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp).
+  layout.gdnCore = ops::GdnCore::Value32;
+  layout.moeSharedExpert = true;
+  return layout;
+}
 
-  uint32_t experts = 256;
-  uint32_t expertsPerToken = 8;
-  uint32_t expertIntermediateSize = 512;
+using Qwen3_6MoeWeights = TargetModelWeights;
 
-  constexpr Qwen3_6MoeLayout()
-      : QwenHybridLayout{.layers = 40,
-                         .hiddenSize = 2048,
-                         .vocabularySize = 248320,
-                         .packedGdnWidth = 12544,
-                         .packedFullWidth = 9216,
-                         .convolutionDimension = 8192,
-                         .gdnKeyHeads = 16,
-                         .gdnValueHeads = 32,
-                         .gdnHeadDimension = 128,
-                         .attentionWidth = 4096,
-                         .attentionQueryHeads = 16,
-                         .attentionKvHeads = 2,
-                         .attentionHeadDimension = 256,
-                         .rotaryPairs = 32,
-                         .rotaryTheta = 10'000'000.0F,
-                         .fullAttentionPeriod = 4,
-                         .maskToken = 248077,
-                         .stopTokens = {248044, 248046},
-                         .hiddenCaptureLayers = {1, 6, 11, 16, 22, 27, 32, 37},
-                         .attentionCore = kv::Core::Kv2Group8} {}
-  bool operator==(const Qwen3_6MoeLayout &) const = default;
-};
-
-struct Qwen3_6MoeLayerWeights final {
-  ops::NormWeights inputNorm;
-  MixerWeights mixer;
-  ops::NormWeights postAttentionNorm;
-  ops::MoeWeights ffn;
-};
-
-using Qwen3_6MoeWeights = TargetModelWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights>;
-
-[[nodiscard]] Qwen3_6MoeWeights
-loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
-                      const TargetFiles<Qwen3_6MoeLayout> &files);
+[[nodiscard]] TargetModelWeights
+loadQwen3_6MoeWeights(metal::MetalBackend &backend, const TargetLayout &layout,
+                      const TargetFiles &files);
 
 } // namespace richengine::model

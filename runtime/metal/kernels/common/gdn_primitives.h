@@ -17,14 +17,17 @@ inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
                                     uint token, uint channel) {
   float value = 0.0f;
   for (uint tap = 0; tap < 4; ++tap) {
-    uint position = token + tap;
+    // The window stays three slots: the pending rows' tail slides into it —
+    // position p reads the (p + pending)-th token of the chained
+    // [state | pending] prefix, or the packed rows once past it.
+    const uint position = token + tap;
     bfloat input;
-    if (position < 3)
-      input = conv_state_in[position * conv_dim + channel];
-    else if (position < 3 + pending)
-      input = tape_conv[(position - 3) * conv_dim + channel];
+    if (position >= 3)
+      input = packed[(position - 3) * packed_width + channel];
+    else if (position + pending >= 3)
+      input = tape_conv[(position + pending - 3) * conv_dim + channel];
     else
-      input = packed[(position - 3 - pending) * packed_width + channel];
+      input = conv_state_in[(position + pending) * conv_dim + channel];
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));

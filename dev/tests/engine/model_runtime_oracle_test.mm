@@ -1394,8 +1394,7 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
             "decode EOS was not distinguished from committed KV rows");
   }
   std::visit([&](auto &weights) {
-    using Layout = std::decay_t<decltype(weights.layout)>;
-    weights.layout = std::get<Layout>(originalTarget);
+    weights.layout = originalTarget;
   }, package.target);
   package.descriptor.target = originalTarget;
   const model::CompositeStateStorage &states = context.stateStorage;
@@ -3035,7 +3034,7 @@ int main(int argc, char **argv) {
         }
         const ModelStepResult selected =
             decodeOne(executor, sequence.id, sequence.prompt.size(), pageTable,
-                      true, DecodeStage::ApplyInitialMask);
+                      DecodeStage::ApplyInitialMask);
         require(selected.outputTokens.empty(),
                 "the first token's selection emitted a token with budget left");
         stage = selected.nextDecodeStage;
@@ -3058,7 +3057,7 @@ int main(int argc, char **argv) {
                     "preempted constrained decode violated its provided mask");
         } else {
           result = decodeOne(executor, sequence.id, sequence.prompt.size(),
-                             pageTable, false, stage);
+                             pageTable, stage);
         }
         require(!result.outputTokens.empty(), "preempted decode made no progress");
         require(result.outputTokens.size() <= sequence.maxNewTokens - transcript.size() &&

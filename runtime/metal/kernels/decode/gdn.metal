@@ -79,12 +79,6 @@ inline void gdn_decode_prologue(
   const uint v_column = KeyWidth + value_head * HeadDim + lane;
   // The lane's tape row layout: ConvDim conv inputs, then KvWidth k|v
   // columns, then ValueHeads decay (f32) and beta (bf16) runs.
-  constexpr ulong TapeRowSpan = ConvDim + KvWidth;
-  constexpr ulong TapeDecayOffset =
-      ulong(RICHENGINE_TARGET_VERIFY_ROWS) * TapeRowSpan;
-  constexpr ulong TapeBetaOffset =
-      TapeDecayOffset + ulong(RICHENGINE_TARGET_VERIFY_ROWS) * ValueHeads * 2;
-
   for (uint token = simd_group; token < Tokens; token += kDecodeSimdgroups) {
     float q[Groups], k[Groups];
     bfloat v[Groups];
@@ -131,50 +125,60 @@ inline void gdn_decode_prologue(
       shared.decay[token] = gates.decay;
     }
     // The step's tape row: conv inputs and this head's k/v columns — the
-    // next step's pending prefix replays the rows it retains.
+    // next step's pending prefix replays the rows it retains. Sectioned per
+    // the staging's layout: every row's conv inputs, then their kv rows,
+    // decay (fp32) and beta (bf16).
     if (step_tape) {
-      device bfloat *row =
+      constexpr uint VRows = RICHENGINE_TARGET_VERIFY_ROWS;
+      device bfloat *conv_row =
+          reinterpret_cast<device bfloat *>(step_tape) + ulong(token) * ConvDim;
+      device bfloat *kv_row =
           reinterpret_cast<device bfloat *>(step_tape) +
-          ulong(token) * TapeRowSpan;
+          ulong(VRows) * ConvDim + ulong(token) * KvWidth;
       for (uint g = 0; g < Groups; ++g) {
-        row[v_channel + 32 * g] =
+        conv_row[v_channel + 32 * g] =
             packed[token * PackedWidth + v_channel + 32 * g];
-        row[ConvDim + v_column + 32 * g] =
+        kv_row[v_column + 32 * g] =
             shared.values[token * HeadDim + 32 * g + lane];
         if (shared_writer) {
-          row[q_channel + 32 * g] =
+          conv_row[q_channel + 32 * g] =
               packed[token * PackedWidth + q_channel + 32 * g];
-          row[k_channel + 32 * g] =
+          conv_row[k_channel + 32 * g] =
               packed[token * PackedWidth + k_channel + 32 * g];
-          row[ConvDim + k_column + 32 * g] =
+          kv_row[k_column + 32 * g] =
               shared.keys[token * HeadDim + 32 * g + lane];
         }
       }
       if (lane == 0) {
         reinterpret_cast<device float *>(
-            step_tape + TapeDecayOffset * 2)
+            step_tape + ulong(VRows) * (ConvDim + KvWidth) * 2)
             [token * ValueHeads + value_head] = gates.decay;
         reinterpret_cast<device bfloat *>(
-            step_tape + TapeBetaOffset * 2)
+            step_tape + ulong(VRows) * (ConvDim + KvWidth) * 2 +
+            ulong(VRows) * ValueHeads * 4)
             [token * ValueHeads + value_head] = gates.beta;
       }
     }
   }
   if (carrier) {
     const uint row = simd_group;
+    // Folded: the committed carry advances past the pending rows only — the
+    // step's own rows wait for the next step's tape. Unfolded: all rows, and
+    // the standalone commit replays the retained ones.
+    const uint consumed = step_tape ? pending : Tokens;
     for (uint g = 0; g < Groups; ++g) {
       conv_state_out[row * ConvDim + v_channel + 32 * g] =
           gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
-                                PackedWidth, ConvDim, pending,
+                                PackedWidth, ConvDim, consumed,
                          row, v_channel + 32 * g);
       if (shared_writer) {
         conv_state_out[row * ConvDim + q_channel + 32 * g] =
             gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
-                                PackedWidth, ConvDim, pending,
+                                PackedWidth, ConvDim, consumed,
                            row, q_channel + 32 * g);
         conv_state_out[row * ConvDim + k_channel + 32 * g] =
             gdn_conv_carry_pending(packed, conv_state_in, tape_conv, pending,
-                                PackedWidth, ConvDim, pending,
+                                PackedWidth, ConvDim, consumed,
                            row, k_channel + 32 * g);
       }
     }
@@ -191,7 +195,7 @@ inline void gdn_decode_scan(device const float *state_in,
                             device float *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
                             uint value_head, uint lane, uint simd_group,
-                            uint tokens, uint pending) {
+                            uint tokens, uint pending, bool tape_step) {
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -237,10 +241,12 @@ inline void gdn_decode_scan(device const float *state_in,
     }
     // The committed state is the incoming state advanced over the pending
     // rows only; the step's own rows emit but their advance waits on the
-    // next step (they may be trimmed there).
+    // next step (they may be trimmed there). Unfolded, the scan still leaves
+    // the provisional all-rows state — the standalone commit decides.
+    float committed[RowsInFlight][4];
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
-        state_out[base(batch, r) + i] = state[r][i];
+        committed[r][i] = state[r][i];
     for (uint token = 0; token < tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
@@ -274,6 +280,10 @@ inline void gdn_decode_scan(device const float *state_in,
           shared.rows[token * HeadDim + value_dim[r]] = bfloat(result[r]);
       }
     }
+    for (uint r = 0; r < RowsInFlight; ++r)
+      for (uint i = 0; i < 4; ++i)
+        state_out[base(batch, r) + i] =
+            tape_step ? committed[r][i] : state[r][i];
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
         state[r][i] = upcoming[r][i];
@@ -693,20 +703,18 @@ inline void gdn_decode_batch_phase(
     device const bfloat *tb = reinterpret_cast<device const bfloat *>(
         tape + TapeRows * ConvDim * 2 + TapeRows * KvWidth * 2 +
         TapeRows * ValueHeads * 4);
+    const uint key_head = group.x / (ValueHeads / KeyHeads);
     for (uint t = simd_group * 32 + lane; t < pending;
          t += kDecodeSimdgroups * 32) {
-      shared.pending_decay[t] = td[t];
-      shared.pending_beta[t] = tb[t];
+      shared.pending_decay[t] = td[t * ValueHeads + group.x];
+      shared.pending_beta[t] = tb[t * ValueHeads + group.x];
     }
-    for (uint t = simd_group * 32 + lane; t < pending * KvWidth;
+    for (uint t = simd_group * 32 + lane; t < pending * HeadDim;
          t += kDecodeSimdgroups * 32) {
-      const uint token = t / KvWidth, dim = t % KvWidth;
-      if (dim < KeyHeads * HeadDim)
-        shared.pending_keys[token * HeadDim + dim % HeadDim +
-                            HeadDim * (dim / HeadDim)] = tkv[t];
-      else
-        shared.pending_values[token * HeadDim + dim - KeyHeads * HeadDim] =
-            tkv[t];
+      const uint token = t / HeadDim, dim = t % HeadDim;
+      shared.pending_keys[t] = tkv[token * KvWidth + key_head * HeadDim + dim];
+      shared.pending_values[t] =
+          tkv[token * KvWidth + KeyHeads * HeadDim + group.x * HeadDim + dim];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -715,9 +723,11 @@ inline void gdn_decode_batch_phase(
       dt_bias, decay, beta, tape_conv, pending,
       tape_out + params.step_tape[batch], shared, group.x, lane,
       simd_group, tokens);
+  const bool tape_step = tape_out != nullptr;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
-                                         lane, simd_group, tokens, pending);
+                                         lane, simd_group, tokens, pending,
+                                         tape_step);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
   const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);

@@ -74,14 +74,11 @@ int main(int argc, char **argv) {
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path package(argv[3]);
       const auto descriptor = model::inspectModelPackage(package);
-      std::visit([&](const auto &layout) {
-        // The affine source loader has no Gemma 4 tensor map; packed only.
-        if constexpr (std::is_same_v<std::decay_t<decltype(layout)>,
-                                     model::Gemma4MoeLayout> ||
-                      std::is_same_v<std::decay_t<decltype(layout)>,
-                                     model::DiffusionGemmaLayout>)
-          throw std::runtime_error("Gemma 4 targets load from packed files only");
-        else {
+      const model::TargetLayout &layout = descriptor.target;
+      // The affine source loader has no Gemma 4 tensor map; packed only.
+      if (layout.packedOnly)
+        throw std::runtime_error("Gemma 4 targets load from packed files only");
+      {
         // Each image is written into memory of its own, so one is held at a
         // time.
         const auto check = [&](const auto &load, uint64_t decayOffset = 0, uint32_t decayHeads = 0) {
@@ -104,8 +101,7 @@ int main(int argc, char **argv) {
           check([](auto &loader) { return loader.head(); });
           check([](auto &loader) { return loader.embedding(); });
         }
-        }
-      }, descriptor.target);
+      }
       std::cout << "affine source oracle PASS seconds="
                 << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << '\n';
     } catch (const std::exception &error) {

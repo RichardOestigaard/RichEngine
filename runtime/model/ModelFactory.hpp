@@ -6,18 +6,8 @@
 #include "DSparkDraft.hpp"
 #include "DFlashV1Draft.hpp"
 #include "ModelDescriptor.hpp"
-#include "Dense.hpp"
-#include "MiniCpmV47.hpp"
-#include "DiffusionGemma.hpp"
-#include "Gemma4Moe.hpp"
-#include "Lfm2.hpp"
-#include "Lfm2Moe.hpp"
-#include "Lfm2Moe24B.hpp"
-#include "Ornith9B.hpp"
-#include "Qwen3_6Moe.hpp"
-#include "Qwen3_8.hpp"
+#include "TargetWeights.hpp"
 #include "QwenVision.hpp"
-#include "model/Granite.hpp"
 #include "model/NullDraft.hpp"
 #include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
@@ -39,11 +29,6 @@ namespace richengine::model {
 
 class CompositeStateStorage;
 
-using TargetWeights =
-    std::variant<Qwen3_8Weights, Ornith9BWeights, Qwen3_6MoeWeights,
-                 MiniCpmV47MoeWeights, DenseWeights, Lfm2Weights,
-                 Lfm2MoeWeights, Lfm2Moe24BWeights, GraniteWeights,
-                 Gemma4MoeWeights, DiffusionGemmaWeights>;
 using DraftWeights =
     std::variant<NullDraftWeights, DFlashDraftWeights, DFlashV1DraftWeights,
                  DSparkDraftWeights>;
@@ -75,7 +60,7 @@ struct ModelPackage final {
     return descriptor.capabilities.maximumContextTokens;
   }
   [[nodiscard]] uint64_t targetActualAllocatedBytes() const noexcept {
-    return std::visit([](const auto &weights) {
+    return std::visit([](const TargetModelWeightsBase &weights) {
       return weights.actualAllocatedBytes;
     }, target);
   }
@@ -85,12 +70,12 @@ struct ModelPackage final {
     }, draft);
   }
   [[nodiscard]] const std::string &targetManifestFingerprint() const noexcept {
-    return std::visit([](const auto &weights) -> const std::string & {
+    return std::visit([](const TargetModelWeightsBase &weights) -> const std::string & {
       return weights.manifestFingerprintSha256;
     }, target);
   }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
-    return std::visit([](const auto &weights) ->
+    return std::visit([](const TargetModelWeightsBase &weights) ->
                           std::span<const WeightFileRecord> {
       return weights.files;
     }, target);

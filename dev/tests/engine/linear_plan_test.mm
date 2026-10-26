@@ -146,6 +146,12 @@ LinearConfig measuredOverride(LinearMatrix matrix, uint32_t rows,
         {{16640, 5120}, 16, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
         {{16640, 5120}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
         {{5120, 17408}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 17408}, 8, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 17408}, 16, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
+        {{5120, 17408}, 32, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 6144}, 8, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 6144}, 16, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{5120, 6144}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
         {{5120, 17408}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
         {{5120, 25600}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
         {{5120, 25600}, 32, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
@@ -161,11 +167,14 @@ LinearConfig measuredOverride(LinearMatrix matrix, uint32_t rows,
         {{12288, 4096}, 16, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
         {{12544, 4096}, 8, LinearEpilogue::None, {LinearTile::Paired256, 49, LinearSimdgroups::Four, 1}},
         {{12544, 4096}, 16, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
+        {{12544, 4096}, 64, LinearEpilogue::None, {LinearTile::N128, 98, LinearSimdgroups::Eight, 1}},
+        {{248320, 4096}, 64, LinearEpilogue::None, {LinearTile::N128, 1940, LinearSimdgroups::Eight, 1}},
         {{6144, 2048}, 32, LinearEpilogue::GateUp, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
         {{2048, 2048}, 32, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
         {{2048, 10240}, 8, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
         {{2048, 10752}, 24, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 8}},
         {{512, 2048}, 24, LinearEpilogue::None, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 4}},
+        {{130560, 2048}, 8, LinearEpilogue::None, {LinearTile::Paired128, 640, LinearSimdgroups::Eight, 1}},
         // LFM2.5-8B-A1B DSpark draft.
         {{2048, 2048}, 64, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
         {{2048, 6144}, 64, LinearEpilogue::Residual, {LinearTile::Split128, 0, LinearSimdgroups::Eight, 2}},
@@ -211,9 +220,14 @@ LinearConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matrix
     if (const auto oneLane = expectedOneLane(cores, matrix, epilogue)) return *oneLane;
   if (epilogue == LinearEpilogue::GateUp) {
     // The resident gate/up rule: the whole N256 grid while it fits four
-    // tiles per core at one or two lanes (kGateUpGroups in Linear.cpp).
-    if (family >= 10 && lanes <= 2 && tiles256 <= 4 * cores)
-      return {LinearTile::N256, tiles256};
+    // tiles per core at one or two lanes (kGateUpGroups in Linear.cpp);
+    // an even grid past two tiles per core takes its one-wave half.
+    if (family >= 10 && lanes <= 2 && tiles256 <= 4 * cores) {
+      const uint32_t half = tiles256 / 2;
+      const bool evenWave =
+          !(tiles256 & 1) && tiles256 > 2 * cores && half >= cores;
+      return {LinearTile::N256, evenWave ? half : tiles256};
+    }
     return {LinearTile::N256, groups(tiles256, gateUp)};
   }
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, n128)};
@@ -419,8 +433,9 @@ void baselinePlans() {
   };
   const LinearWorkload gateUp{{17408, 5120}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
   require(configured(10, 16, gateUp) == LinearConfig{LinearTile::N256, 36} &&
-              // 68 tiles fit four per core at 20 cores: one resident wave.
-              configured(10, 20, gateUp) == LinearConfig{LinearTile::N256, 68} &&
+              // 68 tiles fit four per core at 20 cores, so the even
+              // half grid runs one resident wave of two tiles a group.
+              configured(10, 20, gateUp) == LinearConfig{LinearTile::N256, 34} &&
               configured(9, 40, gateUp) == LinearConfig{LinearTile::Simdgroup, 0, LinearSimdgroups::Four, 2} &&
               // Unknown counts use the same intermediate estimate on both families.
               configured(10, 0, gateUp) == configured(10, 32, gateUp) &&
@@ -443,8 +458,8 @@ void baselinePlans() {
   const auto split = [](uint32_t splits) {
     return LinearConfig{LinearTile::Split128, 0, LinearSimdgroups::Eight, splits};
   };
-  require(configured(10, 20, mixer27) == split(2) &&
-              configured(10, 16, mixer27) == LinearConfig{LinearTile::Paired128, 40} &&
+  require(configured(10, 20, mixer27) == split(4) &&
+              configured(10, 16, mixer27) == split(4) &&
               configured(10, 40, mixer27) == split(4) &&
               configured(10, 20, mixer35) == split(4) &&
               configured(10, 16, mixer35) == split(4) &&
@@ -983,7 +998,7 @@ void ggufPlans() {
   const LinearWorkload down{{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearPlan single = linear.plan(down, blockProjection(5120, 17408, 1));
   require(single.workload().weightLayout == WeightLayout::Block32 &&
-              single.configuration() == LinearConfig{.tile = LinearTile::GgufStaged, .splits = 2} &&
+              single.configuration() == LinearConfig{.tile = LinearTile::GgufStaged, .splits = 2, .spread = true} &&
               single.groups() == 80 &&
               single.input() == LinearInput::Plain &&
               single.scratchSize().partials == splitPartialsBytes(single) &&

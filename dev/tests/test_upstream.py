@@ -143,17 +143,19 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(families.family_for(config).name, "Qwen3.8-27B")
 
     def test_the_runtimes_family_table_matches_the_installers(self):
-        # ModelDescriptor.mm's kModelFamilies resolves model.json's family;
-        # a family one table names and the other does not fails at serve.
-        # Rows may additionally name a retired family (a Legacy alias
-        # comment): existing packages still resolve, but the installer
-        # must not offer them — so extra rows are allowed only when they
-        # carry the alias marker.
-        source = (
-            Path(__file__).resolve().parents[2] / "runtime/model/ModelDescriptor.mm"
-        ).read_text()
+        # The ModelRegistry family rows (registerModelFamily calls in
+        # runtime/model/families/*.mm, what kModelFamilies was) resolve
+        # model.json's family; a family one table names and the other does
+        # not fails at serve. Rows may additionally name a retired family
+        # (a Legacy alias comment): existing packages still resolve, but
+        # the installer must not offer them — so extra rows are allowed
+        # only when they carry the alias marker.
+        families_dir = Path(__file__).resolve().parents[2] / "runtime/model/families"
+        source = "\n".join(
+            source_path.read_text() for source_path in sorted(families_dir.glob("*.mm"))
+        )
         rows = re.findall(
-            r'\{"([^"]+)",\s*"([^"]+)",\s*(?:nullptr|"[^"]+"),',
+            r'registerModelFamily\(\s*\{\s*"([^"]+)",\s*"([^"]+)",\s*"[^"]*"',
             source,
         )
         table = {name: model_type for name, model_type in rows}

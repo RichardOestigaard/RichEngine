@@ -156,6 +156,24 @@ inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
   return GGUF_FMT_COUNT;
 }
 
+// Whether the Apple9 register tile (kernels/decode/linear_gguf_sgmatrix.metal)
+// takes a format in rows of whole coefficient units.
+inline constexpr bool quant_register_format(uint32_t) { return true; }
+// The columns the register tile takes in `format`: whole coefficient units —
+// one 64-input span for a format of one group per meta unit, else four.
+inline constexpr bool quant_register_tensor(uint32_t format, uint64_t columns) {
+  return quant_register_format(format) && columns % (kQuantFormats[format].meta_groups > 1 ? 256 : 64) == 0;
+}
+// The register tile's coefficient unit in `format`: one 64-input span for a
+// format of one group per meta unit, else four.
+inline constexpr uint32_t quant_register_unit(uint32_t format) {
+  return kQuantFormats[format].meta_groups == 1 ? 64 : format == GGUF_FMT_Q2K ? 128 : 256;
+}
+// Whether a format stores at least four bits per weight.
+inline constexpr bool quant_four_bits(uint32_t format) {
+  return 2 * kQuantFormats[format].block_bytes >= kQuantFormats[format].block_elements;
+}
+
 // The chunk order slot of element e (0..31) of a group.
 inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
 

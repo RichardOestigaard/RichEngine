@@ -8,8 +8,6 @@
 #include "Tuning.hpp"
 #include "model/ModelPolicy.hpp"
 
-#include "model/Gemma4Moe.hpp"
-
 #include <cmath>
 #include <utility>
 #include <variant>
@@ -38,7 +36,7 @@ void TargetModel::addLayerScalar(metal::CommandGraph &graph, metal::MetalBuffer 
 // k_eq_v global kernels by index), the post-attention residual the router
 // reads, and the routed experts beside the dense shared expert, each
 // post-normed before they join the residual under layer_scalar.
-void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWeights &layer,
+void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const TargetLayerWeights &layer,
                                       uint32_t index, metal::MetalBuffer input,
                                       metal::MetalBuffer output) const {
   // Timing probes (garbage output downstream, like RICHENGINE_GEGLU_OFF):
@@ -59,6 +57,9 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
   const uint32_t attentionWidth = geometry_.layerAttentionWidth(index);
   const uint32_t hidden = geometry_.hiddenSize;
   const AttentionMixerWeights &mixer = std::get<AttentionMixerWeights>(layer.mixer);
+  // The FFN half of the layer record: the extra norms, the router and both
+  // expert blocks the shared TargetLayerWeights does not carry.
+  const Gemma4FfnWeights &ffn = std::get<Gemma4FfnWeights>(layer.ffn);
   const metal::MetalBuffer ropeCos = global ? b.ropeCosAlt : b.ropeCos;
   const metal::MetalBuffer ropeSin = global ? b.ropeSinAlt : b.ropeSin;
   const uint32_t pairs = geometry_.rotaryPairsAt(index);
@@ -135,31 +136,31 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
   // Router input: scale-free RMS norm times the learned per-dimension scale
   // (rms with weight = routerScale) times hidden^-0.5.
   ops::Normalization::addRms(step.graph, b.attentionOutput,
-                             ops::NormWeights{layer.routerScale}, b.gdnOutput,
+                             ops::NormWeights{ffn.routerScale}, b.gdnOutput,
                              hidden, step.rows);
   addLayerScalar(step.graph, b.gdnOutput,
                  1.0F / std::sqrt(static_cast<float>(hidden)),
                  step.rows * hidden);
   // The shared expert's input norm also emits its affine input sums; the
   // routed experts take the checkpoint's second pre-FFN norm.
-  ops::Normalization::addRmsWithQ4Sums(step.graph, b.attentionOutput, layer.preFfnNorm,
+  ops::Normalization::addRmsWithQ4Sums(step.graph, b.attentionOutput, ffn.preFfnNorm,
                                        b.normalized, b.projectionSums, hidden, step.rows);
-  ops::Normalization::addRms(step.graph, b.attentionOutput, layer.preFfnNormRouted,
+  ops::Normalization::addRms(step.graph, b.attentionOutput, ffn.preFfnNormRouted,
                              b.gdnHidden, hidden, step.rows);
   // Routed experts: the raw routed sum lands in fullPacked, post-normed into
   // gdnOutput.
   if (!skipMoe)
     ops::MoE::addGemma(step.graph,
                      {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, {}},
-                     {layer.routerWeights, layer.perExpertScale, layer.expertGate,
-                      layer.expertUp, layer.expertDown},
+                     {ffn.routerWeights, ffn.perExpertScale, ffn.expertGate,
+                      ffn.expertUp, ffn.expertDown},
                      *step.moe);
-  ops::Normalization::addRms(step.graph, b.fullPacked, layer.postFfnNormRouted,
+  ops::Normalization::addRms(step.graph, b.fullPacked, ffn.postFfnNormRouted,
                              b.gdnOutput, hidden, step.rows);
   // The shared expert's dense GeGLU.
-  linear.addPrefill(step.graph, b.normalized, layer.sharedGate, b.denseGateScratch,
+  linear.addPrefill(step.graph, b.normalized, ffn.sharedGate, b.denseGateScratch,
                     b.projectionSums, step.rows, b.linearScratch, {}, step.canvas);
-  linear.addPrefill(step.graph, b.normalized, layer.sharedUp, b.denseIntermediate,
+  linear.addPrefill(step.graph, b.normalized, ffn.sharedUp, b.denseIntermediate,
                     b.projectionSums, step.rows, b.linearScratch, {},
                     step.canvas);
   const uint32_t intermediate = step.rows * geometry_.denseIntermediateSize;
@@ -170,24 +171,24 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
     step.graph.add("geglu_multiply", {b.denseGateScratch, b.denseIntermediate, b.denseIntermediate},
                    intermediate, {(intermediate + 255) / 256, 1, 1}, {256, 1, 1});
   linear.addPrefillSums(step.graph, b.denseIntermediate,
-                        b.projectionSums, layer.sharedDown, step.rows);
-  linear.addPrefill(step.graph, b.denseIntermediate, layer.sharedDown,
+                        b.projectionSums, ffn.sharedDown, step.rows);
+  linear.addPrefill(step.graph, b.denseIntermediate, ffn.sharedDown,
                     b.attentionHidden, b.projectionSums, step.rows, b.linearScratch,
                     {}, step.canvas);
-  ops::Normalization::addRms(step.graph, b.attentionHidden, layer.postFfnNormShared,
+  ops::Normalization::addRms(step.graph, b.attentionHidden, ffn.postFfnNormShared,
                              b.gdnHidden, hidden, step.rows);
   // The routed + shared sum takes the checkpoint's (un-suffixed) post-FFN
   // norm before it joins the residual.
   addResidualAdd(step.graph, b.gdnOutput, b.gdnHidden, b.attentionHidden,
                  step.rows * hidden);
-  ops::Normalization::addRms(step.graph, b.attentionHidden, layer.postFfnNorm,
+  ops::Normalization::addRms(step.graph, b.attentionHidden, ffn.postFfnNorm,
                              b.gdnOutput, hidden, step.rows);
   addResidualAdd(step.graph, b.attentionOutput, b.gdnOutput, output,
                  step.rows * hidden);
   // The DiffusionGemma encoder pass overrides the packed (decoder)
   // layer_scalar with the encoder's.
   const float layerScalar = step.layerScalars.empty()
-                                ? layer.layerScalar
+                                ? ffn.layerScalar
                                 : step.layerScalars[index];
   addLayerScalar(step.graph, output, layerScalar, step.rows * hidden);
 }
@@ -195,7 +196,7 @@ void TargetModel::addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWe
 // The same layer in a verify step. The attention dispatches suspend no span:
 // the store/split/reduce parameters are patchable, and everything else is
 // static per batch width — the whole layer replays from the ICB.
-void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeights &layer,
+void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const TargetLayerWeights &layer,
                                      uint32_t index, metal::MetalBuffer input,
                                      metal::MetalBuffer output) const {
   const TargetModelVerifyBuffers &b = step.buffers;
@@ -205,6 +206,7 @@ void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeig
   const kv::Layout layerKv = geometry_.layerKvLayout(global);
   const uint32_t hidden = geometry_.hiddenSize;
   const AttentionMixerWeights &mixer = std::get<AttentionMixerWeights>(layer.mixer);
+  const Gemma4FfnWeights &ffn = std::get<Gemma4FfnWeights>(layer.ffn);
   const metal::MetalBuffer ropeCos = global ? b.ropeCosAlt : b.ropeCos;
   const metal::MetalBuffer ropeSin = global ? b.ropeSinAlt : b.ropeSin;
 
@@ -256,53 +258,53 @@ void TargetModel::addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeig
   // The router input: scale-free rms times the learned scale times
   // hidden^-0.5.
   ops::Normalization::addRms(step.graph, b.gemmaResidual,
-                             ops::NormWeights{layer.routerScale}, b.gdnOutput,
+                             ops::NormWeights{ffn.routerScale}, b.gdnOutput,
                              hidden, step.rows);
   addLayerScalar(step.graph, b.gdnOutput,
                  1.0F / std::sqrt(static_cast<float>(hidden)),
                  step.rows * hidden);
-  const ops::LinearPlan gatePlan = linear.decodePlan(layer.sharedGate, step.planLanes);
-  ops::Normalization::addRms(step.graph, b.gemmaResidual, layer.preFfnNorm,
+  const ops::LinearPlan gatePlan = linear.decodePlan(ffn.sharedGate, step.planLanes);
+  ops::Normalization::addRms(step.graph, b.gemmaResidual, ffn.preFfnNorm,
                              b.normalized, hidden, step.rows, b.linearScratch,
                              gatePlan.input());
   // The routed experts take the checkpoint's second pre-FFN norm.
-  ops::Normalization::addRms(step.graph, b.gemmaResidual, layer.preFfnNormRouted,
+  ops::Normalization::addRms(step.graph, b.gemmaResidual, ffn.preFfnNormRouted,
                              b.gdnHidden, hidden, step.rows);
   // Routed experts: raw sum into fullPacked, post-normed into gdnOutput.
   ops::MoE::addGemma(step.graph,
                      {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, b.verifyRows},
-                     {layer.routerWeights, layer.perExpertScale, layer.expertGate,
-                      layer.expertUp, layer.expertDown},
+                     {ffn.routerWeights, ffn.perExpertScale, ffn.expertGate,
+                      ffn.expertUp, ffn.expertDown},
                      *step.moe);
-  ops::Normalization::addRms(step.graph, b.fullPacked, layer.postFfnNormRouted,
+  ops::Normalization::addRms(step.graph, b.fullPacked, ffn.postFfnNormRouted,
                              b.gdnOutput, hidden, step.rows);
   // The dense shared expert's GeGLU.
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseGateScratch,
               .scratch = b.linearScratch},
-             layer.sharedGate, gatePlan);
+             ffn.sharedGate, gatePlan);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate,
               .scratch = b.linearScratch},
-             layer.sharedUp, gatePlan);
+             ffn.sharedUp, gatePlan);
   const uint32_t intermediate = step.rows * geometry_.denseIntermediateSize;
   step.graph.add("geglu_multiply", {b.denseGateScratch, b.denseIntermediate, b.denseIntermediate},
                  intermediate, {(intermediate + 255) / 256, 1, 1}, {256, 1, 1});
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = b.attentionHidden,
               .scratch = b.linearScratch},
-             layer.sharedDown, linear.decodePlan(layer.sharedDown, step.planLanes));
-  ops::Normalization::addRms(step.graph, b.attentionHidden, layer.postFfnNormShared,
+             ffn.sharedDown, linear.decodePlan(ffn.sharedDown, step.planLanes));
+  ops::Normalization::addRms(step.graph, b.attentionHidden, ffn.postFfnNormShared,
                              b.normalized, hidden, step.rows);
   // The routed + shared sum takes the checkpoint's (un-suffixed) post-FFN
   // norm before it joins the residual.
   addResidualAdd(step.graph, b.gdnOutput, b.normalized, b.attentionHidden,
                  step.rows * hidden);
-  ops::Normalization::addRms(step.graph, b.attentionHidden, layer.postFfnNorm,
+  ops::Normalization::addRms(step.graph, b.attentionHidden, ffn.postFfnNorm,
                              b.normalized, hidden, step.rows);
   addResidualAdd(step.graph, b.gemmaResidual, b.normalized, output,
                  step.rows * hidden);
-  addLayerScalar(step.graph, output, layer.layerScalar, step.rows * hidden);
+  addLayerScalar(step.graph, output, ffn.layerScalar, step.rows * hidden);
   step.graph.endBakedSpan();
 }
 

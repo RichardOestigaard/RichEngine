@@ -498,25 +498,26 @@ struct FmtAF4P {
   // so the word gathers its nibbles: slot i of chunk c is at bits
   // (i & 1) * 16 + 4 * (i >> 1) for the first 16-group's i and +8 for the
   // second's (quant_slot).
+  // The linear nibble order deinterleaves to af4's slot word without a
+  // gather loop: the low nibbles of 16-bit words c and 4 + c are pair e0s,
+  // the high nibbles pair e1s.
+  static Chunk deinterleave(uint a, uint b) {
+    // a, b: each u16's nibbles are four elements in row order; the slot
+    // word wants the evens (pair e0s) at nibbles 0-3, the odds at 4-7.
+    const uint ae = (a & 0xFu) | (((a >> 8) & 0xFu) << 4);
+    const uint be = (b & 0xFu) | (((b >> 8) & 0xFu) << 4);
+    const uint ao = ((a >> 4) & 0xFu) | (((a >> 12) & 0xFu) << 4);
+    const uint bo = ((b >> 4) & 0xFu) | (((b >> 12) & 0xFu) << 4);
+    return ae | (be << 8) | (ao << 16) | (bo << 24);
+  }
   static Chunk chunk(Payload w, ushort c) {
-    Chunk r = 0;
-    for (ushort i = 0; i < 4; ++i) {
-      const ushort e0 = 4 * c + i, e1 = 16 + 4 * c + i;
-      const ushort b0 = (i & 1) * 16 + 4 * (i >> 1);
-      r |= ((w.a[e0 / 8] >> (4 * (e0 & 7))) & 15u) << b0;
-      r |= ((w.a[e1 / 8] >> (4 * (e1 & 7))) & 15u) << (b0 + 8);
-    }
-    return r;
+    const uint a = (w.a[c >> 1] >> (16 * (c & 1))) & 0xFFFFu;
+    const uint b = (w.a[(4 + c) >> 1] >> (16 * (c & 1))) & 0xFFFFu;
+    return deinterleave(a, b);
   }
   static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) {
-    Chunk r = 0;
-    for (ushort i = 0; i < 4; ++i) {
-      const ushort e0 = 4 * c + i, e1 = 16 + 4 * c + i;
-      const ushort b0 = (i & 1) * 16 + 4 * (i >> 1);
-      r |= ((p0[e0 / 2] >> (4 * (e0 & 1))) & 15u) << b0;
-      r |= ((p0[e1 / 2] >> (4 * (e1 & 1))) & 15u) << (b0 + 8);
-    }
-    return r;
+    return deinterleave(uint(*((device ushort *)(p0 + 2 * c))),
+                        uint(*((device ushort *)(p0 + 8 + 2 * c))));
   }
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q); }
   static QuantCoef coef(Meta mt, ushort) {

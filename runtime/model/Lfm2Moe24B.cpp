@@ -1,5 +1,6 @@
 #include "model/Lfm2Moe24B.hpp"
 #include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -51,7 +52,17 @@ MixerWeights readLfm24BConv(WeightFile &file, const Format &format,
   return conv;
 }
 
-void requireLfm2Moe24BLayout(const Lfm2Moe24BLayout &layout) {
+// The LFM2.5-24B-A2B mixers' reader, passed to loadTargetWeights as the
+// mixer reader; identical to the 8B's.
+MixerWeights readTargetMixer(WeightFile &file, const TargetLayout &,
+                             const auto &format,
+                             const MixerGeometry &geometry,
+                             bool fullAttention) {
+  if (fullAttention) return readLfm24BAttention(file, format, geometry);
+  return readLfm24BConv(file, format, geometry);
+}
+
+void requireLfm2Moe24BLayout(const TargetLayout &layout) {
   if (layout.layers != 40 || layout.hiddenSize != 2048 ||
       layout.vocabularySize != 128000 || layout.packedGdnWidth != 6144 ||
       layout.convolutionDimension != 2048 || layout.gdnKeyHeads ||
@@ -64,7 +75,7 @@ void requireLfm2Moe24BLayout(const Lfm2Moe24BLayout &layout) {
       layout.expertsPerToken > 4 ||
       layout.expertIntermediateSize != 1536 ||
       layout.attentionLayerCount() != 10 ||
-      Lfm2Moe24BLayout::denseLayers >= layout.layers ||
+      layout.denseLayers >= layout.layers ||
       layout.packedFullWidth !=
           layout.attentionWidth +
               2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
@@ -94,7 +105,7 @@ ops::NormWeights e5(ops::NormWeights weights) {
 // The dense FFN of a leading layer.
 template <class Format>
 Lfm2DenseFfn readDenseFfn(WeightFile &file, const Format &format,
-                          const Lfm2Moe24BLayout &layout) {
+                          const TargetLayout &layout) {
   return {format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate"),
           format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up"),
           format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down")};
@@ -104,22 +115,22 @@ Lfm2DenseFfn readDenseFfn(WeightFile &file, const Format &format,
 // F32 per-expert selection bias (exp_probs_b) and the quantized expert
 // slabs, in the same section order. There is no shared expert.
 template <class Format>
-void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
-                const Lfm2Moe24BLayout &, const Format &) {
+void readMoeFfn(WeightFile &file, TargetLayerWeights &layer,
+                const TargetLayout &, const Format &) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
   ffn.expertBias = readQuantizedSegment(file, "expert-bias");
   ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
   ffn.up.routed = readQuantizedSegment(file, "experts-up");
   ffn.down.routed = readQuantizedSegment(file, "experts-down");
-  layer.ffn = std::move(ffn);
+  layer.ffn = Lfm2FfnWeights{ops::MoeWeights{std::move(ffn)}};
 }
 
 // Packed and MLX images keep a Q8 router padded to whole 256-row tiles (the
 // score kernels' StorageN), an F32 bias of `experts` values and Q4 expert
 // slabs.
-void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
-                const Lfm2Moe24BLayout &layout, const AffineTargetFormat &) {
+void readMoeFfn(WeightFile &file, TargetLayerWeights &layer,
+                const TargetLayout &layout, const AffineTargetFormat &) {
   ops::AffineMoeWeights ffn;
   ffn.router = readAffineQ8Projection(file, kQ4StorageN, layout.hiddenSize, "router");
   ffn.expertBias = file.section(uint64_t{layout.experts} * sizeof(float), "expert-bias");
@@ -132,60 +143,43 @@ void readMoeFfn(WeightFile &file, Lfm2MoeLayerWeights &layer,
   ffn.expertDown = readAffineExpertProjection(file, layout.experts,
                                               layout.hiddenSize,
                                               layout.expertIntermediateSize, "experts-down");
-  layer.ffn = std::move(ffn);
+  layer.ffn = Lfm2FfnWeights{ops::MoeWeights{std::move(ffn)}};
 }
 
 } // namespace
 
-// The LFM2.5-24B-A2B mixers' reader (found by readTargetMixer's ADL),
-// identical to the 8B's.
-template <class Format>
-MixerWeights readTargetMixer(const Lfm2Moe24BLayout &, WeightFile &file,
-                                 const Format &format,
-                                 const MixerGeometry &geometry,
-                                 bool fullAttention) {
-  if (fullAttention) return readLfm24BAttention(file, format, geometry);
-  return readLfm24BConv(file, format, geometry);
-}
-
-Lfm2Moe24BWeights loadLfm2Moe24BWeights(metal::MetalBackend &backend,
-                                        Lfm2Moe24BLayout layout,
-                                        const TargetFiles<Lfm2Moe24BLayout> &files) {
+TargetModelWeights loadLfm2Moe24BWeights(metal::MetalBackend &backend,
+                                         const TargetLayout &layout,
+                                         const TargetFiles &files) {
   requireLfm2Moe24BLayout(layout);
+  const auto readMixer = [](WeightFile &file, const TargetLayout &l,
+                            const auto &format, const MixerGeometry &g,
+                            bool full) {
+    return readTargetMixer(file, l, format, g, full);
+  };
   // Layers are read in order; the leading denseLayers carry a dense FFN.
   uint32_t layerIndex = 0;
-  const auto readFfn = [&](WeightFile &file, Lfm2MoeLayerWeights &layer, const auto &format) {
+  const auto readFfn = [&](WeightFile &file, TargetLayerWeights &layer, const auto &format) {
     if (layout.isMoeLayer(layerIndex++))
       readMoeFfn(file, layer, layout, format);
     else
-      layer.ffn = readDenseFfn(file, format, layout);
+      layer.ffn = Lfm2FfnWeights{readDenseFfn(file, format, layout)};
   };
-  const auto load = [&](auto &&source, const auto &format) {
-    layerIndex = 0;
-    Lfm2Moe24BWeights weights = readTargetModelWeights<Lfm2Moe24BWeights>(
-        backend, layout, std::forward<decltype(source)>(source), format, readFfn);
-    if (layerIndex != layout.layers)
-      throw WeightStoreError("LFM2-MoE 24B layer count mismatch");
-    // The norm_eps 1e-5 of every layer, head and final norm.
-    for (auto &layer : weights.layers) {
-      layer.inputNorm = e5(layer.inputNorm);
-      layer.postAttentionNorm = e5(layer.postAttentionNorm);
-      if (auto *attention = std::get_if<AttentionMixerWeights>(&layer.mixer)) {
-        attention->queryNorm = e5(attention->queryNorm);
-        attention->keyNorm = e5(attention->keyNorm);
-      }
+  TargetModelWeights weights =
+      loadTargetWeights(backend, layout, files, readMixer, readFfn);
+  if (layerIndex != layout.layers)
+    throw WeightStoreError("LFM2-MoE 24B layer count mismatch");
+  // The norm_eps 1e-5 of every layer, head and final norm.
+  for (auto &layer : weights.layers) {
+    layer.inputNorm = e5(layer.inputNorm);
+    layer.postAttentionNorm = e5(layer.postAttentionNorm);
+    if (auto *attention = std::get_if<AttentionMixerWeights>(&layer.mixer)) {
+      attention->queryNorm = e5(attention->queryNorm);
+      attention->keyNorm = e5(attention->keyNorm);
     }
-    weights.finalNorm = e5(weights.finalNorm);
-    return weights;
-  };
-  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return load(gguf->get(), BlockTargetFormat{});
-  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return load(mlx->get(), AffineTargetFormat{});
-  if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
-    return load(oq->get(), OqTargetFormat{});
-  const auto &packed = std::get<PackedTargetFiles<Lfm2Moe24BLayout>>(files);
-  return load(packed, AffineTargetFormat{packed.tiledEmbedding});
+  }
+  weights.finalNorm = e5(weights.finalNorm);
+  return weights;
 }
 
 } // namespace richengine::model

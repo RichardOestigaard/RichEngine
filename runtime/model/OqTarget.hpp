@@ -9,6 +9,7 @@
 // a uniform Q4 group-64 affine checkpoint keeps the legacy path.
 
 #include "model/AffinePlan.hpp"
+#include "model/TargetLayout.hpp"
 #include "model/WeightImages.hpp"
 
 #include <filesystem>
@@ -16,27 +17,9 @@
 
 namespace richengine::model {
 
-struct Qwen3_8Layout;
-struct Ornith9BLayout;
-struct Qwen3_6MoeLayout;
-struct MiniCpmV47MoeLayout;
-struct DenseLayout;
-struct GraniteLayout;
-struct Lfm2Layout;
-struct Lfm2MoeLayout;
-struct Lfm2Moe24BLayout;
-
 class OqTargetLoader final {
 public:
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_8Layout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Ornith9BLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Qwen3_6MoeLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const MiniCpmV47MoeLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const DenseLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2Layout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2MoeLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const Lfm2Moe24BLayout &layout);
-  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const GraniteLayout &layout);
+  OqTargetLoader(WeightImages &images, const std::filesystem::path &directory, const TargetLayout &layout);
   ~OqTargetLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();

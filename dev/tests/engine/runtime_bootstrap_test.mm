@@ -89,7 +89,9 @@ void testInstalledManifestBindsExecutionGeometry() {
   require(sourceIdentity == model::weightDigest(executionManifest()),
           "the sources' identity is not the manifest's digest");
 
-  root.write(executionManifest(7));
+  // A recorded block past the runtime's draft capacity is refused
+  // (executionGeometry is a capacity bound, not an equality contract).
+  root.write(executionManifest(999));
   try {
     static_cast<void>(model::inspectModelPackage(root.path()));
     throw std::runtime_error("geometry mismatch was accepted");
@@ -176,10 +178,10 @@ void testDenseManifestSelectsTargetByHiddenSize() {
   root.write(executionManifest(8, {}, "Ornith-1.5-9B-DFlash2"));
   const model::ModelDescriptor descriptor =
       model::inspectModelPackage(root.path());
-  const auto *target = std::get_if<model::Ornith9BLayout>(&descriptor.target);
-  require(target && descriptor.valid(), "Ornith manifest built an invalid descriptor");
-  require(target->hiddenSize == 4096 && target->layers == 32 &&
-              target->hiddenCaptureLayers.size() == 8,
+  const model::TargetLayout &target = descriptor.target;
+  require(target.arch == "ornith9" && descriptor.valid(), "Ornith manifest built an invalid descriptor");
+  require(target.hiddenSize == 4096 && target.layers == 32 &&
+              target.captureLayerCount == 8,
           "Ornith packed manifest selected the wrong target layout");
   require(descriptor.draft.layers == 6 && descriptor.draft.hiddenSize == 4096 &&
               descriptor.draft.targetHiddenSize == 32768,
@@ -219,7 +221,7 @@ void testSourceModelSelectsDenseFamilyByLayers() {
              R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":6,"hidden_size":4096,"vocab_size":248320,"intermediate_size":12288,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,"attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"hidden_act":"silu","rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"mask_token_id":248077,"target_layer_ids":[1,5,9,13,17,21,25,29]}})");
   const model::ModelDescriptor descriptor =
       model::inspectModelPackage(root.path());
-  require(std::holds_alternative<model::Ornith9BLayout>(descriptor.target) &&
+  require(descriptor.target.arch == "ornith9" &&
               descriptor.valid() &&
               descriptor.targetSource == model::TargetSource::Mlx &&
               descriptor.visionSource == model::VisionSource::None,
@@ -239,8 +241,7 @@ void testSourceModelSelectsDenseFamilyByLayers() {
              R"({"text_config":{"model_type":"qwen3_5_text","hidden_size":5120,"num_hidden_layers":64,"vocab_size":248320,"max_position_embeddings":262144,"num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"full_attention_interval":4,"rms_norm_eps":1e-06,"intermediate_size":17408,"attention_bias":false,"attn_output_gate":true,"tie_word_embeddings":false,"hidden_act":"silu","rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"rope_type":"default"},"layer_types":["linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"]}})");
   root.write("draft/config.json",
              R"({"architectures":["DFlash2DraftModel"],"num_hidden_layers":5,"hidden_size":5120,"vocab_size":248320,"intermediate_size":17408,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"sliding_window":2048,"is_causal":false,"attention_bias":false,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"hidden_act":"silu","rope_parameters":{"rope_type":"default","rope_theta":10000000},"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"mask_token_id":248070,"target_layer_ids":[5,19,33,47,61]}})");
-  require(std::holds_alternative<model::Qwen3_8Layout>(
-              model::inspectModelPackage(root.path()).target),
+  require(model::inspectModelPackage(root.path()).target.arch == "qwen3_8",
           "a 27B source assembly did not select the 27B layout");
   // A family the installer never resolved, and a config contradicting its
   // family's model type, are refused.

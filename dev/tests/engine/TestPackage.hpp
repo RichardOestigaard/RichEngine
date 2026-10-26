@@ -87,7 +87,7 @@ inline uint64_t writeWeightFile(const std::filesystem::path &path,
 }
 
 inline std::vector<uint64_t>
-targetLayerSections(const model::Qwen3_8Layout &layout, bool full) {
+targetLayerSections(const model::TargetLayout &layout, bool full) {
   constexpr uint64_t bf16 = 2;
   std::vector<uint64_t> result{
       uint64_t(layout.hiddenSize) * bf16,
@@ -171,7 +171,7 @@ struct SyntheticAccounting {
 // Writes the files of a package of these layouts under root.
 inline SyntheticAccounting
 writeSyntheticPackage(const std::filesystem::path &root,
-                      const model::Qwen3_8Layout &target,
+                      const model::TargetLayout &target,
                       const model::DFlashDraftLayout &draft,
                       const ops::VisionLayout &vision) {
   SyntheticAccounting result;

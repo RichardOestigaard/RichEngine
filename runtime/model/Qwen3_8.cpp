@@ -1,5 +1,6 @@
 #include "model/Qwen3_8.hpp"
 #include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
 
 #include <cstring>
 #include <map>
@@ -13,7 +14,7 @@ namespace {
 // D (H r), and the GDN writes its value heads grouped, the order of the
 // rotated output projection's inputs. One signs buffer per input width; the
 // manifest fingerprint covers the signs.
-void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const GgufRotation &rotation) {
+void rotateInputs(metal::MetalBackend &backend, TargetModelWeights &weights, const GgufRotation &rotation) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   std::map<uint32_t, metal::MetalBuffer> signs;
   std::string identity = weights.manifestFingerprintSha256 + " input rotation";
@@ -36,9 +37,10 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
       rotate(mixer.outputProjection);
     }, layer.mixer);
     if (auto *gdn = std::get_if<GdnMixerWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
-    rotate(layer.gateProjection);
-    rotate(layer.upProjection);
-    rotate(layer.downProjection);
+    auto &ffn = std::get<DenseFfnWeights>(layer.ffn);
+    rotate(ffn.gateProjection);
+    rotate(ffn.upProjection);
+    rotate(ffn.downProjection);
   }
   rotate(weights.logitsProjection);
   weights.tokenEmbedding.rotation.signs = signsOf(weights.tokenEmbedding.inputSize);
@@ -48,18 +50,27 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 
 } // namespace
 
-Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                                  const TargetFiles<Qwen3_8Layout> &files) {
+TargetModelWeights
+loadQwen3_8Weights(metal::MetalBackend &backend, const TargetLayout &layout,
+                   const TargetFiles &files) {
+  // The GDN/full-attention mixers are TargetLoader.hpp's default
+  // readTargetMixer.
+  const auto readMixer = [](WeightFile &file, const TargetLayout &l,
+                            const auto &format, const MixerGeometry &g,
+                            bool full) {
+    return readTargetMixer(l, file, format, g, full);
+  };
   // The dense FFN reads the same projections from either format.
-  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
-    layer.gateProjection =
+  const auto readFfn = [&](WeightFile &file, TargetLayerWeights &layer, const auto &format) {
+    auto &ffn = layer.ffn.emplace<DenseFfnWeights>();
+    ffn.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-    layer.upProjection =
+    ffn.upProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-    layer.downProjection =
+    ffn.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Qwen3_8Weights weights = loadTargetWeights<Qwen3_8Weights>(backend, layout, files, readFfn);
+  TargetModelWeights weights = loadTargetWeights(backend, layout, files, readMixer, readFfn);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     if (const std::optional<GgufRotation> &rotation = gguf->get().rotation()) rotateInputs(backend, weights, *rotation);
   return weights;

@@ -98,7 +98,7 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
     projection(weight, LinearPhase::Decode, epilogue);
   };
 
-  std::visit([&](const auto &target) {
+  std::visit([&](const TargetModelWeights &target) {
     if (target.layers.empty())
       throw std::invalid_argument("operator probes require target layers");
     for (const auto &layer : target.layers) {
@@ -106,14 +106,14 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
         bothPhases(mixer.inputProjection);
         bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
-      if constexpr (decltype(target.layout)::ffnKind == FfnKind::Dense) {
-        projection(layer.gateProjection, LinearPhase::Prefill,
+      if (const auto *ffn = std::get_if<DenseFfnWeights>(&layer.ffn)) {
+        projection(ffn->gateProjection, LinearPhase::Prefill,
                      LinearEpilogue::None);
-        projection(layer.upProjection, LinearPhase::Prefill,
+        projection(ffn->upProjection, LinearPhase::Prefill,
                      LinearEpilogue::UpWithGate);
-        projection(layer.upProjection, LinearPhase::Decode,
-                     LinearEpilogue::GateUp, &layer.gateProjection);
-        bothPhases(layer.downProjection, LinearEpilogue::Residual);
+        projection(ffn->upProjection, LinearPhase::Decode,
+                     LinearEpilogue::GateUp, &ffn->gateProjection);
+        bothPhases(ffn->downProjection, LinearEpilogue::Residual);
       }
     }
     projection(target.logitsProjection, LinearPhase::Decode,

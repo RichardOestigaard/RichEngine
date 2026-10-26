@@ -1,4 +1,7 @@
-#include "model/families/FamilyMakers.hpp"
+#include "model/ModelRegistry.hpp"
+#include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
+#include "model/Granite.hpp"
 
 namespace richengine::model {
 namespace {
@@ -6,7 +9,7 @@ namespace {
 // Granite 4.2 ships no GPU draft (no DFlash/DSpark/MTP checkpoint exists);
 // the Null layout satisfies the geometry contract while the n-gram predraft
 // supplies every proposal.
-DFlashDraftLayout graniteNullDraftLayout(const GraniteLayout &target) {
+DFlashDraftLayout graniteNullDraftLayout(const TargetLayout &target) {
   // The planning paths still size draft workspaces from the layout, so it
   // describes the compiled Q32K8D128 head even though nothing encodes.
   DFlashDraftLayout layout;
@@ -27,7 +30,8 @@ DFlashDraftLayout graniteNullDraftLayout(const GraniteLayout &target) {
 }
 
 // The granite targets are text-only: no vision layout, no vision weights.
-ModelDescriptor graniteDescriptor(std::string name, const GraniteLayout &target) {
+ModelDescriptor graniteDescriptor(std::string name,
+                                  const TargetLayout &target) {
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.hiddenSize;
   ModelDescriptor descriptor = makeModelDescriptor(
@@ -40,14 +44,29 @@ ModelDescriptor graniteDescriptor(std::string name, const GraniteLayout &target)
   return descriptor;
 }
 
-} // namespace
-
 ModelDescriptor granite3BDescriptor(std::string name) {
-  return graniteDescriptor(std::move(name), GraniteLayout{});
+  return graniteDescriptor(std::move(name), graniteTargetLayout());
 }
 
 ModelDescriptor granite8BDescriptor(std::string name) {
-  return graniteDescriptor(std::move(name), granite8BLayout());
+  return graniteDescriptor(std::move(name), granite8BTargetLayout());
 }
 
+// The registry's erased-signature entry for the granite target.
+TargetWeights loadGraniteTarget(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadGraniteWeights(backend, layout, files);
+}
+
+const bool kRegisteredGraniteFamilies = [] {
+  registerTargetArch({"granite", &loadGraniteTarget});
+  registerModelFamily({"Granite-4.2-3B", "granite", "", &granite3BDescriptor,
+                       nullptr, nullptr});
+  registerModelFamily({"Granite-4.2-8B", "granite", "", &granite8BDescriptor,
+                       nullptr, nullptr});
+  return true;
+}();
+
+} // namespace
 } // namespace richengine::model

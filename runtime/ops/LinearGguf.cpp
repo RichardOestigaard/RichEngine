@@ -188,6 +188,25 @@ inline LinearConfig oneGateUpPassDecode(const DevicePolicy &policy, uint32_t n, 
   return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(policy, 2 * n, k, stagedTiers(policy)),
           .spread = true, .oneGateUpPass = true};
 }
+// Whether a segment takes the register tile (quant_register_tensor).
+bool registerTileTakes(const QuantizedSegment &s) { return quant_register_tensor(s.formatId, s.inputSize); }
+// Whether a segment stores at least four bits per weight (quant_four_bits).
+bool fourBitsPerWeight(const QuantizedSegment &s) { return quant_four_bits(s.formatId); }
+bool everyQuantizedSegment(std::span<const Projection *const> projections, bool (*takes)(const QuantizedSegment &)) {
+  for (const Projection *p : projections)
+    if (p)
+      for (const QuantizedSegment &s : p->blocks().segments)
+        if (!takes(s)) return false;
+  return true;
+}
+// Apple10 runs decode steps on the register tile on narrow grids: where the
+// grid, a threadgroup per 64 columns (a gate/up pair's that runs in one pass
+// staged) and lane, holds fewer than one and a half threadgroups per core,
+// half that in formats of fewer than four bits per weight.
+inline bool apple10Registers(const DevicePolicy &policy, uint32_t rows, uint32_t columns, bool fourBits) noexcept {
+  const uint32_t lanes = rows / RICHENGINE_TARGET_VERIFY_ROWS;
+  return uint64_t{fourBits ? 2u : 4u} * (columns / GGUF_TILE_COLUMNS) * lanes < uint64_t{3} * policy.cores;
+}
 // Whether a gate/up plan's projections, up then gate, are single tensors of
 // one format, which the one-pass kernels take.
 inline bool oneFormat(std::span<const Projection *const> projections) {
@@ -237,6 +256,10 @@ void LinearPlan::requireBlockConfiguration() const {
     throw std::invalid_argument("staged block splits take whole 32-input groups");
   // Prefill chunks of up to the tile's rows run the staged tile and split K
   // as in decode.
+  if (config_.sixteenRows &&
+      (config_.tile != LinearTile::GgufStaged || !decode ||
+       workload_.rows != RICHENGINE_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("invalid sixteen-row decode plan");
   if (!decode && workload_.rows > stagedTileRows(workload_.rows))
     throw std::invalid_argument("the staged block tile runs prefill chunks of up to 32 rows");
   if (c.spread && c.tile != LinearTile::GgufStaged)
@@ -248,6 +271,7 @@ void LinearPlan::requireBlockConfiguration() const {
 
 uint32_t LinearPlan::blockStorageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
+  if (config_.sixteenRows) return 16;
   if (config_.tile == LinearTile::GgufPrefill)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   return stagedTileRows(workload_.rows);
@@ -311,14 +335,23 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (policy_.isApple9() && !apple9Stages(w, projections)) return registerDecode(policy_, n, k);
+  const bool spreads = spreadsStagedDecode(policy_);
+  const bool onePass =
+      spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
+  // Apple10 runs decode steps on the register tile on narrow grids
+  // (apple10Registers), where the staged tile's columns-per-core run its
+  // threads too few; every segment must take the tile's coefficient units.
+  const ProjectionShape shape =
+      projections.empty() || !projections.front() ? ProjectionShape{} : projections.front()->shape();
+  if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+      apple10Registers(policy_, w.rows, onePass ? 2 * n : n,
+                       shape.fourBits && everyQuantizedSegment(projections, fourBitsPerWeight)))
+    return registerDecode(policy_, n, k);
   bool native = false;
   for (const Projection *p : projections) {
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) native |= nativeDecodeFormat(s.formatId);
   }
-  const bool spreads = spreadsStagedDecode(policy_);
-  const bool onePass =
-      spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
   LinearConfig config =
       onePass ? oneGateUpPassDecode(policy_, n, k)
               : LinearConfig{.tile = LinearTile::GgufStaged,
@@ -331,6 +364,14 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (!onePass)
     if (const uint32_t splits = measuredGgufSplits(policy_, n, k, stagedTileRows(w.rows), native))
       config.splits = splits;
+  // Under 4.5 bits a lane's rows run on the 16-row tile in two halves (the
+  // tile's bit rows carry its lane) where its own plan is unsplit.
+  // sixteenRows needs the input arena's storageRows pad to 16
+  // (decodeStorageRows) before it may engage — disabled until then.
+  if (false && shape.underFourAndHalfBits && w.epilogue != LinearEpilogue::GateUp &&
+      w.rows == RICHENGINE_TARGET_VERIFY_ROWS && config.splits == 1 &&
+      policy_.family >= 10)
+    config.sixteenRows = true;
   return config;
 }
 
@@ -339,6 +380,12 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(policy_))
     size.include(LinearPlan(w, oneGateUpPassDecode(policy_, n, k)).scratchSize());
+  // A lane may run the 16-row tile (sixteenRows): its input table takes
+  // twice the rows of the 8-row plan — reserve it either way.
+  if (w.rows == RICHENGINE_TARGET_VERIFY_ROWS)
+    size.include(LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged,
+                                            .sixteenRows = true})
+                     .scratchSize());
   if (policy_.isApple9()) {
     size.include(LinearPlan(w, stagedDecode(policy_, n, k)).scratchSize());
     // Decode steps wider than the staged tile run the register kernels

@@ -1352,8 +1352,7 @@ uint32_t Runtime::draftWindow() const noexcept {
 
 uint32_t Runtime::decodeAdmissionTokens() const noexcept {
   if (impl_->diffusion) {
-    return std::get<DiffusionGemmaLayout>(impl_->package.descriptor.target)
-        .diffusion.canvasLength;
+    return impl_->package.descriptor.target.diffusion.canvasLength;
   }
   return ExecutionLimits::speculativeScratchTokens;
 }
@@ -1361,20 +1360,13 @@ uint32_t Runtime::decodeAdmissionTokens() const noexcept {
 std::vector<ops::SwiGluProjections> aneFfnLayers(const ModelPackage &model) {
   std::vector<ops::SwiGluProjections> layers;
   std::visit(
-      [&](const auto &weights) {
-        using Layer =
-            typename std::decay_t<decltype(weights.layers)>::value_type;
+      [&](const TargetModelWeights &weights) {
         // Every dense target's layers carry the SwiGLU projections the
         // split can take; a MoE target's routed blocks do not.
-        if constexpr (requires(const Layer &layer) {
-                        layer.gateProjection;
-                        layer.upProjection;
-                        layer.downProjection;
-                      }) {
-          for (const Layer &layer : weights.layers)
-            layers.push_back({&layer.gateProjection, &layer.upProjection,
-                              &layer.downProjection});
-        }
+        for (const TargetLayerWeights &layer : weights.layers)
+          if (const auto *ffn = std::get_if<DenseFfnWeights>(&layer.ffn))
+            layers.push_back({&ffn->gateProjection, &ffn->upProjection,
+                              &ffn->downProjection});
       },
       model.target);
   return layers;

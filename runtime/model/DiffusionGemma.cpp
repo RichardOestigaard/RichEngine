@@ -1,5 +1,6 @@
 #include "model/DiffusionGemma.hpp"
 #include "Checked.hpp"
+#include "model/TargetWeights.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
@@ -11,7 +12,7 @@
 namespace richengine::model {
 namespace {
 
-void requireDiffusionLayout(const DiffusionGemmaLayout &layout) {
+void requireDiffusionLayout(const TargetLayout &layout) {
   // The trunk's own consistency rules are Gemma 4's; here only the
   // diffusion fields and the canvas's fit into the paged KV geometry need
   // checking.
@@ -28,7 +29,7 @@ void requireDiffusionLayout(const DiffusionGemmaLayout &layout) {
 // GeGLU triple at the packed shared width — gate, up [packedShared, hidden]
 // and down [hidden, packedShared].
 DiffusionSelfConditioningWeights
-readSelfConditioning(WeightFile &file, const DiffusionGemmaLayout &layout) {
+readSelfConditioning(WeightFile &file, const TargetLayout &layout) {
   const uint32_t hidden = layout.hiddenSize;
   const uint32_t width = layout.packedSharedWidth;
   DiffusionSelfConditioningWeights result;
@@ -46,11 +47,10 @@ readSelfConditioning(WeightFile &file, const DiffusionGemmaLayout &layout) {
 
 DiffusionGemmaWeights
 loadDiffusionGemmaWeights(metal::MetalBackend &backend,
-                          DiffusionGemmaLayout layout,
-                          const TargetFiles<DiffusionGemmaLayout> &files) {
+                          const TargetLayout &layout,
+                          const TargetFiles &files) {
   requireDiffusionLayout(layout);
-  const auto *packed =
-      std::get_if<PackedTargetFiles<DiffusionGemmaLayout>>(&files);
+  const auto *packed = std::get_if<PackedTargetFiles>(&files);
   if (!packed) {
     // As the Gemma 4 trunk: the packed format is the only path this target
     // loads through.
@@ -72,7 +72,7 @@ loadDiffusionGemmaWeights(metal::MetalBackend &backend,
     const uint32_t attentionWidth = layout.attentionWidthAt(layerIndex);
     const uint32_t width = layout.packedExpertWidth;
 
-    Gemma4MoeLayerWeights layer;
+    TargetLayerWeights layer;
     layer.inputNorm = readNorm(file, hidden, false, "input-norm");
     AttentionMixerWeights mixer;
     mixer.inputProjection = readAffineProjection(file, packedWidth, hidden,
@@ -85,43 +85,44 @@ loadDiffusionGemmaWeights(metal::MetalBackend &backend,
     layer.mixer = std::move(mixer);
     layer.postAttentionNorm =
         readNorm(file, hidden, false, "post-attention-norm");
-    layer.preFfnNorm = readNorm(file, hidden, false, "pre-ffn-norm");
-    layer.preFfnNormRouted =
+    auto &ffn = layer.ffn.emplace<Gemma4FfnWeights>();
+    ffn.preFfnNorm = readNorm(file, hidden, false, "pre-ffn-norm");
+    ffn.preFfnNormRouted =
         readNorm(file, hidden, false, "pre-ffn-norm-routed");
-    layer.routerScale = file.section(
+    ffn.routerScale = file.section(
         checkedMultiply<WeightStoreError>(hidden, kBFloat16Bytes,
                                           "router scale bytes"),
         "router-scale");
-    layer.routerWeights = file.section(
+    ffn.routerWeights = file.section(
         checkedMultiply<WeightStoreError>(
             checkedMultiply<WeightStoreError>(layout.experts, hidden,
                                               "router elements"),
             kBFloat16Bytes, "router bytes"),
         "router-weights");
-    layer.perExpertScale = file.section(
+    ffn.perExpertScale = file.section(
         checkedMultiply<WeightStoreError>(layout.experts, uint64_t{4},
                                           "per-expert scale bytes"),
         "per-expert-scale");
-    layer.expertGate = readAffineExpertProjection(file, layout.experts, width,
-                                                  hidden, "experts-gate");
-    layer.expertUp = readAffineExpertProjection(file, layout.experts, width,
-                                                hidden, "experts-up");
-    layer.expertDown = readAffineExpertProjection(file, layout.experts, hidden,
-                                                  width, "experts-down");
-    layer.sharedGate = readAffineProjection(file, layout.packedSharedWidth,
-                                            hidden, "shared-expert-gate");
-    layer.sharedUp = readAffineProjection(file, layout.packedSharedWidth,
-                                          hidden, "shared-expert-up");
-    layer.sharedDown = readAffineProjection(file, hidden,
-                                            layout.packedSharedWidth,
-                                            "shared-expert-down");
-    layer.postFfnNormShared =
+    ffn.expertGate = readAffineExpertProjection(file, layout.experts, width,
+                                                hidden, "experts-gate");
+    ffn.expertUp = readAffineExpertProjection(file, layout.experts, width,
+                                              hidden, "experts-up");
+    ffn.expertDown = readAffineExpertProjection(file, layout.experts, hidden,
+                                                width, "experts-down");
+    ffn.sharedGate = readAffineProjection(file, layout.packedSharedWidth,
+                                          hidden, "shared-expert-gate");
+    ffn.sharedUp = readAffineProjection(file, layout.packedSharedWidth,
+                                        hidden, "shared-expert-up");
+    ffn.sharedDown = readAffineProjection(file, hidden,
+                                          layout.packedSharedWidth,
+                                          "shared-expert-down");
+    ffn.postFfnNormShared =
         readNorm(file, hidden, false, "post-ffn-norm-shared");
-    layer.postFfnNormRouted =
+    ffn.postFfnNormRouted =
         readNorm(file, hidden, false, "post-ffn-norm-routed");
-    layer.postFfnNorm = readNorm(file, hidden, false, "post-ffn-norm");
+    ffn.postFfnNorm = readNorm(file, hidden, false, "post-ffn-norm");
     const metal::MetalBuffer scalar = file.section(4, "layer-scalar");
-    std::memcpy(&layer.layerScalar, scalar.contents(), 4);
+    std::memcpy(&ffn.layerScalar, scalar.contents(), 4);
     result.layers.push_back(std::move(layer));
     file.finish();
     result.files.push_back(file.record());
@@ -149,7 +150,7 @@ loadDiffusionGemmaWeights(metal::MetalBackend &backend,
     WeightFile file = packed->images.load(
         packedImage(packed->directory / "self_conditioning.bin",
                     "target/self_conditioning.bin",
-                    DiffusionGemmaLayout::headMagic, 0, 3));
+                    layout.headMagic, 0, 3));
     result.selfConditioning = readSelfConditioning(file, layout);
     file.finish();
     result.files.push_back(file.record());
@@ -158,7 +159,7 @@ loadDiffusionGemmaWeights(metal::MetalBackend &backend,
     WeightFile file = packed->images.load(
         packedImage(packed->directory / "encoder_scalars.bin",
                     "target/encoder_scalars.bin",
-                    DiffusionGemmaLayout::headMagic, 0, 4));
+                    layout.headMagic, 0, 4));
     const metal::MetalBuffer scalars =
         file.section(uint64_t{layout.layers} * sizeof(float),
                      "encoder-layer-scalars");

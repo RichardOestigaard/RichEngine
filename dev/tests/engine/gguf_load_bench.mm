@@ -26,11 +26,11 @@ int main(int argc, char **argv) {
     model::WeightImages images(backend);
     model::gguf::TargetGeometry geometry;
     if (!std::strcmp(argv[3], "lfm2moe"))
-      geometry = model::ggufTargetGeometry(model::Lfm2MoeLayout{});
+      geometry = model::ggufTargetGeometry(model::lfm2MoeTargetLayout());
     else if (!std::strcmp(argv[3], "lfm2moe24b"))
-      geometry = model::ggufTargetGeometry(model::Lfm2Moe24BLayout{});
+      geometry = model::ggufTargetGeometry(model::lfm2Moe24BTargetLayout());
     else
-      geometry = model::ggufTargetGeometry(model::Ornith9BLayout{});
+      geometry = model::ggufTargetGeometry(model::ornith9TargetLayout());
     model::GgufTargetLoader loader(backend, images, argv[2], geometry);
     for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
     static_cast<void>(loader.head());

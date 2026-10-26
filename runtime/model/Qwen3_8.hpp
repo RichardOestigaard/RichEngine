@@ -1,6 +1,6 @@
 #pragma once
 
-#include "QwenHybridLayout.hpp"
+#include "TargetLayout.hpp"
 #include "TargetModel.hpp"
 #include "TargetFiles.hpp"
 #include "ops/Linear.hpp"
@@ -11,50 +11,54 @@
 
 namespace richengine::model {
 
-struct Qwen3_8Layout final : QwenHybridLayout<5> {
-  static constexpr std::string_view layerMagic = "MDFL0006";
-  static constexpr std::string_view headMagic = "MDFL0002";
-  static constexpr FfnKind ffnKind = FfnKind::Dense;
+// The Qwen3.8 target's canonical layout: a dense qwen3_5_text hybrid of 64
+// layers over hidden 5120, 48 GDN value heads and the DFlash2 draft's five
+// capture layers. Its packed files share the dense family's magics.
+[[nodiscard]] constexpr TargetLayout qwen38TargetLayout() noexcept {
+  TargetLayout layout;
+  layout.arch = "qwen3_8";
+  layout.layerMagic = "MDFL0006";
+  layout.headMagic = "MDFL0002";
+  layout.ffnKind = FfnKind::Dense;
+  // The packed QKV rows interleave a gate row per query head ([q|gate]).
+  layout.attentionQueryStride = 2;
+  // The per-head RMS norms on the queries and keys.
+  layout.attentionQkNorm = true;
+  layout.packedOnly = false;
+  layout.convolutionTaps = kGdnConvolutionTaps;
+  layout.maximumContextTokens = kv::kMaximumLogicalTokens;
+  layout.layers = 64;
+  layout.hiddenSize = 5120;
+  layout.vocabularySize = 248320;
+  layout.packedGdnWidth = 16640;
+  layout.packedFullWidth = 14336;
+  layout.convolutionDimension = 10240;
+  layout.gdnKeyHeads = 16;
+  layout.gdnValueHeads = 48;
+  layout.gdnHeadDimension = 128;
+  layout.attentionWidth = 6144;
+  layout.attentionQueryHeads = 24;
+  layout.attentionKvHeads = 4;
+  layout.attentionHeadDimension = 256;
+  layout.rotaryPairs = 32;
+  layout.rotaryTheta = 10'000'000.0F;
+  layout.fullAttentionPeriod = 4;
+  layout.maskToken = 248070;
+  layout.stopTokens = {248044, 248046};
+  layout.hiddenCaptureLayers = {5, 19, 33, 47, 61};
+  layout.captureLayerCount = 5;
+  layout.attentionCore = kv::Core::Kv4Group6;
+  layout.intermediateSize = 17408;
+  // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp).
+  layout.gdnCore = ops::GdnCore::Value48;
+  layout.moeSharedExpert = true;
+  return layout;
+}
 
-  uint32_t intermediateSize = 17408;
+using Qwen3_8Weights = TargetModelWeights;
 
-  constexpr Qwen3_8Layout()
-      : QwenHybridLayout{.layers = 64,
-                         .hiddenSize = 5120,
-                         .vocabularySize = 248320,
-                         .packedGdnWidth = 16640,
-                         .packedFullWidth = 14336,
-                         .convolutionDimension = 10240,
-                         .gdnKeyHeads = 16,
-                         .gdnValueHeads = 48,
-                         .gdnHeadDimension = 128,
-                         .attentionWidth = 6144,
-                         .attentionQueryHeads = 24,
-                         .attentionKvHeads = 4,
-                         .attentionHeadDimension = 256,
-                         .rotaryPairs = 32,
-                         .rotaryTheta = 10'000'000.0F,
-                         .fullAttentionPeriod = 4,
-                         .maskToken = 248070,
-                         .stopTokens = {248044, 248046},
-                         .hiddenCaptureLayers = {5, 19, 33, 47, 61},
-                         .attentionCore = kv::Core::Kv4Group6} {}
-  bool operator==(const Qwen3_8Layout &) const = default;
-};
-
-struct DenseLayerWeights final {
-  ops::NormWeights inputNorm;
-  MixerWeights mixer;
-  ops::NormWeights postAttentionNorm;
-  ops::Projection gateProjection;
-  ops::Projection upProjection;
-  ops::Projection downProjection;
-};
-
-using Qwen3_8Weights = TargetModelWeights<Qwen3_8Layout, DenseLayerWeights>;
-
-[[nodiscard]] Qwen3_8Weights
-loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                   const TargetFiles<Qwen3_8Layout> &files);
+[[nodiscard]] TargetModelWeights
+loadQwen3_8Weights(metal::MetalBackend &backend, const TargetLayout &layout,
+                   const TargetFiles &files);
 
 } // namespace richengine::model

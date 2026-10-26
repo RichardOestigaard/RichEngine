@@ -70,7 +70,7 @@ verifyAttentionSplits(uint32_t committedTokens,
   // workspace stays sized for kVerifyMaximumSplits and the shader
   // contract's baked bound still admits the smaller count.
   const uint64_t maximum =
-      std::min<uint64_t>(kVerifyPolicySplits, tuning().verifySplitsMax);
+      std::min<uint64_t>(kVerifyPolicySplits, richengine::tuning().verifySplitsMax);
   return static_cast<uint32_t>(std::min<uint64_t>(
       std::max<uint64_t>(kVerifySplits, scaled), maximum));
 }

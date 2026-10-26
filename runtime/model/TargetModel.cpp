@@ -4,17 +4,6 @@
 #include "model/ModelPolicy.hpp"
 
 #include "metal/abi/GDN.h"
-#include "model/Dense.hpp"
-#include "model/DiffusionGemma.hpp"
-#include "model/Gemma4Moe.hpp"
-#include "model/Lfm2.hpp"
-#include "model/Granite.hpp"
-#include "model/Lfm2Moe.hpp"
-#include "model/Lfm2Moe24B.hpp"
-#include "model/MiniCpmV47.hpp"
-#include "model/Ornith9B.hpp"
-#include "model/Qwen3_6Moe.hpp"
-#include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
@@ -26,16 +15,17 @@
 #include <cstdlib>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
 namespace richengine::model {
 namespace {
 
-template <class Layout>
-TargetModelGeometry commonGeometry(const Layout &layout) {
-  static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
-                TargetModelGeometry::maximumCaptureLayers);
+TargetModelGeometry commonGeometry(const TargetLayout &layout) {
+  if (layout.captureLayerCount > TargetModelGeometry::maximumCaptureLayers)
+    throw std::invalid_argument(
+        "target captures more hidden layers than the geometry holds");
   TargetModelGeometry result;
   result.layers = layout.layers;
   result.hiddenSize = layout.hiddenSize;
@@ -55,186 +45,71 @@ TargetModelGeometry commonGeometry(const Layout &layout) {
   result.gdnHeadDimension = layout.gdnHeadDimension;
   result.maskToken = layout.maskToken;
   result.stopTokens = layout.stopTokens;
-  result.ffnKind = Layout::ffnKind;
+  result.ffnKind = layout.ffnKind;
   result.kvLayout = layout.kvLayout();
   result.stateLayout = layout.gdnStateLayout();
-  result.gdnLayers = layout.gdnStateLayout().layers;
-  result.convolutionTaps = layout.mixerGeometry().convolutionTaps;
-  result.attentionQueryGate = Layout::attentionQueryStride == 2;
-  result.attentionQkNorm = Layout::attentionQkNorm;
-  result.captureLayerCount =
-      static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(),
-            layout.hiddenCaptureLayers.end(),
-            result.captureLayerValues.begin());
+  // The stateLayout.layers recurrent slots are the GDN hybrids' gdnLayers,
+  // the LFM2 targets' convLayers; a target without recurrent state has
+  // neither.
+  result.gdnLayers = layout.gdnHeadDimension ? result.stateLayout.layers : 0;
+  result.convLayers =
+      !layout.gdnHeadDimension && layout.convolutionTaps
+          ? result.stateLayout.layers
+          : 0;
+  result.convolutionTaps = layout.convolutionTaps;
+  // The M-RoPE families carry three position axes; everything else one.
+  result.ropeAxes = layout.gdnHeadDimension ? 3 : 1;
+  result.attentionQueryGate = layout.attentionQueryStride == 2;
+  result.attentionQkNorm = layout.attentionQkNorm;
+  result.moeSharedExpert = layout.moeSharedExpert;
+  result.gdnCore = layout.gdnCore;
+  result.captureLayerCount = layout.captureLayerCount;
+  std::copy_n(layout.hiddenCaptureLayers.begin(), layout.captureLayerCount,
+              result.captureLayerValues.begin());
   return result;
 }
 
-TargetModelGeometry geometryFor(const Qwen3_8Layout &layout) {
+// The execution geometry of the canonical layout: the dual-geometry
+// (Gemma/DiffusionGemma) targets take the alt-attention branch, the rest
+// the common fields plus their FFN sizes.
+TargetModelGeometry geometryFor(const TargetLayout &layout) {
   TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.gdnCore = ops::GdnCore::Value48;
+  if (layout.globalLayerPeriod) {
+    // Gemma 4 26B-A4B (and the DiffusionGemma trunk, which shares it): the
+    // sliding layers' geometry is primary, the k_eq_v globals' the
+    // alternate; tied embeddings scale by sqrt(hidden) and the head takes
+    // the logit softcap.
+    result.attentionWidth =
+        layout.attentionQueryHeads * layout.attentionHeadDimension;
+    result.packedFullWidth = layout.packedWidthAt(0);
+    result.altAttentionMask = layout.globalLayerMask();
+    result.altKvHeads = layout.altKvHeads;
+    result.altHeadDimension = layout.altHeadDimension;
+    result.altRotaryPairs = layout.altRotaryPairs;
+    result.altRotaryTheta = layout.altRotaryTheta;
+    result.slidingWindowTokens = layout.slidingWindowTokens;
+    result.gemmaMoe = true;
+    // The expert tiles' padded width; the logical width rides inside it.
+    result.expertIntermediateSize = layout.packedExpertWidth;
+    // The shared expert is a dense GeGLU of the padded shared width.
+    result.denseIntermediateSize = layout.packedSharedWidth;
+    result.embeddingScale =
+        layout.embeddingScale
+            ? layout.embeddingScale
+            : std::sqrt(static_cast<float>(layout.hiddenSize));
+    result.logitSoftcap = layout.logitSoftcap;
+  } else {
+    result.denseIntermediateSize = layout.intermediateSize;
+    result.expertIntermediateSize = layout.expertIntermediateSize;
+  }
+  if (layout.ffnKind == FfnKind::SparseMoe) {
+    result.experts = layout.experts;
+    result.expertsPerToken = layout.expertsPerToken;
+  }
   return result;
 }
 
-TargetModelGeometry geometryFor(const Ornith9BLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.gdnCore = ops::GdnCore::Value32;
-  return result;
-}
-
-TargetModelGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  result.expertIntermediateSize = layout.expertIntermediateSize;
-  result.gdnCore = ops::GdnCore::Value32;
-  return result;
-}
-
-TargetModelGeometry geometryFor(const MiniCpmV47MoeLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  result.expertIntermediateSize = layout.expertIntermediateSize;
-  result.gdnCore = ops::GdnCore::Value32;
-  return result;
-}
-
-// The pure dense target: every layer full attention, no recurrent slots.
-TargetModelGeometry geometryFor(const DenseLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.gdnLayers = 0;
-  result.convLayers = 0;
-  result.convolutionTaps = 0;
-  result.ropeAxes = 1;
-  return result;
-}
-
-// Granite 4.2: the same all-attention target; its kvLayout carries the
-// attention_multiplier into the kernels' softmax scale.
-TargetModelGeometry geometryFor(const GraniteLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.gdnLayers = 0;
-  result.convLayers = 0;
-  result.convolutionTaps = 0;
-  result.ropeAxes = 1;
-  return result;
-}
-
-// LFM2's conv layers are its recurrent slots (convLayers), gated by the
-// double-gated short convolution instead of the GDN.
-TargetModelGeometry geometryFor(const Lfm2Layout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.gdnLayers = 0;
-  result.convLayers = layout.gdnStateLayout().layers;
-  result.convolutionTaps = Lfm2Layout::convolutionTaps;
-  result.ropeAxes = 1;
-  return result;
-}
-
-// LFM2-MoE: LFM2's conv/attention mixers, a dense FFN on the leading
-// denseLayers and the shared-expert-free sigmoid MoE block after them.
-TargetModelGeometry geometryFor(const Lfm2MoeLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  result.expertIntermediateSize = layout.expertIntermediateSize;
-  result.moeSharedExpert = false;
-  result.gdnLayers = 0;
-  result.convLayers = layout.gdnStateLayout().layers;
-  result.convolutionTaps = Lfm2MoeLayout::convolutionTaps;
-  result.ropeAxes = 1;
-  return result;
-}
-
-// LFM2.5-24B-A2B: the 8B MoE target's mixers at 40 layers — 30 convs, 10
-// attention — its dense leading FFNs widened to 11776 and the MoE blocks'
-// 64 sigmoid-gated experts of 1536.
-TargetModelGeometry geometryFor(const Lfm2Moe24BLayout &layout) {
-  TargetModelGeometry result = commonGeometry(layout);
-  result.denseIntermediateSize = layout.intermediateSize;
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  result.expertIntermediateSize = layout.expertIntermediateSize;
-  result.moeSharedExpert = false;
-  result.gdnLayers = 0;
-  result.convLayers = layout.gdnStateLayout().layers;
-  result.convolutionTaps = Lfm2Moe24BLayout::convolutionTaps;
-  result.ropeAxes = 1;
-  return result;
-}
-
-// Gemma 4 26B-A4B: 30 attention layers — 25 sliding (KV8x256, full rotary
-// at 1e4, 1024-token window) and five globals (KV2x512, p-RoPE of 64 at 1e6,
-// k_eq_v) — each followed by the GeGLU MoE block; no recurrent state, tied
-// embeddings scaled by sqrt(hidden), and the 30 logit softcap.
-TargetModelGeometry geometryFor(const Gemma4MoeLayout &layout) {
-  TargetModelGeometry result;
-  result.layers = layout.layers;
-  result.hiddenSize = layout.hiddenSize;
-  result.vocabularySize = layout.vocabularySize;
-  result.paddedVocabularySize = model::paddedVocabularySize(layout.vocabularySize);
-  result.attentionQueryHeads = layout.attentionQueryHeads;
-  result.attentionKvHeads = layout.attentionKvHeads;
-  result.attentionHeadDimension = layout.attentionHeadDimension;
-  result.rotaryPairs = layout.rotaryPairs;
-  result.rotaryTheta = layout.rotaryTheta;
-  result.attentionWidth =
-      layout.attentionQueryHeads * layout.attentionHeadDimension;
-  result.packedFullWidth = layout.packedWidthAt(0);
-  result.altAttentionMask = layout.globalLayerMask();
-  result.altKvHeads = layout.globalKvHeads;
-  result.altHeadDimension = layout.globalHeadDimension;
-  result.altRotaryPairs = layout.globalRotaryPairs;
-  result.altRotaryTheta = layout.globalRotaryTheta;
-  result.slidingWindowTokens = layout.slidingWindowTokens;
-  result.maskToken = layout.maskToken;
-  result.stopTokens = layout.stopTokens;
-  result.ffnKind = FfnKind::SparseMoe;
-  result.experts = layout.experts;
-  result.expertsPerToken = layout.expertsPerToken;
-  // The expert tiles' padded width; the logical 704 rides inside it.
-  result.expertIntermediateSize = layout.packedExpertWidth;
-  result.moeSharedExpert = false;
-  result.gemmaMoe = true;
-  // The shared expert is a dense GeGLU of the padded shared width.
-  result.denseIntermediateSize = layout.packedSharedWidth;
-  result.kvLayout = layout.kvLayout();
-  result.stateLayout = layout.gdnStateLayout();
-  result.gdnLayers = 0;
-  result.convLayers = 0;
-  result.convolutionTaps = 0;
-  result.ropeAxes = 1;
-  // Gemma keeps the queries' gate-free packing and the per-head norms.
-  result.attentionQueryGate = false;
-  result.attentionQkNorm = true;
-  result.embeddingScale = layout.embeddingScale
-                              ? layout.embeddingScale
-                              : std::sqrt(static_cast<float>(layout.hiddenSize));
-  result.logitSoftcap = layout.logitSoftcap;
-  result.captureLayerCount =
-      static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(),
-            layout.hiddenCaptureLayers.end(),
-            result.captureLayerValues.begin());
-  return result;
-}
-
-// DiffusionGemma's trunk is the Gemma 4 MoE trunk — the decoder runs the
-// same layers; only its pass over the canvas differs, and that is a
-// per-sequence flag (TargetModelPrefillSequence::canvas), not a geometry.
-TargetModelGeometry geometryFor(const DiffusionGemmaLayout &layout) {
-  return geometryFor(static_cast<const Gemma4MoeLayout &>(layout));
-}
-
-template <class Weights>
-void requireWeights(const Weights &weights,
+void requireWeights(const TargetModelWeights &weights,
                     const TargetModelGeometry &geometry) {
   const uint32_t attentionLayers = static_cast<uint32_t>(std::count_if(
       weights.layers.begin(), weights.layers.end(), [](const auto &layer) {
@@ -249,8 +124,7 @@ void requireWeights(const Weights &weights,
 
 } // namespace
 
-template <class Layout, class Layer>
-TargetModel::TargetModel(const TargetModelWeights<Layout, Layer> &weights,
+TargetModel::TargetModel(const TargetModelWeights &weights,
                        const TargetModelGeometry &geometry,
                        metal::MetalBackend &backend,
                        const ops::ExecutionPlans &operators)
@@ -259,115 +133,93 @@ TargetModel::TargetModel(const TargetModelWeights<Layout, Layer> &weights,
   requireWeights(weights, geometry_);
 }
 
-template TargetModel::TargetModel(const Qwen3_8Weights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Ornith9BWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Qwen3_6MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const MiniCpmV47MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const DenseWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Lfm2Weights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Lfm2MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Lfm2Moe24BWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const Gemma4MoeWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const DiffusionGemmaTrunkWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-template TargetModel::TargetModel(const GraniteWeights &, const TargetModelGeometry &, metal::MetalBackend &,
-                                const ops::ExecutionPlans &);
-
 namespace {
 
 void includeProjection(TargetModelGeometry &geometry, const ops::Projection &projection) {
   geometry.decodeProjections.push_back(projection.shape());
 }
 
-// The projections each layer's FFN dispatches, from the first layer on.
-void includeFfn(TargetModelGeometry &geometry, const DenseLayerWeights &layer, bool) {
-  if (layer.gateProjection.shape() != layer.upProjection.shape())
+// The projections a dense FFN dispatches: the fused gate/up pair (matching
+// shapes and layouts) and the down projection.
+void includeDenseFfn(TargetModelGeometry &geometry, const ops::Projection &gate,
+                     const ops::Projection &up, const ops::Projection &down) {
+  if (gate.shape() != up.shape())
     throw WeightStoreError("fused gate/up projections must have matching shapes and layouts");
-  includeProjection(geometry, layer.gateProjection);
-  includeProjection(geometry, layer.upProjection);
-  includeProjection(geometry, layer.downProjection);
-  geometry.gateUpProjections.push_back(layer.upProjection.shape());
+  includeProjection(geometry, gate);
+  includeProjection(geometry, up);
+  includeProjection(geometry, down);
+  geometry.gateUpProjections.push_back(up.shape());
 }
-// A dense FFN carried as a variant member (LFM2-MoE's leading layers).
-void includeFfn(TargetModelGeometry &geometry, const Lfm2DenseFfn &ffn) {
-  if (ffn.gateProjection.shape() != ffn.upProjection.shape())
-    throw WeightStoreError("fused gate/up projections must have matching shapes and layouts");
-  includeProjection(geometry, ffn.gateProjection);
-  includeProjection(geometry, ffn.upProjection);
-  includeProjection(geometry, ffn.downProjection);
-  geometry.gateUpProjections.push_back(ffn.upProjection.shape());
-}
-// No source mixes MoE layouts, so one plan runs every block of a step.
-void includeFfn(TargetModelGeometry &geometry, const Qwen3_6MoeLayerWeights &layer, bool first) {
-  if (first) geometry.moeLayout = layer.ffn.layout();
-  if (layer.ffn.layout() != geometry.moeLayout)
+
+// No source mixes MoE layouts, so one plan runs every block of a step; the
+// first MoE block seen seeds the shared layout (a mixed-FFN target's leading
+// dense layers never reach here).
+void includeMoeFfn(TargetModelGeometry &geometry, const ops::MoeWeights &ffn) {
+  if (!geometry.moeSeeded) {
+    geometry.moeSeeded = true;
+    geometry.moeLayout = ffn.layout();
+  }
+  if (ffn.layout() != geometry.moeLayout)
     throw WeightStoreError("the MoE blocks of a target must share one weight layout");
 }
-// LFM2-MoE's per-layer FFN: dense below denseLayers, MoE from there on.
-void includeFfn(TargetModelGeometry &geometry, const Lfm2MoeLayerWeights &layer, bool) {
+
+// The projections each layer's FFN dispatches. Gemma's block binds the
+// routed expert slabs (padded width) plus the shared expert's dense GeGLU
+// projections.
+void includeFfn(TargetModelGeometry &geometry, const TargetLayerWeights &layer) {
   std::visit(
       [&](const auto &ffn) {
         using Ffn = std::decay_t<decltype(ffn)>;
-        if constexpr (std::is_same_v<Ffn, Lfm2DenseFfn>) {
-          includeFfn(geometry, ffn);
+        if constexpr (std::is_same_v<Ffn, DenseFfnWeights>) {
+          includeDenseFfn(geometry, ffn.gateProjection, ffn.upProjection,
+                          ffn.downProjection);
+        } else if constexpr (std::is_same_v<Ffn, ops::MoeWeights>) {
+          includeMoeFfn(geometry, ffn);
+        } else if constexpr (std::is_same_v<Ffn, Lfm2FfnWeights>) {
+          std::visit(
+              [&](const auto &inner) {
+                using Inner = std::decay_t<decltype(inner)>;
+                if constexpr (std::is_same_v<Inner, Lfm2DenseFfn>)
+                  includeDenseFfn(geometry, inner.gateProjection,
+                                  inner.upProjection, inner.downProjection);
+                else
+                  includeMoeFfn(geometry, inner);
+              },
+              ffn.ffn);
         } else {
+          static_assert(std::is_same_v<Ffn, Gemma4FfnWeights>);
+          // Gemma's expert slabs are always affine; the first block seeds
+          // the shared MoE layout the same way.
           if (!geometry.moeSeeded) {
             geometry.moeSeeded = true;
-            geometry.moeLayout = ffn.layout();
+            geometry.moeLayout = ops::WeightLayout::Affine64;
           }
-          if (ffn.layout() != geometry.moeLayout)
-            throw WeightStoreError("the MoE blocks of a target must share one weight layout");
+          if (ffn.sharedGate.shape() != ffn.sharedUp.shape() ||
+              ffn.expertGate.outputSize != ffn.expertUp.outputSize)
+            throw WeightStoreError(
+                "fused gate/up projections must have matching shapes and layouts");
+          includeProjection(geometry, ffn.sharedGate);
+          includeProjection(geometry, ffn.sharedUp);
+          includeProjection(geometry, ffn.sharedDown);
+          geometry.gateUpProjections.push_back(ffn.sharedUp.shape());
         }
       },
       layer.ffn);
 }
-// Gemma's block: the routed expert slabs (padded width) plus the shared
-// expert's dense GeGLU projections.
-void includeFfn(TargetModelGeometry &geometry, const Gemma4MoeLayerWeights &layer, bool first) {
-  if (first) {
-    geometry.moeSeeded = true;
-    geometry.moeLayout = ops::WeightLayout::Affine64;
-  }
-  if (layer.sharedGate.shape() != layer.sharedUp.shape() ||
-      layer.expertGate.outputSize != layer.expertUp.outputSize)
-    throw WeightStoreError(
-        "fused gate/up projections must have matching shapes and layouts");
-  includeProjection(geometry, layer.sharedGate);
-  includeProjection(geometry, layer.sharedUp);
-  includeProjection(geometry, layer.sharedDown);
-  geometry.gateUpProjections.push_back(layer.sharedUp.shape());
-}
 
 // The format of most routed expert weights of a GGUF target's MoE blocks,
-// GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat).
-uint32_t routedExpertFormat(std::span<const DenseLayerWeights>) { return GGUF_FMT_COUNT; }
-uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
+// GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat). Layers without a
+// routed block — a dense FFN or Gemma's always-affine slabs — contribute
+// nothing.
+uint32_t routedExpertFormat(std::span<const TargetLayerWeights> layers) {
   std::array<uint64_t, GGUF_FMT_COUNT> weights{};
-  for (const Qwen3_6MoeLayerWeights &layer : layers) {
-    if (layer.ffn.layout() != ops::WeightLayout::Block32) return GGUF_FMT_COUNT;
-    const ops::BlockMoeWeights &block = layer.ffn.blocks();
-    for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
-      if (!projection->routed.isFloat())
-        weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
-  }
-  const auto most = std::max_element(weights.begin(), weights.end());
-  return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
-}
-// The same over LFM2-MoE's per-layer dense/MoE FFN variant.
-uint32_t routedExpertFormat(std::span<const Lfm2MoeLayerWeights> layers) {
-  std::array<uint64_t, GGUF_FMT_COUNT> weights{};
-  for (const Lfm2MoeLayerWeights &layer : layers) {
-    const auto *moe = std::get_if<ops::MoeWeights>(&layer.ffn);
-    if (!moe) continue;
+  for (const TargetLayerWeights &layer : layers) {
+    const ops::MoeWeights *moe = std::get_if<ops::MoeWeights>(&layer.ffn);
+    if (!moe) {
+      if (const auto *lfm2 = std::get_if<Lfm2FfnWeights>(&layer.ffn))
+        moe = std::get_if<ops::MoeWeights>(&lfm2->ffn);
+      if (!moe) continue;
+    }
     if (moe->layout() != ops::WeightLayout::Block32) return GGUF_FMT_COUNT;
     const ops::BlockMoeWeights &block = moe->blocks();
     for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
@@ -377,20 +229,17 @@ uint32_t routedExpertFormat(std::span<const Lfm2MoeLayerWeights> layers) {
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
-// Gemma's slabs are always affine.
-uint32_t routedExpertFormat(std::span<const Gemma4MoeLayerWeights>) { return GGUF_FMT_COUNT; }
 
 } // namespace
 
-template <class Layout, class Layer>
-TargetModelGeometry targetModelGeometry(const TargetModelWeights<Layout, Layer> &weights) {
+TargetModelGeometry targetModelGeometry(const TargetModelWeights &weights) {
   auto geometry = geometryFor(weights.layout);
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
       includeProjection(geometry, mixer.inputProjection);
       includeProjection(geometry, mixer.outputProjection);
     }, layer.mixer);
-    includeFfn(geometry, layer, &layer == &weights.layers.front());
+    includeFfn(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
@@ -402,18 +251,6 @@ TargetModelGeometry targetModelGeometry(const TargetModelWeights<Layout, Layer> 
   }
   return geometry;
 }
-
-template TargetModelGeometry targetModelGeometry(const Qwen3_8Weights &);
-template TargetModelGeometry targetModelGeometry(const Ornith9BWeights &);
-template TargetModelGeometry targetModelGeometry(const Qwen3_6MoeWeights &);
-template TargetModelGeometry targetModelGeometry(const MiniCpmV47MoeWeights &);
-template TargetModelGeometry targetModelGeometry(const DenseWeights &);
-template TargetModelGeometry targetModelGeometry(const Lfm2Weights &);
-template TargetModelGeometry targetModelGeometry(const Lfm2MoeWeights &);
-template TargetModelGeometry targetModelGeometry(const Lfm2Moe24BWeights &);
-template TargetModelGeometry targetModelGeometry(const Gemma4MoeWeights &);
-template TargetModelGeometry targetModelGeometry(const DiffusionGemmaTrunkWeights &);
-template TargetModelGeometry targetModelGeometry(const GraniteWeights &);
 
 const ops::Projection &TargetModel::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
@@ -499,31 +336,28 @@ metal::MetalBuffer TargetModel::addPrefill(
     step.moe = step.canvas ? operators_.moeCanvas(geometry_.moeShape(), rows)
                            : operators_.moePrefill(geometry_.moeShape(), rows);
   if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
-  std::visit([&](const auto *weights) {
-    for (uint32_t index = 0; index < geometry_.layers; ++index) {
-      const auto &layer = weights->layers[index];
-      const metal::MetalBuffer input = buffers.hidden[index & 1];
-      const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-      if constexpr (std::is_same_v<std::decay_t<decltype(layer)>,
-                                   Gemma4MoeLayerWeights>) {
-        // The Gemma layer keeps the post-attention residual inside its own
-        // encode: its router reads it, so the mixer cannot return a fused
-        // residual.
-        addPrefillGemmaLayer(step, layer, index, input, output);
-      } else {
-        const metal::MetalBuffer residual = std::visit(
-            [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-        addPrefillFfn(step, index, layer, residual, output);
-      }
-      if (const auto slot = geometry_.captureSlot(index))
-        for (const TargetModelPrefillSequence &sequence : sequences)
-          for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
-            const TargetModelPrefillCapture &c = sequence.captures[capture];
-            addCapture(graph, geometry_, *slot, output, c.sourceStart, buffers.captured, c.destinationStart,
-                       c.rows);
-          }
+  for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    const TargetLayerWeights &layer = weights_->layers[index];
+    const metal::MetalBuffer input = buffers.hidden[index & 1];
+    const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
+    if (std::holds_alternative<Gemma4FfnWeights>(layer.ffn)) {
+      // The Gemma layer keeps the post-attention residual inside its own
+      // encode: its router reads it, so the mixer cannot return a fused
+      // residual.
+      addPrefillGemmaLayer(step, layer, index, input, output);
+    } else {
+      const metal::MetalBuffer residual = std::visit(
+          [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
+      addPrefillFfn(step, index, layer, residual, output);
     }
-  }, weights_);
+    if (const auto slot = geometry_.captureSlot(index))
+      for (const TargetModelPrefillSequence &sequence : sequences)
+        for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
+          const TargetModelPrefillCapture &c = sequence.captures[capture];
+          addCapture(graph, geometry_, *slot, output, c.sourceStart, buffers.captured, c.destinationStart,
+                     c.rows);
+        }
+  }
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   return buffers.hidden[geometry_.layers & 1];
 }
@@ -618,16 +452,51 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
   return b.attentionOutput;
 }
 
-void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const DenseLayerWeights &layer,
+// The layer's FFN: the dense triple (on `step.aneFfn` when the split takes
+// it), the routed MoE block, LFM2-MoE's per-layer dense/MoE mix. Gemma's
+// FFN never reaches here — its whole layer encodes in addPrefillGemmaLayer.
+void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const TargetLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
-  const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
-  if (step.aneFfn)
-    step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
-  else
-    operators_.linear().addPrefillSwiGlu(step.graph, {&layer.gateProjection, &layer.upProjection,
-                                                      &layer.downProjection},
-                                         ffn, residual, output, step.rows);
+  const TargetModelPrefillBuffers &b = step.buffers;
+  const auto dense = [&](const ops::Projection &gate, const ops::Projection &up,
+                         const ops::Projection &down) {
+    addPrefillNorm(step, residual, layer.postAttentionNorm, gate.layout());
+    const ops::PrefillFfnBuffers ffn = b.ffn();
+    if (step.aneFfn)
+      step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
+    else
+      operators_.linear().addPrefillSwiGlu(step.graph, {&gate, &up, &down},
+                                           ffn, residual, output, step.rows);
+  };
+  const auto moe = [&](const ops::MoeWeights &weights) {
+    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm,
+                             b.normalized, geometry_.hiddenSize, step.rows);
+    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}},
+                  weights, *step.moe);
+  };
+  std::visit(
+      [&](const auto &ffn) {
+        using Ffn = std::decay_t<decltype(ffn)>;
+        if constexpr (std::is_same_v<Ffn, DenseFfnWeights>) {
+          dense(ffn.gateProjection, ffn.upProjection, ffn.downProjection);
+        } else if constexpr (std::is_same_v<Ffn, ops::MoeWeights>) {
+          moe(ffn);
+        } else if constexpr (std::is_same_v<Ffn, Lfm2FfnWeights>) {
+          std::visit(
+              [&](const auto &inner) {
+                using Inner = std::decay_t<decltype(inner)>;
+                if constexpr (std::is_same_v<Inner, Lfm2DenseFfn>)
+                  dense(inner.gateProjection, inner.upProjection,
+                        inner.downProjection);
+                else
+                  moe(inner);
+              },
+              ffn.ffn);
+        } else {
+          throw std::logic_error("Gemma FFN outside a Gemma layer encode");
+        }
+      },
+      layer.ffn);
 }
 
 void TargetModel::addVerify(
@@ -635,7 +504,7 @@ void TargetModel::addVerify(
     std::span<const RichKvLayer> kvLayers,
     std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
     bool tree, std::span<const uint32_t> liveRows, uint32_t liveNodes,
-    uint32_t verifyStride) const {
+    uint32_t verifyStride, const ops::GdnTapeLanes *tapeLanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       (!liveRows.empty() && liveRows.size() != lanes) ||
       !verifyStride || verifyStride > ExecutionLimits::targetVerifyRows ||
@@ -673,46 +542,43 @@ void TargetModel::addVerify(
         lanes, geometry_.attentionQueryHeads, geometry_.layerKvLayout(true),
         std::span(histories).first(lanes), tree, liveNodes, rowCapacity));
   step.planLanes = planLanes;
+  step.tapeLanes = tapeLanes;
   step.rowCapacity = rowCapacity;
   step.tree = tree;
   step.liveRows = liveRows;
   if (geometry_.ffnKind == FfnKind::SparseMoe)
     step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes,
                                     rowCapacity);
-  std::visit([&](const auto *weights) {
-    for (uint32_t index = 0; index < geometry_.layers; ++index) {
-      const auto &layer = weights->layers[index];
-      const metal::MetalBuffer input = buffers.hidden[index & 1];
-      const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-      if constexpr (std::is_same_v<std::decay_t<decltype(layer)>,
-                                   Gemma4MoeLayerWeights>) {
-        addVerifyGemmaLayer(step, layer, index, input, output);
-        if (const auto slot = geometry_.captureSlot(index)) {
-          graph.beginBakedSpan();
-          addCapture(graph, geometry_, *slot, output, 0,
-                     tree ? buffers.capturedPath : buffers.capturedTargetHidden,
-                     0, rows);
-          graph.endBakedSpan();
-        }
-        continue;
-      } else {
-      const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) { return addVerifyMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-      addVerifyFfn(step, layer, residual, output);
-      }
+  for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    const TargetLayerWeights &layer = weights_->layers[index];
+    const metal::MetalBuffer input = buffers.hidden[index & 1];
+    const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
+    if (std::holds_alternative<Gemma4FfnWeights>(layer.ffn)) {
+      addVerifyGemmaLayer(step, layer, index, input, output);
       if (const auto slot = geometry_.captureSlot(index)) {
-        // The row copy's buffers and geometry are static per batch width. A
-        // tree batch captures the DFS rows into its staging; the path gather
-        // that produces the committed rows runs after acceptance.
         graph.beginBakedSpan();
         addCapture(graph, geometry_, *slot, output, 0,
                    tree ? buffers.capturedPath : buffers.capturedTargetHidden,
                    0, rows);
         graph.endBakedSpan();
       }
+      continue;
     }
-    requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-  }, weights_);
+    const metal::MetalBuffer residual = std::visit(
+        [&](const auto &mixer) { return addVerifyMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
+    addVerifyFfn(step, layer, residual, output);
+    if (const auto slot = geometry_.captureSlot(index)) {
+      // The row copy's buffers and geometry are static per batch width. A
+      // tree batch captures the DFS rows into its staging; the path gather
+      // that produces the committed rows runs after acceptance.
+      graph.beginBakedSpan();
+      addCapture(graph, geometry_, *slot, output, 0,
+                 tree ? buffers.capturedPath : buffers.capturedTargetHidden,
+                 0, rows);
+      graph.endBakedSpan();
+    }
+  }
+  requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, planLanes,
                buffers.linearScratch, &buffers,
                tree ? uint32_t{RICHENGINE_TREE_VERIFY_NODES} : verifyStride);
@@ -815,10 +681,50 @@ void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &no
   step.graph.endBakedSpan();
 }
 
-void TargetModel::addVerifyFfn(VerifyStep &step, const DenseLayerWeights &layer, metal::MetalBuffer residual,
+// The same layer FFN in a verify step: the dense triple through
+// addVerifyDenseFfn, the routed MoE block replayed from a baked span (MoE::add
+// nests its own), LFM2-MoE's mix between them. Gemma's FFN never reaches
+// here — its whole layer encodes in addVerifyGemmaLayer.
+void TargetModel::addVerifyFfn(VerifyStep &step, const TargetLayerWeights &layer, metal::MetalBuffer residual,
                               metal::MetalBuffer output) const {
-  addVerifyDenseFfn(step, layer.postAttentionNorm, layer.gateProjection, layer.upProjection,
-                    layer.downProjection, residual, output);
+  const TargetModelVerifyBuffers &b = step.buffers;
+  const auto moe = [&](const ops::MoeWeights &weights) {
+    // One layer's norm plus MoE block is replayed from a baked indirect
+    // command buffer when the submission revalidates it; MoE::add nests its
+    // own span.
+    step.graph.beginBakedSpan();
+    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm,
+                             b.normalized, geometry_.hiddenSize, step.rows);
+    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows},
+                  weights, *step.moe);
+    step.graph.endBakedSpan();
+  };
+  std::visit(
+      [&](const auto &ffn) {
+        using Ffn = std::decay_t<decltype(ffn)>;
+        if constexpr (std::is_same_v<Ffn, DenseFfnWeights>) {
+          addVerifyDenseFfn(step, layer.postAttentionNorm, ffn.gateProjection,
+                            ffn.upProjection, ffn.downProjection, residual,
+                            output);
+        } else if constexpr (std::is_same_v<Ffn, ops::MoeWeights>) {
+          moe(ffn);
+        } else if constexpr (std::is_same_v<Ffn, Lfm2FfnWeights>) {
+          std::visit(
+              [&](const auto &inner) {
+                using Inner = std::decay_t<decltype(inner)>;
+                if constexpr (std::is_same_v<Inner, Lfm2DenseFfn>)
+                  addVerifyDenseFfn(step, layer.postAttentionNorm,
+                                    inner.gateProjection, inner.upProjection,
+                                    inner.downProjection, residual, output);
+                else
+                  moe(inner);
+              },
+              ffn.ffn);
+        } else {
+          throw std::logic_error("Gemma FFN outside a Gemma layer encode");
+        }
+      },
+      layer.ffn);
 }
 
 void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,

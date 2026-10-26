@@ -1,132 +1,52 @@
 #include "model/GgufTarget.hpp"
-#include "model/Dense.hpp"
-#include "model/Granite.hpp"
 #include "model/GgufPreparation.hpp"
-#include "model/Lfm2.hpp"
-#include "model/Lfm2Moe.hpp"
-#include "model/Lfm2Moe24B.hpp"
 
 namespace richengine::model {
 
-gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout) {
+// The GGUF geometry of a target's layout. The GGUF schema the arch implies
+// names the metadata keys and tensor schema the image planner reads:
+// "llama" the dense target, "granite" Granite 4.2's llama tensors plus the
+// fixed attention multiplier and the unit embedding/residual/logit scales,
+// "lfm2"/"lfm2moe" the LFM2 targets — tied embeddings and the shared-
+// expert-free sigmoid MoE with leading dense-FFN layers — and the hybrids
+// the empty arch that resolves to "qwen35"/"qwen35moe" on the MoE split.
+gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout) {
+  if (layout.packedOnly)
+    throw std::invalid_argument("Gemma 4 targets load from packed files only");
   gguf::TargetGeometry geometry;
-  geometry.arch = "llama";
   geometry.layers = layout.layers;
   geometry.hiddenSize = layout.hiddenSize;
   geometry.vocabularySize = layout.vocabularySize;
   geometry.intermediateSize = layout.intermediateSize;
+  geometry.gdnKeyHeads = layout.gdnKeyHeads;
+  geometry.gdnValueHeads = layout.gdnValueHeads;
+  geometry.gdnHeadDimension = layout.gdnHeadDimension;
+  geometry.convolutionDimension = layout.convolutionDimension;
+  // The conv-only mixers declare their taps; the GDN hybrids' geometry
+  // keeps the zero that defaults to kGdnConvolutionTaps.
+  if (!layout.gdnHeadDimension) geometry.convolutionTaps = layout.convolutionTaps;
   geometry.attentionWidth = layout.attentionWidth;
   geometry.attentionKvHeads = layout.attentionKvHeads;
   geometry.attentionHeadDimension = layout.attentionHeadDimension;
   geometry.rotaryPairs = layout.rotaryPairs;
   geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.fullAttentionPeriod = 1; // every layer attends
-  geometry.attentionQueryGate = false;
-  geometry.attentionQkNorm = false;
-  return geometry;
-}
-
-// Granite 4.2 ("granite" arch): llama tensors plus the fixed attention
-// multiplier and the unit embedding/residual/logit scales.
-gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.arch = "granite";
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.intermediateSize = layout.intermediateSize;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.fullAttentionPeriod = 1;
-  geometry.rmsEpsilon = layout.rmsEpsilon;
-  geometry.attentionScale = layout.attentionScale;
-  geometry.attentionQueryGate = false;
-  geometry.attentionQkNorm = false;
-  return geometry;
-}
-
-gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.arch = "lfm2";
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.intermediateSize = layout.intermediateSize;
+  geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
   geometry.attentionMask = layout.attentionMask;
-  geometry.convolutionDimension = layout.convolutionDimension;
-  geometry.convolutionTaps = Lfm2Layout::convolutionTaps;
-  geometry.rmsEpsilon = layout.rmsEpsilon;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.attentionQueryGate = false;
-  geometry.attentionQkNorm = true;
-  geometry.tiedOutput = true;
-  return geometry;
-}
-
-// The LFM2-MoE target ("lfm2moe"): LFM2's mixers and tied head, a dense FFN
-// on the leading denseLayers and the shared-expert-free sigmoid MoE block
-// on every later layer, conv or attention.
-gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.arch = "lfm2moe";
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.intermediateSize = layout.intermediateSize;
-  geometry.attentionMask = Lfm2MoeLayout::attentionMask;
-  geometry.convolutionDimension = layout.convolutionDimension;
-  geometry.convolutionTaps = Lfm2MoeLayout::convolutionTaps;
-  geometry.rmsEpsilon = layout.rmsEpsilon;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.attentionQueryGate = false;
-  geometry.attentionQkNorm = true;
-  geometry.tiedOutput = true;
-  geometry.experts = layout.experts;
-  geometry.expertsPerToken = layout.expertsPerToken;
-  geometry.expertIntermediateSize = layout.expertIntermediateSize;
-  geometry.leadingDenseLayers = Lfm2MoeLayout::denseLayers;
-  geometry.sharedExpert = false;
-  return geometry;
-}
-
-// The LFM2.5-24B-A2B target ("lfm2moe"): the same hybrid shape as the 8B
-// at 40 layers — 10 full-attention layers, two leading dense-FFN layers of
-// 11776 and 64 sigmoid-gated experts of 1536 from there on.
-gguf::TargetGeometry ggufTargetGeometry(const Lfm2Moe24BLayout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.arch = "lfm2moe";
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.intermediateSize = layout.intermediateSize;
-  geometry.attentionMask = Lfm2Moe24BLayout::attentionMask;
-  geometry.convolutionDimension = layout.convolutionDimension;
-  geometry.convolutionTaps = Lfm2Moe24BLayout::convolutionTaps;
-  geometry.rmsEpsilon = layout.rmsEpsilon;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.attentionQueryGate = false;
-  geometry.attentionQkNorm = true;
-  geometry.tiedOutput = true;
-  geometry.experts = layout.experts;
-  geometry.expertsPerToken = layout.expertsPerToken;
-  geometry.expertIntermediateSize = layout.expertIntermediateSize;
-  geometry.leadingDenseLayers = Lfm2Moe24BLayout::denseLayers;
-  geometry.sharedExpert = false;
+  if (layout.rmsEpsilon) geometry.rmsEpsilon = layout.rmsEpsilon;
+  geometry.attentionScale = layout.attentionScale;
+  // The packed query rows interleave a gate row each on the hybrids alone.
+  geometry.attentionQueryGate = layout.attentionQueryStride == 2;
+  geometry.attentionQkNorm = layout.attentionQkNorm;
+  if (layout.ffnKind == FfnKind::SparseMoe) {
+    geometry.experts = layout.experts;
+    geometry.expertsPerToken = layout.expertsPerToken;
+    geometry.expertIntermediateSize = layout.expertIntermediateSize;
+    geometry.leadingDenseLayers = layout.denseLayers;
+    geometry.sharedExpert = layout.moeSharedExpert;
+  }
+  geometry.arch = std::string(layout.ggufArch);
+  // The LFM2 targets tie their output head to the token embedding.
+  geometry.tiedOutput = layout.tiedOutput;
   return geometry;
 }
 std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {

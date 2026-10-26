@@ -1,6 +1,25 @@
-#include "model/families/FamilyMakers.hpp"
+#include "model/AffinePlan.hpp"
+#include "model/AffineTarget.hpp"
+#include "model/ModelRegistry.hpp"
+#include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
+#include "model/Lfm2Moe24B.hpp"
 
 namespace richengine::model {
+
+// Defined in families/Lfm2.mm: the LFM2 targets' DSpark default the 24B's
+// DSpark layout derives from (FamilyMakers.hpp is gone — extern here
+// instead of a shared header).
+DFlashDraftLayout lfm2DraftLayout();
+
+namespace {
+
+using affine::copy;
+using affine::embeddingSection;
+using affine::image;
+using affine::Image;
+using affine::lfm2MoeFfn;
+using affine::projection;
 
 // LFM2.5-24B-A2B's released DSpark draft
 // (LiquidAI/LFM2.5-24B-A2B-DSpark): the same five-layer interleaved-rotary
@@ -10,7 +29,7 @@ namespace richengine::model {
 // without draft/ keeps the n-gram predraft.
 DFlashDraftLayout lfm2moe24BDSparkDraftLayout() {
   DFlashDraftLayout layout = lfm2DraftLayout();
-  layout.targetHiddenSize = Lfm2Moe24BLayout{}.capturedHiddenSize();
+  layout.targetHiddenSize = lfm2Moe24BTargetLayout().capturedHiddenSize();
   return layout;
 }
 
@@ -20,7 +39,7 @@ DFlashDraftLayout lfm2moe24BDraftLayout() {
   // The planning paths still size draft workspaces from the layout, so it
   // describes the compiled Q32K8D64 interleaved-rotary head even though
   // nothing encodes.
-  const Lfm2Moe24BLayout target;
+  const TargetLayout target = lfm2Moe24BTargetLayout();
   DFlashDraftLayout layout;
   layout.kind = DraftKind::Null;
   layout.layers = 1;
@@ -45,9 +64,10 @@ DFlashDraftLayout lfm2moe24BDraftLayout() {
 // weights.
 ModelDescriptor lfm2moe24BDescriptor(std::string name) {
   ops::VisionLayout vision;
-  vision.outputHiddenSize = Lfm2Moe24BLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Lfm2Moe24BLayout{}, lfm2moe24BDraftLayout(), vision);
+  vision.outputHiddenSize = lfm2Moe24BTargetLayout().hiddenSize;
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), lfm2Moe24BTargetLayout(),
+                          lfm2moe24BDraftLayout(), vision);
   descriptor.visionSource = VisionSource::None;
   // Measured on this target (GGUF Q4_K_M, M5 Pro): the DSpark comb trees
   // lift B1 +55% and B2 +70% (0.19-0.28 acceptance), and the rank-2 leaves
@@ -63,4 +83,123 @@ ModelDescriptor lfm2moe24BDescriptor(std::string name) {
   return descriptor;
 }
 
+// ---- LFM2.5-24B-A2B ("lfm2_moe_24b") ----
+
+// The LFM2.5-24B-A2B source (MLX layout, "lfm2_moe" model_type): the 8B's
+// validation at the 24B geometry — 40 layers, dense intermediate 11776, 64
+// experts of 1536, RoPE base 1e7.
+void validateLfm2Moe24BConfiguration(const SafetensorsCheckpoint &source, const TargetLayout &layout) {
+  const std::pair<const char *, double> fields[] = {
+      {"num_hidden_layers", layout.layers}, {"hidden_size", layout.hiddenSize},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"intermediate_size", layout.intermediateSize},
+      {"conv_L_cache", layout.convolutionTaps},
+      {"norm_eps", 1e-5}, {"tie_word_embeddings", 1},
+      {"rope_parameters.rope_theta", layout.rotaryTheta}};
+  for (const auto &[key, value] : fields) source.requireConfigNumber(key, value);
+  // conv_dim is the hidden size upstream; MLX exports may omit it.
+  source.requireConfigNumberOrAbsent("conv_dim", layout.convolutionDimension);
+  source.requireConfigNumberAtMost("max_position_embeddings", layout.maximumContextTokens);
+  source.requireConfigString("model_type", "lfm2_moe");
+  source.requireLayerTypeMask(layout.layers, layout.attentionMask, "full_attention", "conv");
+}
+
+// The 24B's layer image: the 8B's section order and tensor names at the
+// 24B's geometry and its own image magic — the dense projections keep the
+// gate/up/down names, the experts the switch_mlp ones.
+Image lfm2Moe24BLayerImage(const TargetLayout &layout, uint32_t layer, const QuantResolver &resolve = {}) {
+  const bool full = layout.isFullAttentionLayer(layer);
+  Image result = image("layer-" + std::to_string(layer) + ".bin", layout.layerMagic, layer, full ? 1u : 0u);
+  const std::string prefix = "model.layers." + std::to_string(layer) + ".";
+  copy(result, prefix + "operator_norm.weight", {layout.hiddenSize});
+  if (full) {
+    const std::string attention = prefix + "self_attn.";
+    const uint64_t kvRows = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
+    projection(result, {{attention + "q_proj", layout.attentionWidth},
+                        {attention + "k_proj", kvRows},
+                        {attention + "v_proj", kvRows}},
+               layout.packedFullWidth, layout.hiddenSize, 4, 1, resolve, false, true);
+    copy(result, attention + "q_layernorm.weight", {layout.attentionHeadDimension});
+    copy(result, attention + "k_layernorm.weight", {layout.attentionHeadDimension});
+    projection(result, {{attention + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth,
+               4, 1, resolve, false, true);
+  } else {
+    const std::string conv = prefix + "conv.";
+    projection(result, {{conv + "in_proj", layout.packedGdnWidth}}, layout.packedGdnWidth, layout.hiddenSize,
+               4, 1, resolve, false, true);
+    copy(result, conv + "conv.weight", {layout.convolutionDimension, 1, layout.convolutionTaps});
+    projection(result, {{conv + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.convolutionDimension,
+               4, 1, resolve, false, true);
+  }
+  copy(result, prefix + "ffn_norm.weight", {layout.hiddenSize});
+  const std::string ffn = prefix + "feed_forward.";
+  if (!layout.isMoeLayer(layer)) {
+    projection(result, {{ffn + "gate_proj", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize, 4, 1,
+               resolve, false, true);
+    projection(result, {{ffn + "up_proj", layout.intermediateSize}}, layout.intermediateSize, layout.hiddenSize, 4, 1,
+               resolve, false, true);
+    projection(result, {{ffn + "down_proj", layout.hiddenSize}}, layout.hiddenSize, layout.intermediateSize, 4, 1,
+               resolve, false, true);
+  } else {
+    lfm2MoeFfn(result, layout, ffn, ffn + "switch_mlp.gate_proj", ffn + "switch_mlp.up_proj",
+               ffn + "switch_mlp.down_proj", resolve);
+  }
+  return result;
+}
+
+// The tied LM head shares the token embedding's quantized rows.
+Image lfm2Moe24BHeadImage(const TargetLayout &layout, const QuantResolver &resolve = {}) {
+  Image result = image("head.bin", layout.headMagic, layout.layers, 2);
+  copy(result, "model.embedding_norm.weight", {layout.hiddenSize});
+  projection(result, {{"model.embed_tokens", layout.vocabularySize}},
+             layout.vocabularySize, layout.hiddenSize, 4, 1, resolve, false, true);
+  return result;
+}
+
+Image lfm2Moe24BEmbeddingImage(const TargetLayout &layout, const QuantResolver &resolve = {}) {
+  Image result = image("embedding.bin", kEmbeddingMagic, layout.vocabularySize, layout.hiddenSize);
+  const std::string prefix = "model.embed_tokens";
+  if (resolve) {
+    embeddingSection(result, prefix, layout.vocabularySize, layout.hiddenSize, resolve);
+    return result;
+  }
+  result.quantized.emplace_back(prefix, 4);
+  copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
+  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  return result;
+}
+
+std::vector<Image> lfm2Moe24BImages(const SafetensorsCheckpoint *,
+                                    const TargetLayout &layout,
+                                    const QuantResolver &resolve) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(lfm2Moe24BLayerImage(layout, layer, resolve));
+  result.push_back(lfm2Moe24BHeadImage(layout, resolve));
+  result.push_back(lfm2Moe24BEmbeddingImage(layout, resolve));
+  return result;
+}
+
+constexpr AffineArchHooks kLfm2Moe24BHooks{&lfm2Moe24BImages,
+                                         &validateLfm2Moe24BConfiguration};
+
+// The registry's erased-signature entry for the lfm2_moe_24b target.
+TargetWeights loadLfm2Moe24BTarget(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadLfm2Moe24BWeights(backend, layout, files);
+}
+
+const bool kRegisteredLfm2Moe24BFamilies = [] {
+  registerTargetArch({"lfm2_moe_24b", &loadLfm2Moe24BTarget,
+                      &kLfm2Moe24BHooks});
+  registerModelFamily({"LFM2.5-24B-A2B", "lfm2_moe", "",
+                       &lfm2moe24BDescriptor, &lfm2moe24BDSparkDraftLayout,
+                       nullptr});
+  return true;
+}();
+
+} // namespace
 } // namespace richengine::model

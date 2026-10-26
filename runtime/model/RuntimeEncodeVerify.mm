@@ -153,9 +153,30 @@ namespace richengine::model {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
+    // The GDN decode tape: each lane's previous step's retained rows fold
+    // into this step's scan; the step's own rows go to its tape slot for the
+    // next. Empty pending rows run the standalone commit instead.
+    ops::GdnTapeLanes tapeLanes;
+    const ops::GdnTapeLanes *tape = nullptr;
+    if (gdnTape_ && !tree) {
+      const uint64_t layerBytes = gdnTapeLayerBytes();
+      const uint64_t slotBytes =
+          uint64_t{geometry.target.stateLayout.layers} * layerBytes;
+      tapeLanes.layerBytes = layerBytes;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t sl = entries[lane]->stateLane;
+        const uint64_t base = uint64_t{sl} * 2 * slotBytes;
+        const uint32_t parity = gdnTapeParity_[sl];
+        tapeLanes.pending[lane] = base + (parity ^ 1) * slotBytes;
+        tapeLanes.step[lane] = base + parity * slotBytes;
+        tapeLanes.rows[lane] = gdnPendingRows_[sl];
+      }
+      tape = &tapeLanes;
+    }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes, tree,
-                          liveRows, liveNodes, geometry.draft.verifyRows());
+                          liveRows, liveNodes, geometry.draft.verifyRows(),
+                          tape);
   }
 
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
@@ -849,8 +870,11 @@ namespace richengine::model {
           decodeArena->packed(DecodeTensor::RetainedPath, width), width);
       return;
     }
-    targetModel.addStateCommit(graph, std::move(buffers), width,
-                               geometry.draft.verifyRows());
+    // The folded path folds retained rows into the next step's scan — the
+    // standalone commit only runs when the tape is off or tree-verify did.
+    if (!gdnTape_)
+      targetModel.addStateCommit(graph, std::move(buffers), width,
+                                 geometry.draft.verifyRows());
   }
 
 } // namespace richengine::model

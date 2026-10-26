@@ -2,6 +2,8 @@
 #include "model/ModelFactory.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/MiniCpmV47.hpp"
+#include "model/Qwen3_6Moe.hpp"
+#include "model/Qwen3_8.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "ops/DraftAttention.hpp"
 
@@ -20,24 +22,23 @@ using namespace richengine;
 
 using richengine::test::require;
 
-template <class Weights>
-model::ModelPackage package() {
+model::ModelPackage package(const model::TargetLayout &layout) {
   model::ModelPackage result;
-  Weights target;
+  model::TargetModelWeights target;
+  target.layout = layout;
   model::DFlashDraftLayout draft;
-  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>) {
+  if (layout.arch == "qwen3_6moe") {
     draft.layers = 6;
     draft.hiddenSize = 2048;
     draft.dynamicSize = 512;
     draft.intermediateSize = 6144;
     draft.targetHiddenSize = target.layout.capturedHiddenSize();
-  } else if constexpr (std::is_same_v<Weights, model::MiniCpmV47MoeWeights>) {
+  } else if (layout.arch == "minicpm_v47_moe") {
     draft = model::minicpmV47DraftLayout();
   }
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::AffineWeights{});
   };
-  const auto &layout = target.layout;
   target.logitsProjection =
       projection(model::paddedVocabularySize(layout.vocabularySize),
                  layout.hiddenSize);
@@ -55,10 +56,14 @@ model::ModelPackage package() {
       gdn.outputProjection = projection(layout.hiddenSize, layout.attentionWidth);
       layer.mixer = std::move(gdn);
     }
-    if constexpr (std::is_same_v<Weights, model::Qwen3_8Weights>) {
-      layer.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
-      layer.upProjection = layer.gateProjection;
-      layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+    if (layout.ffnKind == model::FfnKind::Dense) {
+      auto &ffn = layer.ffn.emplace<model::DenseFfnWeights>();
+      ffn.gateProjection = projection(layout.intermediateSize, layout.hiddenSize);
+      ffn.upProjection = ffn.gateProjection;
+      ffn.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
+    } else {
+      // The shared MoE block every sparse layer carries.
+      layer.ffn = ops::MoeWeights{};
     }
   }
   ops::VisionLayout vision;
@@ -72,9 +77,9 @@ model::ModelPackage package() {
 }
 
 void checkMixedLayouts() {
-  auto mixed = package<model::Qwen3_8Weights>();
+  auto mixed = package(model::qwen38TargetLayout());
   auto &target = std::get<model::Qwen3_8Weights>(mixed.target);
-  auto &up = target.layers.front().upProjection;
+  auto &up = std::get<model::DenseFfnWeights>(target.layers.front().ffn).upProjection;
   up = ops::Projection(up.outputSize, up.inputSize,
                        ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize,
                                                                         up.inputSize, {}, {}, {})}});
@@ -82,7 +87,7 @@ void checkMixedLayouts() {
   try { static_cast<void>(model::targetModelGeometry(target)); }
   catch (const model::WeightStoreError &) { mismatchRejected = true; }
   require(mismatchRejected, "incompatible fused gate/up layouts reached execution");
-  target.layers.front().gateProjection = up;
+  std::get<model::DenseFfnWeights>(target.layers.front().ffn).gateProjection = up;
   require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "mixed fixture must keep an affine vocabulary head");
   for (uint32_t family : {9U, 10U, 11U}) {
@@ -120,15 +125,15 @@ void checkMixedLayouts() {
   }
   // Every MoE block of a target shares one layout, which the geometry's one
   // MoE shape records: no source mixes them.
-  auto sparse = package<model::Qwen3_6MoeWeights>();
+  auto sparse = package(model::qwen36MoeTargetLayout());
   auto &moe = std::get<model::Qwen3_6MoeWeights>(sparse.target);
   require(model::targetModelGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Affine64,
           "the MoE shape lost the blocks' layout");
-  for (auto &layer : moe.layers) layer.ffn = ops::BlockMoeWeights{};
+  for (auto &layer : moe.layers) layer.ffn = ops::MoeWeights{ops::BlockMoeWeights{}};
   require(model::targetModelGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Block32 &&
               moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "the MoE shape must follow the expert layers, not the head");
-  moe.layers.back().ffn = ops::AffineMoeWeights{};
+  moe.layers.back().ffn = ops::MoeWeights{ops::AffineMoeWeights{}};
   bool mixedRejected = false;
   try { static_cast<void>(model::targetModelGeometry(moe)); }
   catch (const model::WeightStoreError &) { mixedRejected = true; }
@@ -172,8 +177,9 @@ void checkLaneScratch(const model::ModelPackage &package) {
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
-  auto broken = package<model::Qwen3_8Weights>();
-  std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
+  auto broken = package(model::qwen38TargetLayout());
+  std::get<model::DenseFfnWeights>(
+      std::get<model::Qwen3_8Weights>(broken.target).layers.back().ffn).downProjection = ops::Projection();
   bool rejected = false;
   try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
   catch (const std::invalid_argument &) { rejected = true; }
@@ -185,20 +191,20 @@ void checkUnsizedProjection() {
 // the GDN shape, whose packed rows must also hold the two gates of every
 // value head.
 void checkGdnWidths() {
-  const auto sparse = package<model::Qwen3_6MoeWeights>();
-  const auto layoutRejected = [](const model::Qwen3_6MoeLayout &layout) {
+  const auto sparse = package(model::qwen36MoeTargetLayout());
+  const auto layoutRejected = [](const model::TargetLayout &layout) {
     try { model::requireTargetLayout(layout); }
     catch (const model::WeightStoreError &) { return true; }
     return false;
   };
-  const auto geometryRejected = [&](const model::Qwen3_6MoeLayout &layout) {
+  const auto geometryRejected = [&](const model::TargetLayout &layout) {
     auto broken = sparse;
     std::get<model::Qwen3_6MoeWeights>(broken.target).layout = layout;
     try { static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8)); }
     catch (const std::invalid_argument &) { return true; }
     return false;
   };
-  const model::Qwen3_6MoeLayout shipped;
+  const model::TargetLayout shipped = model::qwen36MoeTargetLayout();
   require(!layoutRejected(shipped) && !geometryRejected(shipped),
           "the shipped sparse layout was refused");
   auto narrowValues = shipped;
@@ -222,7 +228,12 @@ void checkVerifyRows() {
           "a draftless model must verify the full capacity");
   model::DFlashDraftLayout dflash2{model::DraftKind::DFlashTwo};
   dflash2.blockSize = 8;
-  require(dflash2.verifyRows() == 8 && dflash2.proposalLimit() == 7,
+  // The 16-compiled runtime keeps the full verify stride: narrowing it to
+  // the trained block is opt-in (RICHENGINE_VERIFY_NARROW,
+  // DFlashDraft.hpp). proposalLimit and the draft's own query rows still
+  // follow the block.
+  require(dflash2.verifyRows() == model::ExecutionLimits::targetVerifyRows &&
+              dflash2.proposalLimit() == 7 && dflash2.queryRows() == 8,
           "a block-8 draft must verify its trained depth");
   dflash2.blockSize = 16;
   require(dflash2.verifyRows() == model::ExecutionLimits::targetVerifyRows,
@@ -234,7 +245,8 @@ void checkVerifyRows() {
           "a nine-row verify depth rounds up to the next eight-row tile");
   model::DFlashDraftLayout block7{model::DraftKind::DFlashTwo};
   block7.blockSize = 7;
-  require(block7.verifyRows() == 8 && block7.proposalLimit() == 6,
+  require(block7.verifyRows() == model::ExecutionLimits::targetVerifyRows &&
+              block7.proposalLimit() == 6 && block7.queryRows() == 8,
           "a block-7 draft's six proposals and anchor fit the first tile");
   // MiniCPM-V 4.7's DSpark: a 15-proposal block verifies the full stride.
   const auto dspark = model::minicpmV47DraftLayout();
@@ -250,7 +262,7 @@ void checkVerifyRows() {
 // it (248320), the token ids stay within the real vocabulary, and the
 // draft's 8x2x256 attention head pattern plans.
 void checkMiniCpm() {
-  auto sparse = package<model::MiniCpmV47MoeWeights>();
+  auto sparse = package(model::minicpmV47MoeTargetLayout());
   const auto geometry = model::RuntimeGeometry::from(sparse, kv::Format::Int8);
   require(geometry.target.vocabularySize == 248144 &&
               geometry.target.paddedVocabularySize == 248320,
@@ -278,9 +290,9 @@ int main() {
     checkMixedLayouts();
     checkVerifyRows();
     checkMiniCpm();
-    const auto dense = package<model::Qwen3_8Weights>();
-    const auto sparse = package<model::Qwen3_6MoeWeights>();
-    const auto minicpm = package<model::MiniCpmV47MoeWeights>();
+    const auto dense = package(model::qwen38TargetLayout());
+    const auto sparse = package(model::qwen36MoeTargetLayout());
+    const auto minicpm = package(model::minicpmV47MoeTargetLayout());
     checkLaneScratch(dense);
     checkLaneScratch(sparse);
     checkLaneScratch(minicpm);

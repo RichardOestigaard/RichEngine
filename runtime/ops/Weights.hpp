@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/QuantFormat.h"
 
 #include <compare>
 #include <cstdint>
@@ -23,6 +24,14 @@ struct ProjectionShape final {
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
+  // Every segment takes the Apple9 register tile (quant_register_tensor); a
+  // projection with one it does not take stages the segment's reads
+  // (LinearGguf). At least four bits per weight in every (quant_four_bits);
+  // Apple10 runs the register tile on narrower grids of fewer bits. Under
+  // 4.5 bits, the 16-row decode tile may run one lane per bit row.
+  bool registerFormats = false;
+  bool fourBits = false;
+  bool underFourAndHalfBits = false;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -154,7 +163,23 @@ public:
   }
 
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
+    ProjectionShape result{outputSize, inputSize, layout(), static_cast<bool>(rotation)};
+    if (layout() == WeightLayout::Block32) {
+      result.registerFormats = true;
+      result.fourBits = true;
+      result.underFourAndHalfBits = true;
+      for (const QuantizedSegment &s : blocks().segments) {
+        result.registerFormats &=
+            s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
+        result.fourBits &=
+            s.isFloat() || quant_four_bits(s.formatId);
+        result.underFourAndHalfBits &=
+            s.isFloat() ||
+            8 * kQuantFormats[s.formatId].block_bytes <
+                9 * kQuantFormats[s.formatId].block_elements;
+      }
+    }
+    return result;
   }
 
   // Views of a projection of affine Q4 weights or of one unrotated quantized

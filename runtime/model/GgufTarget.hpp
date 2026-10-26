@@ -11,7 +11,7 @@
 
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
-#include "model/QwenHybridLayout.hpp"
+#include "model/TargetLayout.hpp"
 #include "model/WeightImages.hpp"
 
 namespace richengine::model {
@@ -49,61 +49,10 @@ private:
   std::optional<GgufRotation> rotation_;
 };
 
-struct DenseLayout;
-struct DiffusionGemmaLayout;
-struct Gemma4MoeLayout;
-struct GraniteLayout;
-struct Lfm2Layout;
-struct Lfm2MoeLayout;
-struct Lfm2Moe24BLayout;
-
-// The GGUF geometry of the dense ("llama"), LFM2 ("lfm2") and LFM2-MoE
-// ("lfm2moe") targets.
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const DenseLayout &layout);
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const GraniteLayout &layout);
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Layout &layout);
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2MoeLayout &layout);
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Lfm2Moe24BLayout &layout);
-
-// Gemma 4 has no GGUF image plan: the packed files only. The overload keeps
-// the target variant's generic dispatch compilable; the DiffusionGemma one
-// must be exact — the generic template below would otherwise win over the
-// base-class overload.
-[[nodiscard]] inline gguf::TargetGeometry
-ggufTargetGeometry(const Gemma4MoeLayout &) {
-  throw std::invalid_argument("Gemma 4 targets load from packed files only");
-}
-[[nodiscard]] inline gguf::TargetGeometry
-ggufTargetGeometry(const DiffusionGemmaLayout &) {
-  throw std::invalid_argument("Gemma 4 targets load from packed files only");
-}
-
-// The GGUF geometry of a hybrid layout with its family's dense or sparse MoE
-// FFN.
-template <class Layout>
-[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const Layout &layout) {
-  gguf::TargetGeometry geometry;
-  geometry.layers = layout.layers;
-  geometry.hiddenSize = layout.hiddenSize;
-  geometry.vocabularySize = layout.vocabularySize;
-  geometry.gdnKeyHeads = layout.gdnKeyHeads;
-  geometry.gdnValueHeads = layout.gdnValueHeads;
-  geometry.gdnHeadDimension = layout.gdnHeadDimension;
-  geometry.convolutionDimension = layout.convolutionDimension;
-  geometry.attentionWidth = layout.attentionWidth;
-  geometry.attentionKvHeads = layout.attentionKvHeads;
-  geometry.attentionHeadDimension = layout.attentionHeadDimension;
-  geometry.rotaryPairs = layout.rotaryPairs;
-  geometry.rotaryTheta = layout.rotaryTheta;
-  geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
-  if constexpr (Layout::ffnKind == FfnKind::SparseMoe) {
-    geometry.experts = layout.experts;
-    geometry.expertsPerToken = layout.expertsPerToken;
-    geometry.expertIntermediateSize = layout.expertIntermediateSize;
-  } else {
-    geometry.intermediateSize = layout.intermediateSize;
-  }
-  return geometry;
-}
+// The GGUF geometry of a target: the dense ("llama"), Granite ("granite"),
+// LFM2 ("lfm2") and LFM2-MoE ("lfm2moe") targets' metadata schema, or the
+// hybrid qwen35 one. A packed-only layout — Gemma 4, DiffusionGemma — has
+// no GGUF image plan and throws: the packed files only.
+[[nodiscard]] gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout);
 
 } // namespace richengine::model

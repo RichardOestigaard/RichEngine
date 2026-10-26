@@ -7,8 +7,12 @@
 
 inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uint32_t stateLane,
                           std::vector<ImageState> &images) {
-    if (request.images.empty())
+    if (request.images.empty()) {
+      // A freshly admitted lane has no prior step's rows to fold.
+      gdnPendingRows_[stateLane] = 0;
+      gdnTapeParity_[stateLane] = 0;
       return laneAdmission(stateLane, states.tryActivateLane(stateLane, request.id));
+    }
     // The engine rejects image requests at submission when there is no vision.
     if (!package.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
@@ -65,6 +69,10 @@ inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uin
     };
     StateAdmission admission = laneAdmission(
         stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
+    if (admission.granted()) {
+      gdnPendingRows_[stateLane] = 0;
+      gdnTapeParity_[stateLane] = 0;
+    }
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
           Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});

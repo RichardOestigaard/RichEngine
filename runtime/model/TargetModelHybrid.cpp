@@ -1,21 +1,16 @@
 // The recurrent-state mixer encoders of the hybrid targets: the Qwen
-// families' fused GDN block and LFM2's double-gated short convolution, the
-// hybrid families' per-layer FFNs (Qwen3.6-MoE's routed block, LFM2-MoE's
-// dense/MoE variant), and the composite-state commits the verify step's bx
-// rows feed. Split out of TargetModel.cpp; the step records and the row/sum
-// view helpers the target translation units share live in
+// families' fused GDN block and LFM2's double-gated short convolution, and
+// the composite-state commits the verify step's bx rows feed. The layers'
+// FFN encodes live with the rest in TargetModel.cpp; the step records and
+// the row/sum view helpers the target translation units share live in
 // TargetModelGemmaHelpers.hpp.
 #include "model/TargetModelGemmaHelpers.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
-#include "model/Lfm2Moe.hpp"
-#include "model/Qwen3_6Moe.hpp"
 #include "ops/AneFfn.hpp"
 
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace richengine::model {
 
@@ -83,39 +78,6 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const LfmConv
   return b.gdnOutput;
 }
 
-void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
-                               metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  const TargetModelPrefillBuffers &b = step.buffers;
-  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
-                             step.rows);
-  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}}, layer.ffn, *step.moe);
-}
-
-// LFM2-MoE's per-layer FFN: dense below denseLayers, the MoE block after.
-void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const Lfm2MoeLayerWeights &layer,
-                               metal::MetalBuffer residual, metal::MetalBuffer output) const {
-  const TargetModelPrefillBuffers &b = step.buffers;
-  std::visit(
-      [&](const auto &ffn) {
-        using Ffn = std::decay_t<decltype(ffn)>;
-        if constexpr (std::is_same_v<Ffn, Lfm2DenseFfn>) {
-          addPrefillNorm(step, residual, layer.postAttentionNorm, ffn.gateProjection.layout());
-          const ops::PrefillFfnBuffers buffers = b.ffn();
-          if (step.aneFfn)
-            step.aneFfn->add(step.graph, index, buffers, residual, output, step.rows);
-          else
-            operators_.linear().addPrefillSwiGlu(
-                step.graph, {&ffn.gateProjection, &ffn.upProjection, &ffn.downProjection},
-                buffers, residual, output, step.rows);
-        } else {
-          ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized,
-                                     geometry_.hiddenSize, step.rows);
-          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}}, ffn, *step.moe);
-        }
-      },
-      layer.ffn);
-}
-
 // Each producer emits the table (if any) its consumer's plan reads.
 metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerWeights &mixer,
                                               const ops::NormWeights &norm, metal::MetalBuffer input) const {
@@ -144,7 +106,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
                  b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
                  mixer.decay, mixer.timeBias, b.gdnDecay[layer],
                  b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
-                 b.linearScratch},
+                 b.linearScratch, b.gdnTape},
                 b.treeNodes, b.treeCounts, geometry_.gdnShape(), step.lanes,
                 layer,
                 {geometry_.stateLayout.convolutionLayerBytes(),
@@ -157,13 +119,13 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
                  b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
                  mixer.decay, mixer.timeBias, b.gdnDecay[layer],
                  b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
-                 b.linearScratch},
+                 b.linearScratch, b.gdnTape},
                 geometry_.gdnShape(), step.lanes, layer,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
                  geometry_.stateLayout.convolutionBytes()},
                 mixer.outputHeadOrder, outputPlan.input(), step.liveRows,
-                step.rowCapacity);
+                step.rowCapacity, step.tapeLanes);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
               .prepared = hidden},
@@ -218,40 +180,6 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
              mixer.outputProjection, outputPlan);
   step.graph.endBakedSpan();
   return b.gdnOutput;
-}
-
-void TargetModel::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                              metal::MetalBuffer output) const {
-  const TargetModelVerifyBuffers &b = step.buffers;
-  // One layer's norm plus MoE block is replayed from a baked indirect command
-  // buffer when the submission revalidates it; MoE::add nests its own span.
-  step.graph.beginBakedSpan();
-  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
-                             step.rows);
-  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows}, layer.ffn, *step.moe);
-  step.graph.endBakedSpan();
-}
-
-// LFM2-MoE's per-layer FFN in a verify step: dense below denseLayers, the
-// MoE block after.
-void TargetModel::addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &layer, metal::MetalBuffer residual,
-                              metal::MetalBuffer output) const {
-  const TargetModelVerifyBuffers &b = step.buffers;
-  std::visit(
-      [&](const auto &ffn) {
-        using Ffn = std::decay_t<decltype(ffn)>;
-        if constexpr (std::is_same_v<Ffn, Lfm2DenseFfn>) {
-          addVerifyDenseFfn(step, layer.postAttentionNorm, ffn.gateProjection, ffn.upProjection,
-                            ffn.downProjection, residual, output);
-        } else {
-          step.graph.beginBakedSpan();
-          ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized,
-                                     geometry_.hiddenSize, step.rows);
-          ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows}, ffn, *step.moe);
-          step.graph.endBakedSpan();
-        }
-      },
-      layer.ffn);
 }
 
 void TargetModel::addStateCommit(metal::CommandGraph &graph,

@@ -68,6 +68,7 @@ public:
                                                       std::string_view label);
   // Requires the sections read to cover the whole file.
   void finish();
+  [[nodiscard]] metal::MetalBackend &backend() const noexcept;
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 
 private:

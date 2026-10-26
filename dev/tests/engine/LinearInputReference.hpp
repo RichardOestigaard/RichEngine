@@ -31,7 +31,7 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
     // The pack dispatch the mxfp4p consumers run when no producer wrote the
     // operand (ops/LinearGguf.cpp's single-tensor branch).
     graph.add(std::string(ops::kGgufPackHalf), {input, table, sums, input, input, input, input, input},
-              GgufDecodeParams{width, 1, 0, 0}, {uint64_t{lanes} * 8 * width / 32, 1, 1}, {32, 1, 1});
+              GgufDecodeParams{width, 1, 0, 0, 0}, {uint64_t{lanes} * 8 * width / 32, 1, 1}, {32, 1, 1});
     return;
   }
   graph.add(std::string(layout == ops::LinearInput::Table16 ? ops::kDecodeLinearGgufPrepare

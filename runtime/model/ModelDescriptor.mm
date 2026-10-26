@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
-#include "families/FamilyMakers.hpp"
+#include "ModelRegistry.hpp"
+#include "Ornith9B.hpp"
 #include "DFlashTwoDraft.hpp"
 #include "DSparkDraft.hpp"
 #include "DFlashV1Draft.hpp"
@@ -252,10 +253,12 @@ void validateExecutionGeometry(NSDictionary *manifest) {
   const uint64_t recordedRows = requireUnsigned(
       executionGeometry, @"draft_query_rows",
       "execution_geometry draft_query_rows");
-  if (!recordedProposals || recordedProposals > ExecutionLimits::draftProposalTokens ||
-      !recordedRows || recordedRows > ExecutionLimits::draftQueryRows)
-    throw std::invalid_argument(
-        "execution_geometry exceeds the runtime's draft capacity");
+  if (!recordedProposals || recordedProposals > ExecutionLimits::draftProposalTokens)
+    throw std::invalid_argument("execution_geometry draft_proposal_tokens "
+                                "exceeds the runtime's draft capacity");
+  if (!recordedRows || recordedRows > ExecutionLimits::draftQueryRows)
+    throw std::invalid_argument("execution_geometry draft_query_rows "
+                                "exceeds the runtime's draft capacity");
   // The recorded window is the trained context the draft was packed for;
   // anything beyond the ring's physical capacity would be silently clamped.
   const uint64_t recordedWindow = requireUnsigned(
@@ -387,9 +390,7 @@ void validateTokenizer(const std::filesystem::path &root,
                expectedTextModelType, "text model type");
   requireNumbers(
       text, "tokenizer text config",
-      {{"hidden_size",
-        std::visit([](const auto &layout) { return layout.hiddenSize; },
-                   descriptor.target)},
+      {{"hidden_size", descriptor.target.hiddenSize},
        {"vocab_size", descriptor.capabilities.vocabularySize}});
   // Exports disagree on the trained context (131072 vs 128000).
   requireAtMost(text, @"max_position_embeddings",
@@ -409,17 +410,15 @@ void validateQwen38(NSDictionary *manifest,
                  {{"q4_bits", 4},
                   {"q4_group_size", kQ4GroupElements},
                   {"q4_storage_n", kQ4StorageN}});
-  const std::string_view layerMagic = std::visit(
-      [](const auto &layout) { return std::decay_t<decltype(layout)>::layerMagic; },
-      descriptor.target);
-  validateCommonFormat(format, layerMagic, draftLayerMagic(descriptor.draft));
+  validateCommonFormat(format, descriptor.target.layerMagic,
+                       draftLayerMagic(descriptor.draft));
   validateTokenizer(root, descriptor, "qwen3_5_text");
 }
 
-void validateCaptureLayers(NSDictionary *draft, const Qwen3_6MoeLayout &layout) {
+void validateCaptureLayers(NSDictionary *draft, const TargetLayout &layout) {
   NSArray *layers =
       requireArray(draft, @"target_capture_layers", "target capture layers");
-  requireEqual(layers.count, layout.hiddenCaptureLayers.size(),
+  requireEqual(layers.count, layout.captureLayerCount,
                "target capture layer count");
   for (uint32_t index = 0; index < layers.count; ++index) {
     id value = layers[index];
@@ -442,10 +441,10 @@ void validateQwen36(NSDictionary *manifest,
                   {"q8_bits", 8},
                   {"quant_group_size", kQ4GroupElements},
                   {"storage_n", kQ4StorageN}});
-  validateCommonFormat(format, Qwen3_6MoeLayout::layerMagic,
+  validateCommonFormat(format, descriptor.target.layerMagic,
                        draftLayerMagic(descriptor.draft));
 
-  const auto &targetLayout = std::get<Qwen3_6MoeLayout>(descriptor.target);
+  const TargetLayout &targetLayout = descriptor.target;
   NSDictionary *target =
       requireObject(manifest, @"target", "target declaration");
   requireEqual(requireString(target, @"architecture", "target architecture"),
@@ -524,17 +523,9 @@ void validateQwen36(NSDictionary *manifest,
 // spelling is refused.
 bool dsparkArchitectureAccepted(const TargetLayout &target,
                                 std::string_view architecture) {
-  const std::string_view family = std::visit(
-      [](const auto &layout) -> std::string_view {
-        using L = std::decay_t<decltype(layout)>;
-        if constexpr (std::is_same_v<L, Lfm2Layout> ||
-                      std::is_same_v<L, Lfm2MoeLayout> ||
-                      std::is_same_v<L, Lfm2Moe24BLayout>)
-          return "Lfm2DSparkDraftModel";
-        else
-          return "Qwen3DSparkModel";
-      },
-      target);
+  const std::string_view family =
+      target.arch.starts_with("lfm2") ? "Lfm2DSparkDraftModel"
+                                      : "Qwen3DSparkModel";
   return architecture == family || architecture == "DSparkDraftModel";
 }
 
@@ -609,12 +600,8 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
                      "draft markov_rank");
         d.ropeInterleaved =
             [draft[@"rope_interleaved"] isEqual:@YES] ? 1 : 0;
-        const uint64_t captures = static_cast<uint64_t>(std::visit(
-            [](const auto &layout) { return layout.hiddenCaptureLayers.size(); },
-            descriptor.target));
-        if (d.targetHiddenSize !=
-            captures * std::visit([](const auto &layout) { return layout.hiddenSize; },
-                                  descriptor.target))
+        const uint64_t captures = descriptor.target.captureLayerCount;
+        if (d.targetHiddenSize != captures * descriptor.target.hiddenSize)
           throw std::invalid_argument("draft captured hidden size mismatch");
       } else {
         d.causalLayers = static_cast<uint32_t>(
@@ -647,10 +634,8 @@ void validateNewPackedFormat(NSDictionary *manifest,
                kQ4GroupElements, "q4_group_size");
   requireEqual(requireUnsigned(format, @"q4_storage_n", "q4_storage_n"),
                kQ4StorageN, "q4_storage_n");
-  const std::string_view layerMagic = std::visit(
-      [](const auto &layout) { return std::decay_t<decltype(layout)>::layerMagic; },
-      descriptor.target);
-  validateCommonFormat(format, layerMagic, draftLayerMagic(descriptor.draft));
+  validateCommonFormat(format, descriptor.target.layerMagic,
+                       draftLayerMagic(descriptor.draft));
   validateTokenizer(root, descriptor, modelType);
 }
 
@@ -665,8 +650,7 @@ void validateGemma4(NSDictionary *manifest,
                     const std::filesystem::path &root,
                     const ModelDescriptor &descriptor) {
   validateNewPackedFormat(manifest, root, descriptor, "gemma4_text");
-  const Gemma4MoeLayout &targetLayout =
-      std::get<Gemma4MoeLayout>(descriptor.target);
+  const TargetLayout &targetLayout = descriptor.target;
   NSDictionary *target =
       requireObject(manifest, @"target", "target declaration");
   requireEqual(requireString(target, @"architecture", "target architecture"),
@@ -678,8 +662,8 @@ void validateGemma4(NSDictionary *manifest,
                   {"num_attention_heads", targetLayout.attentionQueryHeads},
                   {"num_key_value_heads", targetLayout.attentionKvHeads},
                   {"head_dim", targetLayout.attentionHeadDimension},
-                  {"global_num_key_value_heads", targetLayout.globalKvHeads},
-                  {"global_head_dim", targetLayout.globalHeadDimension},
+                  {"global_num_key_value_heads", targetLayout.altKvHeads},
+                  {"global_head_dim", targetLayout.altHeadDimension},
                   {"sliding_window", targetLayout.slidingWindowTokens},
                   {"experts", targetLayout.experts},
                   {"experts_per_token", targetLayout.expertsPerToken},
@@ -689,7 +673,7 @@ void validateGemma4(NSDictionary *manifest,
                    targetLayout.sharedIntermediateSize},
                   {"final_logit_softcapping", targetLayout.logitSoftcap},
                   {"global_rope_theta",
-                   static_cast<uint64_t>(targetLayout.globalRotaryTheta)},
+                   static_cast<uint64_t>(targetLayout.altRotaryTheta)},
                   {"rope_theta",
                    static_cast<uint64_t>(targetLayout.rotaryTheta)}});
   requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
@@ -704,8 +688,7 @@ void validateDiffusionGemma(NSDictionary *manifest,
                             const ModelDescriptor &descriptor) {
   validateNewPackedFormat(manifest, root, descriptor,
                           "diffusion_gemma_text");
-  const DiffusionGemmaLayout &targetLayout =
-      std::get<DiffusionGemmaLayout>(descriptor.target);
+  const TargetLayout &targetLayout = descriptor.target;
   NSDictionary *target =
       requireObject(manifest, @"target", "target declaration");
   requireEqual(requireString(target, @"architecture", "target architecture"),
@@ -717,8 +700,8 @@ void validateDiffusionGemma(NSDictionary *manifest,
                   {"num_attention_heads", targetLayout.attentionQueryHeads},
                   {"num_key_value_heads", targetLayout.attentionKvHeads},
                   {"head_dim", targetLayout.attentionHeadDimension},
-                  {"global_num_key_value_heads", targetLayout.globalKvHeads},
-                  {"global_head_dim", targetLayout.globalHeadDimension},
+                  {"global_num_key_value_heads", targetLayout.altKvHeads},
+                  {"global_head_dim", targetLayout.altHeadDimension},
                   {"sliding_window", targetLayout.slidingWindowTokens},
                   {"experts", targetLayout.experts},
                   {"experts_per_token", targetLayout.expertsPerToken},
@@ -728,7 +711,7 @@ void validateDiffusionGemma(NSDictionary *manifest,
                    targetLayout.sharedIntermediateSize},
                   {"final_logit_softcapping", targetLayout.logitSoftcap},
                   {"global_rope_theta",
-                   static_cast<uint64_t>(targetLayout.globalRotaryTheta)},
+                   static_cast<uint64_t>(targetLayout.altRotaryTheta)},
                   {"rope_theta",
                    static_cast<uint64_t>(targetLayout.rotaryTheta)}});
   requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
@@ -768,8 +751,7 @@ void validateDiffusionGemma(NSDictionary *manifest,
 // too and which its images are planned from, also holds the rest of what the
 // kernels compute; a GGUF's is what the installer derived from the GGUF's
 // metadata, which the GGUF planner checks.
-template <class Layout>
-void validateTextConfig(NSDictionary *text, const Layout &target,
+void validateTextConfig(NSDictionary *text, const TargetLayout &target,
                         TargetSource source) {
   requireNumbers(text, "text config",
                  {{"hidden_size", target.hiddenSize},
@@ -788,7 +770,7 @@ void validateTextConfig(NSDictionary *text, const Layout &target,
                   {"linear_conv_kernel_dim", kGdnConvolutionTaps},
                   {"full_attention_interval", target.fullAttentionPeriod},
                   {"rms_norm_eps", 1e-6}});
-  if constexpr (std::decay_t<Layout>::ffnKind == FfnKind::SparseMoe)
+  if (target.ffnKind == FfnKind::SparseMoe)
     requireNumbers(text, "text config",
                    {{"num_experts", target.experts},
                     {"num_experts_per_tok", target.expertsPerToken},
@@ -876,43 +858,12 @@ uint32_t validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layou
 }
 
 // The families an assembly's model.json may name (install/families.py's
-// FAMILIES), each with the model_type its upstream config states. The
-// record's family selects the descriptor — the installer resolved it from
-// the same configuration — and the config is then validated against it;
-// the runtime never re-guesses a family from the geometry.
-struct FamilyDescriptor {
-  const char *name;
-  const char *modelType;
-  // A model_type an early release of the family also stated, else null.
-  const char *legacyType;
-  ModelDescriptor (*make)(std::string name);
-};
-
-constexpr FamilyDescriptor kModelFamilies[] = {
-    {"Qwen3.8-27B", "qwen3_5_text", nullptr, qwen38Descriptor},
-    // Legacy alias: packages assembled while Bonsai-2-27B was its own
-    // family name still resolve — it is the Qwen3.8 architecture and the
-    // installer no longer offers it. The parity test exempts this row.
-    {"Bonsai-2-27B", "qwen3_5_text", nullptr, qwen38Descriptor},
-    {"Ornith-1.5-9B", "qwen3_5_text", nullptr, ornithDescriptor},
-    {"Qwen3.6-35B-A3B", "qwen3_5_moe_text", nullptr, qwen36Descriptor},
-    {"Ornith-1.5-35B-A3B", "qwen3_5_moe_text", nullptr, qwen36Descriptor},
-    {"MiniCPM-V-4.7-35B-A3B", "qwen3_5_moe_text", nullptr, minicpmV47Descriptor},
-    // MiniCPM5's early releases stated model_type "minicpm".
-    {"MiniCPM5-2B", "llama", "minicpm", denseDescriptor},
-    {"LFM2.5-2.6B", "lfm2", nullptr, lfm2Descriptor},
-    {"d1-3B", "lfm2", nullptr, d1Descriptor},
-    {"d1-omni", "lfm2", nullptr, d1omniDescriptor},
-    {"LFM2.5-8B-A1B", "lfm2_moe", nullptr, lfm2moeDescriptor},
-    {"LFM2.5-24B-A2B", "lfm2_moe", nullptr, lfm2moe24BDescriptor},
-    {"Granite-4.2-3B", "granite", nullptr, granite3BDescriptor},
-    {"Granite-4.2-8B", "granite", nullptr, granite8BDescriptor},
-    {"Gemma4-26B-A4B", "gemma4_text", nullptr, gemma4Descriptor},
-    // DiffusionGemma-26B-A4B is disabled: its denoising trunk ships
-    // incoherent output pending the numerics bisect in
-    // docs/diffusion_issue.md. Re-add its row and the packed-format branch
-    // below once the trunk matches the torch reference.
-};
+// FAMILIES), each with the model_type its upstream config states —
+// registered by the model/families/<family>.mm translation units
+// (ModelRegistry, replacing kModelFamilies). The record's family selects
+// the descriptor — the installer resolved it from the same configuration —
+// and the config is then validated against it; the runtime never
+// re-guesses a family from the geometry.
 
 ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   std::string sourceIdentity;
@@ -926,20 +877,19 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   const auto type = requireString(text, @"model_type", "text model type");
   const auto name = requireString(record, @"model", "model name");
   const auto family = requireString(record, @"family", "model family");
-  const auto entry = std::ranges::find(kModelFamilies, family,
-                                       &FamilyDescriptor::name);
-  if (entry == std::end(kModelFamilies))
+  const ModelFamilyRegistration *entry = findModelFamily(family);
+  if (!entry)
     throw std::invalid_argument("unsupported model family: " + family);
   if (type != entry->modelType &&
-      !(entry->legacyType && type == entry->legacyType))
+      !(entry->legacyType.size() && type == entry->legacyType))
     throw std::invalid_argument(
-        "model family " + family + " states model_type " + entry->modelType +
-        ", not " + type);
-  ModelDescriptor result = entry->make(name);
+        "model family " + family + " states model_type " +
+        std::string(entry->modelType) + ", not " + type);
+  ModelDescriptor result = entry->makeDescriptor(name);
   result.family = entry->name;
-  std::visit([&](const auto &layout) {
-    using Layout = std::decay_t<decltype(layout)>;
-    if constexpr (std::is_same_v<Layout, DenseLayout>) {
+  {
+    const TargetLayout &layout = result.target;
+    if (layout.arch == "dense") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
           {"num_attention_heads", layout.attentionQueryHeads},
@@ -947,7 +897,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       // MiniCPM5's head_dim is implicit (hidden / heads).
       if (text[@"head_dim"])
         requireNumbers(text, {{"head_dim", layout.attentionHeadDimension}});
-    } else if constexpr (std::is_same_v<Layout, GraniteLayout>) {
+    } else if (layout.arch == "granite") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
@@ -963,12 +913,12 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         throw std::invalid_argument(
             "unsupported granite attention_multiplier: " +
             std::to_string([value doubleValue]));
-    } else if constexpr (std::is_same_v<Layout, Lfm2Layout>) {
+    } else if (layout.arch == "lfm2") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2Layout::convolutionTaps},
+          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
           {"intermediate_size", layout.intermediateSize}});
       // Exports disagree on the trained context (131072 vs 128000).
       requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
@@ -1012,16 +962,16 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
                         "target layer_intermediate_sizes " +
                             std::to_string(layer));
       }
-    } else if constexpr (std::is_same_v<Layout, Lfm2MoeLayout>) {
+    } else if (layout.arch == "lfm2_moe") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", Lfm2MoeLayout::convolutionTaps},
+          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
           {"intermediate_size", layout.intermediateSize},
           {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
           {"moe_intermediate_size", layout.expertIntermediateSize},
-          {"num_dense_layers", Lfm2MoeLayout::denseLayers}});
+          {"num_dense_layers", layout.denseLayers}});
       // Exports disagree on the trained context (131072 vs 128000).
       requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
                     "max_position_embeddings");
@@ -1038,16 +988,16 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         requireEqual(actual ? actual : "", expected,
                      "target layer " + std::to_string(layer));
       }
-    } else if constexpr (std::is_same_v<Layout, Lfm2Moe24BLayout>) {
+    } else if (layout.arch == "lfm2_moe_24b") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize},
           {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_L_cache", Lfm2Moe24BLayout::convolutionTaps},
+          {"conv_L_cache", layout.convolutionTaps},
           {"intermediate_size", layout.intermediateSize},
           {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
           {"moe_intermediate_size", layout.expertIntermediateSize},
-          {"num_dense_layers", Lfm2Moe24BLayout::denseLayers}});
+          {"num_dense_layers", layout.denseLayers}});
       // conv_dim is the hidden size upstream; MLX exports may omit it.
       if (text[@"conv_dim"])
         requireNumbers(text, {{"conv_dim", layout.convolutionDimension}});
@@ -1067,13 +1017,13 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         requireEqual(actual ? actual : "", expected,
                      "target layer " + std::to_string(layer));
       }
-    } else if constexpr (std::is_same_v<Layout, Gemma4MoeLayout> ||
-                         std::is_same_v<Layout, DiffusionGemmaLayout>) {
+    } else if (layout.arch == "gemma4" ||
+               layout.arch == "diffusion_gemma") {
       requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
           {"vocab_size", layout.vocabularySize}, {"num_attention_heads", layout.attentionQueryHeads},
           {"num_key_value_heads", layout.attentionKvHeads}, {"head_dim", layout.attentionHeadDimension},
-          {"global_num_key_value_heads", layout.globalKvHeads},
-          {"global_head_dim", layout.globalHeadDimension},
+          {"global_num_key_value_heads", layout.altKvHeads},
+          {"global_head_dim", layout.altHeadDimension},
           {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
           {"moe_intermediate_size", layout.expertIntermediateSize},
           {"shared_expert_intermediate_size", layout.sharedIntermediateSize},
@@ -1083,27 +1033,23 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     }
     // The Qwen families' text config is checked by validateTextConfig once
     // the target format is known.
-  }, result.target);
+  }
   const auto target = requireString(record, @"target_format", "target format");
   if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + target);
-  std::visit([&](const auto &layout) {
-    using Layout = std::decay_t<decltype(layout)>;
-    if constexpr (std::is_same_v<Layout, Qwen3_8Layout> ||
-                  std::is_same_v<Layout, Ornith9BLayout> ||
-                  std::is_same_v<Layout, Qwen3_6MoeLayout> ||
-                  std::is_same_v<Layout, MiniCpmV47MoeLayout>)
-      validateTextConfig(text, layout, result.targetSource);
-  }, result.target);
+  if (result.target.arch == "qwen3_8" || result.target.arch == "ornith9" ||
+      result.target.arch == "qwen3_6moe" ||
+      result.target.arch == "minicpm_v47_moe")
+    validateTextConfig(text, result.target, result.targetSource);
   // The Null-default families' declared draft: an assembly that ships a
   // draft/config.json declares one anyway (Gemma 4's plain DFlash block,
   // the 24B's DSpark).
   const bool declaredDraft =
-      (std::holds_alternative<Gemma4MoeLayout>(result.target) ||
-       std::holds_alternative<Lfm2Moe24BLayout>(result.target)) &&
+      (result.target.arch == "gemma4" ||
+       result.target.arch == "lfm2_moe_24b") &&
       std::filesystem::exists(root / "draft" / "config.json");
-  if (std::holds_alternative<DiffusionGemmaLayout>(result.target) &&
+  if (result.target.arch == "diffusion_gemma" &&
       std::filesystem::exists(root / "draft" / "config.json"))
     throw std::invalid_argument("diffusion gemma targets take no draft");
   if (result.draft.kind != DraftKind::Null || declaredDraft) {
@@ -1120,32 +1066,28 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   DFlashDraftLayout d = result.draft;
   if (!dflashV1Draft && !dsparkDraft && d.kind != DraftKind::DFlashTwo) {
     // The descriptor's default draft for this target is not DFlash2, but
-    // the assembly declares a DFlash2 draft: swap in its DFlash2 layout.
-    std::visit(
-        [&](const auto &layout) {
-          using Layout = std::decay_t<decltype(layout)>;
-          if constexpr (std::is_same_v<Layout, Qwen3_6MoeLayout>)
-            d = qwen36DraftLayout();
-          else if constexpr (std::is_same_v<Layout, DenseLayout>)
-            d = denseDFlash2DraftLayout();
-          else if constexpr (std::is_same_v<Layout, Qwen3_8Layout>)
-            d = qwen38DraftLayout();
-          else
-            throw std::invalid_argument(
-                "this family declares no DFlash2 draft layout");
-        },
-        result.target);
+    // the assembly declares a DFlash2 draft: swap in the family's
+    // registered DFlash2 layout where it declares one.
+    const ModelFamilyRegistration *draftFamily =
+        findModelFamily(result.family);
+    DFlashDraftLayout dflash2;
+    dflash2.kind = DraftKind::Null;
+    if (draftFamily && draftFamily->draftLayout)
+      dflash2 = draftFamily->draftLayout();
+    if (dflash2.kind != DraftKind::DFlashTwo)
+      throw std::invalid_argument(
+          "this family declares no DFlash2 draft layout");
+    d = dflash2;
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
   }
   // A DFlash2 draft's config is the checkpoint's: one rule checks it before
   // the dialect parsers below read the fields it names.
   if (!dflashV1Draft && !dsparkDraft) {
-    std::visit([&](const auto &layout) {
-      result.draft.blockSize = validateDraftConfig(draft, result.draft,
-                                                 layout.maskToken,
-                                                 layout.hiddenCaptureLayers);
-    }, result.target);
+    result.draft.blockSize = validateDraftConfig(
+        draft, result.draft, result.target.maskToken,
+        {result.target.hiddenCaptureLayers.data(),
+         result.target.captureLayerCount});
   }
   if (dflashV1Draft) {
     // The plain transformer draft: the layout is read from the config.
@@ -1207,11 +1149,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.contextCore = draftContextCoreFor(d.hiddenSize, d.dynamicSize);
     // Gemma 4's draft shares its target's logit softcap; other families'
     // plain drafts leave it disabled.
-    std::visit([&](const auto &layout) {
-      if constexpr (std::is_same_v<std::decay_t<decltype(layout)>,
-                                   Gemma4MoeLayout>)
-        d.logitSoftcap = layout.logitSoftcap;
-    }, result.target);
+    if (result.target.arch == "gemma4")
+      d.logitSoftcap = result.target.logitSoftcap;
   } else if (dsparkDraft) {
     // The DSpark draft: a block-bidirectional qwen3 block plus a Markov and
     // a confidence head. MiniCPM5's config states its fields flat, LFM2.5's
@@ -1293,11 +1232,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   // The draft norm epsilon follows the target family's (the LFM2 targets'
   // 1e-5).
   const double expectedRmsEps =
-      std::holds_alternative<Lfm2Layout>(result.target) ||
-              std::holds_alternative<Lfm2MoeLayout>(result.target) ||
-              std::holds_alternative<Lfm2Moe24BLayout>(result.target)
-          ? 1e-5
-          : 1e-6;
+      result.target.arch.starts_with("lfm2") ? 1e-5 : 1e-6;
   if (dsparkDraft) {
     d.rmsEpsilon = static_cast<float>(expectedRmsEps);
     if (![draft[@"rms_norm_eps"] isEqual:@(expectedRmsEps)] ||
@@ -1356,11 +1291,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     if (d.blockSize < 1)
       throw std::invalid_argument("draft block_size is below a proposal row");
     if (id layers = flash[@"num_target_layers"]) {
-      std::visit([&](const auto &layout) {
-        requireEqual(requireUnsigned(flash, @"num_target_layers",
-                                     "draft num_target_layers"),
-                     layout.layers, "draft num_target_layers");
-      }, result.target);
+      requireEqual(requireUnsigned(flash, @"num_target_layers",
+                                   "draft num_target_layers"),
+                   result.target.layers, "draft num_target_layers");
       static_cast<void>(layers);
     }
   } else {
@@ -1376,10 +1309,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         {"conv_kernel_size", 2}, {"selector_rank", d.selectorRank}, {"selector_top_k", 16}});
   }
   NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
-  std::visit([&](const auto &layout) {
+  {
+    const TargetLayout &layout = result.target;
     requireEqual(requireUnsigned(flash, @"mask_token_id", "draft mask token"), layout.maskToken, "draft mask token");
-    requireEqual(capture.count, layout.hiddenCaptureLayers.size(), "draft target layer count");
-    for (size_t i = 0; i < layout.hiddenCaptureLayers.size(); ++i) {
+    requireEqual(capture.count, layout.captureLayerCount, "draft target layer count");
+    for (size_t i = 0; i < layout.captureLayerCount; ++i) {
       id value = capture[i];
       if (![value isKindOfClass:[NSNumber class]] || [value unsignedLongLongValue] != layout.hiddenCaptureLayers[i])
         throw std::invalid_argument("draft target capture layers do not match this model");
@@ -1387,7 +1321,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     if (dflashV1Draft || dsparkDraft)
       d.targetHiddenSize = static_cast<uint32_t>(
           capture.count * layout.hiddenSize);
-  }, result.target);
+  }
   if (dflashV1Draft || dsparkDraft) {
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
@@ -1398,8 +1332,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (vision == "none") result.visionSource = VisionSource::None;
   else {
     // Only the Qwen VL tower is served; every other family is text-only.
-    if (!std::holds_alternative<Qwen3_8Layout>(result.target) &&
-        !std::holds_alternative<Qwen3_6MoeLayout>(result.target))
+    if (result.target.arch != "qwen3_8" &&
+        result.target.arch != "qwen3_6moe")
       throw std::invalid_argument("unsupported vision source format: " + vision);
     if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
     else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
@@ -1433,18 +1367,11 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.target = target;
   result.draft = draft;
   result.vision = vision;
-  std::visit(
-      [&](const auto &layout) {
-        result.capabilities = {layout.vocabularySize,
-                               layout.maximumContextTokens};
-        if constexpr (std::is_same_v<std::decay_t<decltype(layout)>,
-                                     DiffusionGemmaLayout>)
-          result.capabilities.maximumStepTokens =
-              layout.diffusion.canvasLength;
-        result.targetKvLayout = layout.kvLayout();
-        result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
-      },
-      target);
+  result.capabilities = {target.vocabularySize, target.maximumContextTokens};
+  if (target.arch == "diffusion_gemma")
+    result.capabilities.maximumStepTokens = target.diffusion.canvasLength;
+  result.targetKvLayout = target.kvLayout();
+  result.stateLayout = {target.gdnStateLayout(), draft.stateLayout()};
 
   // Tree-verify default follows the draft kind a family picked: a Null
   // draft only has the n-gram predraft proposing, whose alternates rescue
@@ -1490,17 +1417,12 @@ bool ModelDescriptor::valid() const noexcept {
       vision.outputHiddenSize != draft.hiddenSize) {
     return false;
   }
-  return std::visit(
-      [&](const auto &layout) {
-        return layout.vocabularySize == capabilities.vocabularySize &&
-               layout.maximumContextTokens ==
-                   capabilities.maximumContextTokens &&
-               layout.hiddenSize == draft.hiddenSize &&
-               layout.capturedHiddenSize() == draft.targetHiddenSize &&
-               layout.kvLayout() == targetKvLayout &&
-               layout.gdnStateLayout() == stateLayout.target;
-      },
-      target);
+  return target.vocabularySize == capabilities.vocabularySize &&
+         target.maximumContextTokens == capabilities.maximumContextTokens &&
+         target.hiddenSize == draft.hiddenSize &&
+         target.capturedHiddenSize() == draft.targetHiddenSize &&
+         target.kvLayout() == targetKvLayout &&
+         target.gdnStateLayout() == stateLayout.target;
 }
 
 ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
@@ -1534,11 +1456,10 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
         // it selects the descriptor the same way a source record's does.
         const std::string family =
             requireString(manifest, @"family", "model family");
-        const auto entry = std::ranges::find(kModelFamilies, family,
-                                             &FamilyDescriptor::name);
-        if (entry == std::end(kModelFamilies))
+        const ModelFamilyRegistration *entry = findModelFamily(family);
+        if (!entry)
           throw std::invalid_argument("unsupported model family: " + family);
-        descriptor = entry->make(model);
+        descriptor = entry->makeDescriptor(model);
         descriptor.family = entry->name;
       } else {
         // Both dense families share the packed format; a legacy manifest
@@ -1550,73 +1471,94 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
                                            "text model config");
         const uint64_t hiddenSize =
             requireUnsigned(text, @"hidden_size", "hidden_size");
-        if (hiddenSize == Ornith9BLayout{}.hiddenSize) {
-          descriptor = ornithDescriptor(model);
-          descriptor.family = "Ornith-1.5-9B";
-        } else {
-          descriptor = qwen38Descriptor(model);
-          descriptor.family = "Qwen3.8-27B";
-        }
+        const ModelFamilyRegistration *hiddenSizeFamily =
+            hiddenSize == ornith9TargetLayout().hiddenSize
+                ? findModelFamily("Ornith-1.5-9B")
+                : findModelFamily("Qwen3.8-27B");
+        descriptor = hiddenSizeFamily->makeDescriptor(model);
+        descriptor.family = hiddenSizeFamily->name;
       }
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      const DFlashDraftLayout dflashV1Layout = ornith9DFlashV1DraftLayout();
-      const DFlashDraftLayout dflash2Layout = qwen38DraftLayout();
-      const bool ornith =
-          std::holds_alternative<Ornith9BLayout>(descriptor.target);
-      // Ornith 9B has no DFlash2 draft layout — no compiled context core
-      // covers its hidden 4096 — so a packed DFlash2 manifest is refused.
+      const ModelFamilyRegistration *packedFamily =
+          findModelFamily(descriptor.family);
+      // Ornith 9B registers no DFlash2 draft layout — no compiled context
+      // core covers its hidden 4096 — so a packed DFlash2 manifest is
+      // refused.
+      const DFlashDraftLayout dflashV1Layout =
+          packedFamily->dflashV1Layout ? packedFamily->dflashV1Layout()
+                                       : DFlashDraftLayout{};
+      const DFlashDraftLayout dflash2Layout =
+          packedFamily->draftLayout ? packedFamily->draftLayout()
+                                    : DFlashDraftLayout{};
       applyManifestDraftKind(
-          weightFormat, descriptor, ornith ? &dflashV1Layout : nullptr,
-          ornith ? nullptr : &dflash2Layout);
+          weightFormat, descriptor,
+          packedFamily->dflashV1Layout ? &dflashV1Layout : nullptr,
+          packedFamily->draftLayout ? &dflash2Layout : nullptr);
       validateQwen38(manifest, root, descriptor);
     } else if (canonicalFormat == "richengine-packed-q4-moe") {
-      descriptor = qwen36Descriptor(model);
+      descriptor = findModelFamily("Qwen3.6-35B-A3B")->makeDescriptor(model);
       descriptor.family = "Qwen3.6-35B-A3B";
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      const DFlashDraftLayout dflashV1Layout = qwen36DFlashV1DraftLayout();
-      const DFlashDraftLayout dflash2Layout = qwen36DraftLayout();
+      const ModelFamilyRegistration *packedFamily =
+          findModelFamily(descriptor.family);
+      const DFlashDraftLayout dflashV1Layout = packedFamily->dflashV1Layout();
+      const DFlashDraftLayout dflash2Layout = packedFamily->draftLayout();
       applyManifestDraftKind(weightFormat, descriptor, &dflashV1Layout,
                              &dflash2Layout);
       validateQwen36(manifest, root, descriptor);
     } else if (canonicalFormat == "richengine-packed-q4-dense") {
-      descriptor = denseDescriptor(model);
+      descriptor = findModelFamily("MiniCPM5-2B")->makeDescriptor(model);
       descriptor.family = "MiniCPM5-2B";
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      const DFlashDraftLayout denseDflash2 = denseDFlash2DraftLayout();
-      applyDeclaredDraft(manifest, weightFormat, descriptor, denseDraftLayout(),
+      const ModelFamilyRegistration *packedFamily =
+          findModelFamily(descriptor.family);
+      // The descriptor's default is the family's released DSpark draft; the
+      // registration's draftLayout is the DFlash2 port a manifest may swap
+      // in.
+      const DFlashDraftLayout denseDefaults = descriptor.draft;
+      const DFlashDraftLayout denseDflash2 = packedFamily->draftLayout();
+      applyDeclaredDraft(manifest, weightFormat, descriptor, denseDefaults,
                          &denseDflash2);
       validateNewPackedFormat(manifest, root, descriptor, "minicpm");
     } else if (canonicalFormat == "richengine-packed-q4-lfm2") {
-      descriptor = lfm2Descriptor(model);
+      descriptor = findModelFamily("LFM2.5-2.6B")->makeDescriptor(model);
       descriptor.family = "LFM2.5-2.6B";
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      applyDeclaredDraft(manifest, weightFormat, descriptor, lfm2DraftLayout());
+      const ModelFamilyRegistration *packedFamily =
+          findModelFamily(descriptor.family);
+      applyDeclaredDraft(manifest, weightFormat, descriptor,
+                         packedFamily->draftLayout());
       validateNewPackedFormat(manifest, root, descriptor, "lfm2");
     } else if (canonicalFormat == "richengine-packed-q4-lfm2moe") {
-      descriptor = lfm2moeDescriptor(model);
+      descriptor = findModelFamily("LFM2.5-8B-A1B")->makeDescriptor(model);
       descriptor.family = "LFM2.5-8B-A1B";
       NSDictionary *weightFormat =
           requireObject(manifest, @"format", "model weight format");
-      applyDeclaredDraft(manifest, weightFormat, descriptor, lfm2moeDraftLayout());
+      const ModelFamilyRegistration *packedFamily =
+          findModelFamily(descriptor.family);
+      applyDeclaredDraft(manifest, weightFormat, descriptor,
+                         packedFamily->draftLayout());
       validateNewPackedFormat(manifest, root, descriptor, "lfm2_moe");
     } else if (canonicalFormat == "richengine-packed-q4-lfm2moe24b") {
-      descriptor = lfm2moe24BDescriptor(model);
+      descriptor = findModelFamily("LFM2.5-24B-A2B")->makeDescriptor(model);
       descriptor.family = "LFM2.5-24B-A2B";
       // A package whose manifest declares a draft ships the DSpark block;
       // one without keeps the Null layout and its n-gram predraft.
       if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]]) {
         NSDictionary *weightFormat =
             requireObject(manifest, @"format", "model weight format");
+        const ModelFamilyRegistration *packedFamily =
+            findModelFamily(descriptor.family);
         applyDeclaredDraft(manifest, weightFormat, descriptor,
-                           lfm2moe24BDSparkDraftLayout());
+                           packedFamily->draftLayout());
       }
       validateNewPackedFormat(manifest, root, descriptor, "lfm2_moe");
     } else if (canonicalFormat == "richengine-packed-q4-gemma4") {
-      descriptor = gemma4Descriptor(model);
+      descriptor = findModelFamily("Gemma4-26B-A4B")->makeDescriptor(model);
       descriptor.family = "Gemma4-26B-A4B";
       descriptor.packedTiledEmbedding = true;
       // A package whose manifest declares a draft ships the plain DFlash
@@ -1624,8 +1566,10 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
       if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]]) {
         NSDictionary *weightFormat =
             requireObject(manifest, @"format", "model weight format");
+        const ModelFamilyRegistration *packedFamily =
+            findModelFamily(descriptor.family);
         applyDeclaredDraft(manifest, weightFormat, descriptor,
-                           gemma4DFlashV1DraftDefaults());
+                           packedFamily->dflashV1Layout());
       }
       validateGemma4(manifest, root, descriptor);
     } else {

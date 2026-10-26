@@ -162,8 +162,7 @@ struct Runtime::Impl::DiffusionCanvasArena final {
 
 Runtime::Impl::DiffusionCanvasArena &Runtime::Impl::canvasArena() {
   if (!diffusion_.canvasArena_) {
-    const DiffusionSchedule &schedule =
-        std::get<DiffusionGemmaLayout>(package.descriptor.target).diffusion;
+    const DiffusionSchedule &schedule = package.descriptor.target.diffusion;
     diffusion_.canvasArena_ = std::make_shared<DiffusionCanvasArena>(
         backend, geometry, schedule.canvasLength);
   }

@@ -1,10 +1,11 @@
 #include "ModelFactory.hpp"
 #include "model/AffineTarget.hpp"
 #include "model/AffineToBlock.hpp"
-#include "model/Granite.hpp"
+#include "model/Dense.hpp"
 #include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/ModelRegistry.hpp"
 #include "model/OqTarget.hpp"
 #include "model/TargetLoader.hpp"
 
@@ -12,7 +13,6 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
-#include <type_traits>
 #include <vector>
 
 namespace richengine::model {
@@ -22,15 +22,15 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
       std::visit([](const auto &weights) -> const DFlashDraftLayout & {
         return weights.layout;
       }, package.draft);
+  const TargetLayout &targetLayout = std::visit(
+      [](const TargetModelWeights &weights) -> const TargetLayout & {
+        return weights.layout;
+      },
+      package.target);
   if (!package.descriptor.valid() ||
       package.descriptor.draft != draftLayout ||
-      !std::visit(
-          [&](const auto &target) {
-            return package.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       draftLayout.vocabularySize;
-          },
-          package.target)) {
+      package.descriptor.target != targetLayout ||
+      targetLayout.vocabularySize != draftLayout.vocabularySize) {
     throw std::invalid_argument(
         "target and draft model interfaces are incompatible");
   }
@@ -38,69 +38,17 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
 
 namespace {
 
-TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const TargetFiles<Qwen3_8Layout> &files) {
-  return loadQwen3_8Weights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Ornith9BLayout &layout,
-                         const TargetFiles<Ornith9BLayout> &files) {
-  return loadOrnith9BWeights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const TargetFiles<Qwen3_6MoeLayout> &files) {
-  return loadQwen3_6MoeWeights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const MiniCpmV47MoeLayout &layout,
-                         const TargetFiles<MiniCpmV47MoeLayout> &files) {
-  return loadMiniCpmV47MoeWeights(backend, layout, files);
-}
-
-// Packed and GGUF files fix the layout they store, so the flag only reaches
-// the MLX case below, which calls loadDenseWeights itself.
-TargetWeights readTarget(metal::MetalBackend &backend, const DenseLayout &layout,
-                         const TargetFiles<DenseLayout> &files) {
-  return loadDenseWeights(backend, layout, files, false);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2Layout &layout,
-                         const TargetFiles<Lfm2Layout> &files) {
-  return loadLfm2Weights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2MoeLayout &layout,
-                         const TargetFiles<Lfm2MoeLayout> &files) {
-  return loadLfm2MoeWeights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Lfm2Moe24BLayout &layout,
-                         const TargetFiles<Lfm2Moe24BLayout> &files) {
-  return loadLfm2Moe24BWeights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const GraniteLayout &layout,
-                         const TargetFiles<GraniteLayout> &files) {
-  return loadGraniteWeights(backend, layout, files);
-}
-
-TargetWeights readTarget(metal::MetalBackend &backend, const Gemma4MoeLayout &layout,
-                         const TargetFiles<Gemma4MoeLayout> &files) {
-  return loadGemma4MoeWeights(backend, layout, files);
-}
-
+// The registry lookup the per-layout overload set was: the family's
+// registered load*Weights entry, keyed on TargetLayout::arch.
 TargetWeights readTarget(metal::MetalBackend &backend,
-                         const DiffusionGemmaLayout &layout,
-                         const TargetFiles<DiffusionGemmaLayout> &files) {
-  return loadDiffusionGemmaWeights(backend, layout, files);
+                         const TargetLayout &layout,
+                         const TargetFiles &files) {
+  const auto *arch = findTargetArch(layout.arch);
+  if (!arch)
+    throw std::invalid_argument("unknown target architecture " +
+                                std::string(layout.arch));
+  return arch->loadTarget(backend, layout, files);
 }
-
-// Whether the layout declares packed-only loading
-// (Gemma4MoeLayout::packedOnly): true only where the member exists and is
-// true, false for a layout without it.
-template <class Layout>
-concept PackedOnlyLayout = requires { requires Layout::packedOnly; };
 
 template <class Image> uint64_t imageBytes(const std::vector<Image> &images) {
   uint64_t total = 0;
@@ -139,62 +87,65 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   }
   // The kernel layout the target's weights loaded in, for /status.
   bool targetBlock = false;
-  result.target = std::visit(
-      [&](const auto &layout) -> TargetWeights {
-        using Layout = std::remove_cvref_t<decltype(layout)>;
-        const std::filesystem::path directory = root / "target";
-        switch (result.descriptor.targetSource) {
-        case TargetSource::Packed:
-          return readTarget(backend, layout,
-                            PackedTargetFiles<Layout>{images, directory, layout,
-                                                      result.descriptor.packedTiledEmbedding});
-        case TargetSource::Mlx: {
-          // A packed-only layout declares it (Gemma4MoeLayout::packedOnly);
-          // the affine and GGUF planners have no tensor map for it.
-          if constexpr (PackedOnlyLayout<Layout>)
-            throw std::invalid_argument(
-                "this target loads from packed files only");
-          // An oQ (oMLX mixed-precision) checkpoint plans into the block
-          // weight layout instead of the affine tiles; the probe reads only
-          // its config.json.
-          else if (oqCheckpoint(directory)) {
-            OqTargetLoader loader(images, directory, layout);
-            targetBlock = true;
-            return readTarget(backend, layout, std::ref(loader));
-          }
-          else if constexpr (std::is_same_v<Layout, DenseLayout>) {
-            // preferBlockWeights plans and reads the images' projections in
-            // the block layout; every other layout stays affine this
-            // milestone. Sections without a block form load affine instead.
-            if (preferBlockWeights) {
-              try {
-                AffineTargetLoader loader(images, directory, layout, true);
-                targetBlock = true;
-                return loadDenseWeights(backend, layout, std::ref(loader), true);
-              } catch (const WeightStoreError &) {
-              }
-            }
-            AffineTargetLoader loader(images, directory, layout);
-            return loadDenseWeights(backend, layout, std::ref(loader), false);
-          } else {
-            AffineTargetLoader loader(images, directory, layout);
-            return readTarget(backend, layout, std::ref(loader));
-          }
+  const TargetLayout &layout = result.descriptor.target;
+  const std::filesystem::path directory = root / "target";
+  switch (result.descriptor.targetSource) {
+  case TargetSource::Packed:
+    result.target = readTarget(backend, layout,
+                               PackedTargetFiles{images, directory, layout,
+                                                 result.descriptor.packedTiledEmbedding});
+    break;
+  case TargetSource::Mlx:
+    // A packed-only layout declares it (TargetLayout::packedOnly); the
+    // affine and GGUF planners have no tensor map for it.
+    if (layout.packedOnly)
+      throw std::invalid_argument(
+          "this target loads from packed files only");
+    // An oQ (oMLX mixed-precision) checkpoint plans into the block
+    // weight layout instead of the affine tiles; the probe reads only
+    // its config.json.
+    if (oqCheckpoint(directory)) {
+      OqTargetLoader loader(images, directory, layout);
+      targetBlock = true;
+      result.target = readTarget(backend, layout, std::ref(loader));
+    } else if (layout.mlxBlockWeights) {
+      // Dense's block path bypasses the registered loader so
+      // preferBlockWeights can reach loadDenseWeights: it plans and reads
+      // the images' projections in the block layout. Sections without a
+      // block form load affine instead.
+      if (preferBlockWeights) {
+        try {
+          AffineTargetLoader loader(images, directory, layout, true);
+          result.target =
+              loadDenseWeights(backend, layout, std::ref(loader), true);
+          targetBlock = true;
+        } catch (const WeightStoreError &) {
         }
-        case TargetSource::Gguf: {
-          if constexpr (PackedOnlyLayout<Layout>)
-            throw std::invalid_argument(
-                "this target loads from packed files only");
-          else {
-            GgufTargetLoader loader(backend, images, findTargetGguf(directory), ggufTargetGeometry(layout));
-            targetBlock = true;
-            return readTarget(backend, layout, std::ref(loader));
-          }
-        }
-        }
-        throw std::invalid_argument("unknown target source");
-      },
-      result.descriptor.target);
+      }
+      if (!targetBlock) {
+        AffineTargetLoader loader(images, directory, layout);
+        result.target =
+            loadDenseWeights(backend, layout, std::ref(loader), false);
+      }
+    } else {
+      AffineTargetLoader loader(images, directory, layout);
+      result.target = readTarget(backend, layout, std::ref(loader));
+    }
+    break;
+  case TargetSource::Gguf:
+    if (layout.packedOnly)
+      throw std::invalid_argument(
+          "this target loads from packed files only");
+    {
+      GgufTargetLoader loader(backend, images, findTargetGguf(directory),
+                              ggufTargetGeometry(layout));
+      targetBlock = true;
+      result.target = readTarget(backend, layout, std::ref(loader));
+    }
+    break;
+  default:
+    throw std::invalid_argument("unknown target source");
+  }
   result.weightLayout =
       targetBlock ? ops::WeightLayout::Block32 : ops::WeightLayout::Affine64;
   if (nullDraft) {
@@ -253,35 +204,33 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                           bool preferBlockWeights) {
   uint64_t bytes = 0;
+  const TargetLayout &layout = descriptor.target;
   if (descriptor.targetSource == TargetSource::Gguf) {
     WeightSource source(findTargetGguf(root / "target"));
     const GgufFile file(source);
-    bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, ggufTargetGeometry(layout))); },
-        descriptor.target);
+    bytes = imageBytes(gguf::planImages(file, ggufTargetGeometry(layout)));
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     const std::filesystem::path directory = root / "target";
-    bytes = std::visit(
-        [&](const auto &layout) -> uint64_t {
-          using Layout = std::remove_cvref_t<decltype(layout)>;
-          // Packed-only layouts never take this branch; the probe and the oQ
-          // planner are not instantiated for them.
-          if constexpr (!PackedOnlyLayout<Layout>) {
-            if (oqCheckpoint(directory)) return oqTargetImageBytes(directory, layout);
-            if constexpr (std::is_same_v<Layout, DenseLayout>) {
-              if (preferBlockWeights) {
-                // Sections without a block form budget for the affine load the
-                // fallback below performs.
-                try {
-                  return imageBytes(affine::blockImages(affineTargetImages(layout)));
-                } catch (const WeightStoreError &) {
-                }
-              }
-            }
-          }
-          return imageBytes(affineTargetImages(layout));
-        },
-        descriptor.target);
+    // A packed-only layout never reaches this branch's planners (the
+    // loader throws first); it keeps the affine estimate below.
+    if (layout.packedOnly) {
+      bytes = imageBytes(affineTargetImages(layout));
+    } else if (oqCheckpoint(directory)) {
+      bytes = oqTargetImageBytes(directory, layout);
+    } else {
+      if (layout.mlxBlockWeights && preferBlockWeights) {
+        // Sections without a block form budget for the affine load the
+        // fallback below performs.
+        try {
+          bytes = imageBytes(
+              affine::blockImages(affineTargetImages(layout)));
+        } catch (const WeightStoreError &) {
+          bytes = imageBytes(affineTargetImages(layout));
+        }
+      } else {
+        bytes = imageBytes(affineTargetImages(layout));
+      }
+    }
   }
   if (descriptor.draftFromCheckpoint() &&
       descriptor.draft.kind != DraftKind::Null) {

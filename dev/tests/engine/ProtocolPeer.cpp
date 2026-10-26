@@ -133,6 +133,56 @@ FrameType write(Writer &out, const StatusRequestFrame &request) {
   return FrameType::StatusRequest;
 }
 
+FrameType write(Writer &out, const ForcedTokensFrame &forced) {
+  out.u64(forced.requestId);
+  out.u32(static_cast<uint32_t>(forced.tokens.size()));
+  out.words(forced.tokens);
+  return FrameType::ForcedTokens;
+}
+
+FrameType write(Writer &out, const ConstraintDfaFrame &dfa) {
+  out.u64(dfa.requestId);
+  out.u32(static_cast<uint32_t>(dfa.table.size() / 256));
+  out.u32(0); // flags
+  for (int16_t entry : dfa.table)
+    out.u16(std::bit_cast<uint16_t>(entry));
+  out.raw(dfa.accepting);
+  out.u32(static_cast<uint32_t>(dfa.eosIds.size()));
+  out.words(dfa.eosIds);
+  out.u32(static_cast<uint32_t>(dfa.marker.size()));
+  out.raw(dfa.marker);
+  return FrameType::ConstraintDfa;
+}
+
+FrameType write(Writer &out, const VocabularyFrame &vocabulary) {
+  out.u32(static_cast<uint32_t>(vocabulary.tokenOffsets.size() - 1));
+  out.u32(static_cast<uint32_t>(vocabulary.tokenBytes.size()));
+  out.raw(vocabulary.tokenBytes);
+  for (int32_t offset : vocabulary.tokenOffsets)
+    out.u32(std::bit_cast<uint32_t>(offset));
+  out.u32(static_cast<uint32_t>(vocabulary.specialBits.size()));
+  out.raw(vocabulary.specialBits);
+  return FrameType::Vocabulary;
+}
+
+FrameType write(Writer &out, const ScoreBatchFrame &batch) {
+  out.u64(batch.absoluteDeadlineUnixMicros);
+  out.u64(batch.remainingDeadlineMicros);
+  out.u8(static_cast<uint8_t>(batch.priority));
+  out.u8(batch.flags);
+  out.u32(static_cast<uint32_t>(batch.items.size()));
+  out.u32(static_cast<uint32_t>(batch.prefixTokens.size()));
+  out.words(batch.prefixTokens);
+  for (const ScoreBatchFrame::Item &item : batch.items) {
+    out.u64(item.requestId);
+    out.u32(static_cast<uint32_t>(item.suffixTokens.size()));
+    out.u32(static_cast<uint32_t>(item.scoreTokens.size()));
+    out.words(item.suffixTokens);
+    out.words(item.scoreTokens);
+  }
+  return FrameType::ScoreBatch;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;

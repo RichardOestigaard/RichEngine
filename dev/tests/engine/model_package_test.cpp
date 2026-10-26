@@ -1,6 +1,7 @@
 #include "TestBuffers.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/Qwen3_8.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 #include "ops/Embedding.hpp"
@@ -35,7 +36,7 @@ using richengine::model::WeightFileRecord;
 using richengine::model::WeightStoreError;
 using richengine::model::AttentionMixerWeights;
 using richengine::model::GdnMixerWeights;
-using richengine::model::Qwen3_8Layout;
+using richengine::model::TargetLayout;
 using richengine::model::Qwen3_8Weights;
 using richengine::ops::VisionLayout;
 using richengine::model::kWeightFileAlignment;
@@ -176,7 +177,7 @@ uint64_t writeWeightFile(const std::filesystem::path &path,
 }
 
 std::vector<uint64_t> targetLayerSections(
-    const Qwen3_8Layout &layout, bool full) {
+    const TargetLayout &layout, bool full) {
     constexpr uint64_t bf16 = 2;
     std::vector<uint64_t> result{
         uint64_t(layout.hiddenSize) * bf16,
@@ -262,7 +263,7 @@ struct SyntheticAccounting {
 };
 
 SyntheticAccounting writeSyntheticPackage(
-    const std::filesystem::path &root, const Qwen3_8Layout &target,
+    const std::filesystem::path &root, const TargetLayout &target,
     const DFlashDraftLayout &draft, const VisionLayout &vision) {
     SyntheticAccounting result;
     for (uint32_t layer = 0; layer < target.layers; ++layer) {
@@ -517,7 +518,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
 
 void testSyntheticPackage(MetalBackend &backend,
                           const std::filesystem::path &root) {
-    Qwen3_8Layout target;
+    TargetLayout target = richengine::model::qwen38TargetLayout();
     target.layers = 4;
     target.hiddenSize = 256;
     target.vocabularySize = 256;
@@ -788,7 +789,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,"intermediate_size":6144,"vocab_size":130560,"hidden_act":"silu","rms_norm_eps":1e-06,"attention_bias":false,"tie_word_embeddings":false,"rope_parameters":{"rope_theta":5000000,"rope_type":"default"},"block_size":7,"mask_token_id":75982,"target_layer_ids":[1,10,20,30,39],"num_target_layers":42,"projector_type":"dspark","markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"confidence_head_alpha":1.0,"attention_mode":"gqa","layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"]})");
         const auto descriptor = richengine::model::inspectModelPackage(package);
-        require(std::holds_alternative<richengine::model::DenseLayout>(descriptor.target),
+        require(descriptor.target.arch == "dense",
                 "MiniCPM5 target is not the dense layout");
         require(descriptor.draft.kind == DraftKind::DSpark,
                 "MiniCPM5 draft is not a DSpark layout");
@@ -834,7 +835,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":10000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,9,17,21,27],"num_target_layers":30},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
         const auto descriptor = richengine::model::inspectModelPackage(package);
-        require(std::holds_alternative<richengine::model::Lfm2Layout>(descriptor.target),
+        require(descriptor.target.arch == "lfm2",
                 "LFM2.5 target is not the LFM2 layout");
         const auto &d = descriptor.draft;
         require(d.kind == DraftKind::DSpark && d.layers == 5 &&
@@ -882,10 +883,9 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":5000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,6,10,14,18],"num_target_layers":24},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
         const auto descriptor = richengine::model::inspectModelPackage(package);
-        require(std::holds_alternative<richengine::model::Lfm2MoeLayout>(descriptor.target),
+        require(descriptor.target.arch == "lfm2_moe",
                 "LFM2.5-8B target is not the LFM2-MoE layout");
-        const auto &target =
-            std::get<richengine::model::Lfm2MoeLayout>(descriptor.target);
+        const auto &target = descriptor.target;
         require(target.layers == 24 && target.experts == 32 &&
                     target.expertsPerToken == 4 &&
                     target.expertIntermediateSize == 1792 &&
@@ -935,10 +935,9 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Lfm2DSparkDraftModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"intermediate_size":6144,"vocab_size":128000,"hidden_act":"silu","rms_norm_eps":1e-05,"rope_theta":10000000.0,"rope_is_neox_style":false,"block_size":9,"dflash_config":{"mask_token_id":125017,"target_layer_ids":[2,10,18,26,34],"num_target_layers":40},"markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"],"mask_token_id":125017})");
         const auto descriptor = richengine::model::inspectModelPackage(package);
-        require(std::holds_alternative<richengine::model::Lfm2Moe24BLayout>(descriptor.target),
+        require(descriptor.target.arch == "lfm2_moe_24b",
                 "LFM2.5-24B target is not the LFM2-MoE 24B layout");
-        const auto &target =
-            std::get<richengine::model::Lfm2Moe24BLayout>(descriptor.target);
+        const auto &target = descriptor.target;
         require(target.layers == 40 && target.experts == 64 &&
                     target.expertsPerToken == 4 &&
                     target.expertIntermediateSize == 1536 &&
@@ -1034,8 +1033,7 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
         writeJson(package / "draft" / "config.json",
                   R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3","hidden_size":2048,"num_hidden_layers":5,"num_attention_heads":8,"num_key_value_heads":2,"head_dim":256,"intermediate_size":6144,"vocab_size":248144,"draft_vocab_size":248144,"hidden_act":"silu","rms_norm_eps":1e-06,"attention_bias":false,"tie_word_embeddings":false,"use_sliding_window":false,"rope_parameters":{"rope_theta":10000000,"rope_type":"default","rope_dim":256},"block_size":15,"num_target_layers":40,"markov_rank":256,"enable_confidence_head":true,"confidence_head_with_markov":true,"dflash_config":{"attention_mode":"gqa","markov_rank":256,"markov_head_type":"vanilla","projector_type":"dspark","mask_token_id":248076,"target_layer_ids":[3,11,19,27,35],"confidence_head_with_markov":true,"enable_confidence_head":true},"layer_types":["full_attention","full_attention","full_attention","full_attention","full_attention"]})");
         const auto descriptor = richengine::model::inspectModelPackage(package);
-        require(std::holds_alternative<richengine::model::MiniCpmV47MoeLayout>(
-                    descriptor.target),
+        require(descriptor.target.arch == "minicpm_v47_moe",
                 "MiniCPM-V 4.7 target is not the MiniCpmV47 layout");
         const auto &d = descriptor.draft;
         require(d.kind == DraftKind::DSpark && d.layers == 5 &&

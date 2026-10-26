@@ -885,6 +885,98 @@ void packedInput(MetalBackend &backend, const Linear &linear) {
           "chunks of 8 and 32 rows, no pack dispatch, bitwise equal to the consumer-packed projection");
 }
 
+// ---------------------------------------------------------------- af4p->af4 repack
+// A native af4p weight written both as the packed manifest's planes (linear
+// codes at [tile][64-group][row] 32-byte blocks, scale and bias separate) and
+// as af4's planes (the same codes deinterleaved to af4's slot order, scale
+// and bias interleaved per 64-group). Runs both through decode and requires
+// identical outputs: proves the af4p->af4 plane repack produces what the
+// staged tile reads.
+void af4pRepack(MetalBackend &backend, const Linear &linear, LinearTile tile) {
+  constexpr uint32_t N = 5120, K = 17408, columns = N;
+  const uint32_t G = K / 32, units = G / 2;
+  const auto deinterleave = [](const uint8_t *in) {
+    uint32_t out[4];
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t a = reinterpret_cast<const uint16_t *>(in)[c];
+      const uint32_t b = reinterpret_cast<const uint16_t *>(in)[4 + c];
+      const uint32_t ae = (a & 0xFu) | (((a >> 8) & 0xFu) << 4);
+      const uint32_t be = (b & 0xFu) | (((b >> 8) & 0xFu) << 4);
+      const uint32_t ao = ((a >> 4) & 0xFu) | (((a >> 12) & 0xFu) << 4);
+      const uint32_t bo = ((b >> 4) & 0xFu) | (((b >> 12) & 0xFu) << 4);
+      out[c] = ae | (be << 8) | (ao << 16) | (bo << 24);
+    }
+    uint8_t r[16];
+    memcpy(r, out, 16);
+    return std::vector<uint8_t>(r, r + 16);
+  };
+  const std::vector<uint8_t> native = makeNative(AF4P, N, K, rng);
+  const uint32_t rb = rowBytes(AF4P, K);   // K/64 blocks of {qs[32], scale, bias}
+  // af4p manifest planes: codes [tile][g64][row][32B], scales/biases
+  // [tile][unit][row][2B].
+  std::vector<uint8_t> p0p(size_t{N} * G * 16), sc(size_t{N} * units * 2), bs(size_t{N} * units * 2);
+  std::vector<uint8_t> p0a(size_t{N} * G * 16), meta(size_t{N} * units * 4);
+  for (uint32_t n = 0; n < N; ++n) {
+    const uint8_t *row = native.data() + size_t{n} * rb;
+    for (uint32_t j = 0; j < G; ++j) {
+      const uint8_t *blk = row + (j / 2) * 36;   // the 64-block
+      const uint8_t *qs = blk + 16 * (j % 2);    // the group's 16B linear codes
+      memcpy(p0p.data() + (size_t(quant_tile_index(n, j / 2, units)) * 32 + (j % 2) * 16), qs, 16);
+      const std::vector<uint8_t> slot = deinterleave(qs);
+      memcpy(p0a.data() + quant_tile_index(n, j, G) * 16, slot.data(), 16);
+      if (j % 2 == 0) {
+        const uint64_t o = quant_tile_index(n, j / 2, units);
+        memcpy(sc.data() + o * 2, blk + 32, 2);
+        memcpy(bs.data() + o * 2, blk + 34, 2);
+        const uint32_t m = uint32_t(*reinterpret_cast<const uint16_t *>(blk + 32)) |
+                           (uint32_t(*reinterpret_cast<const uint16_t *>(blk + 34)) << 16);
+        memcpy(meta.data() + o * 4, &m, 4);
+      }
+    }
+  }
+  QuantizedSegment pseg = QuantizedSegment::planes(AF4P, N, K, upload(backend, p0p), upload(backend, bs),
+                                                   upload(backend, sc));
+  QuantizedSegment aseg = QuantizedSegment::planes(AF4, N, K, upload(backend, p0a), MetalBuffer{},
+                                                   upload(backend, meta));
+  BlockWeights bp, ba;
+  bp.segments.push_back(pseg);
+  ba.segments.push_back(aseg);
+  const Projection projP(columns, K, std::move(bp)), projA(columns, K, std::move(ba));
+  const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+  const LinearWorkload w = decode({columns, K}, kMaximumLanes, LinearEpilogue::GateUp);
+  const LinearPlan plan = Linear::plan(w, config(tile, w, 1), FloatOutput::BFloat16);
+  const std::vector<uint16_t> xi = storageRows(x, K, w.rows, plan.storageRows());
+  const std::vector<uint16_t> empty;
+  const Outcome op = run(backend, linear, plan, projP, &projP, xi, empty, kPoisonNaN, N, "af4p");
+  const Outcome oa = run(backend, linear, plan, projA, &projA, xi, empty, kPoisonNaN, N, "af4");
+  // Reference dots from the weight values groupPack reports.
+  std::vector<float> Wf(size_t{N} * K);
+  for (uint32_t n = 0; n < N; ++n) {
+    const uint8_t *row = native.data() + size_t{n} * rb;
+    for (uint32_t j = 0; j < G; ++j) {
+      float vals[32]; uint8_t p0[32], p1[8];
+      groupPack(AF4P, row, j, vals, p0, p1);
+      memcpy(&Wf[size_t{n} * K + j * 32], vals, sizeof(vals));
+    }
+  }
+  (void)Wf;
+  uint64_t diffA = 0, diffG = 0;
+  for (uint32_t r = 0; r < w.rows; ++r)
+    for (uint32_t c = 0; c < N; ++c) {
+      const size_t i = size_t{r} * columns + c;
+      const float oa_out = bf16ToFloat(oa.output[i]), op_out = bf16ToFloat(op.output[i]);
+      if (std::fabs(oa_out - op_out) > 0.05F && diffA++ < 5)
+        std::cerr << "    gate_up out af4 " << oa_out << " vs af4p " << op_out << " at r" << r << " c" << c << '\n';
+      const float oa_g = oa.gate.size() ? bf16ToFloat(oa.gate[i]) : 0, op_g = op.gate.size() ? bf16ToFloat(op.gate[i]) : 0;
+      if (std::fabs(oa_g - op_g) > 0.05F && diffG++ < 5)
+        std::cerr << "    gate af4 " << oa_g << " vs af4p " << op_g << " at r" << r << " c" << c << '\n';
+    }
+  if (diffA || diffG)
+    fail("af4p->af4 repack: " + std::to_string(diffA) + " up/gate_up and " + std::to_string(diffG) +
+         " gate outputs differ");
+  section("af4p->af4 repack: manifest planes repacked to af4 produce identical decode output");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- token gather
@@ -1006,6 +1098,7 @@ int main(int argc, char **argv) {
         decodeTile(backend, linear, tile);
         fusedDecode(backend, linear, tile);
         gateUpPairs(backend, linear, tile);
+        af4pRepack(backend, linear, tile);
       }
       prefill(backend, linear);
       leadingInputs(backend, linear);

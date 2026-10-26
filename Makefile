@@ -209,6 +209,14 @@ ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/librichengine.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
 	-framework CoreML -framework IOSurface
+# Static-init registrations only link when something references them —
+# everything reaches them through the registry, so the linker would
+# dead-strip them out of the archive. The family objects register both
+# their families and their target archs (whose loaders they pull from the
+# archive), so they must link directly into every binary that loads a
+# model. The glob means a new family file needs no Makefile edit.
+ENGINE_FAMILY_SOURCES := $(wildcard runtime/model/families/*.mm)
+ENGINE_FAMILY_OBJECTS := $(patsubst runtime/model/families/%.mm,$(ENGINE_BUILD)/model/families/%.o,$(ENGINE_FAMILY_SOURCES))
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
@@ -342,6 +350,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DSparkDraft.cpp \
 	runtime/model/DFlashV1Draft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/ModelRegistry.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/VerifyBudget.cpp \
 	runtime/model/CompositeStateStorage.cpp
@@ -445,12 +454,12 @@ $(TUNE_MAIN_OBJECT): dev/tuning/tune_kernels.mm $(BUILD_ID_HEADER)
 $(TUNE_TOOL): $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) $(ENGINE_LIBRARY) $(LIB) \
 		| $(BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(TUNE_MAIN_OBJECT) $(TUNE_OBJECTS) \
-		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+		$(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
 $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
 		| $(BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD)

@@ -127,7 +127,7 @@ struct Fixture final {
   Cell cell;
   uint32_t lanes;
   MetalBuffer packed, convWeights, mixed, decayWeights, timeBias, decay, beta,
-      hidden, retained;
+      hidden, retained, tape;
   NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
   std::vector<MetalBuffer> packedLayer, mixedLayer, decayLayer, betaLayer;
@@ -167,6 +167,8 @@ struct Fixture final {
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
     retained = alloc(kMaxLanes * 4, "gdn retained");
+    tape = alloc(uint64_t{kMaxLanes} * 2 * kLayers * tapeLayerBytes(),
+                 "gdn tape");
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
       current[lane] = alloc(cell.bytes, "gdn current");
       next[lane] = alloc(cell.bytes, "gdn next");
@@ -203,11 +205,19 @@ struct Fixture final {
       std::memset(buffer->contents(), 0, buffer->sizeBytes());
   }
 
+  uint64_t tapeLayerBytes() const {
+    const uint64_t kv = uint64_t{shape.keyHeads + shape.valueHeads} * shape.headDimension;
+    return ((uint64_t{kRows} *
+             (shape.convolutionDimension * 2 + kv * 2 +
+              uint64_t{shape.valueHeads} * 4 + uint64_t{shape.valueHeads} * 2)) +
+            255) /
+           256 * 256;
+  }
   GdnDecodeBuffers decodeBuffers(uint32_t layer) const {
     return {packedLayer[layer], convWeights,     current,
             next,               mixedLayer[layer], decayWeights,
             timeBias,           decayLayer[layer], betaLayer[layer],
-            mixerNorm,          hidden};
+            mixerNorm,          hidden,           {},         tape};
   }
   GdnCommitBuffers commitBuffers() const {
     return {packed, mixed, decay, beta, current, next, retained};
@@ -575,6 +585,70 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
   }
 }
 
+// The folded commit: step one's decoded rows land on the lane's tape; step
+// two's scan folds the retained ones into the recurrent state as its pending
+// prefix — its committed cell must equal the standalone commit's.
+void runFold(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  Fixture fixture(backend, shape, lanes, false);
+  const std::string where = "fold lanes " + std::to_string(lanes);
+  const uint64_t slotBytes = uint64_t{kLayers} * fixture.tapeLayerBytes();
+  CommandGraph step1;
+  GdnTapeLanes tape1;
+  tape1.layerBytes = fixture.tapeLayerBytes();
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    tape1.step[lane] = uint64_t{lane} * 2 * slotBytes;
+    tape1.pending[lane] = tape1.step[lane] + slotBytes;
+    tape1.rows[lane] = 0;
+  }
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    GDN::addDecode(step1, fixture.decodeBuffers(layer), shape, lanes, layer,
+                   fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Plain, {}, kRows, &tape1);
+  static_cast<void>(backend.submitCommand(step1.dispatches()));
+  // Step two folds the retained prefix of step one's rows: each lane's
+  // committed cell becomes state_in + retained rows — the standalone
+  // commit's output for the same retained count.
+  std::array<uint32_t, kMaxLanes> retained{};
+  auto *counts = static_cast<uint32_t *>(fixture.retained.contents());
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+    counts[lane] = retained[lane] = 1 + lane % (kRows - 1);
+  CommandGraph step2;
+  GdnTapeLanes tape2;
+  tape2.layerBytes = fixture.tapeLayerBytes();
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    tape2.pending[lane] = uint64_t{lane} * 2 * slotBytes;
+    tape2.step[lane] = tape2.pending[lane] + slotBytes;
+    tape2.rows[lane] = retained[lane];
+  }
+  // The committed cell lands in `next` — step one's provisional output was
+  // already verified; reset it so the fold's write is the only signal. The
+  // reference reads the emitted k/v and gates — step two overwrites them, so
+  // compute the expected states before it runs.
+  std::vector<std::vector<std::vector<double>>> expected(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t head : {0u, shape.valueHeads / 2, shape.valueHeads - 1})
+        expected[lane].push_back(
+            recurrence(fixture, layer, lane, head, retained[lane], nullptr));
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    std::memset(fixture.next[lane].contents(), 0, fixture.cell.bytes);
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    GDN::addDecode(step2, fixture.decodeBuffers(layer), shape, lanes, layer,
+                   fixture.cell.strides(), GdnHeadOrder::Grouped,
+                   LinearInput::Plain, {}, kRows, &tape2);
+  static_cast<void>(backend.submitCommand(step2.dispatches()));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const std::string laneWhere =
+        where + " retained " + std::to_string(retained[lane]) + " lane " +
+        std::to_string(lane);
+    size_t index = 0;
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t head : {0u, shape.valueHeads / 2, shape.valueHeads - 1})
+        checkState(fixture, layer, lane, head, expected[lane][index++],
+                   laneWhere);
+  }
+}
+
 // The out-projection table a fused decode writes into its scratch and the one
 // the projection's own preparation writes from the decoded hidden rows.
 struct PreparedTables final {
@@ -773,6 +847,9 @@ int main(int argc, char **argv) {
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
           runDecode(backend, shape, lanes, float32);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+        runFold(backend, shape, lanes);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

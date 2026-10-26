@@ -60,7 +60,7 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath,
   config.metallibPath = metallibPath;
   config.modelRoot = root.path;
   config.model = model::makeModelDescriptor(
-      "budget-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "budget-test", model::qwen38TargetLayout(), model::DFlashDraftLayout{},
       ops::VisionLayout{});
   config.buildId = "budget-test";
   return config;
@@ -105,7 +105,7 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config,
 // of them names another.
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
-      "namespace-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "namespace-test", model::qwen38TargetLayout(), model::DFlashDraftLayout{},
       ops::VisionLayout{});
   const auto identity = [&](char models, std::string_view build, kv::Format format) {
     kv::Layout layout = model.targetKvLayout;
@@ -307,9 +307,10 @@ void testStartupAdmissionIgnoresPackageSize(const char *metallibPath) {
 void testLoadedVisionIsRequiredOnlyWithVision() {
   model::ModelPackage package;
   package.descriptor = model::makeModelDescriptor(
-      "loaded-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
+      "loaded-test", model::qwen38TargetLayout(), model::DFlashDraftLayout{},
       ops::VisionLayout{});
   model::Qwen3_8Weights target;
+  target.layout = model::qwen38TargetLayout();
   target.actualAllocatedBytes = 1;
   target.manifestFingerprintSha256 = "target";
   package.target = std::move(target);
@@ -336,14 +337,14 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
 // draft attention takes, with Qwen3.8-27B's attention and GDN heads and a
 // two-block vision tower.
 struct PlannedModel final {
-  model::Qwen3_8Layout target;
+  model::TargetLayout target = model::qwen38TargetLayout();
   model::DFlashDraftLayout draft;
   ops::VisionLayout vision;
 };
 
 PlannedModel plannedModel() {
   PlannedModel result;
-  model::Qwen3_8Layout &target = result.target;
+  model::TargetLayout &target = result.target;
   target.layers = 4;
   target.hiddenSize = 2048;
   target.vocabularySize = 1024;

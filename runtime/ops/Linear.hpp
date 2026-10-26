@@ -125,6 +125,9 @@ struct LinearConfig final {
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
   // gate and up in one format), instead of a gate pass and an up pass.
   bool oneGateUpPass = false;
+  // GgufStaged decode: one lane's rows run on the 16-row tile in two 8-row
+  // halves instead of its own 8 (under 4.5 bits per weight).
+  bool sixteenRows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }

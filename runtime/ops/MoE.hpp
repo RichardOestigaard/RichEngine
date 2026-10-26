@@ -277,7 +277,7 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 [[nodiscard]] inline MoeGgufTile moeGgufTile(const DevicePolicy &device, MoeShape shape) noexcept {
   // RICHENGINE_MOE_GGUF_TILE=register|staged forces the tile for a family
   // the policy has not measured (Apple10's staged K-quants).
-  const std::string_view env = tuning().moeGgufTile;
+  const std::string_view env = richengine::tuning().moeGgufTile;
   if (env == "staged")
     return MoeGgufTile::Staged;
   if (env == "register" &&

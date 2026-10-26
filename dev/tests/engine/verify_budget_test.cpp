@@ -158,17 +158,19 @@ void labelsOfLanes() {
     return lane;
   };
   // Verified rows bound the labels (3 rows: proposals 0-2, all accepted); a
-  // rejection ends them (8 rows, 2 accepted: 0, 1 and the rejected 2); one
-  // row labels the first proposal; a thinking end's lane none; seven accepted
-  // of eight rows, all seven.
+  // rejection ends them (16 rows, 2 accepted: 0, 1 and the rejected 2); one
+  // row labels the first proposal; a thinking end's lane none; fifteen
+  // accepted of sixteen rows, all fifteen.
   const std::array lanes{laneOf(3, 5, true), laneOf(16, 2, true), laneOf(1, 0, true), laneOf(16, 7, false)};
   budget.observe(lanes, false, 0.0);
-  const std::array all{laneOf(16, 7, true)};
+  const std::array all{laneOf(16, 15, true)};
   budget.observe(all, true, 0.0);
   const std::vector<std::pair<uint32_t, bool>> expected{{0, true},  {1, true}, {2, true}, {0, true},
                                                          {1, true},  {2, false}, {0, false}, {0, true},
                                                          {1, true},  {2, true}, {3, true}, {4, true},
-                                                         {5, true},  {6, true}};
+                                                         {5, true},  {6, true}, {7, true}, {8, true},
+                                                         {9, true},  {10, true}, {11, true}, {12, true},
+                                                         {13, true}, {14, true}};
   const auto labels = budget.labels();
   require(labels.size() == expected.size(), "the cycles labeled " + std::to_string(labels.size()) + " proposals");
   for (size_t i = 0; i < labels.size(); ++i) {
@@ -203,11 +205,13 @@ void fitsTheLabels() {
           "the fit from the prior differs from the reference by " + std::to_string(distance(cold, reference)));
   require(std::fabs(budget.acceptance().slope - generator.truth[0]) < 0.1, "the fit missed the slope");
   // Each intercept within three standard errors of its labels (whose p(1 - p)
-  // is at least about 0.2), from at least 100 of them.
+  // is at least about 0.2). A position's labels thin toward the tail — one
+  // needs a chain of accepts that deep — so the window holds a hundred of
+  // the first positions and a tenth as many of the last.
   for (uint32_t j = 0; j < kPositions; ++j) {
     const auto count = std::count_if(labels.begin(), labels.end(), [&](const auto &label) { return label.position == j; });
     const double error = std::fabs(budget.acceptance().intercepts[j] - generator.truth[1 + j]);
-    require(count >= 100 && error < 3.0 / std::sqrt(0.2 * double(count)),
+    require(count >= 10 && error < 3.0 / std::sqrt(0.2 * double(count)),
             "the fit missed the intercept at position " + std::to_string(j) + " by " + std::to_string(error) +
                 " over " + std::to_string(count) + " labels");
   }
@@ -252,7 +256,7 @@ void learnsTheCosts() {
           "measured cycles changed another lane count's or kind's costs");
   // Without a spread of rows, the slope is the seed's at the cycles' level.
   for (int repeat = 0; repeat < 100; ++repeat)
-    cycle(1, 8, false, 50.0);
+    cycle(1, VerifyBudget::kBlockRows, false, 50.0);
   const auto flat = budget.costs(1, false);
   for (uint32_t rows = 1; rows <= VerifyBudget::kBlockRows; ++rows) {
     const double expected = 50.0 * (VerifyBudget::seed(1, 1) + (rows - 1) * (1.0 - VerifyBudget::seed(1, 1)) / 15.0);

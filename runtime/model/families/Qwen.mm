@@ -1,6 +1,11 @@
-#include "model/families/FamilyMakers.hpp"
+#include "model/ModelRegistry.hpp"
+#include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
+#include "model/Qwen3_6Moe.hpp"
+#include "model/Qwen3_8.hpp"
 
 namespace richengine::model {
+namespace {
 
 DFlashDraftLayout qwen36DraftLayout() {
   DFlashDraftLayout layout;
@@ -78,10 +83,9 @@ ops::VisionLayout qwenVisionLayout(uint32_t outputHiddenSize) {
 }
 
 ModelDescriptor qwen38Descriptor(std::string name) {
-  ModelDescriptor descriptor =
-      makeModelDescriptor(std::move(name), Qwen3_8Layout{},
-                          qwen38DraftLayout(),
-                          qwenVisionLayout(Qwen3_8Layout{}.hiddenSize));
+  ModelDescriptor descriptor = makeModelDescriptor(
+      std::move(name), qwen38TargetLayout(), qwen38DraftLayout(),
+      qwenVisionLayout(qwen38TargetLayout().hiddenSize));
   // Adaptive proposal budgets shrink the offered chain toward the
   // acceptance EWMA's +2 margin. On this target a saved verify row costs
   // nearly nothing against a 14.5 GiB weight pass — the draft forward and
@@ -93,9 +97,45 @@ ModelDescriptor qwen38Descriptor(std::string name) {
 }
 
 ModelDescriptor qwen36Descriptor(std::string name) {
-  constexpr Qwen3_6MoeLayout target;
+  const TargetLayout target = qwen36MoeTargetLayout();
   return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
                              qwenVisionLayout(target.hiddenSize));
 }
 
+// What was kModelFamilies' qwen3_5 rows: the 27B (plus its Bonsai legacy
+// alias) and both 35B-A3B family names.
+// The registry's erased-signature entry for the qwen3_8 target.
+TargetWeights loadQwen38Target(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadQwen3_8Weights(backend, layout, files);
+}
+
+// The registry's erased-signature entry for the qwen3_6moe target.
+TargetWeights loadQwen36MoeTarget(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
+const bool kRegisteredQwenFamilies = [] {
+  registerTargetArch({"qwen3_8", &loadQwen38Target});
+  registerTargetArch({"qwen3_6moe", &loadQwen36MoeTarget});
+  registerModelFamily({"Qwen3.8-27B", "qwen3_5_text", "", &qwen38Descriptor,
+                       &qwen38DraftLayout, nullptr});
+  // Legacy alias: packages assembled while Bonsai-2-27B was its own
+  // family name still resolve — it is the Qwen3.8 architecture and the
+  // installer no longer offers it. The parity test exempts this row.
+  registerModelFamily({"Bonsai-2-27B", "qwen3_5_text", "", &qwen38Descriptor,
+                       &qwen38DraftLayout, nullptr});
+  registerModelFamily({"Qwen3.6-35B-A3B", "qwen3_5_moe_text", "",
+                       &qwen36Descriptor, &qwen36DraftLayout,
+                       &qwen36DFlashV1DraftLayout});
+  registerModelFamily({"Ornith-1.5-35B-A3B", "qwen3_5_moe_text", "",
+                       &qwen36Descriptor, &qwen36DraftLayout,
+                       &qwen36DFlashV1DraftLayout});
+  return true;
+}();
+
+} // namespace
 } // namespace richengine::model

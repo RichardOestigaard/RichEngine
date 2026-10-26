@@ -1,4 +1,8 @@
-#include "model/families/FamilyMakers.hpp"
+#include "model/ModelRegistry.hpp"
+#include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
+#include "model/DiffusionGemma.hpp"
+#include "model/Gemma4Moe.hpp"
 
 namespace richengine::model {
 namespace {
@@ -9,7 +13,7 @@ namespace {
 // plausible plain block over the target's hidden; a package or assembly that
 // declares a draft swaps in gemma4DFlashV1DraftDefaults' geometry instead.
 DFlashDraftLayout gemma4DraftDefaults() {
-  const Gemma4MoeLayout target;
+  const TargetLayout target = gemma4TargetLayout();
   DFlashDraftLayout layout;
   layout.kind = DraftKind::Null;
   layout.layers = 1;
@@ -28,8 +32,6 @@ DFlashDraftLayout gemma4DraftDefaults() {
   return layout;
 }
 
-} // namespace
-
 // The same layout as the plain-draft default of a packed gemma4 manifest's
 // draft declaration (applyDeclaredDraft): the compiled draft attention cores
 // span hidden 2816 since DraftAttention.cpp's Plain2816 layout.
@@ -42,22 +44,24 @@ DFlashDraftLayout gemma4DFlashV1DraftDefaults() {
 // The Gemma 4 target is text-only on this runtime: no vision layout.
 ModelDescriptor gemma4Descriptor(std::string name) {
   ops::VisionLayout vision;
-  vision.outputHiddenSize = Gemma4MoeLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Gemma4MoeLayout{}, gemma4DraftDefaults(), vision);
+  vision.outputHiddenSize = gemma4TargetLayout().hiddenSize;
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), gemma4TargetLayout(),
+                          gemma4DraftDefaults(), vision);
   descriptor.visionSource = VisionSource::None;
   return descriptor;
 }
 
 // DiffusionGemma shares the Gemma 4 trunk and its text-only scope; the
 // packed package's `diffusion` manifest block carries the canvas schedule,
-// which validateDiffusionGemma reads into the layout.
-ModelDescriptor diffusionGemmaDescriptor(std::string name) {
+// which validateDiffusionGemma reads into the layout. Unused while the
+// family's registration stays commented out below.
+[[maybe_unused]] ModelDescriptor diffusionGemmaDescriptor(std::string name) {
   ops::VisionLayout vision;
-  vision.outputHiddenSize = DiffusionGemmaLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), DiffusionGemmaLayout{}, gemma4DraftDefaults(),
-      vision);
+  vision.outputHiddenSize = diffusionGemmaTargetLayout().hiddenSize;
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), diffusionGemmaTargetLayout(),
+                          gemma4DraftDefaults(), vision);
   descriptor.visionSource = VisionSource::None;
   // The canvas bundle DiffusionGemma runs under; each knob's own
   // RICHENGINE_CANVAS_* variable still wins over the profile.
@@ -65,4 +69,33 @@ ModelDescriptor diffusionGemmaDescriptor(std::string name) {
   return descriptor;
 }
 
+// The registry's erased-signature entry for the gemma4 target.
+TargetWeights loadGemma4Target(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadGemma4MoeWeights(backend, layout, files);
+}
+
+// The registry's erased-signature entry for the diffusion_gemma target.
+TargetWeights loadDiffusionGemmaTarget(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadDiffusionGemmaWeights(backend, layout, files);
+}
+
+const bool kRegisteredGemmaFamilies = [] {
+  registerTargetArch({"gemma4", &loadGemma4Target});
+  registerTargetArch({"diffusion_gemma", &loadDiffusionGemmaTarget});
+  registerModelFamily({"Gemma4-26B-A4B", "gemma4_text", "", &gemma4Descriptor,
+                       nullptr, &gemma4DFlashV1DraftDefaults});
+  // DiffusionGemma-26B-A4B is disabled: its denoising trunk ships
+  // incoherent output pending the numerics bisect in
+  // docs/diffusion_issue.md. Re-add its row and the packed-format branch
+  // in inspectModelPackage once the trunk matches the torch reference.
+  // registerModelFamily({"DiffusionGemma-26B-A4B", "diffusion_gemma_text",
+  //                      "", &diffusionGemmaDescriptor, nullptr, nullptr});
+  return true;
+}();
+
+} // namespace
 } // namespace richengine::model

@@ -22,7 +22,7 @@ namespace {
 using namespace richengine;
 using richengine::test::require;
 
-constexpr model::DiffusionGemmaLayout layout{};
+constexpr model::TargetLayout layout = model::diffusionGemmaTargetLayout();
 
 void checkLayout() {
   require(layout.layers == 30 && layout.hiddenSize == 2816 &&
@@ -39,8 +39,8 @@ void checkLayout() {
               std::fabs(schedule.temperature(0) - 0.4F) < 1e-6F,
           "the temperature ramp does not interpolate tMin..tMax");
   // The manifest's equality check is what validateDiffusionGemma runs.
-  require(layout.layerMagic == model::Gemma4MoeLayout{}.layerMagic &&
-              layout.headMagic == model::Gemma4MoeLayout{}.headMagic,
+  require(layout.layerMagic == model::gemma4TargetLayout().layerMagic &&
+              layout.headMagic == model::gemma4TargetLayout().headMagic,
           "the packed file magics diverged from the trunk's");
   require(layout.stopTokens[0] == 1 && layout.stopTokens[1] == 106,
           "the diffusion stop tokens changed");

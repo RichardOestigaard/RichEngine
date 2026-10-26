@@ -1,6 +1,10 @@
-#include "model/families/FamilyMakers.hpp"
+#include "model/ModelRegistry.hpp"
+#include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
+#include "model/Ornith9B.hpp"
 
 namespace richengine::model {
+namespace {
 
 // Ornith 9B declares no DFlash2 draft layout: no compiled context core
 // covers hidden 4096/dynamic 1024, so a source assembly or packed manifest
@@ -33,11 +37,27 @@ DFlashDraftLayout ornith9DFlashV1DraftLayout() {
 // Ornith is text-only: no vision layout, and no vision weights to load.
 ModelDescriptor ornithDescriptor(std::string name) {
   ops::VisionLayout vision;
-  vision.outputHiddenSize = Ornith9BLayout{}.hiddenSize;
-  ModelDescriptor descriptor = makeModelDescriptor(
-      std::move(name), Ornith9BLayout{}, ornith9DFlashV1DraftLayout(), vision);
+  vision.outputHiddenSize = ornith9TargetLayout().hiddenSize;
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), ornith9TargetLayout(),
+                          ornith9DFlashV1DraftLayout(), vision);
   descriptor.visionSource = VisionSource::None;
   return descriptor;
 }
 
+// The registry's erased-signature entry for the ornith9 target.
+TargetWeights loadOrnith9Target(metal::MetalBackend &backend,
+                     const TargetLayout &layout,
+                     const TargetFiles &files) {
+  return loadOrnith9BWeights(backend, layout, files);
+}
+
+const bool kRegisteredOrnithFamilies = [] {
+  registerTargetArch({"ornith9", &loadOrnith9Target});
+  registerModelFamily({"Ornith-1.5-9B", "qwen3_5_text", "", &ornithDescriptor,
+                       nullptr, &ornith9DFlashV1DraftLayout});
+  return true;
+}();
+
+} // namespace
 } // namespace richengine::model

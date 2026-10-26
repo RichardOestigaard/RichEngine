@@ -3,7 +3,7 @@
 #include "model/AffineTarget.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/OqTarget.hpp"
-#include "model/QwenHybridLayout.hpp"
+#include "model/TargetLayout.hpp"
 #include "model/TargetModel.hpp"
 #include "model/TargetFiles.hpp"
 #include "model/WeightImages.hpp"
@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -154,10 +155,13 @@ template <class Format>
                                              const MixerGeometry &geometry,
                                              bool fullAttention);
 
-// The family's mixer reader; the default reads the hybrid GDN/full-attention
-// mixer, Dense.hpp and Lfm2.hpp overload it for their mixers.
-template <class Layout, class Format>
-[[nodiscard]] MixerWeights readTargetMixer(const Layout &, WeightFile &file,
+// The family's mixer reader, passed to loadTargetWeights and
+// readTargetModelWeights as the readMixer callable (file, layout, format,
+// geometry, fullAttention); this default reads the hybrid GDN/full-attention
+// mixer — the families with another mixer (Dense.cpp, the LFM2s) pass their
+// own.
+template <class Format>
+[[nodiscard]] MixerWeights readTargetMixer(const TargetLayout &, WeightFile &file,
                                                const Format &format,
                                                const MixerGeometry &geometry,
                                                bool fullAttention) {
@@ -166,21 +170,21 @@ template <class Layout, class Format>
 
 // Loads the packed files of a target directory: one per hybrid layer,
 // head.bin and embedding.bin.
-template <class Layout> struct PackedTargetFiles final {
+struct PackedTargetFiles final {
   WeightImages &images;
   std::filesystem::path directory;
-  const Layout &layout;
+  const TargetLayout &layout;
   // Whether the package's embedding.bin stores the 256-row tiled planes of
   // install/pack.py's packed formats; the splash-packed-q4* formats store
   // the checkpoint's flat quantized rows (ModelDescriptor::packedTiledEmbedding).
   bool tiledEmbedding = false;
   [[nodiscard]] WeightFile layer(uint32_t index) const {
     const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return images.load(packedImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
+    return images.load(packedImage(directory / filename, "target/" + filename, layout.layerMagic, index,
                                    layout.isFullAttentionLayer(index) ? 1U : 0U));
   }
   [[nodiscard]] WeightFile head() const {
-    return images.load(packedImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
+    return images.load(packedImage(directory / "head.bin", "target/head.bin", layout.headMagic, layout.layers, 2));
   }
   [[nodiscard]] WeightFile embedding() const {
     return images.load(packedImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
@@ -189,15 +193,15 @@ template <class Layout> struct PackedTargetFiles final {
 };
 
 // Reads a target through the files of its images, packaged or written from
-// an upstream source, in their format: per layer the input norm, mixer,
-// post-attention norm and the architecture's FFN through readFfn, then the
-// head and the token embedding. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class Files, class Format, class ReadFfn>
-[[nodiscard]] Weights
-readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      const Format &format, ReadFfn readFfn) {
+// an upstream source, in their format: per layer the input norm, the
+// architecture's mixer through readMixer, post-attention norm and its FFN
+// through readFfn, then the head and the token embedding.
+template <class Files, class Format, class ReadMixer, class ReadFfn>
+[[nodiscard]] TargetModelWeights
+readTargetModelWeights(metal::MetalBackend &backend, const TargetLayout &layout, Files &&files,
+                      const Format &format, ReadMixer readMixer, ReadFfn readFfn) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
-  Weights result;
+  TargetModelWeights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
 
@@ -206,7 +210,7 @@ readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-    layer.mixer = readTargetMixer(layout, file, format, layout.mixerGeometry(), fullAttention);
+    layer.mixer = readMixer(file, layout, format, layout.mixerGeometry(), fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
     readFfn(file, layer, format);
     file.finish();
@@ -239,12 +243,12 @@ readTargetModelWeights(metal::MetalBackend &backend, const Layout &layout, Files
 
 // Throws unless every dimension of a family's layout is set, the dimensions
 // agree with each other and every projection fits the Q4 storage tiles.
-template <class Layout> void requireTargetLayout(const Layout &layout) {
+inline void requireTargetLayout(const TargetLayout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   uint32_t ffnWidth = 0;
   bool ffnZero = false;
   bool routingInconsistent = false;
-  if constexpr (Layout::ffnKind == FfnKind::Dense) {
+  if (layout.ffnKind == FfnKind::Dense) {
     ffnWidth = layout.intermediateSize;
     ffnZero = zero(ffnWidth);
   } else {
@@ -252,25 +256,42 @@ template <class Layout> void requireTargetLayout(const Layout &layout) {
     ffnZero = zero(layout.experts, layout.expertsPerToken, ffnWidth);
     routingInconsistent = layout.expertsPerToken > layout.experts;
   }
-  if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
+  // The GDN fields bind only when the target carries recurrent state
+  // (gdnHeadDimension != 0); a conv-only target (convolutionTaps, no GDN
+  // heads) needs just its FIFO geometry, a pure attention target neither.
+  const bool gdn = layout.gdnHeadDimension != 0;
+  const bool conv = layout.convolutionTaps != 0;
+  // The full-attention schedule: a mask, a period, or Gemma's global
+  // period — every target declares exactly one.
+  const bool scheduled = layout.attentionMask || layout.fullAttentionPeriod ||
+                         layout.globalLayerPeriod;
+  if (ffnZero || !(layout.rotaryTheta > 0.0F) || !scheduled ||
       zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
-           layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
-           layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
-           layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
-           layout.fullAttentionPeriod))
+           layout.packedFullWidth, layout.attentionWidth, layout.attentionQueryHeads,
+           layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs) ||
+      (gdn && zero(layout.packedGdnWidth, layout.convolutionDimension,
+                   layout.gdnKeyHeads, layout.gdnValueHeads)) ||
+      (conv && zero(layout.packedGdnWidth, layout.convolutionDimension)))
     throw WeightStoreError("target layout contains a zero dimension");
-  if (routingInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
-      layout.convolutionDimension != (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
+  // The GDN consistency rows apply only to a recurrent target; for one the
+  // value rows are sized with attentionWidth throughout.
+  const bool gdnConsistent =
+      !gdn ||
+      (layout.gdnValueHeads % layout.gdnKeyHeads == 0 &&
+       layout.convolutionDimension ==
+           (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension &&
+       layout.gdnValueHeads * layout.gdnHeadDimension == layout.attentionWidth);
+  if (routingInconsistent || !gdnConsistent ||
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
-      // The GDN value rows are sized with attentionWidth throughout.
-      layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
       layout.packedFullWidth !=
-          Layout::attentionQueryStride * layout.attentionWidth +
+          layout.attentionQueryStride * layout.attentionWidth +
               2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
+      std::ranges::any_of(std::span(layout.hiddenCaptureLayers).first(layout.captureLayerCount),
+                          [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("target layout is inconsistent");
-  validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
+  if (gdn || conv)
+    validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
   validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
   validateQ4Layout(ffnWidth, layout.hiddenSize);
@@ -279,22 +300,23 @@ template <class Layout> void requireTargetLayout(const Layout &layout) {
 }
 
 // Checks the layout and loads a target from its files. The architecture
-// reads its FFN through readFfn, called with the file, the layer and the
-// format.
-template <class Weights, class Layout, class ReadFfn>
-[[nodiscard]] Weights
-loadTargetWeights(metal::MetalBackend &backend, const Layout &layout, const TargetFiles<Layout> &files,
-               ReadFfn readFfn) {
+// reads its mixer through readMixer, called with the file, the layout, the
+// format, the mixer geometry and whether the layer is full attention, and
+// its FFN through readFfn, called with the file, the layer and the format.
+template <class ReadMixer, class ReadFfn>
+[[nodiscard]] TargetModelWeights
+loadTargetWeights(metal::MetalBackend &backend, const TargetLayout &layout, const TargetFiles &files,
+               ReadMixer readMixer, ReadFfn readFfn) {
   requireTargetLayout(layout);
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readTargetModelWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
+    return readTargetModelWeights(backend, layout, gguf->get(), BlockTargetFormat{}, readMixer, readFfn);
   if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readTargetModelWeights<Weights>(backend, layout, mlx->get(), AffineTargetFormat{}, readFfn);
+    return readTargetModelWeights(backend, layout, mlx->get(), AffineTargetFormat{}, readMixer, readFfn);
   if (const auto *oq = std::get_if<std::reference_wrapper<OqTargetLoader>>(&files))
-    return readTargetModelWeights<Weights>(backend, layout, oq->get(), OqTargetFormat{}, readFfn);
-  const auto &packed = std::get<PackedTargetFiles<Layout>>(files);
-  return readTargetModelWeights<Weights>(backend, layout, packed,
-                                        AffineTargetFormat{packed.tiledEmbedding}, readFfn);
+    return readTargetModelWeights(backend, layout, oq->get(), OqTargetFormat{}, readMixer, readFfn);
+  const auto &packed = std::get<PackedTargetFiles>(files);
+  return readTargetModelWeights(backend, layout, packed,
+                                        AffineTargetFormat{packed.tiledEmbedding}, readMixer, readFfn);
 }
 
 } // namespace richengine::model

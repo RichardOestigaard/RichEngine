@@ -1,5 +1,6 @@
 #include "model/Granite.hpp"
 #include "model/TargetLoader.hpp"
+#include "model/TargetWeights.hpp"
 #include "Checked.hpp"
 
 #include <algorithm>
@@ -22,7 +23,15 @@ MixerWeights readGraniteAttention(WeightFile &file, const Format &format,
   return attention;
 }
 
-void requireGraniteLayout(const GraniteLayout &layout) {
+// The granite mixer's reader, passed to loadTargetWeights as the mixer
+// reader; every layer is full attention.
+MixerWeights readTargetMixer(WeightFile &file, const TargetLayout &,
+                             const auto &format,
+                             const MixerGeometry &geometry, bool) {
+  return readGraniteAttention(file, format, geometry);
+}
+
+void requireGraniteLayout(const TargetLayout &layout) {
   const bool eightB = layout.hiddenSize == 4096;
   if (layout.layers != 40 || layout.vocabularySize != 100352 ||
       layout.packedGdnWidth || layout.convolutionDimension ||
@@ -54,30 +63,27 @@ void requireGraniteLayout(const GraniteLayout &layout) {
 
 } // namespace
 
-// The granite mixer's reader (found by readTargetMixer's ADL).
-template <class Format>
-MixerWeights readTargetMixer(const GraniteLayout &, WeightFile &file,
-                                 const Format &format,
-                                 const MixerGeometry &geometry, bool) {
-  return readGraniteAttention(file, format, geometry);
-}
-
-GraniteWeights loadGraniteWeights(metal::MetalBackend &backend,
-                                  GraniteLayout layout,
-                                  const TargetFiles<GraniteLayout> &files) {
+TargetModelWeights loadGraniteWeights(metal::MetalBackend &backend,
+                                      const TargetLayout &layout,
+                                      const TargetFiles &files) {
   requireGraniteLayout(layout);
-  const auto readFfn = [&](WeightFile &file, DenseLayerWeights &layer, const auto &format) {
-    layer.gateProjection =
+  const auto readMixer = [](WeightFile &file, const TargetLayout &l,
+                            const auto &format, const MixerGeometry &g,
+                            bool full) {
+    return readTargetMixer(file, l, format, g, full);
+  };
+  const auto readFfn = [&](WeightFile &file, TargetLayerWeights &layer, const auto &format) {
+    auto &ffn = layer.ffn.emplace<DenseFfnWeights>();
+    ffn.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
-    layer.upProjection =
+    ffn.upProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
-    layer.downProjection =
+    ffn.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readTargetModelWeights<GraniteWeights>(backend, layout, gguf->get(),
-                                                 BlockTargetFormat{}, readFfn);
-  throw WeightStoreError("granite targets load from GGUF only");
+  if (!std::holds_alternative<std::reference_wrapper<GgufTargetLoader>>(files))
+    throw WeightStoreError("granite targets load from GGUF only");
+  return loadTargetWeights(backend, layout, files, readMixer, readFfn);
 }
 
 } // namespace richengine::model

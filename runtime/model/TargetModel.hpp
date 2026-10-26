@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Model.hpp"
-#include "QwenHybridLayout.hpp"
+#include "TargetLayout.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/GDN.hpp"
@@ -27,22 +27,6 @@ class AneFfn;
 } // namespace richengine::ops
 
 namespace richengine::model {
-
-struct Qwen3_8Layout;
-struct DenseLayerWeights;
-struct Ornith9BLayout;
-struct Qwen3_6MoeLayout;
-struct MiniCpmV47MoeLayout;
-struct Qwen3_6MoeLayerWeights;
-struct DenseLayout;
-struct Gemma4MoeLayout;
-struct Gemma4MoeLayerWeights;
-struct GraniteLayout;
-struct Lfm2Layout;
-struct Lfm2MoeLayout;
-struct Lfm2Moe24BLayout;
-struct Lfm2MoeLayerWeights;
-struct DiffusionGemmaLayout;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -90,19 +74,83 @@ struct TargetModelWeightsBase {
   std::string manifestFingerprintSha256;
 };
 
-// The weights of a target of Layout, whose layers the family keeps in Layer.
-// Not final: DiffusionGemmaWeights derives from the DiffusionGemmaLayout
-// instantiation to add the self-conditioning block and encoder scalars.
-template <class Layout, class Layer> struct TargetModelWeights : TargetModelWeightsBase {
-  Layout layout;
-  std::vector<Layer> layers;
+// A layer's dense FFN (SwiGLU/GeGLU): the gate, up and down projections.
+struct DenseFfnWeights final {
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
+};
+
+// A leading dense layer's gated FFN of an LFM2-MoE target (moved from
+// Lfm2Moe.hpp; the family header's copy goes away in Phase B).
+struct Lfm2DenseFfn final {
+  ops::Projection gateProjection;
+  ops::Projection upProjection;
+  ops::Projection downProjection;
+};
+
+// LFM2-MoE's per-layer FFN: dense for the leading denseLayers, the sparse
+// MoE block after them.
+struct Lfm2FfnWeights final {
+  std::variant<Lfm2DenseFfn, ops::MoeWeights> ffn;
+};
+
+// Gemma 4's layer tensors besides the shared record's norms and mixer: the
+// pre_ffn_norm feeds the shared expert and preFfnNormRouted (the
+// checkpoint's pre_feedforward_layernorm_2) the routed experts; the router
+// reads the post-attention residual through routerScale (learned
+// per-dimension scale, bf16) after a scaleless RMS norm.
+struct Gemma4FfnWeights final {
+  ops::NormWeights preFfnNorm;
+  ops::NormWeights preFfnNormRouted;
+  metal::MetalBuffer routerScale;
+  // [experts][hidden] bf16, expert-major, bias-free.
+  metal::MetalBuffer routerWeights;
+  // f32[experts].
+  metal::MetalBuffer perExpertScale;
+  ops::ExpertProjection expertGate;
+  ops::ExpertProjection expertUp;
+  ops::ExpertProjection expertDown;
+  ops::Projection sharedGate;
+  ops::Projection sharedUp;
+  ops::Projection sharedDown;
+  ops::NormWeights postFfnNormShared;
+  ops::NormWeights postFfnNormRouted;
+  // The checkpoint's un-suffixed post_feedforward_layernorm: applied to the
+  // routed + shared sum before the residual add.
+  ops::NormWeights postFfnNorm;
+  // layer_scalar: a host-known scalar bound to layer_scalar_scale.
+  float layerScalar = 1.0F;
+};
+
+// The FFN kinds a target layer can carry: the plain dense triple, a routed
+// MoE block (Qwen3.6-MoE, MiniCPM-V), LFM2-MoE's dense/MoE mix and Gemma's
+// routed-plus-shared-expert block.
+using TargetLayerFfn = std::variant<DenseFfnWeights, ops::MoeWeights,
+                                    Lfm2FfnWeights, Gemma4FfnWeights>;
+
+// One target layer: the mixer norm, the mixer, the FFN norm and the FFN.
+// Gemma's extra norms and tensors live in its Gemma4FfnWeights.
+struct TargetLayerWeights final {
+  ops::NormWeights inputNorm;
+  MixerWeights mixer;
+  ops::NormWeights postAttentionNorm;
+  TargetLayerFfn ffn;
+};
+
+// The weights of a target: its canonical layout and every layer. Not final:
+// DiffusionGemmaWeights derives from it to add the self-conditioning block
+// and encoder scalars.
+struct TargetModelWeights : TargetModelWeightsBase {
+  TargetLayout layout;
+  std::vector<TargetLayerWeights> layers;
 };
 
 // Runtime-visible tensor geometry shared by the supported hybrid
 // targets. It describes semantics only; operators remain responsible for
 // choosing device-specific Metal pipelines and compute tiles.
 struct TargetModelGeometry final {
-  static constexpr uint32_t maximumCaptureLayers = 8;
+  static constexpr uint32_t maximumCaptureLayers = kMaximumCaptureLayers;
 
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -476,16 +524,14 @@ struct TargetModelCommitBuffers final {
   metal::MetalBuffer retainedCounts;
 };
 
-template <class Layout, class Layer>
 [[nodiscard]] TargetModelGeometry
-targetModelGeometry(const TargetModelWeights<Layout, Layer> &weights);
+targetModelGeometry(const TargetModelWeights &weights);
 
 // Builds the shared GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class TargetModel final {
 public:
-  template <class Layout, class Layer>
-  TargetModel(const TargetModelWeights<Layout, Layer> &weights, const TargetModelGeometry &geometry,
+  TargetModel(const TargetModelWeights &weights, const TargetModelGeometry &geometry,
              metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
 
   [[nodiscard]] const ops::Projection &
@@ -524,7 +570,8 @@ public:
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, bool tree = false,
       std::span<const uint32_t> liveRows = {}, uint32_t liveNodes = 0,
-      uint32_t verifyStride = ExecutionLimits::targetVerifyRows) const;
+      uint32_t verifyStride = ExecutionLimits::targetVerifyRows,
+      const ops::GdnTapeLanes *tapeLanes = nullptr) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
@@ -585,18 +632,6 @@ public:
                           uint32_t lanes) const;
 
 private:
-  using WeightView =
-      std::variant<const TargetModelWeights<Qwen3_8Layout, DenseLayerWeights> *,
-                   const TargetModelWeights<Ornith9BLayout, DenseLayerWeights> *,
-                   const TargetModelWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> *,
-                   const TargetModelWeights<MiniCpmV47MoeLayout, Qwen3_6MoeLayerWeights> *,
-                   const TargetModelWeights<DenseLayout, DenseLayerWeights> *,
-                   const TargetModelWeights<Lfm2Layout, DenseLayerWeights> *,
-                   const TargetModelWeights<Lfm2MoeLayout, Lfm2MoeLayerWeights> *,
-                   const TargetModelWeights<Lfm2Moe24BLayout, Lfm2MoeLayerWeights> *,
-                   const TargetModelWeights<Gemma4MoeLayout, Gemma4MoeLayerWeights> *,
-                   const TargetModelWeights<DiffusionGemmaLayout, Gemma4MoeLayerWeights> *,
-                   const TargetModelWeights<GraniteLayout, DenseLayerWeights> *>;
   struct PrefillStep;
   struct VerifyStep;
 
@@ -613,11 +648,7 @@ private:
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const LfmConvWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
   // The FFN of layer `index`; the dense FFN runs on `step.aneFfn` when set.
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const DenseLayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_6MoeLayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const;
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Lfm2MoeLayerWeights &layer,
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const TargetLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const GdnMixerWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
@@ -629,20 +660,16 @@ private:
                          const ops::Projection &gate, const ops::Projection &up,
                          const ops::Projection &down, metal::MetalBuffer residual,
                          metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const DenseLayerWeights &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const;
-  void addVerifyFfn(VerifyStep &step, const Lfm2MoeLayerWeights &layer, metal::MetalBuffer residual,
+  void addVerifyFfn(VerifyStep &step, const TargetLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const;
   // Gemma 4's whole layer: the dual-geometry attention mixer, the post-
   // attention residual both the router and the FFN-normed experts read, and
   // the routed plus shared-expert GeGLU block whose normed outputs join the
   // residual before layer_scalar.
-  void addPrefillGemmaLayer(PrefillStep &step, const Gemma4MoeLayerWeights &layer,
+  void addPrefillGemmaLayer(PrefillStep &step, const TargetLayerWeights &layer,
                             uint32_t index, metal::MetalBuffer input,
                             metal::MetalBuffer output) const;
-  void addVerifyGemmaLayer(VerifyStep &step, const Gemma4MoeLayerWeights &layer,
+  void addVerifyGemmaLayer(VerifyStep &step, const TargetLayerWeights &layer,
                            uint32_t index, metal::MetalBuffer input,
                            metal::MetalBuffer output) const;
   // The elementwise helpers Gemma's layer epilogue shares with the draft
@@ -653,7 +680,7 @@ private:
   static void addLayerScalar(metal::CommandGraph &graph, metal::MetalBuffer values,
                              float scale, uint32_t count);
 
-  WeightView weights_;
+  const TargetModelWeights *weights_;
   const TargetModelWeightsBase &weightsBase_;
   TargetModelGeometry geometry_;
   metal::MetalBackend &backend_;

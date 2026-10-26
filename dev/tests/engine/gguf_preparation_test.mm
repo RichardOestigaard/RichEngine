@@ -296,7 +296,7 @@ bool blockProjection(const ops::Projection &p, uint32_t n, uint32_t k, std::vect
 // per tensor in the layout's padded width, the norms F32 and the GDN output in
 // the GGUF's tiled head order; the head and token table as the GGUF stores them.
 void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &directory) {
-  model::Qwen3_8Layout layout;
+  model::TargetLayout layout = model::qwen38TargetLayout();
   layout.layers = 4;
   layout.hiddenSize = 256;
   layout.vocabularySize = 256;
@@ -351,11 +351,12 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
     const auto &layer = weights.layers[index];
     const std::string at = "GGUF target layer " + std::to_string(index) + ": ";
     check(layer.inputNorm.float32 && layer.postAttentionNorm.float32, at + "F32 input and post-attention norms");
-    check(blockProjection(layer.gateProjection, layout.intermediateSize, hidden, {layout.intermediateSize}),
+    const auto &ffn = std::get<model::DenseFfnWeights>(layer.ffn);
+    check(blockProjection(ffn.gateProjection, layout.intermediateSize, hidden, {layout.intermediateSize}),
           at + "gate block projection");
-    check(blockProjection(layer.upProjection, layout.intermediateSize, hidden, {layout.intermediateSize}),
+    check(blockProjection(ffn.upProjection, layout.intermediateSize, hidden, {layout.intermediateSize}),
           at + "up block projection");
-    check(blockProjection(layer.downProjection, hidden, layout.intermediateSize, {hidden}),
+    check(blockProjection(ffn.downProjection, hidden, layout.intermediateSize, {hidden}),
           at + "down block projection");
     if (const auto *gdn = std::get_if<model::GdnMixerWeights>(&layer.mixer)) {
       check(blockProjection(gdn->inputProjection, layout.packedGdnWidth, hidden,

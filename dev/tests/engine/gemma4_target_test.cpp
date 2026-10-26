@@ -20,7 +20,7 @@ namespace {
 using namespace richengine;
 using richengine::test::require;
 
-constexpr model::Gemma4MoeLayout layout{};
+constexpr model::TargetLayout layout = model::gemma4TargetLayout();
 
 void checkLayout() {
   // Five full-attention layers, every sixth; the rest are sliding local.
@@ -41,7 +41,7 @@ void checkLayout() {
           "the packed/attention widths diverge from 16x256/16x512+2x512");
   require(layout.headDimensionAt(5) == 512 && layout.rotaryPairsAt(0) == 128 &&
               layout.rotaryPairsAt(5) == 64 &&
-              layout.hiddenCaptureLayers.size() == 6 &&
+              layout.captureLayerCount == 6 &&
               layout.capturedHiddenSize() == 6 * 2816,
           "the captured hidden or rotary geometry is off");
   require(layout.packedExpertWidth == 768 &&
@@ -79,6 +79,7 @@ model::Gemma4MoeWeights fakeWeights() {
     return ops::Projection(n, k, ops::AffineWeights{});
   };
   model::Gemma4MoeWeights weights;
+  weights.layout = layout;
   weights.finalNorm = {};
   weights.logitsProjection =
       projection(layout.vocabularySize, layout.hiddenSize);
@@ -91,15 +92,16 @@ model::Gemma4MoeWeights fakeWeights() {
     mixer.outputProjection =
         projection(layout.hiddenSize, layout.attentionWidthAt(layer));
     w.mixer = mixer;
+    auto &ffn = w.ffn.emplace<model::Gemma4FfnWeights>();
     // The padded expert slabs: output/input carry the physical 768.
-    w.expertGate = {{}, layout.experts, layout.packedExpertWidth,
-                    layout.hiddenSize, 0};
-    w.expertUp = w.expertGate;
-    w.expertDown = {{}, layout.experts, layout.hiddenSize,
-                    layout.packedExpertWidth, 0};
-    w.sharedGate = projection(layout.packedSharedWidth, layout.hiddenSize);
-    w.sharedUp = w.sharedGate;
-    w.sharedDown = projection(layout.hiddenSize, layout.packedSharedWidth);
+    ffn.expertGate = {{}, layout.experts, layout.packedExpertWidth,
+                      layout.hiddenSize, 0};
+    ffn.expertUp = ffn.expertGate;
+    ffn.expertDown = {{}, layout.experts, layout.hiddenSize,
+                      layout.packedExpertWidth, 0};
+    ffn.sharedGate = projection(layout.packedSharedWidth, layout.hiddenSize);
+    ffn.sharedUp = ffn.sharedGate;
+    ffn.sharedDown = projection(layout.hiddenSize, layout.packedSharedWidth);
   }
   return weights;
 }
@@ -131,7 +133,7 @@ void checkGeometry() {
   require(hasShape(geometry.prefillProjections, {8192, 2816}) &&
               hasShape(geometry.prefillProjections, {9216, 2816}),
           "the packed QKV projections of both widths are not prefill-planned");
-  const auto &first = weights.layers[0];
+  const auto &first = std::get<model::Gemma4FfnWeights>(weights.layers[0].ffn);
   require(first.expertGate.outputSize == layout.packedExpertWidth &&
               first.expertDown.inputSize == layout.packedExpertWidth &&
               first.expertGate.experts == 128 &&

@@ -1,47 +1,13 @@
 #include "model/OqTarget.hpp"
 
 #include "model/AffineTarget.hpp"
-#include "model/Dense.hpp"
-#include "model/Granite.hpp"
-#include "model/Lfm2.hpp"
-#include "model/Lfm2Moe.hpp"
-#include "model/Lfm2Moe24B.hpp"
-#include "model/Ornith9B.hpp"
-#include "model/Qwen3_6Moe.hpp"
-#include "model/Qwen3_8.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
 namespace richengine::model {
 
 OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Qwen3_8Layout &layout)
+                               const TargetLayout &layout)
     : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Ornith9BLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Qwen3_6MoeLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const MiniCpmV47MoeLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const DenseLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Lfm2Layout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Lfm2MoeLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &directory,
-                               const Lfm2Moe24BLayout &layout)
-    : images_(images), directory_(directory), planned_(oqPlannedCheckpoint(directory, layout)) {}
-OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path &,
-                               const GraniteLayout &)
-    : images_(images) {
-  throw std::invalid_argument("Granite targets load from packed or GGUF sources only");
-}
 
 OqTargetLoader::~OqTargetLoader() = default;
 ImagePlan OqTargetLoader::imagePlan(size_t index, std::string_view directory) {

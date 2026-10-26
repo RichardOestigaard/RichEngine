@@ -1,9 +1,10 @@
 """Parity between the Python and C++ model-family registries.
 
-install/families.py's FAMILIES and runtime's ModelDescriptor.mm
-kModelFamilies table name the same served families and the model_type each
-states; drift between them breaks loads. Pure text parsing: no Hub access,
-no weights.
+install/families.py's FAMILIES and the runtime's ModelRegistry
+registrations (the registerModelFamily rows in runtime/model/families/*.mm,
+what kModelFamilies was) name the same served families and the model_type
+each states; drift between them breaks loads. Pure text parsing: no Hub
+access, no weights.
 """
 
 import re
@@ -12,26 +13,24 @@ from pathlib import Path
 
 from install import families, legacy, pack
 
-DESCRIPTOR = Path(__file__).resolve().parents[2] / "runtime/model/ModelDescriptor.mm"
+FAMILIES_DIR = Path(__file__).resolve().parents[2] / "runtime/model/families"
 
-# One kModelFamilies row: {"Name", "model_type", nullptr-or-"legacy", make}.
-ROW = re.compile(r'\{"([^"]+)",\s*"([^"]+)",\s*(nullptr|"[^"]*")')
+# One registerModelFamily row: {"Name", "model_type", ""-or-"legacy", &make, ...}.
+ROW = re.compile(r'registerModelFamily\(\s*\{\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]*)"')
 
 
 def cpp_families():
-    """Each kModelFamilies row's (model_type, legacy_type) by family name."""
-    source = DESCRIPTOR.read_text()
-    start = source.index("kModelFamilies[]")
-    table = source[start : source.index("};", start)]
+    """Each registerModelFamily row's (model_type, legacy_type) by family name."""
     return {
-        name: (model_type, None if legacy == "nullptr" else legacy.strip('"'))
-        for name, model_type, legacy in ROW.findall(table)
+        name: (model_type, legacy or None)
+        for source in FAMILIES_DIR.glob("*.mm")
+        for name, model_type, legacy in ROW.findall(source.read_text())
     }
 
 
 class FamilyParityTest(unittest.TestCase):
     def test_cpp_and_python_name_the_same_families(self):
-        # kModelFamilies may additionally carry Legacy-alias rows for
+        # The registry may additionally carry Legacy-alias rows for
         # retired family names — installed packages still resolve; the
         # installer never offers them (families.LEGACY_NAMES).
         python = {family.name for family in families.FAMILIES}
@@ -59,7 +58,7 @@ class FamilyParityTest(unittest.TestCase):
                 self.assertIn(
                     signature["model_type"],
                     {model_type, legacy_type},
-                    f"kModelFamilies states {model_type}"
+                    f"the registry states {model_type}"
                     + (f" or legacy {legacy_type}" if legacy_type else ""),
                 )
 

@@ -31,8 +31,7 @@ std::vector<uint8_t> fileBytes(const std::filesystem::path &path) {
 
 // The dimensions both fixtures share: two layers (GDN, then full attention)
 // of width 256, every draft capture reading the last.
-template <class Layout> Layout tinyLayout() {
-  Layout layout;
+model::TargetLayout tinyLayout(model::TargetLayout layout) {
   layout.layers = 2;
   layout.hiddenSize = 256;
   layout.vocabularySize = 256;
@@ -157,7 +156,7 @@ int main(int argc, char **argv) {
         return 0;
       }
       if (kind == "moe") {
-        auto layout = tinyLayout<model::Qwen3_6MoeLayout>();
+        auto layout = tinyLayout(model::qwen36MoeTargetLayout());
         layout.experts = 256;
         layout.expertsPerToken = 8;
         layout.expertIntermediateSize = 256;
@@ -169,7 +168,7 @@ int main(int argc, char **argv) {
                      "gate, restore PASS\n";
         return 0;
       }
-      auto layout = tinyLayout<model::Qwen3_8Layout>();
+      auto layout = tinyLayout(model::qwen38TargetLayout());
       layout.intermediateSize = 512;
       prepare<model::AffineTargetLoader>(backend, root, layout, [](auto &loader, const auto &check) {
         openTarget(loader, check);
@@ -188,9 +187,10 @@ int main(int argc, char **argv) {
                   weights.logitsProjection.destination == ops::FloatOutput::Float32 &&
                   weights.tokenEmbedding.layout() == ops::WeightLayout::Affine64;
       for (const auto &layer : weights.layers) {
+        const auto &ffn = std::get<model::DenseFfnWeights>(layer.ffn);
         read = read && !layer.inputNorm.float32 && !layer.postAttentionNorm.float32 &&
-               affine(layer.gateProjection, layout.intermediateSize, layout.hiddenSize) &&
-               affine(layer.downProjection, layout.hiddenSize, layout.intermediateSize);
+               affine(ffn.gateProjection, layout.intermediateSize, layout.hiddenSize) &&
+               affine(ffn.downProjection, layout.hiddenSize, layout.intermediateSize);
         if (const auto *gdn = std::get_if<model::GdnMixerWeights>(&layer.mixer))
           read = read && affine(gdn->inputProjection, layout.packedGdnWidth, layout.hiddenSize) &&
                  gdn->outputHeadOrder == ops::GdnHeadOrder::Grouped && !gdn->mixerNorm.float32;
@@ -202,17 +202,17 @@ int main(int argc, char **argv) {
       // The dense layout is checked like the MoE one, before any file is
       // opened: its capture layers and its convolution width against its GDN
       // heads.
-      const auto inconsistent = [&](const model::Qwen3_8Layout &broken) {
+      const auto inconsistent = [&](const model::TargetLayout &broken) {
         try {
           static_cast<void>(model::loadQwen3_8Weights(
-              backend, broken, model::PackedTargetFiles<model::Qwen3_8Layout>{images, root, broken}));
+              backend, broken, model::PackedTargetFiles{images, root, broken}));
         } catch (const model::WeightStoreError &error) {
           return std::string_view(error.what()) == "target layout is inconsistent";
         }
         return false;
       };
       auto capturePastLastLayer = layout;
-      capturePastLastLayer.hiddenCaptureLayers.back() = layout.layers;
+      capturePastLastLayer.hiddenCaptureLayers[layout.captureLayerCount - 1] = layout.layers;
       auto convolutionMismatch = layout;
       convolutionMismatch.convolutionDimension += layout.gdnHeadDimension;
       if (!inconsistent(capturePastLastLayer) || !inconsistent(convolutionMismatch))
