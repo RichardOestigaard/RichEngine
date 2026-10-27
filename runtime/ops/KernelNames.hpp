@@ -357,6 +357,10 @@ inline constexpr std::string_view kCoreAiFfnCast = "coreai_ffn_cast";
 inline constexpr std::string_view kCoreAiFfnJoin = "coreai_ffn_join";
 inline constexpr std::string_view kCoreAiFfnRowScale = "coreai_ffn_row_scale";
 inline constexpr std::string_view kCoreAiFfnWeights = "coreai_ffn_weights";
+// Block-32 quantizations (RICHENGINE_COREAI_QUANT=b32|si4): the weights
+// kernel takes each 32-input block's own scale and needs no row_scale pass.
+inline constexpr std::string_view kCoreAiFfnWeightsB32 = "coreai_ffn_weights_b32";
+inline constexpr std::string_view kCoreAiFfnWeightsSi4 = "coreai_ffn_weights_si4";
 
 // Canvas (diffusion decoding).
 inline constexpr std::string_view kCanvasUniformNoise = "canvas_uniform_noise";
