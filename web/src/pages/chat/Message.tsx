@@ -1,6 +1,6 @@
 import { createSignal, For, Show } from "solid-js";
 import { fmtClock } from "../../format";
-import { createMarkdownPainter, displayContent } from "./markdown";
+import { createMarkdownPainter, displayContent, paintableText } from "./markdown";
 import type { MarkdownPainter } from "./markdown";
 import { userParts } from "./storage";
 import type { Message } from "./types";
@@ -27,7 +27,13 @@ export default function MessageView(props: {
     box._message = msg;
     if (msg.role === "assistant") {
       const painter = createMarkdownPainter(box);
-      painter.update(typeof msg.content === "string" ? msg.content : "");
+      painter.update(
+        paintableText(
+          typeof msg.content === "string" ? msg.content : "",
+          msg.format,
+          true
+        )
+      );
       props.register?.({ el: box, painter });
     }
   }

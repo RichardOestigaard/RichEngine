@@ -1,7 +1,7 @@
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { storageGet } from "../../api";
 import { MODEL_KEY } from "./storage";
-import { setToolEnabled, TOOL_HINTS, TOOL_IDS, TOOL_LABELS, toolsEnabled } from "./tools";
+import { jsonOutput, setJsonOutput, setToolEnabled, TOOL_HINTS, TOOL_IDS, TOOL_LABELS, toolsEnabled } from "./tools";
 import type { Attachment, ModelInfo, QueuedTurn } from "./types";
 
 // field-sizing grows the textarea in CSS; the manual measure is the fallback.
@@ -37,7 +37,8 @@ export default function Composer(props: {
   let fileInput: HTMLInputElement | undefined;
   let toolsEl: HTMLDivElement | undefined;
   const [toolsOpen, setToolsOpen] = createSignal(false);
-  const anyToolOn = () => TOOL_IDS.some((id) => toolsEnabled()[id]);
+  const anyToolOn = () =>
+    TOOL_IDS.some((id) => toolsEnabled()[id]) || jsonOutput();
 
   // A pointerdown outside the open menu closes it; clicks inside do not.
   // Escape closes it too, in the capture phase: the chat's own Escape
@@ -337,9 +338,36 @@ export default function Composer(props: {
                   </label>
                 )}
               </For>
+              <div class="tools-pop-title">Output</div>
+              <label class="tools-row">
+                <input
+                  type="checkbox"
+                  checked={jsonOutput()}
+                  onChange={(event) =>
+                    setJsonOutput(event.currentTarget.checked)
+                  }
+                />
+                <span class="tools-row-text">
+                  <span class="tools-row-label">JSON output</span>
+                  <span class="tools-row-hint">
+                    Guaranteed-valid JSON response
+                  </span>
+                </span>
+              </label>
             </div>
           </Show>
         </div>
+        <Show when={jsonOutput()}>
+          <button
+            type="button"
+            class="json-pill"
+            title="Replies are constrained to JSON — click to turn off"
+            aria-label="JSON output on, click to turn off"
+            onClick={() => setJsonOutput(false)}
+          >
+            JSON ×
+          </button>
+        </Show>
         <label class="effort picker" hidden={!props.models.length}>
           <span>Model</span>
           <select

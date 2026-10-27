@@ -14,6 +14,8 @@ import { useFreshness } from "../fresh";
 import { poll } from "../poll";
 import { pushToast } from "../toast";
 import Confirm from "../Confirm";
+import SamplingDialog from "./SamplingDialog";
+import { hasSamplingFor } from "../sampling";
 import { MODEL_KEY } from "./chat/storage";
 import "./models.css";
 
@@ -323,6 +325,7 @@ export default function Models() {
   const [modelBusy, setModelBusy] = createSignal(false);
   const [confirmUnload, setConfirmUnload] = createSignal<AvailableModel | null>(null);
   const [confirmTune, setConfirmTune] = createSignal<AvailableModel | null>(null);
+  const [samplingEntry, setSamplingEntry] = createSignal<AvailableModel | null>(null);
   const [tuneBusy, setTuneBusy] = createSignal(false);
   /* Heartbeat for the silent gaps between sweep log lines: each candidate
      is an engine launch, so minutes of quiet are normal — the counter
@@ -963,6 +966,32 @@ export default function Models() {
                       </span>
                     </Show>
                     <span class="num">{fmtBytes(entry.bytes)}</span>
+                    <button
+                      type="button"
+                      class="icon-btn"
+                      classList={{ on: hasSamplingFor(entry.model) }}
+                      title={
+                        hasSamplingFor(entry.model)
+                          ? `Sampling overrides set for ${entry.model} — sent on chat requests naming it`
+                          : `Sampling settings for ${entry.model} — temperature, min_p, penalties`
+                      }
+                      aria-label={`Sampling settings for ${entry.model}`}
+                      onClick={() => setSamplingEntry(entry)}
+                    >
+                      <svg
+                        width="15"
+                        height="15"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <circle cx="12" cy="12" r="3" />
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                      </svg>
+                    </button>
                     <button
                       class="btn small"
                       disabled={
@@ -1784,6 +1813,11 @@ export default function Models() {
         again; other residents keep serving. In-flight requests may be
         interrupted.
       </Confirm>
+
+      <SamplingDialog
+        model={samplingEntry()?.model ?? null}
+        onClose={() => setSamplingEntry(null)}
+      />
 
       <Confirm
         open={confirmTune() !== null}

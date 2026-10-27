@@ -9,6 +9,29 @@ Analysis of the uncommitted working tree: 125 modified files, ~40 new files,
 diffusion-decoding mode for DiffusionGemma, a SolidJS web UI with model
 management, and per-device kernel autotuning.
 
+## 0. Block-8 verify geometry — `make verify8` build variant
+
+- `runtime/metal/abi/ExecutionGeometry.h` — the draft/verify geometry
+  constants (`DRAFT_QUERY_ROWS`, `DRAFT_PROPOSAL_TOKENS`,
+  `TARGET_VERIFY_ROWS`) are `#ifndef`-guarded, so a build can override
+  them. `runtime/model/Model.hpp`, `Sampling.h`, `Dfa.h` and
+  `VerifyBudget.hpp` now derive their limits and ABI asserts from the
+  constants instead of fixed sizes.
+- `Makefile` — `make verify8` builds `build8/richengine` +
+  `build8/richengine.metallib` at the block-8 geometry (8/7/8),
+  verified output-identical to the default build on the 27B DFlash2
+  decode bench at every width (oracle hash 8845173885570541823, 88.7%
+  acceptance) and on all eight transcript cases token-for-token.
+- `server/model_host.py` — `_engine_binary()` selects the variant when
+  the model's `draft/config.json` declares `dflash_config.block_size
+  <= 8` and the sibling binary exists (build8/ or engine8/ packaged).
+- Halves the verify trunk's fused-M work on block-8 drafts: B4 decode
+  121.7 → 249.9 tokens/s on the 27B (upstream splash reference: 334.3;
+  residual is verify-GEMM tile efficiency, not geometry).
+- `RICHENGINE_VERIFY_NARROW=1` keeps the runtime-stride experiment
+  available; it is NOT output-identical on a 16-compiled build — see
+  REGRESSION_FINDINGS.md.
+
 ## 1. Gemma 4 model family
 
 - `runtime/model/Gemma4Moe.{hpp,cpp}` — new target for Gemma4-26B-A4B MoE:
@@ -70,6 +93,10 @@ management, and per-device kernel autotuning.
   `/v1/models/available`, `/v1/models/install` (+`/cancel`),
   `/v1/models/load`, `/v1/models/unload`.
 - New flags: `--models-dir`, `--unload-idle`, `--moe-union`.
+- `HostPool` status surfacing: `/status` reports per-resident
+  `memory_bytes`/`memory_peak_bytes` and a `pool` capacity summary
+  (`max_residents`, `slots`, `free`); `/ready` adds a `residents`
+  per-state tally alongside its unchanged `status`.
 
 ## 5. MoE route union cap (experimental)
 
@@ -216,3 +243,77 @@ requests; `make benchmark-dfa MODEL=...`).
   `hd512_attention`, `ngram_index`, `gelu_saturation`, `test_gemma4.py`,
   `test_diffusiongemma.py`, `test_pack.py`; large expansions to
   `draft_selector_metal_test` and `test_server.py`.
+
+## 11. Baked-span bank auto-enable (Metal 4)
+
+- Baked spans now replay while another submission is in flight
+  (`MetalEncode.mm` `commit`/`commit4`). Each span carries two parameter
+  arenas and two ICBs; the bank is picked from the one the in-flight
+  command is *not* using, and bank 1 is built lazily on the first
+  overlapped replay — a backend that never overlaps never allocates it.
+  `RICHENGINE_SPAN_BANK_OFF` restores the GPU-idle-only replay.
+- Encode of a 300-dispatch span command with a second command in flight:
+  61.3–62.5 µs → 19.6–20.1 µs (3.2×, ~42 µs), `mtl4-benchmark --ring`.
+- End-to-end through `Engine` (2B/9B, free-form B1/B4, DFA B4, mask B4):
+  −0.38…+0.16%, all inside noise; token streams bitwise identical.
+  `commit4` instruments `overlapping=0` on every commit in those runs, so
+  the ahead gate never fires there and the bank is never built.
+- Bug found in review: selecting the bank by submission parity alone
+  collided when the first submission of a pair ran on an idle backend
+  (bank 0) and the second computed bank 0 too. Fixed by flipping the last
+  used bank instead of reading parity.
+- Two further MTL4 experiments ship off: `RICHENGINE_SPAN_BARRIERS`
+  (span barriers from the byte-range frontier — real spans need N−1 of N
+  barriers, no measured effect) and `RICHENGINE_MTL4_EVENTS`
+  (event commands on `commit4` — prefill 556.7 → 548.2 ms, within noise;
+  the old prefix-hit regression is still untested because
+  `model-runtime-oracle` does not compile in this tree).
+- Harness: `mtl4-benchmark --ring` submits a second command while the
+  first is in flight; `decode-profile` now prints prefill wall time.
+
+## 12. af4p → af4 weight repack fix (default-on under `RICHENGINE_AF4P`)
+
+- `WeightStore.cpp` `readAf4pProjection` — the af4p→af4 repack indexed
+  both planes as 64-row tiles (`tiles = outputSize / 64`); the manifest
+  and every GGUF kernel use `QUANT_TILE_ROWS = 256`
+  (`quant_tile_index`), so `RICHENGINE_AF4` produced scrambled weights
+  and degenerate output (acceptance collapsed to 0). The repack now
+  indexes source and destination with `quant_tile_index`, matching the
+  layout the `af4pRepack` GPU test and `FmtAF4P::code_at` assume.
+- Verified oracle-identical on the 27B decode bench
+  (`RICHENGINE_AF4P=1`, verify8 build): hash
+  8845173885570541823 at all widths, 88.7% acceptance, B4 GPU 316.1
+  tok/s vs ~283 on af4p (+11%, matching the repack benchmark's
+  prediction).
+- af4 is now the default inside the af4p path; `RICHENGINE_AF4_OFF`
+  restores af4p, `RICHENGINE_AF4_SKIP` keeps a named projection on
+  af4p, `RICHENGINE_AF4_ONLY` restricts the repack to matching labels.
+  The `RICHENGINE_AF4P` gate itself is unchanged (opt-in).
+
+## 13. Unified dual-geometry binary — one `richengine` for both verify frames
+
+- `runtime/main.mm` — the old `main()` is now `serveMain()` inside
+  `namespace richengine`; `bootstrapConfig` picks `richengine8.metallib`
+  when compiled at `RICHENGINE_TARGET_VERIFY_ROWS == 8` and reads the
+  shared build id through `richengineBuildId()` (one embedded string).
+- `runtime/dispatch.mm` (new) — `main()`: probes the model's draft
+  geometry (`draft/config.json` `dflash_config.block_size`, root
+  `block_size`+1 for DSpark, or package `manifest.json`
+  `execution_geometry.draft_query_rows`; `RICHENGINE_VERIFY_GEOMETRY=8|16`
+  overrides) and calls `richengine::serveMain` or
+  `richengine_8::serveMain`. The DSpark spelling fixes a gap the old
+  Python check had (e.g. block-7 drafts).
+- Makefile — the engine compiles a second time with
+  `VERIFY8_DEFINES` + `-Drichengine=richengine_8` into
+  `build/engine8/` → `librichengine8.a`; `build/metal8/*.air` →
+  `richengine8.metallib`; one `richengine` links both archives plus both
+  family-object sets. `make verify8` remains for the dev/bisection
+  tools (backend-benchmark, decode-profile) that link a single-geometry
+  library.
+- `server/model_host.py` — `_engine_binary` keeps its build8/ heuristic
+  only for trees still built that way; the shipped binary self-selects.
+- `dev/tools/package.py` — ships `richengine8.metallib` beside the rest.
+- Verified: `richengine serve-native` on the 27B DFlash2 (block 8)
+  prints "Verify geometry · 8-row block" and loads; the LFM 2.6B DSpark
+  (block 9) takes the default variant. ODR/ABI audit: no cross-namespace
+  symbol collisions; wire protocol is geometry-agnostic.

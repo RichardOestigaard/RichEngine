@@ -87,6 +87,33 @@
 }
 .copy-btn:hover { color: var(--accent) }
 
+/* Per-row icon button (the sampling cog): bare until hovered, accent once
+   overrides exist for the model. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.icon-btn:hover { color: var(--text); background: var(--hover) }
+.icon-btn.on { color: var(--accent) }
+
+/* The sampling settings dialog's field grid (.confirm-panel supplies the
+   modal chrome). */
+.sampling-panel { width: min(520px, 92vw); top: 20vh }
+.sampling-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 14px }
+.sampling-field { display: grid; gap: 4px }
+.sampling-label { font-size: 12.5px; font-weight: 550 }
+.sampling-field input { width: 100%; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px }
+.sampling-field input:focus { outline: none; border-color: var(--accent) }
+.sampling-field.invalid input { border-color: var(--danger) }
+.sampling-hint { color: var(--muted); font-size: 11px }
+.sampling-note { margin: 12px 0 0; font-size: 11.5px }
+
 /* Clickable suggested-model chip inside the install form. */
 .chip-btn { border: 0; font-family: inherit; cursor: pointer }
 .chip-btn:hover { color: var(--text) }
