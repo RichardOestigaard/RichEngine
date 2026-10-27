@@ -763,7 +763,9 @@ class CompiledDfa:
     next-state or -1 per byte; accepting and live are bitmasks; marker is a
     per-state 256-bit mask of edges only special tokens may traverse."""
 
-    __slots__ = ("n_states", "table", "accepting", "live", "marker", "eos_ok")
+    __slots__ = (
+        "n_states", "table", "accepting", "live", "marker", "eos_ok", "_costs"
+    )
 
     def __init__(self, n_states, table, accepting, live, marker, eos_ok):
         self.n_states = n_states
@@ -772,6 +774,7 @@ class CompiledDfa:
         self.live = live  # bytearray bitmask of states reaching acceptance
         self.marker = marker  # list[int], 256-bit per state
         self.eos_ok = eos_ok  # bytearray bitmask of free-text states
+        self._costs = None  # termination_cost()'s cache
 
     def is_accepting(self, state):
         return bool(self.accepting[state >> 3] >> (state & 7) & 1)
@@ -876,6 +879,57 @@ class CompiledDfa:
             if q < 0 or q >= self.n_states:
                 return ()
         return candidate
+
+    def byte_costs(self):
+        """Per state, the minimum byte count of a walk to acceptance over
+        edges a regular token may take (never marker-only), the bound the
+        engine's decode budget rule gates with: every unmarked edge is
+        walkable by a single-byte token, so no grammar path finishes in
+        fewer tokens than the bound read. Marker-only paths (only special
+        tokens may walk them) and dead states get the 32767 sentinel — the
+        engine's budget rule keeps such rows on the plain grammar walk
+        rather than trusting a bound it cannot see. Cached: a grammar's
+        DFA repeats across its requests."""
+        if self._costs is not None:
+            return self._costs
+        try:
+            import numpy as np
+        except Exception:
+            self._costs = ()
+            return self._costs
+        n = self.n_states
+        sentinel = 32767
+        table = (
+            np.frombuffer(bytes(self.table), dtype=np.int16)
+            .astype(np.int32)
+            .reshape(n, 256)
+        )
+        marked = np.unpackbits(
+            np.frombuffer(
+                b"".join(m.to_bytes(32, "little") for m in self.marker),
+                np.uint8,
+            ).reshape(n, 32),
+            axis=1,
+            bitorder="little",
+        )
+        accept = np.unpackbits(
+            np.frombuffer(bytes(self.accepting), np.uint8), bitorder="little"
+        )[:n].astype(bool)
+        dist = np.full(n, sentinel, np.int32)
+        dist[accept] = 0
+        unmarked = marked == 0
+        # Label-correcting rounds to fixpoint: a state's bound shrinks only
+        # through an edge into a state whose bound just shrank, so each
+        # round propagates at least one distance and the loop ends at the
+        # fixpoint the shortest path needs.
+        for _ in range(n):
+            cand = np.where((table >= 0) & unmarked, dist[table] + 1, sentinel)
+            update = np.minimum(dist, cand.min(axis=1))
+            if np.array_equal(update, dist):
+                break
+            dist = update
+        self._costs = array.array("h", dist.tolist())
+        return self._costs
 
 
 # --- Spec input --------------------------------------------------------------

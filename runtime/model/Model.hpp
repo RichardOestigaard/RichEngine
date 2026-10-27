@@ -622,7 +622,8 @@ public:
   [[nodiscard]] virtual bool provideDfa(uint64_t, std::span<const int16_t>,
                                         std::span<const uint8_t>,
                                         std::span<const uint8_t>,
-                                        std::span<const uint32_t>) {
+                                        std::span<const uint32_t>,
+                                        std::span<const int16_t> = {}) {
     return false;
   }
   // The process-wide packed token vocabulary the DFA walk kernels index

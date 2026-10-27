@@ -525,6 +525,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         return dfa.acceptBuffer;
       case DfaBufferKind::Marker:
         return dfa.markerBuffer;
+      case DfaBufferKind::Cost:
+        return dfa.costBuffer;
       }
       return dfa.tableBuffer;
     };
@@ -597,6 +599,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
     const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
     const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    const auto costs = dfaBuffers(entries, DfaBufferKind::Cost);
     DfaWalkParams walk{};
     walk.verify_stride = geometry.draft.verifyRows();
     walk.lane_mask = laneMask;
@@ -613,6 +616,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
       mask.live_rows[lane] =
           std::min(live + 1, geometry.draft.verifyRows() + 1);
       mask.rows = std::max(mask.rows, mask.live_rows[lane]);
+      mask.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
+      walk.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
       if (entries[lane]->dfa) {
         walk.states[lane] = entries[lane]->dfa->states;
         mask.states[lane] = entries[lane]->dfa->states;
@@ -650,7 +655,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         decodeArena->packed(DecodeTensor::DfaRowStates, lanes), nextStates,
         decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
         markers[0], markers[1], markers[2], markers[3],
-        packedVocab_->special};
+        packedVocab_->special,
+        costs[0], costs[1], costs[2], costs[3]};
     if (grid && grid->gpuSpanMask) {
       // The grid kernel's MTLDispatchThreadgroupsIndirectArguments sizes
       // the launch: {vocabulary groups, mask.rows, lanes}.
@@ -705,16 +711,19 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
     const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
     const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    const auto costs = dfaBuffers(entries, DfaBufferKind::Cost);
     DfaMaskParams mask{};
     mask.vocabulary = packedVocab_->vocab;
     mask.rows = 1;
     mask.lane_mask = laneMask;
     mask.indexed = 1;
-    for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      mask.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
       if (entries[lane]->dfa) {
         mask.states[lane] = entries[lane]->dfa->states;
         dfaLaneEos(mask, lane, *entries[lane]->dfa);
       }
+    }
     graph.add(std::string(ops::kDecodeDfaMask),
               {tables[0], tables[1], tables[2], tables[3],
                accepts[0], accepts[1], accepts[2], accepts[3],
@@ -723,7 +732,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                decodeArena->packed(DecodeTensor::DfaNextStates, lanes),
                decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
                markers[0], markers[1], markers[2], markers[3],
-               packedVocab_->special},
+               packedVocab_->special,
+               costs[0], costs[1], costs[2], costs[3]},
               mask,
               {(uint64_t{packedVocab_->vocab} + 255) / 256, 1, lanes},
               {256, 1, 1});
@@ -772,6 +782,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         syncDfaState(*entries[lane]);
       }
       walk.state_lanes[lane] = entries[lane]->stateLane;
+      walk.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
     }
     graph.add(std::string(ops::kDecodeDfaAdvance),
               {tables[0], tables[1], tables[2], tables[3],
@@ -810,6 +821,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         dfaLaneEos(walk, lane, *entries[lane]->dfa);
       }
       walk.state_lanes[lane] = entries[lane]->stateLane;
+      walk.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
     }
     const MetalBuffer forced =
         decodeArena->packed(DecodeTensor::DfaForced, kLaneCount);
@@ -877,6 +889,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     const auto tables = dfaBuffers(entries, DfaBufferKind::Table);
     const auto accepts = dfaBuffers(entries, DfaBufferKind::Accept);
     const auto markers = dfaBuffers(entries, DfaBufferKind::Marker);
+    const auto costs = dfaBuffers(entries, DfaBufferKind::Cost);
     DfaMaskParams mask{};
     mask.vocabulary = packedVocab_->vocab;
     mask.rows = 1;
@@ -884,6 +897,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       if (!entries[lane] || !entries[lane]->dfa)
         continue;
+      mask.tokens_left[lane] = dfaTokensLeft(*entries[lane]);
       mask.states[lane] = entries[lane]->dfa->states;
       mask.live_rows[lane] = 1;
       dfaLaneEos(mask, lane, *entries[lane]->dfa);
@@ -899,7 +913,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                nextStates,
                decodeArena->packed(DecodeTensor::DfaTrunc, lanes),
                markers[0], markers[1], markers[2], markers[3],
-               packedVocab_->special},
+               packedVocab_->special,
+               costs[0], costs[1], costs[2], costs[3]},
               mask,
               {(uint64_t{packedVocab_->vocab} + 255) / 256, 1, lanes},
               {256, 1, 1});

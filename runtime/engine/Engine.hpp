@@ -153,12 +153,15 @@ public:
   void provideForcedTokens(uint64_t requestId,
                            std::span<const uint32_t> tokens);
   // A compiled byte-DFA for one request's constraint; true when the model
-  // took it. Dropped frames keep the host-mask path.
+  // took it. Dropped frames keep the host-mask path. costs, when present,
+  // is the frame's per-state termination bound the decode budget rule
+  // gates with.
   [[nodiscard]] bool provideDfa(uint64_t requestId,
                                 std::span<const int16_t> table,
                                 std::span<const uint8_t> accepting,
                                 std::span<const uint8_t> marker,
-                                std::span<const uint32_t> eosIds);
+                                std::span<const uint32_t> eosIds,
+                                std::span<const int16_t> costs = {});
   // The process-wide packed token vocabulary for GPU-DFA masks; may be
   // resent after a restart.
   void setVocabulary(std::span<const uint8_t> bytes,
@@ -293,6 +296,7 @@ private:
       std::vector<uint8_t> accepting;
       std::vector<uint8_t> marker;
       std::vector<uint32_t> eosIds;
+      std::vector<int16_t> costs;
     };
     std::optional<PendingDfa> pendingDfa;
     bool replaying = false;

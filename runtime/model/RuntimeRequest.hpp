@@ -83,6 +83,13 @@ struct RequestDfa final {
   MetalBuffer tableBuffer;
   MetalBuffer acceptBuffer;
   MetalBuffer markerBuffer;
+  // Per state, the minimum bytes of an acceptance-requiring unmarked-edge
+  // walk (32767: none a regular token can take) — the token-cost bound the
+  // decode budget rule gates a mask row with. A frame without the cost
+  // section keeps an all-zero buffer, whose zeros read as "terminates
+  // here", which gates nothing.
+  std::vector<int16_t> costs;
+  MetalBuffer costBuffer;
   // The grammar's EOS ids (the contract's, not the engine's stop tokens);
   // at an EOS-admitting state a member ends the walk at the stop state.
   std::array<uint32_t, 8> eosIds{};

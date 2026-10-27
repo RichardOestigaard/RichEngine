@@ -241,13 +241,17 @@ struct ForcedTokensFrame {
 // accepting state, so a non-dead end always stays live). accepting is the
 // EOS-admitting bitset — the grammar's accepting ∪ free-text states;
 // eosIds is its grammar-EOS set (≤ 8 ids); marker is 32 bytes per state,
-// bit b of state s marking edge (s, b) special-only.
+// bit b of state s marking edge (s, b) special-only. costs, when present,
+// is one i16 per state — the minimum tokens a state's grammar owes before
+// it can terminate (32767: no bounded walk); the decode budget rule gates
+// a lane's mask rows with it, and empty costs keep the plain walk.
 struct ConstraintDfaFrame {
   uint64_t requestId = 0;
   std::vector<int16_t> table;
   std::vector<uint8_t> accepting;
   std::vector<uint32_t> eosIds;
   std::vector<uint8_t> marker;
+  std::vector<int16_t> costs;
 
   bool operator==(const ConstraintDfaFrame &) const = default;
 };

@@ -178,7 +178,8 @@ void Engine::provideForcedTokens(uint64_t id,
 bool Engine::provideDfa(uint64_t id, std::span<const int16_t> table,
                         std::span<const uint8_t> accepting,
                         std::span<const uint8_t> marker,
-                        std::span<const uint32_t> eosIds) {
+                        std::span<const uint32_t> eosIds,
+                        std::span<const int16_t> costs) {
   auto found = requests_.find(id);
   if (found == requests_.end() || found->second.finalized ||
       found->second.pendingEnd)
@@ -193,13 +194,15 @@ bool Engine::provideDfa(uint64_t id, std::span<const int16_t> table,
       Request::PendingDfa{std::vector<int16_t>(table.begin(), table.end()),
                           std::vector<uint8_t>(accepting.begin(), accepting.end()),
                           std::vector<uint8_t>(marker.begin(), marker.end()),
-                          std::vector<uint32_t>(eosIds.begin(), eosIds.end())};
+                          std::vector<uint32_t>(eosIds.begin(), eosIds.end()),
+                          std::vector<int16_t>(costs.begin(), costs.end())};
   if (!active.lane && !scheduler_.suspended(id))
     return false;
   active.gpuMask = model_.provideDfa(id, active.pendingDfa->table,
                                      active.pendingDfa->accepting,
                                      active.pendingDfa->marker,
-                                     active.pendingDfa->eosIds);
+                                     active.pendingDfa->eosIds,
+                                     active.pendingDfa->costs);
   return active.gpuMask;
 }
 
@@ -795,7 +798,8 @@ bool Engine::admit(Request &active, double now) {
         model_.provideDfa(active.request.id, active.pendingDfa->table,
                           active.pendingDfa->accepting,
                           active.pendingDfa->marker,
-                          active.pendingDfa->eosIds);
+                          active.pendingDfa->eosIds,
+                          active.pendingDfa->costs);
   }
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, active.request.images);

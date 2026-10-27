@@ -436,6 +436,7 @@ class DfaWireTest(DfaParityTest):
             eos_states,
             self.eos,
             marker,
+            tuple(compiled.byte_costs()),
         )
         decoded = self.round_trip(message)
         self.assertIsInstance(decoded, wire.ConstraintDfaFrame)
@@ -444,6 +445,56 @@ class DfaWireTest(DfaParityTest):
         self.assertEqual(decoded.eos_ids, self.eos)
         self.assertEqual(decoded.accepting, eos_states)
         self.assertEqual(decoded.marker, marker)
+        # The optional budget section survives: n_states int16 bounds.
+        self.assertEqual(decoded.costs, tuple(compiled.byte_costs()))
+
+    def test_constraint_dfa_frame_without_costs(self):
+        """A frame without the budget section decodes to empty costs."""
+        from server import protocol as wire
+
+        spec = self.json_spec(SCHEMA, False)
+        compiled = self.compile(spec)
+        eos_states = bytes(
+            acc | ok for acc, ok in zip(compiled.accepting, compiled.eos_ok)
+        )
+        marker = b"".join(m.to_bytes(32, "little") for m in compiled.marker)
+        decoded = self.round_trip(
+            wire.ConstraintDfaFrame(
+                91,
+                compiled.n_states,
+                compiled.table.tobytes(),
+                eos_states,
+                self.eos,
+                marker,
+            )
+        )
+        self.assertIsInstance(decoded, wire.ConstraintDfaFrame)
+        # The engine keeps its plain walk on empty costs.
+        self.assertEqual(decoded.costs, ())
+
+    def test_byte_costs_bounds_the_shortest_accepting_walk(self):
+        """The cost table is the unmarked-edge walk fixpoint: accepting
+        states cost 0, every other state 1 + its cheapest unmarked-edge
+        successor (32767 where no walk a regular token can take ends)."""
+        for spec in (self.json_spec(SCHEMA, False), self.json_spec(NESTED_SCHEMA, True)):
+            compiled = self.compile(spec)
+            rows = array.array("h", bytes(compiled.table)).tolist()
+            table = [rows[s * 256 : (s + 1) * 256] for s in range(compiled.n_states)]
+            costs = compiled.byte_costs()
+            self.assertEqual(len(costs), compiled.n_states)
+            accepting = compiled.accepting
+            for s in range(compiled.n_states):
+                if accepting[s >> 3] >> (s & 7) & 1:
+                    self.assertEqual(costs[s], 0)
+                    continue
+                through = [
+                    costs[table[s][b]] + 1
+                    for b in range(256)
+                    if table[s][b] >= 0 and not (compiled.marker[s] >> b & 1)
+                ]
+                # The sentinel stops the arithmetic where no walk ends.
+                expected = min(min(through), 32767) if through else 32767
+                self.assertEqual(costs[s], expected, f"state {s}")
 
     def test_vocabulary_frame_round_trip(self):
         """The special-token bitset decodes to the id set it was packed from."""

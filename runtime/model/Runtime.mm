@@ -977,7 +977,8 @@ bool Runtime::provideDfa(uint64_t requestId,
                          std::span<const int16_t> table,
                          std::span<const uint8_t> accepting,
                          std::span<const uint8_t> marker,
-                         std::span<const uint32_t> eosIds) {
+                         std::span<const uint32_t> eosIds,
+                         std::span<const int16_t> costs) {
   // RICHENGINE_DFA_MODE=off leaves every constraint on the host path.
   if (impl_->dfaMode_ == Impl::DfaMode::Off)
     return false;
@@ -1008,6 +1009,16 @@ bool Runtime::provideDfa(uint64_t requestId,
     std::memcpy(dfa.acceptBuffer.contents(), accepting.data(),
                 accepting.size());
     std::memcpy(dfa.markerBuffer.contents(), marker.data(), marker.size());
+    // A frame without the cost section keeps the all-zero stand-in: its
+    // zeros read as "terminates here", which gates no mask row.
+    if (costs.size() == states)
+      dfa.costs.assign(costs.begin(), costs.end());
+    else
+      dfa.costs.assign(states, 0);
+    dfa.costBuffer = impl_->backend.allocateBuffer(
+        bytesFor<int16_t>(states), BufferStorage::Shared, "dfa-costs");
+    std::memcpy(dfa.costBuffer.contents(), dfa.costs.data(),
+                bytesFor<int16_t>(states));
     std::copy(eosIds.begin(), eosIds.end(), dfa.eosIds.begin());
     dfa.eosCount = static_cast<uint32_t>(eosIds.size());
     dfa.states = static_cast<uint32_t>(states);

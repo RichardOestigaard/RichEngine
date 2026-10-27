@@ -26,6 +26,23 @@
 // the shipped accepting bitset marks — the grammar's accepting union
 // free-text states — and ends the walk at the stop state, the lane's DFA
 // state count, from which nothing walks further.
+//
+// The decode budget rule (RICHENGINE_DFA_BUDGET_OFF is its A/B opt-out):
+// the mask rows also carry each lane's remaining token budget. A deeper
+// row's token is the round's emission r, so the row gates it on the cost
+// table's termination bound of the state it lands in fitting under the
+// row's budget share — the walk must still be completable within what the
+// lane may emit. The bound (the CONSTRAINT_DFA frame's optional i16 cost
+// section) is the minimum byte count of an unmarked walk to acceptance: a
+// single-byte token walks every unmarked edge, so the byte count never
+// understates the true token cost, and over-reading only leaves a token
+// the budget could have afforded. A row whose budget cannot even cover
+// its own start's bound — near a budget's end, or past a 32767 sentinel
+// (a marker-only continuation only special tokens may spell) — keeps the
+// plain walk: admitting the grammar is better than starving the row into
+// abandonment. EOS admission is untouched: it ends the output rather than
+// extending it. Forced spans tokenize under the same budget in
+// decode_dfa_forced_tokens.
 
 constant constexpr uint kDfaRows = RICHENGINE_TARGET_VERIFY_ROWS + 1u;
 
@@ -67,6 +84,16 @@ inline bool dfa_eos(constant const uint *eos_ids, uint count, uint token) {
     if (eos_ids[i] == token)
       return true;
   return false;
+}
+
+// The row's emission budget out of the lane's remaining tokens: row 0
+// rides along, and a deeper row's token is the round's emission r, under
+// the r - 1 rows before it in full acceptance. 0xffffffff (no enforced
+// budget) and a spent remainder both come back whole.
+inline uint dfa_row_budget(uint remaining, uint row) {
+  if (remaining == 0xffffffffu || !row)
+    return remaining;
+  return remaining > row - 1 ? remaining - (row - 1) : 0;
 }
 
 // The marker-honoring byte walk: the state after token's bytes walked from
@@ -119,6 +146,14 @@ inline uint dfa_token_state(
                   dfa_special(special, token), state, token);
 }
 
+// The per-lane cost tables, selected like the tables: each state's u16
+// termination bound (32767 = no walk a regular token can finish).
+inline device const ushort *dfa_costs(
+    device const ushort *cost0, device const ushort *cost1,
+    device const ushort *cost2, device const ushort *cost3, uint lane) {
+  return lane == 0 ? cost0 : lane == 1 ? cost1 : lane == 2 ? cost2 : cost3;
+}
+
 // One thread per (token, row, lane): writes the state the token's byte walk
 // leaves from the row's automaton state into the lane's DfaNextStates row —
 // -1 when the token is not admitted — a plain store with no clear pass, so a
@@ -162,7 +197,11 @@ kernel void decode_dfa_mask(
     device const uchar *marker2 [[buffer(15)]],
     device const uchar *marker3 [[buffer(16)]],
     device const uchar *special [[buffer(17)]],
-    constant DfaMaskParams &params [[buffer(18)]],
+    device const ushort *cost0 [[buffer(18)]],
+    device const ushort *cost1 [[buffer(19)]],
+    device const ushort *cost2 [[buffer(20)]],
+    device const ushort *cost3 [[buffer(21)]],
+    constant DfaMaskParams &params [[buffer(22)]],
     uint3 gid [[thread_position_in_grid]]) {
   const uint lane = gid.z;
   const uint token = gid.x;
@@ -197,10 +236,18 @@ kernel void decode_dfa_mask(
       return;
     }
   }
+  const ushort *costs = dfa_costs(cost0, cost1, cost2, cost3, lane);
   const uint start = row_states[lane * kDfaRows + row];
   const uint states = params.states[lane];
   short next = -1;
+  // The budget rule arms only where the row's share covers even the
+  // row's own start state's bound — the least any continuation costs;
+  // everything else stays on the plain walk (see the file header).
+  bool gated = false;
+  uint budget = 0;
   if (start != RICHENGINE_DFA_DEAD_STATE && start < states) {
+    budget = dfa_row_budget(params.tokens_left[lane], row);
+    gated = budget >= 1 + uint(costs[start]);
     if (dfa_eos(params.eos_ids[lane], params.eos_count[lane], token)) {
       // A grammar-EOS id is admitted only from an EOS-admitting state.
       if (dfa_accepting(
@@ -215,6 +262,11 @@ kernel void decode_dfa_mask(
                    token_bytes, token_offsets,
                    dfa_special(special, token), start, token);
       next = end == RICHENGINE_DFA_DEAD_STATE ? -1 : short(end);
+      if (gated && next >= 0) {
+        const uint owed = 1 + uint(costs[uint(next)]);
+        if (budget < owed)
+          next = -1;
+      }
     }
   }
   next_states[(ulong(lane) * kDfaRows + row) * params.vocabulary + token] =
@@ -515,7 +567,15 @@ kernel void decode_dfa_forced_tokens(
     tg_count = 0;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint slot = 0; slot < RICHENGINE_DRAFT_PROPOSAL_TOKENS; ++slot) {
+  // A span is the next round's guaranteed proposals, so its slot count is
+  // also capped under what the lane may still emit: a span past the budget
+  // would overdraw it row by row on auto-accept.
+  const uint remaining = params.tokens_left[lane];
+  const uint spanCap = min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
+                           remaining == 0xffffffffu
+                               ? uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS)
+                               : remaining);
+  for (uint slot = 0; slot < spanCap; ++slot) {
     const uint offset = tg_offset;
     const uint q = tg_state;
     if (offset >= total || q == RICHENGINE_DFA_DEAD_STATE ||

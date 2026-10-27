@@ -956,6 +956,7 @@ class NativeBackend:
                     eos_states,
                     tuple(constraint.eos_tokens),
                     marker,
+                    tuple(compiled.byte_costs()),
                 )
             ),
             call.generation,

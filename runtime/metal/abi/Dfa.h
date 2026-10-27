@@ -66,6 +66,13 @@ struct DfaMaskParams {
   // lane's live_rows + 1 for a verify round.
   uint32_t rows;
   uint32_t lane_mask;
+  // Each lane's decode budget: the tokens it may still emit —
+  // maxNewTokens - generatedTokens — 0xffffffff where none is enforced.
+  // A row past 0 gates its token's admission on what the grammar still
+  // owes after it (the cost table's per-state termination bound) fitting
+  // under the row's share, and leaves the plain walk where the bound says
+  // nothing fits.
+  uint32_t tokens_left[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   // Each lane's grammar-EOS set (CONSTRAINT_DFA's eos ids): a member token
   // admits iff the row's start state is accepting, and the walk ends at the
   // stop state — not the engine's own stop tokens, which only the lane's
@@ -82,8 +89,8 @@ struct DfaMaskParams {
   uint32_t indexed;
 };
 
-static_assert(sizeof(DfaMaskParams) == 192,
-              "DFA mask parameters are 192 bytes on both sides");
+static_assert(sizeof(DfaMaskParams) == 208,
+              "DFA mask parameters are 208 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_chain, decode_dfa_advance and the
 // commit-stage forced-span kernels. The verify input and output tokens pack
@@ -94,6 +101,9 @@ static_assert(sizeof(DfaMaskParams) == 192,
 struct DfaWalkParams {
   uint32_t verify_stride;
   uint32_t lane_mask;
+  // Each lane's decode budget like DfaMaskParams's — the forced-span
+  // tokenization caps its span under what the lane may still emit.
+  uint32_t tokens_left[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t states[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t state_lanes[RICHENGINE_MAXIMUM_BATCH_WIDTH];
   uint32_t vocabulary;
@@ -105,8 +115,8 @@ struct DfaWalkParams {
   uint32_t eos_ids[RICHENGINE_MAXIMUM_BATCH_WIDTH][RICHENGINE_DFA_EOS_TOKENS];
 };
 
-static_assert(sizeof(DfaWalkParams) == 204,
-              "DFA walk parameters are 204 bytes on both sides");
+static_assert(sizeof(DfaWalkParams) == 220,
+              "DFA walk parameters are 220 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_truncate: one thread per lane scans
 // the verify rows and names the truncation row T — the first proposal the

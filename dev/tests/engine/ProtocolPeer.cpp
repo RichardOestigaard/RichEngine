@@ -142,23 +142,33 @@ FrameType write(Writer &out, const ForcedTokensFrame &forced) {
 
 FrameType write(Writer &out, const ConstraintDfaFrame &dfa) {
   out.u64(dfa.requestId);
-  out.u32(static_cast<uint32_t>(dfa.table.size() / 256));
-  out.u32(0); // flags
-  for (int16_t entry : dfa.table)
-    out.u16(std::bit_cast<uint16_t>(entry));
+  const uint32_t nStates = static_cast<uint32_t>(dfa.table.size() / 256);
+  out.u32(nStates);
+  out.u32(0);
+  for (const int16_t state : dfa.table)
+    out.u16(std::bit_cast<uint16_t>(state));
   out.raw(dfa.accepting);
   out.u32(static_cast<uint32_t>(dfa.eosIds.size()));
   out.words(dfa.eosIds);
   out.u32(static_cast<uint32_t>(dfa.marker.size()));
   out.raw(dfa.marker);
+  // The budget section is optional on the wire, and this writer omits it
+  // unless the frame carries one.
+  if (!dfa.costs.empty()) {
+    out.u32(static_cast<uint32_t>(dfa.costs.size()) * sizeof(int16_t));
+    for (const int16_t cost : dfa.costs)
+      out.u16(std::bit_cast<uint16_t>(cost));
+  }
   return FrameType::ConstraintDfa;
 }
 
 FrameType write(Writer &out, const VocabularyFrame &vocabulary) {
-  out.u32(static_cast<uint32_t>(vocabulary.tokenOffsets.size() - 1));
+  const uint32_t vocab =
+      static_cast<uint32_t>(vocabulary.tokenOffsets.size() - 1);
+  out.u32(vocab);
   out.u32(static_cast<uint32_t>(vocabulary.tokenBytes.size()));
   out.raw(vocabulary.tokenBytes);
-  for (int32_t offset : vocabulary.tokenOffsets)
+  for (const int32_t offset : vocabulary.tokenOffsets)
     out.u32(std::bit_cast<uint32_t>(offset));
   out.u32(static_cast<uint32_t>(vocabulary.specialBits.size()));
   out.raw(vocabulary.specialBits);

@@ -315,7 +315,9 @@ class ConstraintDfaFrame:
     EOS-admitting bitset — the DFA's accepting ∪ free-text states; eos_ids
     is the grammar's EOS set (≤ 8 ids), admitted from an EOS-admitting
     state; marker is n_states*32 bytes, bit b of state s marking edge
-    (s, b) special-only."""
+    (s, b) special-only. costs is the optional trailing budget section:
+    n_states little-endian int16 termination bounds, 32767 where no bounded
+    walk exists; empty keeps the frame on engines without it."""
 
     request_id: int
     n_states: int
@@ -323,6 +325,7 @@ class ConstraintDfaFrame:
     accepting: bytes
     eos_ids: tuple
     marker: bytes
+    costs: tuple = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -1100,6 +1103,15 @@ def _constraint_dfa_frame(message: ConstraintDfaFrame) -> bytearray:
         marker = bytes(message.marker)
         if len(marker) != n_states * 32:
             raise ValueError("DFA marker mask must have n_states*32 bytes")
+        costs = message.costs
+        if isinstance(costs, array.array):
+            if costs.typecode != "h":
+                raise ValueError("DFA cost table must be an int16 array")
+            costs = costs.tobytes()
+        elif costs:
+            costs = array.array("h", (int(v) for v in costs)).tobytes()
+        if costs and len(costs) != n_states * 2:
+            raise ValueError("DFA cost table must carry n_states int16 entries")
     except (TypeError, ValueError, OverflowError) as error:
         _fail(
             FailureClass.REQUEST_ERROR,
@@ -1115,6 +1127,7 @@ def _constraint_dfa_frame(message: ConstraintDfaFrame) -> bytearray:
         + 4 * len(eos_ids)
         + 4
         + len(marker)
+        + (4 + len(costs) if costs else 0)
     )
     frame = _frame(FrameType.CONSTRAINT_DFA, payload_bytes)
     _CONSTRAINT_DFA.pack_into(frame, FRAME_HEADER_BYTES, request_id, n_states, 0)
@@ -1129,7 +1142,12 @@ def _constraint_dfa_frame(message: ConstraintDfaFrame) -> bytearray:
     offset += 4 * len(eos_ids)
     _SPEC_BITS_LEN.pack_into(frame, offset, len(marker))
     offset += _SPEC_BITS_LEN.size
-    frame[offset:] = marker
+    frame[offset : offset + len(marker)] = marker
+    offset += len(marker)
+    if costs:
+        _SPEC_BITS_LEN.pack_into(frame, offset, len(costs))
+        offset += _SPEC_BITS_LEN.size
+        frame[offset:] = costs
     return frame
 
 

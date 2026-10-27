@@ -372,7 +372,7 @@ bool NativeRuntime::handleConstraintDfa(
   if (!telemetry_.contains(dfa.requestId))
     return true;
   if (core_.provideDfa(dfa.requestId, dfa.table, dfa.accepting, dfa.marker,
-                        dfa.eosIds))
+                       dfa.eosIds, dfa.costs))
     gpuMaskRequests_.insert(dfa.requestId);
   return true;
 }

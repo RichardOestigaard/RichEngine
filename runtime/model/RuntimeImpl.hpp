@@ -1117,7 +1117,17 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     return result;
   }
   // Which per-lane DFA buffer a kernel binds.
-  enum class DfaBufferKind : uint8_t { Table, Accept, Marker };
+  enum class DfaBufferKind : uint8_t { Table, Accept, Marker, Cost };
+  // The lane's remaining decode budget for the dfa kernels' parameters:
+  // tokens it may still emit, 0xffffffff where the budget rule is off
+  // (RICHENGINE_DFA_BUDGET_OFF, its A/B opt-out) and zero past the cap.
+  uint32_t dfaTokensLeft(const Request &entry) const noexcept {
+    if (tuning().dfaBudgetOff)
+      return 0xffffffffu;
+    return entry.generatedTokens < entry.maxNewTokens
+               ? entry.maxNewTokens - entry.generatedTokens
+               : 0;
+  }
   // Each dispatch lane's DFA table, accepting bitset or marker mask
   // buffer; lanes without one rebind the first DFA lane's and are masked
   // out. Call only while dfaLaneMask is nonzero.
@@ -1541,6 +1551,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
       if (item.logicalPosition == 0) {
         states.clearForColdStart(entry.stateLane);
+        // Pending tape rows reset with the cold start: a braced block, or
+        // the reset rides along every eye-checked non-cold item too.
         gdnPendingRows_[entry.stateLane] = 0;
       }
       if (item.tokenCount > kPrefillRows - batch.rows) {

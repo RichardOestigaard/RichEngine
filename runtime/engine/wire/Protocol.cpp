@@ -939,10 +939,33 @@ ProtocolResult<ClientMessage> decodeConstraintDfa(const Frame &frame) {
   }
   uint32_t markerLen = 0;
   if (!reader.u32(markerLen) || markerLen != markerBytes ||
-      !reader.raw(markerLen, dfa.marker) || reader.remaining() != 0) {
+      !reader.raw(markerLen, dfa.marker)) {
     return failure<ClientMessage>(makeIssue(
         FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
         dfa.requestId, "constraint dfa marker mask is truncated"));
+  }
+  // The cost table's section is optional: trailing bytes name a u32 length
+  // plus nStates i16 termination bounds; nothing there keeps the frame on
+  // a sender that predates the budget rule.
+  const uint64_t costsBytes = uint64_t{nStates} * sizeof(int16_t);
+  if (uint64_t remaining = reader.remaining()) {
+    uint32_t costsLen = 0;
+    if (remaining != sizeof(costsLen) + costsBytes || !reader.u32(costsLen) ||
+        costsLen != costsBytes) {
+      return failure<ClientMessage>(makeIssue(
+          FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+          dfa.requestId, "constraint dfa cost table is truncated"));
+    }
+    dfa.costs.reserve(nStates);
+    for (uint64_t index = 0; index < nStates; ++index) {
+      uint16_t word = 0;
+      if (!reader.u16(word)) {
+        return failure<ClientMessage>(makeIssue(
+            FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+            dfa.requestId, "constraint dfa cost table is truncated"));
+      }
+      dfa.costs.push_back(std::bit_cast<int16_t>(word));
+    }
   }
   return success(ClientMessage{std::move(dfa)});
 }

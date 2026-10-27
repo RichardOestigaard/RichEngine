@@ -77,6 +77,13 @@ struct Tuning {
   // forced-span patch on-device and the WaitingMask stage never opens.
   // Unset keeps the three-command split.
   bool dfaMerge = false;          // RICHENGINE_DFA_MERGE_OFF disables (default on)
+  // model/RuntimeEncodeVerify.mm, kernels/decode/dfa.metal: a Full-mode
+  // DFA lane's mask rows gate each token on the grammar's termination
+  // bound (the CONSTRAINT_DFA frame's per-state cost table) fitting under
+  // the lane's remaining output budget — a JSON or tool call the budget
+  // cannot finish is refused instead of truncated mid-value. Its absence
+  // is the A/B opt-out: rows keep the plain grammar walk.
+  bool dfaBudgetOff = false;      // RICHENGINE_DFA_BUDGET_OFF (presence)
   // model/Runtime.mm: a greedy DFA lane whose pending GPU forced span
   // covers its whole proposal budget takes every live proposal row from
   // the span, so when every lane of a batch qualifies the draft embedding
@@ -249,6 +256,7 @@ inline Tuning makeTuning() {
   t.gpuDecodeGrid = !envFlag("RICHENGINE_GPU_DECODE_GRID_OFF");
   t.deviceVerifyParams = !envFlag("RICHENGINE_DEVICE_VERIFY_PARAMS_OFF");
   t.dfaMerge = !envFlag("RICHENGINE_DFA_MERGE_OFF");
+  t.dfaBudgetOff = envFlag("RICHENGINE_DFA_BUDGET_OFF");
   t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
   t.verifyAllLive = envFlag("RICHENGINE_VERIFY_ALL_LIVE");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");

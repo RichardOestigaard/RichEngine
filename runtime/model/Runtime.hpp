@@ -60,7 +60,8 @@ public:
                                 std::span<const int16_t> table,
                                 std::span<const uint8_t> accepting,
                                 std::span<const uint8_t> marker,
-                                std::span<const uint32_t> eosIds) override;
+                                std::span<const uint32_t> eosIds,
+                                std::span<const int16_t> costs) override;
   void setVocabulary(std::span<const uint8_t> bytes,
                      std::span<const int32_t> offs,
                      std::span<const uint8_t> specialBits) override;

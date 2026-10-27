@@ -1,6 +1,7 @@
 """The engine's side of the native wire, for fake engines and golden tests;
 production is server/protocol.py."""
 
+import array
 import json
 import struct
 from dataclasses import replace
@@ -247,7 +248,18 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             eos_ids = _words(payload, offset, eos_count)
             offset += 4 * eos_count
             (marker_len,) = _LEN.unpack_from(payload, offset)
-            marker = payload[offset + _LEN.size : offset + _LEN.size + marker_len]
+            offset += _LEN.size
+            marker = payload[offset : offset + marker_len]
+            offset += marker_len
+            # The optional budget section: u32 length plus n_states i16
+            # termination bounds.
+            costs = ()
+            if offset < len(payload):
+                (costs_len,) = _LEN.unpack_from(payload, offset)
+                offset += _LEN.size
+                costs = array.array("h")
+                costs.frombytes(payload[offset : offset + costs_len])
+                costs = tuple(costs)
             return wire.ConstraintDfaFrame(
                 request_id,
                 n_states,
@@ -255,6 +267,7 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
                 bytes(accepting),
                 eos_ids,
                 bytes(marker),
+                costs,
             )
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
