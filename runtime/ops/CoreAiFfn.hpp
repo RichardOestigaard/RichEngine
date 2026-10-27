@@ -87,9 +87,14 @@ private:
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
   };
-  // A staging set of the layer's int8 weights and fp16 value scales
-  // (coreai_ffn_weights writes scale = row_scale / ANE_FFN_INT8_UNIT, the
-  // dequantize's argument).
+  // The weight contract the staging serves: Pc is int8 rows under a
+  // per-row scale; B32 is int8 under each 32-input block's own scale; Si4
+  // packs the codes to nibbles under the same block scales
+  // (RICHENGINE_COREAI_QUANT=pc|b32|si4, dev/tools/gen_coreai_ffn.py's
+  // --quant must match).
+  enum class Quant : uint8_t { Pc, B32, Si4 };
+  // A staging set of the layer's quantized weights and fp16 value scales
+  // (the dequantize's scale argument, per row or per 32-input block).
   struct Weights final {
     metal::MetalBuffer gateQ, upQ, downQ, gateS, upS, downS;
   };
@@ -121,9 +126,10 @@ private:
     uint64_t ready, done;
   };
 
+  [[nodiscard]] static Quant quantMode();
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   template <class MakeBuffer>
-  [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer);
+  [[nodiscard]] static Memory allocate(const Shape &shape, Quant quant, MakeBuffer &&buffer);
   static void fillNormalized(const metal::MetalBuffer &normalized);
   void encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
               metal::MetalBuffer output, uint32_t rows, Parts parts);
@@ -137,6 +143,7 @@ private:
 
   metal::MetalBackend &backend_;
   const Linear linear_;
+  const Quant quant_;
   Shape shape_;
   uint32_t minimumRows_ = kMinimumRows;
   std::vector<Layer> layers_;

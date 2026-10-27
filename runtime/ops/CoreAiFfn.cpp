@@ -74,6 +74,10 @@ const ShimApi *shim() {
 // (dev/tools/gen_coreai_ffn.py writes one).
 const char *assetPath() { return std::getenv("RICHENGINE_COREAI_ASSET"); }
 
+// 32 quantized values per fp16 scale in the blockwise contracts (the
+// asset's gate_s [ane, hidden/32]-style dimensions).
+constexpr uint32_t kScaleBlock = 32;
+
 // The GPU's channels of `intermediate` with the ANE taking `aneUnits`, as
 // ops::AneFfn's.
 uint32_t gpuChannels(uint32_t intermediate, uint32_t aneUnits) {
@@ -167,28 +171,41 @@ CoreAiFfn::Shape CoreAiFfn::shapeOf(std::span<const SwiGluProjections> layers, u
   return shape;
 }
 
+CoreAiFfn::Quant CoreAiFfn::quantMode() {
+  const char *mode = std::getenv("RICHENGINE_COREAI_QUANT");
+  if (!mode || !*mode) return Quant::B32;
+  if (std::string(mode) == "b32") return Quant::B32;
+  if (std::string(mode) == "si4") return Quant::Si4;
+  if (std::string(mode) != "pc")
+    throw std::invalid_argument("RICHENGINE_COREAI_QUANT is pc, b32 or si4, not '" + std::string(mode) + "'");
+  return Quant::Pc;
+}
+
 template <class MakeBuffer>
-CoreAiFfn::Memory CoreAiFfn::allocate(const Shape &shape, MakeBuffer &&buffer) {
+CoreAiFfn::Memory CoreAiFfn::allocate(const Shape &shape, Quant quant, MakeBuffer &&buffer) {
   Memory memory;
   memory.rowScales = buffer(uint64_t{shape.layers} * (2 * shape.ane + shape.hidden) * sizeof(_Float16),
                             "coreai ffn row scales");
   memory.x = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "coreai ffn x");
   memory.y = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "coreai ffn y");
   memory.status = buffer(sizeof(uint32_t), "coreai ffn status");
+  const uint64_t qBytes = uint64_t{shape.ane} * shape.hidden / (quant == Quant::Si4 ? 2 : 1);
+  const uint64_t inputScale = quant == Quant::Pc ? shape.ane : uint64_t{shape.ane} * (shape.hidden / kScaleBlock);
+  const uint64_t aneScale = quant == Quant::Pc ? shape.hidden : uint64_t{shape.hidden} * (shape.ane / kScaleBlock);
   for (Weights &set : memory.sets) {
-    set.gateQ = buffer(uint64_t{shape.ane} * shape.hidden, "coreai ffn gate weights");
-    set.upQ = buffer(uint64_t{shape.ane} * shape.hidden, "coreai ffn up weights");
-    set.downQ = buffer(uint64_t{shape.hidden} * shape.ane, "coreai ffn down weights");
-    set.gateS = buffer(uint64_t{shape.ane} * sizeof(_Float16), "coreai ffn gate scales");
-    set.upS = buffer(uint64_t{shape.ane} * sizeof(_Float16), "coreai ffn up scales");
-    set.downS = buffer(uint64_t{shape.hidden} * sizeof(_Float16), "coreai ffn down scales");
+    set.gateQ = buffer(qBytes, "coreai ffn gate weights");
+    set.upQ = buffer(qBytes, "coreai ffn up weights");
+    set.downQ = buffer(qBytes, "coreai ffn down weights");
+    set.gateS = buffer(inputScale * sizeof(_Float16), "coreai ffn gate scales");
+    set.upS = buffer(inputScale * sizeof(_Float16), "coreai ffn up scales");
+    set.downS = buffer(aneScale * sizeof(_Float16), "coreai ffn down scales");
   }
   return memory;
 }
 
 uint64_t CoreAiFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits) {
   uint64_t bytes = 0;
-  static_cast<void>(allocate(shapeOf(layers, aneUnits), [&](uint64_t size, const char *) {
+  static_cast<void>(allocate(shapeOf(layers, aneUnits), quantMode(), [&](uint64_t size, const char *) {
                                bytes += alignUp(size);
                                return metal::MetalBuffer{};
                              }));
@@ -213,10 +230,10 @@ void *CoreAiFfn::open() {
 }
 
 CoreAiFfn::CoreAiFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits)
-    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
-      handoff_(backend, kHandoffBound) {
+    : backend_(backend), linear_(backend.capabilities()), quant_(quantMode()),
+      shape_(shapeOf(layers, aneUnits)), handoff_(backend, kHandoffBound) {
   if (!shim()) throw std::runtime_error("the CoreAI shim librichengine_coreai.dylib does not load");
-  memory_ = allocate(shape_, [&](uint64_t bytes, const char *label) {
+  memory_ = allocate(shape_, quant_, [&](uint64_t bytes, const char *label) {
     metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
     allocatedBytes_ += buffer.allocatedBytes();
     return buffer;
@@ -229,9 +246,11 @@ CoreAiFfn::CoreAiFfn(metal::MetalBackend &backend, std::span<const SwiGluProject
                        source.down->leadingInputs(shape_.gpu)});
   function_ = open();
 
-  // Each row's shared int8 scale over the ANE's share of its inputs.
+  // Each row's shared int8 scale over the ANE's share of its inputs. The
+  // blockwise kernels take each 32-input block's peak in-register and skip
+  // this pass.
   metal::CommandGraph graph;
-  for (uint32_t layer = 0; layer < layers_.size(); ++layer) {
+  for (uint32_t layer = 0; quant_ == Quant::Pc && layer < layers_.size(); ++layer) {
     const auto add = [&](Matrix matrix, uint32_t row, uint32_t input, uint32_t width, uint32_t rows,
                          Rotation rotation) {
       const Planes &planes = layers_[layer].planes[static_cast<size_t>(matrix)];
@@ -245,7 +264,9 @@ CoreAiFfn::CoreAiFfn(metal::MetalBackend &backend, std::span<const SwiGluProject
     add(Matrix::Up, shape_.gpu, 0, shape_.hidden, shape_.ane, Rotation::Inputs);
     add(Matrix::Down, 0, shape_.gpu, shape_.ane, shape_.hidden, Rotation::Intermediate);
   }
-  static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
+  // An empty graph has no command to submit — blockwise modes leave it so.
+  if (quant_ == Quant::Pc)
+    static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
 
   // A cold function specializes on first encode — over 2 s here, past the
   // handoff bound a verify job gets. Burn one job on the split's own buffers
@@ -297,21 +318,26 @@ metal::MetalBuffer CoreAiFfn::rowScales(uint32_t layer, Matrix matrix) const {
                        uint64_t{matrix == Matrix::Down ? shape_.hidden : shape_.ane} * sizeof(_Float16));
 }
 
-// Layer `layer`'s int8 weights and value scales into staging set `set`,
-// unrotated: gate's and up's ANE rows over the whole hidden, down's rows
-// over its ANE inputs.
+// Layer `layer`'s quantized weights and value scales into staging set
+// `set`, unrotated: gate's and up's ANE rows over the whole hidden, down's
+// rows over its ANE inputs. Si4 halves the weight bytes; the blockwise
+// contracts widen the scales to one per 32 inputs.
 void CoreAiFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const {
   const Layer &source = layers_.at(layer);
   const Weights &target = memory_.sets[set];
+  const std::string_view weights =
+      quant_ == Quant::Si4 ? kCoreAiFfnWeightsSi4 : quant_ == Quant::B32 ? kCoreAiFfnWeightsB32 : kCoreAiFfnWeights;
   const auto add = [&](Matrix matrix, const metal::MetalBuffer &output, const metal::MetalBuffer &scale,
                        uint32_t row, uint32_t input, uint32_t width, uint32_t rows, Rotation rotation) {
     const Planes &planes = source.planes[static_cast<size_t>(matrix)];
-    requireBytes(output, uint64_t{rows} * width, "CoreAI FFN weight buffer");
-    requireBytes(scale, uint64_t{rows} * sizeof(_Float16), "CoreAI FFN scale buffer");
-    graph.add(kernel(kCoreAiFfnWeights.data(), planes.suffix, rotation),
+    const uint32_t stride = width / (quant_ == Quant::Si4 ? 2 : 1);
+    const uint32_t scaleStride = quant_ == Quant::Pc ? 1 : width / kScaleBlock;
+    requireBytes(output, uint64_t{rows} * stride, "CoreAI FFN weight buffer");
+    requireBytes(scale, uint64_t{rows} * scaleStride * sizeof(_Float16), "CoreAI FFN scale buffer");
+    graph.add(kernel(weights.data(), planes.suffix, rotation),
               {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), output, scale,
                memory_.rowScales},
-              AneFfnWeightParams{planes.groups, row, input, width, width, 1, planes.format},
+              AneFfnWeightParams{planes.groups, row, input, width, stride, scaleStride, planes.format},
               {rows / ANE_FFN_WEIGHT_ROWS, width / blockOf(rotation), 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   };
   add(Matrix::Gate, target.gateQ, target.gateS, shape_.gpu, 0, shape_.hidden, shape_.ane, Rotation::Inputs);
