@@ -200,7 +200,8 @@ struct RequestFrame {
 //                  u32 specBitsBytes, u8 specBits[ceil(vocab/8)]
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
-//                  u64 wallMicros, u32 count, f32 option logits
+//                  u64 wallMicros, u32 draftedTokens, u32 acceptedDraftTokens,
+//                  u32 count, f32 option logits
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
@@ -324,6 +325,10 @@ struct DoneEvent {
   uint64_t prefillMicros = 0;
   uint64_t decodeMicros = 0;
   uint64_t wallMicros = 0;
+  // The request's lifetime speculative counts: proposals the verify stages
+  // read, and the share of them accepted into the output.
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};

@@ -5,6 +5,8 @@ namespace richengine::model {
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
   // tokens then append through commitSelected.
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
+    entry.corpusArmed = false;
+    entry.corpusProbeAt = 0;
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::seed(entry.ngram, prompt);
@@ -12,12 +14,45 @@ namespace richengine::model {
     entry.ngramAcceptedAvg = 0;
     entry.ngramProbeAt = 0;
     entry.ngramInFlight = false;
+    if (!ngram_.ngramCorpus_)
+      return;
+    if (ngram_.ngramCorpus_ == 1) {
+      entry.corpusArmed = true;
+      return;
+    }
+    // Mode 2: the hint flag arms outright; otherwise the admission probe —
+    // the prompt's closing 3-gram occurring deep inside the corpus — says
+    // this request likely re-emits known text.
+    if (entry.flags & RequestNgramCorpusHint) {
+      entry.corpusArmed = true;
+      return;
+    }
+    if (ngram_.ngramCorpusDocs_.docs.empty())
+      return;
+    std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> scratch;
+    uint32_t extension = 0;
+    if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, prompt, scratch.data(),
+                            extension) &&
+        3 + extension >= ngram::kCorpusArmMin)
+      entry.corpusArmed = true;
   }
 
   void Runtime::Impl::appendNgramTokens(Request &entry, std::span<const uint32_t> tokens) {
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::append(entry.ngram, tokens);
+  }
+
+  void Runtime::Impl::noteNgramCorpus(const Request &entry) {
+    if (!ngram_.ngramCorpus_)
+      return;
+    const auto &history = entry.ngram.history;
+    if (ngram_.ngramCorpusAll_)
+      ngram::push(ngram_.ngramCorpusDocs_, history);
+    else if (history.size() > entry.promptTokens)
+      ngram::push(ngram_.ngramCorpusDocs_,
+                  {history.data() + entry.promptTokens,
+                   history.size() - entry.promptTokens});
   }
 
   // A lane's expected accepted tokens if its n-gram chain is used now:
@@ -63,7 +98,44 @@ namespace richengine::model {
       // rejected, wasting only rows).
       if (samplingEnabled(entry) && !nullDraft)
         return false;
-      const uint32_t found = ngram::lookup(entry.ngram, proposals[lane].data());
+      uint32_t extension = 0;
+      uint32_t found =
+          ngram::lookup(entry.ngram, proposals[lane].data(), &extension);
+      // The cross-request corpus offers its own continuation; it displaces
+      // the lane's match only past the preference margin — the corpus
+      // pattern (3 + its backward extension against the lane) must be that
+      // much longer, the measured defense against coincidental long hits
+      // in unrelated earlier traffic.
+      // Starvation probe: a lane whose own 3-gram found nothing — where
+      // the per-request matcher can only emit anchor repeats — probes the
+      // corpus each kNgramProbeTokens and arms itself on a real match.
+      if (ngram_.ngramCorpus_ && !found && !entry.corpusArmed &&
+          entry.generatedTokens >= entry.corpusProbeAt &&
+          !ngram_.ngramCorpusDocs_.docs.empty()) {
+        entry.corpusProbeAt =
+            entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
+        std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> probe;
+        uint32_t probeExtension = 0;
+        if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
+                                probe.data(), probeExtension) &&
+            3 + probeExtension >= ngram::kCorpusArmMin)
+          entry.corpusArmed = true;
+      }
+      if (ngram_.ngramCorpus_ && ngram_.corpusLane(entry) &&
+          !ngram_.ngramCorpusDocs_.docs.empty()) {
+        std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> corpus;
+        uint32_t corpusExtension = 0;
+        const uint32_t corpusFound =
+            ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
+                                corpus.data(), corpusExtension);
+        const uint32_t corpusPattern =
+            corpusFound ? 3 + corpusExtension : 0;
+        const uint32_t selfPattern = found ? 3 + extension : 0;
+        if (corpusPattern > selfPattern + ngram_.ngramCorpusMargin_) {
+          std::copy(corpus.begin(), corpus.end(), proposals[lane].begin());
+          found = corpusFound;
+        }
+      }
       foundCounts[lane] = found;
       if (found) {
         // Repeat the last real candidate: a duplicate only loses its row.

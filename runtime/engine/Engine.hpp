@@ -251,6 +251,11 @@ private:
     uint32_t promptTokens = 0;
     uint32_t reportedPromptTokens = 0;
     uint32_t replayTokens = 0;
+    // The request's lifetime speculative counts, summed over its decode
+    // steps and reported on the done event: the proposals verify read and
+    // the share of them it accepted.
+    uint32_t draftedTokens = 0;
+    uint32_t acceptedDraftTokens = 0;
     // A failed dispatch must fit before replay can consume any model work.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;

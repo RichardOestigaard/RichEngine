@@ -43,9 +43,15 @@ enum RequestFlag : uint32_t {
   // Never select the model's stop tokens, so generation runs to its output
   // limit. Only unconstrained generation can carry it.
   RequestIgnoreEndOfSequence = 1U << 0,
+  // The serving layer expects this request to reuse earlier traffic (a
+  // session continuation, a prompt-prefix match or a corpus suffix hit):
+  // when the global n-gram corpus is enabled in hinted mode the lane may
+  // draft from it. Without the corpus the bit changes nothing.
+  RequestNgramCorpusHint = 1U << 1,
 };
 
-inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+inline constexpr uint32_t kRequestFlagBits =
+    RequestIgnoreEndOfSequence | RequestNgramCorpusHint;
 
 // A request's token selection, its fields in the native request frame's
 // order. The defaults are greedy selection with nothing changing the logits.

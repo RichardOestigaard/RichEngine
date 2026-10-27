@@ -41,7 +41,10 @@
 /* Queued turns wait in a tray on top of the composer — out of the message
    log — in send order, first ("Next") at top. */
 .chat-shell .queue-tray { position: absolute; right: 0; bottom: calc(100% + 8px); left: 0; display: grid; gap: 6px; max-height: 168px; overflow-y: auto; scrollbar-width: thin }
-.chat-shell .queue-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border: 1px dashed var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); color: var(--muted); font-size: 12.5px }
+.chat-shell .queue-row { display: flex; align-items: center; gap: 6px; padding: 3px 5px 3px 3px; border: 1px dashed var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); color: var(--muted); font-size: 12.5px }
+/* The row body is a button: clicking pulls the turn back into the composer. */
+.chat-shell .queue-edit { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; padding: 4px 9px; border-radius: 9px; font: inherit; color: inherit; text-align: left }
+.chat-shell .queue-edit:hover { color: var(--text); background: var(--hover) }
 .chat-shell .queue-pos { flex: none; min-width: 26px; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
 .chat-shell .queue-text { overflow: hidden; flex: 1; min-width: 0; text-overflow: ellipsis; white-space: nowrap }
 .chat-shell .queue-atts { display: flex; flex: none; gap: 4px }
@@ -110,13 +113,13 @@
 .chat-shell .attachment { position: relative; width: 58px; height: 58px; flex: none }
 .chat-shell .attachment img, .chat-shell .attachment-status, .chat-shell .attachment-pdf { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 10px; object-fit: cover }
 .chat-shell .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
-.chat-shell .attachment.pdf { width: auto; min-width: 120px; max-width: 220px }
+.chat-shell .attachment.pdf, .chat-shell .attachment.txt { width: auto; min-width: 120px; max-width: 220px }
 .chat-shell .attachment-pdf { display: flex; align-items: center; gap: 8px; padding: 8px; background: var(--bubble); color: var(--muted); font-size: 11.5px; object-fit: unset }
 .chat-shell .attachment-pdf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .chat-shell .remove-image { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
 .chat-shell textarea { display: block; width: 100%; max-height: 180px; padding: 4px 8px; resize: none; border: 0; outline: 0; background: transparent; field-sizing: content }
 .chat-shell textarea::placeholder { color: var(--muted) }
-.chat-shell .toolbar { display: flex; align-items: center; gap: 4px }
+.chat-shell .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px }
 .chat-shell .toolbar .spacer { flex: 1 }
 .chat-shell .token-meter { align-self: center; margin-right: 4px; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap }
 .chat-shell .token-meter.warn { color: var(--warn) }
@@ -137,6 +140,7 @@
 .chat-shell .tools-row-text { display: grid; min-width: 0 }
 .chat-shell .tools-row-label { font-size: 13px }
 .chat-shell .tools-row-hint { color: var(--muted); font-size: 11.5px }
+.chat-shell .sampling-badge { display: flex; align-items: center; height: 32px; padding: 0 8px; color: var(--accent); cursor: default }
 .chat-shell .json-pill { display: flex; align-items: center; height: 32px; padding: 0 12px; border: 0; border-radius: 999px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); font: inherit; font-size: 13px; cursor: pointer }
 .chat-shell .json-pill:hover { background: color-mix(in srgb, var(--accent) 20%, transparent) }
 .chat-shell .effort[hidden] { display: none }
@@ -144,10 +148,13 @@
 .chat-shell .effort:hover, .chat-shell .effort:focus-within { color: var(--text); background: var(--hover) }
 .chat-shell .effort::after { position: absolute; top: 50%; right: 10px; transform: translateY(-50%); content: '\2304'; font-size: 11px; pointer-events: none }
 .chat-shell .effort > span { flex: none }
+/* The running turn's locked model/effort readout — a label, not dead selects. */
+.chat-shell .effort.static { overflow: hidden; max-width: 240px; padding-right: 12px; text-overflow: ellipsis; white-space: nowrap }
+.chat-shell .effort.static::after { content: none }
 .chat-shell select { display: block; min-width: 0; max-width: 140px; overflow: hidden; padding: 0; border: 0; outline: 0; background: transparent; text-overflow: ellipsis; white-space: nowrap; cursor: pointer }
 .chat-shell #send { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border-radius: 50%; color: var(--composer); background: var(--text); font-size: 15px; transition: transform .12s ease }
-.chat-shell #send:not(:disabled):hover { transform: scale(1.06) }
-.chat-shell #send:disabled { color: var(--muted); background: var(--hover) }
+.chat-shell #send:not([aria-disabled="true"]):hover { transform: scale(1.06) }
+.chat-shell #send[aria-disabled="true"] { color: var(--muted); background: var(--hover) }
 
 .chat-shell .md-done > :first-child, .chat-shell .md-tail > :first-child { margin-top: 0 }
 .chat-shell .md-done > :last-child, .chat-shell .md-tail > :last-child { margin-bottom: 0 }

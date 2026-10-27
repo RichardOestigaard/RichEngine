@@ -56,3 +56,9 @@
 }
 .settings-page .panel-row.wrap .btn { flex-shrink: 0 }
 .settings-page .danger-zone { margin-top: 12px }
+
+/* Memory editor rows: key, editable value, delete. */
+.memory-row { gap: 8px; align-items: center }
+.memory-key { min-width: 110px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px }
+.memory-key-input { max-width: 140px }
+.memory-value { flex: 1; min-width: 0 }

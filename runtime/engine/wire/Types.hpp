@@ -125,6 +125,7 @@ public:
                              std::span<const uint32_t> simulationTokens) = 0;
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
+                         uint32_t draftedTokens, uint32_t acceptedDraftTokens,
                          std::span<const float> optionLogits) = 0;
   virtual void failed(uint64_t requestId, LaneOutcome outcome,
                       std::string message) = 0;

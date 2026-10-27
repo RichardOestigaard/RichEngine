@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { storageGet, storageSet } from "../../api";
+import { devMode } from "../../devmode";
 import { fmtClock } from "../../format";
 import type { Conversation, Message, MessageContent, Part, ToolRun } from "./types";
 
@@ -16,7 +17,13 @@ function cleanUserContent(content: unknown): MessageContent | null {
     if (!part || typeof part !== "object") return [];
     const entry = part as Record<string, unknown>;
     if (entry.type === "text" && typeof entry.text === "string")
-      return [{ type: "text", text: entry.text }];
+      return [
+        {
+          type: "text",
+          text: entry.text,
+          ...(typeof entry.name === "string" ? { name: entry.name } : {}),
+        },
+      ];
     if (entry.type === "image_url") {
       const url = (entry.image_url as Record<string, unknown> | undefined)?.url;
       if (typeof url === "string" && url.startsWith("data:image/"))
@@ -54,6 +61,8 @@ function cleanMessage(message: unknown): Message | null {
     if (typeof entry.reasoning_content === "string") clean.reasoning_content = entry.reasoning_content;
     if (typeof entry.tps === "number" && Number.isFinite(entry.tps) && entry.tps > 0) clean.tps = entry.tps;
     if (typeof entry.stats === "string") clean.stats = entry.stats;
+    if (typeof entry.think_secs === "number" && Number.isFinite(entry.think_secs) && entry.think_secs > 0)
+      clean.think_secs = entry.think_secs;
     if (Array.isArray(entry.tool_runs)) {
       const runs = entry.tool_runs.flatMap((run): ToolRun[] => {
         if (!run || typeof run !== "object") return [];
@@ -197,15 +206,19 @@ export function chatId(): string {
     byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export function userParts(content: MessageContent): { text: string; images: string[]; files: { name: string; url: string }[] } {
+export function userParts(content: MessageContent): { text: string; images: string[]; files: { name: string; url: string; kind: "pdf" | "text" }[] } {
   if (typeof content === "string") return { text: content, images: [], files: [] };
   return {
-    text: content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n"),
+    // Named text parts are pasted-text attachments: chips in the bubble, not
+    // inline paragraphs. The server never sees the name — it reads text only.
+    text: content.flatMap(part => part.type === "text" && !part.name ? [part.text] : []).join("\n"),
     images: content.flatMap(part => part.type === "image_url" ? [part.image_url.url] : []),
-    files: content.flatMap(part =>
+    files: content.flatMap((part): { name: string; url: string; kind: "pdf" | "text" }[] =>
       part.type === "file"
-        ? [{ name: part.file.filename || "document.pdf", url: part.file.file_data }]
-        : [])
+        ? [{ name: part.file.filename || "document.pdf", url: part.file.file_data, kind: "pdf" }]
+        : part.type === "text" && part.name
+          ? [{ name: part.name, url: part.text, kind: "text" }]
+          : [])
   };
 }
 
@@ -260,6 +273,14 @@ export function statsText(assistant: Message, contextLen: number): string {
     const cached = usage.prompt_tokens_details?.cached_tokens;
     if (cached) parts.push(`${cached.toLocaleString()} cached`);
   }
+  if (
+    devMode() &&
+    assistant.drafted &&
+    assistant.accepted_draft !== undefined
+  )
+    parts.push(
+      `draft ${assistant.accepted_draft.toLocaleString()}/${assistant.drafted.toLocaleString()} (${Math.round((assistant.accepted_draft / assistant.drafted) * 100)}%)`
+    );
   if (assistant.stopped) parts.push("stopped");
   if (assistant.interrupted) parts.push("interrupted");
   return parts.join(" · ");

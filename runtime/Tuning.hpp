@@ -145,6 +145,15 @@ struct Tuning {
   double draftConfMin = 0.0;        // RICHENGINE_DRAFT_CONF_MIN
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;        // RICHENGINE_NGRAM_TREE_MIN
+  // The cross-request corpus (model/NgramIndex.hpp): 0 keeps it off, 1
+  // lets every greedy lane draft from it, 2 only lanes carrying
+  // RequestNgramCorpusHint. CORPUS_ALL indexes the finished stream whole
+  // (prompt + output — tool results included); the default indexes the
+  // emitted span only. CORPUS_MARGIN is AgSpec's preference margin: the
+  // corpus match's pattern must beat the live match's by that many tokens.
+  uint32_t ngramCorpus = 0;         // RICHENGINE_NGRAM_CORPUS
+  bool ngramCorpusAll = false;      // RICHENGINE_NGRAM_CORPUS_ALL (presence)
+  uint32_t ngramCorpusMargin = 5;   // RICHENGINE_NGRAM_CORPUS_MARGIN
   double treeAcceptMin = 0.0;       // RICHENGINE_TREE_ACCEPT_MIN
   double treeAcceptMax = 6.0;       // RICHENGINE_TREE_ACCEPT_MAX
   // Presence flags for the threshold knobs above: a family's ModelTuning
@@ -314,6 +323,9 @@ inline Tuning makeTuning() {
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
   t.ngramTreeMin = envDouble("RICHENGINE_NGRAM_TREE_MIN", 1.0);
+  t.ngramCorpus = envUint("RICHENGINE_NGRAM_CORPUS", 0);
+  t.ngramCorpusAll = envFlag("RICHENGINE_NGRAM_CORPUS_ALL");
+  t.ngramCorpusMargin = envUint("RICHENGINE_NGRAM_CORPUS_MARGIN", 5);
   t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");
   t.treeAcceptMin = envDouble("RICHENGINE_TREE_ACCEPT_MIN", 0.0);
   t.treeAcceptMaxSet = envFlag("RICHENGINE_TREE_ACCEPT_MAX");

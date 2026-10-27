@@ -24,6 +24,7 @@ import {
   SYSTEM_KEY,
 } from "./chat/storage";
 import {
+  readMemory,
   SEARCH_PROVIDER_LABELS,
   SEARCH_PROVIDER_NEEDS_KEY,
   SEARCH_PROVIDERS,
@@ -33,7 +34,10 @@ import {
   setSearchApiKey,
   setSearchInstance,
   setSearchProvider,
+  writeMemory,
 } from "./chat/tools";
+import type { MemoryFact } from "./chat/tools";
+import { devMode, setDevMode } from "../devmode";
 import type { SearchProvider } from "./chat/tools";
 import "./settings.css";
 
@@ -89,7 +93,7 @@ interface InstanceInfo {
 }
 
 /* The destructive action waiting on AlertDialog confirmation. */
-type ConfirmTarget = "chats" | "drafts" | "reset";
+type ConfirmTarget = "chats" | "drafts" | "memory" | "reset";
 
 function chatCount(): number {
   try {
@@ -261,12 +265,65 @@ export default function Settings() {
     location.reload();
   }
 
+  /* The memory editor mirrors the tool store into a signal; writes go
+     through writeMemory and update it. */
+  const [memories, setMemories] = createSignal<Record<string, MemoryFact>>(
+    readMemory()
+  );
+  const [newKey, setNewKey] = createSignal("");
+  const [newValue, setNewValue] = createSignal("");
+
+  const memoryRows = () =>
+    Object.entries(memories()).sort((a, b) => b[1].updated - a[1].updated);
+
+  function commitMemory(entries: Record<string, MemoryFact>): void {
+    const problem = writeMemory(entries);
+    if (problem) {
+      pushToast("error", problem);
+      return;
+    }
+    setMemories(entries);
+  }
+
+  function updateMemory(key: string, value: string): void {
+    if (!value.trim()) return;
+    commitMemory({ ...memories(), [key]: { value, updated: Date.now() } });
+  }
+
+  function deleteMemory(key: string): void {
+    const entries = { ...memories() };
+    delete entries[key];
+    commitMemory(entries);
+  }
+
+  function addMemory(): void {
+    const key = newKey()
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .slice(0, 100);
+    const value = newValue().trim().slice(0, 4000);
+    if (!key || !value) return;
+    commitMemory({
+      ...memories(),
+      [key]: { value, updated: Date.now() },
+    });
+    setNewKey("");
+    setNewValue("");
+  }
+
+  function clearMemory(): void {
+    commitMemory({});
+    pushToast("ok", "Forgot every stored memory.");
+  }
+
   /* Runs whichever action the confirm dialog is currently describing. */
   function runConfirmed() {
     const target = confirm();
     setConfirm(null);
     if (target === "chats") clearChats();
     else if (target === "drafts") clearDrafts();
+    else if (target === "memory") clearMemory();
     else if (target === "reset") resetSettings();
   }
 
@@ -275,7 +332,9 @@ export default function Settings() {
       ? "Clear all chats?"
       : confirm() === "drafts"
         ? "Clear drafts?"
-        : "Reset all settings?";
+        : confirm() === "memory"
+          ? "Forget all memories?"
+          : "Reset all settings?";
 
   const confirmLabel = () => (confirm() === "reset" ? "Reset and reload" : "Clear");
 
@@ -285,6 +344,8 @@ export default function Settings() {
       return `This permanently deletes ${chats() === 1 ? "the saved conversation" : `all ${chats()} saved conversations`} stored in this browser. This cannot be undone.`;
     if (target === "drafts")
       return `This deletes ${drafts()} unsent composer draft${drafts() === 1 ? "" : "s"} held in this tab session.`;
+    if (target === "memory")
+      return `This forgets ${memoryRows().length === 1 ? "the stored memory" : `all ${memoryRows().length} stored memories`}; the chat's memory tools can no longer recall them.`;
     return "This resets the theme, API key, model, thinking effort, system prompt and sidebar preference, then reloads the page. Saved chats and drafts stay.";
   };
 
@@ -514,7 +575,121 @@ export default function Settings() {
         </div>
       </section>
 
-      {/* 5. Local data */}
+      {/* 5. Memory — the chat page's memory_* tools read this store */}
+      <section class="section">
+        <h2>Memory</h2>
+        <div class="panel">
+          <Show
+            when={memoryRows().length}
+            fallback={
+              <div class="panel-row">
+                <span class="grow muted">No memories stored.</span>
+              </div>
+            }
+          >
+            <For each={memoryRows()}>
+              {([key, fact]) => (
+                <div class="panel-row memory-row">
+                  <span class="memory-key mono" title={`Saved ${fact.updated ? new Date(fact.updated).toLocaleString() : "—"}`}>
+                    {key}
+                  </span>
+                  <input
+                    class="settings-input memory-value"
+                    type="text"
+                    value={fact.value}
+                    aria-label={`Memory ${key}`}
+                    onChange={(event) =>
+                      updateMemory(key, event.currentTarget.value)
+                    }
+                  />
+                  <button
+                    type="button"
+                    class="btn small danger"
+                    title={`Forget "${key}"`}
+                    aria-label={`Forget ${key}`}
+                    onClick={() => deleteMemory(key)}
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+            </For>
+          </Show>
+          <div class="panel-row memory-row">
+            <input
+              class="settings-input memory-key-input"
+              type="text"
+              placeholder="key"
+              aria-label="New memory key"
+              maxlength={100}
+              value={newKey()}
+              onInput={(event) => setNewKey(event.currentTarget.value)}
+            />
+            <input
+              class="settings-input memory-value"
+              type="text"
+              placeholder="fact to remember"
+              aria-label="New memory value"
+              maxlength={4000}
+              value={newValue()}
+              onInput={(event) => setNewValue(event.currentTarget.value)}
+              onKeyDown={(event) => event.key === "Enter" && addMemory()}
+            />
+            <button
+              type="button"
+              class="btn small"
+              disabled={!newKey().trim() || !newValue().trim()}
+              onClick={addMemory}
+            >
+              Add
+            </button>
+          </div>
+          <div class="panel-row wrap">
+            <span class="grow field-note">
+              Facts the chat's memory tools save, list and forget. Edits apply
+              at once and persist across chats in this browser.
+            </span>
+            <button
+              type="button"
+              class="btn small danger"
+              title="Forget every stored memory"
+              disabled={!memoryRows().length}
+              onClick={() => setConfirm("memory")}
+            >
+              Clear all
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* 6. Developer */}
+      <section class="section">
+        <h2>Developer</h2>
+        <div class="panel">
+          <div class="panel-row">
+            <label
+              class="settings-check grow"
+              title="Show engine internals: per-reply draft acceptance and the model's sampling overrides on the composer"
+            >
+              <input
+                type="checkbox"
+                checked={devMode()}
+                onChange={(event) => setDevMode(event.currentTarget.checked)}
+              />
+              Developer mode
+            </label>
+          </div>
+          <div class="panel-row wrap">
+            <span class="grow field-note">
+              Adds draft acceptance (accepted/proposed tokens) to each reply's
+              stats line and a cog badge in the composer when the picked model
+              has sampling overrides.
+            </span>
+          </div>
+        </div>
+      </section>
+
+      {/* 7. Local data */}
       <section class="section">
         <h2>Local data</h2>
         <div class="panel">

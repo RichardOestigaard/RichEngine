@@ -64,7 +64,7 @@ _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
 _MASK_REQUEST = struct.Struct("<QQII")
-_DONE = struct.Struct("<QBIIQQQI")
+_DONE = struct.Struct("<QBIIQQQIII")
 _ERROR = struct.Struct("<BBQII")
 _STATUS_JSON = struct.Struct("<Q")
 
@@ -78,7 +78,7 @@ assert _REQUEST.size == 91
 assert _IMAGE_SPAN.size == 32
 assert _READY.size == 9
 assert _START.size == 16
-assert _DONE.size == 45
+assert _DONE.size == 53
 assert _ERROR.size == 18
 assert _STATUS_JSON.size == 8
 
@@ -202,10 +202,17 @@ class RequestFlag(IntFlag):
     # Never select the model's stop tokens, so generation runs to its output
     # limit. Only unconstrained generation can carry it.
     IGNORE_END_OF_SEQUENCE = 1 << 0
+    # The serving layer expects reuse of earlier traffic (session
+    # continuation, prompt-prefix match or corpus suffix hit): the
+    # cross-request n-gram corpus may draft for this lane when enabled in
+    # hinted mode (RICHENGINE_NGRAM_CORPUS=2).
+    NGRAM_CORPUS_HINT = 1 << 1
 
 
 # A request with any other bit set is a request error.
-_REQUEST_FLAG_BITS = int(RequestFlag.IGNORE_END_OF_SEQUENCE)
+_REQUEST_FLAG_BITS = int(
+    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.NGRAM_CORPUS_HINT
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -436,6 +443,10 @@ class DoneEvent:
     prefill_micros: int
     decode_micros: int
     wall_micros: int
+    # The request's lifetime speculative counts: draft proposals the verify
+    # stages read, and the share of them accepted into the output.
+    drafted_tokens: int
+    accepted_draft_tokens: int
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...]

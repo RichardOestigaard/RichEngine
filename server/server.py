@@ -626,6 +626,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "vision": app.vision,
                     "decision": app.decision_pathway,
                     "input_modalities": app.input_modalities,
+                    "tool_dialect": (
+                        app.serving_dialect.name
+                        if app.serving_dialect is not None
+                        else None
+                    ),
                     **(
                         {"root": app.response_model}
                         if name != app.response_model

@@ -332,17 +332,19 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   return "";
 }
 
-interface MemoryEntry {
+export interface MemoryFact {
   value: string;
   updated: number;
 }
 
-function readMemory(): Record<string, MemoryEntry> {
+/* The memory tool's whole store: Settings' memory editor reads and writes
+   the same entries the model's memory_* calls do. */
+export function readMemory(): Record<string, MemoryFact> {
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(MEMORY_KEY) ?? "{}");
     if (!stored || typeof stored !== "object" || Array.isArray(stored))
       return {};
-    const entries: Record<string, MemoryEntry> = {};
+    const entries: Record<string, MemoryFact> = {};
     for (const [key, entry] of Object.entries(stored)) {
       const item = entry as Record<string, unknown>;
       if (typeof item?.value === "string")
@@ -354,7 +356,7 @@ function readMemory(): Record<string, MemoryEntry> {
   }
 }
 
-function writeMemory(entries: Record<string, MemoryEntry>): string | null {
+export function writeMemory(entries: Record<string, MemoryFact>): string | null {
   try {
     localStorage.setItem(MEMORY_KEY, JSON.stringify(entries));
     return null;

@@ -39,7 +39,7 @@ constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
-constexpr uint64_t kDoneFixedBytes = 45;
+constexpr uint64_t kDoneFixedBytes = 53;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 // u64 absolute deadline, u64 remaining deadline, u8 priority, u8 flags,
@@ -674,6 +674,8 @@ EncodedEvent encodeDone(const DoneEvent &event) {
   writer.u64(event.prefillMicros);
   writer.u64(event.decodeMicros);
   writer.u64(event.wallMicros);
+  writer.u32(event.draftedTokens);
+  writer.u32(event.acceptedDraftTokens);
   writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
   for (float logit : event.optionLogits)
     writer.f32(logit);

@@ -557,6 +557,22 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // rescues nothing, and the tree's wider verify would cost for free rows.
     const double ngramTreeMin_;
     static constexpr uint32_t kNgramProbeTokens = 256;
+    // The cross-request corpus (RICHENGINE_NGRAM_CORPUS): 0 off, 1 every
+    // greedy lane may draft from it, 2 only lanes carrying
+    // RequestNgramCorpusHint. A corpus match displaces the lane's own only
+    // past the margin — the pattern it matched must be that much longer
+    // (AgSpec's δ). corpusAll_ pushes a finished request's whole stream;
+    // the default pushes the emitted span only.
+    const uint32_t ngramCorpus_ = modelPolicy().ngramCorpus;
+    const bool ngramCorpusAll_ = modelPolicy().ngramCorpusAll;
+    const uint32_t ngramCorpusMargin_ = modelPolicy().ngramCorpusMargin;
+    ngram::Corpus ngramCorpusDocs_;
+    // Whether a lane may consult the corpus this step. Arming happens at
+    // admission (seedNgramHistory) and through the starvation probe in
+    // applyNgramPredraft — the flag is a prior, the probes are proof.
+    [[nodiscard]] bool corpusLane(const Request &entry) const noexcept {
+      return entry.corpusArmed;
+    }
     // Whether the batch left applyNgramPredraft as a comb tree.
     bool predraftedTree_ = false;
     // The batch-maximum live node count of the emitted comb, known at encode
@@ -1896,6 +1912,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // table logic.
   void seedNgramHistory(Request &entry, std::span<const uint32_t> prompt);
   void appendNgramTokens(Request &entry, std::span<const uint32_t> tokens);
+  // A finishing request's committed stream joins the cross-request corpus:
+  // the emitted span, or the whole stream under RICHENGINE_NGRAM_CORPUS_ALL.
+  void noteNgramCorpus(const Request &entry);
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -63,7 +64,10 @@ inline void append(Table &table, std::span<const uint32_t> tokens) {
 // Follows the most recent earlier occurrences of the stream's closing
 // 3-gram — the stream's own tail is a key's newest start, so each key
 // keeps two. The candidate with the longest backward extension wins.
-inline uint32_t lookup(const Table &table, uint32_t *out) {
+// `extensionOut`, when set, gets the winning occurrence's backward
+// extension — the matched pattern's effective length is 3 + extension.
+inline uint32_t lookup(const Table &table, uint32_t *out,
+                       uint32_t *extensionOut = nullptr) {
   const std::vector<uint32_t> &history = table.history;
   const uint32_t size = static_cast<uint32_t>(history.size());
   if (size < 4)
@@ -94,6 +98,89 @@ inline uint32_t lookup(const Table &table, uint32_t *out) {
   const uint32_t followers =
       std::min<uint32_t>(RICHENGINE_DRAFT_PROPOSAL_TOKENS, bestFollowers);
   std::copy_n(history.data() + best + 3, followers, out);
+  if (extensionOut)
+    *extensionOut = bestExtension;
+  return followers;
+}
+
+// The cross-request corpus (RICHENGINE_NGRAM_CORPUS): a FIFO of per-request
+// tables, each a finished request's committed token stream. A lane drafts
+// from it only when its corpus match beats the live match's pattern length
+// by the preference margin — a long hit in unrelated reference text is
+// likely coincidental (AgSpec's δ; docs/NGRAM_V2_RESEARCH.md).
+struct Corpus {
+  // Every doc is one finished stream; eviction is whole-doc FIFO.
+  std::deque<Table> docs;
+  size_t tokens = 0;
+};
+
+// A corpus match with this effective pattern length (3 + backward
+// extension) arms a lane for corpus lookups: an 8-token verbatim suffix
+// of the prompt already in earlier traffic means the reply likely
+// continues known text.
+constexpr uint32_t kCorpusArmMin = 8;
+
+inline void push(Corpus &corpus, std::span<const uint32_t> stream,
+                 uint32_t maxDocs = 64, size_t maxTokens = 1u << 20) {
+  if (stream.size() < 4)
+    return;
+  Table doc;
+  seed(doc, stream);
+  corpus.docs.push_back(std::move(doc));
+  corpus.tokens += stream.size();
+  while (corpus.docs.size() > maxDocs ||
+         (!corpus.docs.empty() &&
+          corpus.tokens - corpus.docs.front().history.size() >
+              maxTokens - corpus.docs.front().history.size())) {
+    corpus.tokens -= corpus.docs.front().history.size();
+    corpus.docs.pop_front();
+  }
+}
+
+// The lane's closing 3-gram looked up across every corpus doc; the winning
+// occurrence's continuation fills `out`. Returns the follower count and the
+// winning backward extension measured against the lane's own history —
+// that is the corpus match's effective pattern length, minus the fixed 3.
+inline uint32_t lookupCorpus(const Corpus &corpus,
+                             std::span<const uint32_t> laneHistory,
+                             uint32_t *out, uint32_t &extensionOut) {
+  const uint32_t laneSize = static_cast<uint32_t>(laneHistory.size());
+  if (laneSize < 3)
+    return 0;
+  const uint64_t pattern =
+      key(laneHistory.data() + laneSize - 3);
+  const Table *bestDoc = nullptr;
+  uint32_t best = kNone, bestExtension = 0, bestFollowers = 0;
+  for (const Table &doc : corpus.docs) {
+    const auto found = doc.starts.find(pattern);
+    if (found == doc.starts.end())
+      continue;
+    const auto &dhistory = doc.history;
+    const uint32_t dsize = static_cast<uint32_t>(dhistory.size());
+    for (const uint32_t start : found->second) {
+      if (start == kNone || start + 3 >= dsize)
+        continue;
+      uint32_t extension = 0;
+      while (extension < start && extension < laneSize - 3 &&
+             dhistory[start - 1 - extension] ==
+                 laneHistory[laneSize - 4 - extension])
+        ++extension;
+      const uint32_t followers = dsize - (start + 3);
+      if (best == kNone || extension > bestExtension ||
+          (extension == bestExtension && followers > bestFollowers)) {
+        best = start;
+        bestDoc = &doc;
+        bestExtension = extension;
+        bestFollowers = followers;
+      }
+    }
+  }
+  if (best == kNone)
+    return 0;
+  const uint32_t followers =
+      std::min<uint32_t>(RICHENGINE_DRAFT_PROPOSAL_TOKENS, bestFollowers);
+  std::copy_n(bestDoc->history.data() + best + 3, followers, out);
+  extensionOut = bestExtension;
   return followers;
 }
 

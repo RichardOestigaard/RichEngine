@@ -156,6 +156,7 @@ private:
                      std::span<const uint32_t> simulationTokens) override;
   void completed(uint64_t requestId, EngineFinishReason reason,
                  uint32_t promptTokens, uint32_t completionTokens,
+                 uint32_t draftedTokens, uint32_t acceptedDraftTokens,
                  std::span<const float> optionLogits) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
               std::string message) override;

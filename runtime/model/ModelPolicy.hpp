@@ -64,6 +64,11 @@ struct ModelPolicy final {
   double ngramDraftExpect = 4.0;   // RICHENGINE_NGRAM_DRAFT_EXPECT
   uint32_t ngramWarmup = 8;        // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;       // RICHENGINE_NGRAM_TREE_MIN
+  // Cross-request corpus (model/NgramIndex.hpp Corpus): 0 off, 1 all
+  // greedy lanes, 2 hinted lanes only; CORPUS_ALL includes the prompt.
+  uint32_t ngramCorpus = 0;        // RICHENGINE_NGRAM_CORPUS
+  bool ngramCorpusAll = false;     // RICHENGINE_NGRAM_CORPUS_ALL
+  uint32_t ngramCorpusMargin = 5;  // RICHENGINE_NGRAM_CORPUS_MARGIN
   double treeAcceptMin = 0.0;      // RICHENGINE_TREE_ACCEPT_MIN
   double treeAcceptMax = 6.0;      // RICHENGINE_TREE_ACCEPT_MAX
   // ops/Canvas.cpp + model/RuntimeImpl.hpp canvas policy. The profile bundles
@@ -147,6 +152,9 @@ namespace detail {
       env.ngramWarmupSet ? env.ngramWarmup : maker.ngramWarmup;
   p.ngramTreeMin =
       env.ngramTreeMinSet ? env.ngramTreeMin : maker.ngramTreeMin;
+  p.ngramCorpus = env.ngramCorpus;
+  p.ngramCorpusAll = env.ngramCorpusAll;
+  p.ngramCorpusMargin = env.ngramCorpusMargin;
   p.treeAcceptMin =
       env.treeAcceptMinSet ? env.treeAcceptMin : maker.treeAcceptMin;
   p.treeAcceptMax =

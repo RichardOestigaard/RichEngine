@@ -172,6 +172,12 @@ struct RuntimeRequest final {
   // Next generatedTokens count at which a gated-off lane may probe again.
   uint32_t ngramProbeAt = 0;
   bool ngramInFlight = false;
+  // Cross-request corpus eligibility (RICHENGINE_NGRAM_CORPUS): armed at
+  // admission for every lane in mode 1, by the hint flag or a tail-probe
+  // hit in mode 2, and later by the starvation probe when the lane's own
+  // 3-gram finds nothing. corpusProbeAt paces those starvation probes.
+  bool corpusArmed = false;
+  uint32_t corpusProbeAt = 0;
   // Adaptive proposal length (opt-in, RICHENGINE_ADAPTIVE_PROPOSALS): EWMA of
   // accepted draft tokens per chain verify step and the lane's current
   // budget — the acceptance cap and live verify rows that step.

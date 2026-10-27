@@ -334,7 +334,11 @@ def metrics_dict(result):
     }
     metrics = {
         "prefill": {"tokens": result.prefill_tokens},
-        "decode": {"tokens": decode_tokens},
+        "decode": {
+            "tokens": decode_tokens,
+            "drafted_tokens": result.drafted_tokens,
+            "accepted_draft_tokens": result.accepted_draft_tokens,
+        },
         # Native DoneEvent intervals are request lifecycle timing, not summed
         # executor command/GPU time. Native batch throughput lives in /status.
         "request_latency": latency,

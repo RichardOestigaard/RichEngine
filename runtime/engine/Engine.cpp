@@ -1933,6 +1933,8 @@ void Engine::apply(const BatchPlan &plan,
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
       acceptedDraftTokens += result.acceptedDraftTokens;
+      active.draftedTokens += result.draftedTokens;
+      active.acceptedDraftTokens += result.acceptedDraftTokens;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
       const uint32_t storedTokens =
@@ -2064,7 +2066,8 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   const auto completionTokens =
       static_cast<uint32_t>(active.exactTokens.size() - active.promptTokens);
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, active.draftedTokens,
+                    active.acceptedDraftTokens, optionLogits);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

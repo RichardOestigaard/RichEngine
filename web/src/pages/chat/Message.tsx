@@ -102,6 +102,16 @@ export default function MessageView(props: {
       : "");
   const savedStats = [baseStats, clock].filter(Boolean).join(" · ");
 
+  const thoughtLabel = () => {
+    if (props.live) return "Thinking…";
+    const secs = msg.think_secs;
+    if (!secs) return "Thought";
+    const whole = Math.round(secs);
+    return `Thought for ${
+      whole >= 60 ? `${Math.floor(whole / 60)}m ${whole % 60}s` : `${Math.max(1, whole)}s`
+    }`;
+  };
+
   return (
     <div
       class="message assistant"
@@ -110,7 +120,7 @@ export default function MessageView(props: {
     >
       <details hidden={!reasoning} open={!!props.live}>
         <summary>
-          <span class="think-label">{props.live ? "Thinking…" : "Thought"}</span>
+          <span class="think-label">{thoughtLabel()}</span>
         </summary>
         <div class="reasoning">{displayContent(reasoning)}</div>
       </details>
@@ -174,6 +184,19 @@ export default function MessageView(props: {
             </button>
           }
         >
+          <Show when={msg.interrupted || msg.stopped}>
+            <button
+              class="act cont-reply"
+              type="button"
+              title="Continue where it left off"
+              aria-label="Continue response"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 5l7 7-7 7" />
+                <path d="M12 5l7 7-7 7" />
+              </svg>
+            </button>
+          </Show>
           <button
             class="act copy-msg"
             type="button"

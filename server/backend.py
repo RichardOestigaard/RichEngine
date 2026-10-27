@@ -1,7 +1,9 @@
 """Native request submission, cancellation, recovery and completion ownership."""
 
+import collections
 import copy
 import functools
+import os
 import queue
 import threading
 import time
@@ -38,6 +40,54 @@ RESTART_BACKOFF_SECONDS = 5.0
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
 
+# RICHENGINE_TRACE_TOKENS=/path.jsonl records every completed request's prompt
+# and output token ids (plus sampling and linkage fields) for offline replay —
+# the n-gram/spec-decoding corpus analysis in dev/benchmarks/ngram_replay.py.
+# Off without the variable.
+TRACE_TOKENS_PATH = os.environ.get("RICHENGINE_TRACE_TOKENS")
+_trace_tokens_lock = threading.Lock()
+
+# RICHENGINE_NGRAM_HINT=1 marks requests likely to reuse earlier traffic —
+# a session continuation (Responses API previous_response_id or a new
+# prompt extending a recent one) or a prompt whose closing tokens already
+# occur in a recent output — with the wire flag the cross-request n-gram
+# corpus consults (RICHENGINE_NGRAM_CORPUS=2). Off without the variable;
+# the rings it reads stay populated either way since trace consumers may
+# want them.
+NGRAM_HINT = os.environ.get("RICHENGINE_NGRAM_HINT") == "1"
+# How many recent requests the hint checks, and how far into the prompt
+# tail the corpus probe looks.
+_NGRAM_HINT_RING = 64
+_NGRAM_SUFFIX_PROBE = 16
+
+
+def trace_tokens(job, streamer, result, error):
+    if TRACE_TOKENS_PATH is None:
+        return
+    output = list(streamer.token_ids)
+    if not output and result is None:
+        return
+    record = {
+        "v": 1,
+        "id": job.public_id or str(job.request_id),
+        "created_at": job.created_at,
+        "outcome": result.reason if result else error.code,
+        "prompt": list(job.prefix_tokens) + list(job.prompt_tokens),
+        "output": output,
+        "temperature": getattr(job.sampling, "temperature", None),
+        "shared_prefix_tokens": job.shared_prefix_tokens,
+        "generation_prompt_tokens": job.generation_prompt_tokens,
+        "previous_id": job.response_previous_id,
+        "tools_signature": job.tools_signature,
+    }
+    try:
+        line = json_codec.dumps(record)
+        with _trace_tokens_lock:
+            with open(TRACE_TOKENS_PATH, "a") as stream:
+                stream.write(line + "\n")
+    except Exception as logging_error:
+        log_unexpected(logging_error)
+
 
 def remaining_request_time(deadline):
     remaining = deadline - time.monotonic()
@@ -67,6 +117,10 @@ class NativeResult:
     cache: CacheInfo = field(default_factory=CacheInfo)
     stop_sequence: str | None = None
     first_token_batch_tokens: int = 0
+    # The request's speculative counts from the done event: draft proposals
+    # verified, and the share of them accepted into the output.
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
     # The last prompt-progress report's elapsed time inside the
     # start→first-token window; 0 when none arrived.
     prompt_progress_ms: float = 0.0
@@ -399,6 +453,11 @@ class NativeBackend:
         # why restarts stopped.
         self.engine_error = None
         self.terminals = queue.Queue()
+        # Recent completed requests' prompts and outputs — the n-gram
+        # corpus hint's evidence. Bounded rings; each entry is one
+        # request's token-id tuple.
+        self.recent_prompts = collections.deque(maxlen=_NGRAM_HINT_RING)
+        self.recent_outputs = collections.deque(maxlen=_NGRAM_HINT_RING)
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
             name="richengine-http-finalizer",
@@ -798,7 +857,39 @@ class NativeBackend:
             self.active[job.request_id] = state
         return state, request, on_event, on_complete
 
+    def _ngram_hint(self, job):
+        """Whether the request looks like it will reuse earlier traffic:
+        a named session predecessor, a prompt extending a recent prompt
+        (multi-turn history), or a prompt tail already in a recent output
+        (the emitted form is a likely continuation). Cheap admission-time
+        evidence only; the runtime's own gate decides whether proposals
+        land."""
+        if job.response_previous_id:
+            return True
+        # Structured output (grammar mask or callable tools) emits in a
+        # fixed emission format — the corpus's strongest reuse case.
+        if job.constraint is not None or job.may_call_tools:
+            return True
+        prompt = list(job.prefix_tokens) + list(job.prompt_tokens)
+        if not prompt:
+            return False
+        for earlier in self.recent_prompts:
+            if len(earlier) <= len(prompt) and prompt[: len(earlier)] == list(
+                earlier
+            ):
+                return True
+        tail = prompt[-_NGRAM_SUFFIX_PROBE:]
+        if len(tail) == _NGRAM_SUFFIX_PROBE:
+            for emitted in self.recent_outputs:
+                text = list(emitted)
+                for i in range(len(text) - len(tail) + 1):
+                    if text[i : i + len(tail)] == tail:
+                        return True
+        return False
+
     def submit(self, job):
+        if NGRAM_HINT and self._ngram_hint(job):
+            job.flags |= wire.RequestFlag.NGRAM_CORPUS_HINT
         registered = self._register(job)
         if registered is None:
             return
@@ -1100,6 +1191,8 @@ class NativeBackend:
                 cache=job.cache,
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                drafted_tokens=done.drafted_tokens,
+                accepted_draft_tokens=done.accepted_draft_tokens,
                 prompt_progress_ms=state.prompt_progress_ms,
                 diffusion=self.diffusion,
             )
@@ -1141,6 +1234,11 @@ class NativeBackend:
             # before close() acquires the state lock remains a normal result.
             result = None
             error = APIError(503, "server is shutting down", "server_shutdown")
+        trace_tokens(job, state.streamer, result, error)
+        self.recent_prompts.append(
+            tuple(job.prefix_tokens) + tuple(job.prompt_tokens)
+        )
+        self.recent_outputs.append(tuple(state.streamer.token_ids))
         self._record(job, result=result, error=error)
         job.events.put(("error", error) if error else ("done", result))
 

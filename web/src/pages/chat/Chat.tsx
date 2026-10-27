@@ -31,7 +31,7 @@ import {
 import { displayContent, paintableText } from "./markdown";
 import { activeTools, isStrictRejection, jsonOutput, markStrictBroken, runTool, toolDetail } from "./tools";
 import { requestSampling } from "../../sampling";
-import type { Attachment, Message, MessageContent, ModelInfo, QueuedTurn, ToolRun, Usage } from "./types";
+import type { Attachment, Message, MessageContent, ModelInfo, Part, QueuedTurn, ToolRun, Usage } from "./types";
 import Sidebar from "./Sidebar";
 import Composer from "./Composer";
 import MessageView from "./Message";
@@ -41,7 +41,10 @@ import "./chat.css";
 interface StreamChunk {
   error?: { message?: string };
   prompt_progress?: { processed?: number; total?: number; cache?: number };
-  metrics?: { request_latency?: { stream_tokens_per_second?: number } };
+  metrics?: {
+    request_latency?: { stream_tokens_per_second?: number };
+    decode?: { drafted_tokens?: number; accepted_draft_tokens?: number };
+  };
   usage?: Usage;
   choices?: {
     finish_reason?: string | null;
@@ -67,6 +70,9 @@ interface ToolCallDraft {
 
 interface StreamState {
   firstDeltaAt: number;
+  /* performance.now() when reasoning first streamed; cleared into
+     assistant.think_secs when the answer (or the turn) ends it. */
+  thinkStart: number;
   finish: string | null;
   calls: (ToolCallDraft | undefined)[];
 }
@@ -284,6 +290,7 @@ export default function Chat() {
     const accepted = files
       .filter(
         (file) =>
+          file.type === "text/plain" ||
           (file.type.startsWith("image/") && imagesAccepted()) ||
           (file.type === "application/pdf" && pdfsAccepted())
       )
@@ -305,14 +312,22 @@ export default function Chat() {
       name: file.name,
       url: null,
       error: false,
-      kind: file.type === "application/pdf" ? "pdf" : "image",
+      kind:
+        file.type === "application/pdf"
+          ? "pdf"
+          : file.type === "text/plain"
+            ? "text"
+            : "image",
     }));
     setAttachments((list) => [...list, ...selected]);
     await Promise.all(
       accepted.map(async (file, index) => {
         const attachment = selected[index];
         try {
-          attachment.url = await readFile(file);
+          // Text attachments keep the raw text in url; it goes out as a
+          // named text part rather than a data URL.
+          attachment.url =
+            attachment.kind === "text" ? await file.text() : await readFile(file);
         } catch {
           attachment.error = true;
           pushToast("error", `Could not read ${file.name || "file"}`);
@@ -335,15 +350,21 @@ export default function Chat() {
     const content: MessageContent = pending.length
       ? [
           ...(text ? [{ type: "text" as const, text }] : []),
-          ...pending.map((attachment) =>
+          ...pending.map((attachment): Part =>
             attachment.kind === "pdf"
               ? {
                   type: "file" as const,
                   file: { file_data: attachment.url!, filename: attachment.name },
                 }
-              : {
-                  type: "image_url" as const,
-                  image_url: { url: attachment.url! },
+              : attachment.kind === "text"
+                ? {
+                    type: "text" as const,
+                    text: attachment.url!,
+                    name: attachment.name,
+                  }
+                : {
+                    type: "image_url" as const,
+                    image_url: { url: attachment.url! },
                 }
           ),
         ]
@@ -353,6 +374,7 @@ export default function Chat() {
 
   async function complete() {
     if (!canSend()) return;
+    recallPos = -1;
     const turn = buildTurn();
     setInput("");
     setAttachments([]);
@@ -423,6 +445,16 @@ export default function Chat() {
     setQueued((list) => list.filter((item) => item !== turn));
   }
 
+  /* Clicking a queued row pulls it back for editing: the text lands ahead
+     of the current draft, attachments return to the strip. */
+  function editQueued(turn: QueuedTurn) {
+    removeQueued(turn);
+    const draft = input().trim();
+    setInput([turn.text, draft].filter(Boolean).join("\n"));
+    setAttachments((list) => [...turn.attachments, ...list]);
+    inputEl?.focus();
+  }
+
   function paintStats(box: HTMLElement, assistant: Message) {
     const stats = box.querySelector<HTMLElement>(".stats");
     if (!stats) return;
@@ -487,6 +519,10 @@ export default function Chat() {
     }
     const speed = Number(chunk.metrics?.request_latency?.stream_tokens_per_second);
     if (Number.isFinite(speed) && speed > 0) assistant.tps = speed;
+    if (chunk.metrics?.decode?.drafted_tokens)
+      assistant.drafted = chunk.metrics.decode.drafted_tokens;
+    if (chunk.metrics?.decode?.accepted_draft_tokens)
+      assistant.accepted_draft = chunk.metrics.decode.accepted_draft_tokens;
     if (chunk.usage) assistant.usage = chunk.usage;
     if ((assistant.tps || assistant.usage) && box) paintStats(box, assistant);
     const choice = chunk.choices?.[0];
@@ -506,6 +542,7 @@ export default function Chat() {
     const waiting = box?.querySelector<HTMLElement>(".waiting");
     if (waiting) waiting.hidden = true;
     if (delta.reasoning_content) {
+      if (!state.thinkStart) state.thinkStart = performance.now();
       assistant.reasoning_content =
         (assistant.reasoning_content ?? "") + delta.reasoning_content;
       const details = box?.querySelector<HTMLDetailsElement>("details");
@@ -518,6 +555,9 @@ export default function Chat() {
     }
     if (delta.content) {
       if (!state.firstDeltaAt) state.firstDeltaAt = performance.now();
+      // Reasoning ended when the answer started; stop its clock.
+      if (state.thinkStart && assistant.think_secs === undefined)
+        assistant.think_secs = (state.firstDeltaAt - state.thinkStart) / 1000;
       assistant.content = (assistant.content as string) + delta.content;
       schedulePaint(() =>
         paintableText(assistant.content as string, assistant.format)
@@ -746,16 +786,30 @@ export default function Chat() {
   }
 
   // Streams the assistant reply for the user message already at the tail.
-  // Regenerate truncates back to a user turn and calls this directly.
-  async function streamReply(firstPrompt: string) {
-    const assistant: Message = {
+  // Regenerate truncates back to a user turn and calls this directly; a
+  // resume seeds it with a cut-off reply that keeps streaming in place.
+  async function streamReply(firstPrompt: string, resume?: Message) {
+    const assistant: Message = resume ?? {
       role: "assistant",
       content: "",
       reasoning_content: "",
       created: Date.now(),
       ...(jsonOutput() ? { format: "json" as const } : {}),
     };
-    const state: StreamState = { firstDeltaAt: 0, finish: null, calls: [] };
+    if (resume) {
+      // The continued turn sheds its old labels and numbers; the new run
+      // repaints content and stats onto the same message object.
+      resume.stopped = resume.interrupted = undefined;
+      resume.stats = resume.tps = resume.usage = undefined;
+      resume.drafted = resume.accepted_draft = undefined;
+      resume.think_secs = undefined;
+    }
+    const state: StreamState = {
+      firstDeltaAt: 0,
+      thinkStart: 0,
+      finish: null,
+      calls: [],
+    };
     liveBox = undefined;
     setLive(assistant);
     maybeScroll();
@@ -781,6 +835,18 @@ export default function Chat() {
       // carries the assistant's calls and their results until the model
       // answers. Neither side of that transcript is stored or shown.
       const wire = requestMessages(messages());
+      /* A continued turn replays its partial answer so the model picks up
+         the thread; the nudge is wire-only and never renders. */
+      if (resume)
+        wire.push(
+          { role: "assistant", content: resume.content },
+          {
+            role: "user",
+            content:
+              "Continue your previous reply exactly where it stopped. " +
+              "Do not repeat or rephrase what was already written.",
+          }
+        );
       let tools = activeTools(model());
       if (tools.some((tool) => tool.function.name === "memory_save")) {
         const note =
@@ -888,6 +954,10 @@ export default function Chat() {
         if (ctrl.signal.aborted)
           throw new DOMException("The operation was aborted.", "AbortError");
       }
+      // Reasoning that never produced an answer (a stop, a pure tool turn)
+      // still earned its clock.
+      if (state.thinkStart && assistant.think_secs === undefined)
+        assistant.think_secs = (performance.now() - state.thinkStart) / 1000;
       finishLive(assistant);
       assistant.stats = statsText(assistant, contextLen());
       announce(
@@ -907,6 +977,8 @@ export default function Chat() {
       }
       if (isAbort(error)) assistant.stopped = true;
       else assistant.interrupted = true;
+      if (state.thinkStart && assistant.think_secs === undefined)
+        assistant.think_secs = (performance.now() - state.thinkStart) / 1000;
       const label = assistant.stopped ? "stopped" : "interrupted";
       assistant.stats = statsText(assistant, contextLen()) || label;
       finishLive(assistant);
@@ -942,7 +1014,7 @@ export default function Chat() {
         name: file.name,
         url: file.url,
         error: false,
-        kind: "pdf" as const,
+        kind: file.kind,
       })),
     ]);
     setMessages((list) => list.slice(0, index));
@@ -1004,7 +1076,32 @@ export default function Chat() {
     });
   }
 
+  /* Continue an interrupted or stopped reply in place: the partial bubble
+     leaves the wire history, becomes the streamed-into message again, and a
+     wire-only nudge asks the model to pick up where it stopped. */
+  function continueMessage(box: MessageElement) {
+    if (controller()) return;
+    const index = messages().indexOf(box._message as Message);
+    if (index < 0 || messages()[index]?.role !== "assistant") return;
+    const resume = messages()[index];
+    const prompt = messages()
+      .slice(0, index)
+      .reverse()
+      .find((message) => message.role === "user");
+    const { text } = userParts(prompt?.content ?? "");
+    setMessages((list) => list.slice(0, index));
+    setErrorNote(undefined);
+    pinned = true;
+    streamReply(text || "Image", resume).catch((error) => {
+      if (isAbort(error)) return;
+      // Nothing streamed: put the cut reply back so it is not lost.
+      setMessages((list) => [...list, resume]);
+      setErrorNote({ role: "assistant", content: errorText(error) });
+    });
+  }
+
   function reset() {
+    recallPos = -1;
     setAttachments([]);
     setErrorNote(undefined);
     setMenuOpen(false);
@@ -1050,14 +1147,47 @@ export default function Chat() {
     }
   }
 
-  // ArrowUp in an empty composer pulls the last user turn back for resending.
-  function recallLast() {
-    const last = messages()
-      .slice()
-      .reverse()
-      .find((message) => message.role === "user");
-    if (!last) return;
-    setInput(userParts(last.content).text);
+  /* ArrowUp in the composer walks back through sent user turns shell-style;
+     ArrowDown steps forward and past the newest restores the draft it hid.
+     Typing while a recalled turn is shown leaves history mode. */
+  let recallPos = -1;
+  let recallDraft = "";
+  const sentTexts = () =>
+    messages()
+      .filter((message) => message.role === "user")
+      .map((message) => userParts(message.content).text)
+      .filter(Boolean);
+
+  function recallPrev(): boolean {
+    const list = sentTexts();
+    // Only an empty box starts recall; a typed draft keeps the caret's Up.
+    if (!list.length || (recallPos === -1 && input())) return false;
+    if (recallPos === -1) {
+      recallDraft = input();
+      recallPos = list.length - 1;
+    } else if (recallPos > 0) {
+      recallPos--;
+    }
+    setInput(list[recallPos]);
+    return true;
+  }
+
+  function recallNext(): boolean {
+    if (recallPos === -1) return false;
+    const list = sentTexts();
+    if (recallPos < list.length - 1) {
+      recallPos++;
+      setInput(list[recallPos]);
+    } else {
+      recallPos = -1;
+      setInput(recallDraft);
+    }
+    return true;
+  }
+
+  function onDraftInput(value: string) {
+    if (recallPos !== -1 && sentTexts()[recallPos] !== value) recallPos = -1;
+    setInput(value);
   }
 
   function onChatClick(event: MouseEvent) {
@@ -1091,6 +1221,10 @@ export default function Chat() {
     const retry = target.closest(".regenerate");
     if (retry) {
       if (box) regenerate(box);
+      return;
+    }
+    if (target.closest(".cont-reply")) {
+      if (box) continueMessage(box);
       return;
     }
     const zoom = target.closest<HTMLImageElement>(".user-images img");
@@ -1215,7 +1349,9 @@ export default function Chat() {
     });
   });
 
-  const acceptsFiles = () => imagesAccepted() || pdfsAccepted();
+  // Plain-text files attach on every model, so the drop zone stays live even
+  // when the served model takes neither images nor PDFs.
+  const acceptsFiles = () => true;
 
   function onDrop(event: DragEvent) {
     event.preventDefault();
@@ -1376,6 +1512,7 @@ export default function Chat() {
         canSend={canSend()}
         queued={queued()}
         onRemoveQueued={removeQueued}
+        onEditQueued={editQueued}
         attachments={attachments()}
         attachmentsVersion={attachmentsVersion()}
         imagesAccepted={imagesAccepted()}
@@ -1392,12 +1529,13 @@ export default function Chat() {
           if (ctrl) ctrl.abort();
           else void complete();
         }}
-        onInput={setInput}
+        onInput={onDraftInput}
         onModelChange={onModelChange}
         onEffortChange={onEffortChange}
         onAddFiles={(files) => void addFiles(files)}
         onRemoveAttachment={onRemoveAttachment}
-        onRecall={recallLast}
+        onRecallPrev={recallPrev}
+        onRecallNext={recallNext}
         inputRef={(el) => (inputEl = el)}
       />
     </div>

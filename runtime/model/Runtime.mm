@@ -1046,6 +1046,9 @@ void Runtime::end(uint64_t requestId) {
   // its KV through the page table; it drains before the lane's buffers pool
   // and its extents become eviction candidates.
   impl_->settleGpuPredraft();
+  // The finished stream joins the cross-request n-gram corpus while its
+  // table still holds it (RICHENGINE_NGRAM_CORPUS).
+  impl_->noteNgramCorpus(found->second);
   impl_->releaseImages(found->second);
   if (found->second.resident) {
     impl_->states.releaseLane(found->second.stateLane, requestId);
