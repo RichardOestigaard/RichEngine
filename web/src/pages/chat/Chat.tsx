@@ -28,8 +28,9 @@ import {
   SIDEBAR_KEY,
   SYSTEM_KEY,
 } from "./storage";
-import { displayContent } from "./markdown";
-import { activeTools, isStrictRejection, markStrictBroken, runTool, toolDetail } from "./tools";
+import { displayContent, paintableText } from "./markdown";
+import { activeTools, isStrictRejection, jsonOutput, markStrictBroken, runTool, toolDetail } from "./tools";
+import { requestSampling } from "../../sampling";
 import type { Attachment, Message, MessageContent, ModelInfo, QueuedTurn, ToolRun, Usage } from "./types";
 import Sidebar from "./Sidebar";
 import Composer from "./Composer";
@@ -518,7 +519,9 @@ export default function Chat() {
     if (delta.content) {
       if (!state.firstDeltaAt) state.firstDeltaAt = performance.now();
       assistant.content = (assistant.content as string) + delta.content;
-      schedulePaint(() => assistant.content as string);
+      schedulePaint(() =>
+        paintableText(assistant.content as string, assistant.format)
+      );
       // Before the server reports real throughput, estimate from streamed
       // text (~4 chars per token) so the reader sees progress right away.
       if (!assistant.tps && stats) {
@@ -543,7 +546,11 @@ export default function Chat() {
     const waiting = handle.el.querySelector<HTMLElement>(".waiting");
     if (waiting) waiting.hidden = true;
     handle.painter.update(
-      typeof assistant.content === "string" ? assistant.content : ""
+      paintableText(
+        typeof assistant.content === "string" ? assistant.content : "",
+        assistant.format,
+        true
+      )
     );
     paintStats(handle.el, assistant);
   }
@@ -589,6 +596,7 @@ export default function Chat() {
           model: model() || modelData()[0]?.id,
           stream: false,
           max_tokens: 24,
+          priority: "background",
           messages: [
             {
               role: "user",
@@ -745,6 +753,7 @@ export default function Chat() {
       content: "",
       reasoning_content: "",
       created: Date.now(),
+      ...(jsonOutput() ? { format: "json" as const } : {}),
     };
     const state: StreamState = { firstDeltaAt: 0, finish: null, calls: [] };
     liveBox = undefined;
@@ -799,7 +808,11 @@ export default function Chat() {
             stream_options: { include_usage: true },
             ...(model() ? { model: model() } : {}),
             ...(effort() ? { reasoning_effort: effort() } : {}),
+            ...requestSampling(model() || modelData()[0]?.id),
             ...(tools.length ? { tools, parallel_tool_calls: false } : {}),
+            ...(jsonOutput()
+              ? { response_format: { type: "json_object" } }
+              : {}),
           }),
           signal: ctrl.signal,
         });

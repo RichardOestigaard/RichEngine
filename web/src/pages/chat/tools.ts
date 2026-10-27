@@ -118,6 +118,13 @@ export function setSearchInstance(value: string): void {
   persist(SEARCH_INSTANCE_KEY, value);
 }
 
+/* JSON output mode: the request names a response_format, and the reply is
+   grammar-constrained to valid JSON. Session-scoped — it is a per-turn
+   intent, not a preference, so nothing persists it and each load starts
+   clean. */
+const [jsonOutput, setJsonOutput] = createSignal(false);
+export { jsonOutput, setJsonOutput };
+
 export function setToolEnabled(id: ToolId, on: boolean): void {
   const next = { ...toolsEnabled(), [id]: on };
   setToolsEnabled(next);

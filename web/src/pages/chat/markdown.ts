@@ -131,6 +131,26 @@ export function displayContent(content: string): string {
   return content.replace(/^(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+$/g, "");
 }
 
+/* The text a painter gets for a message whose declared format wraps the raw
+   content: a json reply shows inside a json fence, which the code-head Copy
+   button then serves verbatim. Live turns leave the fence open (an unclosed
+   fence already paints as a block); closed paints the completed reply,
+   pretty-printed where the text parses. */
+export function paintableText(
+  text: string,
+  format: string | undefined,
+  closed = false
+): string {
+  if (format !== "json") return text;
+  if (!closed) return "```json\n" + text;
+  try {
+    text = JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    /* A stopped stream keeps its partial object as written. */
+  }
+  return "```json\n" + text + "\n```";
+}
+
 export interface MarkdownPainter {
   update(text: string): void;
   reset(): void;

@@ -25,6 +25,9 @@ export interface Message {
   usage?: Usage;
   stats?: string;
   tool_runs?: ToolRun[];
+  /* The reply's declared shape; "json" renders the raw content inside a
+     json code block. The wire keeps the model's own text either way. */
+  format?: "json";
   stopped?: boolean;
   interrupted?: boolean;
 }
