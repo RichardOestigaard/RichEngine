@@ -1,5 +1,5 @@
 import type { ParentProps } from "solid-js";
-import { createEffect } from "solid-js";
+import { createEffect, Show } from "solid-js";
 import { useLocation } from "@solidjs/router";
 import TopBar from "./TopBar";
 import Toasts from "./toast";
@@ -26,9 +26,12 @@ export default function App(props: ParentProps) {
     <>
       <a href="#content" class="skip-link">Skip to content</a>
       <TopBar />
-      {/* A div, not main: Chat renders its own <main> landmark. */}
+      {/* A div, not main: Chat renders its own <main> landmark. Keying on
+          the path remounts each page into the page-in animation. */}
       <div id="content" tabindex="-1" class="page-host">
-        {props.children}
+        <Show when={location.pathname} keyed>
+          {props.children}
+        </Show>
       </div>
       <Toasts />
       <Palette />

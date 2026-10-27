@@ -1,4 +1,4 @@
-import { createMemo, createSignal, onCleanup, Index, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Index, Show } from "solid-js";
 import { authorization, errorText, noteAuthStatus } from "../api";
 import { Chart, fmtTooltipRows } from "../Chart";
 import type { ChartAppend } from "../Chart";
@@ -236,6 +236,12 @@ export default function Metrics() {
     signature: string;
     append: ChartAppend;
   } | null>(null);
+  /* Hero cards append once per scrape through this shared x. */
+  const [heroAppend, setHeroAppend] = createSignal<{
+    x: number;
+    y: Map<string, number>;
+  } | null>(null);
+  const [advOpen, setAdvOpen] = createSignal(false);
   const { copied, copy } = useCopied();
 
   const seriesKey = (family: string, s: MetricSample) =>
@@ -336,6 +342,12 @@ export default function Metrics() {
       const series = selectedFamily ? chartSeries(selectedFamily) : [];
       const rate = rateMode() && !!selectedFamily && rateable(selectedFamily);
       setHistoryTick((t) => t + 1);
+      setHeroAppend({
+        x: now,
+        y: new Map(
+          HEROES.map((hero) => [hero.key, heroLatest(hero.key)] as const)
+        ),
+      });
       setChartAppend(
         selectedFamily && series.length
           ? {
@@ -357,6 +369,10 @@ export default function Metrics() {
       const f = selectedFamily();
       const series = f ? chartSeries(f) : [];
       setHistoryTick((t) => t + 1);
+      setHeroAppend({
+        x: now,
+        y: new Map(HEROES.map((hero) => [hero.key, NaN] as const)),
+      });
       setChartAppend(
         f && series.length
           ? {
@@ -372,6 +388,14 @@ export default function Metrics() {
 
   /* 2s scrape poll while auto-refresh is on; freshness clock is shared. */
   onCleanup(poll(() => (auto() ? refresh() : Promise.resolve()), 2000));
+
+  /* Typing a query opens Advanced once; closing it manually sticks. */
+  let prevEmpty = true;
+  createEffect(() => {
+    const empty = !query().trim();
+    if (!empty && prevEmpty) setAdvOpen(true);
+    prevEmpty = empty;
+  });
 
   const filtered = () => {
     const q = query().trim().toLowerCase();
@@ -409,6 +433,96 @@ export default function Metrics() {
   /* Key indicators, read straight out of the latest scrape. */
   const metricValue = (name: string) =>
     scrape()?.families.find((f) => f.name === name)?.samples[0]?.value;
+
+  /* Hero cards: the handful of metrics worth a chart by default.
+     Everything else waits behind the Advanced fold. */
+  const TTFT_KEY = "richengine_ttft_seconds";
+  interface HeroDef {
+    key: string;
+    label: string;
+    sub: string;
+    unit: Unit;
+  }
+  const HEROES: HeroDef[] = [
+    { key: "richengine_decode_tokens_per_second", label: "Decode", sub: "output throughput", unit: "none" },
+    { key: "richengine_prefill_tokens_per_second", label: "Prefill", sub: "prompt throughput", unit: "none" },
+    { key: "richengine_memory_current_bytes", label: "Memory", sub: "resident in use / limit", unit: "bytes" },
+    { key: "richengine_scheduler_queued", label: "Queued", sub: "requests waiting", unit: "count" },
+    { key: TTFT_KEY, label: "TTFT", sub: "avg time to first token", unit: "s" },
+  ];
+
+  const heroExists = (name: string) =>
+    Boolean(scrape()?.families.some((f) => f.name === name));
+
+  /* History for a hero's own-named series (buckets never reach it). */
+  const heroPts = (name: string) => {
+    const f = scrape()?.families.find((x) => x.name === name);
+    const s = f?.samples.find((s) => chartable(f, s)) ?? f?.samples[0];
+    if (!f || !s) return [];
+    return seriesHistory.get(seriesKey(f.name, s)) ?? [];
+  };
+
+  /* Avg TTFT per interval: Δsum/Δcount between consecutive scrapes —
+     the histogram's two monotone children cancel into a latency. */
+  const ttftPts = () => {
+    const f = scrape()?.families.find((x) => x.name === TTFT_KEY);
+    const sumS = f?.samples.find((s) => s.name.endsWith("_sum"));
+    const cntS = f?.samples.find((s) => s.name.endsWith("_count"));
+    if (!f || !sumS || !cntS) return [];
+    const sp = seriesHistory.get(seriesKey(f.name, sumS)) ?? [];
+    const cp = seriesHistory.get(seriesKey(f.name, cntS)) ?? [];
+    const pts: { t: number; v: number }[] = [];
+    for (let i = 1, n = Math.min(sp.length, cp.length); i < n; i++) {
+      const ds = sp[i].v - sp[i - 1].v;
+      const dc = cp[i].v - cp[i - 1].v;
+      const dt = sp[i].t - sp[i - 1].t;
+      pts.push({
+        t: sp[i].t,
+        v:
+          Number.isFinite(ds) && Number.isFinite(dc) && dc > 0 && dt > 0
+            ? ds / dc
+            : NaN,
+      });
+    }
+    return pts;
+  };
+
+  const heroSeries = (name: string) =>
+    name === TTFT_KEY ? ttftPts() : heroPts(name);
+
+  const heroReady = (name: string) => {
+    historyTick();
+    return heroSeries(name).length >= 2;
+  };
+
+  const heroLatest = (name: string): number => {
+    const pts = heroSeries(name);
+    return pts.length ? pts[pts.length - 1].v : NaN;
+  };
+
+  const heroData = (name: string) => {
+    const pts = heroSeries(name);
+    return {
+      x: pts.map((p) => p.t),
+      series: [{ label: name, y: pts.map((p) => p.v) }],
+    };
+  };
+
+  const heroAppendFor = (key: string): ChartAppend | null => {
+    const h = heroAppend();
+    const y = h?.y.get(key);
+    return h && y !== undefined ? { x: h.x, y } : null;
+  };
+
+  const heroValue = (key: string): string => {
+    if (key === "richengine_decode_tokens_per_second") return liveRate(key);
+    if (key === "richengine_prefill_tokens_per_second") return liveRate(key);
+    if (key === "richengine_memory_current_bytes") return liveMemory();
+    if (key === "richengine_scheduler_queued")
+      return fmtInt(metricValue(key));
+    const v = heroLatest(TTFT_KEY);
+    return Number.isFinite(v) ? fmtMs(v * 1000) : "—";
+  };
 
   const liveRate = (name: string) => {
     const v = metricValue(name);
@@ -531,30 +645,6 @@ export default function Metrics() {
         </div>
       </div>
 
-      <div class="metric-toolbar">
-        <input
-          class="metric-search"
-          type="search"
-          placeholder="Filter by metric name or help…"
-          aria-label="Filter metrics"
-          value={query()}
-          onInput={(e) => setQuery(e.currentTarget.value)}
-        />
-        <Show when={query().trim() && scrape()}>
-          <span class="muted match-count">
-            {filtered().length} of {scrape()?.families.length ?? 0}
-          </span>
-        </Show>
-        <button
-          class="btn small"
-          title="Copy the raw Prometheus exposition"
-          onClick={() => void copyRaw()}
-          disabled={!scrape()}
-        >
-          {copied() === "raw" ? "copied ✓" : "Copy raw"}
-        </button>
-      </div>
-
       <Show when={error()}>
         <p class="notice error">
           Metrics fetch failed
@@ -562,58 +652,115 @@ export default function Metrics() {
         </p>
       </Show>
 
-      <div class="cards">
-        <div class="card">
-          <div class="card-label">Decode</div>
-          <div class="card-value">
-            {liveRate("richengine_decode_tokens_per_second")}
-          </div>
-          <div class="card-sub">current throughput</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Prefill</div>
-          <div class="card-value">
-            {liveRate("richengine_prefill_tokens_per_second")}
-          </div>
-          <div class="card-sub">current throughput</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Memory</div>
-          <div class="card-value">{liveMemory()}</div>
-          <div class="card-sub">resident in use / limit</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Queued</div>
-          <div class="card-value">
-            {fmtInt(metricValue("richengine_scheduler_queued"))}
-          </div>
-          <div class="card-sub">requests waiting</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Metric families</div>
-          <div class="card-value">{fmtInt(scrape()?.families.length)}</div>
-          <div class="card-sub">HELP/TYPE groups</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Samples</div>
-          <div class="card-value">{fmtInt(scrape()?.sampleCount)}</div>
-          <div class="card-sub">series values</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Scrape</div>
-          <div class="card-value">{fmtMs(durationMs())}</div>
-          <div class="card-sub">fetch + parse</div>
-        </div>
-        <Show when={(scrape()?.errors ?? 0) > 0}>
-          <div class="card">
-            <div class="card-label">Parse errors</div>
-            <div class="card-value err">{fmtInt(scrape()?.errors)}</div>
-            <div class="card-sub">malformed lines skipped</div>
-          </div>
-        </Show>
+      {/* Hero dashboard: the metrics worth a chart, no interaction needed.
+          Each card's live value reads from the latest scrape; its chart
+          mounts once two points exist and grows via heroAppend. */}
+      <div class="hero-grid">
+        <For each={HEROES}>
+          {(hero) => (
+            <Show when={heroExists(hero.key)}>
+              <div class="card hero-card">
+                <div class="card-label">{hero.label}</div>
+                <div class="card-value">{heroValue(hero.key)}</div>
+                <div class="card-sub">{hero.sub}</div>
+                <Show when={heroReady(hero.key)}>
+                  <div class="hero-chart">
+                    <Chart
+                      type="area"
+                      height={88}
+                      data={heroData(hero.key)}
+                      append={heroAppendFor(hero.key)}
+                      options={{
+                        labels: {
+                          y: (v: number) => fmtUnit(hero.unit, v),
+                        },
+                        window: 60,
+                        xScale: "time",
+                        zoom: { wheel: false },
+                        tooltip: {
+                          format: fmtTooltipRows((v) =>
+                            fmtUnit(hero.unit, v)
+                          ),
+                        },
+                        yMin: 0,
+                      }}
+                    />
+                  </div>
+                </Show>
+              </div>
+            </Show>
+          )}
+        </For>
       </div>
 
+      <Show when={(scrape()?.errors ?? 0) > 0}>
+        <p class="notice error">
+          {fmtInt(scrape()?.errors)} malformed metric line
+          {scrape()?.errors === 1 ? "" : "s"} skipped — see Advanced.
+        </p>
+      </Show>
+
       <Show when={scrape()} fallback={<p class="muted">Loading…</p>}>
+        {/* Everything below the fold: meta counts, the filterable family
+            explorer, and the raw exposition. */}
+        <details
+          class="advanced"
+          open={advOpen()}
+          onToggle={(e) => setAdvOpen(e.currentTarget.open)}
+        >
+          <summary title="Expand section">
+            Advanced
+            <span class="muted">
+              {" "}
+              — all {fmtInt(scrape()?.families.length)} families, filter,
+              raw exposition
+            </span>
+          </summary>
+          <div class="advanced-body">
+            <div class="cards meta-cards">
+              <div class="card">
+                <div class="card-label">Metric families</div>
+                <div class="card-value">
+                  {fmtInt(scrape()?.families.length)}
+                </div>
+                <div class="card-sub">HELP/TYPE groups</div>
+              </div>
+              <div class="card">
+                <div class="card-label">Samples</div>
+                <div class="card-value">{fmtInt(scrape()?.sampleCount)}</div>
+                <div class="card-sub">series values</div>
+              </div>
+              <div class="card">
+                <div class="card-label">Scrape</div>
+                <div class="card-value">{fmtMs(durationMs())}</div>
+                <div class="card-sub">fetch + parse</div>
+              </div>
+            </div>
+
+            <div class="metric-toolbar">
+              <input
+                class="metric-search"
+                type="search"
+                placeholder="Filter by metric name or help…"
+                aria-label="Filter metrics"
+                value={query()}
+                onInput={(e) => setQuery(e.currentTarget.value)}
+              />
+              <Show when={query().trim() && scrape()}>
+                <span class="muted match-count">
+                  {filtered().length} of {scrape()?.families.length ?? 0}
+                </span>
+              </Show>
+              <button
+                class="btn small"
+                title="Copy the raw Prometheus exposition"
+                onClick={() => void copyRaw()}
+                disabled={!scrape()}
+              >
+                {copied() === "raw" ? "copied ✓" : "Copy raw"}
+              </button>
+            </div>
+
         {/* Family table grouped by subsystem: click a row for its series +
             history. */}
         <Show
@@ -800,19 +947,21 @@ export default function Metrics() {
           </Index>
         </Show>
 
-        {/* Raw exposition, for copy/paste debugging. */}
-        <section class="section">
-          <details class="metrics-raw" onToggle={collapseToggle}>
-            <summary title="Expand section">Raw /metrics</summary>
-            <pre class="metrics-pre">{rawView().text}</pre>
-            <Show when={rawView().more > 0}>
-              <p class="muted">
-                … {fmtInt(rawView().more)} more lines — Copy raw has the full
-                exposition.
-              </p>
-            </Show>
-          </details>
-        </section>
+            {/* Raw exposition, for copy/paste debugging. */}
+            <section class="section">
+              <details class="metrics-raw" onToggle={collapseToggle}>
+                <summary title="Expand section">Raw /metrics</summary>
+                <pre class="metrics-pre">{rawView().text}</pre>
+                <Show when={rawView().more > 0}>
+                  <p class="muted">
+                    … {fmtInt(rawView().more)} more lines — Copy raw has the
+                    full exposition.
+                  </p>
+                </Show>
+              </details>
+            </section>
+          </div>
+        </details>
       </Show>
     </main>
   );

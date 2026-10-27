@@ -94,17 +94,27 @@ svg { display: block }
   transform: translateY(-300%);
 }
 .skip-link:focus { transform: none }
+.skip-link { transition: transform .15s ease }
 .page-host:focus { outline: 0 }
+
+/* Route swaps remount the page under this entrance. */
+@keyframes page-in { from { opacity: 0; transform: translateY(6px) } }
+.page-host > * { animation: page-in .18s ease-out }
+@keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(.98) } }
+@keyframes icon-in { from { opacity: 0; transform: rotate(-80deg) scale(.6) } }
 
 /* Top bar */
 .topbar { position: fixed; inset: 0 0 auto; z-index: 30; display: flex; align-items: center; gap: 20px; height: var(--topbar); padding: 0 16px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(12px) }
 .topbar .brand { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 650; letter-spacing: -.02em; color: inherit; text-decoration: none }
-.topnav { display: flex; gap: 4px }
-.navlink { padding: 6px 12px; border-radius: 8px; color: var(--muted); font-size: 14px; font-weight: 500; text-decoration: none }
+.topnav { position: relative; display: flex; gap: 4px }
+/* Shared pill under the active link; TopBar places it via --ind-* vars,
+   hidden until the first measurement lands. */
+.nav-ind { position: absolute; top: 0; left: 0; z-index: 0; width: var(--ind-w, 0); height: 100%; border-radius: 8px; background: var(--hover); opacity: var(--ind-o, 0); transform: translateX(var(--ind-x, 0)); transition: transform .22s cubic-bezier(.3, .9, .3, 1), width .22s cubic-bezier(.3, .9, .3, 1), opacity .18s ease; pointer-events: none }
+.navlink { position: relative; z-index: 1; padding: 6px 12px; border-radius: 8px; color: var(--muted); font-size: 14px; font-weight: 500; text-decoration: none; transition: color .12s ease, background-color .12s ease }
 .navlink:hover { color: var(--text); background: var(--hover) }
-.navlink.active { color: var(--text); background: var(--hover) }
+.navlink.active { color: var(--text) }
 .topright { display: flex; align-items: center; gap: 10px; margin-left: auto }
-.top-mem { padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; text-decoration: none; white-space: nowrap }
+.top-mem { padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; text-decoration: none; white-space: nowrap; transition: color .12s ease, background-color .12s ease, border-color .12s ease }
 .top-mem:hover { color: var(--text); background: var(--hover) }
 .top-mem.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)) }
 .top-lock { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 8px; color: var(--muted) }
@@ -116,14 +126,16 @@ svg { display: block }
 .model-menu { position: relative }
 .top-model { display: inline-flex; align-items: center; gap: 7px; max-width: 240px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; font-weight: 500; white-space: nowrap }
 .top-model:hover { color: var(--text); background: var(--hover) }
-.top-model .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--muted) }
+.top-model { transition: color .12s ease, background-color .12s ease }
+.top-model .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--muted); transition: background-color .3s ease }
 .top-model .dot.ok { background: var(--ok) }
 .top-model .dot.warn { background: var(--warn) }
 .top-model .dot.err { background: var(--danger) }
 .top-model .name { overflow: hidden; text-overflow: ellipsis }
 .top-model .count { color: var(--muted) }
-.top-model .chev { flex: none; opacity: .6 }
-.model-pop { position: absolute; top: calc(100% + 8px); right: 0; z-index: 31; width: 300px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow) }
+.top-model .chev { flex: none; opacity: .6; transition: transform .15s ease }
+.top-model[aria-expanded="true"] .chev { transform: rotate(180deg) }
+.model-pop { position: absolute; top: calc(100% + 8px); right: 0; z-index: 31; width: 300px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); animation: pop-in .12s ease-out }
 .model-pop-title { display: flex; justify-content: space-between; padding: 6px 8px 4px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase }
 .model-row { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px; border-radius: 8px; text-align: left }
 .model-row:hover { background: var(--hover) }
@@ -200,6 +212,8 @@ svg { display: block }
   .topbar { gap: 10px; padding: 0 10px }
   .navlink { padding: 6px 8px }
 }
+/* Theme icon remounts keyed → plays icon-in on each cycle. */
+.theme-btn svg { animation: icon-in .2s ease-out }
 @media (max-width: 700px) {
   .topnav { min-width: 0; overflow-x: auto; scrollbar-width: none }
   .topnav::-webkit-scrollbar { display: none }

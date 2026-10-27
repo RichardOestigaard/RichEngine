@@ -1,4 +1,15 @@
-/* Metrics page: /metrics exposition explorer on styles.css primitives. */
+/* Metrics page: hero dashboard on top, the full explorer behind Advanced. */
+
+/* Hero cards: live value + a small area chart that streams via append. */
+.hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 24px }
+.hero-card { min-width: 0 }
+.hero-card .chart-frame { margin-top: 8px }
+
+/* Advanced fold: meta counts + filter + every family + raw exposition. */
+.advanced > summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: 13.5px; font-weight: 500 }
+.advanced > summary:hover { color: var(--text) }
+.advanced-body { margin-top: 16px }
+.meta-cards { margin-bottom: 20px }
 
 /* Page header with the refresh controls (same shape as Models). */
 .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px }

@@ -127,6 +127,30 @@ export default function TopBar() {
   } | null>(null);
   const [menuOpen, setMenuOpen] = createSignal(false);
   let menuEl: HTMLDivElement | undefined;
+  let navEl: HTMLElement | undefined;
+
+  /* The sliding pill under the nav tracks the active link's box; CSS vars
+     carry the position so the transition lives in styles.css. */
+  function placeInd() {
+    if (!navEl) return;
+    const link = navEl.querySelector<HTMLElement>(".navlink.active");
+    if (!link) {
+      navEl.style.setProperty("--ind-o", "0");
+      return;
+    }
+    navEl.style.setProperty("--ind-x", `${link.offsetLeft}px`);
+    navEl.style.setProperty("--ind-w", `${link.offsetWidth}px`);
+    navEl.style.setProperty("--ind-o", "1");
+  }
+
+  createEffect(() => {
+    // Reposition after route swaps and after the Chat link mounts/hides.
+    void location.pathname;
+    void decisionModel();
+    queueMicrotask(placeInd);
+  });
+  window.addEventListener("resize", placeInd);
+  onCleanup(() => window.removeEventListener("resize", placeInd));
 
   async function checkReady() {
     try {
@@ -399,7 +423,8 @@ export default function TopBar() {
         <img src="/favicon.ico" alt="" width="18" height="18" />
         RichEngine
       </A>
-      <nav class="topnav" aria-label="Pages">
+      <nav class="topnav" aria-label="Pages" ref={(el) => (navEl = el)}>
+        <span class="nav-ind" aria-hidden="true" />
         <Show when={!decisionModel()}>
           <A href="/" class="navlink" classList={{ active: active("/") }} title="Chat (⌘1)">Chat</A>
         </Show>
@@ -428,7 +453,10 @@ export default function TopBar() {
         aria-label={`Theme: ${THEME_LABELS[theme()]}. Click to change theme.`}
         onClick={() => cycleTheme()}
       >
-        <ThemeIcon name={theme()} />
+        {/* Keyed remount plays the icon's entrance on every theme change. */}
+        <Show when={theme()} keyed>
+          {(name) => <ThemeIcon name={name} />}
+        </Show>
       </button>
       <div class="model-menu" ref={(el) => (menuEl = el)}>
         <button
