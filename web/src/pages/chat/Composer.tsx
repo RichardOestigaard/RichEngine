@@ -30,11 +30,15 @@ interface SlashItem {
   hint: string;
 }
 
-const SLASH_COMMANDS = [
+const SLASH_COMMANDS: { name: string; hint: string }[] = [
   { name: "new", hint: "Start a new chat" },
   { name: "think", hint: "Set thinking effort" },
   { name: "model", hint: "Pick a model" },
   { name: "json", hint: "Toggle JSON output" },
+  { name: "stop", hint: "Stop the current reply" },
+  { name: "export", hint: "Download this chat as Markdown" },
+  { name: "pin", hint: "Pin or unpin this chat" },
+  { name: "system", hint: "Edit the system prompt" },
 ];
 
 const EFFORT_ITEMS: SlashItem[] = [
@@ -69,6 +73,7 @@ export default function Composer(props: {
   onEffortChange(value: string): void;
   onAddFiles(files: File[]): void;
   onRemoveAttachment(attachment: Attachment): void;
+  onPreviewAttachment(attachment: Attachment): void;
   /* Shell-style history: the handler returns true when it moved the draft,
      false when the caret should move normally. */
   onRecallPrev?(): boolean;
@@ -78,6 +83,7 @@ export default function Composer(props: {
   let inputEl: HTMLTextAreaElement | undefined;
   let fileInput: HTMLInputElement | undefined;
   let toolsEl: HTMLDivElement | undefined;
+  let toolsBtn: HTMLButtonElement | undefined;
   const [toolsOpen, setToolsOpen] = createSignal(false);
   const [cmdIndex, setCmdIndex] = createSignal(0);
 
@@ -89,8 +95,11 @@ export default function Composer(props: {
     const space = value.indexOf(" ");
     if (space === -1) {
       const prefix = value.slice(1).toLowerCase();
-      const items = SLASH_COMMANDS.filter((command) =>
-        command.name.startsWith(prefix)
+      const items = SLASH_COMMANDS.filter(
+        (command) =>
+          command.name.startsWith(prefix) &&
+          // /stop only exists while a reply streams.
+          (command.name !== "stop" || props.running)
       ).map((command) => ({
         id: command.name,
         label: `/${command.name}`,
@@ -149,6 +158,13 @@ export default function Composer(props: {
       if (item.id === "new")
         window.dispatchEvent(new CustomEvent("richengine:new-chat"));
       else if (item.id === "json") setJsonOutput(!jsonOutput());
+      else if (item.id === "stop") props.onToggle();
+      else if (item.id === "export")
+        window.dispatchEvent(new CustomEvent("richengine:export-chat"));
+      else if (item.id === "pin")
+        window.dispatchEvent(new CustomEvent("richengine:pin-chat"));
+      else if (item.id === "system")
+        window.dispatchEvent(new CustomEvent("richengine:open-system"));
     } else if (menu.stage === "think") {
       props.onEffortChange(item.id);
     } else if (menu.stage === "model") {
@@ -183,6 +199,7 @@ export default function Composer(props: {
       if (event.key === "Escape") {
         event.stopPropagation();
         setToolsOpen(false);
+        toolsBtn?.focus();
       }
     };
     document.addEventListener("pointerdown", onDown);
@@ -391,11 +408,17 @@ export default function Composer(props: {
       </Show>
       <Show when={cmdMenu()}>
         {(menu) => (
-          <div class="slash-pop" role="listbox" aria-label="Slash commands">
+          <div
+            class="slash-pop"
+            id="slash-pop"
+            role="listbox"
+            aria-label="Slash commands"
+          >
             <For each={menu().items}>
               {(item, i) => (
                 <button
                   type="button"
+                  id={`slash-opt-${i()}`}
                   role="option"
                   aria-selected={i() === cmdIndex()}
                   class="slash-row"
@@ -450,16 +473,37 @@ export default function Composer(props: {
                     <Show
                       when={attachment.kind === "image"}
                       fallback={
-                        <span class="attachment-pdf">
-                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                            <path d="M6 3h8l5 5v13H6z" />
-                            <path d="M14 3v5h5" />
-                          </svg>
-                          <span class="attachment-pdf-name">{name()}</span>
-                        </span>
+                        attachment.kind === "text" ? (
+                          <button
+                            type="button"
+                            class="attachment-pdf attachment-preview"
+                            title={`Preview ${name()}`}
+                            onClick={() => props.onPreviewAttachment(attachment)}
+                          >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                              <path d="M6 3h8l5 5v13H6z" />
+                              <path d="M14 3v5h5" />
+                            </svg>
+                            <span class="attachment-pdf-name">{name()}</span>
+                          </button>
+                        ) : (
+                          <span class="attachment-pdf">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                              <path d="M6 3h8l5 5v13H6z" />
+                              <path d="M14 3v5h5" />
+                            </svg>
+                            <span class="attachment-pdf-name">{name()}</span>
+                          </span>
+                        )
                       }
                     >
-                      <img src={url()!} alt={name()} />
+                      <img
+                        src={url()!}
+                        alt={name()}
+                        class="attachment-zoom"
+                        title={`Preview ${name()}`}
+                        onClick={() => props.onPreviewAttachment(attachment)}
+                      />
                     </Show>
                   </Show>
                   <button
@@ -487,6 +531,11 @@ export default function Composer(props: {
           }
           autofocus
           enterkeyhint="send"
+          aria-controls={cmdMenu() ? "slash-pop" : undefined}
+          aria-expanded={cmdMenu() ? true : undefined}
+          aria-activedescendant={
+            cmdMenu() ? `slash-opt-${cmdIndex()}` : undefined
+          }
           ref={(el) => {
             inputEl = el;
             props.inputRef?.(el);
@@ -497,7 +546,7 @@ export default function Composer(props: {
           onKeyDown={onKeyDown}
         />
       </div>
-      <div class="toolbar">
+      <div class="toolbar" role="toolbar" aria-label="Composer controls">
         <button
           id="attach"
           type="button"
@@ -530,7 +579,19 @@ export default function Composer(props: {
             }
             disabled={props.running}
             classList={{ on: anyToolOn() }}
+            ref={(el) => (toolsBtn = el)}
             onClick={() => setToolsOpen(!toolsOpen())}
+            onKeyDown={(event) => {
+              // Menu pattern: ArrowDown opens and lands on the first item.
+              if (event.key !== "ArrowDown" || toolsOpen()) return;
+              event.preventDefault();
+              setToolsOpen(true);
+              queueMicrotask(() =>
+                toolsEl
+                  ?.querySelector<HTMLInputElement>(".tools-row input")
+                  ?.focus()
+              );
+            }}
           >
             <svg
               width="18"
@@ -546,7 +607,32 @@ export default function Composer(props: {
             </svg>
           </button>
           <Show when={toolsOpen()}>
-            <div class="tools-pop" role="menu" aria-label="Built-in tools">
+            <div
+              class="tools-pop"
+              role="menu"
+              aria-label="Built-in tools"
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowDown" && event.key !== "ArrowUp")
+                  return;
+                const boxes = Array.from(
+                  toolsEl?.querySelectorAll<HTMLInputElement>(
+                    ".tools-row input"
+                  ) ?? []
+                );
+                if (!boxes.length) return;
+                event.preventDefault();
+                const index = boxes.indexOf(
+                  document.activeElement as HTMLInputElement
+                );
+                const next =
+                  event.key === "ArrowDown"
+                    ? (index + 1) % boxes.length
+                    : index <= 0
+                      ? boxes.length - 1
+                      : index - 1;
+                boxes[next]?.focus();
+              }}
+            >
               <div class="tools-pop-title">Built-in tools</div>
               <For each={TOOL_IDS}>
                 {(id) => (

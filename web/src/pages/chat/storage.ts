@@ -190,6 +190,14 @@ export function pinConversation(id: string, pinned: boolean): void {
   scheduleSave();
 }
 
+/* Undo path for delete: the object survives in the toast's closure and is
+   pushed back unchanged if the user reconsiders. */
+export function restoreConversation(conversation: Conversation): void {
+  if (conversations().some((item) => item.id === conversation.id)) return;
+  setConversations([...conversations(), conversation]);
+  scheduleSave();
+}
+
 export function deleteConversation(id: string): void {
   setConversations(conversations().filter(conversation => conversation.id !== id));
   scheduleSave();
@@ -258,7 +266,11 @@ export function chatMarkdown(title: string, messages: Message[]): string {
       const parts = userParts(message.content);
       out.push(`## You${when}`, "");
       if (parts.text) out.push(parts.text, "");
-      for (const file of parts.files) out.push(`📎 ${file.name}`, "");
+      for (const file of parts.files)
+        // Pasted-text attachments carry their content; binary files don't.
+        if (file.kind === "text")
+          out.push(`📎 ${file.name}`, "", "~~~", file.url, "~~~", "");
+        else out.push(`📎 ${file.name}`, "");
       if (parts.images.length) out.push(`[${parts.images.length} image(s) attached]`, "");
     } else {
       out.push(`## RichEngine${when}`, "");

@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { storageGet, storageSet } from "../../api";
 import { fmtAgo } from "../../format";
 import { conversations, SYSTEM_KEY } from "./storage";
@@ -16,6 +16,22 @@ export default function Sidebar(props: {
 }) {
   const [filter, setFilter] = createSignal("");
   const [system, setSystem] = createSignal(storageGet(SYSTEM_KEY) ?? "");
+  let sysDetails: HTMLDetailsElement | undefined;
+  let sysInput: HTMLTextAreaElement | undefined;
+
+  // "/system" (and anything else dispatching reveal-system) unfolds the
+  // prompt section and lands the caret in it.
+  onMount(() => {
+    const reveal = () => {
+      if (!sysDetails || !sysInput) return;
+      sysDetails.open = true;
+      sysInput.focus();
+    };
+    window.addEventListener("richengine:reveal-system", reveal);
+    onCleanup(() =>
+      window.removeEventListener("richengine:reveal-system", reveal)
+    );
+  });
 
   const filtered = () => {
     const query = filter().trim().toLowerCase();
@@ -142,12 +158,13 @@ export default function Sidebar(props: {
           <div class="recent-empty muted">No matching chats</div>
         </Show>
       </nav>
-      <details class="sys-prompt">
+      <details class="sys-prompt" ref={(el) => (sysDetails = el)}>
         <summary>System prompt</summary>
         <textarea
           rows={3}
           placeholder="Optional instructions for every message…"
           aria-label="System prompt"
+          ref={(el) => (sysInput = el)}
           value={system()}
           onInput={(event) => {
             setSystem(event.currentTarget.value);

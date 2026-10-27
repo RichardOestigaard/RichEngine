@@ -39,16 +39,30 @@
 .chat-shell .starter { padding: 8px 14px; border: 1px solid var(--border); border-radius: 999px; background: var(--composer); color: var(--muted) }
 .chat-shell .starter:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 25%, var(--border)); background: var(--hover) }
 .chat-shell .empty-model { margin-top: 12px; font-size: 12px; font-weight: 400; letter-spacing: normal }
-/* No hover on touch — keep the row actions out instead of hiding them. */
+/* No hover on touch — keep the row actions out instead of hiding them,
+   and give the attachment remove button a reachable size. */
 @media (pointer: coarse) {
   .chat-shell .recent-act { display: grid }
+  .chat-shell .remove-image { width: 26px; height: 26px; top: -7px; right: -7px }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-shell *, .chat-shell *::before, .chat-shell *::after { animation-duration: .01ms !important; transition-duration: .01ms !important }
 }
 .chat-shell .message { margin: 32px 0; white-space: pre-wrap; overflow-wrap: anywhere }
+/* Mount entrances — small and fast; killed by prefers-reduced-motion below. */
+@keyframes msg-in { from { opacity: 0; transform: translateY(6px) } }
+@keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(.98) } }
+@keyframes fade-in { from { opacity: 0 } }
+.chat-shell .user { animation: msg-in .15s ease-out }
+.chat-shell .queue-row { animation: msg-in .14s ease-out }
+.chat-shell .slash-pop, .chat-shell .tools-pop { animation: pop-in .12s ease-out }
+.chat-shell .lightbox { animation: fade-in .15s ease-out }
+.chat-shell #to-bottom { animation: pop-in .14s ease-out }
 .chat-shell .user { position: relative; width: fit-content; max-width: 78%; margin-left: auto; padding: 9px 15px; border-radius: 18px 18px 4px 18px; background: var(--bubble) }
 .chat-shell .user .actions { position: absolute; top: calc(100% + 2px); right: 0; margin-top: 0 }
-/* Queued turns wait in a tray on top of the composer — out of the message
-   log — in send order, first ("Next") at top. */
-.chat-shell .queue-tray { position: absolute; right: 0; bottom: calc(100% + 8px); left: 0; display: grid; gap: 6px; max-height: 168px; overflow-y: auto; scrollbar-width: thin }
+/* Queued turns stack inside the box above the textarea — in-flow, so their
+   arrival never shifts the message log. First ("Next") at top. */
+.chat-shell .queue-tray { display: grid; gap: 6px; max-height: 168px; margin-bottom: 6px; overflow-y: auto; scrollbar-width: thin }
 .chat-shell .queue-row { display: flex; align-items: center; gap: 6px; padding: 3px 5px 3px 3px; border: 1px dashed var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); color: var(--muted); font-size: 12.5px }
 /* The row body is a button: clicking pulls the turn back into the composer. */
 .chat-shell .queue-edit { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; padding: 4px 9px; border-radius: 9px; font: inherit; color: inherit; text-align: left }
@@ -73,8 +87,7 @@
 /* A pinned chat keeps its pin visible outside hover; the rest show on
    row hover like rename and delete. */
 .chat-shell .recent-act.pin.on { display: grid; color: var(--accent) }
-/* The tray covers the tail of the log while it's up; make room for it. */
-.chat-shell.queue-open #chat { padding-bottom: 340px }
+/* The tray lives inside the form now; no log padding needed. */
 .chat-shell.queue-open #to-bottom { bottom: 140px }
 .chat-shell .user-images { display: flex; flex-wrap: wrap; gap: 8px }
 .chat-shell .user-text + .user-images, .chat-shell .user-text + .user-files, .chat-shell .user-images + .user-files { margin-top: 9px }
@@ -127,13 +140,20 @@
 .chat-shell .drop-overlay { position: fixed; inset: calc(var(--topbar) + 8px) 8px 8px; z-index: 40; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 16px; background: color-mix(in srgb, var(--bg) 82%, transparent); color: var(--accent); font-size: 15px; font-weight: 600; pointer-events: none }
 .chat-shell .lightbox { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; background: #000a; cursor: zoom-out }
 .chat-shell .lightbox img { max-width: 92vw; max-height: 90vh; border-radius: 12px; box-shadow: 0 8px 48px #000c }
+.chat-shell .lightbox-text { max-width: min(720px, 92vw); max-height: 85vh; margin: 0; padding: 16px 18px; overflow: auto; border-radius: 12px; background: var(--composer); color: var(--text); font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 8px 48px #000c; cursor: auto }
+.chat-shell .attachment-zoom { cursor: zoom-in }
+.chat-shell .attachment-preview { cursor: pointer; text-align: left }
 
-.chat-shell form { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: max(20px, env(safe-area-inset-bottom)); z-index: 10; display: flex; flex-direction: column; gap: 2px; width: min(720px, calc(100vw - var(--sidebar) - 32px)); transform: translateX(-50%); padding: 10px 10px 8px; border: 1px solid var(--border); border-radius: 24px; background: var(--composer); box-shadow: var(--shadow); transition: border-color .15s ease, box-shadow .15s ease }
+.chat-shell form { position: fixed; left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); bottom: max(20px, env(safe-area-inset-bottom)); z-index: 10; display: flex; flex-direction: column; gap: 2px; width: min(720px, calc(100vw - var(--sidebar) - 32px)); transform: translateX(-50%); padding: 10px 10px 8px; border: 1px solid var(--border); border-radius: 24px; background: var(--composer); box-shadow: var(--shadow); transition: transform .28s cubic-bezier(.3, .9, .3, 1), border-color .15s ease, box-shadow .15s ease }
 .chat-shell form:focus-within { border-color: color-mix(in srgb, var(--text) 30%, var(--border)); box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent) }
-.chat-shell.empty form { top: 50%; bottom: auto }
+/* The empty state lifts the bottom-anchored box to mid-screen with a
+   transform — the first send slides it down instead of teleporting it. */
+.chat-shell.empty form { transform: translate(-50%, calc(20px + 50% - 50vh)) }
 .chat-shell .composer { min-width: 0 }
-.chat-shell #attachments { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px }
-.chat-shell #attachments:empty { display: none }
+/* The strip grows with a max-height transition instead of popping open;
+   overflow-y clips during the grow, overflow-x still scrolls. */
+.chat-shell #attachments { display: flex; gap: 8px; max-height: 0; padding: 0 2px; overflow-x: auto; overflow-y: clip; transition: max-height .18s ease, padding .18s ease }
+.chat-shell #attachments:not(:empty) { max-height: 80px; padding: 2px 2px 8px }
 .chat-shell .attachment { position: relative; width: 58px; height: 58px; flex: none }
 .chat-shell .attachment img, .chat-shell .attachment-status, .chat-shell .attachment-pdf { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 10px; object-fit: cover }
 .chat-shell .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
@@ -222,6 +242,7 @@
   .chat-shell #chat { padding: 14px 16px 140px }
   .chat-shell #empty { top: calc(50% - 118px); left: 50%; font-size: 23px }
   .chat-shell form { left: 50%; bottom: max(8px, env(safe-area-inset-bottom)); width: calc(100% - 16px) }
+  .chat-shell.empty form { transform: translate(-50%, calc(8px + 50% - 50vh)) }
   .chat-shell textarea { max-height: 140px }
 }
 @media (max-width: 430px) {

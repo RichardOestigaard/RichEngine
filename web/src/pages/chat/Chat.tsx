@@ -21,6 +21,7 @@ import {
   pinConversation,
   renameConversation,
   requestMessages,
+  restoreConversation,
   statsText,
   titleFor,
   userParts,
@@ -124,7 +125,11 @@ export default function Chat() {
   const [noModel, setNoModel] = createSignal(false);
   const [modelLoading, setModelLoading] = createSignal(false);
   const [modelError, setModelError] = createSignal("");
-  const [lightbox, setLightbox] = createSignal<string | null>(null);
+  /* The lightbox zooms sent images and previews draft attachments —
+     "img" is a data URL, "text" is raw pasted content. */
+  const [lightbox, setLightbox] = createSignal<
+    { kind: "img" | "text"; src: string } | undefined
+  >(undefined);
   const [dragging, setDragging] = createSignal(0);
   const [tokenCount, setTokenCount] = createSignal<number | null>(null);
   const [queued, setQueued] = createSignal<QueuedTurn[]>([]);
@@ -164,6 +169,14 @@ export default function Chat() {
     pinned = true;
     if (toBottomEl) toBottomEl.hidden = true;
     scrollTo(0, document.documentElement.scrollHeight);
+  }
+
+  /* The ↓ Latest button takes a smooth trip; streaming and sends stay
+     instant so follow-scroll never lags behind the paint. */
+  function jumpToLatest() {
+    pinned = true;
+    if (toBottomEl) toBottomEl.hidden = true;
+    scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
   }
 
   function announce(text: string) {
@@ -352,23 +365,7 @@ export default function Chat() {
     const content: MessageContent = pending.length
       ? [
           ...(text ? [{ type: "text" as const, text }] : []),
-          ...pending.map((attachment): Part =>
-            attachment.kind === "pdf"
-              ? {
-                  type: "file" as const,
-                  file: { file_data: attachment.url!, filename: attachment.name },
-                }
-              : attachment.kind === "text"
-                ? {
-                    type: "text" as const,
-                    text: attachment.url!,
-                    name: attachment.name,
-                  }
-                : {
-                    type: "image_url" as const,
-                    image_url: { url: attachment.url! },
-                }
-          ),
+          ...pending.map(attachmentPart),
         ]
       : text;
     return { content, text, attachments: pending };
@@ -1182,6 +1179,7 @@ export default function Chat() {
   }
 
   function onDeleteConversation(id: string) {
+    const conversation = conversations().find((item) => item.id === id);
     deleteConversation(id);
     if (activeId() === id) newChat();
     // After newChat's save, so the outgoing draft cannot resurrect under the
@@ -1191,6 +1189,13 @@ export default function Chat() {
     } catch {
       /* Storage disabled: the stale draft is harmless. */
     }
+    // The row is gone but the object lives in this closure until the toast
+    // expires — Undo puts it back untouched.
+    if (conversation)
+      pushToast("ok", `Deleted "${conversation.title || "chat"}"`, 8000, {
+        label: "Undo",
+        run: () => restoreConversation(conversation),
+      });
   }
 
   /* ArrowUp in the composer walks back through sent user turns shell-style;
@@ -1274,7 +1279,7 @@ export default function Chat() {
       return;
     }
     const zoom = target.closest<HTMLImageElement>(".user-images img");
-    if (zoom?.src) setLightbox(zoom.src);
+    if (zoom?.src) setLightbox({ kind: "img", src: zoom.src });
   }
 
   // A hidden tab keeps generating; the title says so, then reports done.
@@ -1299,13 +1304,27 @@ export default function Chat() {
     const history = messages();
     const picked = model() || modelData()[0]?.id;
     const effortValue = effort();
+    // Attachments count toward the prompt too; loading ones re-trigger
+    // through attachmentsVersion once their data lands.
+    attachmentsVersion();
+    const pending = attachments().filter((attachment) => attachment.url);
     window.clearTimeout(tokenTimer);
     // Nothing to count: an empty history and draft 400s on the server;
     // a missing model does the same, so count only once one resolves.
-    if (running() || !picked || (!draft.trim() && !history.length)) {
+    if (
+      running() ||
+      !picked ||
+      (!draft.trim() && !history.length && !pending.length)
+    ) {
       setTokenCount(null);
       return;
     }
+    const draftContent: MessageContent = pending.length
+      ? [
+          ...(draft.trim() ? [{ type: "text" as const, text: draft }] : []),
+          ...pending.map(attachmentPart),
+        ]
+      : draft;
     tokenTimer = window.setTimeout(async () => {
       try {
         const res = await api<{ input_tokens?: number }>(
@@ -1315,7 +1334,7 @@ export default function Chat() {
             headers: { "Content-Type": "application/json" },
             /* The count endpoint speaks the Anthropic dialect: the same
                messages OpenAI chat accepts need translation. */
-            body: countBody(picked, history, draft, effortValue),
+            body: countBody(picked, history, draftContent, effortValue),
           }
         );
         setTokenCount(
@@ -1363,7 +1382,8 @@ export default function Chat() {
       }
       if (event.key !== "Escape") return;
       if (lightbox()) {
-        setLightbox(null);
+        setLightbox(undefined);
+        inputEl?.focus();
         return;
       }
       // The command palette owns Escape while it is open.
@@ -1374,6 +1394,21 @@ export default function Chat() {
     const onExport = () => exportChat();
     const onToggleSidebar = () => setMenuOpen((open) => !open);
     const onFocusInput = () => inputEl?.focus();
+    const onPinActive = () => {
+      const id = activeId();
+      if (!id) return;
+      pinConversation(
+        id,
+        !conversations().find((item) => item.id === id)?.pinned
+      );
+    };
+    const onOpenSystem = () => {
+      setMenuOpen(true);
+      // The sidebar mounts/opens async; let it reveal before focusing.
+      queueMicrotask(() =>
+        window.dispatchEvent(new CustomEvent("richengine:reveal-system"))
+      );
+    };
     const onVisible = () => {
       if (!document.hidden) document.title = baseTitle;
     };
@@ -1384,6 +1419,8 @@ export default function Chat() {
     window.addEventListener("richengine:export-chat", onExport);
     window.addEventListener("richengine:toggle-sidebar", onToggleSidebar);
     window.addEventListener("richengine:focus-input", onFocusInput);
+    window.addEventListener("richengine:pin-chat", onPinActive);
+    window.addEventListener("richengine:open-system", onOpenSystem);
     onCleanup(() => {
       window.removeEventListener("scroll", onScroll);
       document.removeEventListener("keydown", onKeyDown);
@@ -1392,6 +1429,8 @@ export default function Chat() {
       window.removeEventListener("richengine:export-chat", onExport);
       window.removeEventListener("richengine:toggle-sidebar", onToggleSidebar);
       window.removeEventListener("richengine:focus-input", onFocusInput);
+      window.removeEventListener("richengine:pin-chat", onPinActive);
+      window.removeEventListener("richengine:open-system", onOpenSystem);
       window.clearTimeout(modelTimer);
       document.title = baseTitle;
     });
@@ -1525,9 +1564,10 @@ export default function Chat() {
                     <button
                       type="button"
                       class="starter"
+                      title="Send this prompt"
                       onClick={() => {
                         setInput(prompt);
-                        inputEl?.focus();
+                        void complete();
                       }}
                     >
                       {prompt}
@@ -1571,14 +1611,22 @@ export default function Chat() {
         <div class="drop-overlay">Drop to attach</div>
       </Show>
       <Show when={lightbox()}>
-        {(src) => (
+        {(box) => (
           <div
             class="lightbox"
             role="dialog"
-            aria-label="Image preview"
-            onClick={() => setLightbox(null)}
+            aria-label={box().kind === "img" ? "Image preview" : "Text preview"}
+            onClick={() => {
+              setLightbox(undefined);
+              inputEl?.focus();
+            }}
           >
-            <img src={src()} alt="Attached image, enlarged" />
+            <Show
+              when={box().kind === "img"}
+              fallback={<pre class="lightbox-text">{box().src}</pre>}
+            >
+              <img src={box().src} alt="Attached image, enlarged" />
+            </Show>
           </div>
         )}
       </Show>
@@ -1589,7 +1637,7 @@ export default function Chat() {
         hidden
         aria-label="Scroll to latest message"
         title="Jump to latest (auto-scroll resumes)"
-        onClick={pinAndScroll}
+        onClick={jumpToLatest}
       >
         ↓ Latest
       </button>
@@ -1621,12 +1669,32 @@ export default function Chat() {
         onEffortChange={onEffortChange}
         onAddFiles={(files) => void addFiles(files)}
         onRemoveAttachment={onRemoveAttachment}
+        onPreviewAttachment={(attachment) => {
+          if (attachment.kind === "image" || attachment.kind === "text")
+            setLightbox({
+              kind: attachment.kind === "image" ? "img" : "text",
+              src: attachment.url!,
+            });
+        }}
         onRecallPrev={recallPrev}
         onRecallNext={recallNext}
         inputRef={(el) => (inputEl = el)}
       />
     </div>
   );
+}
+
+/* One attachment → one content part. buildTurn and the token counter share
+   this so the meter sees what a send would carry. */
+function attachmentPart(attachment: Attachment): Part {
+  return attachment.kind === "pdf"
+    ? {
+        type: "file",
+        file: { file_data: attachment.url!, filename: attachment.name },
+      }
+    : attachment.kind === "text"
+      ? { type: "text", text: attachment.url!, name: attachment.name }
+      : { type: "image_url", image_url: { url: attachment.url! } };
 }
 
 /* OpenAI data-URL parts → Anthropic base64 image/document sources; parts
@@ -1659,7 +1727,7 @@ function anthropicContent(content: MessageContent): unknown {
 function countBody(
   picked: string,
   history: Message[],
-  draft: string,
+  draft: MessageContent,
   effort: string
 ): string {
   const system = storageGet(SYSTEM_KEY)?.trim();
@@ -1689,7 +1757,9 @@ function countBody(
               ]
             : anthropicContent(m.content),
       })),
-      ...(draft.trim() ? [{ role: "user", content: draft }] : []),
+      ...((typeof draft === "string" ? draft.trim() : draft.length)
+        ? [{ role: "user", content: anthropicContent(draft) }]
+        : []),
     ],
   });
 }
