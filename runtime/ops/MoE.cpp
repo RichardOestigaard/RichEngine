@@ -390,14 +390,19 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
     shape_.expertsPerToken = std::clamp(topK, 1u, shape_.expertsPerToken);
   // Affine plans have 32- or 16-row prefill/canvas and 8-row decode
   // kernels, GGUF plans 8-row kernels in both phases and 32-row prefill
-  // kernels. Canvas is affine-only.
+  // kernels; wide GGUF decode batches may take the 32-row kernel so a union
+  // expert's weights stream once instead of per 8-row tile. Canvas is
+  // affine-only.
   const bool gguf = shape.weightLayout == WeightLayout::Block32;
   const bool canvas = phase == MoePhase::Canvas;
   const bool prefill = phase == MoePhase::Prefill;
   const bool affineRowsTile =
       config.expertTile == MoeExpertTile::M32 ||
       config.expertTile == MoeExpertTile::M16;
-  if ((!prefill && !canvas && config.expertTile != MoeExpertTile::M8) ||
+  const bool wideGgufDecode =
+      gguf && !prefill && !canvas && config.expertTile == MoeExpertTile::M32;
+  if ((!prefill && !canvas && !wideGgufDecode &&
+       config.expertTile != MoeExpertTile::M8) ||
       (canvas && (gguf || !affineRowsTile)) ||
       (!gguf && prefill && config.expertTile != MoeExpertTile::M32) ||
       (gguf && prefill && config.expertTile == MoeExpertTile::M16))
@@ -598,7 +603,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     return p.routed.formatId == GGUF_FMT_MXFP4 || p.shared.formatId == GGUF_FMT_MXFP4;
   };
   const bool packed =
-      block && plan.configuration().mxfp4Native &&
+      block && plan.tileRows() == 8 && plan.configuration().mxfp4Native &&
       plan.configuration().ggufTile != MoeGgufTile::Register &&
       !packedDisabled() &&
       (mxfp4Expert(weights.blocks().gate) || mxfp4Expert(weights.blocks().up) ||

@@ -802,14 +802,21 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
       // The fused-M kernels size their logits tile to the live rows: the
       // 8- and 16-row variants skip the 32-row tile's dead MMA work.
       const uint32_t liveRows = lanes * verifyStride;
+      const bool t256 =
+          liveRows <= 16 && head.outputSize % 256 == 0 &&
+          fused->headArgs.output_stride % 256 == 0;
       const std::string_view kernel =
-          liveRows <= 8    ? "decode_head_argmax_q4_m8"
+          t256             ? "decode_head_argmax_q4_m16_t256"
+          : liveRows <= 8  ? "decode_head_argmax_q4_m8"
           : liveRows <= 16 ? "decode_head_argmax_q4_m16"
-                           : "decode_head_argmax_q4";
+          : liveRows <= 32 ? "decode_head_argmax_q4"
+          : liveRows <= 48 ? "decode_head_argmax_q4_m48"
+                           : "decode_head_argmax_q4_m64h";
       graph.add(std::string(kernel),
                 {finalHidden, w.weights, w.scales, w.biases,
                  fused->headArgmaxValues, fused->headArgmaxIndices},
-                fused->headArgs, {head.outputSize / 128, 1, 1}, {256, 1, 1});
+                fused->headArgs, {head.outputSize / (t256 ? 256 : 128), 1, 1},
+                {256, 1, 1});
       graph.endBakedSpan();
       return;
     }

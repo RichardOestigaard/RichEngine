@@ -77,13 +77,20 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         headShape.outputSize % 64 == 0 &&
         headShape.inputSize % 64 == 0;
     static const bool headFusedOff = envFlag("RICHENGINE_HEAD_FUSED_OFF");
-    // The fused head's argmax tile holds 32 rows; banding wider batches
-    // through it measured no better than the ordinary projection.
+    // The fused head's argmax tile holds 48 affine rows (the m48 kernel's
+    // 24 KB tile stays under the threadgroup cap) or 32 GGUF rows (the gguf
+    // amax family is instantiated to m32); beyond that the ordinary
+    // projection plus argmax pass wins.
+    const bool affine48 =
+        headShape.layout() == ops::WeightLayout::Affine64 &&
+        headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0;
+    // m64h is opt-in: its half-precision tile can flip argmax near-ties.
+    static const bool headM64 = envFlag("RICHENGINE_HEAD_M64");
+    const uint32_t affineBound = headM64 ? 64 : 48;
     buffers.fusedHead = !headFusedOff && !tree &&
-        uint64_t{lanes} * geometry.draft.verifyRows() <= 32 &&
-        ((headShape.layout() == ops::WeightLayout::Affine64 &&
-          headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0) ||
-         ggufHead);
+        uint64_t{lanes} * geometry.draft.verifyRows() <=
+            (affine48 ? affineBound : 32) &&
+        (affine48 || ggufHead);
     buffers.headArgs.output_size = geometry.target.vocabularySize;
     buffers.headArgs.output_stride = geometry.target.paddedVocabularySize;
     buffers.headArgs.input_size = geometry.target.hiddenSize;
@@ -264,12 +271,23 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     // The fused head path must match addHeadBatch's 32-row bound: taking
     // partials for a head that never ran would reduce stale scratch — the
     // logits it skipped are never written.
-    uint32_t fusedHead = headFusedOff ||
-            uint64_t{lanes} * geometry.draft.verifyRows() > 32 ? 0 :
+    // Affine heads fuse up to 48 rows (the m48 argmax tile), GGUF heads up
+    // to 32 (their amax kernels stop at m32); the t256 variant additionally
+    // wants a 256-divisible vocabulary.
+    const uint32_t headRows = lanes * geometry.draft.verifyRows();
+    const bool affineHead =
         headShape.layout() == ops::WeightLayout::Affine64 &&
-                headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0
-            ? 1
-            : ggufHead ? 2 : 0;
+        headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0;
+    static const bool headM64 = envFlag("RICHENGINE_HEAD_M64");
+    uint32_t fusedHead =
+        headFusedOff || headRows > (affineHead ? (headM64 ? 64u : 48u) : 32u)
+            ? 0
+            : affineHead
+                  ? (headRows <= 16 && headShape.outputSize % 256 == 0 &&
+                             geometry.target.paddedVocabularySize % 256 == 0
+                         ? 3
+                         : 1)
+                  : ggufHead ? 2 : 0;
     for (uint32_t lane = 0; lane < lanes && fusedHead; ++lane) {
       if (policies[lane].samples() || policies[lane].constrained ||
           policies[lane].penalties.active()) {

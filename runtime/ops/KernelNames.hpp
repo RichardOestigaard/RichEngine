@@ -14,6 +14,7 @@ inline constexpr std::string_view kDecodeSamplePenalize = "decode_sample_penaliz
 inline constexpr std::string_view kDecodeSamplePenalizeVerify = "decode_sample_penalize_verify";
 inline constexpr std::string_view kDecodeHeadArgmaxReduceTiles = "decode_head_argmax_reduce_tiles";
 inline constexpr std::string_view kDecodeHeadArgmaxReduceTilesGguf = "decode_head_argmax_reduce_tiles_gguf";
+inline constexpr std::string_view kDecodeHeadArgmaxReduceTilesT256 = "decode_head_argmax_reduce_tiles_t256";
 inline constexpr std::string_view kDecodeSampleArgmaxSharded = "decode_sample_argmax_sharded";
 inline constexpr std::string_view kDecodeSampleArgmaxReduce = "decode_sample_argmax_reduce";
 inline constexpr std::string_view kDecodeSampleMassSharded = "decode_sample_mass_sharded";

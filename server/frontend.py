@@ -1296,6 +1296,7 @@ class Frontend:
             add_generation_prompt
             and requested is not None
             and thinking != bool(requested)
+            and thinking
         ):
             raise APIError(
                 400, "chat template does not support the requested thinking mode"
@@ -1515,6 +1516,13 @@ class Frontend:
         ]
         for sibling in cohort:
             sibling.cohort = cohort
+            # The cohort shares the whole prompt: mark it so the producer
+            # keeps its state at that junction and followers — this cohort
+            # and later same-prefix requests — resume from it instead of
+            # recomputing the prefill.
+            sibling.shared_prefix_tokens = (
+                len(sibling.prefix_tokens) + len(sibling.prompt_tokens)
+            )
         return cohort
 
     def _tool_dialect(self, detected):

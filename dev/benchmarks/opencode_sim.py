@@ -42,7 +42,7 @@ class Args:
 
 def chat(port, model, body_extra, timeout=600):
     body = smoke_real.chat_body(
-        model, "", max_completion_tokens=256, temperature=0.7, **body_extra
+        model, "", max_completion_tokens=256, temperature=0, **body_extra
     )
     return smoke_real.request(
         port, "POST", "/v1/chat/completions", body, timeout=timeout
@@ -52,11 +52,30 @@ def chat(port, model, body_extra, timeout=600):
 def batches(port):
     status, doc = smoke_real.request(port, "GET", "/status")
     assert status == 200
-    return dict(doc["scheduler"]["decode_batches_by_width"])
+    m = doc["metrics"]
+    return {
+        "widths": dict(doc["scheduler"]["decode_batches_by_width"]),
+        "decode_tokens": m["decode_output_tokens"],
+        "decode_wall_ms": m["decode_wall_ms"],
+    }
 
 
 def batch_delta(before, after):
-    return {k: int(after.get(k, 0)) - int(before.get(k, 0)) for k in after}
+    widths = {
+        k: int(after["widths"].get(k, 0)) - int(before["widths"].get(k, 0))
+        for k in after["widths"]
+    }
+    return {
+        "widths": widths,
+        "decode_tokens": after["decode_tokens"] - before["decode_tokens"],
+        "decode_wall_ms": after["decode_wall_ms"] - before["decode_wall_ms"],
+        "decode_tok_s": round(
+            1000
+            * (after["decode_tokens"] - before["decode_tokens"])
+            / max(after["decode_wall_ms"] - before["decode_wall_ms"], 1e-9),
+            1,
+        ),
+    }
 
 
 def main() -> int:
@@ -72,9 +91,32 @@ def main() -> int:
             timeout=120,
         )
         prompt = (
-            "You are a coding agent. Propose an alternative implementation "
-            "plan for adding retry logic to an HTTP client: distinct "
-            "approaches, trade-offs, then pick one."
+            "Here is module http_client.py:\n\n```python\n"
+            "def request(url, timeout=30):\n"
+            "    response = urllib.request.urlopen(url, timeout=timeout)\n"
+            "    return response.read()\n\n"
+            "def get_json(url):\n"
+            "    return json.loads(request(url))\n\n"
+            "def post(url, data):\n"
+            "    body = json.dumps(data).encode()\n"
+            "    req = urllib.request.Request(url, data=body)\n"
+            "    return request(req)\n"
+            "```\n\n"
+            "Rewrite the complete file adding retry logic: three attempts, "
+            "exponential backoff starting at 100ms, retry only on transient "
+            "HTTP status codes. Emit the whole file in one code block."
+        )
+        # Phase B prompt re-emits a larger file: the agentic edit-loop shape
+        # the draft predicts best.
+        pack_prompt = (
+            "Here is module pipeline.py — emit it verbatim, unchanged, in one "
+            "code block:\n\n```python\n"
+            + "\n".join(
+                f"def stage_{i}(items):\n"
+                f"    return [x * {i} for x in items if x > {i}]"
+                for i in range(12)
+            )
+            + "\n```"
         )
 
         # Phase A — opencode's shape: N sequential single-choice requests.
@@ -97,19 +139,13 @@ def main() -> int:
         t0 = time.monotonic()
         status, doc = chat(
             server.port, model,
-            {"messages": [{"role": "user", "content": prompt}], "n": n},
+            {"messages": [{"role": "user", "content": pack_prompt}], "n": n},
         )
         packed_s = time.monotonic() - t0
         assert status == 200, doc
         packed_completion = doc["usage"]["completion_tokens"]
         packed_batches = batch_delta(before, batches(server.port))
-        packed_lanes = sum(
-            int(k[1:]) * v
-            for k, v in packed_batches.items()
-            if k.startswith("b")
-        )
-        packed_total = sum(packed_batches.values())
-
+        packed_total = sum(packed_batches["widths"].values())
         print(
             json.dumps(
                 {
@@ -119,15 +155,17 @@ def main() -> int:
                         "wall_s": round(serial_s, 2),
                         "completion_tokens": serial_completion,
                         "tok_s": round(serial_completion / serial_s, 1),
-                        "batches": serial_batches,
+                        "engine_decode_tok_s": serial_batches["decode_tok_s"],
+                        "batches": serial_batches["widths"],
                     },
                     "packed_n": {
                         "wall_s": round(packed_s, 2),
                         "completion_tokens": packed_completion,
                         "tok_s": round(packed_completion / packed_s, 1),
-                        "batches": packed_batches,
+                        "engine_decode_tok_s": packed_batches["decode_tok_s"],
+                        "batches": packed_batches["widths"],
                         "multi_lane_share": round(
-                            1 - packed_batches.get("b1", 0)
+                            1 - packed_batches["widths"].get("b1", 0)
                             / max(packed_total, 1),
                             2,
                         ),

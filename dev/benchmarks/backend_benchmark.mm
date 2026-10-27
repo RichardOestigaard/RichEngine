@@ -820,10 +820,13 @@ struct BenchmarkScenarios final {
   // Greedy answers to the transcript prompts (TranscriptPrompts.hpp) —
   // their tokens move with any change in the target's arithmetic.
   bool transcripts = false;
+  // Decode throughput against a live history: 32K/64K/128K prompts warmed
+  // into the cache, then 64 tokens decoded on top.
+  bool longDecode = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -833,6 +836,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "context" ? &selected.context
                      : name == "exact"   ? &selected.exact
                      : name == "transcripts" ? &selected.transcripts
+                     : name == "longdecode" ? &selected.longDecode
                                          : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -859,7 +863,8 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--kv-format FORMAT]\n"
-                   "  NAME: decode, partial, short, context or exact "
+                   "  NAME: decode, partial, short, context, exact, "
+                   "transcripts or longdecode "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -1081,6 +1086,50 @@ int main(int argc, char **argv) {
           stepGpuMilliseconds(1) + stepGpuMilliseconds(2)) {
         performanceFailures.push_back(
             "a B3 decode step takes longer than a B1 step and a B2 step");
+      }
+    }
+
+    // Decode throughput against a live history: each length's prompt is
+    // warmed into the cache, then one lane decodes 64 tokens on top. The
+    // lengths are Page32 multiples, so the timed request's whole prompt is
+    // a published prefix and it prefills no rows — the decode figures are
+    // history-depth clean. The warm request's cold fill is reported as the
+    // length's prefill.
+    constexpr std::array<uint32_t, 3> longDecodeLengths{32768, 65536, 131072};
+    std::vector<std::pair<uint32_t, DecodeThroughputMeasurement>> longDecode;
+    std::vector<uint32_t> skippedLongDecodeLengths;
+    if (selected.longDecode) {
+      for (uint32_t length : longDecodeLengths) {
+        // The warm request's token plus the timed request's 64 must fit.
+        if (uint64_t{length} + 65 > engineConfig.maxContext) {
+          skippedLongDecodeLengths.push_back(length);
+          continue;
+        }
+        for (uint32_t sample = 0; sample < samples; ++sample) {
+          evictAllCache(resources->cache());
+          const std::vector<uint32_t> longPrompt =
+              prompt(length,
+                     (uint64_t{length} << 32 | sample) ^ 0x4c4f4e474458ULL,
+                     promptVocabulary);
+          const model::ModelTelemetry prefillBefore = executor->telemetry();
+          DecodeThroughputMeasurement result = runDecodeThroughput(
+              engine, driver, *executor, events, progress.get(), requestId,
+              /*width*/ 1, sample, longPrompt);
+          const model::ModelTelemetry prefillAfter = executor->telemetry();
+          // The run's prefill is the warm request's cold fill of `length`
+          // tokens; subtract the timed request's (near-empty) share.
+          result.prefillWallMilliseconds =
+              (prefillAfter.totalPrefillWallSeconds -
+               prefillBefore.totalPrefillWallSeconds) *
+                  1000.0 -
+              result.prefillWallMilliseconds;
+          result.prefillGpuMilliseconds =
+              (prefillAfter.totalPrefillGpuSeconds -
+               prefillBefore.totalPrefillGpuSeconds) *
+                  1000.0 -
+              result.prefillGpuMilliseconds;
+          longDecode.emplace_back(length, std::move(result));
+        }
       }
     }
 
@@ -1474,6 +1523,37 @@ int main(int argc, char **argv) {
     // it, and the one its memory plan holds without the Neural Engine split,
     // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
+    std::cout << "]},\"long_decode\":{\"context_lengths\":[";
+    for (size_t index = 0; index < longDecodeLengths.size(); ++index)
+      std::cout << (index ? "," : "") << longDecodeLengths[index];
+    std::cout << "],\"output_tokens_per_lane\":64,\"skipped_lengths\":[";
+    for (size_t index = 0; index < skippedLongDecodeLengths.size(); ++index)
+      std::cout << (index ? "," : "") << skippedLongDecodeLengths[index];
+    std::cout << "],\"samples\":[";
+    for (size_t index = 0; index < longDecode.size(); ++index) {
+      if (index)
+        std::cout << ',';
+      const auto &[length, value] = longDecode[index];
+      std::cout << "{\"context_tokens\":" << length
+                << ",\"sample\":" << value.sample
+                << ",\"prefill_wall_ms\":" << value.prefillWallMilliseconds
+                << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
+                << ",\"prefill_tokens_per_second\":"
+                << (value.prefillWallMilliseconds > 0.0
+                        ? length * 1000.0 / value.prefillWallMilliseconds
+                        : 0.0)
+                << ",\"decode_wall_ms\":" << value.decodeWallMilliseconds
+                << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
+                << ",\"decode_output_tokens\":" << value.decodeOutputTokens
+                << ",\"decode_batches\":" << value.decodeBatches
+                << ",\"decode_wall_tokens_per_second\":"
+                << value.aggregateDecodeWallTokensPerSecond
+                << ",\"gpu_tokens_per_second\":"
+                << value.aggregateGpuTokensPerSecond
+                << ",\"draft_acceptance_rate\":" << value.draftAcceptanceRate
+                << ",\"output_token_hash\":\""
+                << tokenSequenceHash(value.firstLaneOutputTokens) << "\"}";
+    }
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
               << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
               << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes

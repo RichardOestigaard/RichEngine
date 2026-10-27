@@ -551,12 +551,15 @@ constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 constexpr uint32_t kSplitGroupsPerCore = 4;
 
 uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
+  // Sweep knob for the m48/m64 Split128 rows the decode tier never measured
+  // (docs/Ornith_optimizations.md §4); 0 keeps the fitted rule.
+  static const uint32_t forced = envUint("RICHENGINE_SPLIT128", 0);
   const uint64_t grid = matrix.outputSize / 128;
   uint32_t splits = 1;
   while (splits < LinearConfig::kMaximumSplits && grid * 2 * splits <= uint64_t{kSplitGroupsPerCore} * cores &&
          2 * splits <= matrix.inputSize / kInputSumBlock)
     splits *= 2;
-  return splits;
+  return forced ? std::min(forced, LinearConfig::kMaximumSplits) : splits;
 }
 
 // Apple10 wide plain projections reduce input re-reads with paired N256

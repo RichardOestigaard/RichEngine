@@ -1,7 +1,7 @@
 annotated-doc==0.0.5
 anyio==4.15.1
 attrs==26.1.0
-certifi==2026.7.22
+certifi==2026.10.23
 cffi==2.1.1
 click==8.5.0
 cryptography==50.0.2
@@ -10,10 +10,10 @@ fsspec==2026.9.0
 h11==0.16.0
 hf-xet==1.7.0
 httpcore==1.0.9
-httpcore2==2.13.1
+httpcore2==2.16.0
 httpx==0.28.1
-httpx2==2.13.1
-huggingface_hub==2.2.0
+httpx2==2.16.0
+huggingface_hub==2.3.0
 idna==3.20
 Jinja2==3.1.6
 jsonschema==4.26.0
@@ -25,7 +25,7 @@ mdurl==0.1.2
 numpy==2.5.4
 orjson==3.13.0
 packaging==26.3
-Pillow==12.3.0
+Pillow==13.0.0
 pip==26.2.1
 Pygments==2.21.0
 pycparser==3.11
@@ -39,7 +39,7 @@ safetensors==0.8.0
 shellingham==1.5.4
 tokenizers==0.23.3
 tqdm==4.70.1
-transformers==5.20.0
+transformers==5.21.0
 truststore==0.10.5
 typer==0.27.3
 typing_extensions==4.16.0

@@ -252,6 +252,15 @@ def usage_dict(result, job):
         "total_tokens": result.prompt_tokens + result.completion_tokens,
         "prompt_tokens_details": {"cached_tokens": result.cache.matched_tokens},
         "completion_tokens_details": {"reasoning_tokens": job.reasoning_tokens},
+        "draft_tokens_details": {
+            "drafted_tokens": result.drafted_tokens,
+            "accepted_draft_tokens": result.accepted_draft_tokens,
+            "draft_acceptance_rate": (
+                result.accepted_draft_tokens / result.drafted_tokens
+                if result.drafted_tokens
+                else None
+            ),
+        },
     }
 
 

@@ -1554,6 +1554,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "prompt_tokens_details": {
                         "cached_tokens": result.cache.matched_tokens
                     },
+                    "draft_tokens_details": {
+                        "drafted_tokens": result.drafted_tokens,
+                        "accepted_draft_tokens": result.accepted_draft_tokens,
+                        "draft_acceptance_rate": (
+                            result.accepted_draft_tokens / result.drafted_tokens
+                            if result.drafted_tokens
+                            else None
+                        ),
+                    },
                 },
                 "timings": timings_dict(result),
                 "metadata": job.response_metadata or {},

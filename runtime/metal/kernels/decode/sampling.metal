@@ -1707,14 +1707,13 @@ constant constexpr ushort kHeadArgmaxCols = 128;
 // The fused-M variants size the logits tile to the live rows: a lane's
 // verify depth times the batch width, so the narrow steps skip three
 // quarters of the tile's MMA work (the same weight bytes stream either way).
-template <ushort M>
+template <ushort M, ushort TN, class TileT = float>
 __attribute__((always_inline)) inline void head_argmax_q4_tile(
     device bfloat *input, device uchar *weights, device bfloat *scales,
     device bfloat *biases, device float *partial_values,
     device uint *partial_indices, constant HeadArgmaxParams &params,
-    threadgroup float *tg_tile, threadgroup float *input_sums,
+    threadgroup TileT *tg_tile, threadgroup float *input_sums,
     uint tile, uint simd_lane, uint simd_group, uint thread_index) {
-  constexpr ushort TN = kHeadArgmaxCols;
   const uint col0 = tile * TN;
   q4_mpp_tile_sums<M, TN, false, 8, false>(
       input, weights, scales, biases, weights, scales, biases,
@@ -1726,7 +1725,7 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
         q4_visit(sums_0, traversal, [&](ushort i)
                  __attribute__((always_inline)) {
           auto index = sums_0.get_multidimensional_index(i);
-          tg_tile[index[1] * TN + index[0]] = sums_0[i];
+          tg_tile[index[1] * TN + index[0]] = TileT(sums_0[i]);
         });
       });
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1748,7 +1747,7 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
           (exclude_stop &&
            (token == params.stop_token_0 || token == params.stop_token_1)))
         continue;
-      const float value = tg_tile[s * TN + col];
+      const float value = float(tg_tile[s * TN + col]);
       if (value > best || (value == best && token < best_index)) {
         best = value;
         best_index = token;
@@ -1759,7 +1758,7 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
   partial_indices[s * tiles + tile] = best_index;
 }
 
-#define HEAD_ARGMAX_Q4(Name, M)                                                \
+#define HEAD_ARGMAX_Q4_T(Name, M, TN, TileT)                                   \
   kernel void Name(                                                            \
       device bfloat *input [[buffer(0)]],                                      \
       device uchar *weights [[buffer(1)]],                                     \
@@ -1772,16 +1771,32 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]],                      \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    threadgroup float tg_tile[M * kHeadArgmaxCols];                            \
+    threadgroup TileT tg_tile[M * TN];                                         \
     threadgroup float input_sums[8 * M];                                       \
-    head_argmax_q4_tile<M>(input, weights, scales, biases, partial_values,     \
-                           partial_indices, params, tg_tile, input_sums, tile, \
-                           simd_lane, simd_group, thread_index);               \
+    head_argmax_q4_tile<M, TN, TileT>(input, weights, scales, biases,          \
+                                    partial_values, partial_indices, params,   \
+                                    tg_tile, input_sums, tile, simd_lane,      \
+                                    simd_group, thread_index);                 \
   }
-HEAD_ARGMAX_Q4(decode_head_argmax_q4, kHeadArgmaxRows)
-HEAD_ARGMAX_Q4(decode_head_argmax_q4_m16, 16)
-HEAD_ARGMAX_Q4(decode_head_argmax_q4_m8, 8)
+#define HEAD_ARGMAX_Q4(Name, M, TN) HEAD_ARGMAX_Q4_T(Name, M, TN, float)
+HEAD_ARGMAX_Q4(decode_head_argmax_q4, kHeadArgmaxRows, kHeadArgmaxCols)
+// The 48-row variant covers three-lane verify batches; its tile needs
+// 24 KB of threadgroup, under the 32 KB cap. 64 rows would exceed it.
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m48, 48, kHeadArgmaxCols)
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m16, 16, kHeadArgmaxCols)
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m8, 8, kHeadArgmaxCols)
+// The B1 tile doubles its columns: halves each threadgroup's re-read of the
+// fused head's input (docs/Ornith_optimizations.md §2). The M16 × 256-wide
+// tile holds 16 KB of threadgroup, under the 32 KB cap.
+HEAD_ARGMAX_Q4(decode_head_argmax_q4_m16_t256, 16, 256)
+// The four-lane verify batch's 64-row tile would need 34 KB as float —
+// over the threadgroup cap. Staging the logits as half fits in 18 KB; the
+// half rounding can flip argmax ties vs the unfused f32 path, so the host
+// only selects this behind RICHENGINE_HEAD_M64 (off by default until
+// parity is proven).
+HEAD_ARGMAX_Q4_T(decode_head_argmax_q4_m64h, 64, kHeadArgmaxCols, half)
 #undef HEAD_ARGMAX_Q4
+#undef HEAD_ARGMAX_Q4_T
 
 // Reduces the fused head's per-(row, column tile) partials to each selected
 // greedy row's token, lowest id on ties.
@@ -1797,6 +1812,34 @@ kernel void decode_head_argmax_reduce_tiles(
   // The writer strides the head's packed tiles; a padded vocabulary's tail
   // tile is within it but only real tokens were admitted.
   const uint tiles = params.logits_stride / kHeadArgmaxCols;
+  float best = -INFINITY;
+  uint best_index = 0xffffffffu;
+  for (uint t = lane; t < tiles; t += 32) {
+    const float value = partial_values[s * tiles + t];
+    const uint index = partial_indices[s * tiles + t];
+    if (value > best || (value == best && index < best_index)) {
+      best = value;
+      best_index = index;
+    }
+  }
+  const float group_best = simd_max(best);
+  const uint group_index =
+      simd_min(best == group_best ? best_index : 0xffffffffu);
+  if (lane == 0)
+    tokens[s] = group_index;
+}
+
+// Reduces the 256-wide partials of decode_head_argmax_q4_m16_t256.
+kernel void decode_head_argmax_reduce_tiles_t256(
+    device const float *partial_values [[buffer(0)]],
+    device const uint *partial_indices [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    constant TargetSamplingParams &params [[buffer(3)]],
+    uint s [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  if (lane_samples(params, s) || row_dead(params, s))
+    return;
+  const uint tiles = params.logits_stride / 256;
   float best = -INFINITY;
   uint best_index = 0xffffffffu;
   for (uint t = lane; t < tiles; t += 32) {
