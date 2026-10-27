@@ -10,6 +10,7 @@
 
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <sys/qos.h>
 #include <unistd.h>
@@ -262,6 +263,29 @@ struct Completion final {
 };
 
 uint32_t elementBytes(Surface::Element element) noexcept { return element == Surface::Element::Int8 ? 1 : 2; }
+
+// objc_msgSend to `target` with an unchecked signature — for the optional
+// entry points evaluate()/evalInterface() probe, which the signature table
+// does not cover because they may not exist at all.
+template <typename R, typename... Args> R send(id target, SEL selector, Args... args) {
+  return reinterpret_cast<R (*)(id, SEL, Args...)>(objc_msgSend)(target, selector, args...);
+}
+
+// Whether `target` (an instance or a class) answers `selector`, appending
+// `name` and the method's type encoding to `detail` either way.
+bool answers(id target, SEL selector, const char *name, std::string &detail) {
+  const bool isClass = class_isMetaClass(object_getClass(target));
+  Method method = isClass ? class_getClassMethod((Class)target, selector)
+                          : class_getInstanceMethod(object_getClass(target), selector);
+  detail += std::string(" ") + name;
+  if (!method) {
+    detail += ":none";
+    return false;
+  }
+  const char *encoding = method_getTypeEncoding(method);
+  detail += std::string(":") + (encoding ? encoding : "?");
+  return true;
+}
 
 // FNV-1a of `bytes`, continuing `hash`, in hexadecimal: the names of the
 // cache's files.
@@ -793,6 +817,211 @@ void Program::enqueue(const Binding &binding, const metal::SharedEvent &event, u
     completion->queued = true;
     completion->settle(std::move(lock));
   }
+}
+
+Program::EvalInterface Program::evalInterface() const {
+  EvalInterface result;
+  @autoreleasepool {
+    id model = impl_->model;
+    id client = impl_->api.client;
+    result.clientRealtime =
+        answers(client, @selector(evaluateRealTimeWithModel:options:request:error:), "rt", result.detail);
+    result.modelEval =
+        answers(model, @selector(evaluateWithQoS:options:request:error:), "modeleval", result.detail);
+    result.perfStatsMask = answers(model, @selector(setPerfStatsMask:), "mask", result.detail);
+    Class stats = NSClassFromString(@"_ANEPerformanceStats");
+    result.perfStats = stats && [stats respondsToSelector:@selector(statsWithHardwareExecutionNS:)];
+    result.detail += std::string(" stats") + (result.perfStats ? ":factory" : stats ? ":exists" : ":none");
+    answers(impl_->api.request,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            "shortreq", result.detail);
+    for (const char *name :
+         {"beginRealTimeTask", "endRealTimeTask", "loadRealTimeModel:options:qos:error:",
+          "prepareChainingWithModel:options:chainingReq:qos:error:", "buffersReadyWithModel:inputBuffers:options:qos:error:",
+          "enqueueSetsWithModel:outputSet:options:qos:error:"})
+      answers(client, sel_registerName(name), name, result.detail);
+  }
+  return result;
+}
+
+Program::DirectTiming Program::evaluate(const Binding &binding, EvalPath path, uint64_t statsMask) {
+  if (!binding.state_ || binding.state_->program.lock() != impl_)
+    throw std::invalid_argument("ANE program given another program's binding");
+  if (!impl_->loaded) throw std::runtime_error("ANE program is not loaded");
+  const Binding::State &bound = *binding.state_;
+  const Api &api = impl_->api;
+  DirectTiming timing;
+  runOnQueue(api, limits_, [&] {
+    @autoreleasepool {
+      // A stats object the driver may fill, and the perfStats argument
+      // forms to try: validate() counts it, so it takes a collection — the
+      // mutable array the driver may fill, a one-element array, the object
+      // itself, then none. The first an evaluation accepts wins. Only
+      // these proven forms are tried: a request a form gets through
+      // validate() but the driver cannot service hangs the synchronous
+      // evaluate call inside the client with no timeout.
+      id statsObject = nil;
+      NSMutableArray *statsArray = nil;
+      std::vector<id> statsForms;
+      if (statsMask) {
+        Class statsClass = NSClassFromString(@"_ANEPerformanceStats");
+        SEL factory = @selector(statsWithHardwareExecutionNS:);
+        if (statsClass && [statsClass respondsToSelector:factory])
+          statsObject = send<id>((id)statsClass, factory, uint64_t{0});
+        SEL setMask = @selector(setPerfStatsMask:);
+        if ([impl_->model respondsToSelector:setMask])
+          send<void>(impl_->model, setMask, static_cast<unsigned int>(statsMask));
+        if (statsObject) {
+          statsArray = [NSMutableArray array];
+          statsForms = {statsArray, @[ statsObject ], statsObject, nil};
+        }
+      }
+      if (statsForms.empty()) statsForms = {nil};
+
+      const auto requestWith = [&](id statsArg) -> id {
+        const auto create = [&](SEL selector, auto... extra) -> id {
+          return impl_->guarded("request creation", [&] {
+            if (![(id)api.request respondsToSelector:selector]) return (id) nil;
+            return send<id>((id)api.request, selector, bound.inputs, bound.inputIndices, bound.outputs,
+                            bound.outputIndices, (id)nil, statsArg, bound.procedure, extra...);
+          });
+        };
+        id request =
+            create(@selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:
+                             procedureIndex:sharedEvents:transactionHandle:),
+                   (id)nil, (id)nil);
+        if (!request)
+          request = create(
+              @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:));
+        return request;
+      };
+
+      const auto outcome = std::make_shared<Outcome>();
+      id request = nil;
+      const auto evaluate = [&] {
+        switch (path) {
+          case EvalPath::Client: {
+            impl_->guarded("evaluation", [&] {
+              NSError *error = nil;
+              if (![api.client evaluateWithModel:impl_->model options:@{} request:request qos:kQos error:&error])
+                fail("evaluation", error);
+            });
+            return;
+          }
+          case EvalPath::ClientRealtime: {
+            SEL selector = @selector(evaluateRealTimeWithModel:options:request:error:);
+            if (![(id)api.client respondsToSelector:selector])
+              throw std::invalid_argument("ANE real-time evaluation does not exist here");
+            impl_->guarded("evaluation", [&] {
+              SEL begin = @selector(beginRealTimeTask);
+              const bool bracket = [(id)api.client respondsToSelector:begin] && send<BOOL>(api.client, begin);
+              NSError *error = nil;
+              if (send<BOOL>(api.client, selector, impl_->model, @{}, request, &error)) return;
+              // A real-time evaluation may need the model loaded through
+              // the real-time path first; try that once, then evaluate.
+              SEL loadRt = @selector(loadRealTimeModel:options:qos:error:);
+              if (![(id)api.client respondsToSelector:loadRt]) fail("evaluation", error);
+              error = nil;
+              if (!send<BOOL>(api.client, loadRt, impl_->model, @{}, kQos, &error)) fail("real-time load", error);
+              error = nil;
+              if (!send<BOOL>(api.client, selector, impl_->model, @{}, request, &error))
+                fail("evaluation", error);
+              if (bracket) {
+                SEL end = @selector(endRealTimeTask);
+                if ([(id)api.client respondsToSelector:end]) send<BOOL>(api.client, end);
+              }
+            });
+            return;
+          }
+          case EvalPath::Model: {
+            SEL selector = @selector(evaluateWithQoS:options:request:error:);
+            if (![impl_->model respondsToSelector:selector])
+              throw std::invalid_argument("ANE model-side evaluation does not exist here");
+            impl_->guarded("evaluation", [&] {
+              NSError *error = nil;
+              if (!send<BOOL>(impl_->model, selector, kQos, @{}, request, &error)) fail("evaluation", error);
+            });
+            return;
+          }
+        }
+      };
+
+      // Each perfStats argument form until a request builds and the
+      // evaluation runs — validate() raises an exception on a form it
+      // rejects.
+      const auto started = AwakeClock::now();
+      std::exception_ptr rejected;
+      for (const id &statsArg : statsForms) {
+        request = requestWith(statsArg);
+        if (!request) continue;
+        impl_->guarded("completion handler", [&] {
+          [request setCompletionHandler:^(BOOL success, NSError *error) {
+            std::lock_guard lock(outcome->mutex);
+            outcome->finished = true;
+            if (!success)
+              outcome->failure = std::make_exception_ptr(std::runtime_error(
+                  std::string("ANE evaluation reported failure") +
+                  (error ? std::string(": ") + error.description.UTF8String : std::string())));
+            outcome->changed.notify_all();
+          }];
+        });
+        try {
+          evaluate();
+          rejected = nullptr;
+          break;
+        } catch (...) {
+          rejected = std::current_exception();
+          request = nil;
+        }
+      }
+      if (!request) {
+        if (rejected) std::rethrow_exception(rejected);
+        fail("request creation", nil);
+      }
+      timing.callMs =
+          std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
+      // A synchronous path may leave the completion handler uncalled: wait
+      // for it briefly, then take the call's own duration as the timing.
+      {
+        std::unique_lock lock(outcome->mutex);
+        timing.reported = outcome->changed.wait_for(
+            lock, path == EvalPath::Model ? std::chrono::milliseconds(200) : std::chrono::seconds(2),
+            [&] { return outcome->finished; });
+        if (outcome->failure) std::rethrow_exception(outcome->failure);
+      }
+      timing.wallMs =
+          std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
+      // The driver's report, wherever the accepted stats form put it: the
+      // buffer it wrote, the array it filled, or the object it populated.
+      SEL executionTime = @selector(hwExecutionTime);
+      const auto nanosOf = [&](id stats) -> uint64_t {
+        return [stats respondsToSelector:executionTime] ? send<uint64_t>(stats, executionTime) : 0;
+      };
+      // Array entries may be stats objects or raw buffers to rebuild.
+      const auto entryNanos = [&](id entry) -> uint64_t {
+        if (const uint64_t nanos = nanosOf(entry)) return nanos;
+        if (![entry isKindOfClass:[NSData class]]) return 0;
+        Class statsClass = NSClassFromString(@"_ANEPerformanceStats");
+        SEL buffered = @selector(statsWithRequestPerformanceBuffer:statsBufferSize:);
+        if (!statsClass || ![statsClass respondsToSelector:buffered]) return 0;
+        NSData *data = entry;
+        id rebuilt = impl_->guarded("stats rebuild", [&]() -> id {
+          return send<id>((id)statsClass, buffered,
+                          static_cast<unsigned long long>(data.length), data.bytes);
+        });
+        return rebuilt ? nanosOf(rebuilt) : 0;
+      };
+      if (statsArray && statsArray.count) {
+        uint64_t nanos = 0;
+        for (id entry in statsArray) nanos += entryNanos(entry);
+        if (nanos) timing.hardwareNs = nanos;
+      }
+      if (!timing.hardwareNs && statsObject) {
+        if (const uint64_t nanos = nanosOf(statsObject)) timing.hardwareNs = nanos;
+      }
+    }
+  });
+  return timing;
 }
 
 void Program::unload(Limits limits) {

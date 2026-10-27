@@ -200,6 +200,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
           ? bytesFor<uint16_t>(r * geometry.target.hiddenSize)
           : 0);
   put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
+  put(DecodeTensor::IndexTable,
+      geometry.target.kvLayout.indexDimension
+          ? bytesFor<RichKvPage>(kMaximumPageTableEntries)
+          : 0);
+  put(DecodeTensor::PlePriorTokens,
+      geometry.target.pleNgram
+          ? bytesFor<uint32_t>(geometry.target.pleNgram - 1)
+          : 0);
   put(DecodeTensor::PenaltyState,
       bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::DfaState, bytesFor<uint32_t>(1));
@@ -252,6 +260,23 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
   return bytes;
 }
 
+namespace {
+
+// The draft forward's projection shapes; its dynamic and selector heads
+// are absent (size 0) on plain drafts, which callers skip.
+std::array<ops::ProjectionShape, 8> draftProjectionShapes(const DFlashDraftLayout &d) {
+  return {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
+          {d.qkvSize, d.hiddenSize},
+          {d.contextKvSize(), d.hiddenSize},
+          {d.hiddenSize, d.attentionSize},
+          {d.intermediateSize, d.hiddenSize},
+          {d.hiddenSize, d.intermediateSize},
+          {d.selectorRank, d.hiddenSize},
+          {d.hiddenSize, d.targetHiddenSize}};
+}
+
+} // namespace
+
 ops::LinearScratchSize DecodeArena::linearScratchSize(
     const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const auto &d = geometry.draft;
@@ -259,14 +284,9 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // Includes the vocabulary head shared with the draft, whose own
   // projections are affine.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
-  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize},
-       // A DSpark draft's context projections are dequantized float
-       // segments; every other draft's stay affine.
-       {d.contextKvSize(), d.hiddenSize},
-       {d.hiddenSize, d.attentionSize},
-       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}}) {
+  // A DSpark draft's context projections are dequantized float segments;
+  // every other draft's stay affine.
+  for (const ops::ProjectionShape shape : draftProjectionShapes(d)) {
     // A plain draft's dynamic and selector projections are absent (size 0).
     if (!shape.outputSize || !shape.inputSize) continue;
     result.include(operators.linear().decodeScratchSize(shape));
@@ -287,6 +307,25 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     result.include(splits);
   }
   return result;
+}
+
+uint32_t DecodeArena::draftStorageLanes(
+    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+    uint32_t lanes) {
+  const auto &d = geometry.draft;
+  const uint32_t rows = lanes * d.queryRows();
+  uint32_t storageRows = rows;
+  for (const ops::ProjectionShape shape : draftProjectionShapes(d)) {
+    if (!shape.outputSize || !shape.inputSize) continue;
+    ops::ProjectionShape block = shape;
+    block.layout = ops::WeightLayout::Block32;
+    storageRows = std::max(
+        storageRows, operators.linear().decodeStorageRows(rows, block));
+  }
+  // The draft's query stride is not a multiple of the packed lane stride:
+  // a 16-row build binds eight query rows' storage in one lane's span.
+  return (storageRows + ExecutionLimits::targetVerifyRows - 1) /
+         ExecutionLimits::targetVerifyRows;
 }
 
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,

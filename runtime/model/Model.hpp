@@ -302,6 +302,10 @@ struct ModelBatchItem final {
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
   std::span<const uint32_t> inputTokens{};
+  // The request's tokens through logicalPosition (its exactTokens): a
+  // prefill item's full prefix for the n-gram tails its chunk rows need —
+  // inputTokens is chunk-only — and a verify lane's priors.
+  std::span<const uint32_t> requestTokens{};
 };
 
 struct ModelStepResult final {

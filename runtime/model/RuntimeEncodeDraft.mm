@@ -57,14 +57,19 @@ namespace richengine::model {
 
   void Runtime::Impl::encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
-                             std::span<const uint64_t> logicalPositions) {
+                             std::span<const uint64_t> logicalPositions,
+                             const MetalBuffer &devicePack) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    // The draft shares the target's vocabulary head and its storage rows.
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    // The draft shares the target's vocabulary head and its storage rows;
+    // its own AF4-block projections pad to the staged tile the same way
+    // the target's do, which a target-only bound misses on affine targets.
+    const uint32_t storage = std::max(
+        targetModel.decodeStorageLanes(lanes),
+        DecodeArena::draftStorageLanes(geometry, operators, lanes));
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, storage);
     };
@@ -96,9 +101,16 @@ namespace richengine::model {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     std::visit([&](const auto &model) {
-      model.addDecode(graph, std::move(buffers),
-                      targetModel.vocabularyProjection(),
-                      std::span(cacheLengths).first(lanes));
+      if constexpr (std::is_same_v<std::decay_t<decltype(model)>,
+                                   DFlashV1Draft>) {
+        model.addDecode(graph, std::move(buffers),
+                        targetModel.vocabularyProjection(),
+                        std::span(cacheLengths).first(lanes), devicePack);
+      } else {
+        model.addDecode(graph, std::move(buffers),
+                        targetModel.vocabularyProjection(),
+                        std::span(cacheLengths).first(lanes));
+      }
     }, draftModel);
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
@@ -293,6 +305,102 @@ namespace richengine::model {
       model.addContextCommit(graph, std::move(buffers),
                              std::span(startPositions).first(lanes));
     }, draftModel);
+  }
+
+  // The chained predraft (B-prime): appended to the committed step's
+  // command after decode_step_pack, the draft input pack, rope tables,
+  // embedding, forward and selector all read the pack lanes the step just
+  // wrote — no host readback stands between this step and the next
+  // draft. Bookkeeping arms here; the facts the encode could not know
+  // (anchors, positions) land at completeGpuPredraft.
+  void Runtime::Impl::encodeChainedPredraft(
+      CommandGraph &graph, std::span<Request *const> entries,
+      std::span<const ModelBatchItem> items) {
+    static_cast<void>(items);
+    if (!gpuPredraftOn_ || !chainPredraft_ || entries.empty() ||
+        entries.size() > kLaneCount ||
+        !std::holds_alternative<DFlashV1Draft>(draftModel))
+      return;
+    const uint32_t width = static_cast<uint32_t>(entries.size());
+    GpuPredraft predraft;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const Request &entry = *entries[lane];
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      // The launch path's policy vetoes, evaluated one step earlier: a
+      // lane that cannot take a chain draft vetoes the batch. Anchors,
+      // positions and terminal status are the pack's job — the host
+      // proves or drops the arm at finalize.
+      if (!entry.resident || !entry.pendingToken || policy.samples() ||
+          policy.constrained || policy.penalties.active())
+        return;
+      predraft.requestIds[lane] = entry.id;
+    }
+    const DraftPredraftPackParams params{
+        width, geometry.draft.queryRows(), kDecodeRows,
+        geometry.target.maskToken};
+    graph.add(std::string(ops::kDraftPredraftPack),
+              {stepPackBuffer(),
+               decodeArena->packed(DecodeTensor::DraftInputTokens,
+                                   kLaneCount),
+               decodeArena->packed(DecodeTensor::DraftPositions,
+                                   kLaneCount)},
+              params,
+              {std::max(params.query_rows, params.decode_rows), width, 1});
+    // The target's positions are stale here — the draft forward reads
+    // only its own tables, so the target rope slots stay untouched (a
+    // zero target row count keeps the pass draft-only the way
+    // launchDraftPredraft calls it).
+    addRopeTables(
+        graph, decodeArena->packed(DecodeTensor::Positions, width), 0,
+        decodeArena->packed(DecodeTensor::DraftPositions, width),
+        width * kDecodeRows,
+        decodeArena->packed(DecodeTensor::RopeCos, width),
+        decodeArena->packed(DecodeTensor::RopeSin, width),
+        decodeArena->packed(DecodeTensor::DraftRopeCos, width),
+        decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+    encodeBatchEmbedding(graph, DecodeTensor::DraftInputTokens,
+                         DecodeTensor::DraftHidden0, width, 1,
+                         geometry.draft.queryRows());
+    std::array<uint64_t, kLaneCount> zeroPositions{};
+    encodeDraftBatchGraph(graph, {entries.data(), width},
+                          {zeroPositions.data(), width}, stepPackBuffer());
+    predraft.epoch = arenaEpoch_;
+    predraft.lanes = width;
+    predraft.chained = true;
+    gpuPredraft_ = std::move(predraft);
+    if (draftDebug_)
+      fprintf(stderr, "chained predraft armed lanes=%u\n", width);
+  }
+
+  void Runtime::Impl::completeGpuPredraft(
+      std::span<const DecodeLaneResult> lanes,
+      std::span<const ModelBatchItem> items) {
+    if (!gpuPredraft_.chained) {
+      launchDraftPredraft(lanes, items);
+      return;
+    }
+    GpuPredraft predraft = std::move(gpuPredraft_);
+    gpuPredraft_ = GpuPredraft{};
+    if (lanes.size() != predraft.lanes || items.size() != lanes.size())
+      return;
+    // The chained pass ran on the pack's device values; the launch
+    // path's vetoes — terminal anchors, failed lanes, policy changes —
+    // apply at readback, and a dropped arm leaves nothing to adopt.
+    for (uint32_t lane = 0; lane < predraft.lanes; ++lane) {
+      Request &entry = *lanes[lane].request;
+      const ops::SamplingPolicy policy = samplingPolicy(entry);
+      if (!lanes[lane].failure.empty() || !entry.resident ||
+          !entry.pendingToken ||
+          entry.generatedTokens >= entry.maxNewTokens ||
+          isStopToken(geometry, *entry.pendingToken) || policy.samples() ||
+          policy.constrained || policy.penalties.active() ||
+          entry.id != predraft.requestIds[lane])
+        return;
+      predraft.anchors[lane] = *entry.pendingToken;
+      predraft.positions[lane] =
+          items[lane].logicalPosition + lanes[lane].retained;
+    }
+    gpuPredraft_ = std::move(predraft);
   }
 
 } // namespace richengine::model

@@ -7,6 +7,15 @@
 #include <stdint.h>
 #endif
 
+// The expert slots of the routing kernels (ops::MoE): a row's router
+// scores take this many floats, and the select and grouping kernels run
+// one thread per slot. A MoE block of at most MOE_EXPERT_SLOTS experts
+// routes on their instances of that many slots, one of more on their wide
+// instances (_e512), so a block routes at most MOE_WIDE_EXPERT_SLOTS
+// experts.
+#define MOE_EXPERT_SLOTS 256u
+#define MOE_WIDE_EXPERT_SLOTS 512u
+
 struct MoeRouteParams {
   uint32_t rows;
   uint32_t input_size;

@@ -605,6 +605,7 @@ inline void draft_attention_split_impl(
     device bfloat *keys2, device bfloat *keys3, device bfloat *values0,
     device bfloat *values1, device bfloat *values2, device bfloat *values3,
     device bfloat *query_keys, device bfloat *query_values,
+    device const DecodeStepPackLane *step_pack,
     constant DraftAttentionBatchParams &params, threadgroup float *workspace,
     uint3 group, uint thread_index, uint lane, uint simd_group) {
   const ulong Rows = params.query_rows;
@@ -633,7 +634,10 @@ inline void draft_attention_split_impl(
       query_keys + batch * KVHeads * Rows * HeadDim + kv_head * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           kv_head * Rows * HeadDim,
-      partials, params.value_stride, params.cache_length[batch], params.window,
+      partials, params.value_stride,
+      params.device_pack ? step_pack[batch].cache_length
+                         : params.cache_length[batch],
+      params.window,
       group.z, params.causal != 0, params.query_rows, workspace,
       workspace + M * N, workspace + M * N + M, workspace + M * N + 2 * M,
       thread_index, lane, simd_group);
@@ -649,7 +653,8 @@ kernel void draft_attention_bf16_split(
     device bfloat *values3 [[buffer(8)]],
     device bfloat *query_keys [[buffer(9)]],
     device bfloat *query_values [[buffer(10)]],
-    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    device const DecodeStepPackLane *step_pack [[buffer(11)]],
+    constant DraftAttentionBatchParams &params [[buffer(12)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -657,8 +662,8 @@ kernel void draft_attention_bf16_split(
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 8, 128>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
-      query_keys, query_values, params, workspace, group, thread_index, lane,
-      simd_group);
+      query_keys, query_values, step_pack, params, workspace, group,
+      thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q16k2(
@@ -671,7 +676,8 @@ kernel void draft_attention_bf16_split_q16k2(
     device bfloat *values3 [[buffer(8)]],
     device bfloat *query_keys [[buffer(9)]],
     device bfloat *query_values [[buffer(10)]],
-    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    device const DecodeStepPackLane *step_pack [[buffer(11)]],
+    constant DraftAttentionBatchParams &params [[buffer(12)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -679,8 +685,8 @@ kernel void draft_attention_bf16_split_q16k2(
   threadgroup float workspace[64 * 64 + 3 * 64];
   draft_attention_split_impl<64, 64, 2, 128>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
-      query_keys, query_values, params, workspace, group, thread_index, lane,
-      simd_group);
+      query_keys, query_values, step_pack, params, workspace, group,
+      thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q32k8d64i(
@@ -693,7 +699,8 @@ kernel void draft_attention_bf16_split_q32k8d64i(
     device bfloat *values3 [[buffer(8)]],
     device bfloat *query_keys [[buffer(9)]],
     device bfloat *query_values [[buffer(10)]],
-    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    device const DecodeStepPackLane *step_pack [[buffer(11)]],
+    constant DraftAttentionBatchParams &params [[buffer(12)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -701,8 +708,8 @@ kernel void draft_attention_bf16_split_q32k8d64i(
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 8, 64>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
-      query_keys, query_values, params, workspace, group, thread_index, lane,
-      simd_group);
+      query_keys, query_values, step_pack, params, workspace, group,
+      thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q8k2d256(
@@ -715,7 +722,8 @@ kernel void draft_attention_bf16_split_q8k2d256(
     device bfloat *values3 [[buffer(8)]],
     device bfloat *query_keys [[buffer(9)]],
     device bfloat *query_values [[buffer(10)]],
-    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    device const DecodeStepPackLane *step_pack [[buffer(11)]],
+    constant DraftAttentionBatchParams &params [[buffer(12)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -726,8 +734,8 @@ kernel void draft_attention_bf16_split_q8k2d256(
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 2, 256>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
-      query_keys, query_values, params, workspace, group, thread_index, lane,
-      simd_group);
+      query_keys, query_values, step_pack, params, workspace, group,
+      thread_index, lane, simd_group);
 }
 
 template <uint M, uint KVHeads, uint HeadDim>

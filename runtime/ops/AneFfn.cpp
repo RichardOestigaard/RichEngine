@@ -479,7 +479,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
   static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
 }
 
-double AneFfn::share() const noexcept { return static_cast<double>(shape_.ane) / shape_.intermediate; }
+double AneFfn::share() const { return static_cast<double>(shape_.ane) / shape_.intermediate; }
 
 void AneFfn::setMinimumRows(uint32_t rows) {
   if (rows < kMinimumRows || rows > kMaximumRows)

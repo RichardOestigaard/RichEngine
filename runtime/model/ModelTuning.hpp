@@ -12,6 +12,9 @@
 // user override while the maker — not the process environment — states the
 // model's own default. An unset optional keeps the knob's shipped default.
 
+#include "metal/abi/ExecutionGeometry.h"
+
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -78,6 +81,8 @@ struct ModelTuning final {
   std::optional<uint32_t> draftAttentionSplits; // RICHENGINE_DRAFT_SPLITS
   std::optional<bool> dflashPool;         // RICHENGINE_DFLASH_POOL
   std::optional<uint32_t> proposalCap;    // RICHENGINE_PROPOSAL_CAP
+  std::optional<bool> icbOff;             // RICHENGINE_ICB_OFF
+  std::optional<bool> chainPredraft;      // RICHENGINE_CHAIN_PREDRAFT
   // The canvas bundle the family's diffusion model runs under
   // ("paper"|"balanced"|"fast"); RICHENGINE_CANVAS_PROFILE overrides.
   std::optional<std::string> canvasProfile;
@@ -91,6 +96,18 @@ struct ModelTuning final {
   // host path, "forced" adds on-device forced spans, "full" computes masks
   // and spans on the GPU. RICHENGINE_DFA_MODE overrides.
   std::optional<std::string> dfaMode;
+
+  // A family's own verify-budget acceptance prior (model/VerifyBudget):
+  // fitted on the family's draft, it replaces the upstream models' kPrior
+  // as the acceptance model's start and shrink target — the budget's early
+  // cycles then price verify rows by this draft's real confidence curve
+  // instead of another model's. The sparse-MoE verify path alone consumes
+  // it. Positions map to the compiled RICHENGINE_DRAFT_PROPOSAL_TOKENS.
+  struct VerifyAcceptancePrior final {
+    float slope = 0.0F;
+    std::array<float, RICHENGINE_DRAFT_PROPOSAL_TOKENS> intercepts{};
+  };
+  std::optional<VerifyAcceptancePrior> verifyPrior;
 };
 
 } // namespace richengine::model

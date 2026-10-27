@@ -1,5 +1,6 @@
 #include "model/AffinePlan.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -150,6 +151,96 @@ ModelDescriptor lfm2moeDescriptor(std::string name) {
 }
 
 // ---- LFM2 ("lfm2") ----
+
+// The lfm2 source's config check, shared by the d1 variants' targets: the
+// conv/full_attention layer schedule plus the encoder decision models'
+// per-layer geometry.
+void validateLfm2SourceConfig(id textObj,
+                              const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
+      {"intermediate_size", layout.intermediateSize}});
+  // Exports disagree on the trained context (131072 vs 128000).
+  requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                "max_position_embeddings");
+  // The conv/full_attention layer schedule of layer_types.
+  NSArray *types = requireArray(text, @"layer_types", "target layer_types");
+  requireEqual(types.count, layout.layers, "target layer_types count");
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    id value = types[layer];
+    if (![value isKindOfClass:[NSString class]])
+      throw std::invalid_argument("target layer type must be a string");
+    const std::string expected =
+        layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
+    const char *actual = static_cast<NSString *>(value).UTF8String;
+    requireEqual(actual ? actual : "", expected,
+                 "target layer " + std::to_string(layer));
+  }
+  // An encoder decision model (d1-omni) states encoder plus the
+  // per-layer fields its non-uniform geometry needs; a causal target
+  // states none of them.
+  if (id encoder = text[@"encoder"];
+      encoder != nil &&
+      ![encoder isEqual:layout.encoder ? @YES : @NO])
+    throw std::invalid_argument(
+        "target encoder flag does not match the family's");
+  if (NSArray *kvs = text[@"layer_kv_heads"];
+      [kvs isKindOfClass:[NSArray class]]) {
+    requireEqual(kvs.count, layout.layers, "target layer_kv_heads count");
+    for (uint32_t layer = 0; layer < layout.layers; ++layer)
+      requireNumber(
+          kvs[layer],
+          layout.isFullAttentionLayer(layer) ? layout.kvHeadsAt(layer) : 0,
+          "target layer_kv_heads " + std::to_string(layer));
+  }
+  if (NSArray *widths = text[@"layer_intermediate_sizes"];
+      [widths isKindOfClass:[NSArray class]]) {
+    requireEqual(widths.count, layout.layers,
+                 "target layer_intermediate_sizes count");
+    for (uint32_t layer = 0; layer < layout.layers; ++layer)
+      requireNumber(widths[layer], layout.intermediateSizeAt(layer),
+                    "target layer_intermediate_sizes " +
+                        std::to_string(layer));
+  }
+}
+
+// The lfm2_moe source's config check: lfm2's schedule plus the MoE block's
+// fields.
+void validateLfm2MoeSourceConfig(id textObj,
+                                 const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
+      {"intermediate_size", layout.intermediateSize},
+      {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
+      {"moe_intermediate_size", layout.expertIntermediateSize},
+      {"num_dense_layers", layout.denseLayers}});
+  // Exports disagree on the trained context (131072 vs 128000).
+  requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                "max_position_embeddings");
+  // The conv/full_attention layer schedule of layer_types.
+  NSArray *types = requireArray(text, @"layer_types", "target layer_types");
+  requireEqual(types.count, layout.layers, "target layer_types count");
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    id value = types[layer];
+    if (![value isKindOfClass:[NSString class]])
+      throw std::invalid_argument("target layer type must be a string");
+    const std::string expected =
+        layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
+    const char *actual = static_cast<NSString *>(value).UTF8String;
+    requireEqual(actual ? actual : "", expected,
+                 "target layer " + std::to_string(layer));
+  }
+}
 
 // The LFM2 source (MLX layout, "lfm2" model_type): `language_model.model.`
 // tensors, conv and full_attention layer types and tied embeddings.
@@ -358,13 +449,28 @@ TargetWeights loadLfm2MoeTarget(metal::MetalBackend &backend,
 const bool kRegisteredLfm2Families = [] {
   registerTargetArch({"lfm2", &loadLfm2Target, &kLfm2Hooks});
   registerTargetArch({"lfm2_moe", &loadLfm2MoeTarget, &kLfm2MoeHooks});
-  registerModelFamily({"LFM2.5-2.6B", "lfm2", "", &lfm2Descriptor,
-                       &lfm2DraftLayout, nullptr});
-  registerModelFamily({"d1-3B", "lfm2", "", &d1Descriptor, nullptr, nullptr});
-  registerModelFamily({"d1-omni", "lfm2", "", &d1omniDescriptor, nullptr,
-                       nullptr});
-  registerModelFamily({"LFM2.5-8B-A1B", "lfm2_moe", "", &lfm2moeDescriptor,
-                       &lfm2moeDraftLayout, nullptr});
+  registerModelFamily({.name = "LFM2.5-2.6B", .modelType = "lfm2",
+                       .legacyType = "", .makeDescriptor = &lfm2Descriptor,
+                       .draftLayout = &lfm2DraftLayout,
+                       .validateSourceConfig = &validateLfm2SourceConfig,
+                       .dsparkArchName = "Lfm2DSparkDraftModel",
+                       .draftNormEpsilon = 1e-5});
+  registerModelFamily({.name = "d1-3B", .modelType = "lfm2",
+                       .legacyType = "", .makeDescriptor = &d1Descriptor,
+                       .validateSourceConfig = &validateLfm2SourceConfig,
+                       .dsparkArchName = "Lfm2DSparkDraftModel",
+                       .draftNormEpsilon = 1e-5});
+  registerModelFamily({.name = "d1-omni", .modelType = "lfm2",
+                       .legacyType = "", .makeDescriptor = &d1omniDescriptor,
+                       .validateSourceConfig = &validateLfm2SourceConfig,
+                       .dsparkArchName = "Lfm2DSparkDraftModel",
+                       .draftNormEpsilon = 1e-5});
+  registerModelFamily({.name = "LFM2.5-8B-A1B", .modelType = "lfm2_moe",
+                       .legacyType = "", .makeDescriptor = &lfm2moeDescriptor,
+                       .draftLayout = &lfm2moeDraftLayout,
+                       .validateSourceConfig = &validateLfm2MoeSourceConfig,
+                       .dsparkArchName = "Lfm2DSparkDraftModel",
+                       .draftNormEpsilon = 1e-5});
   return true;
 }();
 

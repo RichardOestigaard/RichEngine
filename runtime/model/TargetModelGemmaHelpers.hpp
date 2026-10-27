@@ -1,10 +1,12 @@
 #pragma once
 
-// The internals TargetModel.cpp and TargetModelGemma.cpp share: the prefill
-// and verify step records both targets' layer encoders walk, and the row
-// and input-sum buffer views they slice per sequence. Kept out of
-// TargetModel.hpp so only the two target translation units see them.
+// The internals the target translation units and their layer encoders
+// share: the prefill and verify step records the encoders walk, and the
+// row and input-sum buffer views they slice per sequence. Kept out of
+// TargetModel.hpp so only the encode translation units see them.
 #include "model/TargetModel.hpp"
+
+#include <any>
 
 namespace richengine::model {
 
@@ -18,20 +20,16 @@ struct TargetModel::PrefillStep {
   std::span<const RichKvLayer> kvLayers;
   // Each sequence's attention plan, which every attention layer runs.
   std::vector<ops::PrefillAttentionPlan> attention{};
-  // The same sequences' plans in the alternate (Gemma global) geometry;
-  // empty on single-geometry targets.
-  std::vector<ops::PrefillAttentionPlan> altAttention{};
   std::optional<ops::MoePlan> moe{};
-  ops::AneFfn *aneFfn = nullptr;
-  // A DiffusionGemma encoder pass's per-layer scalars (empty on every other
-  // pass: the packed layer_scalar applies).
-  std::span<const float> layerScalars{};
+  ops::FfnSplit *aneFfn = nullptr;
+  // The active layer encoder's per-pass state, owned by it: addPrefill
+  // seeds it with the encoder-routed inputs (TargetLayerEncoder.hpp's
+  // TargetPrefillInputs) before the encoder's beginPrefill installs its
+  // own record — Gemma's holds the alternate-geometry plans, the canvas
+  // flag and the DiffusionGemma encoder pass's layer scalars.
+  std::any extension{};
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
-  // A DiffusionGemma trunk pass: every sequence is a canvas row span, and
-  // plan selection takes the canvas family (MoePhase::Canvas, canvas-marked
-  // linear workloads).
-  bool canvas = false;
 };
 
 struct TargetModel::VerifyStep {
@@ -42,10 +40,14 @@ struct TargetModel::VerifyStep {
   uint32_t lanes;
   uint32_t rows;
   ops::VerifyAttentionPlan attention;
-  // The alternate-geometry (Gemma global) plan; empty on single-geometry
-  // targets.
-  std::optional<ops::VerifyAttentionPlan> altAttention{};
   std::optional<ops::MoePlan> moe{};
+  // Bounds a tree batch's live node count where the caller already knows
+  // the emitted counts — the attention splits and verify stores then size
+  // for the real rows; the encoder's alternate-geometry plan reads it too.
+  uint32_t liveNodes = 0;
+  // The active layer encoder's per-pass state, owned by it (Gemma's holds
+  // the alternate-geometry plan).
+  std::any extension{};
   // A tree batch keeps `lanes` real lanes of `rowCapacity` node rows, but the
   // row-space operators (linear plans, MoE, the head) see planLanes virtual
   // lanes of targetVerifyRows rows — the same tiles as a wider chain batch.
@@ -72,7 +74,7 @@ metal::MetalBuffer rowsOf(metal::MetalBackend &backend, const metal::MetalBuffer
 // The out-projection's input sums of the rows [begin, begin + count): one
 // float per 64-wide group of the `width`-element rows, in the flat
 // [row][group] layout of prefill_linear_q4_sums32.
-metal::MetalBuffer prefillSums(metal::MetalBackend &backend, const metal::MetalBuffer &sums, uint32_t begin,
+[[maybe_unused]] metal::MetalBuffer prefillSums(metal::MetalBackend &backend, const metal::MetalBuffer &sums, uint32_t begin,
                                uint32_t count, uint32_t width) {
   return backend.view(sums, uint64_t{begin} * (width / 64) * sizeof(float),
                       uint64_t{count} * (width / 64) * sizeof(float));

@@ -38,6 +38,9 @@ inline constexpr std::string_view kDecodeAcceptTree = "decode_accept_tree";
 // step_pack.metal): the committed step's last dispatch mirrors the
 // acceptance results into the next step's device params block.
 inline constexpr std::string_view kDecodeStepPack = "decode_step_pack";
+// The GPU-chained predraft's staging pass (same file): the pack lanes just
+// written become the next step's draft input rows and rotary positions.
+inline constexpr std::string_view kDraftPredraftPack = "draft_predraft_pack";
 inline constexpr std::string_view kDecodeLogitSoftcap = "decode_logit_softcap";
 inline constexpr std::string_view kDecodeHeadArgmaxQ4 = "decode_head_argmax_q4";
 inline constexpr std::string_view kTreeLeafPatch = "tree_leaf_patch";
@@ -176,6 +179,17 @@ inline constexpr std::string_view kVerifyAttentionReduceGemmaHd512 = "verify_att
 inline constexpr std::string_view kVerifyAttentionQ8SplitSwaHd512 = "verify_attention_q8_split_swa_hd512";
 inline constexpr std::string_view kVerifyAttentionQ8SplitSwaHd512M2 = "verify_attention_q8_split_swa_hd512_m2";
 
+// The QSA block indexer (shared/block_indexer.metal, ops::BlockIndexer) and
+// the block lists the sparse attention's tiles list their blocks from
+// (shared/sparse_attention.metal, ops::PagedAttention::addBlockLists).
+inline constexpr std::string_view kBlockIndexerProject = "block_indexer_project";
+inline constexpr std::string_view kBlockIndexerPool = "block_indexer_pool";
+inline constexpr std::string_view kBlockIndexerScore = "block_indexer_score";
+inline constexpr std::string_view kBlockIndexerSelect = "block_indexer_select";
+inline constexpr std::string_view kBlockIndexerPending = "block_indexer_pending";
+inline constexpr std::string_view kBlockIndexerCommit = "block_indexer_commit";
+inline constexpr std::string_view kAttentionBlockLists = "attention_block_lists";
+
 // Embeddings (stems take the format or hidden-width suffix).
 inline constexpr std::string_view kGgufEmbedRotatedPq20 = "gguf_embed_rotated_pq20";
 inline constexpr std::string_view kGgufEmbed = "gguf_embed_";
@@ -186,6 +200,15 @@ inline constexpr std::string_view kVerifyInputTokens = "verify_input_tokens";
 inline constexpr std::string_view kVerifyInputTokensDev = "verify_input_tokens_dev";
 inline constexpr std::string_view kVerifyInputTreeTokens = "verify_input_tree_tokens";
 inline constexpr std::string_view kTreeCaptureGather = "tree_capture_gather";
+
+// The qwen4exp PLE n-gram embedding (kernels/prefill/ngram_embedding.metal
+// for the gate, convolution and in-command history; kernels/decode/
+// ngram_embedding.metal for the verify-step hash and commit).
+inline constexpr std::string_view kNgramEmbeddingGate = "ngram_embedding_gate";
+inline constexpr std::string_view kNgramEmbeddingConv = "ngram_embedding_conv";
+inline constexpr std::string_view kNgramEmbeddingHistory = "ngram_embedding_history";
+inline constexpr std::string_view kNgramEmbeddingCommit = "ngram_embedding_commit";
+inline constexpr std::string_view kNgramEmbeddingHash = "ngram_embedding_hash";
 
 // GGUF linear tiles (stems take format, row count and epilogue tags).
 inline constexpr std::string_view kGgufRotate = "gguf_rotate";
@@ -275,6 +298,12 @@ inline constexpr std::string_view kDecodeLinearQ4N256UpSiluM64Sg16 = "decode_lin
 // Mixture of experts.
 inline constexpr std::string_view kMoePrepareTable16 = "moe_prepare_table16";
 inline constexpr std::string_view kMoeRouteSelectF32 = "moe_route_select_f32";
+// The wide (_e512) routing family for a block of more than 256 experts
+// (MOE_WIDE_EXPERT_SLOTS, metal/abi/MoE.h).
+inline constexpr std::string_view kMoeRouteSelectF32E512 = "moe_route_select_f32_e512";
+inline constexpr std::string_view kMoeRouteCapE512 = "moe_route_cap_e512";
+inline constexpr std::string_view kMoeGroupRoutesE512 = "moe_group_routes_e512";
+inline constexpr std::string_view kMoeGroupRoutesVerifiedE512 = "moe_group_routes_verified_e512";
 inline constexpr std::string_view kMoeRouteSelectSigmoid = "moe_route_select_sigmoid";
 inline constexpr std::string_view kMoeRouteScoresQ8M8 = "moe_route_scores_q8_m8";
 inline constexpr std::string_view kMoeRouteScoresQ8M32 = "moe_route_scores_q8_m32";
@@ -322,6 +351,12 @@ inline constexpr std::string_view kAneFfnPack = "ane_ffn_pack";
 inline constexpr std::string_view kAneFfnJoin = "ane_ffn_join";
 inline constexpr std::string_view kAneFfnRowScale = "ane_ffn_row_scale";
 inline constexpr std::string_view kAneFfnWeights = "ane_ffn_weights";
+// The CoreAI split's variants: weight and scale kernels without the Hadamard,
+// the bf16->fp16 activation cast, and the row-major y join.
+inline constexpr std::string_view kCoreAiFfnCast = "coreai_ffn_cast";
+inline constexpr std::string_view kCoreAiFfnJoin = "coreai_ffn_join";
+inline constexpr std::string_view kCoreAiFfnRowScale = "coreai_ffn_row_scale";
+inline constexpr std::string_view kCoreAiFfnWeights = "coreai_ffn_weights";
 
 // Canvas (diffusion decoding).
 inline constexpr std::string_view kCanvasUniformNoise = "canvas_uniform_noise";

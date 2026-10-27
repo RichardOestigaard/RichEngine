@@ -5,6 +5,7 @@
 // the row/sum view helpers the target translation units share live in
 // TargetModelGemmaHelpers.hpp.
 #include "model/TargetModelGemmaHelpers.hpp"
+#include "model/TargetLayerEncoder.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfn.hpp"
@@ -187,6 +188,10 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
                                 uint32_t lanes, uint32_t verifyStride) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || !verifyStride)
     throw std::invalid_argument("invalid state commit batch");
+  // The arch encoder's auxiliary commit (qwen4exp's PLE history and QSA
+  // pending keys) reads the lane cells and retained counts the shared
+  // commit below consumes; keep them for it.
+  const TargetModelCommitBuffers commit = buffers;
   if (!geometry_.gdnLayers) {
     // LFM2's conv FIFOs: every conv layer rolls its lanes' states forward by
     // the retained rows' bx, kept in VerifyMixedBase like the GDN's. The
@@ -205,6 +210,7 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
         geometry_.convShape(), lanes, verifyStride,
         /*layer*/ 0, geometry_.stateLayout.convolutionLayerBytes(),
         geometry_.convLayers, layerBytes, /*tapsMajor*/ false);
+    encoder_->commitState(graph, commit, lanes, verifyStride);
     return;
   }
   ops::GDN::addCommit(
@@ -217,6 +223,7 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
        geometry_.stateLayout.recurrentLayerBytes(),
        geometry_.stateLayout.convolutionBytes()},
       verifyStride);
+  encoder_->commitState(graph, commit, lanes, verifyStride);
 }
 
 void TargetModel::addStateCommitTree(metal::CommandGraph &graph,

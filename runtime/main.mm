@@ -1,4 +1,5 @@
 #include "AwakeClock.hpp"
+#include "Env.hpp"
 #include "StderrLine.hpp"
 #include "engine/wire/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -370,6 +371,23 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  // RICHENGINE_ANE_D1=<share>: a d1 decision model's opt-in split — measured
+  // up to 2x slower than the GPU (docs/ANE_EXPERIMENTS.md), serving for the
+  // GPU work it frees. 0 or unset leaves the GPU alone.
+  if (const double share = envDouble("RICHENGINE_ANE_D1", 0.0); share > 0.0) {
+    if (share > 1.0) throw UsageError("RICHENGINE_ANE_D1 wants a share in (0, 1]");
+    config.resources.aneFfn.d1 = engine::AneFfnSetting::Given{share};
+  }
+  // RICHENGINE_COREAI_FFN=<share>: the opt-in split over the public CoreAI
+  // framework's encode() — needs the shim (librichengine_coreai.dylib beside
+  // the binary) and a .aimodel of the model's functions
+  // (RICHENGINE_COREAI_ASSET, dev/tools/gen_coreai_ffn.py). Measured ~30%
+  // faster per evaluation than the private program (docs/ANE_EXPERIMENTS.md).
+  // 0 or unset leaves it off.
+  if (const double share = envDouble("RICHENGINE_COREAI_FFN", 0.0); share > 0.0) {
+    if (share > 1.0) throw UsageError("RICHENGINE_COREAI_FFN wants a share in (0, 1]");
+    config.resources.aneFfn.coreai = engine::AneFfnSetting::Given{share};
+  }
   config.resources.moeUnionCap = arguments.moeUnionCap;
   config.preferBlockWeights = arguments.weightLayout == "block";
   config.nativeLoop.engine.maxContext = arguments.maxContext;

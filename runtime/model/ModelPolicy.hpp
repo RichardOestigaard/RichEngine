@@ -47,6 +47,10 @@ struct ModelPolicy final {
   // model/RuntimeImpl.hpp: the decode proposal ceiling; unset leaves the
   // draft checkpoint's trained block bound.
   std::optional<uint32_t> proposalCap; // RICHENGINE_PROPOSAL_CAP
+  // metal/MetalEncode.mm: baked indirect dispatch off entirely.
+  bool icbOff = false;                  // RICHENGINE_ICB_OFF
+  // model/RuntimeEncodeDraft.mm: the in-command chained predraft.
+  bool chainPredraft = false;           // RICHENGINE_CHAIN_PREDRAFT
   // model/RuntimeImpl.hpp adaptive decode gates: an explicitly set variable
   // wins a disable; otherwise the family maker's default applies.
   bool adaptiveProposals = false;  // RICHENGINE_ADAPTIVE_PROPOSALS
@@ -114,6 +118,11 @@ namespace detail {
                      : maker.dflashPool.value_or(false);
   p.proposalCap = env.proposalCapSet ? std::optional<uint32_t>(env.proposalCap)
                                      : maker.proposalCap;
+  p.icbOff = envFlag("RICHENGINE_ICB_OFF") ? env.icbOff
+                                         : maker.icbOff.value_or(false);
+  p.chainPredraft = envFlag("RICHENGINE_CHAIN_PREDRAFT")
+                        ? env.chainPredraft
+                        : maker.chainPredraft.value_or(false);
   // unlessZero knobs: the variable only ever disables, so an explicit set
   // wins; otherwise the maker's default stands.
   p.adaptiveProposals = envFlag("RICHENGINE_ADAPTIVE_PROPOSALS")

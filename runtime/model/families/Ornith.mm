@@ -1,3 +1,4 @@
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -54,8 +55,11 @@ TargetWeights loadOrnith9Target(metal::MetalBackend &backend,
 
 const bool kRegisteredOrnithFamilies = [] {
   registerTargetArch({"ornith9", &loadOrnith9Target});
-  registerModelFamily({"Ornith-1.5-9B", "qwen3_5_text", "", &ornithDescriptor,
-                       nullptr, &ornith9DFlashV1DraftLayout});
+  registerModelFamily({.name = "Ornith-1.5-9B", .modelType = "qwen3_5_text",
+                       .legacyType = "",
+                       .makeDescriptor = &ornithDescriptor,
+                       .dflashV1Layout = &ornith9DFlashV1DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText});
   return true;
 }();
 

@@ -784,6 +784,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeBatchStepPack(commandGraph, entries, items,
                                {budgets.data(), width},
                                impl_->geometry.draft.verifyRows());
+    // The chained predraft's dispatches follow the pack they read.
+    impl_->encodeChainedPredraft(commandGraph, entries, items);
   }
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
@@ -801,7 +803,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // result-handling gap. Tree steps predraft nothing — a tree-capable
     // batch would only discard a chain table.
     if (!tree)
-      impl->launchDraftPredraft(lanes, items);
+      impl->completeGpuPredraft(lanes, items);
     if (tuning().opTimings &&
         std::any_of(lanes.begin(), lanes.end(), [](const auto &l) {
           return l.request->generatedTokens >= l.request->maxNewTokens;
@@ -1111,6 +1113,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
                    .decodeStage = DecodeStage::Regular};
     ModelBatchItem item = warmupItem(id, 0, rows, pages);
     item.inputTokens = request.prompt;
+    item.requestTokens = request.prompt;
     const auto phaseStart = AwakeClock::now();
     auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
@@ -1174,6 +1177,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                             .decodeStage = DecodeStage::Regular};
       ModelBatchItem item = warmupItem(request.id, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
+      item.requestTokens = request.prompt;
       requireLanesSucceeded(
           prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
       prepareWarmupDecode(request.id, warmupPrompt.back());
@@ -1259,6 +1263,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     ModelBatchItem item = warmupItem(id, 0, prefixTokens, pages);
     item.inputTokens =
         std::span<const uint32_t>(request.prompt).first(prefixTokens);
+    item.requestTokens = request.prompt;
     static_cast<void>(prefill(plan, std::span<const ModelBatchItem>(&item, 1)));
     wallSeconds = impl_->counters.lastPrefillWallSeconds;
     cachedState = snapshot(id);
@@ -1286,6 +1291,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     ModelBatchItem suffix = warmupItem(id, prefixTokens, suffixTokens, pages);
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
+    suffix.requestTokens = request.prompt;
     requireLanesSucceeded(
         prefill(suffixPlan, std::span<const ModelBatchItem>(&suffix, 1)));
     prepareWarmupDecode(id, warmupPrompt.back());
@@ -1296,6 +1302,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                          .items = {{id, 0}},
                          .decodeStage = DecodeStage::Regular};
     ModelBatchItem decodeItem = warmupItem(id, promptTokens, 0, pages);
+    decodeItem.requestTokens = request.prompt;
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     requireLanesSucceeded(decoded);

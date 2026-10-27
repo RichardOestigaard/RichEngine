@@ -123,9 +123,13 @@ public:
   // (`factor` is the RICHENGINE_GDN_CHUNKED chunk size; 0 disables it).
   static uint64_t chunkScratchFloats(const GdnShape &shape, uint32_t tokens,
                                      uint32_t factor);
+  // `flags` are the gate-phase flags of metal/abi/GDN.h beyond the head
+  // order (which `order` still carries): GDN_SIGMOID_GATE gates the
+  // normalized output by sigmoid(z) instead of silu(z) (qwen4exp).
   static void addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                          GdnShape shape, uint32_t tokens,
-                         GdnHeadOrder order, metal::MetalBuffer sums = {});
+                         GdnHeadOrder order, metal::MetalBuffer sums = {},
+                         uint32_t flags = 0);
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.
@@ -141,7 +145,8 @@ public:
                                  LinearInput input,
                                  std::span<const uint32_t> liveRows = {},
                                  uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
-                                 const GdnTapeLanes *tapeLanes = nullptr);
+                                 const GdnTapeLanes *tapeLanes = nullptr,
+                                 uint32_t flags = 0);
   // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.
@@ -151,7 +156,8 @@ public:
                                      metal::MetalBuffer treeCounts,
                                      GdnShape shape, uint32_t lanes,
                                      uint32_t layer, GdnStateStrides state,
-                                     GdnHeadOrder order, LinearInput input);
+                                     GdnHeadOrder order, LinearInput input,
+                                     uint32_t flags = 0);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state,

@@ -43,9 +43,12 @@ inline ulong richengine_current_value_index(uint stride, uint head, uint token,
 // One lane per dimension stores a current row in its final page slot.
 // INT8 derives a per-row scale; BF16 copies the original bits. Slots are
 // addressed inside the head's slab of the page: the page index functions at
-// page zero and head zero.
+// page zero and head zero. ValuesTokenMajor stores the head's values
+// token-major like its keys (kv::Layout::valuesTokenMajor); the packed-INT4
+// path is always token-major and ignores it.
 template <uint KVHeads, typename CacheElement,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          bool ValuesTokenMajor = false>
 __attribute__((always_inline)) inline void richengine_store_kv_row(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const RichKvPage *page_table,
@@ -66,7 +69,7 @@ __attribute__((always_inline)) inline void richengine_store_kv_row(
 
   if constexpr (is_same<CacheElement, bfloat>::value) {
     if (value_tensor)
-      slab.values[richengine_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
+      slab.values[richengine_kv_value_index<KVHeads, HeadDim, ValuesTokenMajor>(0, 0, page_token, dimension)] = source;
     else
       slab.keys[richengine_kv_key_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] = source;
     return;
@@ -133,7 +136,7 @@ __attribute__((always_inline)) inline void richengine_store_kv_row(
                         : clamp(int(rint(value * 127.0f / maximum)), -127, 127);
 
     if (value_tensor) {
-      slab.values[richengine_kv_value_index<KVHeads, HeadDim>(0, 0, page_token, dimension)] =
+      slab.values[richengine_kv_value_index<KVHeads, HeadDim, ValuesTokenMajor>(0, 0, page_token, dimension)] =
           char(quantized);
       if (dimension == 0)
         slab.value_scales[richengine_q8_scale_index<KVHeads>(0, 0, page_token)] = scale;

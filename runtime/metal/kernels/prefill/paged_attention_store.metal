@@ -5,7 +5,8 @@
 // committed length. A rejected suffix remains unreachable and is overwritten
 // by the next command starting at the same logical position.
 template <uint KVHeads, typename CacheElement,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          bool ValuesTokenMajor = false>
 inline void richengine_store_chunk_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const RichKvPage *page_table,
@@ -21,7 +22,7 @@ inline void richengine_store_chunk_phase(
   uint row = value_tensor ? group - rows : group;
   uint chunk_token = row % params.chunk_tokens;
   uint head = row / params.chunk_tokens;
-  richengine_store_kv_row<KVHeads, CacheElement, HeadDim>(
+  richengine_store_kv_row<KVHeads, CacheElement, HeadDim, ValuesTokenMajor>(
       chunk_keys, chunk_values, page_table, params, maxima, value_tensor, head,
       chunk_token, thread_index, simd_lane, simd_group);
 }
@@ -155,3 +156,26 @@ PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_gemma_hd512, 2, int8_t, 51
 PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
 #undef PREFILL_ATTENTION_STORE_HD
+
+// Token-major-values variants (_tm) for a valuesTokenMajor layout's pages
+// (the QSA sparse attention's KV2 pages of 256): packed-INT4 values are
+// already token-major, so only INT8 and BF16 need a variant.
+#define PREFILL_ATTENTION_STORE_TM(Name, Heads, CacheElement)                  \
+  kernel void Name(                                                          \
+      device const bfloat *chunk_keys [[buffer(0)]],                         \
+      device const bfloat *chunk_values [[buffer(1)]],                       \
+      device const RichKvPage *page_table [[buffer(2)]],                     \
+      constant RichChunkedPrefillParams &params [[buffer(3)]],               \
+      uint group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                     \
+      uint simd_lane [[thread_index_in_simdgroup]],                          \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
+    threadgroup float maxima[8];                                             \
+    richengine_store_chunk_phase<Heads, CacheElement,                        \
+                                 RICHENGINE_KV_HEAD_DIMENSION, true>(        \
+        chunk_keys, chunk_values, page_table, params, maxima, group,         \
+        thread_index, simd_lane, simd_group);                                \
+  }
+PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_kv2_g8_tm, 2, int8_t)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_kv2_g8_tm, 2, bfloat)
+#undef PREFILL_ATTENTION_STORE_TM

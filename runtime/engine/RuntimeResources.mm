@@ -8,6 +8,7 @@
 #include "model/WeightStore.hpp"
 #include "TestConfig.hpp"
 #include "ops/AneFfnMeasurement.hpp"
+#include "ops/CoreAiFfn.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -153,7 +154,7 @@ std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
 }
 
 // The split's part of what the engine gives back while idle, if it runs one.
-std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
+std::optional<ReleasableMemory::Split> idleSplit(ops::FfnSplit *split) {
   if (!split)
     return std::nullopt;
   return ReleasableMemory::Split{[split] { return split->release(); },
@@ -268,7 +269,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::CompositeStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::unique_ptr<ops::FfnSplit> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::optional<uint64_t> hostAvailableAtStart)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), model_(std::move(model)),
@@ -694,7 +695,7 @@ AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
   const bool stopped = aneFfn_->retired();
-  const ops::AneFfn::Served &served = aneFfn_->served();
+  const ops::FfnSplit::Served &served = aneFfn_->served();
   return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
           stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
           aneFfn_->share(),
@@ -737,13 +738,46 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::ModelPackage 
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(package));
   AneFfnModel model;
   model.dense = !layers->empty();
+  // The d1 decision models serve one forward per judgment; a d1 given
+  // (RICHENGINE_ANE_D1) is their opt-in.
+  model.decisionModel = package.descriptor.family == "d1-3B" || package.descriptor.family == "d1-omni";
   if (!model.dense) return model;
-  if (const char *reason = ops::AneFfn::unsupported(*layers)) {
+  const char *reason = ops::AneFfn::unsupported(*layers);
+  const char *coreaiReason = ops::CoreAiFfn::unsupported(*layers);
+  if (reason && coreaiReason) {
     model.unsupported = reason;
     return model;
   }
+  // The private program's constraints are its rotation conv's; the CoreAI
+  // split's W8A16 function splits what those reject (a hidden size no whole
+  // rotation block covers). A coreai given then still gets a split; the
+  // private path's own selection reports the reason below.
+  if (reason) model.unsupported = reason;
+  model.units = reason ? ops::CoreAiFfn::units(*layers) : ops::AneFfn::units(*layers);
+  if (reason) {
+    if (!coreaiReason) {
+      model.plannedBytesCoreAi = [layers](uint32_t aneUnits) {
+        return ops::CoreAiFfn::plannedBytes(*layers, aneUnits);
+      };
+      const auto onArenaCore = [&backend, &package, &operators, format](const auto &use) {
+        model::withPrefillArena(backend, package, operators, format, use);
+      };
+      model.prepareCoreAi = [&backend, layers, onArenaCore](uint32_t aneUnits) {
+        AneFfnPrepared prepared;
+        onArenaCore([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+          prepared.split = std::make_unique<ops::CoreAiFfn>(backend, *layers, aneUnits);
+          prepared.error = prepared.split->verify(*layers, ffn, hidden);
+        });
+        return prepared;
+      };
+      model.recall = [](uint32_t) { return std::optional<ops::ane_ffn::Calibration>{}; };
+      model.remember = [](uint32_t, const ops::ane_ffn::Calibration &) {};
+      model.forget = [](uint32_t) {};
+      model.healthy = [&backend] { return backend.healthy(); };
+      return model;
+    }
+  }
   model.unavailable = [] { return ane::unavailable(); };
-  model.units = ops::AneFfn::units(*layers);
   model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
   const auto onArena = [&backend, &package, &operators, format](const auto &use) {
     model::withPrefillArena(backend, package, operators, format, use);
@@ -761,11 +795,27 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::ModelPackage 
       prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
-        prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+        prepared.chunks = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled)
+                              .chunks(static_cast<ops::AneFfn &>(*prepared.split));
     });
     return prepared;
   };
+  // The CoreAI given's split (RICHENGINE_COREAI_FFN), where the layers take
+  // it: a shim or asset it lacks makes prepareCoreAi's split throw, which
+  // the start reports as unavailable.
+  if (!ops::CoreAiFfn::unsupported(*layers)) {
+    model.plannedBytesCoreAi = [layers](uint32_t aneUnits) {
+      return ops::CoreAiFfn::plannedBytes(*layers, aneUnits);
+    };
+    model.prepareCoreAi = [&backend, layers, onArena](uint32_t aneUnits) {
+      AneFfnPrepared prepared;
+      onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+        prepared.split = std::make_unique<ops::CoreAiFfn>(backend, *layers, aneUnits);
+        prepared.error = prepared.split->verify(*layers, ffn, hidden);
+      });
+      return prepared;
+    };
+  }
   const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName +
                           " cores " + std::to_string(backend.capabilities().gpuCoreCount) + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +

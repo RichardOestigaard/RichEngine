@@ -42,7 +42,9 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
       moeUnionCap_(moeUnionCap ? moeUnionCap
                               : model::modelPolicy().moeUnionCap),
       moeRouteWideRows_(moeRouteWideRows(policy_.cores)),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(policy_)) {}
+      // RICHENGINE_MOE_SG4 overrides the family's simdgroups for A/Bs.
+      moeDecodeSimdgroups_(tuning().moeSg4 ? MoeExpertSimdgroups::Four
+                                          : moeDecodeSimdgroups(policy_)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {

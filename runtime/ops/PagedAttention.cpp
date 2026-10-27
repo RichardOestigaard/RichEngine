@@ -2,6 +2,7 @@
 
 #include "Env.hpp"
 
+#include "ops/BufferExtent.hpp"
 #include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
@@ -48,6 +49,7 @@ using KernelLayout = kv::Core;
   case KernelLayout::Kv4Group6:
   case KernelLayout::Kv4Group4:
   case KernelLayout::Kv2Group8:
+  case KernelLayout::Kv2Group12H256:
   case KernelLayout::GemmaKv8H256:
     return 256;
   case KernelLayout::Kv2Group8D128:
@@ -87,6 +89,10 @@ using KernelLayout = kv::Core;
     return "_gemma_h256";
   case KernelLayout::GemmaKv2H512:
     return "_gemma_hd512";
+  // The QSA sparse core: only the *_sparse_* splits and *_tm stores carry
+  // this suffix; no dense split/gather kernel does.
+  case KernelLayout::Kv2Group12H256:
+    return "_kv2_g12";
   case KernelLayout::Unspecified:
     break;
   }
@@ -162,6 +168,11 @@ using KernelLayout = kv::Core;
   case KernelLayout::GemmaKv2H512:
     return layout.kvHeads == 2 && layout.headDimension == 512 &&
            queryHeads == 16;
+  // Qwen3.8-Flash-Next's QSA layers: 24 query heads over 2 KV heads of 256,
+  // token-major values (kv::Layout::valuesTokenMajor) for the block gather.
+  case KernelLayout::Kv2Group12H256:
+    return layout.kvHeads == 2 && layout.headDimension == 256 &&
+           queryHeads == 24;
   case KernelLayout::Unspecified:
     break;
   }
@@ -277,8 +288,39 @@ using KernelLayout = kv::Core;
 
 [[nodiscard]] std::string storeKernel(std::string_view stem, kv::Format format,
                                       const kv::Layout &layout) {
-  return std::string(stem) + "_" + formatTag(format) + "_store" +
-         std::string(storageSuffix(layout));
+  std::string kernel = std::string(stem) + "_" + formatTag(format) + "_store" +
+                       std::string(storageSuffix(layout));
+  // A valuesTokenMajor layout's pages take the token-major store variants.
+  if (layout.valuesTokenMajor) kernel += "_tm";
+  return kernel;
+}
+
+// The sparse attention kernels (shared/sparse_attention.metal), which only
+// the Kv2Group12H256 core compiles: stem_fmt_sparse_kv2_g12 splits and
+// stem_sparse_reduce_kv2_g12 reduces. INT8 and BF16 only.
+[[nodiscard]] std::string sparseSplitKernel(std::string_view stem,
+                                            kv::Format format,
+                                            KernelLayout layout) {
+  return std::string(stem) + "_" + formatTag(format) + "_sparse" +
+         std::string(kernelSuffix(layout));
+}
+
+[[nodiscard]] std::string sparseReduceKernel(std::string_view stem,
+                                             KernelLayout layout) {
+  return std::string(stem) + "_sparse_reduce" +
+         std::string(kernelSuffix(layout));
+}
+
+// Whether the layout's core compiles sparse kernels and its pages hold
+// values the gather can read: token-major, INT8 or BF16.
+void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
+  if (kernel != KernelLayout::Kv2Group12H256)
+    throw std::invalid_argument("no sparse attention kernel for layout");
+  if (!layout.valuesTokenMajor)
+    throw std::invalid_argument("sparse attention requires token-major values");
+  if (layout.format != kv::Format::Int8 &&
+      layout.format != kv::Format::BFloat16)
+    throw std::invalid_argument("sparse attention requires int8 or bf16 pages");
 }
 
 [[nodiscard]] std::string reduceKernel(std::string_view stem, KernelLayout layout) {
@@ -360,11 +402,12 @@ AttentionWorkspace PagedAttention::verifyWorkspace(uint32_t lanes, uint32_t quer
 }
 
 PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHeads,
-                                                   kv::Layout layout) {
+                                                   kv::Layout layout, bool sparse) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows ||
       !kv::validFormat(layout.format))
     throw std::invalid_argument("invalid paged prefill attention geometry");
+  if (sparse) requireSparseLayout(layout, kernelLayout);
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
   const uint32_t splits = prefillSplits(tiles);
   const uint32_t fusedRows =
@@ -373,12 +416,16 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
           splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              kernelLayoutHeadDim(kernelLayout)),
-          splitPipeline(kPrefillAttention, layout, kernelLayout),
-          reduceKernel(kPrefillAttentionReduce, kernelLayout),
+          sparse ? sparseSplitKernel(kPrefillAttention, layout.format, kernelLayout)
+                 : splitPipeline(kPrefillAttention, layout, kernelLayout),
+          sparse ? sparseReduceKernel(kPrefillAttention, kernelLayout)
+                 : reduceKernel(kPrefillAttentionReduce, kernelLayout),
           {layout.kvHeads, tiles, splits},
-          {layout.kvHeads, fusedRows, tiles},
+          {layout.kvHeads, sparse ? kv::kSparseTileRows * (queryHeads / layout.kvHeads)
+                                  : fusedRows,
+           tiles},
           metal::DispatchSize{layout.headDimension, 1, 1},
-          layout.format, layout.scoreScale, layout.windowTokens};
+          layout.format, layout.scoreScale, layout.windowTokens, sparse};
 }
 
 PrefillAttentionPlan
@@ -408,12 +455,15 @@ PagedAttention::prefillCanvasPlan(uint32_t rows, uint32_t queryHeads,
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, bool tree, uint32_t liveNodes,
-    uint32_t rowStride) {
+    uint32_t rowStride, bool sparse) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!kv::validFormat(layout.format))
     throw std::invalid_argument("paged attention requires a kv format");
   if (tree && layout.format == kv::Format::Float8E4M3)
     throw std::invalid_argument("tree verify has no fp8 kernels");
+  if (tree && sparse)
+    throw std::invalid_argument("tree verify has no sparse kernels");
+  if (sparse) requireSparseLayout(layout, kernelLayout);
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       historyTokens.size() != lanes)
     throw std::invalid_argument("verify lane count is out of range");
@@ -433,7 +483,18 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     if (uint64_t{historyTokens[lane]} + liveRows > kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
-    laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], liveRows);
+    // A sparse lane's splits follow the most its tiles' lists can hold: the
+    // written splits of a list of every history block, capped like the page
+    // loop's. The kernels' partition reads each list's device count, so the
+    // bound only needs to cover it.
+    laneSplits[lane] =
+        sparse
+            ? std::min(
+                  kv::sparseWrittenSplits(
+                      kv::sparseHistoryBlocks(historyTokens[lane], liveRows),
+                      kv::kVerifyMaximumSplits),
+                  kv::verifyAttentionSplits(historyTokens[lane], liveRows))
+            : kv::verifyAttentionSplits(historyTokens[lane], liveRows);
     splits = std::max(splits, laneSplits[lane]);
   }
   // The plan's exact scratch uses its own row capacity; the public
@@ -448,26 +509,38 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   // compiled sixteen. Tree nodes always take the 16-node tile.
   const bool narrow = !tree && rows == 8 &&
                       !envFlag("RICHENGINE_VERIFY_M8_OFF");
-  const bool chainR2 = !tree && !narrow && !tuning().verifySplitR2Off;
-  std::string split = splitPipeline(
-      tree ? kVerifyTreeAttention : kVerifyAttention, layout, kernelLayout,
-      chainR2);
+  const bool chainR2 = !tree && !narrow && !sparse &&
+                       !tuning().verifySplitR2Off;
+  std::string split =
+      sparse
+          ? sparseSplitKernel(kVerifyAttention, layout.format, kernelLayout)
+          : splitPipeline(
+                tree ? kVerifyTreeAttention : kVerifyAttention, layout,
+                kernelLayout, chainR2);
   uint32_t splitGroupX = layout.kvHeads;
   if (split.size() >= 3 && split.compare(split.size() - 3, 2, "_r") == 0)
     splitGroupX *= split.back() - '0';
-  if (narrow)
+  if (narrow && !sparse)
     split += "_m8";
+  const uint32_t rowTiles =
+      (rows + kv::kSparseTileRows - 1) / kv::kSparseTileRows;
+  const uint32_t group = queryHeads / layout.kvHeads;
   return {lanes,
           laneSplits,
           splits,
           workspace,
           split,
-          reduceKernel(tree ? kVerifyTreeAttentionReduce
-                            : kVerifyAttentionReduce,
-                       kernelLayout) +
-              (narrow ? "_m8" : ""),
-          {splitGroupX, splits, lanes},
-          {layout.kvHeads, rows * (queryHeads / layout.kvHeads), lanes},
+          sparse
+              ? sparseReduceKernel(kVerifyAttention, kernelLayout)
+              : reduceKernel(tree ? kVerifyTreeAttentionReduce
+                                  : kVerifyAttentionReduce,
+                             kernelLayout) +
+                    (narrow ? "_m8" : ""),
+          {splitGroupX, splits, sparse ? uint64_t{lanes} * rowTiles : lanes},
+          {layout.kvHeads,
+           sparse ? kv::kSparseTileRows * group
+                  : rows * group,
+           sparse ? uint64_t{lanes} * rowTiles : lanes},
           // The verify stores are row-count generic; only the emitted rows
           // dispatch, not the tree tile's spare capacity row.
           storeKernel(kVerifyAttention, layout.format, layout),
@@ -475,7 +548,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           metal::DispatchSize{layout.headDimension, 1, 1},
           metal::DispatchSize{layout.headDimension, 1, 1},
           layout.format,
-          rows, layout.scoreScale, layout.windowTokens};
+          rows, layout.scoreScale, layout.windowTokens, sparse};
 }
 
 void PagedAttention::addPrefillProjection(
@@ -632,7 +705,8 @@ void PagedAttention::addPrefill(
     metal::CommandGraph &graph, RichKvLayer layer, metal::MetalBuffer queries,
     metal::MetalBuffer output, metal::MetalBuffer partials,
     metal::MetalBuffer statistics, metal::MetalBuffer pageTable,
-    const kv::ChunkedPrefillParams &chunk, const PrefillAttentionPlan &plan) {
+    const kv::ChunkedPrefillParams &chunk, const PrefillAttentionPlan &plan,
+    AttentionBlocks blocks) {
   if (chunk.chunk_tokens != plan.rows)
     throw std::invalid_argument("prefill attention rows do not match plan");
   if (const std::string_view error = kv::chunkedPrefillValidationError(chunk);
@@ -641,9 +715,12 @@ void PagedAttention::addPrefill(
   if (partials.sizeBytes() < plan.workspace.partialsBytes ||
       statistics.sizeBytes() < plan.workspace.statisticsBytes)
     throw std::invalid_argument("prefill attention scratch is smaller than its bound");
+  if (plan.sparse != static_cast<bool>(blocks.lists))
+    throw std::invalid_argument("prefill attention block lists do not match plan");
   const RichPrefillAttentionParams attention{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, layer, plan.splits, plan.scoreScale};
+      chunk.page_table_entries, layer, plan.splits, plan.scoreScale,
+      blocks.stride, blocks.list};
   // The _swa splits take the window as a constant after the parameters;
   // every canvas split declares the same trailing constant and ignores it
   // when its name is windowless.
@@ -652,6 +729,15 @@ void PagedAttention::addPrefill(
     graph.addPatchableTail(plan.splitPipeline,
               {queries, partials, statistics, pageTable}, attention,
               plan.windowTokens, plan.splitGroups);
+  } else if (plan.sparse) {
+    graph.addPatchable(plan.splitPipeline,
+              {queries, partials, statistics, pageTable, blocks.lists,
+               blocks.counts},
+              attention, plan.splitGroups);
+    graph.addPatchable(plan.reducePipeline,
+              {partials, statistics, output, blocks.counts}, attention,
+              plan.reduceGroups, plan.reduceThreads);
+    return;
   } else {
     graph.addPatchable(plan.splitPipeline,
               {queries, partials, statistics, pageTable}, attention,
@@ -667,13 +753,17 @@ void PagedAttention::addVerify(
     PagedVerifyBuffers buffers,
     std::span<const kv::ChunkedPrefillParams> chunks,
     const VerifyAttentionPlan &plan, metal::MetalBuffer gatePacked,
-    metal::MetalBuffer gateHidden) {
+    metal::MetalBuffer gateHidden, AttentionBlocks blocks) {
   constexpr uint32_t maximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes)
     throw std::invalid_argument("invalid paged verify batch");
   if (buffers.partials.sizeBytes() < plan.workspace.partialsBytes ||
       buffers.statistics.sizeBytes() < plan.workspace.statisticsBytes)
     throw std::invalid_argument("verify attention scratch is smaller than its bound");
+  if (plan.sparse != static_cast<bool>(blocks.lists))
+    throw std::invalid_argument("verify attention block lists do not match plan");
+  if (plan.sparse && gateHidden)
+    throw std::invalid_argument("sparse verify has no fused gate reduce");
   std::array<kv::ChunkedPrefillParams, maximumLanes> stores{};
   std::array<kv::VerifyAttentionParams, maximumLanes> attention{};
   for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
@@ -685,7 +775,9 @@ void PagedAttention::addVerify(
                        plan.laneSplits[lane],
                        plan.splits,
                        chunks[lane].chunk_tokens,
-                       plan.rowCapacity, plan.scoreScale};
+                       plan.rowCapacity, plan.scoreScale,
+                       blocks.stride,
+                       blocks.list + lane * plan.rowTiles};
   }
   std::array<metal::MetalBuffer, 4> tables = {buffers.pageTables[0], buffers.pageTables[1],
                                               buffers.pageTables[2], buffers.pageTables[3]};
@@ -706,9 +798,14 @@ void PagedAttention::addVerify(
       tree ? std::vector<metal::MetalBuffer>{buffers.queries,
                buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3], buffers.treeMasks}
-           : std::vector<metal::MetalBuffer>{buffers.queries,
-               buffers.partials, buffers.statistics, tables[0],
-               tables[1], tables[2], tables[3]};
+           : plan.sparse
+               ? std::vector<metal::MetalBuffer>{buffers.queries,
+                   buffers.partials, buffers.statistics, tables[0],
+                   tables[1], tables[2], tables[3], blocks.lists,
+                   blocks.counts}
+               : std::vector<metal::MetalBuffer>{buffers.queries,
+                   buffers.partials, buffers.statistics, tables[0],
+                   tables[1], tables[2], tables[3]};
   // The _swa splits take the window as a constant after the lane parameters.
   if (plan.splitPipeline.find("_swa_") != std::string::npos) {
     graph.addPatchableTail(plan.splitPipeline, std::move(splitBuffers),
@@ -719,8 +816,14 @@ void PagedAttention::addVerify(
   }
   // The fused reduce applies the query gate only when the out-projection
   // reads Plain input; a table or packed consumer keeps the separate gate
-  // dispatch that writes its operand (addVerifyGate).
-  if (gateHidden) {
+  // dispatch that writes its operand (addVerifyGate). The sparse reduce
+  // binds the lists' counts for its written-split count.
+  if (plan.sparse) {
+    graph.addPatchable(plan.reducePipeline,
+              {buffers.partials, buffers.statistics, buffers.output,
+               blocks.counts},
+              attention, plan.reduceGroups, plan.reduceThreads_);
+  } else if (gateHidden) {
     // plan.reducePipeline's stem is the plan's own; the fused gate keeps
     // its layout suffix and swaps the stem for the gate variant.
     const std::string_view pipeline = plan.reducePipeline;
@@ -751,6 +854,50 @@ void PagedAttention::addVerify(
               {buffers.partials, buffers.statistics, buffers.output},
               attention, plan.reduceGroups, plan.reduceThreads_);
   }
+}
+
+void PagedAttention::addBlockLists(metal::CommandGraph &graph,
+                                   const metal::MetalBuffer &mask,
+                                   uint32_t maskWords,
+                                   std::span<const BlockListRows> sequences,
+                                   const AttentionBlocks &blocks) {
+  if (sequences.empty() ||
+      sequences.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH || !maskWords ||
+      !blocks.stride || !blocks.lists || !blocks.counts)
+    throw std::invalid_argument("invalid attention block lists");
+  RichAttentionBlockListParams params{
+      .tile_rows = kv::kSparseTileRows,
+      .mask_words = maskWords,
+      .stride = blocks.stride,
+      .sequences = static_cast<uint32_t>(sequences.size()),
+      .sequence = {}};
+  uint32_t mostTiles = 0;
+  for (uint32_t index = 0; index < sequences.size(); ++index) {
+    const BlockListRows &sequence = sequences[index];
+    if (!sequence.rows)
+      throw std::invalid_argument("an attention block list has no rows");
+    const uint32_t tiles = (sequence.rows + params.tile_rows - 1) /
+                           params.tile_rows;
+    params.sequence[index] = {sequence.maskRow, sequence.rows,
+                              sequence.firstPosition,
+                              blocks.list + sequence.list};
+    mostTiles = std::max(mostTiles, tiles);
+    requireBytes(mask, rowBytes(sequence.maskRow + sequence.rows, maskWords,
+                                maskWords, sizeof(uint32_t)),
+                 "attention block mask");
+    requireBytes(blocks.counts,
+                 uint64_t{blocks.list + sequence.list + tiles} *
+                     sizeof(uint32_t),
+                 "attention block count");
+    requireBytes(blocks.lists,
+                 uint64_t{blocks.list + sequence.list + tiles} *
+                     blocks.stride * sizeof(uint32_t),
+                 "attention block list");
+  }
+  graph.add(std::string(kAttentionBlockLists),
+            {mask, blocks.lists, blocks.counts}, params,
+            {mostTiles, params.sequences, 1},
+            {RICHENGINE_ATTENTION_BLOCK_LIST_THREADS, 1, 1});
 }
 
 void PagedAttention::addVerifyTreeCompact(

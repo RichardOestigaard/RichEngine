@@ -1,4 +1,5 @@
 #include "ModelDescriptor.hpp"
+#include "DescriptorChecks.hpp"
 #include "ModelRegistry.hpp"
 #include "Ornith9B.hpp"
 #include "DFlashTwoDraft.hpp"
@@ -24,11 +25,6 @@
 
 namespace richengine::model {
 namespace {
-
-struct GeometryField final {
-  const char *name;
-  uint64_t value;
-};
 
 // A model's records and configurations are kilobytes of JSON: a file past
 // this is not one and is not read, as a checkpoint's config.json is not
@@ -83,6 +79,9 @@ NSDictionary *requireObject(NSDictionary *object, NSString *key,
   return static_cast<NSDictionary *>(value);
 }
 
+} // namespace — the checks the families' registration hooks reach are
+// exported (DescriptorChecks.hpp); the rest stay file-local.
+
 NSArray *requireArray(NSDictionary *object, NSString *key,
                       std::string_view label) {
   id value = object[key];
@@ -90,6 +89,8 @@ NSArray *requireArray(NSDictionary *object, NSString *key,
     throw std::invalid_argument(std::string(label) + " must be an array");
   return static_cast<NSArray *>(value);
 }
+
+namespace {
 
 std::string requireString(NSDictionary *object, NSString *key,
                           std::string_view label) {
@@ -127,6 +128,8 @@ uint64_t requireUnsigned(NSDictionary *object, NSString *key,
   throw std::invalid_argument(std::string(label) +
                               " must be a positive unsigned integer");
 }
+
+} // namespace
 
 void requireEqual(uint64_t actual, uint64_t expected,
                   std::string_view label) {
@@ -172,6 +175,8 @@ void requireNumber(id value, double expected, std::string_view label) {
                                 [value description].UTF8String + ", runtime " +
                                 @(expected).description.UTF8String);
 }
+
+namespace {
 
 // A key and the number it must hold.
 struct ExpectedNumber final {
@@ -521,11 +526,12 @@ void validateQwen36(NSDictionary *manifest,
 // The DSpark architecture spellings a packed manifest may declare for a
 // family: its own name or the generic Draftfit spelling — another family's
 // spelling is refused.
-bool dsparkArchitectureAccepted(const TargetLayout &target,
+bool dsparkArchitectureAccepted(const ModelDescriptor &descriptor,
                                 std::string_view architecture) {
+  const ModelFamilyRegistration *entry =
+      findModelFamily(descriptor.family);
   const std::string_view family =
-      target.arch.starts_with("lfm2") ? "Lfm2DSparkDraftModel"
-                                      : "Qwen3DSparkModel";
+      entry ? entry->dsparkArchName : "Qwen3DSparkModel";
   return architecture == family || architecture == "DSparkDraftModel";
 }
 
@@ -550,7 +556,7 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
   const DraftKind kind = descriptor.draft.kind;
   const bool accepted =
       kind == DraftKind::DSpark
-          ? dsparkArchitectureAccepted(descriptor.target, architecture)
+          ? dsparkArchitectureAccepted(descriptor, architecture)
           : architecture == draftArchitecture(descriptor.draft);
   if (!accepted)
     throw std::invalid_argument("unsupported draft architecture: " + architecture);
@@ -639,10 +645,14 @@ void validateNewPackedFormat(NSDictionary *manifest,
   validateTokenizer(root, descriptor, modelType);
 }
 
-void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> fields) {
+} // namespace
+
+void requireGeometryNumbers(NSDictionary *object, std::initializer_list<GeometryField> fields) {
   for (const auto &field : fields)
     requireEqual(requireUnsigned(object, [NSString stringWithUTF8String:field.name], field.name), field.value, field.name);
 }
+
+namespace {
 
 // The packed gemma4 manifest: the shared format fields plus the target's
 // dual attention geometry and MoE sizes.
@@ -751,6 +761,8 @@ void validateDiffusionGemma(NSDictionary *manifest,
 // too and which its images are planned from, also holds the rest of what the
 // kernels compute; a GGUF's is what the installer derived from the GGUF's
 // metadata, which the GGUF planner checks.
+} // namespace
+
 void validateTextConfig(NSDictionary *text, const TargetLayout &target,
                         TargetSource source) {
   requireNumbers(text, "text config",
@@ -802,6 +814,15 @@ void validateTextConfig(NSDictionary *text, const TargetLayout &target,
       std::string("text config rope_parameters ") + typeKey.UTF8String;
   requireEqual(requireString(rope, typeKey, typeLabel), "default", typeLabel);
 }
+
+// The Qwen families' shared refineSourceConfig hook: their text config
+// nests under text_config and binds the target format's rules.
+void refineQwenSourceText(id text, const ModelDescriptor &descriptor) {
+  validateTextConfig(static_cast<NSDictionary *>(text), descriptor.target,
+                     descriptor.targetSource);
+}
+
+namespace {
 
 // A DFlash2 checkpoint's config: the draft's layout; the block, window,
 // convolutions and selector the draft kernels are built for; and the target's
@@ -887,169 +908,24 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         std::string(entry->modelType) + ", not " + type);
   ModelDescriptor result = entry->makeDescriptor(name);
   result.family = entry->name;
-  {
-    const TargetLayout &layout = result.target;
-    if (layout.arch == "dense") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
-          {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads}});
-      // MiniCPM5's head_dim is implicit (hidden / heads).
-      if (text[@"head_dim"])
-        requireNumbers(text, {{"head_dim", layout.attentionHeadDimension}});
-    } else if (layout.arch == "granite") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize},
-          {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads},
-          {"intermediate_size", layout.intermediateSize},
-          {"max_position_embeddings", layout.maximumContextTokens},
-          {"rope_theta", 10000000u}});
-      // attention_multiplier is a float the GGUF metadata check verifies.
-      if (id value = text[@"attention_multiplier"];
-          [value isKindOfClass:[NSNumber class]] &&
-          std::abs([value doubleValue] - layout.attentionScale) >
-              layout.attentionScale * 1e-6)
-        throw std::invalid_argument(
-            "unsupported granite attention_multiplier: " +
-            std::to_string([value doubleValue]));
-    } else if (layout.arch == "lfm2") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize},
-          {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
-          {"intermediate_size", layout.intermediateSize}});
-      // Exports disagree on the trained context (131072 vs 128000).
-      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
-                    "max_position_embeddings");
-      // The conv/full_attention layer schedule of layer_types.
-      NSArray *types = requireArray(text, @"layer_types", "target layer_types");
-      requireEqual(types.count, layout.layers, "target layer_types count");
-      for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-        id value = types[layer];
-        if (![value isKindOfClass:[NSString class]])
-          throw std::invalid_argument("target layer type must be a string");
-        const std::string expected =
-            layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
-        const char *actual = static_cast<NSString *>(value).UTF8String;
-        requireEqual(actual ? actual : "", expected,
-                     "target layer " + std::to_string(layer));
-      }
-      // An encoder decision model (d1-omni) states encoder plus the
-      // per-layer fields its non-uniform geometry needs; a causal target
-      // states none of them.
-      if (id encoder = text[@"encoder"];
-          encoder != nil &&
-          ![encoder isEqual:layout.encoder ? @YES : @NO])
-        throw std::invalid_argument(
-            "target encoder flag does not match the family's");
-      if (NSArray *kvs = text[@"layer_kv_heads"];
-          [kvs isKindOfClass:[NSArray class]]) {
-        requireEqual(kvs.count, layout.layers, "target layer_kv_heads count");
-        for (uint32_t layer = 0; layer < layout.layers; ++layer)
-          requireNumber(
-              kvs[layer],
-              layout.isFullAttentionLayer(layer) ? layout.kvHeadsAt(layer) : 0,
-              "target layer_kv_heads " + std::to_string(layer));
-      }
-      if (NSArray *widths = text[@"layer_intermediate_sizes"];
-          [widths isKindOfClass:[NSArray class]]) {
-        requireEqual(widths.count, layout.layers,
-                     "target layer_intermediate_sizes count");
-        for (uint32_t layer = 0; layer < layout.layers; ++layer)
-          requireNumber(widths[layer], layout.intermediateSizeAt(layer),
-                        "target layer_intermediate_sizes " +
-                            std::to_string(layer));
-      }
-    } else if (layout.arch == "lfm2_moe") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize},
-          {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_dim", layout.convolutionDimension}, {"conv_L_cache", layout.convolutionTaps},
-          {"intermediate_size", layout.intermediateSize},
-          {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
-          {"moe_intermediate_size", layout.expertIntermediateSize},
-          {"num_dense_layers", layout.denseLayers}});
-      // Exports disagree on the trained context (131072 vs 128000).
-      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
-                    "max_position_embeddings");
-      // The conv/full_attention layer schedule of layer_types.
-      NSArray *types = requireArray(text, @"layer_types", "target layer_types");
-      requireEqual(types.count, layout.layers, "target layer_types count");
-      for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-        id value = types[layer];
-        if (![value isKindOfClass:[NSString class]])
-          throw std::invalid_argument("target layer type must be a string");
-        const std::string expected =
-            layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
-        const char *actual = static_cast<NSString *>(value).UTF8String;
-        requireEqual(actual ? actual : "", expected,
-                     "target layer " + std::to_string(layer));
-      }
-    } else if (layout.arch == "lfm2_moe_24b") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize},
-          {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads},
-          {"conv_L_cache", layout.convolutionTaps},
-          {"intermediate_size", layout.intermediateSize},
-          {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
-          {"moe_intermediate_size", layout.expertIntermediateSize},
-          {"num_dense_layers", layout.denseLayers}});
-      // conv_dim is the hidden size upstream; MLX exports may omit it.
-      if (text[@"conv_dim"])
-        requireNumbers(text, {{"conv_dim", layout.convolutionDimension}});
-      // Exports disagree on the trained context (131072 vs 128000).
-      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
-                    "max_position_embeddings");
-      // The conv/full_attention layer schedule of layer_types.
-      NSArray *types = requireArray(text, @"layer_types", "target layer_types");
-      requireEqual(types.count, layout.layers, "target layer_types count");
-      for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-        id value = types[layer];
-        if (![value isKindOfClass:[NSString class]])
-          throw std::invalid_argument("target layer type must be a string");
-        const std::string expected =
-            layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
-        const char *actual = static_cast<NSString *>(value).UTF8String;
-        requireEqual(actual ? actual : "", expected,
-                     "target layer " + std::to_string(layer));
-      }
-    } else if (layout.arch == "gemma4" ||
-               layout.arch == "diffusion_gemma") {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"num_attention_heads", layout.attentionQueryHeads},
-          {"num_key_value_heads", layout.attentionKvHeads}, {"head_dim", layout.attentionHeadDimension},
-          {"global_num_key_value_heads", layout.altKvHeads},
-          {"global_head_dim", layout.altHeadDimension},
-          {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
-          {"moe_intermediate_size", layout.expertIntermediateSize},
-          {"shared_expert_intermediate_size", layout.sharedIntermediateSize},
-          {"sliding_window", layout.slidingWindowTokens}});
-      requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
-                    "max_position_embeddings");
-    }
-    // The Qwen families' text config is checked by validateTextConfig once
-    // the target format is known.
-  }
+  // The family's own check of the resolved text fields.
+  if (entry->validateSourceConfig)
+    entry->validateSourceConfig(text, result);
   const auto target = requireString(record, @"target_format", "target format");
   if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + target);
-  if (result.target.arch == "qwen3_8" || result.target.arch == "ornith9" ||
-      result.target.arch == "qwen3_6moe" ||
-      result.target.arch == "minicpm_v47_moe")
-    validateTextConfig(text, result.target, result.targetSource);
+  // The Qwen families' text config is checked by validateTextConfig once
+  // the target format is known.
+  if (entry->refineSourceConfig)
+    entry->refineSourceConfig(text, result);
   // The Null-default families' declared draft: an assembly that ships a
   // draft/config.json declares one anyway (Gemma 4's plain DFlash block,
   // the 24B's DSpark).
   const bool declaredDraft =
-      (result.target.arch == "gemma4" ||
-       result.target.arch == "lfm2_moe_24b") &&
+      entry->acceptsDeclaredDraft &&
       std::filesystem::exists(root / "draft" / "config.json");
-  if (result.target.arch == "diffusion_gemma" &&
+  if (entry->takesNoDraft &&
       std::filesystem::exists(root / "draft" / "config.json"))
     throw std::invalid_argument("diffusion gemma targets take no draft");
   if (result.draft.kind != DraftKind::Null || declaredDraft) {
@@ -1149,7 +1025,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.contextCore = draftContextCoreFor(d.hiddenSize, d.dynamicSize);
     // Gemma 4's draft shares its target's logit softcap; other families'
     // plain drafts leave it disabled.
-    if (result.target.arch == "gemma4")
+    if (result.target.logitSoftcap != 0.0F)
       d.logitSoftcap = result.target.logitSoftcap;
   } else if (dsparkDraft) {
     // The DSpark draft: a block-bidirectional qwen3 block plus a Markov and
@@ -1221,7 +1097,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.headCore = draftHeadCoreFor(heads, kvHeads, headDim, d.ropeInterleaved);
     d.contextCore = draftContextCoreFor(d.hiddenSize, d.dynamicSize);
   } else {
-    requireNumbers(draft, {{"num_hidden_layers", d.layers}, {"hidden_size", d.hiddenSize},
+    requireGeometryNumbers(draft, {{"num_hidden_layers", d.layers}, {"hidden_size", d.hiddenSize},
         {"vocab_size", d.vocabularySize}, {"intermediate_size", d.intermediateSize},
         {"num_attention_heads", d.attentionSize / d.attentionHeadDimension},
         {"num_key_value_heads", d.kvHeads}, {"head_dim", d.attentionHeadDimension},
@@ -1231,8 +1107,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   }
   // The draft norm epsilon follows the target family's (the LFM2 targets'
   // 1e-5).
-  const double expectedRmsEps =
-      result.target.arch.starts_with("lfm2") ? 1e-5 : 1e-6;
+  const double expectedRmsEps = entry->draftNormEpsilon;
   if (dsparkDraft) {
     d.rmsEpsilon = static_cast<float>(expectedRmsEps);
     if (![draft[@"rms_norm_eps"] isEqual:@(expectedRmsEps)] ||
@@ -1305,7 +1180,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       throw std::invalid_argument("draft block_size is below a proposal row");
     d.blockSize = static_cast<uint32_t>(blockSize);
     result.draft.blockSize = d.blockSize;
-    requireNumbers(flash, {{"conv_group_size", 16},
+    requireGeometryNumbers(flash, {{"conv_group_size", 16},
         {"conv_kernel_size", 2}, {"selector_rank", d.selectorRank}, {"selector_top_k", 16}});
   }
   NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
@@ -1332,8 +1207,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (vision == "none") result.visionSource = VisionSource::None;
   else {
     // Only the Qwen VL tower is served; every other family is text-only.
-    if (result.target.arch != "qwen3_8" &&
-        result.target.arch != "qwen3_6moe")
+    if (!entry->servesVisionTower)
       throw std::invalid_argument("unsupported vision source format: " + vision);
     if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
     else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
@@ -1368,8 +1242,6 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   result.draft = draft;
   result.vision = vision;
   result.capabilities = {target.vocabularySize, target.maximumContextTokens};
-  if (target.arch == "diffusion_gemma")
-    result.capabilities.maximumStepTokens = target.diffusion.canvasLength;
   result.targetKvLayout = target.kvLayout();
   result.stateLayout = {target.gdnStateLayout(), draft.stateLayout()};
 

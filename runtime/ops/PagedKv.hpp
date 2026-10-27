@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
@@ -136,6 +137,7 @@ enum class Core : uint8_t {
   Kv8Group4D128,
   GemmaKv8H256,
   GemmaKv2H512,
+  Kv2Group12H256,
 };
 
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric
@@ -169,6 +171,20 @@ struct Layout final {
   // altAttentionCore for the altLayerMask layers (Gemma 4's globals).
   Core attentionCore = Core::Unspecified;
   Core altAttentionCore = Core::Unspecified;
+  // A block index: each page also holds, per layer, the pooled keys of its
+  // blocks of RICHENGINE_ATTENTION_BLOCK_TOKENS tokens, this many values each
+  // (bf16 [block][dimension]), in an index plane after every layer's K/V
+  // region of its extent (PageStorage::indexOffset). Only a complete block
+  // has a pooled key in a page: whoever owns the sequence keeps the keys of
+  // its open block (ops::BlockIndexer).
+  uint32_t indexDimension = 0;
+  // Whether a page holds each head's values token-major like its keys
+  // ([token][dimension]) rather than dimension-major ([dimension][token]).
+  // The page loop of dense attention reads whole pages, and its PV runs
+  // faster on dimension-major values; a sparse attention
+  // (ops::AttentionBlocks) gathers blocks of tokens, whose values are
+  // contiguous only token-major. The `_tm` store variants write them.
+  bool valuesTokenMajor = false;
 
   [[nodiscard]] constexpr bool isAltLayer(uint32_t layer) const noexcept {
     return layer < 64 && ((altLayerMask >> layer) & 1);
@@ -184,8 +200,11 @@ struct Layout final {
   }
   // The uniform one-layer layout a layer's kernels take.
   [[nodiscard]] constexpr Layout layerLayout(uint32_t layer) const noexcept {
-    return {1, kvHeadsAt(layer), headDimensionAt(layer), format, scoreScale,
-            0, 0, 0, windowTokens, attentionCoreAt(layer), Core::Unspecified};
+    return {1,           kvHeadsAt(layer), headDimensionAt(layer),
+            format,      scoreScale,       0,
+            0,           0,                windowTokens,
+            attentionCoreAt(layer),        Core::Unspecified,
+            indexDimension,                valuesTokenMajor};
   }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
@@ -245,11 +264,26 @@ struct Layout final {
       uint32_t layer) const noexcept {
     return 2 * (dataBytesPerLayerPageAt(layer) + scaleBytesPerLayerPageAt(layer));
   }
-  [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
+  // One layer's bytes of one page's block index (Layout::indexDimension),
+  // in the extent's index plane.
+  [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
+    return uint64_t{kPageTokens} / RICHENGINE_ATTENTION_BLOCK_TOKENS *
+           indexDimension * 2;
+  }
+  // A page's K/V bytes in every layer; its block index's bytes are apart.
+  [[nodiscard]] constexpr uint64_t kvBytesPerModelPage() const noexcept {
     uint64_t total = 0;
     for (uint32_t layer = 0; layer < attentionLayers; ++layer)
       total += bytesPerLayerPageAt(layer);
     return total;
+  }
+  [[nodiscard]] constexpr uint64_t indexBytesPerModelPage() const noexcept {
+    return uint64_t{attentionLayers} * indexBytesPerLayerPage();
+  }
+  // A page's whole bytes in an extent: its K/V and, in the index plane that
+  // follows the layers' regions, its index.
+  [[nodiscard]] constexpr uint64_t bytesPerModelPage() const noexcept {
+    return kvBytesPerModelPage() + indexBytesPerModelPage();
   }
 
   // An extent holds a whole number of these pages, so that every tensor
@@ -277,6 +311,9 @@ struct Layout final {
       if (altScale)
         pages = detail::lcm(pages, detail::pagesForAlignedRegion(altScale));
     }
+    if (indexDimension)
+      pages = detail::lcm(
+          pages, detail::pagesForAlignedRegion(indexBytesPerLayerPage()));
     return static_cast<uint32_t>(pages);
   }
 

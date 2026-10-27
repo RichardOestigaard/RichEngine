@@ -17,6 +17,7 @@
 #include "model/DFlashTwo8width.hpp"
 #include "model/DFlashTwo16width.hpp"
 #include "model/CompositeStateStorage.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "model/TargetModel.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/VerifyBudget.hpp"
@@ -427,7 +428,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                  std::span<const CommitLane> lanes);
   TargetModel targetModel;
   detail::DraftModel draftModel;
-  ops::AneFfn *aneFfn;
+  ops::FfnSplit *aneFfn;
   // Tree verify (docs/TREE_VERIFY_DESIGN.md): the selector emits each greedy,
   // unconstrained lane's comb tree when the draft is tree-capable. DFlash2's
   // 87%-acceptance benchmark measured identical tokens at ~2x verify rows,
@@ -448,6 +449,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   const bool treeDebug_ = tuning().treeDebug;
   const bool draftDebug_ = tuning().draftDebug;
   const bool draftConfDebug_ = tuning().draftConf;
+  const bool verifyBudgetDebug_ = tuning().verifyBudgetDebug;
   const std::string treeSkip_ = tuning().treeSkip;
   const bool aneDebug_ = tuning().aneDebug;
   const bool ngramDebug_ = tuning().ngramDebug;
@@ -579,6 +581,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   struct GpuPredraft final {
     CommandTicket ticket;
     bool submitted = false;
+    // Armed inside the step's own command (B-prime): the pack lanes it ran
+    // from carry the anchors and positions, so adoption needs no ticket —
+    // only the lane bookkeeping finalizeChainedPredraft fills from the
+    // readback.
+    bool chained = false;
     uint64_t epoch = 0;
     uint32_t lanes = 0;
     std::array<uint64_t, kLaneCount> requestIds{};
@@ -588,6 +595,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   GpuPredraft gpuPredraft_;
   const bool gpuPredraftOn_ =
       modelPolicy().gpuPredraft && geometry.tuning.gpuPredraft;
+  // RICHENGINE_CHAIN_PREDRAFT=0 keeps the post-finalize second-command
+  // predraft: the chained variant needs the step pack's device mirrors,
+  // and is off unless the family opts in — it measured slower where the
+  // host gap the second command overlaps is wide (Ornith-9B's ANE FFN
+  // handoff), while the 35B's tight loop gained it.
+  const bool chainPredraft_ =
+      modelPolicy().chainPredraft && deviceVerifyParams_;
   // Bumped once per decodeAsync's buffer-writing phase: a predraft's
   // recorded epoch proves no other decode wrote the arena between its
   // submission and the adoption check.
@@ -625,6 +639,21 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       draftPositions[row] = static_cast<uint32_t>(logicalPosition + row);
   }
   void launchDraftPredraft(std::span<const DecodeLaneResult> lanes,
+                           std::span<const ModelBatchItem> items);
+  // Encodes the next step's draft forward into the committed step's own
+  // command when every lane can take a chain draft: draft_predraft_pack
+  // stages the inputs decode_step_pack just wrote, and the draft graph's
+  // attention reads each lane's cache length from the pack. Arms
+  // gpuPredraft_'s lane bookkeeping; its anchors/positions are
+  // host-known only at finalize, which completeGpuPredraft fills or —
+  // on a launch-veto — clears.
+  void encodeChainedPredraft(CommandGraph &graph,
+                             std::span<Request *const> entries,
+                             std::span<const ModelBatchItem> items);
+  // The finish-callback predraft entry point: a chained arm only needs
+  // its lane facts confirmed against the readback (veto drops it);
+  // anything else gets the host-launched second command.
+  void completeGpuPredraft(std::span<const DecodeLaneResult> lanes,
                            std::span<const ModelBatchItem> items);
   bool adoptGpuPredraft(std::span<Request *const> entries,
                         std::span<const ModelBatchItem> items, uint32_t width,
@@ -704,6 +733,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded package");
+    }
+    // A family that fitted its draft's acceptance curve seeds the verify
+    // budget's start and shrink target with it (ModelTuning::verifyPrior);
+    // unset families keep the upstream models' kPrior.
+    if (geometry.tuning.verifyPrior) {
+      VerifyBudget::Acceptance seeded{};
+      seeded.slope = geometry.tuning.verifyPrior->slope;
+      seeded.intercepts = geometry.tuning.verifyPrior->intercepts;
+      verifyBudget_.seedAcceptance(seeded);
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
@@ -1460,6 +1498,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     ChunkedPrefillParams chunk;
     MetalBuffer pageTable;
     DispatchDraftCapturePlan captures;
+    // qwen4exp's host-computed layer inputs: each row's PLE table ids
+    // (pleHeads() per row, full-prefix history) and the QSA block records
+    // its rows complete. Empty on other targets.
+    std::vector<uint32_t> pleRowIds;
+    std::vector<BlockIndexerBlock> qsaBlocks;
   };
   struct PackedPrefillBatch final {
     std::vector<PackedPrefillSequence> sequences;
@@ -1511,10 +1554,34 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           chunkParams(item.logicalPosition, item.tokenCount, attentionStride,
                       item.pageTable);
       MetalBuffer pageTable = synchronizedPageTable(entry, item);
-      batch.sequences.push_back({&entry, &item, lane, batch.rows,
-                                 attentionStride, queryOffset, kvOffset,
-                                 batch.capturedRows, chunk, std::move(pageTable),
-                                 std::move(captures)});
+      PackedPrefillSequence &sequence = batch.sequences.emplace_back(
+          PackedPrefillSequence{&entry, &item, lane, batch.rows,
+                                attentionStride, queryOffset, kvOffset,
+                                batch.capturedRows, chunk, std::move(pageTable),
+                                std::move(captures), {}, {}});
+      // qwen4exp's n-gram tails and QSA block records span the whole
+      // prompt: the chunk's inputTokens alone lacks both.
+      if (const auto *qwen4 =
+              std::get_if<Qwen4ExpWeights>(&package.target)) {
+        sequence.pleRowIds.resize(
+            uint64_t{item.tokenCount} * qwen4->layout.pleHeads());
+        if (item.requestTokens.size() < item.logicalPosition)
+          throw std::invalid_argument(
+              "prefill item lacks its request's tokens");
+        qwen4ExpPleRows(*qwen4, item.logicalPosition, item.inputTokens,
+                        item.requestTokens, sequence.pleRowIds.data());
+        for (uint64_t last = item.logicalPosition;
+             last < item.logicalPosition + item.tokenCount; ++last) {
+          if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1)
+            continue;
+          const uint64_t first = last - (BLOCK_INDEXER_BLOCK - 1);
+          const std::array<uint32_t, 3> rotary =
+              ropePosition(entry, first);
+          sequence.qsaBlocks.push_back(
+              {static_cast<uint32_t>(first),
+               {rotary[0], rotary[1], rotary[2]}});
+        }
+      }
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
       batch.capturedRows += capturedRows;
@@ -1593,8 +1660,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
          p(PrefillTensor::ContextKv), p(PrefillTensor::ContextQkv),
          p(PrefillTensor::DraftRopeCos),
          p(PrefillTensor::DraftRopeSin),
-         {.partials = p(PrefillTensor::LinearPartials),
+         {.input = p(PrefillTensor::LinearPacked),
+          .sums = p(PrefillTensor::LinearExponents),
+          .partials = p(PrefillTensor::LinearPartials),
           .counters = p(PrefillTensor::LinearCounters),
+          .rotated = p(PrefillTensor::LinearRotated),
           .i8codes = p(PrefillTensor::I8Codes),
           .i8codesLo = p(PrefillTensor::I8CodesLo),
           .i8params = p(PrefillTensor::I8Params),
@@ -1672,6 +1742,26 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
         recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
       }
+      // The state cells' auxiliary region (PLE history + QSA pending keys)
+      // and the block index plane's entries, for the layouts that carry
+      // them — qwen4exp's.
+      if (const uint64_t auxiliary =
+              geometry.target.stateLayout.auxiliaryBytes) {
+        const uint64_t offset =
+            geometry.target.stateLayout.convolutionBytes() +
+            geometry.target.stateLayout.recurrentBytes();
+        destination.auxiliaryIn =
+            backend.view(in.stateBase, offset, auxiliary);
+        destination.auxiliaryOut =
+            backend.view(out.stateBase, offset, auxiliary);
+      }
+      if (geometry.target.kvLayout.indexDimension)
+        destination.indexTable =
+            decodeArena->get(sequence.entry->stateLane,
+                             DecodeTensor::IndexTable);
+      destination.pleRowIds = std::span<const uint32_t>(sequence.pleRowIds);
+      destination.qsaBlocks =
+          std::span<const BlockIndexerBlock>(sequence.qsaBlocks);
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
         const DispatchDraftCaptureSpan &capture = sequence.captures[index];
@@ -1739,6 +1829,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   void bindPageTables(
       std::span<Request *const> entries,
       std::array<MetalBuffer, kLaneCount> &pageTables) const;
+  // The lanes' block index tables — the same pages' index-plane entries —
+  // when the kv layout carries one (qwen4exp's QSA); untouched elsewhere.
+  void bindIndexTables(
+      std::span<Request *const> entries,
+      std::array<MetalBuffer, kLaneCount> &indexTables) const;
 
   void bindGdnStates(
       std::span<Request *const> entries,
@@ -1749,9 +1844,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       std::span<Request *const> entries,
       std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
       std::vector<std::array<MetalBuffer, kLaneCount>> &values) const;
+  // `devicePack` binds the step's DecodeStepPackLane block for the
+  // attention splits' cache lengths (the chained predraft); drafts that
+  // cannot consume it keep their host-staged lengths.
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
-                             std::span<const uint64_t> logicalPositions);
+                             std::span<const uint64_t> logicalPositions,
+                             const MetalBuffer &devicePack = {});
   // bf16 rows (the arena's hidden storage) to the fp16 the predictor
   // contracts name: a bf16 is the top half of a float's bits.
   static void bf16ToFp16Row(const uint16_t *source, _Float16 *target,
@@ -2456,6 +2555,22 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
       verifyBudget_.observe(std::span(observed).first(items.size()),
                             constrained, timing.wallSeconds * 1000.0);
+      if (verifyBudgetDebug_) {
+        const VerifyBudget::Acceptance &a = verifyBudget_.acceptance();
+        fprintf(stderr, "verify-budget slope=%.3f intercepts=[", a.slope);
+        for (uint32_t p = 0; p < VerifyBudget::kPositions; ++p)
+          fprintf(stderr, "%s%.2f", p ? " " : "", a.intercepts[p]);
+        fprintf(stderr, "]");
+        for (uint32_t lane = 0; lane < items.size(); ++lane)
+          fprintf(stderr, " l%u:rows=%u,acc=%u", lane,
+                  observed[lane].verifyRows, observed[lane].accepted);
+        const auto costs = verifyBudget_.costs(
+            static_cast<uint32_t>(items.size()), constrained);
+        fprintf(stderr, " cost=[%.2f %.2f %.2f]",
+                costs[items.size()], costs[items.size() * 8],
+                costs[items.size() * VerifyBudget::kBlockRows]);
+        fprintf(stderr, "\n");
+      }
     }
 
     const auto f1 = std::chrono::steady_clock::now();

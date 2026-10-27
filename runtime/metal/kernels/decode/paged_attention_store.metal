@@ -1,7 +1,8 @@
 #include "metal/kernels/common/paged_store_row.h"
 
 template <uint KVHeads, typename CacheElement,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          bool ValuesTokenMajor = false>
 inline void richengine_store_verify_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const RichKvPage *page_table0, device const RichKvPage *page_table1,
@@ -39,7 +40,7 @@ inline void richengine_store_verify_phase(
   uint row = value_tensor ? local_group - head_rows : local_group;
   uint chunk_token = row % rows;
   uint head = row / rows;
-  richengine_store_kv_row<KVHeads, CacheElement, HeadDim>(
+  richengine_store_kv_row<KVHeads, CacheElement, HeadDim, ValuesTokenMajor>(
       chunk_keys, chunk_values, page_table, lane_params, maxima, value_tensor,
       head, chunk_token, thread_index, simd_lane, simd_group);
 }
@@ -193,6 +194,32 @@ VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_gemma_hd512, 2, int8_t, 512)
 VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
 VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
 #undef VERIFY_ATTENTION_STORE_HD
+
+// Token-major-values variants (_tm) for a valuesTokenMajor layout's pages
+// (the QSA sparse attention's KV2 pages of 256).
+#define VERIFY_ATTENTION_STORE_TM(Name, Heads, CacheElement)                   \
+  kernel void Name(                                                          \
+      device const bfloat *chunk_keys [[buffer(0)]],                         \
+      device const bfloat *chunk_values [[buffer(1)]],                       \
+      device const RichKvPage *page_table0 [[buffer(2)]],                    \
+      device const RichKvPage *page_table1 [[buffer(3)]],                    \
+      device const RichKvPage *page_table2 [[buffer(4)]],                    \
+      device const RichKvPage *page_table3 [[buffer(5)]],                    \
+      constant RichChunkedPrefillParams *params [[buffer(6)]],               \
+      uint group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                     \
+      uint simd_lane [[thread_index_in_simdgroup]],                          \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
+    threadgroup float maxima[8];                                             \
+    richengine_store_verify_phase<Heads, CacheElement,                       \
+                                  RICHENGINE_KV_HEAD_DIMENSION, true>(       \
+        chunk_keys, chunk_values, page_table0, page_table1, page_table2,     \
+        page_table3, params, maxima, group, thread_index, simd_lane,         \
+        simd_group);                                                         \
+  }
+VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_kv2_g8_tm, 2, int8_t)
+VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_kv2_g8_tm, 2, bfloat)
+#undef VERIFY_ATTENTION_STORE_TM
 
 // Tree verify compaction. A tree lane's retained path names the scratch rows
 // (in emitted order) that survived acceptance, depth-ordered; chain rows

@@ -133,6 +133,41 @@ public:
   void enqueue(const Binding &binding, const metal::SharedEvent &event, uint64_t wait, uint64_t signal,
                std::function<void(bool)> done);
 
+  // How one evaluation can run without shared events: the client's async
+  // path (completion-reported), its real-time variant, or a synchronous
+  // evaluate on the model object itself when it offers one.
+  enum class EvalPath : uint8_t { Client, ClientRealtime, Model };
+
+  // Which of the private interface's optional entry points this Mac has,
+  // discovered without the signature check enqueue() relies on.
+  struct EvalInterface {
+    bool clientRealtime = false;  // evaluateRealTimeWithModel:options:request:error:
+    bool modelEval = false;       // the model's own evaluateWithQoS:options:request:error:
+    bool perfStats = false;       // _ANEPerformanceStats can be constructed
+    bool perfStatsMask = false;   // the model accepts setPerfStatsMask:
+    std::string detail;           // selectors found, with type encodings
+  };
+  [[nodiscard]] EvalInterface evalInterface() const;
+
+  // One synchronous evaluation's timing: wall time of the evaluation on the
+  // service's queue until its completion report (or its call's duration when
+  // a synchronous path never reports), the call alone, and the driver's
+  // hardware report in nanoseconds when a stats request produced one.
+  struct DirectTiming {
+    double wallMs = 0;
+    double callMs = 0;
+    bool reported = false;
+    std::optional<uint64_t> hardwareNs;
+  };
+
+  // One evaluation of `binding` run to completion on the service's queue,
+  // with no shared events — for benchmarks measuring the per-evaluation
+  // floor outside the enqueue() path. `statsMask` != 0 sets the model's
+  // perfStatsMask (when it accepts one) and reports the evaluation's
+  // hwExecutionTime when the driver fills it. Throws if `path` does not
+  // exist here (see evalInterface()) or the evaluation fails.
+  [[nodiscard]] DirectTiming evaluate(const Binding &binding, EvalPath path, uint64_t statsMask);
+
   // Releases the loaded program, whose compilation the service keeps; nothing
   // if it is not loaded. Waits under `limits`, which the destructor's unload
   // keeps, as it keeps load()'s. No evaluation may be in flight.

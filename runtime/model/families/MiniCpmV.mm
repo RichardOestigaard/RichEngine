@@ -1,5 +1,6 @@
 #include "model/AffinePlan.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -201,9 +202,11 @@ TargetWeights loadMinicpmV47MoeTarget(metal::MetalBackend &backend,
 const bool kRegisteredMiniCpmVFamilies = [] {
   registerTargetArch({"minicpm_v47_moe", &loadMinicpmV47MoeTarget,
                       &kMiniCpmV47Hooks});
-  registerModelFamily({"MiniCPM-V-4.7-35B-A3B", "qwen3_5_moe_text", "",
-                       &minicpmV47Descriptor, &minicpmV47DraftLayout,
-                       nullptr});
+  registerModelFamily({.name = "MiniCPM-V-4.7-35B-A3B",
+                       .modelType = "qwen3_5_moe_text", .legacyType = "",
+                       .makeDescriptor = &minicpmV47Descriptor,
+                       .draftLayout = &minicpmV47DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText});
   return true;
 }();
 

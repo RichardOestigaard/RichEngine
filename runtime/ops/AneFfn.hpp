@@ -4,7 +4,7 @@
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
-#include "ops/AneFfnCalibration.hpp"
+#include "ops/FfnSplit.hpp"
 #include "ops/Linear.hpp"
 
 #include <array>
@@ -35,12 +35,12 @@ class Measurement;
 // the caller runs the chunk again on the GPU alone, which every later chunk
 // runs too. A split that loses to the GPU alone stops the same way, after a
 // command whose results are usable (setBreaker).
-class AneFfn final {
+class AneFfn final : public FfnSplit {
 public:
   // A chunk runs on the smallest of the program's functions that holds it,
   // one every kProgramStep rows from kMinimumRows to the prefill budget,
   // since an evaluation costs the ANE its function's rows.
-  static constexpr uint32_t kMinimumRows = 512, kProgramStep = 128, kMaximumRows = RICHENGINE_PREFILL_TOKEN_BUDGET;
+  static constexpr uint32_t kProgramStep = 128;
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
 
@@ -63,29 +63,22 @@ public:
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
 
   // The fraction of intermediate channels the ANE takes.
-  [[nodiscard]] double share() const noexcept;
+  [[nodiscard]] double share() const override;
   // What Metal allocated for the split, which plannedBytes() bounds.
-  [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
+  [[nodiscard]] uint64_t allocatedBytes() const override { return allocatedBytes_; }
   // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
   // kMinimumRows to kMaximumRows.
-  [[nodiscard]] uint32_t minimumRows() const noexcept { return minimumRows_; }
-  void setMinimumRows(uint32_t rows);
+  [[nodiscard]] uint32_t minimumRows() const override { return minimumRows_; }
+  void setMinimumRows(uint32_t rows) override;
   // Stops the split once it loses to the GPU alone: `breaker` judges each
   // command finish() finds split, and `lost` runs once when it trips. Until
   // this is called, none does.
-  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost) noexcept {
+  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost) override {
     breaker_ = std::move(breaker);
     lost_ = std::move(lost);
   }
 
-  // The commands finish() found split since the split was built, their
-  // evaluations, and the Neural Engine's milliseconds over them
-  // (ane::Handoff::finish).
-  struct Served final {
-    uint64_t commands = 0, evaluations = 0;
-    double milliseconds = 0.0;
-  };
-  [[nodiscard]] const Served &served() const noexcept { return served_; }
+  [[nodiscard]] const Served &served() const override { return served_; }
 
   // Checks the split against the GPU alone on `layers`, those it was built
   // from, with chunks in `ffn` and the residual and output of alternate
@@ -100,31 +93,32 @@ public:
   // that error exceeds its bound or the ANE's work fails, which stops the
   // split.
   [[nodiscard]] double verify(std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
-                              const std::array<metal::MetalBuffer, 2> &hidden);
+                              const std::array<metal::MetalBuffer, 2> &hidden) override;
 
   // Whether the split takes a chunk of `rows` rows: from minimumRows() to
   // kMaximumRows, until it stops.
-  [[nodiscard]] bool splits(uint32_t rows) const;
+  [[nodiscard]] bool splits(uint32_t rows) const override;
   // Whether the split stopped, and why.
-  [[nodiscard]] bool retired() const { return handoff_.retired(); }
-  [[nodiscard]] std::string reason() const { return handoff_.reason(); }
+  [[nodiscard]] bool retired() const override { return handoff_.retired(); }
+  [[nodiscard]] std::string reason() const override { return handoff_.reason(); }
 
   // Starts encoding a command; false once the split stopped.
-  bool begin();
+  bool begin() override;
   // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
   // kMaximumRows, encoded in layer order from layer 0 after begin(): output =
   // residual + FFN of ffn.normalized, whose Q4 sums the norm wrote.
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
-           metal::MetalBuffer output, uint32_t rows);
+           metal::MetalBuffer output, uint32_t rows) override;
   // Starts the ANE's evaluations of the command encoded since begin(), then
   // submits it (MetalBackend::submitCommandAsync). A submission that throws
   // stops the split before the exception goes on.
-  [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph, metal::CommandCompletion completion);
+  [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph,
+                                            metal::CommandCompletion completion) override;
   // After the command committed last has completed: whether its outputs hold
   // the split's FFN. False when its ANE work failed, which stops the split
   // and logs why, once; true otherwise, also when the breaker stops the
   // split after it.
-  [[nodiscard]] bool finish();
+  [[nodiscard]] bool finish() override;
 
   // The engine's idle release (engine::ReleasableMemory). Between commands:
   // unloads the program, whose memory the ANE service gives back, and keeps
@@ -136,11 +130,11 @@ public:
   // it once they have all reported, and keeps it unloaded. A program that does
   // not unload stops the split. Throws std::logic_error while a command it
   // encoded is not committed or not finished.
-  [[nodiscard]] bool release();
+  [[nodiscard]] bool release() override;
   // Loads the program release() unloaded again, unless the split stopped;
   // nothing otherwise. Never throws: a program that does not load stops the
   // split, and the GPU runs every later chunk alone.
-  void restore() noexcept;
+  void restore() noexcept override;
 
 private:
   // Times the split's layers and their GPU part against the GPU's alone.

@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace richengine::ops {
-class AneFfn;
+class FfnSplit;
 } // namespace richengine::ops
 
 namespace richengine::model {
@@ -91,7 +91,7 @@ struct RuntimeContext final {
   CompositeStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
-  ops::AneFfn *aneFfn = nullptr;
+  ops::FfnSplit *aneFfn = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft

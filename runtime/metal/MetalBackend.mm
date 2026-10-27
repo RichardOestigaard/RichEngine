@@ -121,6 +121,14 @@ uint64_t MetalBuffer::gpuAddress() const noexcept {
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }
 
+void *MetalBuffer::nativeHandle() const noexcept {
+    return impl_ ? (__bridge void *)impl_->allocation->buffer : nullptr;
+}
+
+uint64_t MetalBuffer::offsetBytes() const noexcept {
+    return impl_ ? impl_->offsetBytes : 0;
+}
+
 CommandTicket::CommandTicket() = default;
 
 CommandTicket::CommandTicket(std::shared_ptr<State> state)
@@ -277,6 +285,10 @@ void MetalBackend::stop() noexcept {
 
 const DeviceCapabilities &MetalBackend::capabilities() const noexcept {
     return impl_->capabilities;
+}
+
+void *MetalBackend::nativeDevice() const noexcept {
+    return (__bridge void *)impl_->device;
 }
 
 DeviceCapabilities probeDeviceCapabilities() {

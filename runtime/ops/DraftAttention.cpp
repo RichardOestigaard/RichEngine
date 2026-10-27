@@ -272,7 +272,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
 void DraftAttention::addDecode(
     metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
     std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan,
-    bool causal) {
+    bool causal, const metal::MetalBuffer &devicePack) {
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
@@ -292,15 +292,20 @@ void DraftAttention::addDecode(
   const uint32_t window =
       std::max(1u, std::min(shape.slidingWindow, kWindow));
   DraftAttentionBatchParams params{kWindow, window, lanes,
-                                   causal ? 1u : 0u, plan.rows(), {}};
+                                   causal ? 1u : 0u, plan.rows(), {},
+                                   devicePack ? 1u : 0u};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};
-  bindings.reserve(2 * kMaximumLanes + 3);
+  bindings.reserve(2 * kMaximumLanes + 4);
   appendLaneBindings(bindings, buffers.persistentKeys,
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
+  // The split kernels declare the step-pack binding unconditionally; the
+  // flag keeps host-known lengths authoritative unless a chained predraft
+  // bound its pack.
+  bindings.push_back(devicePack ? devicePack : buffers.queryKeys);
   // cache_length changes every step: the payloads are patchable, so an
   // enclosing baked span replays the pair with the lengths rewritten into
   // its parameter arena.

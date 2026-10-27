@@ -197,6 +197,30 @@ struct TargetLayout final {
   // The DiffusionGemma trunk's denoising schedule; inert on every other
   // target.
   DiffusionSchedule diffusion{};
+  // The qwen4exp arch's additions, all zero on every other target
+  // (upstream's QwenTargetDimensions): hyperConnections residual streams of
+  // hiddenSize values and the mixes' low rank; the QSA block indexer every
+  // full-attention layer carries, of indexerHeads heads of
+  // indexerHeadDimension values scoring blocks of indexerBlockTokens tokens
+  // (indexerTopBlocks kept per row); and the PLE n-gram embedding feeding
+  // layer pleLayer — 2- to pleNgram-gram hashes, pleHeadsPerNgram heads per
+  // n-gram of pleHeadDimension table values each, gated through a
+  // dilated convolution of pleConvolutionTaps taps pleNgram rows apart.
+  uint32_t hyperConnections = 0;
+  uint32_t hyperRank = 0;
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t indexerTopBlocks = 0;
+  uint32_t indexerBlockTokens = 0;
+  uint32_t pleLayer = 0;
+  uint32_t pleNgram = 0;
+  uint32_t pleHeadsPerNgram = 0;
+  uint32_t pleHeadDimension = 0;
+  uint32_t pleConvolutionTaps = 0;
+  // The PLE hash's end-of-sequence token (an n-gram cuts there) and the
+  // token it reads at an image's prompt positions (<|image_pad|>).
+  uint32_t pleEosToken = 0;
+  uint32_t pleImageToken = 0;
 
   // The full-attention layer set: the LFM2 mask where set, else every
   // fullAttentionPeriod-th layer on the hybrids, else Gemma's globals,
@@ -241,33 +265,77 @@ struct TargetLayout final {
   // kernels bind an explicit scoreScale of 1; Granite's attentionScale
   // replaces the implicit 1/sqrt(d) on the others that declare one.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {globalLayerPeriod ? layers : attentionLayerCount(),
-            attentionKvHeads,
-            attentionHeadDimension,
-            kv::Format::Int8,
-            globalLayerPeriod ? 1.0F : attentionScale,
-            altKvHeads,
-            altHeadDimension,
-            globalLayerMask(),
-            0,
-            attentionCore,
-            altAttentionCore};
+    kv::Layout result{globalLayerPeriod ? layers : attentionLayerCount(),
+                      attentionKvHeads,
+                      attentionHeadDimension,
+                      kv::Format::Int8,
+                      globalLayerPeriod ? 1.0F : attentionScale,
+                      altKvHeads,
+                      altHeadDimension,
+                      globalLayerMask(),
+                      0,
+                      attentionCore,
+                      altAttentionCore};
+    // A QSA target's pages carry the block index plane (one pooled key of
+    // indexerHeadDimension bf16 values per indexer block) and token-major
+    // values, which its sparse gathers read contiguously.
+    result.indexDimension = indexerHeads ? indexerHeadDimension : 0;
+    result.valuesTokenMajor = indexerHeads != 0;
+    return result;
   }
   [[nodiscard]] constexpr kv::Layout kvLayout(kv::Format format) const noexcept {
     kv::Layout layout = kvLayout();
     layout.format = format;
     return layout;
   }
+  // The qwen4exp helpers: the residual's streams' values per row, the PLE
+  // table's heads and their gathered width, and the per-state-cell
+  // auxiliary bytes the PLE history and the QSA pending keys take
+  // (GdnStateLayout::auxiliaryBytes).
+  [[nodiscard]] constexpr bool hyperConnected() const noexcept {
+    return hyperConnections != 0;
+  }
+  [[nodiscard]] constexpr uint32_t streamWidth() const noexcept {
+    return hyperConnections * hiddenSize;
+  }
+  [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
+    return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
+  }
+  [[nodiscard]] constexpr uint32_t pleWidth() const noexcept {
+    return pleHeads() * pleHeadDimension;
+  }
+  // The PLE convolution's history rows: (taps - 1) dilated by the n-gram.
+  [[nodiscard]] constexpr uint32_t pleHistory() const noexcept {
+    return pleConvolutionTaps ? (pleConvolutionTaps - 1) * pleNgram : 0;
+  }
+  [[nodiscard]] constexpr uint64_t pleHistoryBytes() const noexcept {
+    return uint64_t{pleHistory()} * streamWidth() *
+           GdnStateLayout::bfloat16Bytes;
+  }
+  // The QSA indexer's pending keys per state cell: per attention layer the
+  // raw keys (bf16) of the open block's tokens but its last.
+  [[nodiscard]] constexpr uint64_t indexerPendingBytes() const noexcept {
+    return indexerBlockTokens
+               ? uint64_t{attentionLayerCount()} * (indexerBlockTokens - 1) *
+                     indexerHeadDimension * GdnStateLayout::bfloat16Bytes
+               : 0;
+  }
   // The recurrent slots: the GDN hybrids keep the taps-1 convolution FIFO
   // and the value-head matrix; the LFM2 convolutions keep the FIFO alone; a
-  // convolution-free target has no state at all.
+  // convolution-free target has no state at all. qwen4exp's cells carry the
+  // PLE history and QSA pending keys after them.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     if (!convolutionTaps) return {};
     const uint32_t stateLayers = layers - attentionLayerCount();
-    if (gdnHeadDimension)
-      return {stateLayers, convolutionTaps - 1, convolutionDimension,
-              gdnValueHeads, gdnHeadDimension, gdnHeadDimension};
-    return {stateLayers, convolutionTaps - 1, convolutionDimension, 0, 0, 0};
+    GdnStateLayout state =
+        gdnHeadDimension
+            ? GdnStateLayout{stateLayers, convolutionTaps - 1,
+                             convolutionDimension, gdnValueHeads,
+                             gdnHeadDimension, gdnHeadDimension}
+            : GdnStateLayout{stateLayers, convolutionTaps - 1,
+                             convolutionDimension, 0, 0, 0};
+    state.auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes();
+    return state;
   }
   [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,           packedGdnWidth,        packedFullWidth,

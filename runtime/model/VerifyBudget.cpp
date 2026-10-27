@@ -184,7 +184,7 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
     }
   }
   if (++cycles_ % kRefitCycles == 0 && !labels_.empty())
-    acceptance_ = fit(labels(), acceptance_);
+    acceptance_ = fit(labels(), acceptance_, prior_);
 }
 
 std::vector<VerifyBudget::Label> VerifyBudget::labels() const {
@@ -194,10 +194,15 @@ std::vector<VerifyBudget::Label> VerifyBudget::labels() const {
 }
 
 VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const Acceptance &start) {
+  return fit(labels, start, kPrior);
+}
+
+VerifyBudget::Acceptance VerifyBudget::fit(std::span<const Label> labels, const Acceptance &start,
+                                           const Acceptance &priorAcceptance) {
   for (const Label &label : labels)
     if (label.position >= kPositions || !std::isfinite(label.feature))
       throw std::invalid_argument("invalid verify budget label");
-  const Parameters prior = parametersOf(kPrior);
+  const Parameters prior = parametersOf(priorAcceptance);
   Parameters theta = parametersOf(start);
   double current = objective(labels, theta, prior);
   for (uint32_t iteration = 0; iteration < kIterations; ++iteration) {

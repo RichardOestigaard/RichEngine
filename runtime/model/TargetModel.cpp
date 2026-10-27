@@ -1,5 +1,7 @@
 #include "model/TargetModel.hpp"
 #include "model/TargetModelGemmaHelpers.hpp"
+#include "model/TargetLayerEncoder.hpp"
+#include "model/ModelRegistry.hpp"
 #include "Tuning.hpp"
 #include "model/ModelPolicy.hpp"
 
@@ -63,6 +65,7 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.attentionQkNorm = layout.attentionQkNorm;
   result.moeSharedExpert = layout.moeSharedExpert;
   result.gdnCore = layout.gdnCore;
+  result.pleNgram = layout.pleNgram;
   result.captureLayerCount = layout.captureLayerCount;
   std::copy_n(layout.hiddenCaptureLayers.begin(), layout.captureLayerCount,
               result.captureLayerValues.begin());
@@ -124,13 +127,77 @@ void requireWeights(const TargetModelWeights &weights,
 
 } // namespace
 
+// The default layer encoder: today's mixer visit plus the FFN dispatch —
+// the layer body of every arch whose registration leaves makeEncoder null.
+// At namespace scope, not the anonymous one, because TargetModel's friend
+// declaration names it.
+class StandardLayerEncoder final : public TargetLayerEncoder {
+public:
+  explicit StandardLayerEncoder(const TargetModel &model) : model_(model) {}
+
+  metal::MetalBuffer addPrefillLayer(TargetModel::PrefillStep &step,
+                                     uint32_t index, metal::MetalBuffer input,
+                                     metal::MetalBuffer output) const override {
+    const TargetLayerWeights &layer = model_.weights_->layers[index];
+    const metal::MetalBuffer residual = std::visit(
+        [&](const auto &mixer) {
+          return model_.addPrefillMixer(step, mixer, layer.inputNorm, input);
+        },
+        layer.mixer);
+    model_.addPrefillFfn(step, index, layer, residual, output);
+    return output;
+  }
+
+  void addVerifyLayer(TargetModel::VerifyStep &step, uint32_t index,
+                      metal::MetalBuffer input,
+                      metal::MetalBuffer output) const override {
+    const TargetLayerWeights &layer = model_.weights_->layers[index];
+    const metal::MetalBuffer residual = std::visit(
+        [&](const auto &mixer) {
+          return model_.addVerifyMixer(step, mixer, layer.inputNorm, input);
+        },
+        layer.mixer);
+    model_.addVerifyFfn(step, layer, residual, output);
+  }
+
+private:
+  const TargetModel &model_;
+};
+
+namespace {
+
+// The arch registration's encoder factory; unregistered or unset takes the
+// standard encoder.
+std::unique_ptr<TargetLayerEncoder> (*encoderFactoryFor(
+    const TargetLayout &layout))(const TargetModel &) {
+  const TargetArchRegistration *registration = findTargetArch(layout.arch);
+  return registration ? registration->makeEncoder : nullptr;
+}
+
+} // namespace
+
 TargetModel::TargetModel(const TargetModelWeights &weights,
                        const TargetModelGeometry &geometry,
                        metal::MetalBackend &backend,
                        const ops::ExecutionPlans &operators)
     : weights_(&weights), weightsBase_(weights), geometry_(geometry),
-      backend_(backend), operators_(operators) {
+      backend_(backend), operators_(operators),
+      encoderFactory_(encoderFactoryFor(weights.layout)) {
   requireWeights(weights, geometry_);
+  if (encoderFactory_) encoder_ = encoderFactory_(*this);
+  if (!encoder_) encoder_ = std::make_unique<StandardLayerEncoder>(*this);
+}
+
+TargetModel::~TargetModel() = default;
+
+TargetModel::TargetModel(TargetModel &&other)
+    : weights_(other.weights_), weightsBase_(other.weightsBase_),
+      geometry_(std::move(other.geometry_)), backend_(other.backend_),
+      operators_(other.operators_), encoderFactory_(other.encoderFactory_) {
+  // The encoder references the model it was built against — rebuild it for
+  // the moved-to object instead of moving the pointer.
+  if (encoderFactory_) encoder_ = encoderFactory_(*this);
+  if (!encoder_) encoder_ = std::make_unique<StandardLayerEncoder>(*this);
 }
 
 namespace {
@@ -288,7 +355,7 @@ void addCapture(metal::CommandGraph &graph, const TargetModelGeometry &geometry,
 metal::MetalBuffer TargetModel::addPrefill(
     metal::CommandGraph &graph, TargetModelPrefillBuffers buffers,
     std::span<const TargetModelPrefillSequence> sequences, uint32_t rows,
-    std::span<const RichKvLayer> kvLayers, ops::AneFfn *aneFfn,
+    std::span<const RichKvLayer> kvLayers, ops::FfnSplit *aneFfn,
     std::span<const float> layerScalars) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
@@ -306,12 +373,15 @@ metal::MetalBuffer TargetModel::addPrefill(
     }
   }
   PrefillStep step{graph, buffers, sequences, rows, kvLayers};
-  step.layerScalars = layerScalars;
+  // The pass inputs routed to the active layer encoder (the DiffusionGemma
+  // encoder's per-layer scalars); its beginPrefill replaces the seed with
+  // its own state record.
+  step.extension = TargetPrefillInputs{layerScalars};
   // A canvas pass is homogeneous: either every sequence spans canvas rows or
   // none does (the commit pass encodes separately).
-  step.canvas = sequences.front().canvas;
+  const bool canvas = sequences.front().canvas;
   for (const TargetModelPrefillSequence &sequence : sequences)
-    if (sequence.canvas != step.canvas)
+    if (sequence.canvas != canvas)
       throw std::invalid_argument("mixed canvas and causal prefill sequences");
   for (const TargetModelPrefillSequence &sequence : sequences) {
     step.attention.push_back(
@@ -322,39 +392,23 @@ metal::MetalBuffer TargetModel::addPrefill(
             : operators_.prefillAttention(
                   sequence.rows, geometry_.attentionQueryHeads,
                   geometry_.layerKvLayout(false)));
-    if (geometry_.altAttentionMask)
-      step.altAttention.push_back(
-          sequence.canvas
-              ? ops::PagedAttention::prefillCanvasPlan(
-                    sequence.rows, geometry_.attentionQueryHeads,
-                    geometry_.layerKvLayout(true))
-              : operators_.prefillAttention(
-                    sequence.rows, geometry_.attentionQueryHeads,
-                    geometry_.layerKvLayout(true)));
   }
+  encoder_->beginPrefill(step);
   if (geometry_.ffnKind == FfnKind::SparseMoe)
-    step.moe = step.canvas ? operators_.moeCanvas(geometry_.moeShape(), rows)
-                           : operators_.moePrefill(geometry_.moeShape(), rows);
+    step.moe = canvas ? operators_.moeCanvas(geometry_.moeShape(), rows)
+                      : operators_.moePrefill(geometry_.moeShape(), rows);
   if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
-    const TargetLayerWeights &layer = weights_->layers[index];
     const metal::MetalBuffer input = buffers.hidden[index & 1];
     const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-    if (std::holds_alternative<Gemma4FfnWeights>(layer.ffn)) {
-      // The Gemma layer keeps the post-attention residual inside its own
-      // encode: its router reads it, so the mixer cannot return a fused
-      // residual.
-      addPrefillGemmaLayer(step, layer, index, input, output);
-    } else {
-      const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-      addPrefillFfn(step, index, layer, residual, output);
-    }
-    if (const auto slot = geometry_.captureSlot(index))
+    const metal::MetalBuffer layerOutput =
+        encoder_->addPrefillLayer(step, index, input, output);
+    if (const auto slot = geometry_.captureSlot(index);
+        slot && !encoder_->capturesHidden())
       for (const TargetModelPrefillSequence &sequence : sequences)
         for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
           const TargetModelPrefillCapture &c = sequence.captures[capture];
-          addCapture(graph, geometry_, *slot, output, c.sourceStart, buffers.captured, c.destinationStart,
+          addCapture(graph, geometry_, *slot, layerOutput, c.sourceStart, buffers.captured, c.destinationStart,
                      c.rows);
         }
   }
@@ -454,7 +508,8 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
 
 // The layer's FFN: the dense triple (on `step.aneFfn` when the split takes
 // it), the routed MoE block, LFM2-MoE's per-layer dense/MoE mix. Gemma's
-// FFN never reaches here — its whole layer encodes in addPrefillGemmaLayer.
+// FFN never reaches here — its whole layer encodes in the Gemma layer
+// encoder.
 void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const TargetLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const TargetModelPrefillBuffers &b = step.buffers;
@@ -537,37 +592,22 @@ void TargetModel::addVerify(
   VerifyStep step{graph, buffers, kvLayers, chunks, lanes, rows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.layerKvLayout(false),
                                              std::span(histories).first(lanes), tree, liveNodes, rowCapacity)};
-  if (geometry_.altAttentionMask)
-    step.altAttention.emplace(operators_.verifyAttention(
-        lanes, geometry_.attentionQueryHeads, geometry_.layerKvLayout(true),
-        std::span(histories).first(lanes), tree, liveNodes, rowCapacity));
   step.planLanes = planLanes;
   step.tapeLanes = tapeLanes;
   step.rowCapacity = rowCapacity;
   step.tree = tree;
   step.liveRows = liveRows;
+  step.liveNodes = liveNodes;
   if (geometry_.ffnKind == FfnKind::SparseMoe)
     step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes,
                                     rowCapacity);
+  encoder_->beginVerify(step);
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
-    const TargetLayerWeights &layer = weights_->layers[index];
     const metal::MetalBuffer input = buffers.hidden[index & 1];
     const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-    if (std::holds_alternative<Gemma4FfnWeights>(layer.ffn)) {
-      addVerifyGemmaLayer(step, layer, index, input, output);
-      if (const auto slot = geometry_.captureSlot(index)) {
-        graph.beginBakedSpan();
-        addCapture(graph, geometry_, *slot, output, 0,
-                   tree ? buffers.capturedPath : buffers.capturedTargetHidden,
-                   0, rows);
-        graph.endBakedSpan();
-      }
-      continue;
-    }
-    const metal::MetalBuffer residual = std::visit(
-        [&](const auto &mixer) { return addVerifyMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-    addVerifyFfn(step, layer, residual, output);
-    if (const auto slot = geometry_.captureSlot(index)) {
+    encoder_->addVerifyLayer(step, index, input, output);
+    if (const auto slot = geometry_.captureSlot(index);
+        slot && !encoder_->capturesHidden()) {
       // The row copy's buffers and geometry are static per batch width. A
       // tree batch captures the DFS rows into its staging; the path gather
       // that produces the committed rows runs after acceptance.
@@ -684,7 +724,7 @@ void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &no
 // The same layer FFN in a verify step: the dense triple through
 // addVerifyDenseFfn, the routed MoE block replayed from a baked span (MoE::add
 // nests its own), LFM2-MoE's mix between them. Gemma's FFN never reaches
-// here — its whole layer encodes in addVerifyGemmaLayer.
+// here — its whole layer encodes in the Gemma layer encoder.
 void TargetModel::addVerifyFfn(VerifyStep &step, const TargetLayerWeights &layer, metal::MetalBuffer residual,
                               metal::MetalBuffer output) const {
   const TargetModelVerifyBuffers &b = step.buffers;
@@ -863,11 +903,16 @@ void TargetModel::addVerifyInput(metal::CommandGraph &graph,
                                 metal::MetalBuffer verifyInput,
                                 uint32_t lanes, uint32_t verifyStride,
                                 uint32_t draftStride,
-                                std::span<const uint32_t> liveRows) const {
+                                std::span<const uint32_t> liveRows,
+                                metal::MetalBuffer plePriorTokens) const {
+  const metal::MetalBuffer tokens = verifyInput;
   ops::Embedding::addVerifyInput(graph, std::move(draftInput),
                                  std::move(proposals), std::move(verifyInput),
                                  geometry_.vocabularySize, lanes, verifyStride,
                                  draftStride, liveRows);
+  // The arch encoder's input hook (qwen4exp's GPU PLE hash of the rows).
+  encoder_->onVerifyInput(graph, std::move(tokens),
+                          std::move(plePriorTokens), lanes, verifyStride);
 }
 
 void TargetModel::addVerifyTreeInput(metal::CommandGraph &graph,

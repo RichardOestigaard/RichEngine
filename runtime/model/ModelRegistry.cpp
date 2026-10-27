@@ -29,7 +29,8 @@ bool registerTargetArch(TargetArchRegistration registration) {
   for (const TargetArchRegistration &existing : targetArchs())
     if (existing.arch == registration.arch) {
       if (existing.loadTarget == registration.loadTarget &&
-          existing.affineHooks == registration.affineHooks)
+          existing.affineHooks == registration.affineHooks &&
+          existing.makeEncoder == registration.makeEncoder)
         return true;
       throw std::invalid_argument("duplicate target arch " +
                                   std::string(registration.arch));

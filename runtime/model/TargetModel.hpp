@@ -11,11 +11,13 @@
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
+#include "metal/abi/BlockIndexer.h"
 #include "metal/abi/Sampling.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -23,10 +25,12 @@
 #include <vector>
 
 namespace richengine::ops {
-class AneFfn;
+class FfnSplit;
 } // namespace richengine::ops
 
 namespace richengine::model {
+
+class TargetLayerEncoder;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -228,6 +232,9 @@ struct TargetModelGeometry final {
   // disables.
   float embeddingScale = 0.0F;
   float logitSoftcap = 0.0F;
+  // qwen4exp's PLE n-gram length (0 elsewhere): the runtime sizes each
+  // lane's prior-token span by it.
+  uint32_t pleNgram = 0;
   // Distinct operator requirements, collected from the loaded weights.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
@@ -393,6 +400,25 @@ struct TargetModelPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<TargetModelPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // The sequence's auxiliary state cell region (the tail of its GDN cell
+  // past the convolution and recurrent bytes, GdnStateLayout::auxiliaryBytes):
+  // the views into the cells its rows read and write. Only targets whose
+  // layout reserves auxiliary bytes bind them — qwen4exp's PLE convolution
+  // history (first pleHistoryBytes) and QSA pending keys; empty elsewhere.
+  metal::MetalBuffer auxiliaryIn;
+  metal::MetalBuffer auxiliaryOut;
+  // Its pages' block index, for a layout with one (ops::BlockIndex::tables):
+  // qwen4exp's QSA. Written beside the page table (synchronizedPageTable).
+  metal::MetalBuffer indexTable;
+  // The QSA block records the sequence's rows complete (one per block whose
+  // last token is a row of the sequence), computed host-side where the RoPE
+  // positions live. Empty on targets without a block index.
+  std::span<const BlockIndexerBlock> qsaBlocks{};
+  // The row ids the sequence's layer encoder gathers — qwen4exp's PLE table
+  // rows: pleHeads() ids per row, computed on the CPU by qwen4ExpPleRows
+  // during the packed prefill's input preparation. Empty on targets without
+  // a host-computed row table.
+  std::span<const uint32_t> pleRowIds{};
   // A canvas (DiffusionGemma decoder) sequence: its chunk's committed_tokens
   // is the read-only prefix length, its rows the canvas positions, and its
   // page table the prefix pages followed by the canvas scratch pages. The
@@ -491,6 +517,14 @@ struct TargetModelVerifyBuffers final {
       nextGdnStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
+  // Each lane's pages' block index, for a layout with one (qwen4exp's QSA;
+  // ops::BlockIndex::tables). Empty elsewhere.
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
+      indexTables{};
+  // Each lane's QSA block records (lane-major, laneRecords per lane), the
+  // blocks its verify rows complete; the layer encoder copies them into its
+  // own scratch in beginVerify. Empty without a block index.
+  std::span<const BlockIndexerBlock> qsaBlocks{};
   // Fused greedy head (Ornith-9B vocabulary shape): when fusedHead is set and
   // every lane is greedy and unconstrained, the head writes per-tile argmax
   // partials into these instead of materializing logits.
@@ -531,8 +565,20 @@ targetModelGeometry(const TargetModelWeights &weights);
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class TargetModel final {
 public:
+  // The pass step records the layer encoders walk; their fields are shared
+  // internals, defined only in TargetModelGemmaHelpers.hpp.
+  struct PrefillStep;
+  struct VerifyStep;
+
   TargetModel(const TargetModelWeights &weights, const TargetModelGeometry &geometry,
              metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
+  ~TargetModel();
+  // The encoder references this object; a copy would bind it to the wrong
+  // model, so copies are out and the move rebuilds the encoder instead of
+  // moving the pointer.
+  TargetModel(const TargetModel &) = delete;
+  TargetModel &operator=(const TargetModel &) = delete;
+  TargetModel(TargetModel &&);
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
@@ -544,7 +590,7 @@ public:
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
   // Returns the hidden buffer that holds the last layer's output rows. The
-  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
+  // dense FFN of a chunk the split takes (FfnSplit::splits) runs split with the
   // Neural Engine on `aneFfn`, when given.
   // layerScalars, when nonempty, replaces each layer's packed layer_scalar —
   // the DiffusionGemma encoder pass runs the trunk with the separately
@@ -553,7 +599,7 @@ public:
   [[nodiscard]] metal::MetalBuffer addPrefill(
       metal::CommandGraph &graph, TargetModelPrefillBuffers buffers,
       std::span<const TargetModelPrefillSequence> sequences, uint32_t rows,
-      std::span<const RichKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr,
+      std::span<const RichKvLayer> kvLayers, ops::FfnSplit *aneFfn = nullptr,
       std::span<const float> layerScalars = {}) const;
   // liveRows, when nonempty, gives each chain lane's live verify row count
   // for the GDN scan (adaptive proposal budgets); ignored for tree batches.
@@ -601,13 +647,17 @@ public:
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals. liveRows[lane]
   // bounds the live rows (anchor included); rows past it repeat the anchor,
-  // keeping dead rows' expert routes on the anchor's paths.
+  // keeping dead rows' expert routes on the anchor's paths. plePriorTokens
+  // holds, for a target whose verify rows hash their context (qwen4exp's
+  // PLE), the tokens before each lane's first row — pleNgram - 1 per lane,
+  // nearest first — that the layer encoder's onVerifyInput hook hashes with.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
                       metal::MetalBuffer verifyInput, uint32_t lanes,
                       uint32_t verifyStride = ExecutionLimits::targetVerifyRows,
                       uint32_t draftStride = ExecutionLimits::draftQueryRows,
-                      std::span<const uint32_t> liveRows = {}) const;
+                      std::span<const uint32_t> liveRows = {},
+                      metal::MetalBuffer plePriorTokens = {}) const;
   // A tree batch's verify inputs: each lane's RICHENGINE_TREE_VERIFY_NODES nodes
   // supply the input tokens, rope positions and ancestor masks. `base` is
   // each lane's (t, h, w) rotary position at its committed length.
@@ -632,9 +682,6 @@ public:
                           uint32_t lanes) const;
 
 private:
-  struct PrefillStep;
-  struct VerifyStep;
-
   // A layer's parts in dispatch order: the mixer normalizes its input and
   // returns the residual rows the FFN normalizes and adds to into `output`.
   void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm,
@@ -662,16 +709,6 @@ private:
                          metal::MetalBuffer output) const;
   void addVerifyFfn(VerifyStep &step, const TargetLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const;
-  // Gemma 4's whole layer: the dual-geometry attention mixer, the post-
-  // attention residual both the router and the FFN-normed experts read, and
-  // the routed plus shared-expert GeGLU block whose normed outputs join the
-  // residual before layer_scalar.
-  void addPrefillGemmaLayer(PrefillStep &step, const TargetLayerWeights &layer,
-                            uint32_t index, metal::MetalBuffer input,
-                            metal::MetalBuffer output) const;
-  void addVerifyGemmaLayer(VerifyStep &step, const TargetLayerWeights &layer,
-                           uint32_t index, metal::MetalBuffer input,
-                           metal::MetalBuffer output) const;
   // The elementwise helpers Gemma's layer epilogue shares with the draft
   // kernels: a flat bf16 residual add and the in-place scalar multiply.
   static void addResidualAdd(metal::CommandGraph &graph, metal::MetalBuffer input,
@@ -680,11 +717,23 @@ private:
   static void addLayerScalar(metal::CommandGraph &graph, metal::MetalBuffer values,
                              float scale, uint32_t count);
 
+  // The arch seam's encoders (TargetLayerEncoder.hpp) call the layer
+  // helpers and reach the weights, geometry, backend and plans through the
+  // model.
+  friend class StandardLayerEncoder;
+  friend class GemmaLayerEncoder;
+  friend class Qwen4LayerEncoder;
+
   const TargetModelWeights *weights_;
   const TargetModelWeightsBase &weightsBase_;
   TargetModelGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
+  // The arch's layer encoder — the standard one where the registration
+  // leaves makeEncoder null. The factory is kept so a move rebuilds the
+  // encoder against the moved-to object.
+  std::unique_ptr<TargetLayerEncoder> encoder_;
+  std::unique_ptr<TargetLayerEncoder> (*encoderFactory_)(const TargetModel &);
 };
 
 } // namespace richengine::model

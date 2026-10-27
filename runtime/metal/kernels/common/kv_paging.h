@@ -25,13 +25,19 @@ inline ulong richengine_kv_key_index(uint page, uint head, uint token,
          richengine_kv_key_element_dim(head, token, dimension, HeadDim);
 }
 
-template <uint KVHeads, uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+// A layout may keep its values token-major like its keys
+// (kv::Layout::valuesTokenMajor): a block of a head's tokens then holds its
+// values contiguously, which a sparse attention's block gather needs.
+template <uint KVHeads, uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          bool ValuesTokenMajor = false>
 inline ulong richengine_kv_value_index(uint page, uint head, uint token,
                                      uint dimension) {
   constexpr ulong ElementsPerPage =
       ulong(KVHeads) * RichKvPageTokens * HeadDim;
   return ulong(page) * ElementsPerPage +
-         richengine_kv_value_element_dim(head, token, dimension, HeadDim);
+         (ValuesTokenMajor
+              ? richengine_kv_key_element_dim(head, token, dimension, HeadDim)
+              : richengine_kv_value_element_dim(head, token, dimension, HeadDim));
 }
 
 template <uint KVHeads>

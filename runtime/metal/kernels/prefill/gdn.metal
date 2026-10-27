@@ -314,7 +314,7 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192, 12544)
     threadgroup float reductions[4];                                          \
     gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(      \
         recurrent, packed, norm_weight, hidden, task,                         \
-        params.tiled_heads != 0, reductions, thread_index, lane, simd_group); \
+        params.flags, reductions, thread_index, lane, simd_group);            \
   }
 
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, 16640, bfloat)
@@ -344,10 +344,10 @@ GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
       uint lane [[thread_index_in_simdgroup]],                               \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
     threadgroup float reductions[4];                                         \
-    const bool tiled = params.tiled_heads != 0;                              \
+    const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;                \
     gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(     \
-        recurrent, packed, norm_weight, hidden, task, tiled, reductions,     \
-        thread_index, lane, simd_group);                                     \
+        recurrent, packed, norm_weight, hidden, task, params.flags,          \
+        reductions, thread_index, lane, simd_group);                         \
     const ulong base =                                                       \
         (ulong(task / ValueHeads) * ValueHeads +                             \
          gdn_output_head<KeyHeads, ValueHeads>(task % ValueHeads, tiled)) *  \

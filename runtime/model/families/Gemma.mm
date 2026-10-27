@@ -1,4 +1,6 @@
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
+#include "model/TargetLayerEncoder.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
 #include "model/DiffusionGemma.hpp"
@@ -66,7 +68,28 @@ ModelDescriptor gemma4Descriptor(std::string name) {
   // The canvas bundle DiffusionGemma runs under; each knob's own
   // RICHENGINE_CANVAS_* variable still wins over the profile.
   descriptor.tuning.canvasProfile = "paper";
+  descriptor.capabilities.maximumStepTokens =
+      descriptor.target.diffusion.canvasLength;
   return descriptor;
+}
+
+// The gemma4 and diffusion_gemma sources' shared config check: the dual
+// attention geometry and MoE sizes, trained context capped.
+void validateGemmaSourceConfig(id textObj,
+                               const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize}, {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads}, {"head_dim", layout.attentionHeadDimension},
+      {"global_num_key_value_heads", layout.altKvHeads},
+      {"global_head_dim", layout.altHeadDimension},
+      {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
+      {"moe_intermediate_size", layout.expertIntermediateSize},
+      {"shared_expert_intermediate_size", layout.sharedIntermediateSize},
+      {"sliding_window", layout.slidingWindowTokens}});
+  requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                "max_position_embeddings");
 }
 
 // The registry's erased-signature entry for the gemma4 target.
@@ -84,16 +107,26 @@ TargetWeights loadDiffusionGemmaTarget(metal::MetalBackend &backend,
 }
 
 const bool kRegisteredGemmaFamilies = [] {
-  registerTargetArch({"gemma4", &loadGemma4Target});
-  registerTargetArch({"diffusion_gemma", &loadDiffusionGemmaTarget});
-  registerModelFamily({"Gemma4-26B-A4B", "gemma4_text", "", &gemma4Descriptor,
-                       nullptr, &gemma4DFlashV1DraftDefaults});
+  registerTargetArch({"gemma4", &loadGemma4Target, nullptr,
+                      &makeGemmaLayerEncoder});
+  registerTargetArch({"diffusion_gemma", &loadDiffusionGemmaTarget, nullptr,
+                      &makeGemmaLayerEncoder});
+  registerModelFamily({.name = "Gemma4-26B-A4B", .modelType = "gemma4_text",
+                       .legacyType = "",
+                       .makeDescriptor = &gemma4Descriptor,
+                       .dflashV1Layout = &gemma4DFlashV1DraftDefaults,
+                       .validateSourceConfig = &validateGemmaSourceConfig,
+                       .acceptsDeclaredDraft = true});
   // DiffusionGemma-26B-A4B is disabled: its denoising trunk ships
   // incoherent output pending the numerics bisect in
   // docs/diffusion_issue.md. Re-add its row and the packed-format branch
   // in inspectModelPackage once the trunk matches the torch reference.
-  // registerModelFamily({"DiffusionGemma-26B-A4B", "diffusion_gemma_text",
-  //                      "", &diffusionGemmaDescriptor, nullptr, nullptr});
+  // registerModelFamily({.name = "DiffusionGemma-26B-A4B",
+  //                      .modelType = "diffusion_gemma_text",
+  //                      .legacyType = "",
+  //                      .makeDescriptor = &diffusionGemmaDescriptor,
+  //                      .validateSourceConfig = &validateGemmaSourceConfig,
+  //                      .takesNoDraft = true});
   return true;
 }();
 

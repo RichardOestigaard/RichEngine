@@ -1,5 +1,6 @@
 #include "model/AffinePlan.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -84,6 +85,42 @@ ModelDescriptor lfm2moe24BDescriptor(std::string name) {
 }
 
 // ---- LFM2.5-24B-A2B ("lfm2_moe_24b") ----
+
+// The lfm2_moe_24b source's config check: the 8B's schedule at the 24B
+// geometry, conv_dim optional (it is the hidden size upstream).
+void validateLfm2Moe24BSourceConfig(id textObj,
+                                    const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"conv_L_cache", layout.convolutionTaps},
+      {"intermediate_size", layout.intermediateSize},
+      {"num_experts", layout.experts}, {"num_experts_per_tok", layout.expertsPerToken},
+      {"moe_intermediate_size", layout.expertIntermediateSize},
+      {"num_dense_layers", layout.denseLayers}});
+  // conv_dim is the hidden size upstream; MLX exports may omit it.
+  if (text[@"conv_dim"])
+    requireGeometryNumbers(text, {{"conv_dim", layout.convolutionDimension}});
+  // Exports disagree on the trained context (131072 vs 128000).
+  requireAtMost(text, @"max_position_embeddings", layout.maximumContextTokens,
+                "max_position_embeddings");
+  // The conv/full_attention layer schedule of layer_types.
+  NSArray *types = requireArray(text, @"layer_types", "target layer_types");
+  requireEqual(types.count, layout.layers, "target layer_types count");
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    id value = types[layer];
+    if (![value isKindOfClass:[NSString class]])
+      throw std::invalid_argument("target layer type must be a string");
+    const std::string expected =
+        layout.isFullAttentionLayer(layer) ? "full_attention" : "conv";
+    const char *actual = static_cast<NSString *>(value).UTF8String;
+    requireEqual(actual ? actual : "", expected,
+                 "target layer " + std::to_string(layer));
+  }
+}
 
 // The LFM2.5-24B-A2B source (MLX layout, "lfm2_moe" model_type): the 8B's
 // validation at the 24B geometry — 40 layers, dense intermediate 11776, 64
@@ -195,9 +232,14 @@ TargetWeights loadLfm2Moe24BTarget(metal::MetalBackend &backend,
 const bool kRegisteredLfm2Moe24BFamilies = [] {
   registerTargetArch({"lfm2_moe_24b", &loadLfm2Moe24BTarget,
                       &kLfm2Moe24BHooks});
-  registerModelFamily({"LFM2.5-24B-A2B", "lfm2_moe", "",
-                       &lfm2moe24BDescriptor, &lfm2moe24BDSparkDraftLayout,
-                       nullptr});
+  registerModelFamily({.name = "LFM2.5-24B-A2B", .modelType = "lfm2_moe",
+                       .legacyType = "",
+                       .makeDescriptor = &lfm2moe24BDescriptor,
+                       .draftLayout = &lfm2moe24BDSparkDraftLayout,
+                       .validateSourceConfig = &validateLfm2Moe24BSourceConfig,
+                       .dsparkArchName = "Lfm2DSparkDraftModel",
+                       .draftNormEpsilon = 1e-5,
+                       .acceptsDeclaredDraft = true});
   return true;
 }();
 

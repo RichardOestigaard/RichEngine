@@ -188,10 +188,15 @@ inline LinearConfig oneGateUpPassDecode(const DevicePolicy &policy, uint32_t n, 
   return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(policy, 2 * n, k, stagedTiers(policy)),
           .spread = true, .oneGateUpPass = true};
 }
-// Whether a segment takes the register tile (quant_register_tensor).
-bool registerTileTakes(const QuantizedSegment &s) { return quant_register_tensor(s.formatId, s.inputSize); }
+// Whether a segment takes the register tile (quant_register_tensor): the
+// float segments ProjectionShape counts as taking it skip the format table.
+bool registerTileTakes(const QuantizedSegment &s) {
+  return s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
+}
 // Whether a segment stores at least four bits per weight (quant_four_bits).
-bool fourBitsPerWeight(const QuantizedSegment &s) { return quant_four_bits(s.formatId); }
+bool fourBitsPerWeight(const QuantizedSegment &s) {
+  return s.isFloat() || quant_four_bits(s.formatId);
+}
 bool everyQuantizedSegment(std::span<const Projection *const> projections, bool (*takes)(const QuantizedSegment &)) {
   for (const Projection *p : projections)
     if (p)
@@ -391,6 +396,12 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
     // Decode steps wider than the staged tile run the register kernels
     // (ggufBaseline): their split count comes from the register tiers,
     // which the baseline does not reach on Apple9.
+    size.include(LinearPlan(w, registerDecode(policy_, n, k)).scratchSize());
+  }
+  if (policy_.family >= 10) {
+    // Apple10 picks the register tile on narrow grids (apple10Registers):
+    // reserve its Table16 operand, which the projections here are not known
+    // to exclude.
     size.include(LinearPlan(w, registerDecode(policy_, n, k)).scratchSize());
   }
   if (policy_.nativeFormats() && w.phase == LinearPhase::Decode && w.weightLayout == WeightLayout::Block32) {

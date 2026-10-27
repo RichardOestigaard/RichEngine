@@ -450,7 +450,7 @@ struct PipelineOptionSpec {
 
 // The escape hatch: baked indirect dispatch is off entirely.
     bool MetalBackend::Impl::icbDisabled() noexcept {
-        return tuning().icbOff;
+        return model::modelPolicy().icbOff;
     }
 
 // The Metal 4 encoder is on by default (RICHENGINE_MTL4_OFF disables) —

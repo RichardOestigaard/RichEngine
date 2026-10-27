@@ -145,6 +145,10 @@ TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
+TEST_ANE_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-moe-benchmark
+TEST_ANE_FORWARD_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-forward-benchmark
+TEST_ANE_PREDRAFT_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-predraft-benchmark
+TEST_COREAI_SHIM := $(ENGINE_TEST_BUILD)/libcoreai_shim.dylib
 TEST_MTL4_BENCHMARK := $(ENGINE_TEST_BUILD)/mtl4-benchmark
 TEST_ML_ENCODER_BENCH := $(ENGINE_TEST_BUILD)/ml-encoder-bench
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
@@ -279,6 +283,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GGUF_DECODE_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+	$(TEST_ANE_MOE_BENCHMARK) $(TEST_ANE_FORWARD_BENCHMARK) \
+	$(TEST_ANE_PREDRAFT_BENCHMARK) \
 	$(TEST_MTL4_BENCHMARK) $(TEST_ML_ENCODER_BENCH) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) \
@@ -819,6 +825,38 @@ $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
+# The ANE MoE probe (docs/ANE_EXPERIMENTS.md): one 35B routed expert through
+# the dense split's kernels and machinery against the GPU's own SwiGLU.
+$(TEST_ANE_MOE_BENCHMARK): dev/benchmarks/ane_moe_benchmark.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
+# The ANE floor/d1-forward probes (docs/ANE_EXPERIMENTS.md): per-evaluation
+# floor anatomy and the LFM2-family d1-3B chained forward model.
+$(TEST_ANE_FORWARD_BENCHMARK): dev/benchmarks/ane_forward_benchmark.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
+# The predraft transport A/B (docs/ANE_EXPERIMENTS.md): CoreML predict()
+# against an in-memory MIL program over surfaces and CoreAI's public API.
+# The CoreAI side is a small @_cdecl Swift shim — the framework exposes no
+# C or Objective-C symbols.
+$(TEST_COREAI_SHIM): dev/benchmarks/coreai_shim.swift | $(ENGINE_TEST_BUILD)
+	swiftc -O -emit-library $< -o $@ -module-name CoreAIShim \
+		-framework CoreAI -framework Metal
+
+$(TEST_ANE_PREDRAFT_BENCHMARK): dev/benchmarks/ane_predraft_benchmark.mm \
+		$(ENGINE_LIBRARY) $(LIB) $(TEST_COREAI_SHIM) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) \
+		-L$(ENGINE_TEST_BUILD) -lcoreai_shim \
+		-Wl,-rpath,$(abspath $(ENGINE_TEST_BUILD)) -o $@
+
 $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		dev/benchmarks/PrefillWork.hpp \
 		$(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER) \
@@ -1009,6 +1047,23 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 # [gate/up format] [down format] (q4k q5k by default).
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
+
+# ANE expert-eval A/B at the 35B shape; ANE_MOE_ARGS passes [rounds].
+.PHONY: benchmark-ane-moe
+benchmark-ane-moe: $(TEST_ANE_MOE_BENCHMARK) $(LIB)
+	$(TEST_ANE_MOE_BENCHMARK) $(LIB) $(ANE_MOE_ARGS)
+
+# ANE eval-floor anatomy + the d1-3B chained-forward model;
+# ANE_FORWARD_ARGS passes [rounds].
+.PHONY: benchmark-ane-forward
+benchmark-ane-forward: $(TEST_ANE_FORWARD_BENCHMARK) $(LIB)
+	$(TEST_ANE_FORWARD_BENCHMARK) $(LIB) $(ANE_FORWARD_ARGS)
+
+# Predraft transport A/B: ANE_PREDRAFT_MODEL names the CoreML artifact,
+# ANE_PREDRAFT_ARGS optional [rounds].
+.PHONY: benchmark-ane-predraft
+benchmark-ane-predraft: $(TEST_ANE_PREDRAFT_BENCHMARK) $(LIB)
+	$(TEST_ANE_PREDRAFT_BENCHMARK) $(LIB) "$(or $(ANE_PREDRAFT_MODEL),/tmp/predraft_ab.mlmodel)" $(ANE_PREDRAFT_ARGS)
 
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
 	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"

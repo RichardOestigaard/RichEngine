@@ -1,8 +1,8 @@
 #pragma once
 
 #include "engine/memory/MemoryPlan.hpp"
-#include "ops/AneFfn.hpp"
 #include "ops/AneFfnCalibration.hpp"
+#include "ops/FfnSplit.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -21,10 +21,19 @@ struct AneFfnSetting final {
   // (ops::ane_ffn::nearestUnits), over chunks of `minimumRows` rows or more.
   struct Given final {
     double share = 0.0;
-    uint32_t minimumRows = ops::AneFfn::kMinimumRows;
+    uint32_t minimumRows = ops::FfnSplit::kMinimumRows;
   };
   bool enabled = true;
   std::optional<Given> given;
+  // A d1 decision model's split as given (RICHENGINE_ANE_D1): takes the
+  // share whatever a calibration would say — measured up to 2x slower than
+  // the GPU (docs/ANE_EXPERIMENTS.md), kept for the GPU work it frees.
+  std::optional<Given> d1;
+  // A CoreAI-backed split as given (RICHENGINE_COREAI_FFN): same contract,
+  // the public framework's encode() in place of the private program —
+  // measured ~30% faster per evaluation (docs/ANE_EXPERIMENTS.md). Takes
+  // the share whatever a calibration would say, like `given`.
+  std::optional<Given> coreai;
 
   // The setting of a dev tool's --ane-ffn-share and --ane-ffn-minimum-rows:
   // none calibrates the split, and a share of 0 runs the GPU alone. Throws
@@ -36,7 +45,7 @@ struct AneFfnSetting final {
 // functions hold; its chunks as timed, if they were; and what
 // AneFfn::verify returned.
 struct AneFfnPrepared final {
-  std::unique_ptr<ops::AneFfn> split;
+  std::unique_ptr<ops::FfnSplit> split;
   ops::ane_ffn::ChunkTimings chunks;
   double error = 0.0;
 };
@@ -47,6 +56,9 @@ struct AneFfnModel final {
   // Whether the target has dense FFN layers, which the split could take; a
   // MoE target has none.
   bool dense = false;
+  // Whether the target is a d1 decision model (one forward per judgment),
+  // which a d1 given applies to.
+  bool decisionModel = false;
   // Why the split does not take them; empty when it does.
   std::string unsupported;
   // Why this Mac cannot run the split (ane::unavailable), asked only of a
@@ -56,12 +68,18 @@ struct AneFfnModel final {
   uint32_t units = 0;
   // The split's Metal memory with the ANE taking `aneUnits` of them.
   std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
+  // The same for the CoreAI split; null falls back to plannedBytes.
+  std::function<uint64_t(uint32_t aneUnits)> plannedBytesCoreAi;
   // Calibration's timings (ops::ane_ffn::Measurement::time).
   std::function<ops::ane_ffn::Timings()> time;
   // The split that serves with the ANE taking `aneUnits`, verified, with its
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
+  // The same over the CoreAI framework (AneFfnSetting::coreai); null where
+  // the machine lacks the framework or the model's shape no CoreAI asset
+  // covers, which a coreai given reports as unavailable.
+  std::function<AneFfnPrepared(uint32_t aneUnits)> prepareCoreAi;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
   // is remembered; remembering one; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
@@ -94,7 +112,7 @@ struct AneFfnOutcome final {
 // The split a start runs and the memory plan that sets its memory aside,
 // both none without one, and the outcome.
 struct AneFfnStart final {
-  std::unique_ptr<ops::AneFfn> split;
+  std::unique_ptr<ops::FfnSplit> split;
   std::optional<EngineMemoryPlan> plan;
   AneFfnOutcome outcome;
 };

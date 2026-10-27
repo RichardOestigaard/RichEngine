@@ -1,5 +1,6 @@
 #include "model/AffinePlan.hpp"
 #include "model/AffineTarget.hpp"
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -56,6 +57,20 @@ DFlashDraftLayout denseDFlash2DraftLayout() {
   layout.selectorRank = 256;
   layout.markovRank = 0;
   return layout;
+}
+
+// The dense source's flat config check (MiniCPM5's "llama" model_type).
+void validateDenseSourceConfig(id textObj,
+                               const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads}});
+  // MiniCPM5's head_dim is implicit (hidden / heads).
+  if (text[@"head_dim"])
+    requireGeometryNumbers(text, {{"head_dim", layout.attentionHeadDimension}});
 }
 
 // The dense target is text-only: no vision layout, no vision weights.
@@ -160,8 +175,11 @@ TargetWeights loadDenseTarget(metal::MetalBackend &backend,
 const bool kRegisteredDenseFamilies = [] {
   registerTargetArch({"dense", &loadDenseTarget, &kDenseHooks});
   // MiniCPM5's early releases stated model_type "minicpm".
-  registerModelFamily({"MiniCPM5-2B", "llama", "minicpm", &denseDescriptor,
-                       &denseDFlash2DraftLayout, nullptr});
+  registerModelFamily({.name = "MiniCPM5-2B", .modelType = "llama",
+                       .legacyType = "minicpm",
+                       .makeDescriptor = &denseDescriptor,
+                       .draftLayout = &denseDFlash2DraftLayout,
+                       .validateSourceConfig = &validateDenseSourceConfig});
   return true;
 }();
 

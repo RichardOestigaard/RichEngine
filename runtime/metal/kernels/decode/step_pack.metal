@@ -43,3 +43,25 @@ kernel void decode_step_pack(
       maximum ? min(params.budget[lane], maximum - 1u) + 1u : 0u;
   out.live_rows = maximum ? clamp(live, 1u, params.verify_stride) : 0u;
 }
+
+// The GPU-chained predraft's staging pass: dispatched after
+// decode_step_pack in the same command, it writes the next step's draft
+// inputs the host encode cannot know yet — each lane's anchor row plus
+// mask padding, and its rotary positions continuing at the pack's
+// position base. A lane the step ended keeps whatever the kernel writes;
+// the next encode's lane set proves it away. Grid {rows, lanes}.
+kernel void draft_predraft_pack(
+    device const DecodeStepPackLane *pack [[buffer(0)]],
+    device uint *draft_input [[buffer(1)]],
+    device uint *draft_positions [[buffer(2)]],
+    constant DraftPredraftPackParams &params [[buffer(3)]],
+    uint2 index [[thread_position_in_grid]]) {
+  const uint lane = index.y;
+  const uint row = index.x;
+  const device DecodeStepPackLane &p = pack[lane];
+  if (row < params.query_rows)
+    draft_input[lane * params.query_rows + row] =
+        row ? params.mask_token : p.anchor;
+  if (row < params.decode_rows)
+    draft_positions[lane * params.decode_rows + row] = p.position_base + row;
+}

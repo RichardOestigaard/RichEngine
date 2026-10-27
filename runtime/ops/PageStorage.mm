@@ -149,6 +149,43 @@ void PageStorage::writeEntries(std::span<const uint32_t> pages,
         entries[index] = entry(pages[index]);
 }
 
+uint32_t PageStorage::indexOffset(uint32_t layer) const {
+    if (!layout_.indexDimension || layer >= layout_.attentionLayers) {
+        throw std::out_of_range("KV page storage has no such index layer");
+    }
+    return static_cast<uint32_t>(uint64_t{layer} * extentPages_ *
+                                 layout_.indexBytesPerLayerPage());
+}
+
+void PageStorage::writeIndexEntries(std::span<const uint32_t> pages,
+                                    uint32_t first,
+                                    const metal::MetalBuffer &table) const {
+    if (!layout_.indexDimension) {
+        throw std::logic_error("KV index table of a layout without an index");
+    }
+    auto *entries = static_cast<RichKvPage *>(table.contents());
+    if (!entries || table.sizeBytes() / sizeof(RichKvPage) < pages.size()) {
+        throw std::logic_error(
+            "KV index table is not CPU-visible or too small for its entries");
+    }
+    if (first > pages.size()) {
+        throw std::invalid_argument(
+            "KV index table entries start past the end of its pages");
+    }
+    for (size_t index = first; index < pages.size(); ++index) {
+        const uint32_t page = pages[index];
+        const size_t extent = extentIndex(page);
+        const uint64_t address = extentAddresses_[extent];
+        if (!address) {
+            throw std::logic_error("KV page " + std::to_string(page) +
+                                   " is in an extent that is not allocated");
+        }
+        entries[index] = richengine_kv_page_entry(
+            address + indexPlaneOffset(),
+            page - static_cast<uint32_t>(extent) * extentPages_);
+    }
+}
+
 std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     auto *extent =
         static_cast<std::byte *>(extents_[extentIndex(page)].contents());
@@ -178,6 +215,28 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
                                     bytes);
             }
         }
+    }
+    const auto blocks = indexSpans(page);
+    result.insert(result.end(), blocks.begin(), blocks.end());
+    return result;
+}
+
+std::vector<std::span<std::byte>> PageStorage::indexSpans(uint32_t page) const {
+    if (!layout_.indexDimension) return {};
+    auto *extent =
+        static_cast<std::byte *>(extents_[extentIndex(page)].contents());
+    if (!extent) {
+        throw std::logic_error("KV page " + std::to_string(page) +
+                               " is in an extent that is not allocated");
+    }
+    const uint32_t index = page % extentPages_;
+    const uint64_t bytes = layout_.indexBytesPerLayerPage();
+    std::vector<std::span<std::byte>> result;
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        result.emplace_back(extent + indexPlaneOffset() +
+                                layer * extentPages_ * bytes +
+                                uint64_t(index) * bytes,
+                            bytes);
     }
     return result;
 }

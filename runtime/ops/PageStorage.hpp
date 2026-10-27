@@ -69,6 +69,11 @@ public:
   [[nodiscard]] std::span<const RichKvLayer> layers() const noexcept {
     return layers_;
   }
+  // Where a layer's index region (Layout::indexDimension), the pooled keys
+  // of every page, sits in every extent's index plane, in bytes: what an
+  // index table's entries reach (writeIndexEntries, ops::BlockIndex).
+  // std::out_of_range without an index or for a layer past the layout.
+  [[nodiscard]] uint32_t indexOffset(uint32_t layer) const;
 
   // Writes the entries kernels reach `pages` by, from index `first` on, to a
   // CPU-visible GPU page table, which must hold all of them; entries before
@@ -78,16 +83,30 @@ public:
   // for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
+  // The same for an index table (ops::BlockIndex::tables), whose entries
+  // reach the pages' block index: the GPU address of the page's extent's
+  // index plane, with the page's index in the low bits
+  // (RICHENGINE_KV_PAGE_INDEX_MASK). std::logic_error also without an index
+  // (Layout::indexDimension).
+  void writeIndexEntries(std::span<const uint32_t> pages, uint32_t first,
+                         const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
   // it: the page's bytes of each tensor in every layer's region, layer by
   // layer as keys, key scales, values and value scales, where
   // richengine_kv_offset places them for the kernels. BF16 pages have no scale
   // bytes. Throws std::logic_error for a page whose extent is not allocated.
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const;
+  // The page's bytes of each layer's block index (empty without an index):
+  // the index-plane spans that follow the layer spans in spans().
+  [[nodiscard]] std::vector<std::span<std::byte>> indexSpans(uint32_t page) const;
 
 private:
   [[nodiscard]] size_t extentIndex(uint32_t page) const;
   [[nodiscard]] RichKvPage entry(uint32_t page) const;
+  // Where an extent's index plane starts in its buffer.
+  [[nodiscard]] uint64_t indexPlaneOffset() const noexcept {
+    return uint64_t{extentPages_} * layout_.kvBytesPerModelPage();
+  }
 
   metal::MetalBackend &backend_;
   metal::AllocationAdmission admitAllocation_;

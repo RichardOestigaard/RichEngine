@@ -73,6 +73,9 @@ void logOutcome(const AneFfnOutcome &outcome, const AneFfnModel &model, const An
     const size_t detail = std::min(reason.find(": "), reason.find(", "));
     logLine("Neural Engine FFN split ", reason.substr(0, detail),
             dim(std::string(reason.substr(std::min(detail, reason.size()))) + context + "."));
+    if (setting.d1 && model.decisionModel)
+      logLine(dim("The d1 Neural Engine split was measured up to 2x slower than the GPU "
+                  "(docs/ANE_EXPERIMENTS.md); it serves for the GPU work it frees."));
     return;
   }
   }
@@ -87,20 +90,39 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
   };
   if (!model.dense) return gpuAlone(Kind::Unsupported, "the target has no dense FFN layers", without);
   if (!setting.enabled) return gpuAlone(Kind::Off, "as given", without);
-  if (!model.unsupported.empty()) return gpuAlone(Kind::Unsupported, model.unsupported, without);
-  if (const std::optional<std::string> reason = model.unavailable())
-    return gpuAlone(Kind::Unsupported, *reason, without);
+  // A coreai given prepares the CoreAI split or nothing: where the model or
+  // the Mac lacks one it does not fall back to the private program, and the
+  // private path's own unsupported checks do not gate it either — its
+  // function splits layers the rotation conv's checks reject.
+  if (setting.coreai) {
+    if (!model.prepareCoreAi)
+      return gpuAlone(Kind::Unavailable, "the CoreAI FFN path is unavailable on this model or Mac", without);
+  } else {
+    if (!model.unsupported.empty()) return gpuAlone(Kind::Unsupported, model.unsupported, without);
+    if (model.unavailable)
+      if (const std::optional<std::string> reason = model.unavailable())
+        return gpuAlone(Kind::Unsupported, *reason, without);
+  }
+  // A coreai given applies to any dense model, then a d1 given only to a
+  // d1 decision model, then `given`, each in place of the rest.
+  const AneFfnSetting::Given *effective = setting.coreai                  ? &*setting.coreai
+                                        : setting.d1 && model.decisionModel ? &*setting.d1
+                                        : setting.given                 ? &*setting.given
+                                                                        : nullptr;
   const std::optional<uint32_t> given =
-      setting.given ? std::optional(ane_ffn::nearestUnits(setting.given->share, model.units)) : std::nullopt;
-  if (setting.given && (setting.given->minimumRows < ops::AneFfn::kMinimumRows ||
-                        setting.given->minimumRows > ops::AneFfn::kMaximumRows))
-    throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(setting.given->minimumRows) +
+      effective ? std::optional(ane_ffn::nearestUnits(effective->share, model.units)) : std::nullopt;
+  if (effective && (effective->minimumRows < ops::FfnSplit::kMinimumRows ||
+                    effective->minimumRows > ops::FfnSplit::kMaximumRows))
+    throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(effective->minimumRows) +
                                 " rows");
 
   // Feasibility. The split's memory comes out of the KV cache, more of it
   // with each unit the ANE takes: the plan must still hold the context asked
   // for, or with none asked some context, which becomes the automatic one.
-  const auto planWith = [&](uint32_t aneUnits) { return planMemory(model.plannedBytes(aneUnits)); };
+  const auto planWith = [&](uint32_t aneUnits) {
+    return planMemory(setting.coreai && model.plannedBytesCoreAi ? model.plannedBytesCoreAi(aneUnits)
+                                                                 : model.plannedBytes(aneUnits));
+  };
   const auto contextWith = [&](uint32_t aneUnits) { return contextOf(planWith(aneUnits)); };
   // The most units from `low`, whose plan holds `context`, to `high` whose
   // plan holds it.
@@ -148,7 +170,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
          << " s";
     return text.str();
   };
-  const std::string layer = " ms per " + std::to_string(ops::AneFfn::kMaximumRows) + "-row FFN layer";
+  const std::string layer = " ms per " + std::to_string(ops::FfnSplit::kMaximumRows) + "-row FFN layer";
   const auto fixed = [](double value) {
     std::ostringstream text;
     text << std::fixed << std::setprecision(1) << value;
@@ -171,9 +193,13 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
   };
   try {
     if (given) {
-      AneFfnPrepared prepared = model.prepare(*given, false);
-      if (prepared.split) prepared.split->setMinimumRows(setting.given->minimumRows);
-      return serve(std::move(prepared), *given, setting.given->minimumRows, "", "set up");
+      AneFfnPrepared prepared = effective == &*setting.coreai ? model.prepareCoreAi(*given)
+                                                            : model.prepare(*given, false);
+      if (prepared.split) prepared.split->setMinimumRows(effective->minimumRows);
+      return serve(std::move(prepared), *given, effective->minimumRows, "",
+                   effective == &*setting.coreai   ? "set up through CoreAI"
+                   : effective == &*setting.d1 ? "set up for the GPU it frees"
+                                               : "set up");
     }
     // The split takes the calibration's least chunk, and judges itself
     // against the GPU alone as calibrated, forgetting the calibration once it
@@ -194,8 +220,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
 
     std::optional<ane_ffn::Calibration> calibration = model.recall(maxAneUnits);
     if (calibration && calibration->aneUnits &&
-        (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::AneFfn::kMinimumRows ||
-         calibration->minimumRows > ops::AneFfn::kMaximumRows))
+        (calibration->aneUnits > maxAneUnits || calibration->minimumRows < ops::FfnSplit::kMinimumRows ||
+         calibration->minimumRows > ops::FfnSplit::kMaximumRows))
       calibration.reset();
     if (calibration) {
       assumed = calibration->aneUnits;
@@ -262,7 +288,7 @@ AneFfnSetting AneFfnSetting::fromGiven(std::optional<double> share, std::optiona
     return {};
   }
   if (*share == 0.0) return {.enabled = false};
-  return {.given = Given{*share, minimumRows.value_or(ops::AneFfn::kMinimumRows)}};
+  return {.given = Given{*share, minimumRows.value_or(ops::FfnSplit::kMinimumRows)}};
 }
 
 AneFfnStart startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t requestedContextTokens,

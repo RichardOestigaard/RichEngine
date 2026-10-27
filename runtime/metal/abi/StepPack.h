@@ -69,3 +69,20 @@ struct DecodeStepPackLane {
 
 static_assert(sizeof(DecodeStepPackLane) == 40,
               "step-pack lane is 40 bytes on both sides");
+
+// draft_predraft_pack's payload (the GPU-chained predraft, dispatched
+// after decode_step_pack in the same command): the pack lanes just written
+// supply each lane's next anchor and position base, so the kernel stages
+// the draft input rows and rotary positions the draft graph's encodes
+// would otherwise need the host's readback for.
+struct DraftPredraftPackParams {
+  uint32_t lanes;
+  // The packed draft input's per-lane row count (draft.queryRows()).
+  uint32_t query_rows;
+  // The packed draft positions' per-lane row count (kDecodeRows).
+  uint32_t decode_rows;
+  uint32_t mask_token;
+};
+
+static_assert(sizeof(DraftPredraftPackParams) == 16,
+              "draft predraft pack parameters are 16 bytes on both sides");

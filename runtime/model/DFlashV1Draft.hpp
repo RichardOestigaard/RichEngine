@@ -83,9 +83,14 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans) const;
+  // `devicePack` binds the committed step's DecodeStepPackLane block: the
+  // attention splits take each lane's cache length from it, so the
+  // GPU-chained predraft encodes before the host knows them. cacheLengths
+  // still sizes the batch.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths) const;
+                 std::span<const uint32_t> cacheLengths,
+                 const metal::MetalBuffer &devicePack = {}) const;
   // The plain draft has no candidate DAG, so treeMask is ignored: its
   // selector always emits the seven-token chain.
   void addSelection(metal::CommandGraph &graph,

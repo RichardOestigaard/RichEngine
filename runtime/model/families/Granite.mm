@@ -1,7 +1,10 @@
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
 #include "model/Granite.hpp"
+
+#include <cmath>
 
 namespace richengine::model {
 namespace {
@@ -52,6 +55,28 @@ ModelDescriptor granite8BDescriptor(std::string name) {
   return graniteDescriptor(std::move(name), granite8BTargetLayout());
 }
 
+// The granite source's flat config check.
+void validateGraniteSourceConfig(id textObj,
+                                 const ModelDescriptor &descriptor) {
+  NSDictionary *text = static_cast<NSDictionary *>(textObj);
+  const TargetLayout &layout = descriptor.target;
+  requireGeometryNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+      {"vocab_size", layout.vocabularySize},
+      {"num_attention_heads", layout.attentionQueryHeads},
+      {"num_key_value_heads", layout.attentionKvHeads},
+      {"intermediate_size", layout.intermediateSize},
+      {"max_position_embeddings", layout.maximumContextTokens},
+      {"rope_theta", 10000000u}});
+  // attention_multiplier is a float the GGUF metadata check verifies.
+  if (id value = text[@"attention_multiplier"];
+      [value isKindOfClass:[NSNumber class]] &&
+      std::abs([value doubleValue] - layout.attentionScale) >
+          layout.attentionScale * 1e-6)
+    throw std::invalid_argument(
+        "unsupported granite attention_multiplier: " +
+        std::to_string([value doubleValue]));
+}
+
 // The registry's erased-signature entry for the granite target.
 TargetWeights loadGraniteTarget(metal::MetalBackend &backend,
                      const TargetLayout &layout,
@@ -61,10 +86,14 @@ TargetWeights loadGraniteTarget(metal::MetalBackend &backend,
 
 const bool kRegisteredGraniteFamilies = [] {
   registerTargetArch({"granite", &loadGraniteTarget});
-  registerModelFamily({"Granite-4.2-3B", "granite", "", &granite3BDescriptor,
-                       nullptr, nullptr});
-  registerModelFamily({"Granite-4.2-8B", "granite", "", &granite8BDescriptor,
-                       nullptr, nullptr});
+  registerModelFamily({.name = "Granite-4.2-3B", .modelType = "granite",
+                       .legacyType = "",
+                       .makeDescriptor = &granite3BDescriptor,
+                       .validateSourceConfig = &validateGraniteSourceConfig});
+  registerModelFamily({.name = "Granite-4.2-8B", .modelType = "granite",
+                       .legacyType = "",
+                       .makeDescriptor = &granite8BDescriptor,
+                       .validateSourceConfig = &validateGraniteSourceConfig});
   return true;
 }();
 

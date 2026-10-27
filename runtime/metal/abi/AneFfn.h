@@ -73,7 +73,16 @@ struct AneFfnJoinParams {
   uint32_t rows;
 };
 
+// The CoreAI split's row-major y and cast: output[t][c] += y[t][c] over
+// rows t < rows, hidden c per row; the same pair bounds the elementwise
+// bf16 to fp16 cast.
+struct CoreAiFfnParams {
+  uint32_t hidden;
+  uint32_t rows;
+};
+
 static_assert(sizeof(AneFfnRotateParams) == 4, "ANE FFN rotate parameters are 4 bytes");
 static_assert(sizeof(AneFfnPackParams) == 12, "ANE FFN pack parameters are 12 bytes");
 static_assert(sizeof(AneFfnWeightParams) == 28, "ANE FFN weight parameters are 28 bytes");
 static_assert(sizeof(AneFfnJoinParams) == 12, "ANE FFN join parameters are 12 bytes");
+static_assert(sizeof(CoreAiFfnParams) == 8, "CoreAI FFN parameters are 8 bytes");

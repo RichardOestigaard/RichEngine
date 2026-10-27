@@ -82,6 +82,11 @@ public:
   // GPU address of the view's first byte, for kernels that reach a buffer
   // through an address another buffer holds.
   [[nodiscard]] uint64_t gpuAddress() const noexcept;
+  // The base allocation's id<MTLBuffer> as a void* for Objective-C++ or
+  // foreign-API callers (ops::CoreAiFfn binds it into CoreAI NDArrays);
+  // offsetBytes() is the view's offset into it, 0 for a base allocation.
+  [[nodiscard]] void *nativeHandle() const noexcept;
+  [[nodiscard]] uint64_t offsetBytes() const noexcept;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -332,6 +337,9 @@ public:
   MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
+  // The backend's id<MTLDevice>, borrowed (the backend outlives callers), for
+  // bridges that bind Metal objects — ops::CoreAiFfn's shim takes one.
+  [[nodiscard]] void *nativeDevice() const noexcept;
 
   // Every buffer the backend allocates belongs to one residency set, attached
   // to the command queue, until its memory is released or its last view is

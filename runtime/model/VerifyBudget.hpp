@@ -109,9 +109,21 @@ public:
 
   // The labels kept, oldest first.
   [[nodiscard]] std::vector<Label> labels() const;
-  // The maximum a posteriori model of `labels` under the prior, by damped
-  // Newton steps from `start`.
+  // A family-specific prior (ModelTuning::verifyPrior): the acceptance
+  // model starts at it and the fit shrinks toward it. Safe only before the
+  // first observation's labels land; a budget that already learned keeps
+  // what it has.
+  void seedAcceptance(const Acceptance &prior) {
+    if (!labels_.empty())
+      return;
+    prior_ = prior;
+    acceptance_ = prior;
+  }
+  // The maximum a posteriori model of `labels` under `prior`, by damped
+  // Newton steps from `start`. The two-argument form uses kPrior.
   [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
+  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start,
+                                      const Acceptance &prior);
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1).
   [[nodiscard]] static double seed(uint32_t lanes, uint32_t rows);
 
@@ -129,6 +141,9 @@ private:
   // The fit's intercept and slope; none before any cycle.
   [[nodiscard]] std::optional<std::pair<double, double>> line(uint32_t lanes, bool constrained) const;
 
+  // The prior the online fit regularizes against: kPrior unless a family
+  // seedAcceptance()ed its own before the first labels.
+  Acceptance prior_ = kPrior;
   Acceptance acceptance_ = kPrior;
   std::vector<Label> labels_;
   size_t next_ = 0;

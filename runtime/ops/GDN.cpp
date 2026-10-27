@@ -70,7 +70,7 @@ uint64_t GDN::chunkScratchFloats(const GdnShape &shape, uint32_t tokens,
 
 void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                      GdnShape shape, uint32_t tokens, GdnHeadOrder order,
-                     metal::MetalBuffer sums) {
+                     metal::MetalBuffer sums, uint32_t flags) {
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -119,7 +119,9 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                                                 buffers.mixerNorm.buffer, buffers.hidden};
   if (sums) gateBindings.push_back(sums);
   graph.add(gate, gateBindings,
-            GDNGatePrefillParams{order == GdnHeadOrder::Tiled},
+            GDNGatePrefillParams{flags | (order == GdnHeadOrder::Tiled
+                                              ? GDN_TILED_HEADS
+                                              : 0u)},
             {uint64_t{tokens} * shape.valueHeads, 1, 1}, {128, 1, 1});
 }
 
@@ -128,7 +130,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input,
                              std::span<const uint32_t> liveRows,
                              uint32_t verifyStride,
-                             const GdnTapeLanes *tapeLanes) {
+                             const GdnTapeLanes *tapeLanes, uint32_t flags) {
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
       !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
       (!liveRows.empty() && liveRows.size() != lanes))
@@ -156,7 +158,9 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
       bindings.insert(bindings.end(), {buffers.hidden, buffers.hidden});
     bindings.push_back(buffers.tape);
   }
-  GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
+  GDNDecodeBatchParams params{flags | (order == GdnHeadOrder::Tiled
+                                           ? GDN_TILED_HEADS
+                                           : 0u),
                               layer,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,
@@ -199,7 +203,7 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                                  metal::MetalBuffer treeCounts, GdnShape shape,
                                  uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state, GdnHeadOrder order,
-                                 LinearInput input) {
+                                 LinearInput input, uint32_t flags) {
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
       !treeNodes || !treeCounts)
     throw std::invalid_argument("invalid GDN tree decode geometry");
@@ -218,7 +222,9 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
                    buffers.hidden, treeNodes, treeCounts});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  GDNDecodeBatchParams params{order == GdnHeadOrder::Tiled,
+  GDNDecodeBatchParams params{flags | (order == GdnHeadOrder::Tiled
+                                           ? GDN_TILED_HEADS
+                                           : 0u),
                               layer,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,

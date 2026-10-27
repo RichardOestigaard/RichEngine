@@ -3,6 +3,7 @@
 #include "Tuning.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/MoE.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
 
@@ -36,10 +37,32 @@ struct MoeShape final {
   bool sharedExpert = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
-           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
-           expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+    if ((weightLayout != WeightLayout::Affine64 &&
+         weightLayout != WeightLayout::Block32) ||
+        !hiddenSize || hiddenSize % 256 != 0 || !experts || !expertsPerToken ||
+        expertsPerToken > experts || !expertIntermediateSize)
+      return false;
+    if (experts <= MOE_EXPERT_SLOTS)
+      return expertIntermediateSize % 256 == 0;
+    // More experts than the routing kernels' slots hold: the wide (_e512)
+    // family routes a GGUF block with a shared expert on 512-slot scores
+    // and 512-slot select and grouping instances (upstream's
+    // SPLASH_MOE_WIDE_EXPERT_SLOTS). The staged expert tiles take any
+    // 64-column intermediate; the affine slabs' N256 tiles keep the 256
+    // expert bound, as does sigmoid gating, which has no wide select.
+    return sharedExpert && weightLayout == WeightLayout::Block32 &&
+           experts <= MOE_WIDE_EXPERT_SLOTS &&
+           expertIntermediateSize % 64 == 0;
+  }
+  // Whether the block routes on the wide (_e512) kernel instances.
+  [[nodiscard]] constexpr bool wideExperts() const noexcept {
+    return experts > MOE_EXPERT_SLOTS;
+  }
+  // The router's score slots per row — the expert slots of the select and
+  // grouping kernels that route the block (metal/abi/MoE.h), one thread
+  // each.
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return wideExperts() ? MOE_WIDE_EXPERT_SLOTS : MOE_EXPERT_SLOTS;
   }
   // Routed experts followed by the shared expert, if there is one.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {

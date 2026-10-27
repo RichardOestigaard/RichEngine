@@ -27,6 +27,9 @@ struct Tuning {
   // ops/MoE.cpp, ops/MoE.hpp
   bool moeGgufFused = false;      // RICHENGINE_MOE_GGUF_FUSED (presence)
   std::string_view moeGgufTile;   // RICHENGINE_MOE_GGUF_TILE=register|staged
+  // ops/ExecutionPlans.cpp: forces the four-simdgroup affine expert tiles
+  // (moe_expert_*_sg4) on families that default to eight, for A/Bs.
+  bool moeSg4 = false;            // RICHENGINE_MOE_SG4 (presence)
   // ops/GDN.cpp, model/RuntimeArenas.mm
   uint32_t gdnChunked = 0;    // RICHENGINE_GDN_CHUNKED
   // ops/Linear.cpp, ops/LinearGguf.cpp
@@ -117,6 +120,10 @@ struct Tuning {
   bool ngramPredraft = true;        // RICHENGINE_NGRAM_PREDRAFT, =0 disables
   bool draftBypass = true;          // RICHENGINE_DRAFT_BYPASS, =0 disables
   bool gpuPredraft = true;          // RICHENGINE_GPU_PREDRAFT, =0 disables
+  // The predraft dispatches chain inside the committed step's own command
+  // (draft_predraft_pack stages inputs from the step pack) instead of a
+  // second submission in the host's result-handling gap.
+  bool chainPredraft = true;        // RICHENGINE_CHAIN_PREDRAFT, =0 disables
   // GPU-DFA constraint scope (model/RuntimeImpl.hpp): "full" computes the
   // lane's masks and forced spans on the GPU, "forced" keeps the host mask
   // round trip and only derives forced spans and the automaton state
@@ -145,6 +152,7 @@ struct Tuning {
   bool treeDebug = false;           // RICHENGINE_TREE_DEBUG (presence)
   bool draftDebug = false;          // RICHENGINE_DRAFT_DEBUG (presence)
   bool draftConf = false;           // RICHENGINE_DRAFT_CONF (presence)
+  bool verifyBudgetDebug = false;   // RICHENGINE_VERIFY_BUDGET_DEBUG=1
   std::string treeSkip;             // RICHENGINE_TREE_SKIP
   bool aneDebug = false;            // RICHENGINE_ANE_DEBUG (presence)
   bool ngramDebug = false;          // RICHENGINE_NGRAM_DEBUG (presence)
@@ -223,6 +231,7 @@ inline Tuning makeTuning() {
   t.moeTopK = envUint("RICHENGINE_MOE_TOPK", 0);
   t.moeGgufFused = envFlag("RICHENGINE_MOE_GGUF_FUSED");
   t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
+  t.moeSg4 = envFlag("RICHENGINE_MOE_SG4");
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
@@ -284,6 +293,7 @@ inline Tuning makeTuning() {
   t.ngramPredraft = unlessZero("RICHENGINE_NGRAM_PREDRAFT");
   t.draftBypass = unlessZero("RICHENGINE_DRAFT_BYPASS");
   t.gpuPredraft = unlessZero("RICHENGINE_GPU_PREDRAFT");
+  t.chainPredraft = unlessZero("RICHENGINE_CHAIN_PREDRAFT");
   t.dfaMode = stringOrEmpty("RICHENGINE_DFA_MODE");
   t.draftBypassExpectSet = envFlag("RICHENGINE_DRAFT_BYPASS_EXPECT");
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
@@ -301,6 +311,7 @@ inline Tuning makeTuning() {
   t.treeDebug = envFlag("RICHENGINE_TREE_DEBUG");
   t.draftDebug = envFlag("RICHENGINE_DRAFT_DEBUG");
   t.draftConf = envFlag("RICHENGINE_DRAFT_CONF");
+  t.verifyBudgetDebug = envFlagOn("RICHENGINE_VERIFY_BUDGET_DEBUG");
   if (const char *value = std::getenv("RICHENGINE_TREE_SKIP"))
     t.treeSkip = value;
   t.aneDebug = envFlag("RICHENGINE_ANE_DEBUG");

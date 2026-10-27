@@ -19,6 +19,9 @@
 #include "model/DFlashDraft.hpp"
 #include "model/ModelDescriptor.hpp"
 
+#include <objc/objc.h>
+
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,6 +31,8 @@ namespace richengine::model {
 struct ModelDescriptor;
 struct DFlashDraftLayout;
 struct AffineArchHooks;
+class TargetModel;
+class TargetLayerEncoder;
 
 // One target architecture: its discriminator (TargetLayout::arch) and the
 // loader that reads its weights from the target's files. The loader is the
@@ -42,6 +47,10 @@ struct TargetArchRegistration {
   // planner and config.json validator, null where the default GDN schema
   // and no validation apply.
   const AffineArchHooks *affineHooks = nullptr;
+  // The arch's layer encoder (TargetLayerEncoder.hpp), bound to the built
+  // model; a null factory selects the standard encoder.
+  std::unique_ptr<TargetLayerEncoder> (*makeEncoder)(const TargetModel &) =
+      nullptr;
 };
 
 // One kModelFamilies row: the name an assembly's model.json states, the
@@ -56,6 +65,32 @@ struct ModelFamilyRegistration {
   ModelDescriptor (*makeDescriptor)(std::string name);
   DFlashDraftLayout (*draftLayout)();
   DFlashDraftLayout (*dflashV1Layout)();
+  // The family's check of the source's resolved text object (the config's
+  // own fields or its text_config): inspectSourceModel runs it right after
+  // makeDescriptor, before the record's target_format resolves. Null for a
+  // family with no source-config checks.
+  void (*validateSourceConfig)(id text,
+                               const ModelDescriptor &descriptor) = nullptr;
+  // Runs once the record's target_format resolved descriptor.targetSource —
+  // the source-dialect-dependent check (the Qwen families' text config).
+  // Null for a family whose checks are source-agnostic.
+  void (*refineSourceConfig)(id text,
+                             const ModelDescriptor &descriptor) = nullptr;
+  // The DSpark draft architecture a manifest or draft config may declare
+  // for the family; the generic Draftfit spelling "DSparkDraftModel"
+  // always passes.
+  std::string_view dsparkArchName = "Qwen3DSparkModel";
+  // The rms_norm_eps a declared draft's config states: the LFM2 targets'
+  // 1e-5, every other family's 1e-6.
+  double draftNormEpsilon = 1e-6;
+  // A Null-default family whose assembly may still ship a draft/config.json
+  // declaring one (Gemma 4's plain DFlash block, the 24B's DSpark).
+  bool acceptsDeclaredDraft = false;
+  // The family takes no draft at all; a shipped draft/config.json is
+  // refused.
+  bool takesNoDraft = false;
+  // The family serves the Qwen VL tower; every other is text-only.
+  bool servesVisionTower = false;
 };
 
 // Both return true so a family's translation unit can register at static

@@ -129,11 +129,16 @@ public:
                          const DraftAttentionPlan &plan);
   // `causal` masks the eight current rows to the block rows up to each
   // query's position (a plain DFlash draft's sliding layers); the DFlash2
-  // blocks attend bidirectionally.
+  // blocks attend bidirectionally. `devicePack` binds the step's
+  // DecodeStepPackLane block: the split kernel reads each lane's cache
+  // length from it instead of `cacheLengths` (the GPU-chained predraft,
+  // whose positions the encode cannot know). cacheLengths still sizes
+  // the batch.
   static void addDecode(metal::CommandGraph &graph,
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
-                        const DraftAttentionPlan &plan, bool causal = false);
+                        const DraftAttentionPlan &plan, bool causal = false,
+                        const metal::MetalBuffer &devicePack = {});
   // output = input + residual over the plan's rows: the plain draft's
   // residual adds, which the DFlash2 convolutions fold in.
   static void addResidual(metal::CommandGraph &graph,

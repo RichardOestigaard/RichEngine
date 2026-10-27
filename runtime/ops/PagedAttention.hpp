@@ -80,6 +80,45 @@ inline constexpr uint32_t kChunkedPrefillMaximumRows =
 inline constexpr uint32_t kPrefillAttentionTileRows =
     RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
 
+// Sparse attention over a tile's block list (kernels/shared/
+// sparse_attention.metal): a tile of a block list entry's row bits — eight
+// rows — and the partition the splits and the reduce share of a list of
+// `count` entries over at most `splits` splits, whole units of
+// kSparsePartitionBlocks each (the shader's richengine_sparse_* twins, so the
+// host's slot bound and the kernels' partition agree).
+inline constexpr uint32_t kSparseTileRows = RICHENGINE_ATTENTION_BLOCK_ROW_BITS;
+inline constexpr uint32_t kSparsePartitionBlocks = 8;
+inline constexpr uint32_t kSparseSplitBlocks = RICHENGINE_SPARSE_SPLIT_BLOCKS;
+inline constexpr uint32_t kSparseMinimumSplits =
+    RICHENGINE_SPARSE_MINIMUM_SPLITS;
+
+[[nodiscard]] constexpr uint32_t
+sparseHistoryBlocks(uint32_t firstPosition, uint32_t rows) noexcept {
+  return (firstPosition + rows + RICHENGINE_ATTENTION_BLOCK_TOKENS - 1) /
+         RICHENGINE_ATTENTION_BLOCK_TOKENS;
+}
+
+[[nodiscard]] constexpr uint32_t sparseSplitEntries(uint32_t count,
+                                                    uint32_t splits) noexcept {
+  const uint32_t units =
+      (count + kSparsePartitionBlocks - 1) / kSparsePartitionBlocks;
+  const uint32_t used = std::clamp(
+      std::max((count + kSparseSplitBlocks - 1) / kSparseSplitBlocks,
+               std::min(kSparseMinimumSplits, units)),
+      1u, splits);
+  const uint32_t share = (count + used - 1) / used;
+  return (share + kSparsePartitionBlocks - 1) / kSparsePartitionBlocks *
+         kSparsePartitionBlocks;
+}
+
+// The splits of `splits` a list of `count` fills: what a plan's workspace
+// and grid must cover when the list could hold the whole `count`.
+[[nodiscard]] constexpr uint32_t sparseWrittenSplits(uint32_t count,
+                                                     uint32_t splits) noexcept {
+  const uint32_t perSplit = sparseSplitEntries(count, splits);
+  return perSplit ? (count + perSplit - 1) / perSplit : 0;
+}
+
 [[nodiscard]] constexpr uint32_t
 prefillAttentionTiles(uint32_t rows) noexcept {
   return (rows + kPrefillAttentionTileRows - 1) / kPrefillAttentionTileRows;
@@ -135,6 +174,8 @@ struct PrefillAttentionPlan final {
   // The split kernel's trailing-context window in tokens (the _swa
   // pipelines' buffer(5)); zero leaves the split windowless.
   const uint32_t windowTokens;
+  // Whether the kernels attend through block lists (AttentionBlocks).
+  const bool sparse;
 
 private:
   friend class PagedAttention;
@@ -142,14 +183,15 @@ private:
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        metal::DispatchSize reduceThreads, kv::Format format,
-                       float scoreScale = 0.0F, uint32_t windowTokens = 0)
+                       float scoreScale = 0.0F, uint32_t windowTokens = 0,
+                       bool sparse = false)
       : format(format), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
         reduceThreads(reduceThreads), scoreScale(scoreScale),
-        windowTokens(windowTokens) {}
+        windowTokens(windowTokens), sparse(sparse) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -173,6 +215,13 @@ struct VerifyAttentionPlan final {
   // The split kernel's trailing-context window in tokens (the _swa
   // pipelines' buffer(8)); zero leaves the split windowless.
   const uint32_t windowTokens;
+  // Whether the kernels attend through block lists (AttentionBlocks): the
+  // lane's rowCapacity/8 eight-row tiles, tile t reading list
+  // block_list + t.
+  const bool sparse;
+  // Eight-row tiles of a lane's rowCapacity rows, the sparse split and
+  // reduce grids' tiles per lane.
+  const uint32_t rowTiles;
 
 private:
   friend class PagedAttention;
@@ -190,16 +239,40 @@ private:
                       metal::DispatchSize storeThreads,
                       metal::DispatchSize reduceThreads, kv::Format format,
                       uint32_t rowCapacity, float scoreScale = 0.0F,
-                      uint32_t windowTokens = 0)
+                      uint32_t windowTokens = 0, bool sparse = false)
       : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
         rowCapacity(rowCapacity), scoreScale(scoreScale),
-        windowTokens(windowTokens),
+        windowTokens(windowTokens), sparse(sparse),
+        rowTiles((rowCapacity + kv::kSparseTileRows - 1) / kv::kSparseTileRows),
         storePipeline_(std::move(storePipeline)), storeGroups_(storeGroups),
         storeThreads_(storeThreads), reduceThreads_(reduceThreads) {}
+};
+
+// The block lists a sparse plan's tiles attend through (metal/abi/
+// PagedAttention.h, PagedAttention::addBlockLists): lists of `stride` entries,
+// each list's count in `counts`; a verify lane's eight-row tile t reads list
+// `list` + lane * rowTiles + t, a prefill tile list `list` + tile. Without a
+// stride every tile attends to every block of its history. Only a sparse
+// plan takes lists.
+struct AttentionBlocks final {
+  metal::MetalBuffer lists;
+  metal::MetalBuffer counts;
+  uint32_t stride = 0;
+  uint32_t list = 0;
+};
+
+// Rows whose block masks become block lists (PagedAttention::addBlockLists):
+// `rows` rows from row `maskRow` of the masks, the first at position
+// `firstPosition`, whose eight-row tiles take the lists from `list` on.
+struct BlockListRows final {
+  uint32_t maskRow = 0;
+  uint32_t rows = 0;
+  uint32_t firstPosition = 0;
+  uint32_t list = 0;
 };
 
 struct PagedVerifyBuffers final {
@@ -221,9 +294,11 @@ struct PagedVerifyBuffers final {
 class PagedAttention final {
 public:
   // The kernels read a sequence's history from its chunk parameters, so a
-  // plan depends on the rows only.
+  // plan depends on the rows only. `sparse` selects the block-list kernels
+  // (AttentionBlocks), which only the Kv2Group12H256 core compiles.
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
+              bool sparse = false);
   // The DiffusionGemma canvas splits: same grids and workspace, but every
   // row admits the whole visible range — the read-only encoder prefix (its
   // pages) plus the canvas positions (scratch pages the host appended to
@@ -240,10 +315,14 @@ public:
   // rows is a chain lane's packed verify stride: draft.verifyRows() — a
   // trained-block draft verifies fewer than kVerifyRows rows per lane. Tree
   // plans keep RICHENGINE_TREE_VERIFY_NODES regardless.
+  // `sparse` selects the block-list kernels (AttentionBlocks): each lane's
+  // rows attend in eight-row tiles through list block_list + t. Tree verify
+  // has no sparse kernels; fp8 and int4 have none either.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens, bool tree = false,
-             uint32_t liveNodes = 0, uint32_t rows = kv::kVerifyRows);
+             uint32_t liveNodes = 0, uint32_t rows = kv::kVerifyRows,
+             bool sparse = false);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -334,7 +413,8 @@ public:
                          metal::MetalBuffer statistics,
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
-                         const PrefillAttentionPlan &plan);
+                         const PrefillAttentionPlan &plan,
+                         AttentionBlocks blocks = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts. When `gatePacked` and
   // `gateHidden` are bound (a Plain-input out-projection), the reduce
@@ -343,12 +423,27 @@ public:
   // attention-row round trip, bitwise identical. With `gateHidden` bound and
   // `gatePacked` empty the no-gate fusion runs instead: the reduce writes
   // `gateHidden` directly (verify_attention_reduce_gather_*, chain plans).
+  // With a sparse plan, `blocks` names the lanes' block lists
+  // (addBlockLists); a zero stride leaves every tile attending its whole
+  // history. The fused gate variants are dense-only; a sparse reduce writes
+  // `buffers.output`.
   static void addVerify(metal::CommandGraph &graph, RichKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
                         const VerifyAttentionPlan &plan,
                         metal::MetalBuffer gatePacked = {},
-                        metal::MetalBuffer gateHidden = {});
+                        metal::MetalBuffer gateHidden = {},
+                        AttentionBlocks blocks = {});
+  // One dispatch of the block lists of up to a batch of sequences of query
+  // rows, whose block masks are rows of `mask`, `maskWords` words each
+  // (metal/abi/PagedAttention.h) that cover each sequence's history: each
+  // sequence's tiles of eight rows, its tile t's list into list
+  // blocks.list + its list + t. A list holds at most blocks.stride entries,
+  // which the masks' rows must keep to.
+  static void addBlockLists(metal::CommandGraph &graph,
+                            const metal::MetalBuffer &mask, uint32_t maskWords,
+                            std::span<const BlockListRows> sequences,
+                            const AttentionBlocks &blocks);
   // The tree-verify tail after acceptance: the store wrote every node's K/V
   // at committed + emitted row, while the committed tokens are the retained
   // path — this dispatch copies each path row's slab to its path slot

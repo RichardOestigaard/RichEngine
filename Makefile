@@ -77,7 +77,7 @@ VERIFY8_AIRS := $(addprefix $(METAL8_BUILD)/, \
 	install-environment _install-environment \
 	platform-check model-selection preflight serve webui
 
-all: $(TARGET) $(TUNE_TOOL)
+all: $(TARGET) $(TUNE_TOOL) $(COREAI_SHIM)
 
 # The dev/bisection tree at the block-8 geometry: benchmark and profile
 # binaries linked against the 8-row archive. The shipped richengine already
@@ -299,6 +299,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \
 	runtime/ops/Canvas.cpp \
+	runtime/ops/CoreAiFfn.cpp \
 	runtime/ops/DeviceTuning.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
@@ -309,12 +310,15 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/HyperConnection.cpp \
 	runtime/ops/LfmConv.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
+	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
+	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
@@ -362,6 +366,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/MiniCpmV47.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Ornith9B.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
@@ -388,6 +393,7 @@ ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/families/Qwen.mm \
+	runtime/model/families/Qwen4.mm \
 	runtime/model/families/Ornith.mm \
 	runtime/model/families/MiniCpm.mm \
 	runtime/model/families/MiniCpmV.mm \
@@ -423,13 +429,17 @@ ENGINE8_MAIN_OBJECT := $(ENGINE8_BUILD)/main.o
 # dispatch.mm's main() picks the variant; it owns the one embedded build id
 # both serveMain bodies read through richengineBuildId().
 DISPATCH_OBJECT := $(ENGINE_BUILD)/dispatch.o
+# The CoreAI split's Swift bridge (runtime/ops/CoreAiShim.swift): the
+# framework exposes no C symbols, so ops::CoreAiFfn dlopens this dylib,
+# which sits beside the binary and only loads where CoreAI exists.
+COREAI_SHIM := $(BUILD)/librichengine_coreai.dylib
 VERIFY8_CONFIG_TARGETS := $(ENGINE8_OBJECTS) $(ENGINE8_MAIN_OBJECT) \
 	$(ENGINE8_LIBRARY) $(VERIFY8_AIRS) $(LIB8)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 	$(TUNE_OBJECTS) $(TUNE_MAIN_OBJECT) \
 	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET) $(TUNE_TOOL) \
-	$(DISPATCH_OBJECT)
+	$(DISPATCH_OBJECT) $(COREAI_SHIM)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE8_OBJECTS:.o=.d) \
 	$(ENGINE_MAIN_OBJECT:.o=.d) $(ENGINE8_MAIN_OBJECT:.o=.d) \
 	$(DISPATCH_OBJECT:.o=.d) \
@@ -527,6 +537,10 @@ $(TARGET): $(DISPATCH_OBJECT) $(ENGINE_MAIN_OBJECT) $(ENGINE8_MAIN_OBJECT) \
 		$(ENGINE_MAIN_OBJECT) $(ENGINE8_MAIN_OBJECT) \
 		$(ENGINE_LIBRARY) $(ENGINE8_LIBRARY) \
 		$(ENGINE_FAMILY_OBJECTS) $(ENGINE8_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
+$(COREAI_SHIM): runtime/ops/CoreAiShim.swift | $(BUILD)
+	swiftc -O -emit-library $< -o $@ -module-name RichengineCoreAi \
+		-framework CoreAI -framework Metal
 
 clean:
 	rm -rf $(BUILD)

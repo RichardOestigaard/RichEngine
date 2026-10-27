@@ -171,8 +171,12 @@ struct AneFfnGguf {
 
 // One simdgroup per weight row, ANE_FFN_WEIGHT_ROWS rows x one rotation block
 // of K * 128 inputs per threadgroup: the int8 rows under their shared scale,
-// which the first block also copies into the ANE's scale surface.
-template <uint K, class Source>
+// which the first block also copies into the ANE's scale surface. ROT is the
+// Hadamard of the W8A8 split; the CoreAI split (W8A16, fp16 activations)
+// stages the same int8 rows unrotated and its scale surface holds the value
+// scales the model's dequantize applies directly (row_scale /
+// ANE_FFN_INT8_UNIT).
+template <uint K, class Source, bool ROT>
 inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *c, device const half *row_scale,
                                 device char *output, device half *scale, device const float *sign,
                                 constant AneFfnWeightParams &params, uint2 tile, uint simd_group, uint lane) {
@@ -181,19 +185,20 @@ inline void ane_ffn_weight_rows(device uchar *a, device uchar *b, device uchar *
   for (uint k = 0; k < K; ++k)
     Source::values(value[k], a, b, c, params.groups, params.row + row,
                    params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
-  ane_ffn_rotate_block<K>(value, lane, sign);
+  if constexpr (ROT) ane_ffn_rotate_block<K>(value, lane, sign);
   const float inverse = ANE_FFN_INT8_UNIT / float(row_scale[row]);
   for (uint k = 0; k < K; ++k)
     *(device char4 *)(output + ulong(row) * params.stride + block + k * ANE_FFN_ROTATION_UNIT + lane * 4) =
         char4(clamp(rint(float4(value[k][0], value[k][1], value[k][2], value[k][3]) * inverse), -ANE_FFN_INT8_PEAK,
                     ANE_FFN_INT8_PEAK));
-  if (tile.y == 0 && lane == 0) scale[row * params.scale_stride] = row_scale[row];
+  if (tile.y == 0 && lane == 0)
+    scale[row * params.scale_stride] = ROT ? row_scale[row] : half(float(row_scale[row]) / ANE_FFN_INT8_UNIT);
 }
 
 // Each row's largest weight over inputs [input, input + width) rotated in
 // blocks of K * 128, as the shared scale, times the ANE's ANE_FFN_INT8_UNIT, of
-// ane_ffn_weights and the ANE.
-template <uint K, class Source>
+// ane_ffn_weights and the ANE. ROT as in ane_ffn_weight_rows.
+template <uint K, class Source, bool ROT>
 inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c, device half *row_scale,
                                device const float *sign, constant AneFfnWeightParams &params, uint tile,
                                uint simd_group, uint lane) {
@@ -204,7 +209,7 @@ inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c
     for (uint k = 0; k < K; ++k)
       Source::values(value[k], a, b, c, params.groups, params.row + row,
                      params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
-    ane_ffn_rotate_block<K>(value, lane, sign);
+    if constexpr (ROT) ane_ffn_rotate_block<K>(value, lane, sign);
     for (uint k = 0; k < K; ++k)
       for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[k][e]));
   }
@@ -212,16 +217,17 @@ inline void ane_ffn_row_scales(device uchar *a, device uchar *b, device uchar *c
   if (lane == 0) row_scale[row] = half(max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK * ANE_FFN_INT8_UNIT);
 }
 
-template <uint K>
+template <uint K, bool ROT>
 kernel void ane_ffn_weights(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]], device uchar *c [[buffer(2)]],
     device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]], device half *scale [[buffer(5)]],
     device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
     uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  ane_ffn_weight_rows<K, AneFfnAffine>(a, b, c, row_scale, output, scale, sign, params, tile, simd_group, lane);
+  ane_ffn_weight_rows<K, AneFfnAffine, ROT>(a, b, c, row_scale, output, scale, sign, params, tile, simd_group,
+                                            lane);
 }
 // The GGUF variants run the body of the dispatch's format.
-template <uint K>
+template <uint K, bool ROT>
 kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
     device uchar *c [[buffer(2)]], device const half *row_scale [[buffer(3)]], device char *output [[buffer(4)]],
     device half *scale [[buffer(5)]], device const float *sign [[buffer(6)]],
@@ -229,24 +235,25 @@ kernel void ane_ffn_weights_gguf(device uchar *a [[buffer(0)]], device uchar *b 
     uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   quant_format_switch(params.format, [&](auto format) {
-    ane_ffn_weight_rows<K, AneFfnGguf<decltype(format)>>(a, b, c, row_scale, output, scale, sign, params, tile,
-                                                         simd_group, lane);
+    ane_ffn_weight_rows<K, AneFfnGguf<decltype(format)>, ROT>(a, b, c, row_scale, output, scale, sign, params,
+                                                              tile, simd_group, lane);
   });
 }
-template <uint K>
+template <uint K, bool ROT>
 kernel void ane_ffn_row_scale(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
     device uchar *c [[buffer(2)]], device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
     constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  ane_ffn_row_scales<K, AneFfnAffine>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
+  ane_ffn_row_scales<K, AneFfnAffine, ROT>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
 }
-template <uint K>
+template <uint K, bool ROT>
 kernel void ane_ffn_row_scale_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
     device uchar *c [[buffer(2)]], device half *row_scale [[buffer(3)]], device const float *sign [[buffer(4)]],
     constant AneFfnWeightParams &params [[buffer(5)]], uint tile [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   quant_format_switch(params.format, [&](auto format) {
-    ane_ffn_row_scales<K, AneFfnGguf<decltype(format)>>(a, b, c, row_scale, sign, params, tile, simd_group, lane);
+    ane_ffn_row_scales<K, AneFfnGguf<decltype(format)>, ROT>(a, b, c, row_scale, sign, params, tile, simd_group,
+                                                             lane);
   });
 }
 
@@ -258,17 +265,33 @@ using AneFfnRowScaleKernel = void(device uchar *, device uchar *, device uchar *
 // rows over the ANE's intermediate channels.
 constant constexpr uint kInputUnits = ANE_FFN_INPUT_BLOCK / ANE_FFN_ROTATION_UNIT;
 constant constexpr uint kIntermediateUnits = ANE_FFN_INTERMEDIATE_BLOCK / ANE_FFN_ROTATION_UNIT;
-template [[host_name("ane_ffn_weights_inputs")]] kernel AneFfnWeightsKernel ane_ffn_weights<kInputUnits>;
-template [[host_name("ane_ffn_weights_intermediate")]] kernel AneFfnWeightsKernel ane_ffn_weights<kIntermediateUnits>;
-template [[host_name("ane_ffn_weights_gguf_inputs")]] kernel AneFfnWeightsKernel ane_ffn_weights_gguf<kInputUnits>;
+template [[host_name("ane_ffn_weights_inputs")]] kernel AneFfnWeightsKernel ane_ffn_weights<kInputUnits, true>;
+template [[host_name("ane_ffn_weights_intermediate")]] kernel AneFfnWeightsKernel
+    ane_ffn_weights<kIntermediateUnits, true>;
+template [[host_name("ane_ffn_weights_gguf_inputs")]] kernel AneFfnWeightsKernel ane_ffn_weights_gguf<kInputUnits, true>;
 template [[host_name("ane_ffn_weights_gguf_intermediate")]] kernel AneFfnWeightsKernel
-    ane_ffn_weights_gguf<kIntermediateUnits>;
-template [[host_name("ane_ffn_row_scale_inputs")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<kInputUnits>;
+    ane_ffn_weights_gguf<kIntermediateUnits, true>;
+template [[host_name("coreai_ffn_weights_inputs")]] kernel AneFfnWeightsKernel ane_ffn_weights<kInputUnits, false>;
+template [[host_name("coreai_ffn_weights_intermediate")]] kernel AneFfnWeightsKernel
+    ane_ffn_weights<kIntermediateUnits, false>;
+template [[host_name("coreai_ffn_weights_gguf_inputs")]] kernel AneFfnWeightsKernel
+    ane_ffn_weights_gguf<kInputUnits, false>;
+template [[host_name("coreai_ffn_weights_gguf_intermediate")]] kernel AneFfnWeightsKernel
+    ane_ffn_weights_gguf<kIntermediateUnits, false>;
+template [[host_name("ane_ffn_row_scale_inputs")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<kInputUnits, true>;
 template [[host_name("ane_ffn_row_scale_intermediate")]] kernel AneFfnRowScaleKernel
-    ane_ffn_row_scale<kIntermediateUnits>;
-template [[host_name("ane_ffn_row_scale_gguf_inputs")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale_gguf<kInputUnits>;
+    ane_ffn_row_scale<kIntermediateUnits, true>;
+template [[host_name("ane_ffn_row_scale_gguf_inputs")]] kernel AneFfnRowScaleKernel
+    ane_ffn_row_scale_gguf<kInputUnits, true>;
 template [[host_name("ane_ffn_row_scale_gguf_intermediate")]] kernel AneFfnRowScaleKernel
-    ane_ffn_row_scale_gguf<kIntermediateUnits>;
+    ane_ffn_row_scale_gguf<kIntermediateUnits, true>;
+template [[host_name("coreai_ffn_row_scale_inputs")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<kInputUnits, false>;
+template [[host_name("coreai_ffn_row_scale_intermediate")]] kernel AneFfnRowScaleKernel
+    ane_ffn_row_scale<kIntermediateUnits, false>;
+template [[host_name("coreai_ffn_row_scale_gguf_inputs")]] kernel AneFfnRowScaleKernel
+    ane_ffn_row_scale_gguf<kInputUnits, false>;
+template [[host_name("coreai_ffn_row_scale_gguf_intermediate")]] kernel AneFfnRowScaleKernel
+    ane_ffn_row_scale_gguf<kIntermediateUnits, false>;
 
 // Whether `value` is an infinity or a NaN, by its exponent bits: fast math
 // may fold isfinite() to true.
@@ -311,4 +334,28 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     const uint index = (row + j) * params.hidden + channel + position.x;
     output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
   }
+}
+
+// The CoreAI split reads its activation input fp16 off the same normalized
+// bf16 surface the GPU path writes; one thread per element, rows * hidden.
+kernel void coreai_ffn_cast(device const bfloat *input [[buffer(0)]],
+                            device half *output [[buffer(1)]],
+                            constant CoreAiFfnParams &params [[buffer(2)]],
+                            uint i [[thread_position_in_grid]]) {
+  if (i >= params.rows * params.hidden) return;
+  output[i] = half(float(input[i]));
+}
+
+// output[t][c] += y[t][c] in fp32 for rows t < rows, a y value of the chunk
+// that is not finite setting `status` for the host to read once the command
+// completes.
+kernel void coreai_ffn_join(device bfloat *output [[buffer(0)]],
+                            device const half *y [[buffer(1)]],
+                            device atomic_uint *status [[buffer(2)]],
+                            constant CoreAiFfnParams &params [[buffer(3)]],
+                            uint i [[thread_position_in_grid]]) {
+  if (i >= params.rows * params.hidden) return;
+  const half value = y[i];
+  if (ane_ffn_not_finite(value)) atomic_store_explicit(status, 1u, memory_order_relaxed);
+  output[i] = bfloat(float(output[i]) + float(value));
 }

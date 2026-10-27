@@ -234,8 +234,15 @@ inline   MetalBuffer Runtime::Impl::synchronizedPageTable(Request &entry,
       else if (binding.revision + 1 == item.pageTableRevision)
         first = std::min(item.pageTableFirstChanged, size);
     }
-    if (first < size)
+    if (first < size) {
       kvPages.writeEntries(item.pageTable, first, destination);
+      // The block index rides the same revision: its entries name the same
+      // pages, an extent's index plane instead of its data.
+      if (kvPages.layout().indexDimension)
+        kvPages.writeIndexEntries(
+            item.pageTable, first,
+            decodeArena->get(entry.stateLane, DecodeTensor::IndexTable));
+    }
     binding = {entry.id, item.pageTableRevision};
     return destination;
   }
@@ -294,6 +301,17 @@ inline   void Runtime::Impl::bindPageTables(
       pageTables[lane] =
           decodeArena->get(laneEntry(entries, lane).stateLane,
                            DecodeTensor::PageTable);
+  }
+
+inline   void Runtime::Impl::bindIndexTables(
+      std::span<Request *const> entries,
+      std::array<MetalBuffer, kLaneCount> &indexTables) const {
+    if (!kvPages.layout().indexDimension)
+      return;
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+      indexTables[lane] =
+          decodeArena->get(laneEntry(entries, lane).stateLane,
+                           DecodeTensor::IndexTable);
   }
 
 inline   void Runtime::Impl::bindGdnStates(

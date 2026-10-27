@@ -256,7 +256,7 @@ private:
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<ops::FfnSplit> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
@@ -275,7 +275,7 @@ private:
   std::unique_ptr<KvPageTier> kvTier_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
-  std::unique_ptr<ops::AneFfn> aneFfn_;
+  std::unique_ptr<ops::FfnSplit> aneFfn_;
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;

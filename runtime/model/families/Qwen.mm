@@ -1,3 +1,4 @@
+#include "model/DescriptorChecks.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetWeights.hpp"
@@ -102,6 +103,25 @@ ModelDescriptor qwen36Descriptor(std::string name) {
                              qwenVisionLayout(target.hiddenSize));
 }
 
+// Ornith's own policy on the same qwen3_6moe target: measured on its
+// released DFlashV1 draft (M5 Pro, decode ABBA). A 12-proposal cap lands
+// +4-6% at B1-B4 — the flat acceptance tail past position 11 pays verify
+// rows it never returns — and baked indirect dispatch measures a few
+// points behind direct encoding on this step graph.
+ModelDescriptor ornith36Descriptor(std::string name) {
+  const TargetLayout target = qwen36MoeTargetLayout();
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
+                          qwenVisionLayout(target.hiddenSize));
+  descriptor.tuning.proposalCap = 12;
+  descriptor.tuning.icbOff = true;
+  // The in-command chained predraft: neutral-to-good here (the host gap a
+  // second command would overlap is thin), a measured -2..4% on Ornith-9B
+  // whose ANE FFN handoff widens that gap — so it is opt-in per family.
+  descriptor.tuning.chainPredraft = true;
+  return descriptor;
+}
+
 // What was kModelFamilies' qwen3_5 rows: the 27B (plus its Bonsai legacy
 // alias) and both 35B-A3B family names.
 // The registry's erased-signature entry for the qwen3_8 target.
@@ -121,19 +141,35 @@ TargetWeights loadQwen36MoeTarget(metal::MetalBackend &backend,
 const bool kRegisteredQwenFamilies = [] {
   registerTargetArch({"qwen3_8", &loadQwen38Target});
   registerTargetArch({"qwen3_6moe", &loadQwen36MoeTarget});
-  registerModelFamily({"Qwen3.8-27B", "qwen3_5_text", "", &qwen38Descriptor,
-                       &qwen38DraftLayout, nullptr});
+  registerModelFamily({.name = "Qwen3.8-27B", .modelType = "qwen3_5_text",
+                       .legacyType = "",
+                       .makeDescriptor = &qwen38Descriptor,
+                       .draftLayout = &qwen38DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText,
+                       .servesVisionTower = true});
   // Legacy alias: packages assembled while Bonsai-2-27B was its own
   // family name still resolve — it is the Qwen3.8 architecture and the
   // installer no longer offers it. The parity test exempts this row.
-  registerModelFamily({"Bonsai-2-27B", "qwen3_5_text", "", &qwen38Descriptor,
-                       &qwen38DraftLayout, nullptr});
-  registerModelFamily({"Qwen3.6-35B-A3B", "qwen3_5_moe_text", "",
-                       &qwen36Descriptor, &qwen36DraftLayout,
-                       &qwen36DFlashV1DraftLayout});
-  registerModelFamily({"Ornith-1.5-35B-A3B", "qwen3_5_moe_text", "",
-                       &qwen36Descriptor, &qwen36DraftLayout,
-                       &qwen36DFlashV1DraftLayout});
+  registerModelFamily({.name = "Bonsai-2-27B", .modelType = "qwen3_5_text",
+                       .legacyType = "",
+                       .makeDescriptor = &qwen38Descriptor,
+                       .draftLayout = &qwen38DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText,
+                       .servesVisionTower = true});
+  registerModelFamily({.name = "Qwen3.6-35B-A3B",
+                       .modelType = "qwen3_5_moe_text", .legacyType = "",
+                       .makeDescriptor = &qwen36Descriptor,
+                       .draftLayout = &qwen36DraftLayout,
+                       .dflashV1Layout = &qwen36DFlashV1DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText,
+                       .servesVisionTower = true});
+  registerModelFamily({.name = "Ornith-1.5-35B-A3B",
+                       .modelType = "qwen3_5_moe_text", .legacyType = "",
+                       .makeDescriptor = &ornith36Descriptor,
+                       .draftLayout = &qwen36DraftLayout,
+                       .dflashV1Layout = &qwen36DFlashV1DraftLayout,
+                       .refineSourceConfig = &refineQwenSourceText,
+                       .servesVisionTower = true});
   return true;
 }();
 

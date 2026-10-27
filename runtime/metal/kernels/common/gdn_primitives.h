@@ -160,18 +160,21 @@ inline uint gdn_output_head(uint head, bool tiled) {
 // dispatches one task per threadgroup; decode runs gdn_decode_gate, which
 // reproduces these rows bitwise. The norm weights are read in their stored
 // type W: bfloat in the packed formats, float for a GGUF's F32 norms.
+// `flags` is GDNGatePrefillParams': GDN_TILED_HEADS the output's head order,
+// GDN_SIGMOID_GATE sigmoid(z) gating instead of silu(z) (qwen4exp).
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, class W>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const W *norm_weight, device bfloat *hidden, uint task,
-               bool tiled, threadgroup float *scratch, uint thread_index,
+               uint flags, threadgroup float *scratch, uint thread_index,
                uint lane, uint simd_group) {
   constexpr uint Simdgroups = 4, ZOffset = ConvDim;
   static_assert(HeadDim == Simdgroups * 32, "one thread per dimension");
   uint token = task / ValueHeads;
   uint head = task % ValueHeads;
   ulong base = ulong(task) * HeadDim;
+  const bool tiled = (flags & GDN_TILED_HEADS) != 0;
   ulong hidden_base =
       (ulong(token) * ValueHeads +
        gdn_output_head<KeyHeads, ValueHeads>(head, tiled)) *
@@ -183,6 +186,8 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = richengine_silu(gate);
-  hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
+  const float activation = (flags & GDN_SIGMOID_GATE)
+                               ? richengine_sigmoid(gate)
+                               : richengine_silu(gate);
+  hidden[hidden_base + thread_index] = bfloat(float(normalized) * activation);
 }

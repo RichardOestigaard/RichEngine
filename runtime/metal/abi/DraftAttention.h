@@ -43,10 +43,14 @@ struct DraftAttentionBatchParams {
   // (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
   uint32_t query_rows;
   uint32_t cache_length[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  // Nonzero: the split kernel takes each lane's cache length from the
+  // bound DecodeStepPackLane block (the chained predraft, whose lengths
+  // the encode could not know) instead of this payload.
+  uint32_t device_pack;
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 36,
-              "Draft attention parameters are 36 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 40,
+              "Draft attention parameters are 40 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

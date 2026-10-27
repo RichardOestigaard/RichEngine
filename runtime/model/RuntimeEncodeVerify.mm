@@ -1,6 +1,16 @@
 #include "model/RuntimeImpl.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "metal/abi/BlockIndexer.h"
+#include "metal/abi/NgramEmbedding.h"
 
 namespace richengine::model {
+
+namespace {
+// A verify lane's record slots: the blocks its verifyRows can complete.
+constexpr uint32_t kQsaVerifyLaneRecords =
+    (RICHENGINE_TARGET_VERIFY_ROWS + BLOCK_INDEXER_BLOCK - 1) /
+    BLOCK_INDEXER_BLOCK;
+}  // namespace
 
   void Runtime::Impl::encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
@@ -134,6 +144,32 @@ namespace richengine::model {
                      static_cast<uint32_t>(items[lane].pageTable.size()),
                      geometry.draft.verifyRows());
     bindPageTables(entries, buffers.pageTables);
+    bindIndexTables(entries, buffers.indexTables);
+    // Each lane's QSA block records (upstream prepareVerifyLane's
+    // writeBlocks): one per block whose last token is a verify row, its
+    // first token's position and M-RoPE coordinates.
+    std::array<BlockIndexerBlock, kLaneCount * kQsaVerifyLaneRecords>
+        qsaBlocks{};
+    if (geometry.target.kvLayout.indexDimension) {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint64_t position = items[lane].logicalPosition;
+        uint32_t count = 0;
+        for (uint64_t last = position;
+             last < position + geometry.draft.verifyRows(); ++last) {
+          if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1)
+            continue;
+          const uint64_t first = last - (BLOCK_INDEXER_BLOCK - 1);
+          const std::array<uint32_t, 3> rotary =
+              ropePosition(*entries[lane], first);
+          qsaBlocks[lane * kQsaVerifyLaneRecords + count++] =
+              {static_cast<uint32_t>(first),
+               {rotary[0], rotary[1], rotary[2]}};
+        }
+      }
+      buffers.qsaBlocks =
+          std::span<const BlockIndexerBlock>(qsaBlocks.data(),
+                                             kLaneCount * kQsaVerifyLaneRecords);
+    }
     if (gdnLayers)
       bindGdnStates(entries, buffers.currentGdnStates,
                     buffers.nextGdnStates);
@@ -360,9 +396,32 @@ namespace richengine::model {
           liveRows);
       return;
     }
+    // qwen4exp's PLE hash reads each lane's pleNgram - 1 tokens before its
+    // first verify row (upstream Qwen4Steps::prepareVerifyLane's
+    // plePriorTokens); underflow lanes get the none id.
+    MetalBuffer plePriorTokens;
+    if (const auto *qwen4 =
+            std::get_if<Qwen4ExpWeights>(&package.target)) {
+      const uint32_t priors = qwen4->layout.pleNgram - 1;
+      plePriorTokens =
+          decodeArena->packed(DecodeTensor::PlePriorTokens, lanes);
+      auto *priorTokens =
+          contents<uint32_t>(plePriorTokens, "PLE prior tokens");
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint64_t position = items[lane].logicalPosition;
+        const std::span<const uint32_t> request =
+            items[lane].requestTokens;
+        for (uint32_t back = 1; back <= priors; ++back)
+          priorTokens[lane * priors + back - 1] =
+              position >= back && position - back < request.size()
+                  ? request[position - back]
+                  : NGRAM_EMBEDDING_NONE;
+      }
+    }
     targetModel.addVerifyInput(
         graph, draftInput, proposals, verifyInput, lanes,
-        geometry.draft.verifyRows(), geometry.draft.queryRows(), liveRows);
+        geometry.draft.verifyRows(), geometry.draft.queryRows(), liveRows,
+        std::move(plePriorTokens));
   }
 
   void Runtime::Impl::encodeBatchStepPack(

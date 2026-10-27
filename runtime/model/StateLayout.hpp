@@ -22,6 +22,11 @@ struct GdnStateLayout final {
   uint32_t recurrentGroups = 0;
   uint32_t recurrentRows = 0;
   uint32_t recurrentColumns = 0;
+  // Bytes after the recurrent matrix that the cell keeps for a layer's other
+  // state: qwen4exp's PLE convolution history and its QSA indexer's pending
+  // keys (TargetLayout::pleHistoryBytes + indexerPendingBytes). Zero on
+  // every recurrent target without them.
+  uint64_t auxiliaryBytes = 0;
 
   // A pure dense target carries no recurrent layers (layers == 0); LFM2's
   // convolutions keep the FIFO but no recurrent matrix (zero rows and
@@ -55,7 +60,7 @@ struct GdnStateLayout final {
     return uint64_t{layers} * recurrentLayerBytes();
   }
   [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
-    return convolutionBytes() + recurrentBytes();
+    return convolutionBytes() + recurrentBytes() + auxiliaryBytes;
   }
 
   bool operator==(const GdnStateLayout &) const = default;

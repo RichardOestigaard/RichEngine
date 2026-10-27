@@ -1306,6 +1306,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     item.pageTable = pageTable.pages;
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
+    item.requestTokens = active.exactTokens;
     if (plan.kind == WorkKind::Prefill) {
       item.inputTokens =
           std::span<const uint32_t>(active.exactTokens)

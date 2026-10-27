@@ -304,8 +304,8 @@ template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
 inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim, Rows> &shared,
                             device const bfloat *packed,
                             device const W *norm_weight, device bfloat *hidden,
-                            bool tiled, uint value_head, uint lane,
-                            uint token) {
+                            bool tiled, bool sigmoid, uint value_head,
+                            uint lane, uint token) {
 #pragma clang fp reassociate(off)
   constexpr uint Groups = HeadDim / 32;
   constexpr uint ZOffset = ConvDim;
@@ -330,8 +330,12 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim, Rows> &shared,
     const uint dim = 32 * g + lane;
     const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));
     const float z = float(gate[g]);
-    const bfloat gated = bfloat((float(normalized) * z) /
-                                (1.0f + fast::exp2(-1.44269504089f * z)));
+    // GDN_SIGMOID_GATE (qwen4exp): the normalized row takes sigmoid(z), the
+    // same product the prefill gate's richengine_sigmoid branch emits.
+    const bfloat gated =
+        sigmoid ? bfloat(float(normalized) * richengine_sigmoid(z))
+                : bfloat((float(normalized) * z) /
+                         (1.0f + fast::exp2(-1.44269504089f * z)));
     hidden[hidden_base + dim] = gated;
     shared.rows[token * HeadDim + dim] = gated;
   }
@@ -729,12 +733,13 @@ inline void gdn_decode_batch_phase(
                                          lane, simd_group, tokens, pending,
                                          tape_step);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const bool tiled = params.tiled_heads != 0;
+  const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
+  const bool sigmoid = (params.flags & GDN_SIGMOID_GATE) != 0;
   const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
   for (uint token = simd_group; token < stride; token += kDecodeSimdgroups) {
     gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-        shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
-        token);
+        shared, packed, gdn_norm_weight, lane_hidden, tiled, sigmoid, group.x,
+        lane, token);
     if (table) {
       // Each group owns this head for every row; each simdgroup writes
       // the table of the row it just gated. The write_row reads stay
@@ -1055,11 +1060,12 @@ inline void gdn_decode_tree_batch_phase(
                                               count, group.x, lane,
                                               simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const bool tiled = params.tiled_heads != 0;
+  const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
+  const bool sigmoid = (params.flags & GDN_SIGMOID_GATE) != 0;
   for (uint token = simd_group; token < Rows; token += kDecodeSimdgroups) {
     gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
-        shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
-        token);
+        shared, packed, gdn_norm_weight, lane_hidden, tiled, sigmoid, group.x,
+        lane, token);
   }
   if (table) {
     // As above: every simdgroup tables only the rows it gated itself, so

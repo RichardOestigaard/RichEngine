@@ -138,6 +138,13 @@ enum class DecodeTensor : uint32_t {
   VerifyBetaBase,
   ChunkKeysBase,
   ChunkValuesBase,
+  // A lane's pages' block index: an entry per logical page, the RichKvPage
+  // of the index plane (PageStorage::writeIndexEntries). Allocated only
+  // when the kv layout has an index plane (qwen4exp's QSA).
+  IndexTable,
+  // A verify lane's pleNgram - 1 prior tokens, the PLE hash's tail inputs
+  // (qwen4exp; addVerifyInput's trailing argument). 0 bytes elsewhere.
+  PlePriorTokens,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -278,6 +285,13 @@ public:
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
                                                  const ops::ExecutionPlans &operators);
+  // The packed lanes a `lanes`-wide draft forward binds: its AF4-block
+  // projections pad rows to the staged tile like the target's do, so an
+  // affine target's decodeStorageLanes under-slices them (three lanes'
+  // 24 rows stage a 32-row tile on MiniCPM5-2B/Qwen3.8-27B).
+  static uint32_t draftStorageLanes(const RuntimeGeometry &geometry,
+                                    const ops::ExecutionPlans &operators,
+                                    uint32_t lanes);
 
   [[nodiscard]] metal::MetalBuffer gateScratch() const { return gateScratch_; }
 
