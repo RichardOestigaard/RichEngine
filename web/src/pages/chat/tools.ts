@@ -21,6 +21,7 @@ export const TOOL_HINTS: Record<ToolId, string> = {
 };
 
 const TOOLS_KEY = "richengine:chat-tools";
+const STRICT_BROKEN_KEY = "richengine:chat-tools-strict-broken";
 const MEMORY_KEY = "richengine:memory";
 const SEARCH_PROVIDER_KEY = "richengine:search-provider";
 const SEARCH_API_KEY_KEY = "richengine:search-api-key";
@@ -133,10 +134,57 @@ interface ToolDef {
     name: string;
     description: string;
     parameters: Record<string, unknown>;
-    // Not strict: a strict tool's arguments are grammar-generated, which
-    // fails on dialects whose call markup is a special token (minicpm5).
-    // Free-form calls still read back type-converted by the schema.
+    // Strict: the arguments are grammar-generated to the schema, which
+    // guarantees a parseable call. A model whose dialect rejects the
+    // grammar marks itself broken once in strictBrokenFor() and goes
+    // free-form — free-form calls still read back type-converted.
+    strict?: boolean;
   };
+}
+
+/* The models a strict-tool request failed on, remembered so their chats go
+   free-form from then on: the grammar a dialect cannot serve rejects the
+   request itself, which isStrictRejection detects and the caller retries
+   without strict once. Keys are served model names. */
+function strictBrokenSet(): Record<string, boolean> {
+  try {
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(STRICT_BROKEN_KEY) ?? "{}"
+    );
+    if (stored && typeof stored === "object")
+      return stored as Record<string, boolean>;
+  } catch {
+    /* Storage disabled or corrupt: strict is tried again. */
+  }
+  return {};
+}
+
+export function strictBrokenFor(model: string | undefined): boolean {
+  return Boolean(model && strictBrokenSet()[model]);
+}
+
+export function markStrictBroken(model: string | undefined): void {
+  if (!model) return;
+  const broken = strictBrokenSet();
+  broken[model] = true;
+  try {
+    localStorage.setItem(STRICT_BROKEN_KEY, JSON.stringify(broken));
+  } catch {
+    /* The mark only has to hold for this tab. */
+  }
+}
+
+/* Whether a failed chat request blames the constraint a strict tool added:
+   a 400 whose code names the grammar, or whose message does. Only trusted
+   while strict tools were on the request. */
+export function isStrictRejection(
+  status: number,
+  error: { message?: string; code?: string | null } | null
+): boolean {
+  if (status !== 400 || !error) return false;
+  if (error.code === "invalid_constraint" || error.code === "constraint_error")
+    return true;
+  return /strict|grammar|constrain/i.test(error.message ?? "");
 }
 
 const DEFS: { id: ToolId; def: ToolDef }[] = [
@@ -245,9 +293,17 @@ const DEFS: { id: ToolId; def: ToolDef }[] = [
   },
 ];
 
-export function activeTools(): ToolDef[] {
+export function activeTools(model?: string): ToolDef[] {
   const on = toolsEnabled();
-  return DEFS.filter((entry) => on[entry.id]).map((entry) => entry.def);
+  const strict = !strictBrokenFor(model);
+  return DEFS.filter((entry) => on[entry.id]).map((entry) =>
+    strict
+      ? {
+          type: "function" as const,
+          function: { ...entry.def.function, strict: true },
+        }
+      : entry.def
+  );
 }
 
 /* What the tool chip shows next to the tool name while it runs. */

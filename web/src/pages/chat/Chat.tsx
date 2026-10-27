@@ -29,7 +29,7 @@ import {
   SYSTEM_KEY,
 } from "./storage";
 import { displayContent } from "./markdown";
-import { activeTools, runTool, toolDetail } from "./tools";
+import { activeTools, isStrictRejection, markStrictBroken, runTool, toolDetail } from "./tools";
 import type { Attachment, Message, MessageContent, ModelInfo, QueuedTurn, ToolRun, Usage } from "./types";
 import Sidebar from "./Sidebar";
 import Composer from "./Composer";
@@ -772,7 +772,7 @@ export default function Chat() {
       // carries the assistant's calls and their results until the model
       // answers. Neither side of that transcript is stored or shown.
       const wire = requestMessages(messages());
-      const tools = activeTools();
+      let tools = activeTools(model());
       if (tools.some((tool) => tool.function.name === "memory_save")) {
         const note =
           "This chat has built-in memory tools: memory_save stores a fact " +
@@ -799,14 +799,25 @@ export default function Chat() {
             stream_options: { include_usage: true },
             ...(model() ? { model: model() } : {}),
             ...(effort() ? { reasoning_effort: effort() } : {}),
-            ...(tools.length ? { tools } : {}),
+            ...(tools.length ? { tools, parallel_tool_calls: false } : {}),
           }),
           signal: ctrl.signal,
         });
         if (!response.ok) {
           const body = (await response.json().catch(() => null)) as {
-            error?: { message?: string };
+            error?: { message?: string; code?: string | null };
           } | null;
+          // A strict tool's grammar may be unservable on the model's call
+          // dialect: the model marks itself strict-broken and the request
+          // retries free-form once.
+          if (
+            tools.some((tool) => tool.function.strict) &&
+            isStrictRejection(response.status, body?.error ?? null)
+          ) {
+            markStrictBroken(model());
+            tools = activeTools(model());
+            continue;
+          }
           throw new Error(body?.error?.message || response.statusText);
         }
         const reader = response.body!.getReader();
