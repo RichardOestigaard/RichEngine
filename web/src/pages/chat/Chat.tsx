@@ -18,6 +18,7 @@ import {
   conversations,
   deleteConversation,
   persistChat,
+  pinConversation,
   renameConversation,
   requestMessages,
   statsText,
@@ -174,7 +175,8 @@ export default function Chat() {
   function saveDraft() {
     try {
       const text = input();
-      if (text) sessionStorage.setItem(draftKey(activeId()), text);
+      // A lone "/" is menu residue from the focus shortcut, not a draft.
+      if (text && text !== "/") sessionStorage.setItem(draftKey(activeId()), text);
       else sessionStorage.removeItem(draftKey(activeId()));
     } catch {
       /* Storage disabled or full: the draft stays in memory. */
@@ -455,6 +457,18 @@ export default function Chat() {
     inputEl?.focus();
   }
 
+  /* Alt+Arrow on a queue row reorders the pending sends. */
+  function moveQueued(turn: QueuedTurn, dir: -1 | 1) {
+    setQueued((list) => {
+      const index = list.indexOf(turn);
+      const target = index + dir;
+      if (index < 0 || target < 0 || target >= list.length) return list;
+      const next = [...list];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
   function paintStats(box: HTMLElement, assistant: Message) {
     const stats = box.querySelector<HTMLElement>(".stats");
     if (!stats) return;
@@ -506,7 +520,6 @@ export default function Chat() {
     const stats = box?.querySelector<HTMLElement>(".stats");
     const progress = chunk.prompt_progress;
     if (
-      stats &&
       progress &&
       Number.isFinite(progress.processed) &&
       Number.isFinite(progress.total)
@@ -514,8 +527,14 @@ export default function Chat() {
       const cached = progress.cache
         ? ` (${progress.cache.toLocaleString()} cached)`
         : "";
-      stats.textContent = `Prefill ${progress.processed!.toLocaleString()}/${progress.total!.toLocaleString()} tok${cached}`;
-      stats.hidden = false;
+      const text = `Prefill ${progress.processed!.toLocaleString()}/${progress.total!.toLocaleString()} tok${cached}`;
+      if (stats) {
+        stats.textContent = text;
+        stats.hidden = false;
+      }
+      // The waiting bubble shows the same progress while nothing renders.
+      const waitingMsg = box?.querySelector<HTMLElement>(".waiting-msg");
+      if (waitingMsg) waitingMsg.textContent = text;
     }
     const speed = Number(chunk.metrics?.request_latency?.stream_tokens_per_second);
     if (Number.isFinite(speed) && speed > 0) assistant.tps = speed;
@@ -828,8 +847,25 @@ export default function Chat() {
           stats.textContent = `Queued · ${pending - 1} ahead`;
           stats.hidden = false;
         }
+        const waitingMsg = liveBox.el.querySelector<HTMLElement>(".waiting-msg");
+        if (waitingMsg) waitingMsg.textContent = `Queued · ${pending - 1} ahead`;
       }
     }, 600);
+    /* "Thinking… 4s" ticks on the reasoning fold while it streams; once the
+       clock stops it holds the final span until the turn commits. */
+    const thinkTimer = window.setInterval(() => {
+      const label = liveBox?.el.querySelector<HTMLElement>(".think-label");
+      if (!label || !state.thinkStart) return;
+      const done = assistant.think_secs;
+      const whole = Math.floor(
+        done ?? (performance.now() - state.thinkStart) / 1000
+      );
+      const span =
+        whole >= 60 ? `${Math.floor(whole / 60)}m ${whole % 60}s` : `${whole}s`;
+      const text =
+        done === undefined ? `Thinking… ${span}` : `Thought for ${span}`;
+      if (label.textContent !== text) label.textContent = text;
+    }, 500);
     try {
       // The wire history differs from the display one mid-turn: it also
       // carries the assistant's calls and their results until the model
@@ -980,12 +1016,22 @@ export default function Chat() {
       if (state.thinkStart && assistant.think_secs === undefined)
         assistant.think_secs = (performance.now() - state.thinkStart) / 1000;
       const label = assistant.stopped ? "stopped" : "interrupted";
+      // A cut-off turn can leave tool chips spinning; close them out.
+      let unfinished = false;
+      for (const run of assistant.tool_runs ?? [])
+        if (run.status === "running") {
+          run.status = "error";
+          run.result ??= `${label === "stopped" ? "Stopped" : "Interrupted"} before the tool finished`;
+          unfinished = true;
+        }
+      if (unfinished) paintToolRuns(assistant);
       assistant.stats = statsText(assistant, contextLen()) || label;
       finishLive(assistant);
       announce(`Response ${label}`);
       commitAssistant(assistant, firstPrompt);
     } finally {
       window.clearTimeout(queueTimer);
+      window.clearInterval(thinkTimer);
       setController(undefined);
       liveBox = undefined;
       // A deliberate stop parks the queue back in the draft instead of
@@ -1311,6 +1357,8 @@ export default function Chat() {
       ) {
         event.preventDefault();
         inputEl?.focus();
+        // An empty box takes the "/" itself so the command menu opens.
+        if (!input()) setInput("/");
         return;
       }
       if (event.key !== "Escape") return;
@@ -1392,6 +1440,12 @@ export default function Chat() {
         onOpen={openChat}
         onDelete={onDeleteConversation}
         onRename={(id, title) => renameConversation(id, title)}
+        onPin={(id) =>
+          pinConversation(
+            id,
+            !conversations().find((item) => item.id === id)?.pinned
+          )
+        }
       />
       <div class="scrim" onClick={() => setMenuOpen(false)} />
       <button
@@ -1459,11 +1513,43 @@ export default function Chat() {
           <Show when={!messages().length}>
             <div id="empty">
               How can I help?
+              <div class="starters">
+                <For
+                  each={[
+                    "Explain DNS like I'm five",
+                    "Write a haiku about compilers",
+                    "Draft a standup update from rough notes",
+                  ]}
+                >
+                  {(prompt) => (
+                    <button
+                      type="button"
+                      class="starter"
+                      onClick={() => {
+                        setInput(prompt);
+                        inputEl?.focus();
+                      }}
+                    >
+                      {prompt}
+                    </button>
+                  )}
+                </For>
+              </div>
               <div class="empty-hints">
                 <span>⌘K commands</span>
+                <span>/ for slash commands</span>
                 <span>Drop images or PDFs to attach</span>
-                <span>/ focuses the composer</span>
               </div>
+              {/* Which model answers and how much room it has — the
+                  readiness signal the blank page otherwise lacks. */}
+              <Show when={currentModel()?.id}>
+                <div class="empty-model muted">
+                  Ready with {currentModel()!.id}
+                  {contextLen()
+                    ? ` · ${contextLen().toLocaleString()} ctx`
+                    : ""}
+                </div>
+              </Show>
             </div>
           </Show>
           <For each={messages()}>{(message) => <MessageView msg={message} />}</For>
@@ -1513,6 +1599,7 @@ export default function Chat() {
         queued={queued()}
         onRemoveQueued={removeQueued}
         onEditQueued={editQueued}
+        onMoveQueued={moveQueued}
         attachments={attachments()}
         attachmentsVersion={attachmentsVersion()}
         imagesAccepted={imagesAccepted()}

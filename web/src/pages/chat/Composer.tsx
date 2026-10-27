@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { storageGet } from "../../api";
 import { pushToast } from "../../toast";
 import { MODEL_KEY } from "./storage";
@@ -24,12 +24,34 @@ const EFFORT_LABELS: Record<string, string> = {
   none: "Off",
 };
 
+interface SlashItem {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+const SLASH_COMMANDS = [
+  { name: "new", hint: "Start a new chat" },
+  { name: "think", hint: "Set thinking effort" },
+  { name: "model", hint: "Pick a model" },
+  { name: "json", hint: "Toggle JSON output" },
+];
+
+const EFFORT_ITEMS: SlashItem[] = [
+  { id: "", label: "Default", hint: "Server default" },
+  { id: "xhigh", label: "XHigh", hint: "Maximum reasoning" },
+  { id: "medium", label: "Medium", hint: "Balanced reasoning" },
+  { id: "low", label: "Low", hint: "Light reasoning" },
+  { id: "none", label: "Off", hint: "No reasoning" },
+];
+
 export default function Composer(props: {
   running: boolean;
   canSend: boolean;
   queued: QueuedTurn[];
   onRemoveQueued(turn: QueuedTurn): void;
   onEditQueued(turn: QueuedTurn): void;
+  onMoveQueued(turn: QueuedTurn, dir: -1 | 1): void;
   attachments: Attachment[];
   attachmentsVersion: number;
   imagesAccepted: boolean;
@@ -57,6 +79,82 @@ export default function Composer(props: {
   let fileInput: HTMLInputElement | undefined;
   let toolsEl: HTMLDivElement | undefined;
   const [toolsOpen, setToolsOpen] = createSignal(false);
+  const [cmdIndex, setCmdIndex] = createSignal(0);
+
+  /* "/cmd" opens the command menu; "/think " and "/model " open a second
+     stage listing that command's argument. Anything else closes it. */
+  const cmdMenu = createMemo((): { stage: string; items: SlashItem[] } | null => {
+    const value = props.input;
+    if (!value.startsWith("/") || value.includes("\n")) return null;
+    const space = value.indexOf(" ");
+    if (space === -1) {
+      const prefix = value.slice(1).toLowerCase();
+      const items = SLASH_COMMANDS.filter((command) =>
+        command.name.startsWith(prefix)
+      ).map((command) => ({
+        id: command.name,
+        label: `/${command.name}`,
+        hint: command.hint,
+      }));
+      return items.length ? { stage: "root", items } : null;
+    }
+    const name = value.slice(1, space);
+    const arg = value.slice(space + 1).trimStart().toLowerCase();
+    if (name === "think") {
+      const items = EFFORT_ITEMS.filter(
+        (item) =>
+          item.label.toLowerCase().includes(arg) || item.id.startsWith(arg)
+      );
+      return items.length ? { stage: "think", items } : null;
+    }
+    if (name === "model") {
+      const items = [
+        { id: "", label: "Default", hint: "Server default" },
+        ...props.models.flatMap((model) =>
+          model?.id
+            ? [
+                {
+                  id: model.id,
+                  label: model.id,
+                  hint: model.context_length
+                    ? `${Number(model.context_length).toLocaleString()} ctx`
+                    : "",
+                },
+              ]
+            : []
+        ),
+      ].filter((item) => item.label.toLowerCase().includes(arg));
+      return items.length ? { stage: "model", items } : null;
+    }
+    return null;
+  });
+
+  // A keystroke that reshapes the menu restarts the highlight at the top.
+  createEffect(() => {
+    cmdMenu();
+    setCmdIndex(0);
+  });
+
+  function cmdPick(item: SlashItem) {
+    const menu = cmdMenu();
+    if (!menu) return;
+    if (menu.stage === "root" && (item.id === "think" || item.id === "model")) {
+      // Submenu commands keep the line open for their argument.
+      props.onInput(`/${item.id} `);
+      return;
+    }
+    // Clear before acting so the command never lands as a saved draft.
+    props.onInput("");
+    if (menu.stage === "root") {
+      if (item.id === "new")
+        window.dispatchEvent(new CustomEvent("richengine:new-chat"));
+      else if (item.id === "json") setJsonOutput(!jsonOutput());
+    } else if (menu.stage === "think") {
+      props.onEffortChange(item.id);
+    } else if (menu.stage === "model") {
+      props.onModelChange(item.id);
+    }
+  }
   const anyToolOn = () =>
     TOOL_IDS.some((id) => toolsEnabled()[id]) || jsonOutput();
 
@@ -156,6 +254,31 @@ export default function Composer(props: {
   function onKeyDown(event: KeyboardEvent) {
     // Safari can end composition before the confirming Enter keydown.
     if (event.isComposing || event.keyCode === 229) return;
+    const menu = cmdMenu();
+    if (menu) {
+      const count = menu.items.length;
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setCmdIndex((i) => (i + 1) % count);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setCmdIndex((i) => (i - 1 + count) % count);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        cmdPick(menu.items[Math.min(cmdIndex(), count - 1)]);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        props.onInput("");
+        return;
+      }
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       props.onSend();
@@ -187,6 +310,20 @@ export default function Composer(props: {
           event.currentTarget.value = "";
         }}
       />
+      {/* A hairline along the box's top edge fills as the draft approaches
+          the context limit — the meter's warn colors without its numbers. */}
+      <Show when={props.tokenPct > 0}>
+        <div class="token-bar" aria-hidden="true">
+          <div
+            class="token-bar-fill"
+            classList={{
+              warn: props.tokenPct >= 80 && props.tokenPct < 95,
+              danger: props.tokenPct >= 95,
+            }}
+            style={{ width: `${props.tokenPct}%` }}
+          />
+        </div>
+      </Show>
       {/* Queued turns wait here, anchored to the box's top edge — out of
           the message log — and send in order once the reply ends. */}
       <Show when={props.queued.length}>
@@ -200,8 +337,16 @@ export default function Composer(props: {
                 <button
                   type="button"
                   class="queue-edit"
-                  title="Edit — pull back into the composer"
+                  title="Edit — pull back into the composer · ⌥↑/⌥↓ to reorder"
+                  aria-label={`Queued message ${i() + 1} — click to edit, Alt arrow keys to reorder`}
                   onClick={() => props.onEditQueued(turn)}
+                  onKeyDown={(event) => {
+                    if (!event.altKey) return;
+                    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                      event.preventDefault();
+                      props.onMoveQueued(turn, event.key === "ArrowUp" ? -1 : 1);
+                    }
+                  }}
                 >
                   <span class="queue-pos">
                     {i() === 0 ? "Next" : `#${i() + 1}`}
@@ -243,6 +388,28 @@ export default function Composer(props: {
             )}
           </For>
         </div>
+      </Show>
+      <Show when={cmdMenu()}>
+        {(menu) => (
+          <div class="slash-pop" role="listbox" aria-label="Slash commands">
+            <For each={menu().items}>
+              {(item, i) => (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={i() === cmdIndex()}
+                  class="slash-row"
+                  classList={{ active: i() === cmdIndex() }}
+                  onMouseEnter={() => setCmdIndex(i())}
+                  onClick={() => cmdPick(item)}
+                >
+                  <span class="slash-label">{item.label}</span>
+                  <span class="slash-hint">{item.hint}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        )}
       </Show>
       <div class="composer">
         <div id="attachments" aria-label="Attachments">

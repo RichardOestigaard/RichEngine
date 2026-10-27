@@ -35,6 +35,14 @@
 .chat-shell #chat { width: min(720px, 100%); margin: auto; padding: 48px 24px 160px }
 .chat-shell #empty { position: fixed; top: calc(50% - 118px + var(--topbar) / 2); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 24px; font-weight: 600; letter-spacing: -.03em; text-align: center }
 .chat-shell .empty-hints { display: flex; flex-wrap: wrap; gap: 4px 16px; justify-content: center; margin-top: 14px; color: var(--muted); font-size: 12.5px; font-weight: 400; letter-spacing: normal; white-space: nowrap }
+.chat-shell .starters { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; font-size: 13px; font-weight: 400; letter-spacing: normal }
+.chat-shell .starter { padding: 8px 14px; border: 1px solid var(--border); border-radius: 999px; background: var(--composer); color: var(--muted) }
+.chat-shell .starter:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 25%, var(--border)); background: var(--hover) }
+.chat-shell .empty-model { margin-top: 12px; font-size: 12px; font-weight: 400; letter-spacing: normal }
+/* No hover on touch — keep the row actions out instead of hiding them. */
+@media (pointer: coarse) {
+  .chat-shell .recent-act { display: grid }
+}
 .chat-shell .message { margin: 32px 0; white-space: pre-wrap; overflow-wrap: anywhere }
 .chat-shell .user { position: relative; width: fit-content; max-width: 78%; margin-left: auto; padding: 9px 15px; border-radius: 18px 18px 4px 18px; background: var(--bubble) }
 .chat-shell .user .actions { position: absolute; top: calc(100% + 2px); right: 0; margin-top: 0 }
@@ -52,6 +60,19 @@
 .chat-shell .queue-file { overflow: hidden; max-width: 140px; padding: 1px 7px; border-radius: 6px; background: var(--bubble); font-size: 11px; text-overflow: ellipsis; white-space: nowrap }
 .chat-shell .queue-remove { display: grid; width: 20px; height: 20px; flex: none; place-items: center; border-radius: 50%; color: var(--muted); font-size: 14px; line-height: 1 }
 .chat-shell .queue-remove:hover { color: var(--text); background: var(--hover) }
+/* The prompt-size hairline runs along the composer's top edge. */
+.chat-shell .token-bar { position: absolute; top: -1px; right: 16px; left: 16px; height: 3px; overflow: hidden; border-radius: 0 0 4px 4px; pointer-events: none }
+.chat-shell .token-bar-fill { height: 100%; border-radius: inherit; background: var(--accent); opacity: .55; transition: width .2s ease }
+.chat-shell .token-bar-fill.warn { background: var(--warn); opacity: 1 }
+.chat-shell .token-bar-fill.danger { background: var(--danger); opacity: 1 }
+.chat-shell .slash-pop { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 30; width: 260px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow) }
+.chat-shell .slash-row { display: flex; align-items: baseline; gap: 10px; width: 100%; padding: 8px; border-radius: 8px; text-align: left }
+.chat-shell .slash-row.active { background: var(--hover) }
+.chat-shell .slash-label { flex: none; font-size: 13px; font-weight: 500 }
+.chat-shell .slash-hint { overflow: hidden; flex: 1; min-width: 0; color: var(--muted); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap }
+/* A pinned chat keeps its pin visible outside hover; the rest show on
+   row hover like rename and delete. */
+.chat-shell .recent-act.pin.on { display: grid; color: var(--accent) }
 /* The tray covers the tail of the log while it's up; make room for it. */
 .chat-shell.queue-open #chat { padding-bottom: 340px }
 .chat-shell.queue-open #to-bottom { bottom: 140px }
@@ -76,7 +97,10 @@
    children stay in-flow, while .user's hover actions sit outside the border
    box and would be clipped by paint containment. */
 .chat-shell .assistant { padding: 0 2px; content-visibility: auto; contain-intrinsic-size: auto 200px }
-.chat-shell .waiting { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
+.chat-shell .waiting { display: flex; align-items: center; gap: 10px }
+.chat-shell .waiting[hidden] { display: none }
+.chat-shell .waiting-spin { width: 16px; height: 16px; flex: none; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin .8s linear infinite }
+.chat-shell .waiting-msg:empty { display: none }
 @keyframes spin { to { transform: rotate(360deg) } }
 .chat-shell details { margin-bottom: 14px; color: var(--muted); font-size: 13.5px }
 .chat-shell summary { width: fit-content; margin-left: -8px; padding: 2px 8px; border-radius: 7px; cursor: pointer; user-select: none; font-weight: 500 }

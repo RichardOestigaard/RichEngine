@@ -1915,6 +1915,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // A finishing request's committed stream joins the cross-request corpus:
   // the emitted span, or the whole stream under RICHENGINE_NGRAM_CORPUS_ALL.
   void noteNgramCorpus(const Request &entry);
+  // An externally pushed stream (workspace file, tool output,
+  // emission-format copy) joins the corpus without a request behind it.
+  void corpusPush(std::span<const uint32_t> tokens);
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after

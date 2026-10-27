@@ -231,6 +231,8 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleMask(typed);
         } else if constexpr (std::is_same_v<T, protocol::ForcedTokensFrame>) {
           return handleForcedTokens(typed);
+        } else if constexpr (std::is_same_v<T, protocol::CorpusAppendFrame>) {
+          return handleCorpusAppend(typed);
         } else if constexpr (std::is_same_v<T, protocol::ConstraintDfaFrame>) {
           return handleConstraintDfa(typed);
         } else if constexpr (std::is_same_v<T, protocol::ScoreBatchFrame>) {
@@ -362,6 +364,12 @@ bool NativeRuntime::handleForcedTokens(
   if (!telemetry_.contains(forced.requestId))
     return true;
   core_.provideForcedTokens(forced.requestId, forced.tokens);
+  return true;
+}
+
+bool NativeRuntime::handleCorpusAppend(
+    const protocol::CorpusAppendFrame &append) {
+  core_.corpusAppend(append.tokens);
   return true;
 }
 

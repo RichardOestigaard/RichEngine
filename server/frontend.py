@@ -1142,6 +1142,26 @@ class Frontend:
         with self.latencies.measure("tokenization"):
             return self.tokenizer(text, **options)
 
+    def corpus_push(self, body):
+        """POST /v1/corpus: tokenize text and push it into the engine's
+        cross-request n-gram corpus — workspace files, tool outputs, and
+        (emit_variants=true) the diff-prefixed and JSON-escaped copies
+        whose emission forms differ from the raw text."""
+        text = body.get("text")
+        if not isinstance(text, str) or not text:
+            raise APIError(400, '"text" must be a non-empty string')
+        docs = [text]
+        if body.get("emit_variants"):
+            docs.append("".join("+" + l for l in text.splitlines(keepends=True)))
+            docs.append(json.dumps(text))
+        pushed = []
+        for doc in docs:
+            ids = self._tokenize(doc, add_special_tokens=False)["input_ids"]
+            if ids:
+                self.backend.runtime.corpus_append(ids)
+                pushed.append(len(ids))
+        return {"pushed": pushed}
+
     def _apply_chat_template(self, messages, template):
         with self.latencies.measure("template"):
             return render_chat_template(self.tokenizer, messages, template)

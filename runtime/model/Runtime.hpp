@@ -56,6 +56,7 @@ public:
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void provideForcedTokens(uint64_t requestId,
                            std::span<const uint32_t> tokens) override;
+  void corpusAppend(std::span<const uint32_t> tokens) override;
   [[nodiscard]] bool provideDfa(uint64_t requestId,
                                 std::span<const int16_t> table,
                                 std::span<const uint8_t> accepting,

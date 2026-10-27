@@ -323,8 +323,11 @@ inline Tuning makeTuning() {
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
   t.ngramTreeMin = envDouble("RICHENGINE_NGRAM_TREE_MIN", 1.0);
-  t.ngramCorpus = envUint("RICHENGINE_NGRAM_CORPUS", 0);
-  t.ngramCorpusAll = envFlag("RICHENGINE_NGRAM_CORPUS_ALL");
+  // Corpus on by default (mode 2: hinted/self-armed lanes) with the
+  // prompt+output corpus — measured safe (docs/NGRAM_V2_RESEARCH.md):
+  // margin-gated displacement, lossless verify, opt-out with =0.
+  t.ngramCorpus = envUint("RICHENGINE_NGRAM_CORPUS", 2);
+  t.ngramCorpusAll = envUint("RICHENGINE_NGRAM_CORPUS_ALL", 1) != 0;
   t.ngramCorpusMargin = envUint("RICHENGINE_NGRAM_CORPUS_MARGIN", 5);
   t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");
   t.treeAcceptMin = envDouble("RICHENGINE_TREE_ACCEPT_MIN", 0.0);

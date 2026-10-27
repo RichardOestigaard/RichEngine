@@ -735,6 +735,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/models/tune/cancel",
             "/v1/tools/fetch",
             "/v1/tools/search",
+            "/v1/corpus",
             "/v1/embeddings",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
@@ -751,6 +752,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             or path.startswith("/v1/models/")
             or path == "/v1/tools/fetch"
             or path == "/v1/tools/search"
+            or path == "/v1/corpus"
         ):
             # Control endpoints answer while the engine refuses, serves or is
             # unloaded: they hold no generation slot and no refusal gate
@@ -1020,6 +1022,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         count=body.get("count", 8),
                     ),
                 )
+                return
+            if path == "/v1/corpus":
+                app = self._request_app or self.app
+                if app is None or app.backend is None:
+                    raise APIError(503, "no model is loaded", "model_not_found")
+                self._json(200, app.corpus_push(body))
                 return
             if path == "/v1/models/load":
                 if self.server.host is None:

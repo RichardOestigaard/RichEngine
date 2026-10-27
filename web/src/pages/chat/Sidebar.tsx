@@ -12,6 +12,7 @@ export default function Sidebar(props: {
   onOpen(id: string): void;
   onDelete(id: string): void;
   onRename(id: string, title: string): void;
+  onPin(id: string): void;
 }) {
   const [filter, setFilter] = createSignal("");
   const [system, setSystem] = createSignal(storageGet(SYSTEM_KEY) ?? "");
@@ -35,7 +36,10 @@ export default function Sidebar(props: {
       now.getFullYear(), now.getMonth(), now.getDate()
     ).getTime();
     const out: { label: string; items: Conversation[] }[] = [];
+    const pinned = filtered().filter((conv) => conv.pinned);
+    if (pinned.length) out.push({ label: "Pinned", items: pinned });
     for (const conv of filtered()) {
+      if (conv.pinned) continue;
       const label =
         conv.updated >= today
           ? "Today"
@@ -59,6 +63,7 @@ export default function Sidebar(props: {
       onOpen={() => props.onOpen(conv.id)}
       onDelete={() => props.onDelete(conv.id)}
       onRename={(title) => props.onRename(conv.id, title)}
+      onPin={() => props.onPin(conv.id)}
     />
   );
 
@@ -164,6 +169,7 @@ function Recent(props: {
   onOpen(): void;
   onDelete(): void;
   onRename(title: string): void;
+  onPin(): void;
 }) {
   const [editing, setEditing] = createSignal(false);
   let editEl: HTMLInputElement | undefined;
@@ -211,6 +217,33 @@ function Recent(props: {
               onClick={startEdit}
             >
               ✎
+            </button>
+            <button
+              type="button"
+              class="recent-act pin"
+              classList={{ on: !!props.conv.pinned }}
+              aria-label={
+                props.conv.pinned
+                  ? `Unpin ${props.conv.title}`
+                  : `Pin ${props.conv.title}`
+              }
+              title={props.conv.pinned ? "Unpin" : "Pin to top"}
+              onClick={() => props.onPin()}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill={props.conv.pinned ? "currentColor" : "none"}
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 17v5" />
+                <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6a3 3 0 0 0-6 0z" />
+              </svg>
             </button>
             <button
               type="button"

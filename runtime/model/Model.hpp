@@ -613,6 +613,10 @@ public:
   // drops a stale or unmatched span. Default: unsupported, drops everything.
   virtual void provideForcedTokens(uint64_t,
                                    std::span<const uint32_t>) {}
+  // A standalone token stream pushed into the cross-request n-gram corpus
+  // (workspace file, tool output, emission-format copy). Default:
+  // unsupported, drops it.
+  virtual void corpusAppend(std::span<const uint32_t>) {}
   // A compiled byte-DFA for one request's constraint: while the model holds
   // it, decode derives the lane's automaton state and forced spans on the
   // GPU — and under RICHENGINE_DFA_MODE=full its masks too. accepting is

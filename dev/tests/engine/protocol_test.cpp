@@ -214,6 +214,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"mask_response",
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
+      {"corpus_append", CorpusAppendFrame{{10, 11, 12}}},
   };
   return messages;
 }
@@ -228,9 +229,9 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
       {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
-                         3500, {}}},
+                         3500, 0, 0, {}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
-                                3500, {1.5f, -2.25f, 0.5f}}},
+                                3500, 0, 0, {1.5f, -2.25f, 0.5f}}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
@@ -379,14 +380,14 @@ void testScoreRequestAndDoneLogits() {
   topP.sampling.topP = 0.9f;
   expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
-  DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
+  DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500, 0, 0,
                    {1.5f, -2.0f, 0.25f}};
   CHECK(test, roundTripEvent(scored) == scored);
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 53 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 49) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
@@ -867,7 +868,7 @@ void testRequestFlags() {
   constexpr std::string_view test = "request flags";
   RequestFrame request = exampleIgnoreEosRequest();
   CHECK(test, roundTrip(request) == request);
-  for (const uint32_t flags : {1U << 1, 1U << 31, 0xffffffffU}) {
+  for (const uint32_t flags : {1U << 2, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
     expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);

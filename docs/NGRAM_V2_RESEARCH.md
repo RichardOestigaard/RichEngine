@@ -528,6 +528,37 @@ Two structural points worth keeping:
    `push` each; only worth it once a real file-write/edit workload shows
    the formats miss.
 
+#### Workspace push — wired + measured (2026-10-27)
+
+`POST /v1/corpus {text, emit_variants}` → `Frontend.corpus_push` →
+`runtime.corpus_append` → `CorpusAppend` frame (0x0009) →
+`Engine::corpusAppend` → `Runtime::corpusAppend` → `Impl::corpusPush` →
+`ngram::push` — raw + diff-prefixed + JSON-escaped docs when variants
+are on. Verified end-to-end: `{"pushed":[85,92,89]}` for one file.
+
+Production A/B on a "emit a file you never sent" request: **flat**
+(71/1365 draft, ~135 tok/s, both arms) — two reasons, both real:
+
+- The lane's own n-gram table absorbs the re-emission once the first
+  emission lands; corpus adds nothing past token ~0.
+- The starvation probe (every 256 emitted tokens) never fired on a
+  ~140-token output — corpus-arming arrives too late for short
+  emissions.
+
+Fix: young-output cadence — starvation probes every 32 tokens while
+`generatedTokens < 256`, then the normal 256 cadence. Remeasured, same
+request with the pushed file (raw + variants):
+
+| arm | tok/s | draft accepted/offered |
+|---|---|---|
+| corpus off | 135.4 | 71/1365 |
+| corpus on, 256-cadence | 134.8 | 71/1365 |
+| corpus on, 32-cadence | **218.3** | **108/810** |
+
++62% over baseline with *fewer* offered rows — the corpus carried the
+file emission the prompt never contained. This is the replay's 2×
+showing up in production.
+
 #### Corpus sizing
 
 64 docs / 1M tokens FIFO is minutes of traffic on a busy server. For a

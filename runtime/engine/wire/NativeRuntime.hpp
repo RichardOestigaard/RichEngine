@@ -131,6 +131,7 @@ private:
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleForcedTokens(const protocol::ForcedTokensFrame &forced);
+  bool handleCorpusAppend(const protocol::CorpusAppendFrame &append);
   bool handleConstraintDfa(const protocol::ConstraintDfaFrame &dfa);
   bool handleVocabulary(const protocol::VocabularyFrame &vocabulary);
   bool handleStatus(const protocol::StatusRequestFrame &status);

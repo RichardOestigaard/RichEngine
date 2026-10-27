@@ -37,6 +37,7 @@ enum class FrameType : uint16_t {
   ConstraintDfa = 0x0006,
   Vocabulary = 0x0007,
   ScoreBatch = 0x0008,
+  CorpusAppend = 0x0009,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -235,6 +236,16 @@ struct ForcedTokensFrame {
   bool operator==(const ForcedTokensFrame &) const = default;
 };
 
+// A standalone token stream pushed into the cross-request n-gram corpus
+// (RICHENGINE_NGRAM_CORPUS): workspace files, tool outputs, or
+// emission-format copies indexed ahead of the request that re-emits
+// them. Process-wide, request-agnostic.
+struct CorpusAppendFrame {
+  std::vector<uint32_t> tokens;
+
+  bool operator==(const CorpusAppendFrame &) const = default;
+};
+
 // A compiled byte-DFA for one request's grammar: while the engine holds it,
 // decode computes the lane's masks on the GPU (kernels/decode/dfa.metal)
 // and no MaskRequest event goes out. The table is row-major Q x 256 with
@@ -386,7 +397,7 @@ struct ScoreBatchFrame {
 using ClientMessage =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
                  StatusRequestFrame, ForcedTokensFrame, ConstraintDfaFrame,
-                 VocabularyFrame, ScoreBatchFrame>;
+                 VocabularyFrame, ScoreBatchFrame, CorpusAppendFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;

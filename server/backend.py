@@ -54,7 +54,7 @@ _trace_tokens_lock = threading.Lock()
 # corpus consults (RICHENGINE_NGRAM_CORPUS=2). Off without the variable;
 # the rings it reads stay populated either way since trace consumers may
 # want them.
-NGRAM_HINT = os.environ.get("RICHENGINE_NGRAM_HINT") == "1"
+NGRAM_HINT = os.environ.get("RICHENGINE_NGRAM_HINT", "1") != "0"
 # How many recent requests the hint checks, and how far into the prompt
 # tail the corpus probe looks.
 _NGRAM_HINT_RING = 64

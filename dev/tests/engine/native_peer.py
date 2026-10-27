@@ -97,7 +97,7 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             )
         case wire.DoneEvent():
             return wire.FrameType.DONE, struct.pack(
-                f"<QBIIQQQI{len(event.option_logits)}f",
+                f"<QBIIQQQIII{len(event.option_logits)}f",
                 event.request_id,
                 event.reason,
                 event.prompt_tokens,
@@ -105,6 +105,8 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
                 event.prefill_micros,
                 event.decode_micros,
                 event.wall_micros,
+                event.drafted_tokens,
+                event.accepted_draft_tokens,
                 len(event.option_logits),
                 *event.option_logits,
             )
@@ -271,6 +273,9 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             )
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
+        case wire.FrameType.CORPUS_APPEND:
+            (count,) = struct.unpack_from("<I", payload)
+            return wire.CorpusAppendFrame(tuple(_words(payload, 4, count)))
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

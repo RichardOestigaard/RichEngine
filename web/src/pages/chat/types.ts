@@ -42,6 +42,8 @@ export interface Conversation {
   id: string;
   title: string;
   updated: number;
+  /* Pinned chats hold a "Pinned" group at the top of the recents list. */
+  pinned?: boolean;
   messages: Message[];
 }
 export interface Attachment {

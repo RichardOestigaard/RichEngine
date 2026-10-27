@@ -95,6 +95,7 @@ class FrameType(IntEnum):
     CONSTRAINT_DFA = 0x0006
     VOCABULARY = 0x0007
     SCORE_BATCH = 0x0008
+    CORPUS_APPEND = 0x0009
 
     READY = 0x0100
     START = 0x0101
@@ -313,6 +314,15 @@ class ForcedTokensFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class CorpusAppendFrame:
+    """A standalone token stream for the cross-request n-gram corpus:
+    workspace files, tool outputs, emission-format copies pushed ahead of
+    the request that re-emits them (RICHENGINE_NGRAM_CORPUS)."""
+
+    tokens: tuple[int, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class ConstraintDfaFrame:
     """A compiled byte-level constraint DFA for one request.
 
@@ -478,6 +488,7 @@ ClientMessage: TypeAlias = (
     | ConstraintDfaFrame
     | VocabularyFrame
     | ScoreBatchFrame
+    | CorpusAppendFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -639,6 +650,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             )
         case FrameType.STATUS_REQUEST:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
+        case FrameType.CORPUS_APPEND:
+            bounds = (4, 4 + MAX_PROMPT_TOKENS * 4)
         case FrameType.READY:
             bounds = (_READY.size, _READY.size)
         case FrameType.PROMPT_PROGRESS:
@@ -1032,6 +1045,21 @@ def _forced_tokens_frame(forced: ForcedTokensFrame) -> bytearray:
     return frame
 
 
+def _corpus_append_frame(append: CorpusAppendFrame) -> bytearray:
+    packed = array.array("I", append.tokens)
+    if not len(packed):
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COUNT,
+            "corpus append carries no tokens",
+        )
+    frame = _frame(FrameType.CORPUS_APPEND, 4 + 4 * len(packed))
+    _U32_COUNT = struct.Struct("<I")
+    _U32_COUNT.pack_into(frame, FRAME_HEADER_BYTES, len(packed))
+    frame[FRAME_HEADER_BYTES + 4 :] = packed.tobytes()
+    return frame
+
+
 def _vocabulary_frame(message: VocabularyFrame) -> bytearray:
     try:
         tokens = message.vocab_tokens
@@ -1268,6 +1296,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _status_request_frame(message)
         if isinstance(message, ScoreBatchFrame):
             return _score_batch_frame(message)
+        if isinstance(message, CorpusAppendFrame):
+            return _corpus_append_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")

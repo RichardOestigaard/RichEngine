@@ -27,6 +27,7 @@ constexpr std::array<uint8_t, 4> kMagic{'R', 'I', 'C', 'H'};
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kForcedTokensFixedBytes = 12;
+constexpr uint64_t kCorpusAppendFixedBytes = 4;
 constexpr uint64_t kConstraintDfaFixedBytes = 16;
 constexpr uint64_t kVocabularyFixedBytes = 8;
 // The largest byte-DFA the wire admits: 32767 states x 256 i16 transitions.
@@ -116,6 +117,12 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   case FrameType::ScoreBatch:
     // Prefix and suffix tokens dominate the items; the frame cap rules.
     return bounded(kScoreBatchFixedBytes, limits.maxFramePayloadBytes);
+  case FrameType::CorpusAppend:
+    if (!checkedMultiply(limits.maxPromptTokens, sizeof(uint32_t), variable) ||
+        !checkedAdd(kCorpusAppendFixedBytes, variable, maximum)) {
+      return std::nullopt;
+    }
+    return bounded(kCorpusAppendFixedBytes, maximum);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -158,6 +165,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::ConstraintDfa:
   case FrameType::Vocabulary:
   case FrameType::ScoreBatch:
+  case FrameType::CorpusAppend:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -851,6 +859,30 @@ ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
   return success(ClientMessage{std::move(response)});
 }
 
+ProtocolResult<ClientMessage> decodeCorpusAppend(const Frame &frame,
+                                                 const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  CorpusAppendFrame append;
+  uint32_t count = 0;
+  if (!reader.u32(count)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "corpus append payload is truncated"));
+  }
+  if (!count || count > limits.maxPromptTokens) {
+    return failure<ClientMessage>(makeIssue(
+        FailureClass::RequestError, IssueCode::InvalidCount, 0,
+        "corpus append token count is out of range"));
+  }
+  if (reader.remaining() != uint64_t{count} * sizeof(uint32_t) ||
+      !reader.words(count, append.tokens)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "corpus append token count does not match the payload"));
+  }
+  return success(ClientMessage{std::move(append)});
+}
+
 ProtocolResult<ClientMessage> decodeForcedTokens(const Frame &frame,
                                                  const ProtocolLimits &limits) {
   Reader reader(frame.payload);
@@ -1157,6 +1189,8 @@ std::string_view frameTypeName(FrameType type) {
     return "vocabulary";
   case FrameType::ScoreBatch:
     return "score_batch";
+  case FrameType::CorpusAppend:
+    return "corpus_append";
   case FrameType::MaskRequest:
     return "mask_request";
   case FrameType::Done:
@@ -1294,6 +1328,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeStatusRequest(frame);
     case FrameType::ScoreBatch:
       return decodeScoreBatch(frame, limits);
+    case FrameType::CorpusAppend:
+      return decodeCorpusAppend(frame, limits);
     default:
       break;
     }

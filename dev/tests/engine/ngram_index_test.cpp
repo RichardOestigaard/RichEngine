@@ -146,6 +146,109 @@ void testCombTableHonoursFoundBound() {
           "positions past the real match emit no leaves");
 }
 
+// A corpus doc's closing-3-gram match against the lane history returns
+// the occurrence's followers and the backward extension — the pair the
+// margin gate compares against the live match.
+void testCorpusLookupFindsContinuation() {
+  ngram::Corpus corpus;
+  const uint32_t doc[] = {9, 9, 1, 2, 3, 40, 50, 60};
+  ngram::push(corpus, doc);
+  const uint32_t lane[] = {7, 8, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 99;
+  const uint32_t found = ngram::lookupCorpus(corpus, lane, out.data(),
+                                             extension);
+  require(found == 3 && out[0] == 40 && out[1] == 50 && out[2] == 60,
+          "corpus lookup should return the matched doc's followers");
+  require(extension == 0,
+          "no shared prefix before the key means no backward extension");
+}
+
+// The extension walk compares the corpus doc's tokens before the key
+// against the lane's own history — cross-doc context counts.
+void testCorpusLookupCountsBackwardExtension() {
+  ngram::Corpus corpus;
+  const uint32_t doc[] = {11, 12, 13, 1, 2, 3, 40, 50};
+  ngram::push(corpus, doc);
+  const uint32_t lane[] = {5, 11, 12, 13, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const uint32_t found = ngram::lookupCorpus(corpus, lane, out.data(),
+                                             extension);
+  require(found == 2 && extension == 3,
+          "extension should count the three shared context tokens");
+}
+
+// Short lane histories and an empty corpus both decline.
+void testCorpusLookupRefusesShortLane() {
+  ngram::Corpus corpus;
+  const uint32_t lane[] = {1, 2, 3};
+  uint32_t extension = 0;
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension) == 0,
+          "empty corpus should return no followers");
+  const uint32_t doc[] = {1, 2, 3, 4};
+  ngram::push(corpus, doc);
+  const uint32_t short_lane[] = {1, 2};
+  require(ngram::lookupCorpus(corpus, short_lane, out.data(),
+                              extension) == 0,
+          "a lane shorter than the key should return no followers");
+}
+
+// Between docs the longest backward extension wins, then follower count.
+void testCorpusLookupRanksAcrossDocs() {
+  ngram::Corpus corpus;
+  const uint32_t docA[] = {1, 2, 3, 70};
+  const uint32_t docB[] = {9, 9, 9, 1, 2, 3, 80};
+  ngram::push(corpus, docA);
+  ngram::push(corpus, docB);
+  const uint32_t lane[] = {9, 9, 9, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const uint32_t found = ngram::lookupCorpus(corpus, lane, out.data(),
+                                             extension);
+  require(found == 1 && out[0] == 80 && extension == 3,
+          "the better-extended doc's continuation should win");
+}
+
+// Whole-doc FIFO eviction keeps the corpus bounded on both counts.
+void testCorpusPushEvictsWholeDocs() {
+  ngram::Corpus corpus;
+  const uint32_t a[] = {1, 2, 3, 4, 5};
+  const uint32_t b[] = {6, 7, 8, 9, 10};
+  const uint32_t c[] = {11, 12, 13, 14, 15};
+  ngram::push(corpus, a, /*maxDocs=*/2, /*maxTokens=*/1000);
+  ngram::push(corpus, b, 2, 1000);
+  ngram::push(corpus, c, 2, 1000);
+  require(corpus.docs.size() == 2 && corpus.tokens == 10,
+          "the doc cap should evict the oldest document whole");
+  // The first doc's key is gone; the retained docs still answer.
+  const uint32_t lane[] = {0, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension) == 0,
+          "an evicted doc's key must not survive eviction");
+}
+
+void testCorpusPushHonoursTokenCap() {
+  ngram::Corpus corpus;
+  const uint32_t big[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const uint32_t small[] = {9, 10, 11, 12, 13};
+  ngram::push(corpus, big, /*maxDocs=*/64, /*maxTokens=*/10);
+  ngram::push(corpus, small, 64, 10);
+  require(corpus.docs.size() == 1 && corpus.tokens == 5,
+          "the token cap should evict the oversized older doc");
+}
+
+// Streams under the 4-token minimum never enter the corpus.
+void testCorpusPushDropsShortStreams() {
+  ngram::Corpus corpus;
+  const uint32_t short_stream[] = {1, 2, 3};
+  ngram::push(corpus, short_stream);
+  require(corpus.docs.empty() && corpus.tokens == 0,
+          "sub-key-length streams should not become docs");
+}
+
 // Tokens appended after seeding index their new 3-grams.
 void testAppendIndexesNewGrams() {
   ngram::Table t = table({1, 2, 3, 40});
@@ -171,6 +274,13 @@ int main() {
     testCombTableLeafless();
     testCombTableHonoursFoundBound();
     testAppendIndexesNewGrams();
+    testCorpusLookupFindsContinuation();
+    testCorpusLookupCountsBackwardExtension();
+    testCorpusLookupRefusesShortLane();
+    testCorpusLookupRanksAcrossDocs();
+    testCorpusPushEvictsWholeDocs();
+    testCorpusPushHonoursTokenCap();
+    testCorpusPushDropsShortStreams();
     std::cout << "ngram index tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

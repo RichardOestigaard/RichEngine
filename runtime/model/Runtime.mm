@@ -937,6 +937,10 @@ void Runtime::provideForcedTokens(uint64_t requestId,
   found->second.forcedTokens.assign(tokens.begin(), tokens.end());
 }
 
+void Runtime::corpusAppend(std::span<const uint32_t> tokens) {
+  impl_->corpusPush(tokens);
+}
+
 void Runtime::setVocabulary(std::span<const uint8_t> bytes,
                             std::span<const int32_t> offs,
                             std::span<const uint8_t> specialBits) {

@@ -175,6 +175,10 @@ void Engine::provideForcedTokens(uint64_t id,
   model_.provideForcedTokens(id, tokens);
 }
 
+void Engine::corpusAppend(std::span<const uint32_t> tokens) {
+  model_.corpusAppend(tokens);
+}
+
 bool Engine::provideDfa(uint64_t id, std::span<const int16_t> table,
                         std::span<const uint8_t> accepting,
                         std::span<const uint8_t> marker,

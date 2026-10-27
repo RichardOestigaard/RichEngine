@@ -140,6 +140,12 @@ FrameType write(Writer &out, const ForcedTokensFrame &forced) {
   return FrameType::ForcedTokens;
 }
 
+FrameType write(Writer &out, const CorpusAppendFrame &append) {
+  out.u32(static_cast<uint32_t>(append.tokens.size()));
+  out.words(append.tokens);
+  return FrameType::CorpusAppend;
+}
+
 FrameType write(Writer &out, const ConstraintDfaFrame &dfa) {
   out.u64(dfa.requestId);
   const uint32_t nStates = static_cast<uint32_t>(dfa.table.size() / 256);
@@ -258,6 +264,8 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.prefillMicros = in.u64();
     event.decodeMicros = in.u64();
     event.wallMicros = in.u64();
+    event.draftedTokens = in.u32();
+    event.acceptedDraftTokens = in.u32();
     event.optionLogits.resize(in.u32());
     for (float &logit : event.optionLogits)
       logit = in.f32();

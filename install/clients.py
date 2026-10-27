@@ -185,7 +185,7 @@ def _claude(path, server, environment, arguments):
     )
     # Auto mode adds classifier inference to tool approval. Start in the
     # normal approval mode, even if the user's global default is auto.
-    return [
+    argv = [
         path,
         "--disallowedTools",
         "WebSearch",
@@ -193,8 +193,15 @@ def _claude(path, server, environment, arguments):
         server.model,
         "--permission-mode",
         "default",
-        *arguments,
     ]
+    # Same corpus hook as OpenCode (docs/NGRAM_V2_RESEARCH.md): a
+    # PostToolUse matcher pushing Read/Write/Edit outputs to /v1/corpus.
+    # --settings layers onto the user's own settings for this launch only;
+    # an explicit --settings in arguments wins.
+    settings_path = _claude_corpus_settings(server)
+    if settings_path is not None and "--settings" not in arguments:
+        argv += ["--settings", str(settings_path)]
+    return [*argv, *arguments]
 
 
 def _opencode(path, server, environment, arguments, version):
@@ -241,6 +248,17 @@ def _opencode(path, server, environment, arguments, version):
             }
         },
     }
+    # RichEngine's n-gram corpus boosts (docs/NGRAM_V2_RESEARCH.md): the
+    # served engine runs its hinted cross-request corpus by default; the
+    # plugin indexes every file OpenCode reads, writes or edits — the
+    # workspace tier — so "emit a file" turns draft from the corpus.
+    plugin_path = _opencode_corpus_plugin(server)
+    if plugin_path is not None:
+        config["plugin"] = _opencode_object(config, "plugin")
+        config["plugin"] = [
+            *(config["plugin"] if isinstance(config["plugin"], list) else []),
+            str(plugin_path),
+        ]
     environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
     argv = [path, *arguments]
     # OpenCode 2 loads configuration inside its persistent background
@@ -256,6 +274,106 @@ def _opencode(path, server, environment, arguments, version):
         # subcommand and precede the end-of-options separator.
         argv.insert(argv.index("--") if "--" in argv else len(argv), "--standalone")
     return argv
+
+
+_CLAUDE_CORPUS_HOOK = """#!/bin/sh
+# RichEngine n-gram corpus hook (auto-installed by `richengine claude`) —
+# PostToolUse JSON on stdin; pushes the tool result text to /v1/corpus.
+python3 - "$1" <<'PY'
+import json, sys, urllib.request
+try:
+    result = json.load(sys.stdin)
+    # Claude Code sends tool_response; older spellings used tool_result.
+    result = result.get("tool_response") or result.get("tool_result") or {}
+    text = result.get("content")
+    if isinstance(text, list):
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    if not isinstance(text, str) or not text:
+        sys.exit(0)
+    urllib.request.urlopen(
+        urllib.request.Request(
+            sys.argv[1] + "/v1/corpus",
+            json.dumps({"text": text, "emit_variants": True}).encode(),
+            {"Content-Type": "application/json"},
+        ),
+        timeout=5,
+    )
+except Exception:
+    pass
+PY
+"""
+
+
+def _claude_corpus_settings(server):
+    """Writes the corpus hook + a session settings file under a stable
+    per-user path; None when the file system refuses."""
+    directory = Path.home() / ".cache" / "richengine" / "claude"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        hook = directory / "corpus-hook.sh"
+        hook.write_text(_CLAUDE_CORPUS_HOOK)
+        hook.chmod(0o700)
+        settings = directory / "settings.json"
+        settings.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostToolUse": [
+                            {
+                                "matcher": "Read|Write|Edit|MultiEdit",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"{hook} {server.endpoint}",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+    except OSError:
+        return None
+    return settings
+
+
+_OPENCODE_CORPUS_PLUGIN = """// RichEngine n-gram corpus hook (auto-installed by `richengine opencode`)
+// — indexes every file read/write/edit output into the cross-request
+// corpus via POST /v1/corpus, so emitted files draft from workspace
+// state. See docs/NGRAM_V2_RESEARCH.md.
+export const RichEngineCorpus = async () => ({
+  "tool.execute.after": async (input, output) => {
+    if (!["read", "write", "edit"].includes(input.tool)) return;
+    const text =
+      (output && typeof output.output === "string" ? output.output : "") ||
+      (output && output.output && output.output.content) || "";
+    if (typeof text !== "string" || !text) return;
+    fetch("__RICHENGINE_ENDPOINT__/v1/corpus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, emit_variants: true }),
+    }).catch(() => {});
+  },
+});
+"""
+
+
+def _opencode_corpus_plugin(server):
+    """Writes the corpus hook under a stable per-user path and returns it;
+    None when the file system refuses — the launch proceeds without it."""
+    directory = Path.home() / ".cache" / "richengine" / "opencode"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "corpus.js"
+        target.write_text(
+            _OPENCODE_CORPUS_PLUGIN.replace(
+                "__RICHENGINE_ENDPOINT__", server.endpoint
+            )
+        )
+    except OSError:
+        return None
+    return target
 
 
 def _opencode_object(value, *keys):

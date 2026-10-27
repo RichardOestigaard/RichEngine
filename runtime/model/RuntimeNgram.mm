@@ -55,6 +55,11 @@ namespace richengine::model {
                    history.size() - entry.promptTokens});
   }
 
+  void Runtime::Impl::corpusPush(std::span<const uint32_t> tokens) {
+    if (ngram_.ngramCorpus_)
+      ngram::push(ngram_.ngramCorpusDocs_, tokens);
+  }
+
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after
@@ -112,8 +117,12 @@ namespace richengine::model {
       if (ngram_.ngramCorpus_ && !found && !entry.corpusArmed &&
           entry.generatedTokens >= entry.corpusProbeAt &&
           !ngram_.ngramCorpusDocs_.docs.empty()) {
-        entry.corpusProbeAt =
-            entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
+        // Young outputs probe often — a lane that starts re-emitting a
+        // pushed or earlier document loses most of the win if arming
+        // waits 256 tokens. Steady-state stays at the slow cadence.
+        const uint32_t cadence =
+            entry.generatedTokens < 256 ? 32 : NgramPredraft::kNgramProbeTokens;
+        entry.corpusProbeAt = entry.generatedTokens + cadence;
         std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> probe;
         uint32_t probeExtension = 0;
         if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,

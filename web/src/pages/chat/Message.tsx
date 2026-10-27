@@ -163,7 +163,12 @@ export default function MessageView(props: {
         hidden={!props.live || Boolean(content || reasoning)}
         role="status"
         aria-label="Generating response"
-      />
+      >
+        <span class="waiting-spin" />
+        {/* The stream writes prefill/queue progress here (consume,
+            queueTimer) so the first dead seconds show movement. */}
+        <span class="waiting-msg muted" />
+      </div>
       <div class="stats" hidden={!savedStats}>
         {savedStats}
       </div>

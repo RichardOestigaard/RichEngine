@@ -110,6 +110,7 @@ def client_messages():
             91, 7, struct.pack("<3I", 0xFFFFFFFF, 0, 0xA5A5A5A5)
         ),
         "status_request": p.StatusRequestFrame(808),
+        "corpus_append": p.CorpusAppendFrame((10, 11, 12)),
     }
 
 
@@ -122,9 +123,12 @@ def engine_events():
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
         "mask_request_initial": p.MaskRequestEvent(91, 6, 4, ()),
         "mask_request_verify": p.MaskRequestEvent(91, 7, 4, (101, 102, 103)),
-        "done": p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, ()),
+        "done": p.DoneEvent(
+            91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, 0, 0, ()
+        ),
         "done_scored": p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, 0, 0,
+            (1.5, -2.25, 0.5)
         ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
@@ -303,6 +307,8 @@ class ProtocolPythonTests(unittest.TestCase):
             1000,
             0,
             1000,
+            0,
+            0,
             tuple(float(index) for index in range(255)),
         )
         self.assertEqual(decode_event(native_peer.serialize_event(done)), done)
@@ -489,7 +495,8 @@ class ProtocolPythonTests(unittest.TestCase):
 
     def test_done_option_logits_wire_layout_and_roundtrip(self):
         done = p.DoneEvent(
-            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5)
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, 0, 0,
+            (1.5, -2.25, 0.5)
         )
         wire = native_peer.serialize_event(done)
         self.assertEqual(decode_event(wire), done)
@@ -497,11 +504,11 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
-            lambda: decode_event(mutate_u32(wire, 24 + 41, 2)),
+            lambda: decode_event(mutate_u32(wire, 24 + 49, 2)),
         )
-        # A Done payload without its option-logit count (41 bytes) is below
+        # A Done payload without its option-logit count (49 bytes) is below
         # the minimum.
-        short = mutate_u64(wire[: 24 + 41], 12, 41)
+        short = mutate_u64(wire[: 24 + 49], 12, 49)
         self.assertEqual(parser_issue(short).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
 
     def test_done_option_logits_validation(self):
@@ -513,6 +520,8 @@ class ProtocolPythonTests(unittest.TestCase):
             prefill_micros=100,
             decode_micros=0,
             wall_micros=200,
+            drafted_tokens=0,
+            accepted_draft_tokens=0,
         )
         # Each scored-done invariant fails closed on the wire: too few or
         # non-finite logits, a finish other than stop, completion tokens or
@@ -542,9 +551,9 @@ class ProtocolPythonTests(unittest.TestCase):
         # Scored, generation and cancelled done events decode unchanged.
         for event in (
             p.DoneEvent(**base, option_logits=(1.0, 2.0)),
-            p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, ()),
-            p.DoneEvent(91, p.FinishReason.LENGTH, 4096, 512, 1000, 2000, 3500, ()),
-            p.DoneEvent(91, p.FinishReason.CANCELLED, 4096, 128, 1000, 500, 1500, ()),
+            p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, 0, 0, ()),
+            p.DoneEvent(91, p.FinishReason.LENGTH, 4096, 512, 1000, 2000, 3500, 0, 0, ()),
+            p.DoneEvent(91, p.FinishReason.CANCELLED, 4096, 128, 1000, 500, 1500, 0, 0, ()),
         ):
             with self.subTest(event=event):
                 decoded = decode_event(native_peer.serialize_event(event))
@@ -636,7 +645,7 @@ class ProtocolPythonTests(unittest.TestCase):
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 1, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),

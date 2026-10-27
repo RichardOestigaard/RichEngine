@@ -408,6 +408,10 @@ class FakeRuntime:
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
         self.threads = []
+        self.corpus_docs = []
+
+    def corpus_append(self, tokens):
+        self.corpus_docs.append(tuple(tokens))
 
     @property
     def pending_count(self):
@@ -10629,6 +10633,39 @@ class WebFetchEndpointTest(unittest.TestCase):
         )
         self.assertEqual(status, 422)
         self.assertEqual(json.loads(payload)["error"]["code"], "unsupported")
+
+
+class CorpusEndpointTest(unittest.TestCase):
+    """POST /v1/corpus pushes token streams into the engine's
+    cross-request n-gram corpus — workspace files and, with
+    emit_variants, their diff-prefixed and JSON-escaped copies."""
+
+    def setUp(self):
+        self.runtime = FakeRuntime()
+        self.harness = Harness(self.runtime)
+        self.addCleanup(self.harness.close)
+
+    def test_corpus_pushes_the_tokenized_text(self):
+        status, _, payload = self.harness.request(
+            "POST", "/v1/corpus", {"text": "def f(): pass\n"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.runtime.corpus_docs), 1)
+        self.assertEqual(json.loads(payload)["pushed"], [2])
+
+    def test_corpus_emit_variants_pushes_three_documents(self):
+        status, _, payload = self.harness.request(
+            "POST", "/v1/corpus", {"text": "line\n", "emit_variants": True}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.runtime.corpus_docs), 3)
+        self.assertEqual(json.loads(payload)["pushed"], [2, 2, 2])
+
+    def test_corpus_rejects_a_missing_text(self):
+        status, _, payload = self.harness.request("POST", "/v1/corpus", {})
+        self.assertEqual(status, 400)
+        self.assertIn("text", json.loads(payload)["error"]["message"])
+        self.assertEqual(self.runtime.corpus_docs, [])
 
 
 class WebSearchEndpointTest(unittest.TestCase):

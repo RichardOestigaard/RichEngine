@@ -102,7 +102,13 @@ function load(): Conversation[] {
       const messages = entry.messages.map(cleanMessage).filter((m): m is Message => m !== null);
       if (!messages.length) return [];
       seen.add(entry.id);
-      return [{ id: entry.id, title: entry.title, updated: entry.updated, messages }];
+      return [{
+        id: entry.id,
+        title: entry.title,
+        updated: entry.updated,
+        ...(entry.pinned === true ? { pinned: true } : {}),
+        messages,
+      }];
     });
   } catch { return []; }
 }
@@ -175,6 +181,13 @@ export function persistChat(firstPrompt: string, activeId: string | null, messag
   conversation.updated = Date.now();
   scheduleSave();
   return conversation.id;
+}
+
+export function pinConversation(id: string, pinned: boolean): void {
+  const conversation = conversations().find((item) => item.id === id);
+  if (!conversation || Boolean(conversation.pinned) === pinned) return;
+  conversation.pinned = pinned;
+  scheduleSave();
 }
 
 export function deleteConversation(id: string): void {
