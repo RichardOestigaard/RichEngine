@@ -279,6 +279,12 @@ std::string runtimeStatusJson(
       << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
       << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes
       << "}"
+      << ",\"corpus\":{\"docs\":" << executorTelemetry.corpusDocs
+      << ",\"tokens\":" << executorTelemetry.corpusTokens
+      << ",\"hits\":" << executorTelemetry.corpusHits
+      << ",\"misses\":" << executorTelemetry.corpusMisses
+      << ",\"pushes\":" << executorTelemetry.corpusPushes
+      << ",\"evictions\":" << executorTelemetry.corpusEvictions << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
       << ",\"waiting_prefix\":" << scheduler.waitingPrefix

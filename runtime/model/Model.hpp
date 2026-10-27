@@ -500,6 +500,14 @@ struct ModelTelemetry final {
   double lastDecodeWallSeconds = 0.0;
   double totalPrefillWallSeconds = 0.0;
   double totalDecodeWallSeconds = 0.0;
+  // Cross-request n-gram corpus (RICHENGINE_NGRAM_CORPUS): live bounds and
+  // lifetime hit/push/eviction counters for /status.
+  uint64_t corpusDocs = 0;
+  uint64_t corpusTokens = 0;
+  uint64_t corpusHits = 0;
+  uint64_t corpusMisses = 0;
+  uint64_t corpusPushes = 0;
+  uint64_t corpusEvictions = 0;
 };
 
 // One warmup lane's observable outcome: its step result, the anchor the step

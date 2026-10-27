@@ -249,6 +249,63 @@ void testCorpusPushDropsShortStreams() {
           "sub-key-length streams should not become docs");
 }
 
+// Lookup cost at scale: 64 docs x 16k tokens, worst case = a miss scanning
+// every doc. Not an assertion — prints the measured microseconds.
+void testCorpusLookupScale() {
+  ngram::Corpus corpus;
+  std::vector<uint32_t> doc(16 * 1024);
+  for (uint32_t d = 0; d < 64; ++d) {
+    for (uint32_t i = 0; i < doc.size(); ++i)
+      doc[i] = (d * 2654435761u + i) & 0xFFFFu;
+    ngram::push(corpus, doc);
+  }
+  // A miss probes every doc.
+  const uint32_t lane[] = {0xFFFFFFu, 0xFFFFFEu, 0xFFFFFDu, 0xFFFFFCu};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (uint32_t i = 0; i < 1000; ++i)
+    ngram::lookupCorpus(corpus, lane, out.data(), extension);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  const double microsPerLookup =
+      std::chrono::duration<double, std::micro>(elapsed).count() / 1000.0;
+  std::cout << "corpus lookup miss (64 docs x 16k): " << microsPerLookup
+            << "us\n";
+  require(microsPerLookup < 500, "corpus miss should stay sub-0.5ms");
+}
+
+// A lane's own committed stream never serves it — its self table already
+// covers that history; the corpus doc is dead weight for that lane.
+void testCorpusLookupSkipsSelfOrigin() {
+  ngram::Corpus corpus;
+  const uint32_t own[] = {1, 2, 3, 40, 50, 60};
+  ngram::push(corpus, own, 64, 1u << 20, /*origin=*/7);
+  const uint32_t lane[] = {9, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension, /*selfOrigin=*/7) == 0,
+          "a lane must not draft from its own pushed stream");
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension, 8) == 3,
+          "another lane still finds the same doc");
+}
+
+// On equal matches, a doc from the same conversation outranks unrelated
+// traffic — same-session continuations are likelier.
+void testCorpusLookupPrefersSameSession() {
+  ngram::Corpus corpus;
+  const uint32_t other[] = {1, 2, 3, 70, 71, 72, 73};
+  const uint32_t mine[] = {1, 2, 3, 40, 50, 60, 61};
+  ngram::push(corpus, other, 64, 1u << 20, 0, /*session=*/99);
+  ngram::push(corpus, mine, 64, 1u << 20, 0, /*session=*/5);
+  const uint32_t lane[] = {8, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const uint32_t found =
+      ngram::lookupCorpus(corpus, lane, out.data(), extension, 0, /*selfSession=*/5);
+  require(found == 4 && out[0] == 40,
+          "equal matches should prefer the same-session doc");
+}
+
 // Tokens appended after seeding index their new 3-grams.
 void testAppendIndexesNewGrams() {
   ngram::Table t = table({1, 2, 3, 40});
@@ -281,6 +338,9 @@ int main() {
     testCorpusPushEvictsWholeDocs();
     testCorpusPushHonoursTokenCap();
     testCorpusPushDropsShortStreams();
+    testCorpusLookupScale();
+    testCorpusLookupSkipsSelfOrigin();
+    testCorpusLookupPrefersSameSession();
     std::cout << "ngram index tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

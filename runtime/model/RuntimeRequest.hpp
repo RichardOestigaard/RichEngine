@@ -178,6 +178,10 @@ struct RuntimeRequest final {
   // 3-gram finds nothing. corpusProbeAt paces those starvation probes.
   bool corpusArmed = false;
   uint32_t corpusProbeAt = 0;
+  // Weak session key (opening-prompt hash) and, on corpus docs this lane
+  // committed, self-exclusion: origin skips the lane's own pushed stream,
+  // session prefers same-conversation docs on ties.
+  uint64_t corpusSession = 0;
   // Adaptive proposal length (opt-in, RICHENGINE_ADAPTIVE_PROPOSALS): EWMA of
   // accepted draft tokens per chain verify step and the lane's current
   // budget — the acceptance cap and live verify rows that step.

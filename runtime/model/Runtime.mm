@@ -1366,6 +1366,12 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
+  result.corpusDocs = impl_->ngram_.ngramCorpusDocs_.docs.size();
+  result.corpusTokens = impl_->ngram_.ngramCorpusDocs_.tokens;
+  result.corpusHits = impl_->ngram_.ngramCorpusDocs_.hits;
+  result.corpusMisses = impl_->ngram_.ngramCorpusDocs_.misses;
+  result.corpusPushes = impl_->ngram_.ngramCorpusDocs_.pushes;
+  result.corpusEvictions = impl_->ngram_.ngramCorpusDocs_.evictions;
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();

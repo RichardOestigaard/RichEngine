@@ -109,10 +109,40 @@ inline uint32_t lookup(const Table &table, uint32_t *out,
 // by the preference margin — a long hit in unrelated reference text is
 // likely coincidental (AgSpec's δ; docs/NGRAM_V2_RESEARCH.md).
 struct Corpus {
-  // Every doc is one finished stream; eviction is whole-doc FIFO.
-  std::deque<Table> docs;
+  // Every doc is one finished stream; eviction is whole-doc LRU — the
+  // least recently *hit* doc leaves first, so a hot session's corpus
+  // survives unrelated chatter. hitStamp is bumped on any doc that
+  // contributed a lookup hit.
+  struct Doc {
+    Table table;
+    uint64_t hitStamp = 0;
+    // Who produced this stream: the request id that committed it, or 0 for
+    // externally pushed text (POST /v1/corpus). A lane never drafts from
+    // its own committed stream — its self table already covers it.
+    uint64_t origin = 0;
+    // Weak session key: a hash of the request's opening prompt tokens —
+    // requests extending the same conversation share it. Same-session docs
+    // win lookup ties.
+    uint64_t session = 0;
+  };
+  std::deque<Doc> docs;
   size_t tokens = 0;
+  uint64_t tick = 0;
+  // Lifetime counters for /status observability.
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t pushes = 0;
+  uint64_t evictions = 0;
 };
+
+// FNV-1a over the opening prompt tokens; stable across turns of one
+// conversation, which is all the session tier needs.
+inline uint64_t sessionKey(std::span<const uint32_t> prompt) {
+  uint64_t hash = 14695981039346656037ull;
+  for (const uint32_t token : prompt.first(std::min<size_t>(prompt.size(), 64)))
+    hash = (hash ^ token) * 1099511628211ull;
+  return hash;
+}
 
 // A corpus match with this effective pattern length (3 + backward
 // extension) arms a lane for corpus lookups: an 8-token verbatim suffix
@@ -121,19 +151,30 @@ struct Corpus {
 constexpr uint32_t kCorpusArmMin = 8;
 
 inline void push(Corpus &corpus, std::span<const uint32_t> stream,
-                 uint32_t maxDocs = 64, size_t maxTokens = 1u << 20) {
+                 uint32_t maxDocs = 64, size_t maxTokens = 1u << 20,
+                 uint64_t origin = 0, uint64_t session = 0) {
   if (stream.size() < 4)
     return;
-  Table doc;
-  seed(doc, stream);
+  Corpus::Doc doc;
+  doc.origin = origin;
+  doc.session = session;
+  seed(doc.table, stream);
+  doc.hitStamp = corpus.tick;
   corpus.docs.push_back(std::move(doc));
   corpus.tokens += stream.size();
+  ++corpus.pushes;
   while (corpus.docs.size() > maxDocs ||
          (!corpus.docs.empty() &&
-          corpus.tokens - corpus.docs.front().history.size() >
-              maxTokens - corpus.docs.front().history.size())) {
-    corpus.tokens -= corpus.docs.front().history.size();
-    corpus.docs.pop_front();
+          corpus.tokens - corpus.docs.front().table.history.size() >
+              maxTokens - corpus.docs.front().table.history.size())) {
+    // LRU: evict the least-recently-hit doc, not the oldest.
+    auto oldest = corpus.docs.begin();
+    for (auto it = corpus.docs.begin() + 1; it != corpus.docs.end(); ++it)
+      if (it->hitStamp < oldest->hitStamp)
+        oldest = it;
+    corpus.tokens -= oldest->table.history.size();
+    corpus.docs.erase(oldest);
+    ++corpus.evictions;
   }
 }
 
@@ -141,21 +182,26 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
 // occurrence's continuation fills `out`. Returns the follower count and the
 // winning backward extension measured against the lane's own history —
 // that is the corpus match's effective pattern length, minus the fixed 3.
-inline uint32_t lookupCorpus(const Corpus &corpus,
+inline uint32_t lookupCorpus(Corpus &corpus,
                              std::span<const uint32_t> laneHistory,
-                             uint32_t *out, uint32_t &extensionOut) {
+                             uint32_t *out, uint32_t &extensionOut,
+                             uint64_t selfOrigin = 0,
+                             uint64_t selfSession = 0) {
   const uint32_t laneSize = static_cast<uint32_t>(laneHistory.size());
   if (laneSize < 3)
     return 0;
   const uint64_t pattern =
       key(laneHistory.data() + laneSize - 3);
-  const Table *bestDoc = nullptr;
+  Corpus::Doc *bestDoc = nullptr;
   uint32_t best = kNone, bestExtension = 0, bestFollowers = 0;
-  for (const Table &doc : corpus.docs) {
-    const auto found = doc.starts.find(pattern);
-    if (found == doc.starts.end())
+  bool bestSession = false;
+  for (Corpus::Doc &doc : corpus.docs) {
+    if (selfOrigin && doc.origin == selfOrigin)
       continue;
-    const auto &dhistory = doc.history;
+    const auto found = doc.table.starts.find(pattern);
+    if (found == doc.table.starts.end())
+      continue;
+    const auto &dhistory = doc.table.history;
     const uint32_t dsize = static_cast<uint32_t>(dhistory.size());
     for (const uint32_t start : found->second) {
       if (start == kNone || start + 3 >= dsize)
@@ -166,20 +212,36 @@ inline uint32_t lookupCorpus(const Corpus &corpus,
                  laneHistory[laneSize - 4 - extension])
         ++extension;
       const uint32_t followers = dsize - (start + 3);
-      if (best == kNone || extension > bestExtension ||
-          (extension == bestExtension && followers > bestFollowers)) {
+      const bool sameSession =
+          selfSession && doc.session == selfSession;
+      // Extension, then same-session, then followers: session affinity
+      // breaks ties — a same-conversation continuation beats an equal
+      // match from unrelated traffic.
+      const bool better =
+          best == kNone || extension > bestExtension ||
+          (extension == bestExtension &&
+           (sameSession > bestSession ||
+            (sameSession == bestSession && followers > bestFollowers)));
+      if (better) {
         best = start;
         bestDoc = &doc;
         bestExtension = extension;
         bestFollowers = followers;
+        bestSession = sameSession;
       }
     }
   }
-  if (best == kNone)
+  if (best == kNone) {
+    ++corpus.misses;
     return 0;
+  }
+  // A contributing doc earns recency — the LRU keeps it past untouched
+  // docs under pressure.
+  bestDoc->hitStamp = ++corpus.tick;
+  ++corpus.hits;
   const uint32_t followers =
       std::min<uint32_t>(RICHENGINE_DRAFT_PROPOSAL_TOKENS, bestFollowers);
-  std::copy_n(bestDoc->history.data() + best + 3, followers, out);
+  std::copy_n(bestDoc->table.history.data() + best + 3, followers, out);
   extensionOut = bestExtension;
   return followers;
 }

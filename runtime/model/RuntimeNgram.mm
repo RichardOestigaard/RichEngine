@@ -7,6 +7,7 @@ namespace richengine::model {
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
     entry.corpusArmed = false;
     entry.corpusProbeAt = 0;
+    entry.corpusSession = ngram::sessionKey(prompt);
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::seed(entry.ngram, prompt);
@@ -32,7 +33,7 @@ namespace richengine::model {
     std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> scratch;
     uint32_t extension = 0;
     if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, prompt, scratch.data(),
-                            extension) &&
+                            extension, entry.id, entry.corpusSession) &&
         3 + extension >= ngram::kCorpusArmMin)
       entry.corpusArmed = true;
   }
@@ -48,11 +49,13 @@ namespace richengine::model {
       return;
     const auto &history = entry.ngram.history;
     if (ngram_.ngramCorpusAll_)
-      ngram::push(ngram_.ngramCorpusDocs_, history);
+      ngram::push(ngram_.ngramCorpusDocs_, history, 64, 1u << 20, entry.id,
+                  entry.corpusSession);
     else if (history.size() > entry.promptTokens)
       ngram::push(ngram_.ngramCorpusDocs_,
                   {history.data() + entry.promptTokens,
-                   history.size() - entry.promptTokens});
+                   history.size() - entry.promptTokens},
+                  64, 1u << 20, entry.id, entry.corpusSession);
   }
 
   void Runtime::Impl::corpusPush(std::span<const uint32_t> tokens) {
@@ -126,7 +129,8 @@ namespace richengine::model {
         std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> probe;
         uint32_t probeExtension = 0;
         if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
-                                probe.data(), probeExtension) &&
+                                probe.data(), probeExtension, entry.id,
+                                entry.corpusSession) &&
             3 + probeExtension >= ngram::kCorpusArmMin)
           entry.corpusArmed = true;
       }
@@ -136,7 +140,8 @@ namespace richengine::model {
         uint32_t corpusExtension = 0;
         const uint32_t corpusFound =
             ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
-                                corpus.data(), corpusExtension);
+                                corpus.data(), corpusExtension, entry.id,
+                                entry.corpusSession);
         const uint32_t corpusPattern =
             corpusFound ? 3 + corpusExtension : 0;
         const uint32_t selfPattern = found ? 3 + extension : 0;
