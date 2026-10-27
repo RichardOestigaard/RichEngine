@@ -24,7 +24,7 @@ from llguidance.hf import from_tokenizer as guidance_tokenizer
 
 from server import constraints, dfa, serving
 
-MAGIC = b"DFAPACK\x01"
+MAGIC = b"DFAPACK\x02"
 
 # A tool-call-shaped payload: literal stretches ({"name":" ... ,"arguments":{"
 # produce forced spans), with a free string, an integer, an enum and an array
@@ -134,12 +134,19 @@ def main():
     body += marker
     body += array.array("I", eos_ids).tobytes()
     body += array.array("I", prompt).tobytes()
+    # The budget rule's per-state termination bounds, the engine's B_bytes
+    # cost: single byte-unmarked walks bottom out at their acceptance.
+    costs = compiled.byte_costs()
+    body += array.array("h", costs).tobytes()
+    bounded = [c for c in costs if c != 32767]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(header + body)
     print(
         f"dfa-pack: vocab={contract.vocabulary} token_bytes={len(token_bytes)} "
         f"special={len(special)} dfa_states={compiled.n_states} "
-        f"eos={eos_ids} prompt_tokens={len(prompt)} -> {out_path}",
+        f"eos={eos_ids} prompt_tokens={len(prompt)} "
+        f"costs={len(costs)} bounded={len(bounded)} "
+        f"max_bound={max(bounded) if bounded else 0} -> {out_path}",
         file=sys.stderr,
     )
 

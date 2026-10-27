@@ -79,6 +79,9 @@ struct Pack final {
   std::vector<uint8_t> marker;        // states * 32 bytes
   std::vector<uint32_t> eosIds;
   std::vector<uint32_t> prompt;
+  // The budget rule's per-state termination bounds (n_states i16 entries),
+  // the frame's optional cost section.
+  std::vector<int16_t> costs;
 };
 
 class PackReader final {
@@ -126,7 +129,7 @@ Pack loadPack(const std::filesystem::path &path) {
   std::array<char, 8> magic{};
   for (char &byte : magic)
     reader.read(byte, "magic");
-  if (std::string_view(magic.data(), magic.size()) != "DFAPACK\x01")
+  if (std::string_view(magic.data(), magic.size()) != "DFAPACK\x02")
     throw std::runtime_error("dfa pack magic mismatch");
   Pack pack;
   uint32_t tokenByteCount = 0;
@@ -157,6 +160,9 @@ Pack loadPack(const std::filesystem::path &path) {
   reader.readArray(pack.marker, markerBytes, "marker");
   reader.readArray(pack.eosIds, eosCount, "eos ids");
   reader.readArray(pack.prompt, promptTokens, "prompt");
+  // The budget rule's per-state termination bounds — n_states i16 entries,
+  // exactly the frame's optional cost section.
+  reader.readArray(pack.costs, size_t{pack.dfaStates}, "cost table");
   reader.finish();
   if (pack.tokenOffsets.front() != 0 ||
       uint64_t(pack.tokenOffsets.back()) != pack.tokenBytes.size() ||
@@ -757,7 +763,7 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
       // like a CONSTRAINT_DFA frame outrunning its lane.
       static_cast<void>(
           engine.provideDfa(id, pack.dfaTable, pack.accepting, pack.marker,
-                            pack.eosIds));
+                            pack.eosIds, pack.costs));
     }
   }
 
