@@ -139,6 +139,17 @@ def main():
             arm_min=args.arm_min, mode=2, occ_all=True, grouped=True,
             session=sess,
         ),
+        # Variable-order corpus matcher: longest lane-suffix substring in
+        # the doc wins — catches what the fixed-3 key + extension misses.
+        "v2p+vo": lambda corpus, hinted, sess: NgramV2P(
+            global_corpus=corpus, margin=args.margin,
+            arm_min=args.arm_min, mode=2, vo=True,
+        ),
+        # Adaptive proposal length: cap ∝ match length (AgSpec §3.2, α=0.5).
+        "v2p+ad": lambda corpus, hinted, sess: NgramV2P(
+            global_corpus=corpus, margin=args.margin,
+            arm_min=args.arm_min, mode=2, adapt_alpha=0.5,
+        ),
     }
     if args.variant:
         variants = {k: v for k, v in variants.items() if k in args.variant}

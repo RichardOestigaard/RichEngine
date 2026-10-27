@@ -369,7 +369,7 @@ bool NativeRuntime::handleForcedTokens(
 
 bool NativeRuntime::handleCorpusAppend(
     const protocol::CorpusAppendFrame &append) {
-  core_.corpusAppend(append.tokens);
+  core_.corpusAppend(append.tokens, append.session);
   return true;
 }
 

@@ -566,6 +566,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     const uint32_t ngramCorpus_ = modelPolicy().ngramCorpus;
     const bool ngramCorpusAll_ = modelPolicy().ngramCorpusAll;
     const uint32_t ngramCorpusMargin_ = modelPolicy().ngramCorpusMargin;
+    const bool ngramCorpusSessionGate_ =
+        modelPolicy().ngramCorpusSessionGate;
     ngram::Corpus ngramCorpusDocs_;
     // Whether a lane may consult the corpus this step. Arming happens at
     // admission (seedNgramHistory) and through the starvation probe in
@@ -1110,6 +1112,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // host mask request: only a Full-mode DFA lane skips the round trip.
   bool gpuDfaMasks(const Request &entry) const noexcept {
     return dfaMode_ == DfaMode::Full && entry.dfa.has_value();
+  }
+  // Model::decodeUsesHostMask: the engine consults this only for TokenMask
+  // lanes, so a GPU-DFA lane answers "no host exchange — submit ahead is
+  // safe"; anything else (no DFA, forced mode) keeps the old answer.
+  bool decodeUsesHostMask(uint64_t requestId) const noexcept {
+    const auto it = requests.find(requestId);
+    return it == requests.end() || !gpuDfaMasks(it->second);
   }
   // gpuDfaMasks over a dispatch: the lanes whose DfaNextStates rows the
   // selection kernels read instead of a constraint bitmask.
@@ -1917,7 +1926,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   void noteNgramCorpus(const Request &entry);
   // An externally pushed stream (workspace file, tool output,
   // emission-format copy) joins the corpus without a request behind it.
-  void corpusPush(std::span<const uint32_t> tokens);
+  void corpusPush(std::span<const uint32_t> tokens, uint64_t session);
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after
@@ -3132,10 +3141,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         Request &entry = *laneResult.request;
         entries[lane] = &entry;
         entry.maskWords.clear();
-        // Every lane took the gate's GPU-mask branch, so this is the
-        // bookkeeping the split path's Draft stage does for one.
-        gpuMask_[lane] = true;
-        entry.gpuMaskInFlight = true;
+        // A free lane of a mixed pack needs no mask and asks for none: the
+        // bookkeeping the split path's Draft stage does for one. Its live
+        // rows are decodeAsync's own (the adaptive budget constrained lanes
+        // skip).
+        const bool maskLane = constrained(lane);
+        gpuMask_[lane] = maskLane;
+        entry.gpuMaskInFlight = maskLane;
         entry.verifyMaskInFlight = false;
         // The span bookkeeping the split path does host-side: the forced
         // prefix length, its auto-accept record and the lane's live
@@ -3143,7 +3155,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         forced_[lane] = 0;
         gpuForced_[lane] = 0;
         DfaForcedSpan &span = impl_.dfaForcedSpan(entry.stateLane);
-        if (entry.pendingToken && span.tokens) {
+        if (maskLane && entry.pendingToken && span.tokens) {
           forced_[lane] = std::min<uint32_t>(
               span.tokens,
               std::min<uint32_t>(kDraftProposalTokens,
@@ -3154,9 +3166,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           impl_.counters.forcedTokensEmitted += forced_[lane];
         }
         liveRows_[lane] =
-            forced_[lane]
-                ? forced_[lane] + 1
-                : std::min(cap, laneResult.maximumRetained - 1) + 1;
+            maskLane
+                ? (forced_[lane]
+                       ? forced_[lane] + 1
+                       : std::min(cap, laneResult.maximumRetained - 1) + 1)
+                : laneResult.proposals + 1;
         maximumRetained[lane] = laneResult.maximumRetained;
         proposals[lane] = liveRows_[lane] - 1;
         laneResult.proposals = proposals[lane];

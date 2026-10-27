@@ -508,6 +508,11 @@ struct ModelTelemetry final {
   uint64_t corpusMisses = 0;
   uint64_t corpusPushes = 0;
   uint64_t corpusEvictions = 0;
+  // Weak matches = the key was found but the best pattern stayed under the
+  // arm minimum; dropped starts = occurrences pushed past a key's last-4
+  // window — together the signal for a variable-order matcher.
+  uint64_t corpusWeakMatches = 0;
+  uint64_t corpusDroppedStarts = 0;
 };
 
 // One warmup lane's observable outcome: its step result, the anchor the step
@@ -576,6 +581,14 @@ public:
   [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
     return ExecutionLimits::draftContextTokens;
   }
+  // Whether this request's constrained decode exchanges masks with the
+  // host between commands — true for a TokenMask lane whose masks the GPU
+  // does not produce (no shipped DFA under full mode). Submit-ahead uses
+  // it: a merged constrained step is one command and can submit ahead like
+  // a free lane; a host-mask lane cannot.
+  [[nodiscard]] virtual bool decodeUsesHostMask(uint64_t) const noexcept {
+    return true;
+  }
   // How far past a decode step's logical position the engine must admit KV
   // pages: the ordinary verify's speculative tail, a diffusion target's
   // whole canvas (its step writes the canvas KV into the uncommitted span
@@ -624,7 +637,7 @@ public:
   // A standalone token stream pushed into the cross-request n-gram corpus
   // (workspace file, tool output, emission-format copy). Default:
   // unsupported, drops it.
-  virtual void corpusAppend(std::span<const uint32_t>) {}
+  virtual void corpusAppend(std::span<const uint32_t>, uint64_t) {}
   // A compiled byte-DFA for one request's constraint: while the model holds
   // it, decode derives the lane's automaton state and forced spans on the
   // GPU — and under RICHENGINE_DFA_MODE=full its masks too. accepting is

@@ -1,7 +1,7 @@
-import { createMemo, createSignal, onMount, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, onMount, For, Show } from "solid-js";
 import { A, useSearchParams } from "@solidjs/router";
 import { Tab, TabGroup, TabList, TabPanel } from "terracotta";
-import { ApiError, api, authorization, errorText, noteAuthStatus } from "../api";
+import { ApiError, api, authorization, errorText, noteAuthStatus, storageGet, storageSet } from "../api";
 import { decisionModel } from "../decision";
 import { useCopied } from "../clipboard";
 import { fmtInt } from "../format";
@@ -79,7 +79,7 @@ const [modelIds, setModelIds] = createSignal<string[]>([]);
 
 /* Tokenize form + result. */
 const [content, setContent] = createSignal("");
-const [addSpecial, setAddSpecial] = createSignal(false);
+const [addSpecial, setAddSpecial] = createSignal(storageGet("pg:add-special") === "1");
 const [tokBusy, setTokBusy] = createSignal(false);
 const [tokError, setTokError] = createSignal<string | null>(null);
 const [tokController, setTokController] = createSignal<AbortController>();
@@ -108,14 +108,14 @@ const [tplCancelled, setTplCancelled] = createSignal(false);
 const [tplResult, setTplResult] = createSignal<string | null>(null);
 
 /* Completions form + result. */
-const [compMode, setCompMode] = createSignal<"text" | "ids">("text");
+const [compMode, setCompMode] = createSignal<"text" | "ids">(storageGet("pg:mode") === "ids" ? "ids" : "text");
 const [promptText, setPromptText] = createSignal("");
 const [idsText, setIdsText] = createSignal("");
-const [maxTokens, setMaxTokens] = createSignal("64");
-const [temperature, setTemperature] = createSignal("");
-const [stopText, setStopText] = createSignal("");
+const [maxTokens, setMaxTokens] = createSignal(storageGet("pg:max-tokens") ?? "64");
+const [temperature, setTemperature] = createSignal(storageGet("pg:temperature") ?? "");
+const [stopText, setStopText] = createSignal(storageGet("pg:stop") ?? "");
 const [compModel, setCompModel] = createSignal("");
-const [compStream, setCompStream] = createSignal(true);
+const [compStream, setCompStream] = createSignal(storageGet("pg:stream") !== "0");
 const [compBusy, setCompBusy] = createSignal(false);
 const [compController, setCompController] = createSignal<AbortController>();
 const [compCancelled, setCompCancelled] = createSignal(false);
@@ -129,6 +129,40 @@ const [compResult, setCompResult] = createSignal<{
 export default function Playground() {
   /* Which control last copied. */
   const { copied, copy } = useCopied();
+
+  /* Params survive reloads — retyping them each visit was the friction. */
+  createEffect(() => {
+    storageSet("pg:add-special", addSpecial() ? "1" : "0");
+    storageSet("pg:mode", compMode());
+    storageSet("pg:max-tokens", maxTokens());
+    storageSet("pg:temperature", temperature());
+    storageSet("pg:stop", stopText());
+    storageSet("pg:stream", compStream() ? "1" : "0");
+  });
+
+  /* Debounced /tokenize under the prompt — teaches context cost without
+     a submit. */
+  const [liveTokens, setLiveTokens] = createSignal<number | null>(null);
+  createEffect(() => {
+    const text = compMode() === "text" ? promptText().trim() : "";
+    if (!text) {
+      setLiveTokens(null);
+      return;
+    }
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await api<TokenizeResponse>("/tokenize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: text }),
+        });
+        setLiveTokens(res.tokens?.length ?? null);
+      } catch {
+        setLiveTokens(null);
+      }
+    }, 400);
+    onCleanup(() => window.clearTimeout(timer));
+  });
 
   /* The active tab lives in the hash — #/playground?tab=completions
      survives reloads, and the cross-tool buttons go through setTab. */
@@ -930,6 +964,9 @@ export default function Playground() {
                   <Show when={compErrors().prompt}>
                     {(msg) => <p class="field-error">{msg()}</p>}
                   </Show>
+                  <Show when={liveTokens() !== null}>
+                    <p class="hint">≈{fmtInt(liveTokens()!)} tokens</p>
+                  </Show>
                 </label>
               </Show>
               <div class="panel-row params">
@@ -1092,6 +1129,27 @@ export default function Playground() {
                     }
                   >
                     {copied() === "text" ? "copied ✓" : "Copy text"}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn small"
+                    title="Open chat with this prompt prefilled"
+                    onClick={() => {
+                      window.dispatchEvent(
+                        new CustomEvent("richengine:navigate", { detail: "/" })
+                      );
+                      setTimeout(
+                        () =>
+                          window.dispatchEvent(
+                            new CustomEvent("richengine:prefill", {
+                              detail: promptText(),
+                            })
+                          ),
+                        0
+                      );
+                    }}
+                  >
+                    Send to chat →
                   </button>
                 </div>
               </div>

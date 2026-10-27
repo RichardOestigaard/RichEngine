@@ -19,9 +19,11 @@ import {
   DialogPanel,
   DialogTitle,
 } from "terracotta";
-import { api, curlExample, storageGet, storageSet } from "../api";
+import { api, apiPost, curlExample, errorText, storageGet, storageSet } from "../api";
 import { useCopied } from "../clipboard";
+import { installJob, pollInstall } from "../install";
 import { MODEL_KEY } from "../pages/chat/storage";
+import { pushToast } from "../toast";
 import { cycleTheme, theme, THEME_LABELS } from "../theme";
 import {
   closePalette,
@@ -163,6 +165,61 @@ export default function Palette() {
     { id: "go-metrics", title: "Go to Metrics", kbd: "⌘6", run: () => { navigate("/metrics"); closePalette(); } },
     { id: "go-settings", title: "Go to Settings", kbd: "⌘7", run: () => { navigate("/settings"); closePalette(); } },
     { id: "switch-model", title: "Switch model…", hint: currentModelLabel(), run: enterModels },
+    {
+      id: "install-model",
+      title: "Install a model…",
+      hint: "Models",
+      run: () => {
+        navigate("/models?open=install");
+        closePalette();
+      },
+    },
+    /* Live jobs become actions: cancel a running install, unload the
+       current resident. */
+    ...(installJob()?.running
+      ? [
+          {
+            id: "cancel-install",
+            title: `Cancel install of ${installJob()?.model}`,
+            run: () => {
+              void apiPost("/v1/models/install/cancel", {})
+                .then(pollInstall)
+                .catch((e) => pushToast("error", errorText(e)));
+              closePalette();
+            },
+          },
+        ]
+      : []),
+    ...(currentModel()
+      ? [
+          {
+            id: "unload-model",
+            title: `Unload ${currentModel()}`,
+            run: () => {
+              const id = currentModel()!;
+              void apiPost("/v1/models/unload", { model: id })
+                .then(() =>
+                  pushToast("ok", `Unloaded ${id}`, 8000, {
+                    label: "Load again",
+                    run: () =>
+                      void apiPost("/v1/models/load", { model: id }).then(
+                        () => {
+                          storageSet(MODEL_KEY, id);
+                          window.dispatchEvent(
+                            new CustomEvent("richengine:model-changed", {
+                              detail: id,
+                            })
+                          );
+                        }
+                      ),
+                  })
+                )
+                .catch((e) => pushToast("error", errorText(e)));
+              closePalette();
+            },
+          },
+        ]
+      : []),
     {
       id: "tune-model",
       title: "Tune a model…",

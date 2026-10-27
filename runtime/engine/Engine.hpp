@@ -155,7 +155,7 @@ public:
   // A workspace/emission-format stream pushed into the cross-request
   // n-gram corpus (RICHENGINE_NGRAM_CORPUS); a no-op when the corpus is
   // off.
-  void corpusAppend(std::span<const uint32_t> tokens);
+  void corpusAppend(std::span<const uint32_t> tokens, uint64_t session = 0);
   // A compiled byte-DFA for one request's constraint; true when the model
   // took it. Dropped frames keep the host-mask path. costs, when present,
   // is the frame's per-state termination bound the decode budget rule
@@ -292,6 +292,9 @@ private:
     // When the engine asked the server for this lane's token mask, until the
     // model takes one.
     std::optional<double> maskRequestedMilliseconds;
+    // Once a request has answered one mask, later waits are row evals —
+    // the first can join a still-running grammar compile.
+    bool maskAnswered = false;
     // The model took the request's byte-DFA: masks come from the GPU walk
     // kernels, so the request never enters a host mask wait.
     bool gpuMask = false;

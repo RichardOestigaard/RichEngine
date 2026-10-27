@@ -33,12 +33,22 @@
 
 .chat-shell main { min-height: 100vh; margin-left: var(--sidebar); padding-top: var(--topbar) }
 .chat-shell #chat { width: min(720px, 100%); margin: auto; padding: 48px 24px 160px }
-.chat-shell #empty { position: fixed; top: calc(50% - 118px + var(--topbar) / 2); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 24px; font-weight: 600; letter-spacing: -.03em; text-align: center }
+/* Anchored from the bottom so taller content (starters or the get-started
+   checklist) grows upward, always clearing the centered composer. The
+   column stack keeps heading, checklist and hints aligned as one unit. */
+.chat-shell #empty { position: fixed; bottom: calc(50% + 80px); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); display: flex; flex-direction: column; align-items: center; transform: translateX(-50%); font-size: 24px; font-weight: 600; letter-spacing: -.03em; text-align: center }
+.chat-shell .getstarted { align-items: flex-start; text-align: left; margin-top: 14px }
 .chat-shell .empty-hints { display: flex; flex-wrap: wrap; gap: 4px 16px; justify-content: center; margin-top: 14px; color: var(--muted); font-size: 12.5px; font-weight: 400; letter-spacing: normal; white-space: nowrap }
 .chat-shell .starters { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; font-size: 13px; font-weight: 400; letter-spacing: normal }
 .chat-shell .starter { padding: 8px 14px; border: 1px solid var(--border); border-radius: 999px; background: var(--composer); color: var(--muted) }
 .chat-shell .starter:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 25%, var(--border)); background: var(--hover) }
 .chat-shell .empty-model { margin-top: 12px; font-size: 12px; font-weight: 400; letter-spacing: normal }
+/* Cold-start checklist, replaces starters when nothing is loaded. */
+.chat-shell .getstarted { display: inline-flex; flex-direction: column; gap: 9px; margin-top: 18px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--composer); font-size: 13.5px; font-weight: 400; letter-spacing: normal; text-align: left }
+.chat-shell .gs-title { font-weight: 650; letter-spacing: -.01em }
+.chat-shell .gs-step { color: var(--muted); text-decoration: none }
+.chat-shell a.gs-step { color: var(--accent); font-weight: 500 }
+.chat-shell a.gs-step:hover { text-decoration: underline }
 /* No hover on touch — keep the row actions out instead of hiding them,
    and give the attachment remove button a reachable size. */
 @media (pointer: coarse) {
@@ -240,7 +250,7 @@
   .chat-shell.menu-open .scrim { display: block }
   .chat-shell .menu-btn { display: grid }
   .chat-shell #chat { padding: 14px 16px 140px }
-  .chat-shell #empty { top: calc(50% - 118px); left: 50%; font-size: 23px }
+  .chat-shell #empty { bottom: calc(50% + 80px); left: 50%; font-size: 23px }
   .chat-shell form { left: 50%; bottom: max(8px, env(safe-area-inset-bottom)); width: calc(100% - 16px) }
   .chat-shell.empty form { transform: translate(-50%, calc(8px + 50% - 50vh)) }
   .chat-shell textarea { max-height: 140px }

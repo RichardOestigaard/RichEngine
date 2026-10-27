@@ -27,7 +27,7 @@ constexpr std::array<uint8_t, 4> kMagic{'R', 'I', 'C', 'H'};
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kForcedTokensFixedBytes = 12;
-constexpr uint64_t kCorpusAppendFixedBytes = 4;
+constexpr uint64_t kCorpusAppendFixedBytes = 12;
 constexpr uint64_t kConstraintDfaFixedBytes = 16;
 constexpr uint64_t kVocabularyFixedBytes = 8;
 // The largest byte-DFA the wire admits: 32767 states x 256 i16 transitions.
@@ -864,7 +864,7 @@ ProtocolResult<ClientMessage> decodeCorpusAppend(const Frame &frame,
   Reader reader(frame.payload);
   CorpusAppendFrame append;
   uint32_t count = 0;
-  if (!reader.u32(count)) {
+  if (!reader.u64(append.session) || !reader.u32(count)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "corpus append payload is truncated"));

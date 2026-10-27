@@ -733,12 +733,12 @@ class MultiplexedRuntime:
                 acquired -= 1
             raise
 
-    def corpus_append(self, tokens) -> None:
+    def corpus_append(self, tokens, session=0) -> None:
         """Pushes a token stream into the engine's cross-request n-gram
         corpus (RICHENGINE_NGRAM_CORPUS) — workspace files, tool outputs,
         emission-format copies. No-op when the corpus is off engine-side."""
         encoded = wire.serialize_message(
-            wire.CorpusAppendFrame(tuple(tokens))
+            wire.CorpusAppendFrame(tuple(tokens), session)
         )
         with self._state_lock:
             if self._closed:

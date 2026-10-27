@@ -214,7 +214,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       {"mask_response",
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
-      {"corpus_append", CorpusAppendFrame{{10, 11, 12}}},
+      {"corpus_append", CorpusAppendFrame{0, {10, 11, 12}}},
   };
   return messages;
 }

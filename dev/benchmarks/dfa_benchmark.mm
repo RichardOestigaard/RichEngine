@@ -465,7 +465,8 @@ public:
   }
 
   void completed(uint64_t requestId, EngineFinishReason, uint32_t,
-                 uint32_t, std::span<const float>) override {
+                 uint32_t, uint32_t, uint32_t,
+                 std::span<const float>) override {
     observations_[requestId].completed = true;
   }
 
@@ -591,7 +592,7 @@ private:
 
 // ---------------------------------------------------------- scenarios ----
 
-enum class Scenario : uint8_t { Unconstrained, Mask, MaskForced, Dfa };
+enum class Scenario : uint8_t { Unconstrained, Mask, MaskForced, Dfa, Mixed };
 
 struct ScenarioResult final {
   std::string scenario;
@@ -696,8 +697,15 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
                            uint32_t sample, uint64_t &requestId) {
   static_cast<void>(cache.evictAll());
   const bool constrained = scenario != Scenario::Unconstrained;
-  const bool installDfa = scenario == Scenario::Dfa;
+  // The mixed burst alternates DFA-installed constrained lanes with free
+  // ones — what RICHENGINE_MIXED_DECODE_PACK packs into one command under
+  // RICHENGINE_DFA_MODE=full.
+  const bool mixed = scenario == Scenario::Mixed;
+  const bool installDfa = scenario == Scenario::Dfa || mixed;
   const bool pushForced = scenario == Scenario::MaskForced;
+  const auto laneConstrained = [&](uint32_t lane) {
+    return constrained && (!mixed || lane % 2 == 0);
+  };
   // The lanes share one prompt; warm it once so every lane resumes from the
   // published prefix in a packed prefill and decodes in lockstep, as the
   // decode-throughput scenario of backend_benchmark does.
@@ -720,6 +728,8 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
     events.onTokens = [&](uint64_t id, std::span<const uint32_t> tokens) {
       auto lane = laneOf.find(id);
       if (lane == laneOf.end())
+        return;
+      if (!laneConstrained(lane->second))
         return;
       mirrors[lane->second].commit(tokens);
       if (pushForced) {
@@ -756,9 +766,9 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
     const uint64_t id = requestId++;
     laneOf.emplace(id, lane);
     requestIds.push_back(id);
-    submitRequest(engine, id, pack.prompt, steps, constrained,
+    submitRequest(engine, id, pack.prompt, steps, laneConstrained(lane),
                   milliseconds(began + std::chrono::hours(2)));
-    if (installDfa) {
+    if (installDfa && laneConstrained(lane)) {
       // Queued requests record the frame for admission to deliver, exactly
       // like a CONSTRAINT_DFA frame outrunning its lane.
       static_cast<void>(
@@ -832,6 +842,9 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
     break;
   case Scenario::Dfa:
     result.scenario = "dfa";
+    break;
+  case Scenario::Mixed:
+    result.scenario = "mixed";
     break;
   }
   return result;
@@ -929,6 +942,7 @@ std::vector<Scenario> parseScenarios(std::string_view value) {
         : name == "mask"        ? Scenario::Mask
         : name == "mask-forced" ? Scenario::MaskForced
         : name == "dfa"         ? Scenario::Dfa
+        : name == "mixed"       ? Scenario::Mixed
                                 : throw std::invalid_argument(
                                       "unknown benchmark scenario");
     selected.push_back(scenario);
@@ -1079,7 +1093,8 @@ int main(int argc, char **argv) {
                   << (scenario == Scenario::Unconstrained ? "unconstrained"
                       : scenario == Scenario::Mask         ? "mask"
                       : scenario == Scenario::MaskForced   ? "mask-forced"
-                                                           : "dfa")
+                      : scenario == Scenario::Dfa          ? "dfa"
+                                                           : "mixed")
                   << " sample=" << sample << " width=" << width
                   << " steps=" << steps << '\n';
         ScenarioResult result =

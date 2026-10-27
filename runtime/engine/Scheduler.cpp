@@ -1,5 +1,7 @@
 #include "engine/Scheduler.hpp"
 
+#include "Env.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -367,8 +369,16 @@ uint32_t Scheduler::prefillBudget(
   // decoders left out of this command (their streams resume once their
   // memory lands), and for peers that can finish prefill within this slice.
   // The first sample and minimum matrix shape remain limits.
-  if (contended)
+  if (contended) {
+    // A 1024-row chunk ceiling while decode debt is owed (default on,
+    // measured win): a 27K prefill's chunks stop donating half-second
+    // decode stalls each. RICHENGINE_PREFILL_DEBT_ROWS=0 removes the cap.
+    static const uint32_t debtCap =
+        static_cast<uint32_t>(envUint("RICHENGINE_PREFILL_DEBT_ROWS", 1024));
+    if (debtCap && decodeDebtMilliseconds_ > 0.0)
+      rows = std::min(rows, debtCap);
     return rows;
+  }
   // A leader that finishes within the full budget ends the command at its
   // last row, or at its next state boundary: prefill cost is linear above
   // the slice, so shortest-first sequential commands minimise first-token
@@ -401,16 +411,32 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   });
   const DecodeStage decodeStage = ready.front()->decodeStage;
   const RequestPriority selectedPriority = ready.front()->spec.priority;
+  // One host-mask lane would pull the whole batch onto the constrained
+  // split ticket — a host mask round trip between its commands every step —
+  // so lanes pack only with peers of the same mask need. A GPU-DFA lane's
+  // masks are computed on-device (model::Model::decodeUsesHostMask), so it
+  // packs with free lanes instead of paying each mode its own command's
+  // fixed streams; RICHENGINE_MIXED_DECODE_PACK_OFF restores the split.
+  static const bool mixedPack = getenv("RICHENGINE_MIXED_DECODE_PACK_OFF") == nullptr;
+  const auto hostMaskLane = [&](const Request *request) {
+    return request->spec.constraint == ConstraintMode::TokenMask &&
+           (!mixedPack || !hostMaskProbe || hostMaskProbe(request->spec.id));
+  };
+  const bool leaderHostMask = hostMaskLane(ready.front());
+  const ConstraintMode constraint = ready.front()->spec.constraint;
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
   plan.decodeStage = decodeStage;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
-        request->decodeStage != decodeStage) {
+        request->decodeStage != decodeStage ||
+        (mixedPack ? hostMaskLane(request) != leaderHostMask
+                   : request->spec.constraint != constraint)) {
       if (getenv("RICHENGINE_DENY_DEBUG"))
-        fprintf(stderr, "stage-split id=%llu stage=%d want=%d\n",
+        fprintf(stderr, "stage-split id=%llu stage=%d want=%d constr=%d want=%d\n",
                 (unsigned long long)request->spec.id,
-                (int)request->decodeStage, (int)decodeStage);
+                (int)request->decodeStage, (int)decodeStage,
+                (int)request->spec.constraint, (int)constraint);
       continue;
     }
     plan.items.push_back({request->spec.id, 0, 0});

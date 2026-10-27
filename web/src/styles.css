@@ -97,9 +97,11 @@ svg { display: block }
 .skip-link { transition: transform .15s ease }
 .page-host:focus { outline: 0 }
 
-/* Route swaps remount the page under this entrance. */
+/* Route swaps remount the page under this entrance. Scoped to .page —
+   a transform on .chat-shell would briefly become the containing block
+   for its fixed-position composer and sidebar. */
 @keyframes page-in { from { opacity: 0; transform: translateY(6px) } }
-.page-host > * { animation: page-in .18s ease-out }
+.page-host > .page { animation: page-in .18s ease-out }
 @keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(.98) } }
 @keyframes icon-in { from { opacity: 0; transform: rotate(-80deg) scale(.6) } }
 
@@ -212,6 +214,8 @@ svg { display: block }
   .topbar { gap: 10px; padding: 0 10px }
   .navlink { padding: 6px 8px }
 }
+/* Global engine-down banner under the topbar. */
+.topdown { position: fixed; inset: var(--topbar) 0 auto; z-index: 29; padding: 8px 16px; border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, var(--bg)); color: var(--warn); font-size: 13px; text-align: center }
 /* Theme icon remounts keyed → plays icon-in on each cycle. */
 .theme-btn svg { animation: icon-in .2s ease-out }
 @media (max-width: 700px) {

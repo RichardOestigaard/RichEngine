@@ -356,7 +356,9 @@ class ModelHost:
                     "native runtime reported an invalid context window"
                 )
             effective_context = readiness.max_context_tokens
-            constraint_factory = ConstraintFactory(tokenizer, contract)
+            constraint_factory = ConstraintFactory(
+                tokenizer, contract, dfa_mode_default=serving_contract.dfa_mode
+            )
             app = Frontend(
                 tokenizer,
                 backend,

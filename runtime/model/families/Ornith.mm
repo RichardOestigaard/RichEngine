@@ -43,6 +43,11 @@ ModelDescriptor ornithDescriptor(std::string name) {
       makeModelDescriptor(std::move(name), ornith9TargetLayout(),
                           ornith9DFlashV1DraftLayout(), vision);
   descriptor.visionSource = VisionSource::None;
+  // GPU masks and forced spans: the host mask round trip stalls the engine
+  // outright while a constrained ticket waits, which starves every lane of
+  // a tool-call burst. The family's serving block declares the same mode so
+  // the server ships the DFA and skips the pushed spans.
+  descriptor.tuning.dfaMode = "full";
   return descriptor;
 }
 

@@ -1394,6 +1394,11 @@ export default function Chat() {
     const onExport = () => exportChat();
     const onToggleSidebar = () => setMenuOpen((open) => !open);
     const onFocusInput = () => inputEl?.focus();
+    /* Playground's "Send to chat" lands here — prefill, don't send. */
+    const onPrefill = (e: Event) => {
+      setInput((e as CustomEvent<string>).detail ?? "");
+      inputEl?.focus();
+    };
     const onPinActive = () => {
       const id = activeId();
       if (!id) return;
@@ -1419,6 +1424,7 @@ export default function Chat() {
     window.addEventListener("richengine:export-chat", onExport);
     window.addEventListener("richengine:toggle-sidebar", onToggleSidebar);
     window.addEventListener("richengine:focus-input", onFocusInput);
+    window.addEventListener("richengine:prefill", onPrefill);
     window.addEventListener("richengine:pin-chat", onPinActive);
     window.addEventListener("richengine:open-system", onOpenSystem);
     onCleanup(() => {
@@ -1429,6 +1435,7 @@ export default function Chat() {
       window.removeEventListener("richengine:export-chat", onExport);
       window.removeEventListener("richengine:toggle-sidebar", onToggleSidebar);
       window.removeEventListener("richengine:focus-input", onFocusInput);
+      window.removeEventListener("richengine:prefill", onPrefill);
       window.removeEventListener("richengine:pin-chat", onPinActive);
       window.removeEventListener("richengine:open-system", onOpenSystem);
       window.clearTimeout(modelTimer);
@@ -1552,29 +1559,47 @@ export default function Chat() {
           <Show when={!messages().length}>
             <div id="empty">
               How can I help?
-              <div class="starters">
-                <For
-                  each={[
-                    "Explain DNS like I'm five",
-                    "Write a haiku about compilers",
-                    "Draft a standup update from rough notes",
-                  ]}
-                >
-                  {(prompt) => (
-                    <button
-                      type="button"
-                      class="starter"
-                      title="Send this prompt"
-                      onClick={() => {
-                        setInput(prompt);
-                        void complete();
-                      }}
-                    >
-                      {prompt}
-                    </button>
-                  )}
-                </For>
-              </div>
+              {/* Cold start: with no resident the starters are unusable —
+                  a checklist is the better empty state. */}
+              <Show
+                when={!noModel() || serverDown() || modelLoading()}
+                fallback={
+                  <div class="getstarted">
+                    <div class="gs-title">Get started</div>
+                    <A href="/models?open=install" class="gs-step">
+                      1 · Install a model
+                    </A>
+                    <div class="gs-step">
+                      2 · It loads itself — watch for the toast
+                    </div>
+                    <div class="gs-step">3 · Come back and chat</div>
+                  </div>
+                }
+              >
+                <div class="starters">
+                  <For
+                    each={[
+                      "Explain DNS like I'm five",
+                      "Write a haiku about compilers",
+                      "Draft a standup update from rough notes",
+                    ]}
+                  >
+                    {(prompt) => (
+                      <button
+                        type="button"
+                        class="starter"
+                        title="Send this prompt"
+                        onClick={() => {
+                          setInput(prompt);
+                          void complete();
+                        }}
+                      >
+                        {prompt}
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
               <div class="empty-hints">
                 <span>⌘K commands</span>
                 <span>/ for slash commands</span>

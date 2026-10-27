@@ -316,6 +316,16 @@ inline constexpr std::string_view kMoeGatherTable16 = "moe_gather_table16";
 inline constexpr std::string_view kMoeGatherPacked = "moe_gather_packed";
 inline constexpr std::string_view kMoeGatherRows = "moe_gather_rows";
 inline constexpr std::string_view kMoeCombine = "moe_combine";
+// The dense shared-expert dispatches of a decode plan under
+// RICHENGINE_MOE_SHARED_DENSE (params.shared == 2 in the grouping).
+inline constexpr std::string_view kMoeSharedGateUpQ4M8 = "moe_shared_gate_up_q4_m8";
+inline constexpr std::string_view kMoeSharedDownQ4M8 = "moe_shared_down_q4_m8";
+inline constexpr std::string_view kMoeSharedGateUpQ4M16 = "moe_shared_gate_up_q4_m16";
+inline constexpr std::string_view kMoeSharedDownQ4M16 = "moe_shared_down_q4_m16";
+inline constexpr std::string_view kMoeSharedGateUpQ4M8Sg4 = "moe_shared_gate_up_q4_m8_sg4";
+inline constexpr std::string_view kMoeSharedDownQ4M8Sg4 = "moe_shared_down_q4_m8_sg4";
+inline constexpr std::string_view kMoeSharedGateUpQ4M16Sg4 = "moe_shared_gate_up_q4_m16_sg4";
+inline constexpr std::string_view kMoeSharedDownQ4M16Sg4 = "moe_shared_down_q4_m16_sg4";
 inline constexpr std::string_view kMoeRouteScoresGemma = "moe_route_scores_gemma";
 inline constexpr std::string_view kMoeRouteScoresGemmaVec = "moe_route_scores_gemma_vec";
 inline constexpr std::string_view kMoeRouteSelectGemma = "moe_route_select_gemma";

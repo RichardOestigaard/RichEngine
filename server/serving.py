@@ -65,6 +65,11 @@ class ServingContract:
     # Extra names the model serves under beyond its package id and the
     # command line's --served-model-name list.
     served_names: tuple = ()
+    # The engine's default DFA mode when RICHENGINE_DFA_MODE is unset; the
+    # family's descriptor declares the same value so both sides of the wire
+    # resolve identically. "full" ships constraint DFAs and serves no host
+    # mask; None keeps every constraint on the host path.
+    dfa_mode: str | None = None
     # A decision model (Liquid d1 family): /v1/systemone and /v1/judgments
     # run the native decision pathway, not the SemIf emulation.
     decision: bool = False
@@ -112,6 +117,7 @@ class ServingContract:
             sampling=dict(doc.get("sampling", {})),
             reasoning_effort=doc.get("reasoning_effort"),
             served_names=tuple(doc.get("served_names", ())),
+            dfa_mode=doc.get("dfa_mode"),
             decision=bool(doc.get("decision", False)),
             encoder=bool(doc.get("encoder", False)),
             decision_temperatures=dict(doc.get("decision_temperatures") or {}),
@@ -144,10 +150,15 @@ def load(assembly_dir):
     record = _record(assembly_dir)
     family_name = record.get("family")
     doc = record.get("serving")
-    if not isinstance(doc, dict) and family_name:
+    if family_name:
         from install import families
 
         family = families.named(family_name)
-        if family is not None and doc is None:
-            doc = family.serving
+        if family is not None:
+            if doc is None:
+                doc = family.serving
+            elif isinstance(doc, dict) and family.serving:
+                # Keys a record predates — dfa_mode and later additions —
+                # come from the family's file; the record's own win.
+                doc = {**family.serving, **doc}
     return ServingContract.of(doc, family=family_name)

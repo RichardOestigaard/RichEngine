@@ -1,6 +1,6 @@
 import type { ParentProps } from "solid-js";
-import { createEffect, Show } from "solid-js";
-import { useLocation } from "@solidjs/router";
+import { createEffect, onCleanup, Show } from "solid-js";
+import { useLocation, useNavigate } from "@solidjs/router";
 import TopBar from "./TopBar";
 import Toasts from "./toast";
 import Palette from "./palette/Palette";
@@ -16,12 +16,21 @@ const TITLES: [RegExp, string][] = [
 
 export default function App(props: ParentProps) {
   const location = useLocation();
+  const navigate = useNavigate();
   /* Per-route document titles: browser tabs and screen readers announce
      the page instead of a static name. */
   createEffect(() => {
     const found = TITLES.find(([pattern]) => pattern.test(location.pathname));
     document.title = found ? `${found[1]} — RichEngine` : "RichEngine";
   });
+  /* Module-scope code (install.ts) can't useNavigate; it asks and App
+     answers. */
+  const onNavigate = (event: Event) =>
+    navigate((event as CustomEvent<string>).detail);
+  window.addEventListener("richengine:navigate", onNavigate);
+  onCleanup(() =>
+    window.removeEventListener("richengine:navigate", onNavigate)
+  );
   return (
     <>
       <a href="#content" class="skip-link">Skip to content</a>

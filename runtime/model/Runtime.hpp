@@ -42,6 +42,7 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion) override;
   [[nodiscard]] bool prefillSubmitAheadAvailable() const noexcept override;
+  [[nodiscard]] bool decodeUsesHostMask(uint64_t requestId) const noexcept override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<const CompositeState>
@@ -56,7 +57,7 @@ public:
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void provideForcedTokens(uint64_t requestId,
                            std::span<const uint32_t> tokens) override;
-  void corpusAppend(std::span<const uint32_t> tokens) override;
+  void corpusAppend(std::span<const uint32_t> tokens, uint64_t session) override;
   [[nodiscard]] bool provideDfa(uint64_t requestId,
                                 std::span<const int16_t> table,
                                 std::span<const uint8_t> accepting,

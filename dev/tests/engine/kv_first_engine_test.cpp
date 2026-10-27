@@ -5765,11 +5765,13 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
           "overlapped verify mask did not complete the owning batch");
 }
 
-// Once its first token is selected, a constrained lane decodes in the command
-// of an unconstrained lane of its priority. The command asks for the
-// constrained lane's verify mask alone, a mask response for the other lane
-// does not reach the model, and the one mask completes the command for both.
-void testConstrainedLaneSharesDecodeCommand() {
+// Once its first token is selected, a constrained lane decodes in commands
+// of its own: one TokenMask lane would pull the whole batch onto the split
+// ticket's host mask round trip, so the scheduler never packs it with free
+// lanes. The free lane decodes through the initial mask wait and again after
+// the constrained batch retires, a mask offered for it reaches no model, and
+// no two-lane decode batch is ever planned.
+void testConstrainedLaneDecodesInOwnCommand() {
   test::TestKvStorage storage(8, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -5795,18 +5797,22 @@ void testConstrainedLaneSharesDecodeCommand() {
             "the constrained lane's first cycle did not ask for its verify mask");
   require(engine.commandInFlight() && executor.overlap &&
               executor.overlap->requestId == 1 &&
-              events.maskRequests[1].first == 1,
-          "the shared command did not wait for the constrained lane's mask");
+              events.maskRequests[1].first == 1 &&
+              engine.snapshot().scheduler.decodeBatchesByWidth[1] == 0,
+          "a free lane rode the constrained lane's mask wait");
   const uint32_t unconstrainedTokens = events.outputs[2].size();
   engine.provideMask(2, mask);
   require(!executor.overlap->provided && events.failedCount == 0,
           "a mask for the lane that asked for none reached the model");
   engine.provideMask(1, mask);
-  require(engine.tick(now++) && !engine.commandInFlight() &&
-              events.outputs[1].size() == 1 &&
-              events.outputs[2].size() > unconstrainedTokens &&
-              engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
-          "the constrained lane's mask did not complete the command for both lanes");
+  require(engine.tick(now++) && events.outputs[1].size() == 1,
+          "the constrained lane's mask did not retire its batch");
+  tickUntil(
+      engine, now, [&] { return events.outputs[2].size() > unconstrainedTokens; },
+      "the free lane did not decode behind the retired constrained batch");
+  require(events.failedCount == 0 &&
+              engine.snapshot().scheduler.decodeBatchesByWidth[1] == 0,
+          "a two-lane decode batch mixed constraint modes");
   for (const uint64_t id : {1, 2})
     engine.cancel(id);
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
@@ -9347,7 +9353,7 @@ int main() {
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
-    testConstrainedLaneSharesDecodeCommand();
+    testConstrainedLaneDecodesInOwnCommand();
     testConstraintMaskWaitHonorsCancelAndDeadline();
     testUnansweredVerifyMaskFailsOnlyItsRequest();
     testUnansweredInitialMaskFails();

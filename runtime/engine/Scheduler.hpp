@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -32,6 +33,10 @@ struct RequestSpec final {
   // replayed history.
   uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
+  // A TokenMask lane never packs into a decode command with lanes of another
+  // mode: one would put the whole batch on the constrained split ticket and
+  // its host mask round trip, so free lanes batch separately.
+  ConstraintMode constraint = ConstraintMode::None;
 };
 
 struct PrefillAdmission final {
@@ -64,6 +69,12 @@ public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
   explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
+
+  // Whether a TokenMask request's decode masks come from the host
+  // (model::Model::decodeUsesHostMask). Unset, every TokenMask lane counts
+  // as host-masked — the pre-probe packing behavior. Only consulted under
+  // RICHENGINE_MIXED_DECODE_PACK.
+  std::function<bool(uint64_t)> hostMaskProbe;
 
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);

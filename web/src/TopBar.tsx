@@ -3,7 +3,7 @@ import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { api, apiKey, authorization, noteAuthStatus, storageSet, unauthorized } from "./api";
 import { decisionModel, setDecisionModel } from "./decision";
 import { fmtBytes, fmtTokens } from "./format";
-import { installJob } from "./install";
+import { installJob, installPct } from "./install";
 import { MODEL_KEY } from "./pages/chat/storage";
 import { poll } from "./poll";
 import { togglePalette } from "./shortcuts";
@@ -418,6 +418,7 @@ export default function TopBar() {
     path === "/" ? location.pathname === "/" : location.pathname.startsWith(path);
 
   return (
+    <>
     <header class="topbar">
       <A href="/" class="brand" title="RichEngine — Chat">
         <img src="/favicon.ico" alt="" width="18" height="18" />
@@ -567,7 +568,9 @@ export default function TopBar() {
           title={`Installing ${installJob()?.model ?? "model"} — view progress`}
         >
           <span class="dot" aria-hidden="true" />
-          installing…
+          {installPct() !== undefined
+            ? `installing ${installPct()}%`
+            : "installing…"}
         </A>
       </Show>
       <div class="topright">
@@ -620,5 +623,13 @@ export default function TopBar() {
         </Show>
       </div>
     </header>
+    {/* Global outage banner — per-page notices describe last-good data;
+        this one says the engine itself is gone. */}
+    <Show when={ready() === "down"}>
+      <div class="topdown" role="alert">
+        Engine unreachable — retrying every 5s
+      </div>
+    </Show>
+    </>
   );
 }

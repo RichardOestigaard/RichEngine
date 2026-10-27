@@ -274,8 +274,10 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
         case wire.FrameType.STATUS_REQUEST:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
         case wire.FrameType.CORPUS_APPEND:
-            (count,) = struct.unpack_from("<I", payload)
-            return wire.CorpusAppendFrame(tuple(_words(payload, 4, count)))
+            session, count = struct.unpack_from("<QI", payload)
+            return wire.CorpusAppendFrame(
+                tuple(_words(payload, 12, count)), session
+            )
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

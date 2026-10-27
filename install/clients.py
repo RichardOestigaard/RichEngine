@@ -352,7 +352,11 @@ export const RichEngineCorpus = async () => ({
     fetch("__RICHENGINE_ENDPOINT__/v1/corpus", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, emit_variants: true }),
+      body: JSON.stringify({
+        text,
+        emit_variants: true,
+        session: input.sessionID || 0,
+      }),
     }).catch(() => {});
   },
 });

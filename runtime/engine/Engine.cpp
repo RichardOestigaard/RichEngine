@@ -17,6 +17,9 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
 constexpr int kMaskWaitLimitMilliseconds = 5000;
+// A request's first mask can wait on the host's deferred grammar compile —
+// bounded by the request's own deadline rather than the liveness fuse.
+constexpr int kFirstMaskWaitLimitMilliseconds = 120000;
 // A junction costs a snapshot, a command split and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
@@ -78,6 +81,9 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   }
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
+  scheduler_.hostMaskProbe = [this](uint64_t id) {
+    return model_.decodeUsesHostMask(id);
+  };
 }
 
 void Engine::submit(EngineRequest value) {
@@ -129,7 +135,8 @@ void Engine::submit(EngineRequest value) {
       {.id = id,
        .priority = stored.request.priority,
        .prefillTokens = stored.promptTokens,
-       .deadlineMilliseconds = stored.request.deadlineMilliseconds});
+       .deadlineMilliseconds = stored.request.deadlineMilliseconds,
+       .constraint = stored.request.constraint});
   ++counters_.submitted;
 }
 
@@ -162,6 +169,7 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
     return;
   }
   active.maskRequestedMilliseconds.reset();
+  active.maskAnswered = true;
   if (!ownedByActiveBatch)
     scheduler_.maskReady(id);
 }
@@ -175,8 +183,8 @@ void Engine::provideForcedTokens(uint64_t id,
   model_.provideForcedTokens(id, tokens);
 }
 
-void Engine::corpusAppend(std::span<const uint32_t> tokens) {
-  model_.corpusAppend(tokens);
+void Engine::corpusAppend(std::span<const uint32_t> tokens, uint64_t session) {
+  model_.corpusAppend(tokens, session);
 }
 
 bool Engine::provideDfa(uint64_t id, std::span<const int16_t> table,
@@ -256,10 +264,11 @@ bool Engine::tick(double now) {
     // A mask request left unanswered past the limit ends its request: a lane
     // in flight commits without the mask, any other fails now.
     if (!active.pendingEnd && active.maskRequestedMilliseconds &&
-        now >= *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds) {
+        now >= *active.maskRequestedMilliseconds +
+                   (active.maskAnswered ? kMaskWaitLimitMilliseconds
+                                        : kFirstMaskWaitLimitMilliseconds)) {
       settle(active, {LaneOutcome::MaskTimeout,
-                      "the server did not answer a token-mask request within " +
-                          std::to_string(kMaskWaitLimitMilliseconds) + " ms"});
+                      "the server did not answer a token-mask request"});
       progressed = true;
     }
     // Admission is deliberately paused while resident peers finish. Start a
@@ -424,7 +433,9 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       result = active.request.deadlineMilliseconds;
     if (active.maskRequestedMilliseconds) {
       const double limit =
-          *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds;
+          *active.maskRequestedMilliseconds +
+          (active.maskAnswered ? kMaskWaitLimitMilliseconds
+                               : kFirstMaskWaitLimitMilliseconds);
       if (!result || limit < *result)
         result = limit;
     }
@@ -1426,16 +1437,23 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
   // hold at most two. The AR decode contract is the only one the ring
   // covers: a canvas decode runs its whole schedule inside submit() and a
   // batch holding a constrained lane exchanges masks with the host
-  // between commands.
+  // between commands. A retired constrained batch is no such hazard —
+  // its mask exchange ended inside wait() like any other step — so only
+  // the plan going out is checked.
+  // Only a host-mask lane blocks submit-ahead: its ticket stops between
+  // commands to exchange masks with the host. A GPU-DFA lane (full mode)
+  // merges the mask into one command, so it submits ahead like a free
+  // lane.
   const auto anyConstrained = [this](const BatchPlan &plan) {
     return std::any_of(
         plan.items.begin(), plan.items.end(), [this](const BatchItem &item) {
           return request(item.requestId).request.constraint ==
-                 ConstraintMode::TokenMask;
+                     ConstraintMode::TokenMask &&
+                 model_.decodeUsesHostMask(item.requestId);
         });
   };
   if (!enabled || !pending_.empty() ||
-      retired.plan.kind != WorkKind::Decode || anyConstrained(retired.plan) ||
+      retired.plan.kind != WorkKind::Decode ||
       retired.plan.decodeStage != DecodeStage::Regular ||
       retired.plan.items.size() != results.size() ||
       model_.decodeAdmissionTokens() !=

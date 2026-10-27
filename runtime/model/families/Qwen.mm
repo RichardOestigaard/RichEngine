@@ -119,6 +119,12 @@ ModelDescriptor ornith36Descriptor(std::string name) {
   // second command would overlap is thin), a measured -2..4% on Ornith-9B
   // whose ANE FFN handoff widens that gap — so it is opt-in per family.
   descriptor.tuning.chainPredraft = true;
+  // GPU masks and forced spans: a constrained burst is all TokenMask lanes,
+  // and each host mask round trip idles the engine between the ticket's
+  // commands — the "GPU masks lose inside the verify loop" note predates
+  // that stall. The family's serving block declares the same mode so the
+  // server ships the DFA and skips the pushed spans.
+  descriptor.tuning.dfaMode = "full";
   return descriptor;
 }
 

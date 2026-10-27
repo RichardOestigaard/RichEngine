@@ -35,21 +35,26 @@ inline uint64_t key(const uint32_t *tokens) {
          (uint64_t{tokens[2]} << 36);
 }
 
-inline void noteAt(Table &table, uint32_t start) {
+inline void noteAt(Table &table, uint32_t start, uint32_t *drops = nullptr) {
   auto &seen =
       table.starts
           .try_emplace(key(table.history.data() + start),
                        std::array{kNone, kNone, kNone, kNone})
           .first->second;
+  // A fifth+ start evicts the oldest recorded one — the occurrence a
+  // variable-order matcher would still have found. `drops` counts them.
+  if (drops && seen[3] != kNone)
+    ++*drops;
   seen = {start, seen[0], seen[1], seen[2]};
 }
 
 // (Re)seeds a table from its lane's prompt; emitted tokens then append.
-inline void seed(Table &table, std::span<const uint32_t> prompt) {
+inline void seed(Table &table, std::span<const uint32_t> prompt,
+                 uint32_t *drops = nullptr) {
   table.history.assign(prompt.begin(), prompt.end());
   table.starts.clear();
   for (uint32_t i = 0; i + 3 <= table.history.size(); ++i)
-    noteAt(table, i);
+    noteAt(table, i, drops);
 }
 
 inline void append(Table &table, std::span<const uint32_t> tokens) {
@@ -128,11 +133,17 @@ struct Corpus {
   std::deque<Doc> docs;
   size_t tokens = 0;
   uint64_t tick = 0;
-  // Lifetime counters for /status observability.
+  // Lifetime counters for /status observability. droppedStarts tracks
+  // occurrences pushed past a key's last-4 window — the signal for
+  // whether a variable-order matcher would pay. weakMatches counts
+  // lookups that found the key but whose best pattern fell below
+  // kCorpusArmMin (misses where the key wasn't found at all).
   uint64_t hits = 0;
   uint64_t misses = 0;
+  uint64_t weakMatches = 0;
   uint64_t pushes = 0;
   uint64_t evictions = 0;
+  uint64_t droppedStarts = 0;
 };
 
 // FNV-1a over the opening prompt tokens; stable across turns of one
@@ -158,7 +169,9 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
   Corpus::Doc doc;
   doc.origin = origin;
   doc.session = session;
-  seed(doc.table, stream);
+  uint32_t drops = 0;
+  seed(doc.table, stream, &drops);
+  corpus.droppedStarts += drops;
   doc.hitStamp = corpus.tick;
   corpus.docs.push_back(std::move(doc));
   corpus.tokens += stream.size();
@@ -186,7 +199,8 @@ inline uint32_t lookupCorpus(Corpus &corpus,
                              std::span<const uint32_t> laneHistory,
                              uint32_t *out, uint32_t &extensionOut,
                              uint64_t selfOrigin = 0,
-                             uint64_t selfSession = 0) {
+                             uint64_t selfSession = 0,
+                             bool sessionGate = false) {
   const uint32_t laneSize = static_cast<uint32_t>(laneHistory.size());
   if (laneSize < 3)
     return 0;
@@ -197,6 +211,11 @@ inline uint32_t lookupCorpus(Corpus &corpus,
   bool bestSession = false;
   for (Corpus::Doc &doc : corpus.docs) {
     if (selfOrigin && doc.origin == selfOrigin)
+      continue;
+    // Hard gate: another conversation's docs are invisible, not just
+    // outranked. Global docs (session 0) stay open to everyone.
+    if (sessionGate && selfSession && doc.session &&
+        doc.session != selfSession)
       continue;
     const auto found = doc.table.starts.find(pattern);
     if (found == doc.table.starts.end())
@@ -235,6 +254,10 @@ inline uint32_t lookupCorpus(Corpus &corpus,
     ++corpus.misses;
     return 0;
   }
+  // Key found but pattern too short to arm/displace — the lane's corpus
+  // is close but the last-4 window hid the carrying occurrence.
+  if (3 + bestExtension < kCorpusArmMin)
+    ++corpus.weakMatches;
   // A contributing doc earns recency — the LRU keeps it past untouched
   // docs under pressure.
   bestDoc->hitStamp = ++corpus.tick;

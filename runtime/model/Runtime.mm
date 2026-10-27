@@ -249,6 +249,10 @@ bool Runtime::prefillSubmitAheadAvailable() const noexcept {
   return impl_->prefillSubmitAheadAvailable();
 }
 
+bool Runtime::decodeUsesHostMask(uint64_t requestId) const noexcept {
+  return impl_->decodeUsesHostMask(requestId);
+}
+
 std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
@@ -542,6 +546,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
       proposals[lane] = 0;
       liveRows[lane] = 1;
     }
+    // Verify rows shrink with context: proposals divide by
+    // (1 + position/RICHENGINE_VERIFY_CTX_SCALE), so a lane at 2× the scale
+    // verifies half the rows of one at 1×. Covers the attention term the
+    // VerifyBudget cost table does not see. Default 16000; =0 disables.
+    static const double ctxScale =
+        envDouble("RICHENGINE_VERIFY_CTX_SCALE", 16000);
+    if (ctxScale > 0)
+      proposals[lane] = std::min<uint32_t>(
+          proposals[lane],
+          std::max<uint32_t>(0, static_cast<uint32_t>(
+              proposals[lane] / (1.0 + item.logicalPosition / ctxScale))));
+    liveRows[lane] = proposals[lane] + 1;
     laneResult.proposals = proposals[lane];
 
     impl_->prepareDecodeLane(entry, item, lane);
@@ -576,7 +592,13 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // forward, its vocabulary head read and the selector all skip. A lane
   // whose probe is due keeps the whole batch drafted so its EWMA recovers.
   bool draftBypassed = false;
-  if (!predrafted && !constrained && !nullDraft && impl_->draftBypass_) {
+  // Constrained batches bypass too (default on, measured win): below
+  // break-even acceptance the draft forward is the same wasted cost, mask
+  // or no mask. RICHENGINE_DRAFT_BYPASS_CONSTRAINED_OFF restores the gate.
+  static const bool bypassConstrained =
+      !envFlag("RICHENGINE_DRAFT_BYPASS_CONSTRAINED_OFF");
+  if (!predrafted && (!constrained || bypassConstrained) && !nullDraft &&
+      impl_->draftBypass_) {
     draftBypassed = true;
     for (uint32_t lane = 0; lane < width; ++lane) {
       const Impl::Request &entry = *entries[lane];
@@ -704,14 +726,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
         {liveRows.data(), width}, confMin);
   }
   if (constrained) {
-    // RICHENGINE_DFA_MERGE: a Full-mode batch whose lanes all carry a GPU
-    // DFA owes no host mask work — unless a host-pushed forced span is
-    // pending, which keeps the split path — so the ticket encodes draft,
-    // verify and commit as one command instead of three.
+    // RICHENGINE_DFA_MERGE: a Full-mode batch owes no host mask work — so
+    // the ticket encodes draft, verify and commit as one command instead of
+    // three — unless a constrained lane lacks the GPU DFA or holds a
+    // host-pushed forced span, which keeps the split path. A free lane
+    // needs no DFA: it joins a mixed pack (RICHENGINE_MIXED_DECODE_PACK)
+    // and simply takes no mask.
     bool merged = impl_->dfaMergeOn_;
     for (uint32_t lane = 0; merged && lane < width; ++lane) {
       const Impl::Request &entry = *entries[lane];
-      if (!impl_->gpuDfaMasks(entry) || !entry.forcedTokens.empty())
+      if (entry.constraint == ConstraintMode::TokenMask &&
+          (!impl_->gpuDfaMasks(entry) || !entry.forcedTokens.empty()))
         merged = false;
     }
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
@@ -937,8 +962,8 @@ void Runtime::provideForcedTokens(uint64_t requestId,
   found->second.forcedTokens.assign(tokens.begin(), tokens.end());
 }
 
-void Runtime::corpusAppend(std::span<const uint32_t> tokens) {
-  impl_->corpusPush(tokens);
+void Runtime::corpusAppend(std::span<const uint32_t> tokens, uint64_t session) {
+  impl_->corpusPush(tokens, session);
 }
 
 void Runtime::setVocabulary(std::span<const uint8_t> bytes,
@@ -1372,6 +1397,8 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.corpusMisses = impl_->ngram_.ngramCorpusDocs_.misses;
   result.corpusPushes = impl_->ngram_.ngramCorpusDocs_.pushes;
   result.corpusEvictions = impl_->ngram_.ngramCorpusDocs_.evictions;
+  result.corpusWeakMatches = impl_->ngram_.ngramCorpusDocs_.weakMatches;
+  result.corpusDroppedStarts = impl_->ngram_.ngramCorpusDocs_.droppedStarts;
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
       result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();

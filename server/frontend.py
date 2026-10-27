@@ -668,7 +668,9 @@ class Frontend:
                 "waiting": self.preparation_waiting,
             }
         status["grammar_cache"] = self.constraint_factory.stats()
-        status["dfa_mode"] = constraints.dfa_mode()
+        status["dfa_mode"] = getattr(
+            self.constraint_factory, "resolved_dfa_mode", constraints.dfa_mode
+        )()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
@@ -1150,6 +1152,15 @@ class Frontend:
         text = body.get("text")
         if not isinstance(text, str) or not text:
             raise APIError(400, '"text" must be a non-empty string')
+        session = body.get("session", 0)
+        if isinstance(session, str):
+            # Client-side conversation ids arrive as strings (opencode
+            # sessionID); fold to a nonzero u64 session key.
+            session = int.from_bytes(
+                hashlib.blake2b(session.encode(), digest_size=8).digest()
+            ) | 1
+        if not isinstance(session, int) or session < 0:
+            raise APIError(400, '"session" must be a non-negative integer')
         docs = [text]
         if body.get("emit_variants"):
             docs.append("".join("+" + l for l in text.splitlines(keepends=True)))
@@ -1158,7 +1169,7 @@ class Frontend:
         for doc in docs:
             ids = self._tokenize(doc, add_special_tokens=False)["input_ids"]
             if ids:
-                self.backend.runtime.corpus_append(ids)
+                self.backend.runtime.corpus_append(ids, session)
                 pushed.append(len(ids))
         return {"pushed": pushed}
 
@@ -1406,60 +1417,22 @@ class Frontend:
         constraint = None
         remaining_request_time(deadline)
         if constrained:
-            with self.latencies.measure("grammar"):
-                # The DFA path compiles the regular subset; anything else
-                # keeps the llguidance grammar.
-                create_dfa = getattr(
-                    self.constraint_factory, "create_dfa", None
-                )
-                if tool_constrained:
-                    # The grammar is built either way: the DFA path keeps a
-                    # llguidance delegate on it for masks and checks, and a
-                    # spec outside the DFA subset compiles it outright.
-                    grammar = tool_grammar(
+
+            def build_constraint():
+                with self.latencies.measure("grammar"):
+                    return self._compile_constraint(
+                        tool_constrained,
                         tool_policy,
                         thinking,
                         response_schema,
-                        think_end_id=self.think_end_id,
+                        deadline,
                     )
-                    constraint = create_dfa and create_dfa(
-                        dfa_compiler.tool_spec(
-                            tool_policy,
-                            thinking,
-                            response_schema,
-                            think_end=self.think_end,
-                        ),
-                        grammar,
-                        timeout=remaining_request_time(deadline),
-                        prefixes=lambda: self._call_openings(tool_policy, thinking),
-                    )
-                    if constraint is None:
-                        constraint = self.constraint_factory.create(
-                            grammar,
-                            timeout=remaining_request_time(deadline),
-                            prefixes=lambda: self._call_openings(
-                                tool_policy, thinking
-                            ),
-                        )
-                else:
-                    grammar = json_grammar(
-                        response_schema,
-                        thinking,
-                        think_end_id=self.think_end_id,
-                        think_end_text=self.think_end,
-                    )
-                    constraint = create_dfa and create_dfa(
-                        dfa_compiler.json_spec(
-                            response_schema, thinking, think_end=self.think_end
-                        ),
-                        grammar,
-                        timeout=remaining_request_time(deadline),
-                    )
-                    if constraint is None:
-                        constraint = self.constraint_factory.create(
-                            grammar,
-                            timeout=remaining_request_time(deadline),
-                        )
+
+            # Compile on the factory's pool: the request's own admission,
+            # tokenization and prefill overlap the compile. The first mask
+            # or forced-span access joins it.
+            defer = getattr(self.constraint_factory, "defer", None)
+            constraint = defer(build_constraint) if defer else build_constraint()
         remaining_request_time(deadline)
         tools_signature = None
         if tools:
@@ -1522,6 +1495,60 @@ class Frontend:
             bound = bind_dialect(dialect, self.tokenizer.get_vocab())
             bindings[dialect.name] = bound
         return bound
+
+    def _compile_constraint(
+        self, tool_constrained, tool_policy, thinking, response_schema, deadline
+    ):
+        """Compile the request's constraint. Runs on the factory's compile
+        pool so request prep overlaps it."""
+        create_dfa = getattr(self.constraint_factory, "create_dfa", None)
+        if tool_constrained:
+            # The grammar is built either way: the DFA path keeps a
+            # llguidance delegate on it for masks and checks, and a spec
+            # outside the DFA subset compiles it outright.
+            grammar = tool_grammar(
+                tool_policy,
+                thinking,
+                response_schema,
+                think_end_id=self.think_end_id,
+            )
+            constraint = create_dfa and create_dfa(
+                dfa_compiler.tool_spec(
+                    tool_policy,
+                    thinking,
+                    response_schema,
+                    think_end=self.think_end,
+                ),
+                grammar,
+                timeout=remaining_request_time(deadline),
+                prefixes=lambda: self._call_openings(tool_policy, thinking),
+            )
+            if constraint is not None:
+                return constraint
+            return self.constraint_factory.create(
+                grammar,
+                timeout=remaining_request_time(deadline),
+                prefixes=lambda: self._call_openings(tool_policy, thinking),
+            )
+        grammar = json_grammar(
+            response_schema,
+            thinking,
+            think_end_id=self.think_end_id,
+            think_end_text=self.think_end,
+        )
+        constraint = create_dfa and create_dfa(
+            dfa_compiler.json_spec(
+                response_schema, thinking, think_end=self.think_end
+            ),
+            grammar,
+            timeout=remaining_request_time(deadline),
+        )
+        if constraint is not None:
+            return constraint
+        return self.constraint_factory.create(
+            grammar,
+            timeout=remaining_request_time(deadline),
+        )
 
     def _call_openings(self, policy, thinking):
         """The tokens that begin each strict tool's call. Its parameter names

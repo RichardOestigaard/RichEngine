@@ -1,11 +1,11 @@
 import { createSignal, createEffect, onCleanup, onMount, For, Index, Show, untrack } from "solid-js";
 import type { JSX } from "solid-js";
-import { A } from "@solidjs/router";
+import { A, useSearchParams } from "@solidjs/router";
 import { api, apiPost, authorization, curlExample, errorText, storageGet, storageSet } from "../api";
 import { Chart, fmtTooltipRows } from "../Chart";
 import type { ChartAppend } from "../Chart";
 import { fmtBytes, fmtInt, fmtMs, fmtTokens, pct, rate } from "../format";
-import { installJob, onInstallDone, pollInstall, setInstallJob } from "../install";
+import { installJob, installPct, installRate, onInstallDone, pollInstall, setInstallJob } from "../install";
 import type { InstallJob } from "../install";
 import { onTuneDone, pollTune, setTuneJob, tuneJob } from "../tune";
 import type { TuneJob } from "../tune";
@@ -309,6 +309,9 @@ const [history, setHistory] = createSignal<{
 /* ---- page ---- */
 
 export default function Models() {
+  /* Deep links (/models?open=install) force the named fold open. */
+  const [searchParams] = useSearchParams();
+  const deepOpen = () => String(searchParams.open ?? "");
   const [status, setStatus] = createSignal<Status | null>(null);
   const [models, setModels] = createSignal<ModelsResponse | null>(null);
   const [error, setError] = createSignal<string | null>(null);
@@ -326,12 +329,15 @@ export default function Models() {
   const [confirmUnload, setConfirmUnload] = createSignal<AvailableModel | null>(null);
   const [confirmTune, setConfirmTune] = createSignal<AvailableModel | null>(null);
   const [samplingEntry, setSamplingEntry] = createSignal<AvailableModel | null>(null);
+  /* One open row action menu at a time, keyed by model id. */
+  const [rowMenu, setRowMenu] = createSignal<string | null>(null);
   const [tuneBusy, setTuneBusy] = createSignal(false);
   /* Heartbeat for the silent gaps between sweep log lines: each candidate
      is an engine launch, so minutes of quiet are normal — the counter
      shows the sweep is alive. */
   const [tick, setTick] = createSignal(0);
   const [lastTailAt, setLastTailAt] = createSignal(Date.now());
+  const [lastInstallTailAt, setLastInstallTailAt] = createSignal(Date.now());
   const [installBusy, setInstallBusy] = createSignal(false);
   const [installModel, setInstallModel] = createSignal("");
   const [installRevision, setInstallRevision] = createSignal("");
@@ -443,7 +449,10 @@ export default function Models() {
         "/v1/models/unload",
         entry.model ? { model: entry.model } : {}
       );
-      pushToast("ok", `Unloaded ${entry.model ?? "model"}`);
+      pushToast("ok", `Unloaded ${entry.model ?? "model"}`, 8000, {
+        label: "Load again",
+        run: () => void loadModel(entry.model ?? ""),
+      });
     } catch (e) {
       pushToast("error", errorText(e));
     }
@@ -455,8 +464,9 @@ export default function Models() {
 
   /* Install progress polling and its toasts live in ../install — the job
      runs as a server-side subprocess and outlives this page. */
-  async function submitInstall(event: SubmitEvent) {
-    event.preventDefault();
+  /* Start an install from the current form state. Retry reuses it — the
+     inputs keep their values, so a failed run resubmits as-is. */
+  async function startInstall() {
     const model = installModel().trim();
     if (!model || installBusy() || installJob()?.running) return;
     setInstallBusy(true);
@@ -477,6 +487,57 @@ export default function Models() {
       setInstallBusy(false);
     }
   }
+
+  async function submitInstall(event: SubmitEvent) {
+    event.preventDefault();
+    await startInstall();
+  }
+
+  /* Installs pause for a running sweep or another install — the server
+     409s the same way; naming the blocker beats a silent disabled button. */
+  const installBlocked = () =>
+    installBusy() || !!installJob()?.running || Boolean(tuneJob()?.running);
+
+  const installBlockReason = () =>
+    installJob()?.running
+      ? `An install of ${installJob()?.model} is running`
+      : tuneJob()?.running
+        ? `A tune of ${tuneJob()?.model} is running — installs wait`
+        : "";
+
+  /* Seconds since the install tail last grew — proof of life during the
+     silent conversion stretches (same trick as the sweep's quiet clock). */
+  const installQuiet = () => {
+    tick();
+    return Math.max(
+      0,
+      Math.round((Date.now() - lastInstallTailAt()) / 1000)
+    );
+  };
+
+  /* What the installer is doing, inferred from the newest output. */
+  const installPhase = () => {
+    const recent = (installJob()?.tail ?? []).slice(-6).join("\n").toLowerCase();
+    if (/%|download|fetch/.test(recent)) return "Downloading weights";
+    if (/convert|safetensors|prepar|shard/.test(recent)) return "Preparing";
+    return "Working";
+  };
+
+  /* Failure summary: the last non-empty log line beats "exit 1". */
+  const installErrorLine = () => {
+    const tail = installJob()?.tail ?? [];
+    for (let i = tail.length - 1; i >= 0; i--) {
+      const line = tail[i].trim();
+      if (line) return line;
+    }
+    return "";
+  };
+
+  /* Repo ids look like owner/repo — flag shape before the server does. */
+  const installIdBad = () => {
+    const id = installModel().trim();
+    return Boolean(id) && !id.includes("/");
+  };
 
   async function cancelInstall() {
     try {
@@ -562,6 +623,27 @@ export default function Models() {
     }
   };
 
+  /* Outside click and Escape dismiss the open row menu. */
+  createEffect(() => {
+    if (!rowMenu()) return;
+    const onDown = (event: PointerEvent) => {
+      if (!(event.target as HTMLElement).closest(".row-menu-wrap"))
+        setRowMenu(null);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setRowMenu(null);
+      }
+    };
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("keydown", onKey, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("keydown", onKey, true);
+    });
+  });
+
   const installElapsed = () => {
     const started = installJob()?.started;
     if (!started) return "";
@@ -583,6 +665,9 @@ export default function Models() {
   /* The quiet-gap counter: lastTailAt moves whenever the tail grows. */
   createEffect(() => {
     if (tuneJob()?.tail?.length) setLastTailAt(Date.now());
+  });
+  createEffect(() => {
+    if (installJob()?.tail?.length) setLastInstallTailAt(Date.now());
   });
 
   onMount(() => {
@@ -858,7 +943,7 @@ export default function Models() {
               fallback={
                 <div class="panel-row">
                   <span class="grow muted">
-                    No models installed — install one below.
+                    No models installed — open Install a model below.
                   </span>
                 </div>
               }
@@ -966,54 +1051,7 @@ export default function Models() {
                       </span>
                     </Show>
                     <span class="num">{fmtBytes(entry.bytes)}</span>
-                    <button
-                      type="button"
-                      class="icon-btn"
-                      classList={{ on: hasSamplingFor(entry.model) }}
-                      title={
-                        hasSamplingFor(entry.model)
-                          ? `Sampling overrides set for ${entry.model} — sent on chat requests naming it`
-                          : `Sampling settings for ${entry.model} — temperature, min_p, penalties`
-                      }
-                      aria-label={`Sampling settings for ${entry.model}`}
-                      onClick={() => setSamplingEntry(entry)}
-                    >
-                      <svg
-                        width="15"
-                        height="15"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.8"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      >
-                        <circle cx="12" cy="12" r="3" />
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                      </svg>
-                    </button>
-                    <button
-                      class="btn small"
-                      disabled={
-                        tuneBusy() ||
-                        !!tuneJob()?.running ||
-                        entry.tunable === false
-                      }
-                      title={
-                        entry.tunable === false
-                          ? "No tunable knobs for this model's family"
-                          : tuneJob()?.running
-                            ? `A tune of ${tuneJob()?.model} is running`
-                            : entry.tuning === "stale"
-                              ? "Re-measure this chip's fastest engine knobs — the record went stale"
-                              : "Measure this chip's fastest engine knobs for this model"
-                      }
-                      onClick={() => setConfirmTune(entry)}
-                    >
-                      {tuneJob()?.running && tuneJob()?.model === entry.model
-                        ? "Tuning…"
-                        : "Tune"}
-                    </button>
+                    <span class="num">{fmtBytes(entry.bytes)}</span>
                     <Show
                       when={entry.serving}
                       fallback={
@@ -1028,15 +1066,94 @@ export default function Models() {
                       }
                     >
                       <span class="badge ok">serving</span>
-                      <button
-                        class="btn small danger"
-                        disabled={modelWorking()}
-                        title={`Unload ${entry.model} — requests naming it fail until it's loaded again; other residents keep serving`}
-                        onClick={() => setConfirmUnload(entry)}
-                      >
-                        Unload
-                      </button>
                     </Show>
+                    {/* Rare actions live under one overflow — Load keeps the
+                        primary spot on the row. */}
+                    <div class="row-menu-wrap">
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        aria-label={`More actions for ${entry.model}`}
+                        aria-expanded={rowMenu() === (entry.model ?? "")}
+                        title="More actions"
+                        onClick={() =>
+                          setRowMenu(
+                            rowMenu() === (entry.model ?? "")
+                              ? null
+                              : entry.model ?? ""
+                          )
+                        }
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          <circle cx="5" cy="12" r="2" />
+                          <circle cx="12" cy="12" r="2" />
+                          <circle cx="19" cy="12" r="2" />
+                        </svg>
+                      </button>
+                      <Show when={rowMenu() === (entry.model ?? "")}>
+                        <div class="row-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            title={
+                              hasSamplingFor(entry.model)
+                                ? `Sampling overrides set for ${entry.model} — sent on chat requests naming it`
+                                : `Sampling settings for ${entry.model} — temperature, min_p, penalties`
+                            }
+                            onClick={() => {
+                              setRowMenu(null);
+                              setSamplingEntry(entry);
+                            }}
+                          >
+                            {hasSamplingFor(entry.model)
+                              ? "Sampling ✓"
+                              : "Sampling…"}
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={
+                              tuneBusy() ||
+                              !!tuneJob()?.running ||
+                              entry.tunable === false
+                            }
+                            title={
+                              entry.tunable === false
+                                ? "No tunable knobs for this model's family"
+                                : tuneJob()?.running
+                                  ? `A tune of ${tuneJob()?.model} is running`
+                                  : entry.tuning === "stale"
+                                    ? "Re-measure this chip's fastest engine knobs — the record went stale"
+                                    : "Measure this chip's fastest engine knobs for this model"
+                            }
+                            onClick={() => {
+                              setRowMenu(null);
+                              setConfirmTune(entry);
+                            }}
+                          >
+                            {tuneJob()?.running &&
+                            tuneJob()?.model === entry.model
+                              ? "Tuning…"
+                              : "Tune…"}
+                          </button>
+                          <Show when={entry.serving}>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              class="danger"
+                              disabled={modelWorking()}
+                              title={`Unload ${entry.model} — requests naming it fail until it's loaded again; other residents keep serving`}
+                              onClick={() => {
+                                setRowMenu(null);
+                                setConfirmUnload(entry);
+                              }}
+                            >
+                              Unload
+                            </button>
+                          </Show>
+                        </div>
+                      </Show>
+                    </div>
                   </div>
                 )}
               </For>
@@ -1227,14 +1344,66 @@ export default function Models() {
         </Show>
       </section>
 
-      {/* 1c. Install a model */}
+      {/* 1c. Install a model — folded by default; an in-flight install
+          reopens it so its progress stays visible. */}
       <section class="section">
-        <h2>Install a model</h2>
+        <details
+          class="collapse install-fold"
+          data-name="install"
+          open={
+            collapseOpen("install", false) ||
+            Boolean(installJob()?.running) ||
+            deepOpen() === "install"
+          }
+          onToggle={collapseToggle}
+        >
+          <summary title="Expand section">Install a model</summary>
+        {/* One-click rows first — most installs are a suggestion, not an
+            id the user had to look up. */}
+        <Show when={suggested().length > 0}>
+          <div class="panel install-suggested">
+            <For each={suggested().slice(0, 6)}>
+              {(id) => (
+                <div class="panel-row">
+                  <span class="grow mono">{id}</span>
+                  <Show
+                    when={
+                      available()?.find((m) => m.model === id)?.bytes != null
+                    }
+                  >
+                    <span class="num">
+                      {fmtBytes(
+                        available()?.find((m) => m.model === id)?.bytes
+                      )}
+                    </span>
+                  </Show>
+                  <button
+                    type="button"
+                    class="btn small primary"
+                    disabled={installBlocked()}
+                    title={installBlockReason() || `Install ${id}`}
+                    onClick={() => {
+                      setInstallModel(id);
+                      void startInstall();
+                    }}
+                  >
+                    Install
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
         <form class="panel install-form" onSubmit={submitInstall}>
           <div class="panel-row">
-            <span class="grow">Hugging Face repo</span>
+            <span class="grow muted">
+              {suggested().length
+                ? "or paste a Hugging Face id"
+                : "Hugging Face repo"}
+            </span>
             <input
               class="install-input mono"
+              classList={{ invalid: installIdBad() }}
               list="suggested-models"
               placeholder="owner/repo[:variant]"
               aria-label="Hugging Face repository ID"
@@ -1245,76 +1414,79 @@ export default function Models() {
             <datalist id="suggested-models">
               <For each={suggested()}>{(id) => <option value={id} />}</For>
             </datalist>
-          </div>
-          <Show when={suggested().length > 0}>
-            <div class="panel-row">
-              <span class="grow muted">Suggested</span>
-              <span class="chips">
-                <For each={suggested().slice(0, 6)}>
-                  {(id) => (
-                    <button
-                      type="button"
-                      class="chip chip-btn"
-                      title={`Fill ${id}`}
-                      onClick={() => setInstallModel(id)}
-                    >
-                      {id}
-                    </button>
-                  )}
-                </For>
-              </span>
-            </div>
-          </Show>
-          <div class="panel-row">
-            <span class="grow">
-              Revision <span class="muted">— optional</span>
-            </span>
-            <input
-              class="install-input mono"
-              placeholder="branch, tag or commit"
-              aria-label="Revision"
-              spellcheck={false}
-              value={installRevision()}
-              onInput={(event) => setInstallRevision(event.currentTarget.value)}
-            />
-          </div>
-          <div class="panel-row">
-            <span class="grow">
-              Draft model <span class="muted">— optional</span>
-            </span>
-            <input
-              class="install-input mono"
-              placeholder="owner/repo or local directory"
-              aria-label="Draft model"
-              spellcheck={false}
-              value={installDraft()}
-              onInput={(event) => setInstallDraft(event.currentTarget.value)}
-            />
-          </div>
-          <div class="panel-row">
-            <label class="install-check grow muted">
-              <input
-                type="checkbox"
-                title="Skip vision weights — installs a text-only build"
-                checked={installLanguageOnly()}
-                onChange={(event) =>
-                  setInstallLanguageOnly(event.currentTarget.checked)
-                }
-              />
-              language only — skip vision weights
-            </label>
             <button
               class="btn small primary"
               type="submit"
-              title="Download and prepare this model from Hugging Face"
+              title={
+                installBlockReason() ||
+                "Download and prepare this model from Hugging Face"
+              }
               disabled={
-                installBusy() || !!installJob()?.running || !installModel().trim()
+                installBlocked() || !installModel().trim() || installIdBad()
               }
             >
               {installBusy() ? "Starting…" : "Install"}
             </button>
           </div>
+          <Show when={installIdBad()}>
+            <div class="panel-row">
+              <span class="grow muted">
+                Repo ids look like owner/repo — a slash is missing.
+              </span>
+            </div>
+          </Show>
+          <Show when={installBlockReason()}>
+            <div class="panel-row">
+              <span class="grow muted">{installBlockReason()}</span>
+            </div>
+          </Show>
+          {/* Rare knobs hide behind a nested fold — most users never open
+              it. */}
+          <details class="install-options">
+            <summary>Options — revision · draft · language-only</summary>
+            <div class="panel-row">
+              <span class="grow">
+                Revision <span class="muted">— optional</span>
+              </span>
+              <input
+                class="install-input mono"
+                placeholder="branch, tag or commit"
+                aria-label="Revision"
+                spellcheck={false}
+                value={installRevision()}
+                onInput={(event) => setInstallRevision(event.currentTarget.value)}
+              />
+            </div>
+            <div class="panel-row">
+              <span class="grow">
+                Draft model <span class="muted">— optional</span>
+              </span>
+              <input
+                class="install-input mono"
+                placeholder="owner/repo or local directory"
+                aria-label="Draft model"
+                title="A small helper model that speeds up decoding — skip unless you know why"
+                spellcheck={false}
+                value={installDraft()}
+                onInput={(event) => setInstallDraft(event.currentTarget.value)}
+              />
+            </div>
+            <div class="panel-row">
+              <label class="install-check grow muted">
+                <input
+                  type="checkbox"
+                  title="Skip vision weights — smaller download, but the model can't take image input"
+                  checked={installLanguageOnly()}
+                  onChange={(event) =>
+                    setInstallLanguageOnly(event.currentTarget.checked)
+                  }
+                />
+                language only — skip vision weights (no image input)
+              </label>
+            </div>
+          </details>
         </form>
+        </details>
         <Show when={installJob()?.model}>
           <div class="panel install-job">
             <div class="panel-row">
@@ -1342,16 +1514,29 @@ export default function Models() {
               <Show
                 when={installJob()?.running}
                 fallback={
-                  <Show when={installJob()?.done && installJob()?.ok}>
-                    <button
-                      class="btn small"
-                      title="Load this model now"
-                      disabled={modelWorking()}
-                      onClick={() => void loadModel(installJob()?.model ?? "")}
-                    >
-                      Load it
-                    </button>
-                  </Show>
+                  <>
+                    <Show when={installJob()?.done && installJob()?.ok}>
+                      <button
+                        class="btn small primary"
+                        title="Load this model now"
+                        disabled={modelWorking()}
+                        onClick={() =>
+                          void loadModel(installJob()?.model ?? "")
+                        }
+                      >
+                        Load it →
+                      </button>
+                    </Show>
+                    <Show when={installJob()?.done && !installJob()?.ok}>
+                      <button
+                        class="btn small"
+                        title="Retry the install — partial downloads resume"
+                        onClick={() => void startInstall()}
+                      >
+                        Retry
+                      </button>
+                    </Show>
+                  </>
                 }
               >
                 <button
@@ -1363,18 +1548,68 @@ export default function Models() {
                 </button>
               </Show>
             </div>
+            {/* Progress bar while running: % and rate parse off the HF
+                progress lines; pending bar when nothing has reported. */}
+            <Show when={installJob()?.running}>
+              <div class="panel-row meter-row tune-progress-row">
+                <div class="tune-progress">
+                  <div
+                    class="meter"
+                    role="progressbar"
+                    aria-label="Download progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={installPct() ?? 0}
+                  >
+                    <i
+                      classList={{ pending: installPct() === undefined }}
+                      style={{ width: `${installPct() ?? 100}%` }}
+                    />
+                  </div>
+                  <div class="tune-sub">
+                    <span>
+                      {installPhase()}
+                      {installPct() !== undefined
+                        ? ` — ${installPct()}%`
+                        : ""}
+                      {installRate() ? ` · ${installRate()}` : ""}
+                    </span>
+                    <span class="num">{installQuiet()}s quiet</span>
+                  </div>
+                </div>
+              </div>
+            </Show>
+            <Show
+              when={
+                installJob()?.done &&
+                !installJob()?.ok &&
+                installErrorLine()
+              }
+            >
+              <div class="panel-row">
+                <span class="grow muted install-err">
+                  {installErrorLine()}
+                </span>
+              </div>
+            </Show>
             <Show when={(installJob()?.tail?.length ?? 0) > 0}>
-              <pre
-                class="install-log"
-                ref={logEl}
-                onScroll={(event) => {
-                  const el = event.currentTarget;
-                  logPinned =
-                    el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
-                }}
+              <details
+                class="tune-log"
+                open={Boolean(installJob()?.done && !installJob()?.ok)}
               >
-                {installJob()?.tail?.join("\n")}
-              </pre>
+                <summary>Install log</summary>
+                <pre
+                  class="install-log"
+                  ref={logEl}
+                  onScroll={(event) => {
+                    const el = event.currentTarget;
+                    logPinned =
+                      el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+                  }}
+                >
+                  {installJob()?.tail?.join("\n")}
+                </pre>
+              </details>
             </Show>
           </div>
         </Show>
@@ -1467,6 +1702,18 @@ export default function Models() {
           </div>
         </section>
       </Show>
+
+      {/* 3+. Engine internals — everything below Performance folds into
+          one section; the inner collapses keep their own open state. */}
+      <details
+        class="collapse internals"
+        data-name="internals"
+        open={collapseOpen("internals", false) || deepOpen() === "internals"}
+        onToggle={collapseToggle}
+      >
+        <summary title="Expand section">
+          Engine internals — scheduler, caches, warmup, requests, raw metrics
+        </summary>
 
       {/* 3. Scheduler */}
       <Show when={s().scheduler}>
@@ -1801,6 +2048,26 @@ export default function Models() {
         </section>
       </Show>
 
+      {/* 10. Raw /metrics, fetched on expand */}
+      <section class="section">
+        <details
+          class="metrics-raw"
+          data-name="raw-metrics"
+          open={collapseOpen("raw-metrics", false)}
+          onToggle={(event) => {
+            collapseToggle(event);
+            if (event.currentTarget.open && metricsText() === null)
+              void loadMetrics();
+          }}
+        >
+          <summary title="Expand section">Raw /metrics</summary>
+          <Show when={metricsText() !== null} fallback={<p class="muted">Loading…</p>}>
+            <pre class="metrics-pre">{metricsText()}</pre>
+          </Show>
+        </details>
+      </section>
+      </details>
+
       <Confirm
         open={confirmUnload() !== null}
         title={`Unload ${confirmUnload()?.model ?? "model"}?`}
@@ -1854,25 +2121,6 @@ export default function Models() {
           </p>
         </Show>
       </Confirm>
-
-      {/* 10. Raw /metrics, fetched on expand */}
-      <section class="section">
-        <details
-          class="metrics-raw"
-          data-name="raw-metrics"
-          open={collapseOpen("raw-metrics", false)}
-          onToggle={(event) => {
-            collapseToggle(event);
-            if (event.currentTarget.open && metricsText() === null)
-              void loadMetrics();
-          }}
-        >
-          <summary title="Expand section">Raw /metrics</summary>
-          <Show when={metricsText() !== null} fallback={<p class="muted">Loading…</p>}>
-            <pre class="metrics-pre">{metricsText()}</pre>
-          </Show>
-        </details>
-      </section>
     </main>
   );
 }

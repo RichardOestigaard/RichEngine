@@ -14,7 +14,7 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec
 from . import protocol as wire
 from . import runtime as engine_runtime
-from .constraints import DfaConstraint, TokenConstraint, dfa_mode
+from .constraints import DeferredConstraint, DfaConstraint, TokenConstraint
 from .diagnostics import log_unexpected, print_status
 from .errors import APIError, ConstraintError
 from .latency import RequestLatency
@@ -898,6 +898,11 @@ class NativeBackend:
             call = self.runtime.submit(
                 request, on_event=on_event, on_complete=on_complete
             )
+            # A deferred constraint joins its compile here — after submit,
+            # so the request's prefill overlaps it. Stream order still
+            # places the DFA frame before the engine's first mask need.
+            if isinstance(job.constraint, DeferredConstraint):
+                job.constraint = job.constraint.resolve()
             if isinstance(job.constraint, DfaConstraint):
                 self._send_constraint_dfa(call, job.constraint)
             if job.constraint is not None and self._pushes_forced(
@@ -999,7 +1004,10 @@ class NativeBackend:
         """Whether the host pushes this constraint's forced-token spans. A
         GPU-DFA mode derives a DfaConstraint's span on-device, where a host
         push would only race it; every other constraint needs the push."""
-        return not isinstance(constraint, DfaConstraint) or dfa_mode() == "off"
+        return (
+            not isinstance(constraint, DfaConstraint)
+            or getattr(constraint, "dfa_mode", "off") == "off"
+        )
 
     def _send_constraint_dfa(self, call, constraint):
         """Ship the vocabulary (once per engine generation) then the request's

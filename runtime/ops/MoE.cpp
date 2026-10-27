@@ -439,9 +439,19 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // The stats generation makes the dispatch's record slot unique across the
   // process; the baked span replays it through addPatchable below.
   const uint32_t stats = statsEnabled() ? ++statsSequence() : 0;
-  const MoeGroupParams groupParams{rows, shape.expertsPerToken, tileRows,
-                                   shape.experts, shape.sharedExpert, stats,
-                                   plan.laneRows()};
+  // RICHENGINE_MOE_SHARED_DENSE (affine decode only): the shared expert runs
+  // as one dense tile per lane block (moe_shared_*_q4) instead of a tile per
+  // tile_rows rows. The grouping keeps its routes aimed at the grouped rows
+  // past the routed ones (shared == 2), where the dense passes write.
+  const bool denseShared =
+      shape.sharedExpert && weights.layout() == WeightLayout::Affine64 &&
+      plan.phase() == MoePhase::Decode && tuning().moeSharedDense &&
+      (plan.laneRows() == 8 || plan.laneRows() == 16) &&
+      rows % plan.laneRows() == 0;
+  const MoeGroupParams groupParams{
+      rows, shape.expertsPerToken, tileRows, shape.experts,
+      shape.sharedExpert ? (denseShared ? 2u : 1u) : 0u, stats,
+      plan.laneRows()};
   // The union cap runs between select and grouping; it needs the separate
   // select even where the fused route-group would apply. The plan's value
   // (serve-native --moe-union) wins; RICHENGINE_MOE_UNION covers callers
@@ -529,16 +539,55 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     // The counting and scatter loops stride by the threadgroup width; a
     // 1024-thread group quadruples both while threads past the 256 experts
     // skip the per-expert bookkeeping between them.
+    // RICHENGINE_MOE_VERIFIED_ROWS: the verify step's grouping routes each
+    // lane's live rows alone — padding rows (anchor repeats) keep their
+    // routes out of the expert union.
+    const bool verified = buffers.verifyRows && plan.laneRows() &&
+                          tuning().moeVerifiedRows;
+    std::vector<metal::MetalBuffer> groupBindings{scratch.selectedExperts,
+                                                scratch.tileDescriptors,
+                                                scratch.tileCount,
+                                                scratch.groupedRoutes,
+                                                scratch.routeRows};
+    if (verified)
+      groupBindings.push_back(buffers.verifyRows);
     if (stats)
-      graph.addPatchable(std::string(kMoeGroupRoutes),
-                         {scratch.selectedExperts, scratch.tileDescriptors,
-                          scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-                         groupParams, {1, 1, 1}, {1024, 1, 1});
+      graph.addPatchable(std::string(verified ? kMoeGroupRoutesVerified
+                                              : kMoeGroupRoutes),
+                         std::move(groupBindings), groupParams, {1, 1, 1},
+                         {1024, 1, 1});
     else
-      graph.add(std::string(kMoeGroupRoutes),
-                {scratch.selectedExperts, scratch.tileDescriptors,
-                 scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-                groupParams, {1, 1, 1}, {1024, 1, 1});
+      graph.add(std::string(verified ? kMoeGroupRoutesVerified
+                                     : kMoeGroupRoutes),
+                std::move(groupBindings), groupParams, {1, 1, 1},
+                {1024, 1, 1});
+  }
+  if (denseShared) {
+    const AffineMoeWeights &affine = weights.affine();
+    const bool m16 = plan.laneRows() == 16;
+    const bool four =
+        plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
+    const std::string_view gateUpKernel =
+        m16 ? (four ? kMoeSharedGateUpQ4M16Sg4 : kMoeSharedGateUpQ4M16)
+            : (four ? kMoeSharedGateUpQ4M8Sg4 : kMoeSharedGateUpQ4M8);
+    const std::string_view downKernel =
+        m16 ? (four ? kMoeSharedDownQ4M16Sg4 : kMoeSharedDownQ4M16)
+            : (four ? kMoeSharedDownQ4M8Sg4 : kMoeSharedDownQ4M8);
+    const uint32_t blocks = rows / plan.laneRows();
+    graph.add(std::string(gateUpKernel),
+              {buffers.input, scratch.tileCount, affine.sharedGate.packed,
+               affine.sharedUp.packed, scratch.expertIntermediate},
+              MoeSharedParams{rows, shape.hiddenSize,
+                              shape.expertIntermediateSize, tileRows},
+              {shape.expertIntermediateSize / 128, blocks, 1},
+              {four ? 128u : 256u, 1, 1});
+    graph.add(std::string(downKernel),
+              {scratch.expertIntermediate, scratch.tileCount,
+               affine.sharedDown.packed, scratch.expertOutput},
+              MoeSharedParams{rows, shape.expertIntermediateSize,
+                              shape.hiddenSize, tileRows},
+              {shape.hiddenSize / (four ? 256u : 128u), blocks, 1},
+              {four ? 128u : 256u, 1, 1});
   }
   // The packed path (packsDecode's MoE analog): a plan on the `_n` kernels
   // whose weights hold at least one MXFP4 expert segment gathers the packed

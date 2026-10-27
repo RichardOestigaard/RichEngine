@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import Future, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,14 +30,18 @@ from .tool_schema import (
 )
 
 
-def dfa_mode():
+def dfa_mode(default="off"):
     """The engine's RICHENGINE_DFA_MODE tri-state, read the same way there:
     "full" computes a DFA lane's masks and forced spans on the GPU,
     "forced" keeps the host mask round trip and only derives forced spans
     and the automaton state on-device, "off" leaves the DFA unused.
-    Anything unset or unrecognized is "off"."""
-    mode = os.environ.get("RICHENGINE_DFA_MODE", "off").strip().lower()
-    return mode if mode in ("full", "forced", "off") else "off"
+    An explicit environment value wins, then `default` — the family's
+    serving block, matching its engine descriptor's tuning.dfaMode — then
+    "off"."""
+    mode = os.environ.get("RICHENGINE_DFA_MODE", "").strip().lower()
+    if mode in ("full", "forced", "off"):
+        return mode
+    return default if default in ("full", "forced") else "off"
 
 
 # The think-block spellings the served families use, in preference order:
@@ -303,9 +307,10 @@ def _vocab_token_bytes(tokenizer, vocabulary):
 # RICHENGINE_DFA_MASK_CACHE opts DfaConstraint.masks into serving rows a
 # per-state LRU instead of the delegate matcher. The rows come from
 # CompiledDfa.masks_for_state — a pure-Python walk of the whole vocabulary
-# that costs far more per miss than the matcher's mask (the reason the
-# no-delegate path is documented as too slow to serve traffic) — so the
-# flag is a measurement path, not a serving one: the constraint's
+# that costs far more per miss than the matcher's mask, so a miss is
+# expensive and a hit is near-free; tool-call DFAs revisit the same states
+# every step, which keeps the hit rate high enough to serve. On by default;
+# set to "0" to restore the always-delegate path. The constraint's
 # mask_stats() records what hits save and what misses cost.
 _MASK_ROW_CACHE_SIZE = 512
 # (id(dfa), state) -> (dfa, allowed ids). The stored reference pins the
@@ -315,7 +320,7 @@ _mask_row_cache_lock = threading.Lock()
 
 
 def _mask_cache_enabled():
-    return bool(os.environ.get("RICHENGINE_DFA_MASK_CACHE"))
+    return os.environ.get("RICHENGINE_DFA_MASK_CACHE", "1") != "0"
 
 
 class DfaConstraint:
@@ -330,10 +335,20 @@ class DfaConstraint:
     MAX_ROWS = TokenConstraint.MAX_ROWS
 
     def __init__(
-        self, dfa, vocab_tokens, special_tokens, contract, encode=None, inner=None
+        self,
+        dfa,
+        vocab_tokens,
+        special_tokens,
+        contract,
+        encode=None,
+        inner=None,
+        dfa_mode="off",
     ):
         self.dfa = dfa
         self._inner = inner
+        # The mode the constraint shipped under: "off" means the engine runs
+        # the host mask path and needs this constraint's forced spans pushed.
+        self.dfa_mode = dfa_mode
         self.vocab_tokens = vocab_tokens
         self.special_tokens = frozenset(special_tokens)
         self.vocabulary = contract.vocabulary
@@ -742,12 +757,36 @@ def _grammar_error(error):
     return APIError(400, f"unsupported output schema: {error.splitlines()[0]}")
 
 
+class DeferredConstraint:
+    """A constraint still compiling on the factory's pool. The request
+    submits and prefills while the grammar/DFA compiles; the first masks(),
+    forced_tokens() or DFA-frame access joins the compile."""
+
+    def __init__(self, future):
+        self._future = future
+        self._resolved = None
+
+    def resolve(self):
+        if self._resolved is None:
+            self._resolved = self._future.result()
+        return self._resolved
+
+    def __getattr__(self, name):
+        return getattr(self.resolve(), name)
+
+
 class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer, contract):
+    def __init__(self, tokenizer, contract, dfa_mode_default=None):
         self.contract = contract
+        # The serving contract's dfa_mode: the family's engine descriptor
+        # declares the same mode, so this default and the engine's resolve
+        # to one answer whenever RICHENGINE_DFA_MODE does not override both.
+        self.dfa_mode_default = (
+            dfa_mode_default if dfa_mode_default in ("full", "forced") else "off"
+        )
         self.hf_tokenizer = tokenizer
         self.tokenizer = guidance_tokenizer(
             tokenizer,
@@ -769,6 +808,23 @@ class ConstraintFactory:
         # The vocabulary's token bytes and special-token ids, for DFA
         # constraints; computed once, on first use.
         self._vocab = None
+        # Grammar and DFA compiles run here so a request's admission,
+        # tokenization and prefill overlap the compile instead of waiting
+        # for it. Bounded: a compile is pure CPU.
+        self._compile_pool = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="grammar"
+        )
+
+    def defer(self, build):
+        """Run a constraint build on the compile pool, returning a
+        DeferredConstraint that resolves on first use."""
+        return DeferredConstraint(self._compile_pool.submit(build))
+
+    def resolved_dfa_mode(self):
+        """The DFA mode this factory's constraints ship under: the
+        environment's RICHENGINE_DFA_MODE where set, the family's serving
+        default otherwise."""
+        return dfa_mode(getattr(self, "dfa_mode_default", "off"))
 
     def _vocabulary(self):
         if self._vocab is None:
@@ -792,7 +848,9 @@ class ConstraintFactory:
         masks); the constraint itself serves masks(), commits and the
         finishing check through a TokenConstraint on `grammar`, the same
         grammar the llguidance path would compile."""
-        if os.environ.get("RICHENGINE_DISABLE_DFA") or dfa_mode() == "off":
+        if os.environ.get(
+            "RICHENGINE_DISABLE_DFA"
+        ) or self.resolved_dfa_mode() == "off":
             return None
         with self.lock:
             cached = self._dfa_cache.get(grammar)
@@ -842,6 +900,7 @@ class ConstraintFactory:
             special,
             self.contract,
             encode=encode,
+            dfa_mode=self.resolved_dfa_mode(),
             inner=TokenConstraint(
                 matcher.deep_copy(),
                 self.executor,

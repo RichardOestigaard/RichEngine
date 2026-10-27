@@ -320,6 +320,8 @@ class CorpusAppendFrame:
     the request that re-emits them (RICHENGINE_NGRAM_CORPUS)."""
 
     tokens: tuple[int, ...]
+    # Conversation key the corpus doc inherits; 0 = workspace/global.
+    session: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -1053,10 +1055,11 @@ def _corpus_append_frame(append: CorpusAppendFrame) -> bytearray:
             IssueCode.INVALID_COUNT,
             "corpus append carries no tokens",
         )
-    frame = _frame(FrameType.CORPUS_APPEND, 4 + 4 * len(packed))
-    _U32_COUNT = struct.Struct("<I")
-    _U32_COUNT.pack_into(frame, FRAME_HEADER_BYTES, len(packed))
-    frame[FRAME_HEADER_BYTES + 4 :] = packed.tobytes()
+    # u64 session, u32 count, then count u32 tokens.
+    frame = _frame(FrameType.CORPUS_APPEND, 12 + 4 * len(packed))
+    _HEADER = struct.Struct("<QI")
+    _HEADER.pack_into(frame, FRAME_HEADER_BYTES, append.session, len(packed))
+    frame[FRAME_HEADER_BYTES + 12 :] = packed.tobytes()
     return frame
 
 

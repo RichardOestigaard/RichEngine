@@ -1,7 +1,7 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import { Tab, TabGroup, TabList, TabPanel } from "terracotta";
-import { ApiError, api, authorization, errorText, noteAuthStatus } from "../api";
+import { ApiError, api, authorization, errorText, noteAuthStatus, storageGet, storageSet } from "../api";
 import { Chart, fmtTooltipRows } from "../Chart";
 import { useCopied } from "../clipboard";
 import { fmtInt, fmtMs, pct } from "../format";
@@ -262,7 +262,16 @@ export default function Judge() {
   const [sCancelled, setSCancelled] = createSignal(false);
 
   /* Creator guide: a small LLM chat that patches either form. */
-  const [guideOpen, setGuideOpen] = createSignal(true);
+  /* The guide folds away once you don't need it — state persists, and the
+     first successful judgment closes it automatically. */
+  const [guideOpen, setGuideOpen] = createSignal(
+    storageGet("richengine:judge-guide") !== "0"
+  );
+  const toggleGuide = () => {
+    setGuideOpen(!guideOpen());
+    storageSet("richengine:judge-guide", guideOpen() ? "1" : "0");
+  };
+  let guideAutoClosed = false;
   const [guideLog, setGuideLog] = createSignal<GuideMsg[]>([]);
   const [guideInput, setGuideInput] = createSignal("");
   const [guideBusy, setGuideBusy] = createSignal(false);
@@ -330,7 +339,9 @@ export default function Judge() {
     return { body, errors };
   }
 
-  const jErrors = () => judgmentBody().errors;
+  /* Server 422s map onto the same field keys, merged under client errors. */
+  const [jFieldErrs, setJFieldErrs] = createSignal<Record<string, string>>({});
+  const jErrors = () => ({ ...judgmentBody().errors, ...jFieldErrs() });
   const jFirstError = () => Object.values(jErrors())[0];
   const jInvalid = (field: string) =>
     jErrors()[field] ? { "aria-invalid": true } : {};
@@ -341,6 +352,7 @@ export default function Judge() {
     event.preventDefault();
     if (jBusy() || jFirstError()) return;
     const { body } = judgmentBody();
+    setJFieldErrs({});
     setJBusy(true);
     setJCancelled(false);
     const ctrl = new AbortController();
@@ -355,12 +367,29 @@ export default function Judge() {
         })
       );
       setJId(newJudgmentId());
+      /* First result means the guide did its job — fold it once. */
+      if (!guideAutoClosed && guideOpen()) {
+        guideAutoClosed = true;
+        toggleGuide();
+      }
       requestAnimationFrame(() =>
         jResultEl?.scrollIntoView({ behavior: "smooth", block: "nearest" })
       );
     } catch (e) {
       /* A deliberate cancel is a note, not an error. */
       if (isAbort(e)) setJCancelled(true);
+      else if (e instanceof DetailError)
+        /* loc is ["body", field, …] — the same keys the client errors use. */
+        setJFieldErrs(
+          Object.fromEntries(
+            e.details
+              .map(
+                (d) =>
+                  [String(d.loc?.[1] ?? ""), String(d.msg ?? "invalid")] as const
+              )
+              .filter(([k]) => k)
+          )
+        );
       else pushToast("error", errorText(e));
     } finally {
       setJController(undefined);
@@ -542,7 +571,7 @@ export default function Judge() {
           type="button"
           class="guide-head"
           aria-expanded={guideOpen()}
-          onClick={() => setGuideOpen(!guideOpen())}
+          onClick={toggleGuide}
         >
           <span class="grow">
             Creator guide{" "}

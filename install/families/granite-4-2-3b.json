@@ -24,7 +24,8 @@
       "open": "<think>",
       "open_token": "<think>"
     },
-    "tool_dialect": "qwen3-xml"
+    "tool_dialect": "qwen3-xml",
+    "dfa_mode": "full"
   },
   "tuning": [
     {

@@ -102,6 +102,40 @@
 .icon-btn:hover { color: var(--text); background: var(--hover) }
 .icon-btn.on { color: var(--accent) }
 
+/* Per-row overflow menu: Tune/Sampling/Unload behind one ⋯. */
+.row-menu-wrap { position: relative; flex: none }
+.row-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 32;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--composer);
+  box-shadow: var(--shadow);
+  animation: pop-in .12s ease-out;
+}
+.row-menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 7px;
+  text-align: left;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.row-menu button:hover { background: var(--hover) }
+.row-menu button.danger { color: var(--danger) }
+.row-menu button:disabled { opacity: .5; cursor: default }
+.row-menu button:disabled:hover { background: none }
+
+/* The Engine internals fold — same summary treatment as .collapse, with
+   breathing room before its inner sections. */
+.internals > summary { margin-bottom: 20px }
+.internals:not([open]) > summary { margin-bottom: 0 }
+
 /* The sampling settings dialog's field grid (.confirm-panel supplies the
    modal chrome). */
 .sampling-panel { width: min(520px, 92vw); top: 20vh }
@@ -147,6 +181,17 @@
   cursor: pointer;
 }
 .install-check input { accent-color: var(--accent); margin: 0 }
+.install-input.invalid { border-color: var(--danger) }
+.install-suggested { margin-bottom: 10px }
+.install-options { border-top: 1px solid var(--border) }
+.install-options > summary {
+  padding: 10px 16px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.install-options > summary:hover { color: var(--text) }
+.install-err { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .install-job { margin-top: 10px }
 .install-log {
   margin: 0 14px 12px;

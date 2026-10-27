@@ -130,6 +130,21 @@ struct MoeCapParams {
 static_assert(sizeof(MoeCapParams) == 16,
               "MoE union-cap parameters are 16 bytes on both sides");
 
+// The dense shared-expert dispatches (moe_shared_*_q4, ops/MoE.cpp): one
+// row tile per lane block streams the shared slab once instead of once per
+// tile_rows rows. The grouping keeps each row's shared route aimed at the
+// grouped row past the routed tiles (tile_count * tile_rows + row), where
+// these kernels write and moe_combine reads.
+struct MoeSharedParams {
+  uint32_t rows;
+  uint32_t input_size;
+  uint32_t output_size;
+  uint32_t tile_rows;
+};
+
+static_assert(sizeof(MoeSharedParams) == 16,
+              "MoE shared-expert parameters are 16 bytes on both sides");
+
 struct MoeGatherParams {
   uint32_t tile_rows;
   uint32_t input_size;

@@ -284,7 +284,10 @@ std::string runtimeStatusJson(
       << ",\"hits\":" << executorTelemetry.corpusHits
       << ",\"misses\":" << executorTelemetry.corpusMisses
       << ",\"pushes\":" << executorTelemetry.corpusPushes
-      << ",\"evictions\":" << executorTelemetry.corpusEvictions << "}"
+      << ",\"evictions\":" << executorTelemetry.corpusEvictions
+      << ",\"weak_matches\":" << executorTelemetry.corpusWeakMatches
+      << ",\"dropped_starts\":" << executorTelemetry.corpusDroppedStarts
+      << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
       << ",\"waiting_prefix\":" << scheduler.waitingPrefix

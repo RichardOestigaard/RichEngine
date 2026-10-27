@@ -33,7 +33,8 @@ namespace richengine::model {
     std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> scratch;
     uint32_t extension = 0;
     if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, prompt, scratch.data(),
-                            extension, entry.id, entry.corpusSession) &&
+                            extension, entry.id, entry.corpusSession,
+                            ngram_.ngramCorpusSessionGate_) &&
         3 + extension >= ngram::kCorpusArmMin)
       entry.corpusArmed = true;
   }
@@ -58,9 +59,9 @@ namespace richengine::model {
                   64, 1u << 20, entry.id, entry.corpusSession);
   }
 
-  void Runtime::Impl::corpusPush(std::span<const uint32_t> tokens) {
+  void Runtime::Impl::corpusPush(std::span<const uint32_t> tokens, uint64_t session) {
     if (ngram_.ngramCorpus_)
-      ngram::push(ngram_.ngramCorpusDocs_, tokens);
+      ngram::push(ngram_.ngramCorpusDocs_, tokens, 64, 1u << 20, 0, session);
   }
 
   // A lane's expected accepted tokens if its n-gram chain is used now:
@@ -130,7 +131,8 @@ namespace richengine::model {
         uint32_t probeExtension = 0;
         if (ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
                                 probe.data(), probeExtension, entry.id,
-                                entry.corpusSession) &&
+                                entry.corpusSession,
+                                ngram_.ngramCorpusSessionGate_) &&
             3 + probeExtension >= ngram::kCorpusArmMin)
           entry.corpusArmed = true;
       }
@@ -141,7 +143,8 @@ namespace richengine::model {
         const uint32_t corpusFound =
             ngram::lookupCorpus(ngram_.ngramCorpusDocs_, entry.ngram.history,
                                 corpus.data(), corpusExtension, entry.id,
-                                entry.corpusSession);
+                                entry.corpusSession,
+                                ngram_.ngramCorpusSessionGate_);
         const uint32_t corpusPattern =
             corpusFound ? 3 + corpusExtension : 0;
         const uint32_t selfPattern = found ? 3 + extension : 0;

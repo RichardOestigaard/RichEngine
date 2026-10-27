@@ -141,6 +141,7 @@ FrameType write(Writer &out, const ForcedTokensFrame &forced) {
 }
 
 FrameType write(Writer &out, const CorpusAppendFrame &append) {
+  out.u64(append.session);
   out.u32(static_cast<uint32_t>(append.tokens.size()));
   out.words(append.tokens);
   return FrameType::CorpusAppend;

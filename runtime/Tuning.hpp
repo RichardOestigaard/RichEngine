@@ -24,6 +24,19 @@ struct Tuning {
   bool moePackedOff = false;  // RICHENGINE_MOE_PACKED_OFF (presence)
   uint32_t moeUnionCap = 0;   // RICHENGINE_MOE_UNION
   uint32_t moeTopK = 0;       // RICHENGINE_MOE_TOPK
+  // A verify step's grouping routes each lane's live rows alone
+  // (moe_group_routes_verified): measured +10-13% decode on Ornith, token
+  // parity — default on, opt-out for A/B.
+  bool moeVerifiedRows = true;  // RICHENGINE_MOE_VERIFIED_ROWS_OFF (presence)
+  // A/B candidate (NEW_DSP_FINDINGS.md §8): the shared expert leaves the
+  // tiled route loop for one dense dispatch per lane block
+  // (moe_shared_*_q4). Affine64 targets only.
+  bool moeSharedDense = false;  // RICHENGINE_MOE_SHARED_DENSE (presence)
+  // engine/Scheduler.cpp: pack a decode batch by mask exchange, not
+  // constraint mode — a GPU-DFA constrained lane joins free lanes instead of
+  // splitting the command (NEW_DSP_FINDINGS.md §3.4). Default on, opt-out
+  // for A/B.
+  bool mixedDecodePack = true;  // RICHENGINE_MIXED_DECODE_PACK_OFF (presence)
   // ops/MoE.cpp, ops/MoE.hpp
   bool moeGgufFused = false;      // RICHENGINE_MOE_GGUF_FUSED (presence)
   std::string_view moeGgufTile;   // RICHENGINE_MOE_GGUF_TILE=register|staged
@@ -154,6 +167,7 @@ struct Tuning {
   uint32_t ngramCorpus = 0;         // RICHENGINE_NGRAM_CORPUS
   bool ngramCorpusAll = false;      // RICHENGINE_NGRAM_CORPUS_ALL (presence)
   uint32_t ngramCorpusMargin = 5;   // RICHENGINE_NGRAM_CORPUS_MARGIN
+  bool ngramCorpusSessionGate = false; // RICHENGINE_NGRAM_CORPUS_SESSION_GATE
   double treeAcceptMin = 0.0;       // RICHENGINE_TREE_ACCEPT_MIN
   double treeAcceptMax = 6.0;       // RICHENGINE_TREE_ACCEPT_MAX
   // Presence flags for the threshold knobs above: a family's ModelTuning
@@ -246,6 +260,9 @@ inline Tuning makeTuning() {
   t.moePackedOff = envFlag("RICHENGINE_MOE_PACKED_OFF");
   t.moeUnionCap = envUint("RICHENGINE_MOE_UNION", 0);
   t.moeTopK = envUint("RICHENGINE_MOE_TOPK", 0);
+  t.moeVerifiedRows = !envFlag("RICHENGINE_MOE_VERIFIED_ROWS_OFF");
+  t.moeSharedDense = envFlag("RICHENGINE_MOE_SHARED_DENSE");
+  t.mixedDecodePack = !envFlag("RICHENGINE_MIXED_DECODE_PACK_OFF");
   t.moeGgufFused = envFlag("RICHENGINE_MOE_GGUF_FUSED");
   t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
   t.moeSg4 = envFlag("RICHENGINE_MOE_SG4");
@@ -329,6 +346,9 @@ inline Tuning makeTuning() {
   t.ngramCorpus = envUint("RICHENGINE_NGRAM_CORPUS", 2);
   t.ngramCorpusAll = envUint("RICHENGINE_NGRAM_CORPUS_ALL", 1) != 0;
   t.ngramCorpusMargin = envUint("RICHENGINE_NGRAM_CORPUS_MARGIN", 5);
+  // Hard session isolation: cross-session docs are invisible, not just
+  // outranked — kills the "a match existed" timing leak entirely.
+  t.ngramCorpusSessionGate = envFlag("RICHENGINE_NGRAM_CORPUS_SESSION_GATE");
   t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");
   t.treeAcceptMin = envDouble("RICHENGINE_TREE_ACCEPT_MIN", 0.0);
   t.treeAcceptMaxSet = envFlag("RICHENGINE_TREE_ACCEPT_MAX");

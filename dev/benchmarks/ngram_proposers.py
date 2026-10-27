@@ -131,7 +131,7 @@ class NgramV2P:
 
     def __init__(self, global_corpus=None, margin=5, arm_min=8,
                  probe_every=256, mode=2, occ_all=False, grouped=False,
-                 session=None):
+                 session=None, vo=False, adapt_alpha=0.0):
         self.corpus = list(global_corpus or [])
         self.margin = margin
         self.arm_min = arm_min
@@ -150,6 +150,12 @@ class NgramV2P:
         self.occ_all = occ_all
         self.grouped = grouped
         self.session = session
+        # vo: variable-order corpus match — the lane's longest suffix
+        # occurring inside a doc wins, not just closing-3-gram starts.
+        # adapt_alpha: proposal length = clip(round(alpha*m), 1, k) where
+        # m is the effective match length (AgSpec §3.2); 0 = fixed k.
+        self.vo = vo
+        self.adapt_alpha = adapt_alpha
         self._corpus_docs = [
             c[0] if isinstance(c, tuple) else c for c in self.corpus
         ]
@@ -200,15 +206,33 @@ class NgramV2P:
         for doc, sess in zip(self.corpus, self._corpus_sess):
             if sessions_only is not None and sess != sessions_only:
                 continue
-            hit, ext, fol = self._doc_hit(
-                doc, lane, len(lane), self.occ_all, self.grouped
-            )
+            if self.vo:
+                hit, ext, fol = self._doc_hit_vo(doc, lane, len(lane))
+            else:
+                hit, ext, fol = self._doc_hit(
+                    doc, lane, len(lane), self.occ_all, self.grouped
+                )
             if hit is not None and (
                 best is None or ext > best_ext
                 or (ext == best_ext and fol > best_fol)
             ):
                 best, best_ext, best_fol, best_doc = hit, ext, fol, doc
         return best, best_ext, best_fol, best_doc
+
+    @staticmethod
+    def _doc_hit_vo(doc, lane, key_end):
+        """Variable-order match: the lane's longest tail substring present
+        in the doc. Returns (start, extension, followers) in the v1 shape —
+        extension = pattern length - 3 so margins stay comparable."""
+        limit = min(key_end, len(doc) - 1)
+        # Longest first, short-circuit at the first (longest) hit.
+        for p in range(limit, 2, -1):
+            pat = lane[key_end - p : key_end]
+            first = pat[0]
+            for i in range(len(doc) - p):
+                if doc[i] == first and doc[i : i + p] == pat:
+                    return i + p - 3, p - 3, len(doc) - (i + p)
+        return None, 0, 0
 
     def _corpus_lookup(self, lane, k):
         # Session tier: a same-session doc's hit wins outright (AgSpec's
@@ -275,9 +299,15 @@ class NgramV2P:
             if corpus_p > self_p + self.margin and len(corpus_cand) >= 1:
                 self.last_match_p = corpus_p
                 self.last_match_source = "corpus"
+                if self.adapt_alpha:
+                    cap = max(1, min(k, round(self.adapt_alpha * corpus_p)))
+                    return corpus_cand[:cap]
                 return corpus_cand
         self.last_match_p = self_p
         self.last_match_source = "self" if cand else ""
+        if self.adapt_alpha and cand:
+            cap = max(1, min(k, round(self.adapt_alpha * self_p)))
+            return cand[:cap]
         return cand
 
 
