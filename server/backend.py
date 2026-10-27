@@ -203,6 +203,12 @@ class Job:
     # The PromptTokenizer remembering emitted reply ids for later prompts;
     # None where the request cannot record one.
     reply_memory: object | None = None
+    # OpenAI `n`: how many completions the request asked for; the frontend
+    # expands n > 1 into one sibling job per lane (expand()).
+    n_samples: int = 1
+    # All jobs of one n > 1 request, primary included, so cancellation stops
+    # the whole batch. Empty for ordinary single-completion requests.
+    cohort: list = field(default_factory=list)
 
     @property
     def may_call_tools(self):
@@ -1137,13 +1143,17 @@ class NativeBackend:
             job.reply_memory.record_reply(text, ids[start:end])
 
     def cancel(self, job):
-        call = None
+        # An n > 1 request's siblings share the cancelled event and the
+        # cohort list: cancelling any lane stops them all.
+        cohort = job.cohort or [job]
+        calls = []
         with self.lock:
-            job.cancelled.set()
-            state = self.active.get(job.request_id)
-            if state is not None:
-                call = state.call
-        if call is not None:
+            for sibling in cohort:
+                sibling.cancelled.set()
+                state = self.active.get(sibling.request_id)
+                if state is not None and state.call is not None:
+                    calls.append(state.call)
+        for call in calls:
             call.cancel()
 
     def _finalize_loop(self):

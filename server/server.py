@@ -923,10 +923,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._body_reservation = None
             job.return_progress = return_progress
             job.latency = RequestLatency(self.app.latencies, started_at)
+            cohort = self.app.expand(job)
+            if len(cohort) > 1 and stream:
+                raise APIError(400, "n values above 1 cannot be streamed")
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
-            self.app.backend.submit(job)
+            for sibling in cohort:
+                self.app.backend.submit(sibling)
             submitted = True
             if anthropic and stream:
                 self._anthropic_stream(job)
@@ -941,7 +945,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             elif completions:
                 self._text_completion(job)
             else:
-                self._complete(job)
+                self._complete(job) if len(cohort) == 1 else self._complete_n(job)
         except judgments.SystemOneError as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -1489,8 +1493,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             None if projector is None else projector.call_id,
         )
 
-    def _complete(self, job):
-        collected = self._collect(job)
+    def _message(self, job, collected):
         message = {
             "role": "assistant",
             "content": collected.content or None,
@@ -1500,15 +1503,61 @@ class FrontendHandler(BaseHTTPRequestHandler):
             message["reasoning_content"] = collected.reasoning
         if collected.tool_calls:
             message["tool_calls"] = collected.tool_calls
+        return message
+
+    def _complete(self, job):
+        collected = self._collect(job)
         self._json(
             200,
             completion_response(
                 self.app.response_model,
                 job,
                 collected.result,
-                message,
+                self._message(job, collected),
                 bool(collected.tool_calls),
             ),
+        )
+
+    def _complete_n(self, job):
+        """n > 1: one choice per sibling lane, submitted together so they
+        decode packed. The prompt is billed once — later lanes' prefix reads
+        are cache hits, not new tokens."""
+        results = [self._collect(sibling) for sibling in job.cohort]
+        choices = []
+        completions = 0
+        for index, (sibling, collected) in enumerate(zip(job.cohort, results)):
+            choices.append(
+                {
+                    "index": index,
+                    "message": self._message(sibling, collected),
+                    "logprobs": None,
+                    "finish_reason": finish_reason(
+                        collected.result, bool(collected.tool_calls)
+                    ),
+                }
+            )
+            completions += collected.result.completion_tokens
+        result = results[0].result
+        prompt_tokens = result.prompt_tokens
+        self._json(
+            200,
+            {
+                "id": f"chatcmpl-{job.public_id}",
+                "object": "chat.completion",
+                "created": job.created_at,
+                "model": self.app.response_model,
+                "choices": choices,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completions,
+                    "total_tokens": prompt_tokens + completions,
+                    "prompt_tokens_details": {
+                        "cached_tokens": result.cache.matched_tokens
+                    },
+                },
+                "timings": timings_dict(result),
+                "metadata": job.response_metadata or {},
+            },
         )
 
     def _text_completion(self, job):

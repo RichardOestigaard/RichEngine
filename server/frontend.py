@@ -8,7 +8,8 @@ import secrets
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+import queue
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
@@ -24,7 +25,7 @@ from .api_shapes import (
     responses_to_chat_body,
     template_messages,
 )
-from .backend import Job, remaining_request_time
+from .backend import CacheInfo, Job, remaining_request_time
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -1374,8 +1375,8 @@ class Frontend:
         # can render documents and build validators.
         options = self._generation_options(body)
         n = body.get("n", 1)
-        if not isinstance(n, int) or isinstance(n, bool) or n != 1:
-            raise APIError(400, "n values other than 1 are not supported")
+        if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 4:
+            raise APIError(400, "n must be an integer from 1 to 4")
         # TokensEvent carries token ids only, so per-token logprobs would
         # need engine support.
         logprobs = body.get("logprobs")
@@ -1403,6 +1404,14 @@ class Frontend:
             tool_policy.constrained or response_schema is not None
         )
         constrained = tool_constrained or response_schema is not None
+        if n > 1 and constrained:
+            # One compiled constraint carries per-request grammar state; it
+            # cannot feed sibling lanes.
+            raise APIError(
+                400,
+                "n values above 1 cannot be combined with tools, tool_choice "
+                "none or structured output",
+            )
         if options.ignore_eos and constrained:
             raise APIError(
                 400,
@@ -1477,7 +1486,36 @@ class Frontend:
             generation_prompt_tokens=rendered.generation_prompt_tokens,
             shared_prefix_tokens=rendered.shared_prefix_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
+            n_samples=n,
         )
+
+    def expand(self, job):
+        """Sibling jobs for an n > 1 request: the same prepared prompt on
+        one lane each with a distinct seed, submitted together so the
+        scheduler packs the lanes into a single decode batch and later lanes'
+        prompt resolves from the first's prefix. Returns the cohort with the
+        primary job first; single-completion requests return [job]."""
+        n = job.n_samples
+        if n <= 1:
+            return [job]
+        cohort = [job] + [
+            replace(
+                job,
+                request_id=next(self.ids),
+                public_id=secrets.token_hex(16),
+                seed=(job.seed + index) % 2**64,
+                events=queue.Queue(),
+                cache=CacheInfo(),
+                latency=None,
+                reply_memory=None,
+                n_samples=1,
+                cohort=[],
+            )
+            for index in range(1, n)
+        ]
+        for sibling in cohort:
+            sibling.cohort = cohort
+        return cohort
 
     def _tool_dialect(self, detected):
         """The request's tool dialect — the template probe's, else the
