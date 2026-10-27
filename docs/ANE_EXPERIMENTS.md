@@ -769,9 +769,20 @@ adds ~0; the eval itself costs more than the GPU's share it replaces.
 | LFM2.5-2.6B (h2048 i10752) | ~384 ms | **~323 ms** (cal. share 0.29, 5.2 ms/eval) | ~455 ms @0.52 (10.7 ms/eval) | ~408 ms @0.52 (9.5 ms/eval) |
 | Ornith-1.5-9B (h4096 i12288) | ~1122 ms | **~959 ms** (cal. share 0.375, 14.3 ms/layer) | ~1181 ms @0.5 | ~1225 ms @0.5 |
 | Granite-4.2-3B (h2560 i8192) | **~565 ms** | rejects (hidden %1024 fails) | ~676 ms @0.5 | ~598 ms @0.5 (1.6% err, 80 evals) |
-| MiniCPM5-2B (h2048 i6144) | was blocked by `decode_warmup` scratch 98304<131072 — fixed (draft-storage bound), untested since | — | — | — |
-| Qwen3.8-27B (h5120 i17408) | was blocked by `decode_warmup` scratch 245760<327680 — same fix, weights not fetched here | — | — | — |
+| MiniCPM5-2B (h2048 i6144) | ~392 ms | **~335 ms** (cal. share 0.333, 3.5 ms/eval) | ~446 ms @0.333 (6.0 ms/eval) | ~412 ms @0.333 (5.6 ms/eval) |
+| MiniCPM5-2B-MLX (affine, same dims) | ~373 ms | **~322 ms** (cal. share 0.333) | ~407 ms @0.333 (5.6 ms/eval) | ~398 ms @0.333 (5.6 ms/eval) |
+| Qwen3.8-27B-4bit (mlx-community, h5120 i17408) | ~5027-5420 ms | **~3284-3472 ms** (cal. share 0.441, 25.3 ms/eval, 1.6% err) | ~5418 ms @0.441 (54.3 ms/eval, 1.4% err) | blocked: `memory_audit` runtime_reserve_exceeded (AOT delegates exceed the 768 MiB reserve on the 27B) |
 | Granite-4.2-8B | registered, weights not fetched — untested | — | — | — |
+
+Split-efficiency probe: the split layer's overhead above its GPU part is
+~0.6 ms (staging + rotate + pack + join + event ops); the ANE eval is
+fully hidden and both engines stream int8 weights at ~3.5 GB/s effective,
+which is what parks the share at the calibration crossing. Fusing the
+rotate's fp16 intermediate into an int8 one (pack is then a pure int8
+transpose) cuts ~0.25 ms/layer of staging traffic — measured overhead
+~0.35 ms/layer on a same-run recalibration — but the calibrated share
+moved 8→6 units and total prefill stayed flat within noise. Commit-split
+A/B (`RICHENGINE_MTL4_OFF`) measured ~0.
 
 The `decode_warmup` blocker was a storage-lane bound, not an ANE path
 issue: `encodeDraftBatchGraph` sized packed draft tensors from the
@@ -789,10 +800,12 @@ given can serve shapes the rotation path rejects (Granite-3B engages:
 `state: split`, 1.6-2.4% verify error, 0.1-0.8 s setup).
 
 **Verdict: ship as opt-in compatibility, not default.** Private ANE
-wins every model it supports (~1.7x faster per eval at real rows);
-CoreAI's value is shapes the private path structurally rejects —
-Granite-3B runs ANE-assisted for the first time, ~6% slower than GPU
-alone but freeing GPU bandwidth during prefill.
+wins every model it supports (1.7-2.1x faster per eval at real rows);
+the win scales with FFN width — the 27B's split is 35% faster end to
+end, the biggest measured. CoreAI's value is shapes the private path
+structurally rejects — Granite-3B runs ANE-assisted for the first
+time, ~6% slower than GPU alone but freeing GPU bandwidth during
+prefill.
 
 AOT delivery: `coreai-build compile` (in the MetalToolchain cryptex,
 `.../Metal.xctoolchain/usr/bin/coreai-build`) with
@@ -800,4 +813,7 @@ AOT delivery: `coreai-build compile` (in the MetalToolchain cryptex,
 --expect-frequent-reshapes` emits `<name>.h17s.aimodelc`;
 `RICHENGINE_COREAI_ASSET` accepts it directly. Setup drops to
 0.1-0.8 s and per-eval time lands at the standalone AOT numbers —
-still slower than private at engine row counts.
+still slower than private at engine row counts. Caveat: on the 27B
+the `.aimodelc` delegates' driver-side allocations exceed the
+256+512 MiB pipeline/runtime reserve and `memory_audit` refuses
+bootstrap; JIT assets (which compile lazily per function) fit.

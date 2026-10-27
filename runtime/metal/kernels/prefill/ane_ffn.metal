@@ -65,7 +65,7 @@ inline void ane_ffn_q4_values(thread float (&value)[4], device const uchar *weig
 static_assert(ANE_FFN_INPUT_BLOCK == ANE_FFN_ROTATION_UNIT, "ane_ffn_rotate rotates an input block per unit");
 kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
                            device const float *sign [[buffer(1)]],
-                           device half *rotated [[buffer(2)]],
+                           device char *rotated [[buffer(2)]],
                            device half *token_scale [[buffer(3)]],
                            constant AneFfnRotateParams &params [[buffer(4)]],
                            uint row [[threadgroup_position_in_grid]],
@@ -90,26 +90,27 @@ kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
   const float scale = max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
   for (uint block = 0; block < blocks; ++block) {
     const uint origin = row * params.hidden + (simd_group * blocks + block) * ANE_FFN_INPUT_BLOCK + lane * 4;
-    for (uint e = 0; e < 4; ++e) rotated[origin + e] = half(value[block][0][e] * inverse);
+    for (uint e = 0; e < 4; ++e)
+      rotated[origin + e] =
+          char(clamp(rint(value[block][0][e] * inverse), -ANE_FFN_INT8_PEAK, ANE_FFN_INT8_PEAK));
   }
   if (simd_group == 0 && lane == 0) token_scale[row] = half(scale * ANE_FFN_INT8_UNIT);
 }
 
 // ANE_FFN_TILE x ANE_FFN_TILE tiles of rows x channels, ANE_FFN_TILE x
 // ANE_FFN_TILE_ROWS threads.
-kernel void ane_ffn_pack(device const half *rotated [[buffer(0)]],
+kernel void ane_ffn_pack(device const char *rotated [[buffer(0)]],
                          device char *packed [[buffer(1)]],
                          constant AneFfnPackParams &params [[buffer(2)]],
                          uint2 tile [[threadgroup_position_in_grid]],
                          uint2 position [[thread_position_in_threadgroup]]) {
-  threadgroup half staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  threadgroup char staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
   const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     staged[j][position.x] = rotated[(row + j) * params.hidden + params.channel + channel + position.x];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
-    packed[(channel + j) * params.stride + row + position.x] =
-        char(clamp(rint(float(staged[position.x][j])), -ANE_FFN_INT8_PEAK, ANE_FFN_INT8_PEAK));
+    packed[(channel + j) * params.stride + row + position.x] = staged[position.x][j];
 }
 
 // The four values of `row` at inputs [input, input + 4) of a GGUF image

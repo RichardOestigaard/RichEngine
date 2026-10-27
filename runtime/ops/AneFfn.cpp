@@ -242,7 +242,7 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
   memory.signs = buffer(ANE_FFN_INTERMEDIATE_BLOCK * sizeof(float), "ane ffn signs");
   memory.rowScales = buffer(uint64_t{shape.layers} * (2 * shape.ane + shape.hidden) * sizeof(_Float16),
                             "ane ffn row scales");
-  memory.rotated = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "ane ffn rotated input");
+  memory.rotated = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(int8_t), "ane ffn rotated input");
   memory.status = buffer(sizeof(uint32_t), "ane ffn status");
   for (uint32_t k = 0; k < inputSegments; ++k)
     memory.inputs.push_back(surface(shape.inputSegment, kMaximumRows, Element::Int8));

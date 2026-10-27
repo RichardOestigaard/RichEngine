@@ -216,7 +216,8 @@ kernel void dspark_select_edges(
     device float *partial_values [[buffer(1)]],
     device const bfloat *markov_w1 [[buffer(2)]],
     device const bfloat *markov_w2 [[buffer(3)]],
-    constant SelectorBatchParams &params [[buffer(4)]],
+    device const uint *draft_input [[buffer(4)]],
+    constant SelectorBatchParams &params [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
@@ -237,7 +238,7 @@ kernel void dspark_select_edges(
     // keeps a corrupted id inside the Markov tables.
     const uint prev_token = position
         ? partial_ids[(row - 1) * Pool + predecessor]
-        : params.anchor[batch];
+        : draft_input[batch * params.query_rows];
     const uint safe_predecessor = min(prev_token, params.vocabulary - 1u);
     const uint safe_candidate =
         min(partial_ids[row * Pool + candidate], params.vocabulary - 1u);
@@ -408,7 +409,8 @@ kernel void draft_select_dspark_tree(
     device uint *tokens [[buffer(4)]], device uint *tree_tokens [[buffer(5)]],
     device uint *tree_nodes [[buffer(6)]],
     device uint *tree_counts [[buffer(7)]],
-    constant SelectorBatchParams &params [[buffer(8)]],
+    device const uint *draft_input [[buffer(8)]],
+    constant SelectorBatchParams &params [[buffer(9)]],
     uint batch [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
@@ -428,7 +430,7 @@ kernel void draft_select_dspark_tree(
   const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
   const float temperature = sampling ? params.temperature[batch] : 1.0f;
   if (lane == 0) {
-    tree_tokens[0] = params.anchor[batch];
+    tree_tokens[0] = draft_input[batch * params.query_rows];
     tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
                     (RICHENGINE_TREE_NODE_NONE << 16);
   }

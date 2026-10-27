@@ -30,6 +30,10 @@ ModelDescriptor minicpmV47Descriptor(std::string name) {
       makeModelDescriptor(std::move(name), minicpmV47MoeTargetLayout(),
                           minicpmV47DraftLayout(), vision);
   descriptor.visionSource = VisionSource::None;
+  // Measured on the Q4_K_M install (decode bench, widths 1-4, M5 Pro):
+  // 0.5 prunes ~35% of drafted rows at identical output for +5-10% decode
+  // tokens/s; 0.7 prunes deeper and loses it back.
+  descriptor.tuning.draftConfMin = 0.5;
   return descriptor;
 }
 

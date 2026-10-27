@@ -396,6 +396,8 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
   const DraftMarkovHead markov{
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  const MetalBuffer draftInput =
+      allocate(backend, uint64_t{c.lanes} * kRows * sizeof(uint32_t));
   DraftSelectorBuffers buffers{
       logits,
       allocate(backend, workspace.partialIdsBytes),
@@ -411,7 +413,8 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
-      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t)),
+      draftInput};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
   for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
@@ -421,6 +424,7 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
     anchors[lane] = random.next() % c.vocabulary;
     const bool laneSamples = c.sampling && (lane & 1);
     policies[lane] = SamplingPolicy{16, laneSamples ? 0.8F : 0.0F, 1.0F, false};
+    static_cast<uint32_t *>(draftInput.contents())[lane * kRows] = anchors[lane];
   }
 
   CommandGraph graph;
@@ -664,6 +668,8 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
   const DraftCodebooks codebooks{
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  const MetalBuffer draftInput =
+      allocate(backend, uint64_t{c.lanes} * kRows * sizeof(uint32_t));
   DraftSelectorBuffers buffers{
       logits,
       allocate(backend, workspace.partialIdsBytes),
@@ -679,7 +685,8 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
-      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t)),
+      draftInput};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
   for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
@@ -689,6 +696,7 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
     anchors[lane] = random.next() % c.vocabulary;
     const bool laneSamples = c.sampling && (lane & 1);
     policies[lane] = SamplingPolicy{16, laneSamples ? 0.8F : 0.0F, 1.0F, false};
+    static_cast<uint32_t *>(draftInput.contents())[lane * kRows] = anchors[lane];
   }
 
   CommandGraph graph;

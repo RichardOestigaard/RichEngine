@@ -210,7 +210,7 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
-             markov.projection},
+             markov.projection, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   graph.add(std::string(kDraftSelectDspark),
@@ -247,13 +247,14 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
-             markov.projection},
+             markov.projection, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   graph.add(std::string(kDraftSelectDsparkTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.proposalProbabilities, buffers.proposedTokens,
-             buffers.treeTokens, buffers.treeNodes, buffers.treeCounts},
+             buffers.treeTokens, buffers.treeNodes, buffers.treeCounts,
+             buffers.draftInput},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 
@@ -329,7 +330,8 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
   graph.add(std::string(kDraftSelectDsparkTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.proposalProbabilities, buffers.proposedTokens,
-             buffers.treeTokens, buffers.treeNodes, buffers.treeCounts},
+             buffers.treeTokens, buffers.treeNodes, buffers.treeCounts,
+             buffers.draftInput},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 

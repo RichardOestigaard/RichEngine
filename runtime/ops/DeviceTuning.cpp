@@ -297,7 +297,12 @@ constexpr MeasuredSplit kMeasuredMxfp4Splits[] = {
 // 10-80 cores emulated by width, the decode step's projections run 0.95%
 // slower than the fastest split of each shape on average and 2.3% at worst
 // (sixteen threadgroups per core with two units per partition: 2.8%, 7.8%).
-constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
+// A grid that eight partitions leave below three threadgroups per core takes
+// sixteen while the partitions keep 512 inputs (upstream 6198321e, measured
+// on Apple10's register tile alone): the narrowest-K projections — a
+// 320 x 10240 hyper-connection down on five column tiles, or a two-tile
+// {512,2048} expert — gain 11-17% at one to four lanes.
+constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}, {3, 512, 16}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
 // 512 inputs per partition. Six is not a residency (12-17 of these
@@ -338,9 +343,9 @@ uint32_t decodeSplits(const DevicePolicy &device, uint32_t n, uint32_t k,
   const uint64_t grid = n / GGUF_TILE_COLUMNS;
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
-    return grid * splits < uint64_t{t.threadgroups} * device.cores && k / (2 * splits) >= t.inputs;
+    return splits < t.splits && grid * splits < uint64_t{t.threadgroups} * device.cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks))
+  while (std::any_of(tiers.begin(), tiers.end(), asks))
     splits *= 2;
   return splits;
 }
@@ -351,9 +356,13 @@ uint32_t decodeSplits(const DevicePolicy &device, uint32_t n, uint32_t k,
 // fastest split (20% at one lane on 2048 x 512, a 0.012 ms projection),
 // where the fitted tier above is 13-27% slower on 17408 x 5120 and
 // 12288 x 5120 and 50% on 2048 x 512.
+// Apple9's staged tile takes the register tile's tiers of eight (the first
+// two): at sixteen Apple10's staged tile takes 15-34% more time on the
+// narrow-K projections that win the tier (upstream 6198321e).
 std::span<const SplitTier> stagedTiers(const DevicePolicy &device) noexcept {
-  return device.isApple9() ? std::span<const SplitTier>(kRegisterTiers)
-                           : std::span<const SplitTier>(kStagedTiers);
+  return device.isApple9()
+             ? std::span<const SplitTier>(kRegisterTiers).first(2)
+             : std::span<const SplitTier>(kStagedTiers);
 }
 
 std::span<const SplitTier> mxfp4Tiers() noexcept { return kMxfp4Tiers; }

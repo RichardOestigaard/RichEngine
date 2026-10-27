@@ -17,10 +17,12 @@ namespace richengine::ops {
 
 // One tier of a GGUF decode tile's K-split rule: the tile splits again while
 // the grid holds fewer than `threadgroups` threadgroups per core and each
-// partition would still keep `inputs` inputs.
+// partition would still keep `inputs` inputs, up to the tier's own maximum
+// (`splits`, eight unless it says more).
 struct SplitTier final {
   uint32_t threadgroups;
   uint32_t inputs;
+  uint32_t splits = 8;
 };
 
 // The K splits of a GGUF decode tile on `device`: the largest power of two

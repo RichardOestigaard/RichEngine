@@ -102,7 +102,9 @@ namespace richengine::model {
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     std::visit([&](const auto &model) {
       if constexpr (std::is_same_v<std::decay_t<decltype(model)>,
-                                   DFlashV1Draft>) {
+                                   DFlashV1Draft> ||
+                    std::is_same_v<std::decay_t<decltype(model)>,
+                                   DSparkDraft>) {
         model.addDecode(graph, std::move(buffers),
                         targetModel.vocabularyProjection(),
                         std::span(cacheLengths).first(lanes), devicePack);
@@ -136,7 +138,8 @@ namespace richengine::model {
            d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
            d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence),
            d(DecodeTensor::TreeNodes),
-           d(DecodeTensor::TreeTokens), d(DecodeTensor::TreeCounts)},
+           d(DecodeTensor::TreeTokens), d(DecodeTensor::TreeCounts),
+           d(DecodeTensor::DraftInputTokens)},
           std::span(anchors).first(lanes), std::span(policies).first(lanes),
           treeMask);
     }, draftModel);
@@ -145,7 +148,7 @@ namespace richengine::model {
     // to the head's own sigmoid, which draft_verify_rows's conf_min
     // prunes on. The GPU predraft's graph scores its proposals the same
     // way, so an adopted predraft's confidences stay valid.
-    if (tuning().draftConfMin > 0.0) {
+    if (modelPolicy().draftConfMin > 0.0) {
       if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
         const DSparkDraftWeights &w = dspark->weights();
         graph.add(
@@ -319,7 +322,8 @@ namespace richengine::model {
     static_cast<void>(items);
     if (!gpuPredraftOn_ || !chainPredraft_ || entries.empty() ||
         entries.size() > kLaneCount ||
-        !std::holds_alternative<DFlashV1Draft>(draftModel))
+        !(std::holds_alternative<DFlashV1Draft>(draftModel) ||
+          std::holds_alternative<DSparkDraft>(draftModel)))
       return;
     const uint32_t width = static_cast<uint32_t>(entries.size());
     GpuPredraft predraft;

@@ -1,6 +1,7 @@
 // GGUF MoE experts on the staged decode tile (kernels/common/gguf_staged_tile.h); the Apple9 register form is in
 // kernels/decode/linear_gguf_sgmatrix.metal.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/gguf_column_tile.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/gguf_mxfp4_tile.h"
 #include "metal/kernels/common/gguf_mxfp4p_tile.h"
@@ -17,7 +18,10 @@
 // 2.42-2.78 ms at 512 rows and 6.70-6.83 ms at 2048 rows against 3.44-3.86 and 8.20-8.23 for 64-row tiles sharing one
 // 64-column stage over four 16-row simdgroups, and 1.29-1.71 ms against 1.59-2.60 for 8-row tiles at 128-256 rows,
 // all with a 16-row matmul for up to 16 live rows; the 8-row matmul for up to 8 takes another 4-6% off 64- to
-// 256-row chunks of gguf-moe-benchmark's uniform routes (40-core M5 Max).
+// 256-row chunks of gguf-moe-benchmark's uniform routes (40-core M5 Max). An expert's only tile of at most
+// MOE_GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile),
+// each lane one of the simdgroup's columns over the live rows: routes spread over many experts leave most decode
+// tiles at one or two rows, where the staged tile's padded matmul steps bound it.
 template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
@@ -30,6 +34,17 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  if (moe_column_tile(tiles, group.y)) {
+    float sums[MOE_GGUF_COLUMN_ROWS];
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
+                                         0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
+                                         sums);
+    for (uint row = 0; row < tile.rows; ++row) {
+      const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
+      output[o] = gguf_epilogue<Ep>(sums[row], aux, o);
+    }
+    return;
+  }
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
@@ -110,6 +125,21 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
+  if (moe_column_tile(tiles, group.y)) {
+    float gs[MOE_GGUF_COLUMN_ROWS], us[MOE_GGUF_COLUMN_ROWS];
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(gate.format, x, tile.rows, p.input_size, gate.w0, gate.w1, gate.meta,
+                                         origin + simd_lane, 0, p.input_size / 32, tl,
+                                         simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, gs);
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(up.format, x, tile.rows, p.input_size, up.w0, up.w1, up.meta,
+                                         origin + simd_lane, 0, p.input_size / 32, tl,
+                                         simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, us);
+    for (uint row = 0; row < tile.rows; ++row) {
+      const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
+      output[o] = bfloat(float(bfloat(us[row])) *
+                         richengine_silu(float(bfloat(gs[row]))));
+    }
+    return;
+  }
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
     auto acc_g = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);

@@ -82,9 +82,13 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans) const;
+  // `devicePack` binds the committed step's DecodeStepPackLane block: the
+  // attention splits read each lane's cache length from it, which the
+  // GPU-chained predraft needs — the encode cannot know them yet.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths) const;
+                 std::span<const uint32_t> cacheLengths,
+                 const metal::MetalBuffer &devicePack = {}) const;
   // treeMask marks greedy, unconstrained lanes whose selector emits the
   // pool's biased runner-up per position as a comb tree's sibling leaf; 0
   // selects the chain-only pipeline.

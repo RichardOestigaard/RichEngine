@@ -150,6 +150,7 @@ struct Tuning {
   // Presence flags for the threshold knobs above: a family's ModelTuning
   // value is the default and an explicitly set variable overrides it.
   bool draftBypassExpectSet = false;
+  bool draftConfMinSet = false;
   bool ngramDraftExpectSet = false;
   bool ngramWarmupSet = false;
   bool ngramTreeMinSet = false;
@@ -307,6 +308,7 @@ inline Tuning makeTuning() {
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
   t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");
   t.ngramDraftExpect = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
+  t.draftConfMinSet = envFlag("RICHENGINE_DRAFT_CONF_MIN");
   t.draftConfMin = envDouble("RICHENGINE_DRAFT_CONF_MIN", 0.0);
   t.ngramWarmupSet = envFlag("RICHENGINE_NGRAM_WARMUP");
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);

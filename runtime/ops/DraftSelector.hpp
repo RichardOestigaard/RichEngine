@@ -41,6 +41,12 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer treeNodes;
   metal::MetalBuffer treeTokens;
   metal::MetalBuffer treeCounts;
+  // The lanes' packed draft input rows (DraftInputTokens): row 0 of each
+  // lane's query stride is its anchor. The DSpark kernels read the anchor
+  // from here rather than the parameter block, so a GPU-chained predraft
+  // (whose anchor the encode cannot know) selects correctly; the host paths
+  // write the same token there.
+  metal::MetalBuffer draftInput;
 };
 
 // What a decode cycle's verify rows follow (DraftSelector::addVerifyRows,

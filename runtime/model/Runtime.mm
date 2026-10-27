@@ -695,7 +695,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     const float confMin =
         std::holds_alternative<DSparkDraft>(impl_->draftModel) &&
                 !constrained && (drafted || gpuPredrafted)
-            ? static_cast<float>(tuning().draftConfMin)
+            ? static_cast<float>(modelPolicy().draftConfMin)
             : 0.0F;
     ops::DraftSelector::addVerifyRows(
         commandGraph,

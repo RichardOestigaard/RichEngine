@@ -83,6 +83,9 @@ struct ModelTuning final {
   std::optional<uint32_t> proposalCap;    // RICHENGINE_PROPOSAL_CAP
   std::optional<bool> icbOff;             // RICHENGINE_ICB_OFF
   std::optional<bool> chainPredraft;      // RICHENGINE_CHAIN_PREDRAFT
+  // A DSpark draft's confidence-prune threshold (draft_conf_score +
+  // VerifyRowsParams's conf_min); unset leaves it off.
+  std::optional<double> draftConfMin;     // RICHENGINE_DRAFT_CONF_MIN
   // The canvas bundle the family's diffusion model runs under
   // ("paper"|"balanced"|"fast"); RICHENGINE_CANVAS_PROFILE overrides.
   std::optional<std::string> canvasProfile;

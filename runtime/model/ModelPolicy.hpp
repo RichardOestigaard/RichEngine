@@ -51,6 +51,9 @@ struct ModelPolicy final {
   bool icbOff = false;                  // RICHENGINE_ICB_OFF
   // model/RuntimeEncodeDraft.mm: the in-command chained predraft.
   bool chainPredraft = false;           // RICHENGINE_CHAIN_PREDRAFT
+  // model/RuntimeEncodeDraft.mm + Runtime.mm: the DSpark confidence-prune
+  // threshold; 0 leaves the proposals unpruned.
+  double draftConfMin = 0.0;            // RICHENGINE_DRAFT_CONF_MIN
   // model/RuntimeImpl.hpp adaptive decode gates: an explicitly set variable
   // wins a disable; otherwise the family maker's default applies.
   bool adaptiveProposals = false;  // RICHENGINE_ADAPTIVE_PROPOSALS
@@ -123,6 +126,8 @@ namespace detail {
   p.chainPredraft = envFlag("RICHENGINE_CHAIN_PREDRAFT")
                         ? env.chainPredraft
                         : maker.chainPredraft.value_or(false);
+  p.draftConfMin = env.draftConfMinSet ? env.draftConfMin
+                                       : maker.draftConfMin.value_or(0.0);
   // unlessZero knobs: the variable only ever disables, so an explicit set
   // wins; otherwise the maker's default stands.
   p.adaptiveProposals = envFlag("RICHENGINE_ADAPTIVE_PROPOSALS")
