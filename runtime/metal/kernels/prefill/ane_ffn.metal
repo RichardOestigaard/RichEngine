@@ -258,8 +258,76 @@ kernel void ane_ffn_row_scale_gguf(device uchar *a [[buffer(0)]], device uchar *
   });
 }
 
+// The CoreAI split's block-32 quantizations: one simdgroup per row of K * 128
+// inputs as ane_ffn_weight_rows, but the scale is each 32-input block's own
+// peak, computed in-register across the 8 lanes holding that block — the
+// row_scale pass is unneeded. SI4 packs to +-7, low nibble the even input
+// (the ANE's int4 layout, the affine planes' convention); otherwise int8 to
+// +-ANE_FFN_INT8_PEAK. `params.stride` counts output bytes: width for int8,
+// width / 2 for si4; `params.scale_stride` is width / 32 in both.
+template <uint K, class Source, bool SI4>
+inline void coreai_ffn_weight_rows_b32(device uchar *a, device uchar *b, device uchar *c,
+                                       device uchar *output, device half *scale,
+                                       constant AneFfnWeightParams &params, uint2 tile, uint simd_group,
+                                       uint lane) {
+  const uint row = tile.x * ANE_FFN_WEIGHT_ROWS + simd_group;
+  const uint block = tile.y * K * ANE_FFN_ROTATION_UNIT;
+  const float peak_bits = SI4 ? 7.0f : ANE_FFN_INT8_PEAK;
+  for (uint k = 0; k < K; ++k) {
+    float value[4];
+    Source::values(value, a, b, c, params.groups, params.row + row,
+                   params.input + block + k * ANE_FFN_ROTATION_UNIT + lane * 4);
+    float peak = 0.0f;
+    for (uint e = 0; e < 4; ++e) peak = max(peak, fabs(value[e]));
+    for (uint mask = 1; mask < 8; mask <<= 1) peak = max(peak, simd_shuffle_xor(peak, mask));
+    peak = max(peak, ANE_FFN_PEAK_FLOOR);
+    if ((lane & 7) == 0)
+      scale[row * params.scale_stride + tile.y * K * 4 + k * 4 + lane / 8] = half(peak / peak_bits);
+    const float inverse = peak_bits / peak;
+    if constexpr (SI4) {
+      const int4 q = int4(clamp(rint(float4(value[0], value[1], value[2], value[3]) * inverse), -7.0f, 7.0f));
+      *(device uchar2 *)(output + ulong(row) * params.stride + ulong(block) / 2 +
+                         k * ANE_FFN_ROTATION_UNIT / 2 + lane * 2) =
+          uchar2((q.x & 15) | ((q.y & 15) << 4), (q.z & 15) | ((q.w & 15) << 4));
+    } else {
+      *(device char4 *)(output + ulong(row) * params.stride + block + k * ANE_FFN_ROTATION_UNIT + lane * 4) =
+          char4(clamp(rint(float4(value[0], value[1], value[2], value[3]) * inverse), -ANE_FFN_INT8_PEAK,
+                      ANE_FFN_INT8_PEAK));
+    }
+  }
+}
+
+template <uint K, bool SI4>
+kernel void coreai_ffn_weights_b32(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
+    device uchar *c [[buffer(2)]], device const half *row_scale [[buffer(3)]],
+    device uchar *output [[buffer(4)]], device half *scale [[buffer(5)]],
+    device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
+    uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_cast<void>(row_scale);
+  static_cast<void>(sign);
+  coreai_ffn_weight_rows_b32<K, AneFfnAffine, SI4>(a, b, c, output, scale, params, tile, simd_group, lane);
+}
+template <uint K, bool SI4>
+kernel void coreai_ffn_weights_b32_gguf(device uchar *a [[buffer(0)]], device uchar *b [[buffer(1)]],
+    device uchar *c [[buffer(2)]], device const half *row_scale [[buffer(3)]],
+    device uchar *output [[buffer(4)]], device half *scale [[buffer(5)]],
+    device const float *sign [[buffer(6)]], constant AneFfnWeightParams &params [[buffer(7)]],
+    uint2 tile [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_cast<void>(row_scale);
+  static_cast<void>(sign);
+  quant_format_switch(params.format, [&](auto format) {
+    coreai_ffn_weight_rows_b32<K, AneFfnGguf<decltype(format)>, SI4>(a, b, c, output, scale, params, tile,
+                                                                   simd_group, lane);
+  });
+}
+
 using AneFfnWeightsKernel = void(device uchar *, device uchar *, device uchar *, device const half *, device char *,
                                  device half *, device const float *, constant AneFfnWeightParams &, uint2, uint, uint);
+using CoreAiFfnWeightsB32Kernel =
+    void(device uchar *, device uchar *, device uchar *, device const half *, device uchar *, device half *,
+         device const float *, constant AneFfnWeightParams &, uint2, uint, uint);
 using AneFfnRowScaleKernel = void(device uchar *, device uchar *, device uchar *, device half *, device const float *,
                                   constant AneFfnWeightParams &, uint, uint, uint);
 // _inputs: gate's and up's rows over the hidden inputs; _intermediate: down's
@@ -279,6 +347,22 @@ template [[host_name("coreai_ffn_weights_gguf_inputs")]] kernel AneFfnWeightsKer
     ane_ffn_weights_gguf<kInputUnits, false>;
 template [[host_name("coreai_ffn_weights_gguf_intermediate")]] kernel AneFfnWeightsKernel
     ane_ffn_weights_gguf<kIntermediateUnits, false>;
+template [[host_name("coreai_ffn_weights_b32_inputs")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32<kInputUnits, false>;
+template [[host_name("coreai_ffn_weights_b32_intermediate")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32<kIntermediateUnits, false>;
+template [[host_name("coreai_ffn_weights_b32_gguf_inputs")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32_gguf<kInputUnits, false>;
+template [[host_name("coreai_ffn_weights_b32_gguf_intermediate")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32_gguf<kIntermediateUnits, false>;
+template [[host_name("coreai_ffn_weights_si4_inputs")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32<kInputUnits, true>;
+template [[host_name("coreai_ffn_weights_si4_intermediate")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32<kIntermediateUnits, true>;
+template [[host_name("coreai_ffn_weights_si4_gguf_inputs")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32_gguf<kInputUnits, true>;
+template [[host_name("coreai_ffn_weights_si4_gguf_intermediate")]] kernel CoreAiFfnWeightsB32Kernel
+    coreai_ffn_weights_b32_gguf<kIntermediateUnits, true>;
 template [[host_name("ane_ffn_row_scale_inputs")]] kernel AneFfnRowScaleKernel ane_ffn_row_scale<kInputUnits, true>;
 template [[host_name("ane_ffn_row_scale_intermediate")]] kernel AneFfnRowScaleKernel
     ane_ffn_row_scale<kIntermediateUnits, true>;

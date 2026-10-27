@@ -18,12 +18,17 @@ private final class Slot {
   let event: any MTLSharedEvent
   let hidden: Int
   let ane: Int
+  // The asset's weight contract, read off its descriptors at open: packed
+  // means int4 weights (half the q bytes); blockwise means one fp16 scale
+  // per 32 inputs (gate_s [ane, hidden/32]) rather than per row [ane].
+  let packed: Bool
+  let blockwise: Bool
   // One evaluation on the shared x/y buffers at a time. A semaphore, not a
   // lock: the wait is released from whichever thread the task resumed on.
   let jobs = DispatchSemaphore(value: 1)
 
   init(model: AIModel, function: InferenceFunction, queue: any MTLCommandQueue, event: any MTLSharedEvent,
-       hidden: Int, ane: Int) {
+       hidden: Int, ane: Int, packed: Bool, blockwise: Bool) {
     self.model = model
     self.function = function
     self.queue = queue
@@ -31,7 +36,15 @@ private final class Slot {
     self.event = event
     self.hidden = hidden
     self.ane = ane
+    self.packed = packed
+    self.blockwise = blockwise
   }
+
+  var qType: NDArray.ScalarType { packed ? .int4 : .int8 }
+  // Bytes of a [rows, width] weight input and of its scale input.
+  func qBytes(_ rows: Int, _ width: Int) -> Int { rows * width / (packed ? 2 : 1) }
+  func sShape(_ rows: Int, _ width: Int) -> [Int] { blockwise ? [rows, width / 32] : [rows] }
+  func sBytes(_ rows: Int, _ width: Int) -> Int { rows * (blockwise ? width / 32 : 1) * 2 }
 }
 
 private var lastError: NSString?
@@ -53,12 +66,12 @@ private func warmUp(_ slot: Slot, on device: any MTLDevice) async throws {
   for rows in [1, 512, 2048] {
     let inputs: [String: InferenceFunction.AsyncValue] = [
       "x": .init(unsafeBuffer: buffer(rows * h * 2), scalarType: .float16, shape: [rows, h]),
-      "gate_q": .init(unsafeBuffer: buffer(a * h), scalarType: .int8, shape: [a, h]),
-      "gate_s": .init(unsafeBuffer: buffer(a * 2), scalarType: .float16, shape: [a]),
-      "up_q": .init(unsafeBuffer: buffer(a * h), scalarType: .int8, shape: [a, h]),
-      "up_s": .init(unsafeBuffer: buffer(a * 2), scalarType: .float16, shape: [a]),
-      "down_q": .init(unsafeBuffer: buffer(h * a), scalarType: .int8, shape: [h, a]),
-      "down_s": .init(unsafeBuffer: buffer(h * 2), scalarType: .float16, shape: [h]),
+      "gate_q": .init(unsafeBuffer: buffer(slot.qBytes(a, h)), scalarType: slot.qType, shape: [a, h]),
+      "gate_s": .init(unsafeBuffer: buffer(slot.sBytes(a, h)), scalarType: .float16, shape: slot.sShape(a, h)),
+      "up_q": .init(unsafeBuffer: buffer(slot.qBytes(a, h)), scalarType: slot.qType, shape: [a, h]),
+      "up_s": .init(unsafeBuffer: buffer(slot.sBytes(a, h)), scalarType: .float16, shape: slot.sShape(a, h)),
+      "down_q": .init(unsafeBuffer: buffer(slot.qBytes(h, a)), scalarType: slot.qType, shape: [h, a]),
+      "down_s": .init(unsafeBuffer: buffer(slot.sBytes(h, a)), scalarType: .float16, shape: slot.sShape(h, a)),
     ]
     var yv = InferenceFunction.AsyncMutableValue(unsafeBuffer: buffer(rows * h * 2),
                                                  scalarType: .float16, shape: [rows, h])
@@ -95,13 +108,20 @@ public func coreai_ffn_open(_ path: UnsafePointer<CChar>, _ name: UnsafePointer<
         sem.signal()
         return
       }
-      // The function's contract: x/y fp16 [rows, hidden] (rows dynamic),
-      // gate/up int8 [ane, hidden], down int8 [hidden, ane], their fp16
-      // scales per output channel.
+      // The function's contract, inferred from the asset: x/y fp16
+      // [rows, hidden]; gate/up [ane, hidden] and down [hidden, ane]
+      // int8 or packed int4; their fp16 scales per output channel
+      // (per-channel) or per 32-input block (blockwise).
       let h = Int(hidden), a = Int(ane)
+      var packed = false
+      if let d = f.descriptor.inputDescriptor(of: "gate_q"), case .ndArray(let nd) = d {
+        packed = nd.scalarType == .int4
+      }
+      let blockwise = shape(f, "gate_s")?.count == 2
+      let sShape: (Int, Int) -> [Int] = { r, w in blockwise ? [r, w / 32] : [r] }
       let want: [(String, [Int])] = [
-        ("gate_q", [a, h]), ("gate_s", [a]), ("up_q", [a, h]), ("up_s", [a]),
-        ("down_q", [h, a]), ("down_s", [h]),
+        ("gate_q", [a, h]), ("gate_s", sShape(a, h)), ("up_q", [a, h]), ("up_s", sShape(a, h)),
+        ("down_q", [h, a]), ("down_s", sShape(h, a)),
       ]
       for (input, expected) in want where shape(f, input) != expected {
         failure = "input \(input) is \(shape(f, input).map(String.init(describing:)) ?? "missing"), " +
@@ -120,7 +140,8 @@ public func coreai_ffn_open(_ path: UnsafePointer<CChar>, _ name: UnsafePointer<
         sem.signal()
         return
       }
-      let slot = Slot(model: model, function: f, queue: queue, event: event, hidden: h, ane: a)
+      let slot = Slot(model: model, function: f, queue: queue, event: event, hidden: h, ane: a,
+                      packed: packed, blockwise: blockwise)
       // A cold function specializes on its first encode, which can outlast
       // the caller's job bound: burn one row through it here while load
       // latency is expected.
@@ -196,9 +217,12 @@ public func coreai_ffn_start(_ ref: UnsafeMutableRawPointer?, _ job: UnsafeRawPo
         let (x, xo) = untracked(j.x.buffer, j.x.offset, rows * h * 2, keep: &keep)
         inputs["x"] = .init(unsafeBuffer: x, byteOffset: xo, scalarType: .float16, shape: [rows, h])
         let binds: [(String, coreai_ffn_buf, NDArray.ScalarType, [Int], Int)] = [
-          ("gate_q", j.gate_q, .int8, [a, h], a * h), ("gate_s", j.gate_s, .float16, [a], a * 2),
-          ("up_q", j.up_q, .int8, [a, h], a * h), ("up_s", j.up_s, .float16, [a], a * 2),
-          ("down_q", j.down_q, .int8, [h, a], h * a), ("down_s", j.down_s, .float16, [h], h * 2),
+          ("gate_q", j.gate_q, slot.qType, [a, h], slot.qBytes(a, h)),
+          ("gate_s", j.gate_s, .float16, slot.sShape(a, h), slot.sBytes(a, h)),
+          ("up_q", j.up_q, slot.qType, [a, h], slot.qBytes(a, h)),
+          ("up_s", j.up_s, .float16, slot.sShape(a, h), slot.sBytes(a, h)),
+          ("down_q", j.down_q, slot.qType, [h, a], slot.qBytes(h, a)),
+          ("down_s", j.down_s, .float16, slot.sShape(h, a), slot.sBytes(h, a)),
         ]
         for (name, b, type, dims, bytes) in binds {
           let (buf, off) = untracked(b.buffer, b.offset, bytes, keep: &keep)

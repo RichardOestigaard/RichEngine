@@ -817,3 +817,62 @@ still slower than private at engine row counts. Caveat: on the 27B
 the `.aimodelc` delegates' driver-side allocations exceed the
 256+512 MiB pipeline/runtime reserve and `memory_audit` refuses
 bootstrap; JIT assets (which compile lazily per function) fit.
+
+### CoreAI follow-ups (2026-10-27): blockwise weights, kernels, decode probes
+
+**Block-wise quantization — b32 shipped and default.** The FFN asset now
+authors `constexpr_blockwise_shift_scale` (fp16 scale per 32 inputs)
+instead of per-channel `dequantize`: `dev/tools/gen_coreai_ffn.py
+--quant b32` (the default). Runtime-input scales work — the torch op's
+`constexpr_` name is misleading; the lowering forwards operands. The
+staging side is `coreai_ffn_weights_b32{,_gguf}_{inputs,intermediate}`
+in `prefill/ane_ffn.metal`: each 8-lane subgroup reduces its 32-input
+block's peak via xor-shuffles, so no row-scale pass (the `Quant::Pc`
+ctor graph guard exists because an empty CommandGraph submit is an
+error). Selection: `RICHENGINE_COREAI_QUANT=pc|b32|si4` (default b32);
+the shim infers the contract from the asset's descriptors, so a
+mismatched env/asset pair fails at open. MiniCPM5-2B, share 0.333:
+verify 1.4% vs pc's 1.9%, eval parity (4.31 vs 4.41 ms/eval over 210
+evals).
+
+**si4 rejected by verify — measured dead end.** `torch.int4` runtime
+inputs bind and run at ANE speed (half the staging bytes), and nibble
+order is low-first (the affine convention), but the split's verify
+rejects it at 15.5% on MiniCPM5-2B: re-quantizing affine-Q4 sources to
+int4 block-32 is double quantization (sim: ~17% vs int8's ~1%). The
+path stays behind `RICHENGINE_COREAI_QUANT=si4` — revivable only with
+error-feedback staging or a native-4-bit source path.
+
+**fp8 authoring works, engine staging does not exist.** `--quant fp8`
+emits e4m3 weights + fp16 block scales; runtime binding verified at
+~1.1-1.7x int8 eval cost. e8m0 scales cannot be runtime inputs
+(`copy_with_constraints` rejects `Float8E8M0FN`, process abort) —
+baked-only, where they are the fastest variant. No
+`RICHENGINE_COREAI_QUANT=fp8` mode: a staging kernel writing e4m3
+codes has not been written. Relevant only for native-fp8 models.
+
+**TorchMetalKernel — for graph-internal ops only.** `coreai.metal4_kernel`
+runs custom MSL inside a graph (tested: chained elementwise, state-read
+gathers, fused argmax). It beats CoreAI-composed ops for gather work
+(fused MoE gather-GEMV ~4x over index_select+bmm) but loses ~8-15x to
+the repo's tuned Metal kernels at the same math (~43 GB/s vs 170-370
+GB/s effective). Costs: one `copy_with_constraints`/`copy_discarding`
+pair per kernel boundary (~0.3 ms + per-byte at ANE↔GPU partitions) —
+keep ≤1-2 boundaries per function. Traps: `array<int,N>` indexes
+innermost-dim-first; scalar args bake at compile time (runtime values
+must be tensor inputs); dynamic grids/result_shapes segfault.
+
+**Decode probes — no CoreAI decode path.** The primitives all work:
+`encode()` is async (0.19-0.32 ms GPU floor, ~1 ms ANE folded);
+`AsyncValue` outputs feed the next call's inputs directly (−29% per
+step, −40% pipelined); `states:` bind KV onto caller MTLBuffers
+(`index_copy_` writes land on-device; re-binding a bigger buffer works
+— state is purely buffer-bound); in-graph argmax + unrolled K-step
+`decode_K` functions hold bit-identical trajectories at ~0.67 ms/step
+marginal vs ~1.2 chained. But a matvec at rows=1 streams weights at
+~50-80 GB/s vs the tuned kernels' 170-370 GB/s: the payload is 3-6x
+slower, dwarfing the ~10% unroll saving. Also measured: `.cpu`
+specialization returns wrong values (rows≥16) — do not use. `while`/
+`scan`/`if` exist in the aicode dialect but coreai-torch 0.4.3 lowers
+none of them (scan is a fixed combiner) — no in-graph token loops, so
+EOS early-exit in an unroll is impossible.
