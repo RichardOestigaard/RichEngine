@@ -144,7 +144,6 @@ public:
 
 struct MaskOverlapState final {
   uint64_t requestId = 0;
-  bool finishes = true;
   bool emitted = false;
   bool provided = false;
   bool abandoned = false;
@@ -152,10 +151,13 @@ struct MaskOverlapState final {
   bool held = false;
 };
 
+// A decode command that waits for the verify mask of its one constrained
+// lane; `results` are its lanes', in order.
 class MaskOverlapTicket final : public ModelBatchTicket {
 public:
-  explicit MaskOverlapTicket(std::shared_ptr<MaskOverlapState> state)
-      : state_(std::move(state)) {}
+  MaskOverlapTicket(std::shared_ptr<MaskOverlapState> state,
+                    std::vector<ModelStepResult> results)
+      : state_(std::move(state)), results_(std::move(results)) {}
 
   std::vector<ModelMaskRequest> takeMaskRequests() override {
     if (state_->emitted)
@@ -176,13 +178,13 @@ public:
   std::vector<ModelStepResult> wait() override {
     if (!ready())
       throw std::logic_error("mask-overlap ticket completed without input");
-    return {{state_->requestId, 0, {42}, state_->finishes,
-             DecodeStage::Regular, 7, 0}};
+    return std::move(results_);
   }
   double wallMilliseconds() const noexcept override { return 1.0; }
 
 private:
   std::shared_ptr<MaskOverlapState> state_;
+  std::vector<ModelStepResult> results_;
 };
 
 class Executor final : public model::Model {
@@ -379,19 +381,30 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
-    // Every constrained cycle after the first token waits for its mask
-    // inside the ticket, as the production constrained ticket does.
-    const bool anyConstrained = std::any_of(
-        plan.items.begin(), plan.items.end(), [&](const BatchItem &item) {
-          const auto found = requests.find(item.requestId);
-          return found != requests.end() && found->second.constrained;
-        });
-    if (plan.kind == WorkKind::Decode && anyConstrained &&
-        plan.decodeStage == DecodeStage::Regular) {
+    const auto constrained = [&](const BatchItem &item) {
+      const auto found = requests.find(item.requestId);
+      return found != requests.end() && found->second.constrained;
+    };
+    if (plan.kind == WorkKind::Decode && plan.decodeStage == DecodeStage::Regular &&
+        std::ranges::any_of(plan.items, constrained)) {
+      // A cycle with a constrained lane after its first token waits for that
+      // lane's mask inside the ticket, as the production constrained ticket
+      // does, and its other lanes decode as they do in a command of their
+      // own.
+      if (std::ranges::count_if(plan.items, constrained) > 1)
+        throw std::logic_error("the test model takes the verify mask of one lane per command");
       overlap = std::make_shared<MaskOverlapState>();
-      overlap->requestId = items.front().requestId;
-      overlap->finishes = decodeFinishes;
-      return std::make_unique<MaskOverlapTicket>(overlap);
+      std::vector<ModelStepResult> results;
+      for (size_t index = 0; index < plan.items.size(); ++index) {
+        if (constrained(plan.items[index])) {
+          overlap->requestId = items[index].requestId;
+          results.push_back({items[index].requestId, 0, {42}, decodeFinishes,
+                             DecodeStage::Regular, 7, 0});
+        } else {
+          results.push_back(std::move(decode(plan, items.subspan(index, 1)).front()));
+        }
+      }
+      return std::make_unique<MaskOverlapTicket>(overlap, std::move(results));
     }
     if (plan.kind == WorkKind::Decode && holdDecodeUntil) {
       return std::make_unique<test::HeldTicket>(decode(plan, items),
@@ -5751,6 +5764,54 @@ void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
           "overlapped verify mask did not complete the owning batch");
 }
 
+// Once its first token is selected, a constrained lane decodes in the command
+// of an unconstrained lane of its priority. The command asks for the
+// constrained lane's verify mask alone, a mask response for the other lane
+// does not reach the model, and the one mask completes the command for both.
+void testConstrainedLaneSharesDecodeCommand() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(2);
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  guardReleases(storage, engine);
+
+  auto constrained = constrainedRequest(1, 100'000);
+  constrained.maxNewTokens = 100;
+  engine.submit(std::move(constrained));
+  EngineRequest unconstrained = request(2, {2});
+  unconstrained.maxNewTokens = 100;
+  unconstrained.deadlineMilliseconds = 100'000;
+  engine.submit(std::move(unconstrained));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.maskRequests.size() == 1; },
+            "the constrained prompt did not ask for its first mask");
+  const std::array<uint32_t, 1> mask{1};
+  engine.provideMask(1, mask);
+  tickUntil(engine, now, [&] { return events.maskRequests.size() == 2; },
+            "the constrained lane's first cycle did not ask for its verify mask");
+  require(engine.commandInFlight() && executor.overlap &&
+              executor.overlap->requestId == 1 &&
+              events.maskRequests[1].first == 1,
+          "the shared command did not wait for the constrained lane's mask");
+  const uint32_t unconstrainedTokens = events.outputs[2].size();
+  engine.provideMask(2, mask);
+  require(!executor.overlap->provided && events.failedCount == 0,
+          "a mask for the lane that asked for none reached the model");
+  engine.provideMask(1, mask);
+  require(engine.tick(now++) && !engine.commandInFlight() &&
+              events.outputs[1].size() == 1 &&
+              events.outputs[2].size() > unconstrainedTokens &&
+              engine.snapshot().scheduler.decodeBatchesByWidth[1] != 0,
+          "the constrained lane's mask did not complete the command for both lanes");
+  for (const uint64_t id : {1, 2})
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  require(events.failedCount == 0, "a lane failed");
+}
+
 // A command's engine cycle runs from the previous command's retirement while
 // the engine stays busy, so it covers the host work between commands, and
 // from the command's plan after a tick that found nothing to do.
@@ -9285,6 +9346,7 @@ int main() {
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();
+    testConstrainedLaneSharesDecodeCommand();
     testConstraintMaskWaitHonorsCancelAndDeadline();
     testUnansweredVerifyMaskFailsOnlyItsRequest();
     testUnansweredInitialMaskFails();
