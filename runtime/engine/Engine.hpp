@@ -38,6 +38,13 @@ struct EngineConfig final {
   // Patches per image the server's --max-image-pixels allows; zero rejects
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // Mel frames per clip the runtime's audio encoder supports; zero rejects
+  // audio (a model without the lfm3a tower).
+  uint32_t maxAudioMelFrames = 0;
+  // The model's speech tower is loaded: generated audio frames stream as
+  // AudioPcm events beside the text tokens (the Ready event's third
+  // capability byte).
+  bool speech = false;
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode. At 0.5 a stream keeps about a third of
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
@@ -276,6 +283,10 @@ private:
     // the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;
+    // The image and audio spans merged for cache identity, sorted by offset
+    // (audio spans wear their mel frame count where a grid goes). Built at
+    // submit; the cache folds only offset, tokens, dims and digest.
+    std::vector<ImageSpan> mediaSpans;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;

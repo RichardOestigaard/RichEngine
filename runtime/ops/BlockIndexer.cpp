@@ -128,6 +128,68 @@ void BlockIndexer::addSelect(metal::CommandGraph &graph, metal::MetalBuffer quer
   }
 }
 
+void BlockIndexer::addTopk(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                           metal::MetalBuffer scores, metal::MetalBuffer mask,
+                           const IndexerRows &rows, bool locks) {
+  if (!rows.rows || rows.firstPositions.empty() ||
+      rows.firstPositions.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
+      rows.index.tables.size() != rows.firstPositions.size() ||
+      !rows.topBlocks || !rows.maskWords || !rows.scoreStride)
+    throw std::invalid_argument("invalid indexer topk rows");
+  uint32_t blocks = 0;
+  for (const uint32_t first : rows.firstPositions)
+    blocks = std::max(blocks, static_cast<uint32_t>(completeBlocks(first, rows.rows)));
+  if (blocks > uint64_t{BLOCK_INDEXER_TOPK_THREADS} * BLOCK_INDEXER_TOPK_LOCAL)
+    throw std::invalid_argument("indexer topk history exceeds the fused kernel's reach");
+  if (rows.scoreStride < blocks || uint64_t{rows.maskWords} * 32 <= blocks)
+    throw std::invalid_argument("indexer scores or bitmaps narrower than the rows' history");
+  const uint64_t laneRows =
+      uint64_t{rows.firstPositions.size()} * rows.rows;
+  requireBytes(queries, laneRows * BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION * sizeof(uint16_t),
+               "indexer queries");
+  requireBytes(scores, laneRows * uint64_t{rows.scoreStride} * sizeof(float),
+               "indexer score");
+  requireBytes(mask, laneRows * rows.maskWords * sizeof(uint32_t), "indexer bitmap");
+  BlockIndexerTopkParams params{
+      .lanes = static_cast<uint32_t>(rows.firstPositions.size()),
+      .rows = rows.rows,
+      .first_position = {},
+      .top_blocks = rows.topBlocks,
+      .mask_words = rows.maskWords,
+      .score_stride = rows.scoreStride,
+      .index_offset = rows.index.offset,
+      .window_blocks = 0,
+      .sink_blocks = 0,
+      .prefilter = locks ? 1u : 0u};
+  std::ranges::copy(rows.firstPositions, std::begin(params.first_position));
+  const auto tables = laneBindings(rows.index.tables);
+  graph.add(std::string(kBlockIndexerTopk),
+            {std::move(queries), tables[0], tables[1], tables[2], tables[3],
+             std::move(scores), std::move(mask)},
+            params, {rows.rows, params.lanes, 1},
+            {BLOCK_INDEXER_TOPK_THREADS, 1, 1});
+}
+
+void BlockIndexer::addWindow(metal::CommandGraph &graph, metal::MetalBuffer mask,
+                             uint32_t window, uint32_t sink, const IndexerRows &rows) {
+  if (!rows.rows || rows.firstPositions.empty() ||
+      rows.firstPositions.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH || !rows.maskWords)
+    throw std::invalid_argument("invalid indexer window rows");
+  const uint64_t laneRows =
+      uint64_t{rows.firstPositions.size()} * rows.rows;
+  requireBytes(mask, laneRows * rows.maskWords * sizeof(uint32_t), "indexer bitmap");
+  BlockIndexerWindowParams params{
+      .lanes = static_cast<uint32_t>(rows.firstPositions.size()),
+      .rows = rows.rows,
+      .first_position = {},
+      .mask_words = rows.maskWords,
+      .window_blocks = window,
+      .sink_blocks = sink};
+  std::ranges::copy(rows.firstPositions, std::begin(params.first_position));
+  graph.add(std::string(kBlockIndexerWindow), {std::move(mask)}, params,
+            {rows.rows, params.lanes, 1}, {BLOCK_INDEXER_TOPK_THREADS, 1, 1});
+}
+
 void BlockIndexer::addPending(metal::CommandGraph &graph, metal::MetalBuffer keys, metal::MetalBuffer pendingIn,
                               metal::MetalBuffer pendingOut, uint32_t firstPosition, uint32_t retained) {
   requireBytes(keys, uint64_t{retained} * kKeyBytes, "indexer keys");

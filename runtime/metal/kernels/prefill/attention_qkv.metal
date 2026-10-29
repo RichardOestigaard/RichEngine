@@ -297,3 +297,97 @@ kernel void prefill_attention_qkv_gemma_hd512(
       chunk_values, params, reductions, normalized, task, thread_index, lane,
       simd_group);
 }
+
+// LFM3's attention mixers: 16 query heads grouped 4-to-1 over 4 KV heads of
+// 128 dimensions, all 64 pairs rotated — the sliding layers' full rotary;
+// the global layers' zero-tail table leaves the last 32 pairs unrotated —
+// and per-head RMS norms of epsilon 1e-5 (_f32 for a GGUF's F32 norms).
+#define PREFILL_ATTENTION_QKV_K4Q4D128(Name, W) \
+  kernel void Name( \
+      device const bfloat *qkv [[buffer(0)]], \
+      device const W *q_norm [[buffer(1)]], \
+      device const W *k_norm [[buffer(2)]], \
+      device const float *rope_cos [[buffer(3)]], \
+      device const float *rope_sin [[buffer(4)]], \
+      device bfloat *queries [[buffer(5)]], \
+      device bfloat *chunk_keys [[buffer(6)]], \
+      device bfloat *chunk_values [[buffer(7)]], \
+      constant FullPrefillParams &params [[buffer(8)]], \
+      uint task [[threadgroup_position_in_grid]], \
+      uint thread_index [[thread_index_in_threadgroup]], \
+      uint lane [[thread_index_in_simdgroup]], \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    threadgroup bfloat normalized[256]; \
+    full_qkv_storage_phase<16, 4, 128, 64, false, true>( \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys, \
+        chunk_values, params, reductions, normalized, task, thread_index, \
+        lane, simd_group, 1e-5f); \
+  }
+PREFILL_ATTENTION_QKV_K4Q4D128(prefill_attention_qkv_k4q4d128, bfloat)
+PREFILL_ATTENTION_QKV_K4Q4D128(prefill_attention_qkv_k4q4d128_f32, float)
+#undef PREFILL_ATTENTION_QKV_K4Q4D128
+
+// LFM3's head-wise gate: `gates` holds each row's QHeads sigmoid inputs
+// (the gate projection's output), one scalar per query head — where the
+// query-gate targets' phase reads the packed [q|gate] row's second half.
+template <uint QHeads, uint KHeads, uint HeadDim>
+inline void full_attention_headgate_prefill_phase(
+    device const bfloat *gates, device const bfloat *attention,
+    device bfloat *hidden, constant FullPrefillParams &params, uint index,
+    uint grid_size) {
+  constexpr uint HeadsPerKV = QHeads / KHeads;
+  const uint count = params.tokens * QHeads * HeadDim;
+  for (uint element = index; element < count; element += grid_size) {
+    const uint row = element / (QHeads * HeadDim);
+    const uint remainder = element % (QHeads * HeadDim);
+    const uint query_head = remainder / HeadDim;
+    const uint dim = remainder % HeadDim;
+    const float gate = richengine_sigmoid(
+        float(gates[ulong(row) * 256u + query_head])); // gates stride: the padded 256-row gate tile
+    const uint kv_head = query_head / HeadsPerKV;
+    const uint local_head = query_head % HeadsPerKV;
+    hidden[element] = bfloat(
+        float(attention[((ulong(kv_head) * params.stride + row) *
+                             HeadsPerKV + local_head) * HeadDim + dim]) *
+        gate);
+  }
+}
+
+kernel void prefill_attention_headgate_k4q4d128(
+    device const bfloat *gates [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullPrefillParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_headgate_prefill_phase<16, 4, 128>(
+      gates, attention, hidden, params, index, grid_size);
+}
+
+// The *_sums variant also writes the out-projection's Affine64 input sums
+// of the gated rows, like the gate_sums kernels'.
+kernel void prefill_attention_headgate_sums_k4q4d128(
+    device const bfloat *gates [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    device float *sums [[buffer(3)]],
+    constant FullPrefillParams &params [[buffer(4)]],
+    uint task [[threadgroup_position_in_grid]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  full_attention_headgate_prefill_phase<16, 4, 128>(
+      gates, attention, hidden, params, index, grid_size);
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint group = simd_group; group < threads / 64;
+       group += threads / 32) {
+    const uint origin = task * threads + group * 64 + lane;
+    const float sum =
+        simd_sum(float(hidden[origin]) + float(hidden[origin + 32]));
+    if (lane == 0)
+      sums[task * (threads / 64) + group] = sum;
+  }
+}

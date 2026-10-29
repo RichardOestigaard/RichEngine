@@ -325,6 +325,13 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   config.nativeLoop.engine.maxImagePatches =
       config.resources.model.hasVision() ? config.resources.maximumImagePatches
                                          : 0;
+  // Audio clips are admitted up to the mel-frame bound; a model without the
+  // audio tower admits none.
+  config.nativeLoop.engine.maxAudioMelFrames =
+      config.resources.model.hasAudio() ? kMaximumAudioMelFrames : 0;
+  // The speech decoder shares the mmproj: a record that declared it loads
+  // its host-side weights and the engine streams decoded PCM.
+  config.nativeLoop.engine.speech = config.resources.model.hasSpeech();
 
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {

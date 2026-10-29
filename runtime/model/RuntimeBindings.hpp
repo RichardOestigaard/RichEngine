@@ -6,7 +6,73 @@
 // Impl definition.
 
 inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uint32_t stateLane,
-                          std::vector<ImageState> &images) {
+                          std::vector<ImageState> &images,
+                          std::vector<AudioState> &audios) {
+    if (!request.audio.empty()) {
+      // The engine rejects audio requests at submission without the tower.
+      const auto *weights = std::get_if<LfmAudioWeights>(&package.audio);
+      if (!weights || !package.descriptor.hasAudio())
+        throw std::logic_error("audio request reached a model without audio");
+      audios.reserve(request.audio.size());
+      uint64_t audioBytes = 0;
+      // The mel frames of the largest staged clip that still needs its encode.
+      uint32_t encodeFrames = 0;
+      for (const AudioSpan &span : request.audio) {
+        if (span.end() <= request.restoredTokens) {
+          audios.push_back({span, nullptr});
+          continue;
+        }
+        std::shared_ptr<AudioRows> rows = findAudioRows(span);
+        if (!rows) {
+          rows = std::make_shared<AudioRows>();
+          rows->key = audioKey(span);
+          audioRows.insert_or_assign(rows->key, rows);
+          audioBytes += span.melBytes() + audioEmbeddingBytes(span);
+        }
+        if (!rows->encoded)
+          encodeFrames = std::max(encodeFrames, span.melFrames);
+        audios.push_back({span, std::move(rows)});
+      }
+      const uint64_t audioEncoderBytes =
+          encodeFrames && !(audio && audio->maximumMelFrames() >= encodeFrames)
+              ? ops::LfmAudioEnc::scratchBytes(weights->tensors.layout, encodeFrames)
+              : 0;
+      std::shared_ptr<ops::LfmAudioEnc> audioEncoder;
+      const uint8_t *mel = request.audioMel.data();
+      const auto allocateAudio = [&] {
+        if (audioEncoderBytes) {
+          audioEncoder = std::make_shared<ops::LfmAudioEnc>(
+              backend, weights->tensors, encodeFrames);
+        }
+        for (AudioState &clip : audios) {
+          const AudioSpan &span = clip.span;
+          if (clip.rows && !clip.rows->embeddings) {
+            AudioRows &rows = *clip.rows;
+            rows.mel = backend.allocateBuffer(span.melBytes(),
+                                              BufferStorage::Shared, "audio mel");
+            std::memcpy(contents<uint8_t>(rows.mel, "audio mel"), mel,
+                        static_cast<size_t>(span.melBytes()));
+            rows.embeddings = backend.allocateBuffer(
+                audioEmbeddingBytes(span), BufferStorage::Private,
+                "audio embeddings");
+          }
+          mel += span.melBytes();
+        }
+      };
+      StateAdmission admission = laneAdmission(
+          stateLane, states.tryActivateLane(stateLane, request.id,
+                                            audioEncoderBytes + audioBytes,
+                                            allocateAudio));
+      if (!admission.granted()) {
+        admission.held = std::make_shared<const Matched>(
+            Matched{{}, nullptr, audioEncoderBytes ? nullptr : audio});
+        return admission;
+      }
+      if (audioEncoder)
+        audio = std::move(audioEncoder);
+      if (request.images.empty())
+        return admission;
+    }
     if (request.images.empty()) {
       // A freshly admitted lane has no prior step's rows to fold.
       gdnPendingRows_[stateLane] = 0;
@@ -44,14 +110,33 @@ inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uin
     }
     const uint64_t encoderBytes =
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
-            ? ops::Vision::scratchBytes(package.vision.tensors.layout, encodePatches)
+            ? std::visit(
+                  [encodePatches](const auto &weights) -> uint64_t {
+                    using W = std::decay_t<decltype(weights)>;
+                    if constexpr (std::is_same_v<W, QwenVisionWeights>)
+                      return ops::Vision::scratchBytes(weights.tensors.layout,
+                                                       encodePatches);
+                    else
+                      return ops::LfmVision::scratchBytes(weights.tensors.layout,
+                                                          encodePatches);
+                  },
+                  package.vision)
             : 0;
-    std::shared_ptr<ops::Vision> encoder;
+    std::shared_ptr<ops::VisionEncoder> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
-        encoder = std::make_shared<ops::Vision>(
-            backend, package.vision.tensors, encodePatches);
+        encoder = std::visit(
+            [&](const auto &weights) -> std::shared_ptr<ops::VisionEncoder> {
+              using W = std::decay_t<decltype(weights)>;
+              if constexpr (std::is_same_v<W, QwenVisionWeights>)
+                return std::make_shared<ops::Vision>(
+                    backend, weights.tensors, encodePatches);
+              else
+                return std::make_shared<ops::LfmVision>(
+                    backend, weights.tensors, encodePatches);
+            },
+            package.vision);
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -75,7 +160,8 @@ inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uin
     }
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
-          Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
+          Matched{std::move(shared),
+                  encodePatches && !encoderBytes ? vision : nullptr, nullptr});
       return admission;
     }
     if (encoder)
@@ -102,6 +188,41 @@ inline   bool Runtime::Impl::visionIdle() noexcept {
 inline   uint64_t Runtime::Impl::embeddingBytes(const ImageSpan &span) const {
     return uint64_t{ops::Vision::embeddingRows(span.grid())} *
            geometry.target.hiddenSize * sizeof(uint16_t);
+  }
+
+inline   bool Runtime::Impl::audioIdle() noexcept {
+    for (auto entry = audioRows.begin(); entry != audioRows.end();) {
+      const std::shared_ptr<AudioRows> rows = entry->second.lock();
+      if (!rows) {
+        entry = audioRows.erase(entry);
+        continue;
+      }
+      if (!rows->encoded)
+        return false;
+      ++entry;
+    }
+    return true;
+  }
+
+inline Runtime::Impl::ImageKey Runtime::Impl::audioKey(const AudioSpan &span) noexcept {
+    return {span.digestLo, span.digestHi, span.melFrames, 1};
+  }
+
+inline   uint64_t Runtime::Impl::audioEmbeddingBytes(const AudioSpan &span) const {
+    return uint64_t{span.tokens} * geometry.target.hiddenSize * sizeof(uint16_t);
+  }
+
+inline std::shared_ptr<Runtime::Impl::AudioRows>
+Runtime::Impl::findAudioRows(const AudioSpan &span) {
+    const auto found = audioRows.find(audioKey(span));
+    if (found == audioRows.end())
+      return {};
+    std::shared_ptr<AudioRows> rows = found->second.lock();
+    if (!rows) {
+      audioRows.erase(found);
+      return {};
+    }
+    return rows;
   }
 
 inline Runtime::Impl::ImageKey Runtime::Impl::imageKey(const ImageSpan &span) noexcept {
@@ -195,12 +316,18 @@ inline   void Runtime::Impl::releaseImages(Request &entry) {
         retain(image.rows);
     }
     entry.images.clear();
+    entry.audios.clear();
   }
 
 inline   uint64_t Runtime::Impl::releaseOneCache() noexcept {
     if (vision && vision.use_count() == 1 && visionIdle()) {
       const uint64_t bytes = vision->arenaBytes();
       vision.reset();
+      return bytes;
+    }
+    if (audio && audio.use_count() == 1 && audioIdle()) {
+      const uint64_t bytes = audio->arenaBytes();
+      audio.reset();
       return bytes;
     }
     for (auto entry = embeddingCache.end(); entry != embeddingCache.begin();) {
@@ -228,7 +355,9 @@ inline   MetalBuffer Runtime::Impl::synchronizedPageTable(Request &entry,
     // one, and everything after two changes or for another request.
     const auto size = static_cast<uint32_t>(item.pageTable.size());
     uint32_t first = 0;
-    if (binding.requestId == entry.id) {
+    if (envFlag("RICHENGINE_FORCE_PT_REWRITE")) {
+      first = 0;
+    } else if (binding.requestId == entry.id) {
       if (binding.revision == item.pageTableRevision)
         first = size;
       else if (binding.revision + 1 == item.pageTableRevision)
@@ -242,6 +371,19 @@ inline   MetalBuffer Runtime::Impl::synchronizedPageTable(Request &entry,
         kvPages.writeIndexEntries(
             item.pageTable, first,
             decodeArena->get(entry.stateLane, DecodeTensor::IndexTable));
+    }
+    if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+      const auto *te = contents<uint64_t>(destination, "page table");
+      fprintf(stderr,
+              "dump2 sync sl=%u id=%llu bind=[%llu r%llu] rev=%llu fc=%u "
+              "first=%u size=%u e0=%llx e1=%llx\n",
+              entry.stateLane, (unsigned long long)entry.id,
+              (unsigned long long)binding.requestId,
+              (unsigned long long)binding.revision,
+              (unsigned long long)item.pageTableRevision,
+              item.pageTableFirstChanged, first, size,
+              te ? (unsigned long long)te[0] : 0,
+              size > 1 && te ? (unsigned long long)te[1] : 0);
     }
     binding = {entry.id, item.pageTableRevision};
     return destination;
@@ -297,10 +439,21 @@ inline Runtime::Impl::Request &Runtime::Impl::laneEntry(std::span<Request *const
 inline   void Runtime::Impl::bindPageTables(
       std::span<Request *const> entries,
       std::array<MetalBuffer, kLaneCount> &pageTables) const {
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       pageTables[lane] =
           decodeArena->get(laneEntry(entries, lane).stateLane,
                            DecodeTensor::PageTable);
+      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+        const uint32_t sl = laneEntry(entries, lane).stateLane;
+        const auto direct = decodeArena->get(sl, DecodeTensor::PageTable);
+        const auto *e = contents<uint64_t>(pageTables[lane], "pt");
+        fprintf(stderr,
+                "dump2 bind lane=%u sl=%u req=%llu ptr=%p direct=%p e0=%llx\n",
+                lane, sl, (unsigned long long)laneEntry(entries, lane).id,
+                pageTables[lane].contents(), direct.contents(),
+                e ? (unsigned long long)e[0] : 0);
+      }
+    }
   }
 
 inline   void Runtime::Impl::bindIndexTables(

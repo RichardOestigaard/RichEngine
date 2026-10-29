@@ -49,6 +49,7 @@ inline constexpr std::string_view kTreeLeafPatch = "tree_leaf_patch";
 // Draft attention heads and stages.
 inline constexpr std::string_view kDraftConv = "draft_conv";
 inline constexpr std::string_view kDraftConvH2048 = "draft_conv_h2048";
+inline constexpr std::string_view kDraftConvH4096 = "draft_conv_h4096";
 inline constexpr std::string_view kDraftResidualAdd = "draft_residual_add";
 inline constexpr std::string_view kDraftAttentionQkv = "draft_attention_qkv";
 inline constexpr std::string_view kDraftAttentionQkvQ16k2 = "draft_attention_qkv_q16k2";
@@ -145,6 +146,40 @@ inline constexpr std::string_view kVisionGemmM64n128GeluTanh = "vision_gemm_m64n
 inline constexpr std::string_view kVisionGemmM32n256 = "vision_gemm_m32n256";
 inline constexpr std::string_view kVisionGemmM32n256GeluErf = "vision_gemm_m32n256_gelu_erf";
 
+// The LFM3-VL tower (lfm_vision.metal); its dense GEMMs and the projector's
+// input LayerNorm reuse the vision_* pipelines above.
+inline constexpr std::string_view kLfmVisionPatchify = "lfm_vision_patchify";
+inline constexpr std::string_view kLfmVisionPrepare = "lfm_vision_prepare";
+inline constexpr std::string_view kLfmVisionRmsnormEmbed = "lfm_vision_rmsnorm_embed";
+inline constexpr std::string_view kLfmVisionRmsnorm = "lfm_vision_rmsnorm";
+inline constexpr std::string_view kLfmVisionQkvPrepare = "lfm_vision_qkv_prepare";
+inline constexpr std::string_view kLfmVisionAttention = "lfm_vision_attention";
+inline constexpr std::string_view kLfmVisionAttentionPack = "lfm_vision_attention_pack";
+inline constexpr std::string_view kLfmVisionConv2d = "lfm_vision_conv2d";
+inline constexpr std::string_view kLfmVisionSiluMul = "lfm_vision_silu_mul";
+inline constexpr std::string_view kLfmVisionGemmM64n128SiluUp = "lfm_vision_gemm_m64n128_silu_up";
+inline constexpr std::string_view kLfmVisionGemmQkv = "lfm_vision_gemm_qkv";
+inline constexpr std::string_view kLfmVisionMerge = "lfm_vision_merge";
+
+// The lfm3a audio encoder (lfm_audio.metal); its dense GEMMs, block
+// RMSNorms and SiLU-gated FFN reuse the vision_* and lfm_vision_*
+// pipelines above.
+inline constexpr std::string_view kLfmAudioMelPack = "lfm_audio_mel_pack";
+inline constexpr std::string_view kLfmAudioConvWt = "lfm_audio_conv_wt";
+inline constexpr std::string_view kLfmAudioStage1Im2col = "lfm_audio_stage1_im2col";
+inline constexpr std::string_view kLfmAudioStage1Mm = "lfm_audio_stage1_mm";
+inline constexpr std::string_view kLfmAudioConvDown = "lfm_audio_conv_down";
+inline constexpr std::string_view kLfmAudioSilu = "lfm_audio_silu";
+inline constexpr std::string_view kLfmAudioFlatten = "lfm_audio_flatten";
+inline constexpr std::string_view kLfmAudioPrepare = "lfm_audio_prepare";
+inline constexpr std::string_view kLfmAudioGemmQkv = "lfm_audio_gemm_qkv";
+inline constexpr std::string_view kLfmAudioGemmLinOut = "lfm_audio_gemm_lin_out";
+inline constexpr std::string_view kLfmAudioQkvPrepare = "lfm_audio_qkv_prepare";
+inline constexpr std::string_view kLfmAudioAttention = "lfm_audio_attention";
+inline constexpr std::string_view kLfmAudioAttentionPack = "lfm_audio_attention_pack";
+inline constexpr std::string_view kLfmAudioConvBcx = "lfm_audio_conv_bcx";
+inline constexpr std::string_view kLfmAudioLayerNorm = "lfm_audio_layer_norm";
+
 // Paged attention stems (the format tag, split/store/gate role and layout
 // suffix are appended by the PagedAttention helpers).
 inline constexpr std::string_view kPrefillAttention = "prefill_attention";
@@ -159,6 +194,8 @@ inline constexpr std::string_view kVerifyAttentionGate = "verify_attention_gate"
 inline constexpr std::string_view kVerifyTreeAttention = "verify_tree_attention";
 inline constexpr std::string_view kVerifyTreeAttentionReduce = "verify_tree_attention_reduce";
 inline constexpr std::string_view kVerifyTreeAttentionReduceGate = "verify_tree_attention_reduce_gate";
+inline constexpr std::string_view kVerifyAttentionReduceHeadGate = "verify_attention_reduce_headgate";
+inline constexpr std::string_view kVerifyTreeAttentionReduceHeadGate = "verify_tree_attention_reduce_headgate";
 inline constexpr std::string_view kPrefillAttentionReduceCanvasGemmaH256 = "prefill_attention_reduce_canvas_gemma_h256";
 inline constexpr std::string_view kPrefillAttentionReduceCanvasGemmaHd512 = "prefill_attention_reduce_canvas_gemma_hd512";
 
@@ -187,6 +224,8 @@ inline constexpr std::string_view kBlockIndexerProject = "block_indexer_project"
 inline constexpr std::string_view kBlockIndexerPool = "block_indexer_pool";
 inline constexpr std::string_view kBlockIndexerScore = "block_indexer_score";
 inline constexpr std::string_view kBlockIndexerSelect = "block_indexer_select";
+inline constexpr std::string_view kBlockIndexerTopk = "block_indexer_topk";
+inline constexpr std::string_view kBlockIndexerWindow = "block_indexer_window";
 inline constexpr std::string_view kBlockIndexerPending = "block_indexer_pending";
 inline constexpr std::string_view kBlockIndexerCommit = "block_indexer_commit";
 inline constexpr std::string_view kAttentionBlockLists = "attention_block_lists";

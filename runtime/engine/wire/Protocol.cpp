@@ -35,10 +35,11 @@ constexpr uint32_t kMaximumDfaStates = 32767;
 // Bound on the packed vocabulary's token count and total byte payload.
 constexpr uint32_t kMaximumVocabularyTokens = 1U << 24;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
-constexpr uint64_t kReadyFixedBytes = 9;
+constexpr uint64_t kReadyFixedBytes = 12;
 constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
+constexpr uint64_t kAudioPcmFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 53;
 constexpr uint64_t kErrorFixedBytes = 18;
@@ -388,6 +389,15 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                                              request.imagePixels.size())) {
     return invalid(IssueCode::InvalidCount, std::string(*error));
   }
+  if (request.audioSpans.size() > limits.maxAudioSpans) {
+    return invalid(IssueCode::LimitExceeded,
+                   "audio span count exceeds its limit");
+  }
+  if (auto error = audioSpansValidationError(request.audioSpans,
+                                             request.promptTokens.size(),
+                                             request.audioMel.size())) {
+    return invalid(IssueCode::InvalidCount, std::string(*error));
+  }
   if (request.generationPromptTokens >= request.promptTokens.size()) {
     return invalid(IssueCode::InvalidCount,
                    "generation prompt must leave a prompt token");
@@ -397,7 +407,7 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "shared prefix must lie within the prompt");
   }
   if (scoring) {
-    if (!request.imageSpans.empty()) {
+    if (!request.imageSpans.empty() || !request.audioSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
                      "score requests are text-only");
     }
@@ -612,6 +622,27 @@ EncodedEvent encodeReady(const ReadyEvent &event) {
   writer.u32(event.maxConcurrentRequests);
   writer.u32(event.maxContextTokens);
   writer.u8(event.vision);
+  writer.u8(event.audio);
+  writer.u8(event.speech);
+  writer.u8(0); // reserved
+  return success(writer.take());
+}
+
+EncodedEvent encodeAudioPcm(const AudioPcmEvent &event,
+                            const ProtocolLimits &limits) {
+  if (uint64_t(event.pcm.size()) > limits.maxAudioPcmSamples) {
+    return failure<std::vector<uint8_t>>(
+        {FailureClass::EngineUnhealthy, IssueCode::LimitExceeded,
+         event.requestId, "audio PCM frame exceeds the sample limit"});
+  }
+  Writer writer =
+      frameWriter(FrameType::AudioPcm,
+                  kAudioPcmFixedBytes + event.pcm.size() * sizeof(float));
+  writer.u64(event.requestId);
+  writer.u32(event.frameIndex);
+  writer.u32(static_cast<uint32_t>(event.pcm.size()));
+  for (const float sample : event.pcm)
+    writer.f32(sample);
   return success(writer.take());
 }
 
@@ -727,13 +758,14 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   uint8_t returnProgress = 0;
   uint32_t promptCount = 0;
   uint32_t imageSpanCount = 0;
+  uint32_t audioSpanCount = 0;
   uint32_t scoreCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
       !reader.u64(request.remainingDeadlineMicros) ||
       !reader.u32(request.logicalMaxOutputTokens) || !reader.u32(promptCount) ||
-      !reader.u32(imageSpanCount) ||
+      !reader.u32(imageSpanCount) || !reader.u32(audioSpanCount) ||
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) ||
@@ -771,6 +803,11 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
         makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
                   request.requestId, "image span count exceeds its limit"));
   }
+  if (audioSpanCount > limits.maxAudioSpans) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
+                  request.requestId, "audio span count exceeds its limit"));
+  }
   if (!reader.words(promptCount, request.promptTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
@@ -783,29 +820,48 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
+        !reader.u32(span.frames) ||
         !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
       return failure<ClientMessage>(
           makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                     request.requestId, "image span payload is malformed"));
     }
   }
+  request.audioSpans.resize(audioSpanCount);
+  uint64_t melBytes = 0;
+  for (AudioSpan &span : request.audioSpans) {
+    if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
+        !reader.u32(span.melFrames) || !reader.u64(span.digestLo) ||
+        !reader.u64(span.digestHi) ||
+        !checkedAdd(melBytes, span.melBytes(), melBytes)) {
+      return failure<ClientMessage>(
+          makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
+                    request.requestId, "audio span payload is malformed"));
+    }
+  }
   const size_t pixelsOffset = payload.size() - reader.remaining();
   uint64_t scoreBytes = 0;
+  uint64_t mediaBytes = 0;
   if (!checkedMultiply(scoreCount, sizeof(uint32_t), scoreBytes) ||
-      reader.remaining() != pixelBytes + scoreBytes ||
-      !reader.skip(pixelBytes) ||
+      !checkedAdd(pixelBytes, melBytes, mediaBytes) ||
+      reader.remaining() != mediaBytes + scoreBytes ||
+      !reader.skip(mediaBytes) ||
       !reader.words(scoreCount, request.scoreTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                   request.requestId,
-                  "image pixel or score payload does not match its counts"));
+                  "media or score payload does not match its counts"));
   }
-  // The pixels are most of a large frame, so they stay in its buffer: the
-  // score words behind them are read, and moving the pixels to its front
-  // allocates nothing.
-  if (pixelBytes) {
-    payload.resize(pixelsOffset + pixelBytes);
+  // The pixels and mel are most of a large frame, so they stay in its
+  // buffer: the score words behind them are read, and moving the payload to
+  // its front allocates nothing. Pixels lead, mel follows.
+  if (mediaBytes) {
+    payload.resize(pixelsOffset + mediaBytes);
     payload.erase(payload.begin(), payload.begin() + pixelsOffset);
+    if (melBytes) {
+      request.audioMel.assign(payload.begin() + pixelBytes, payload.end());
+      payload.resize(pixelBytes);
+    }
     request.imagePixels = std::move(payload);
   }
   if (auto issue = validateRequest(request, limits)) {
@@ -1175,6 +1231,8 @@ std::string_view frameTypeName(FrameType type) {
     return "status_request";
   case FrameType::Ready:
     return "ready";
+  case FrameType::AudioPcm:
+    return "audio_pcm";
   case FrameType::PromptProgress:
     return "prompt_progress";
   case FrameType::Start:
@@ -1361,6 +1419,8 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodePromptProgress(value, limits);
           } else if constexpr (std::is_same_v<T, TokensEvent>) {
             return encodeTokens(value, limits);
+          } else if constexpr (std::is_same_v<T, AudioPcmEvent>) {
+            return encodeAudioPcm(value, limits);
           } else if constexpr (std::is_same_v<T, MaskRequestEvent>) {
             return encodeMaskRequest(value, limits);
           } else if constexpr (std::is_same_v<T, DoneEvent>) {

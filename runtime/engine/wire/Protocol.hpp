@@ -18,9 +18,9 @@
 // pins the bytes both sides agree on.
 namespace richengine::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 9;
 inline constexpr size_t kFrameHeaderBytes = 24;
-inline constexpr uint32_t kStatusSchemaVersion = 7;
+inline constexpr uint32_t kStatusSchemaVersion = 8;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
@@ -47,6 +47,7 @@ enum class FrameType : uint16_t {
   Error = 0x0105,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
+  AudioPcm = 0x0109,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -114,9 +115,15 @@ struct ProtocolLimits {
   uint32_t maxPromptTokens = 1U << 20;
   uint32_t maxLogicalOutputTokens = 1U << 20;
   uint32_t maxTokenBatch = 4096;
+  // Speech PCM frames run far past a token batch: one codec frame is 1920
+  // samples and the end-of-audio flush adds its tail.
+  uint32_t maxAudioPcmSamples = 1U << 16;
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
-  uint32_t maxImageSpans = 64;
+  // Video input spends spans fast: one per temporal frame pair (up to 192
+  // for a 384-frame clip) and one per soundtrack piece.
+  uint32_t maxImageSpans = 256;
+  uint32_t maxAudioSpans = 256;
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>
@@ -138,9 +145,11 @@ validateLimits(const ProtocolLimits &limits);
 //   79 u32 generationPromptTokens
 //   83 u32 flags
 //   87 u32 sharedPrefixTokens
-// then the prompt tokens, the 32-byte image spans, the image pixels and the
-// score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 91;
+//   91 u32 audio span count (protocol 8; the image span record's u32
+//   frames field is protocol 9)
+// then the prompt tokens, the 36-byte image spans, the 28-byte audio spans,
+// the image pixels, the audio mel payload and the score tokens.
+inline constexpr uint64_t kRequestFixedBytes = 95;
 
 struct RequestFrame {
   uint64_t requestId = 0;
@@ -155,10 +164,14 @@ struct RequestFrame {
   uint32_t logicalMaxOutputTokens = 0;
   std::vector<uint32_t> promptTokens;
   // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
-  // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
-  // Both are empty for text-only requests.
+  // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 per temporal
+  // frame; a video pair's span carries two). Both empty for text-only.
   std::vector<ImageSpan> imageSpans;
   std::vector<uint8_t> imagePixels;
+  // Sorted, non-overlapping audio spans and their float32 [128 x melFrames]
+  // log-mel payload, concatenated in span order; empty without audio.
+  std::vector<AudioSpan> audioSpans;
+  std::vector<uint8_t> audioMel;
   // The defaults are greedy selection with nothing changing the logits,
   // which score requests require (seed aside).
   SamplingParameters sampling;
@@ -186,10 +199,13 @@ struct RequestFrame {
 //   Cancel         u64 requestId
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
-//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens,
+//                  u8 capabilities (bit0 vision, bit1 speech output)
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
+//   AudioPcm       u64 requestId, u32 frameIndex, u32 sample count,
+//                  f32 samples (24 kHz PCM)
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
 //                  u32 count, u32 simulation tokens
 //   ConstraintDfa  u64 requestId, u32 nStates, u32 flags,
@@ -290,6 +306,11 @@ struct ReadyEvent {
   // Requests may carry image spans. A model serving without vision rejects
   // each image request with a request error.
   bool vision = false;
+  // Requests may carry audio spans. A model serving without the audio
+  // encoder rejects each audio request with a request error.
+  bool audio = false;
+  // The model emits AudioPcm events while generating speech.
+  bool speech = false;
 
   bool operator==(const ReadyEvent &) const = default;
 };
@@ -317,6 +338,18 @@ struct TokensEvent {
   std::vector<uint32_t> tokens;
 
   bool operator==(const TokensEvent &) const = default;
+};
+
+// One decoded speech segment of a generating request: a non-EOS codec
+// frame carries 1920 fp32 samples (6 STFT columns x 320 @ 24 kHz); the
+// end-of-audio frame carries the ISTFT tail. frameIndex counts the
+// request's emitted frames so the server can order and size the stream.
+struct AudioPcmEvent {
+  uint64_t requestId = 0;
+  uint32_t frameIndex = 0;
+  std::vector<float> pcm;
+
+  bool operator==(const AudioPcmEvent &) const = default;
 };
 
 struct MaskRequestEvent {
@@ -403,7 +436,8 @@ using ClientMessage =
                  VocabularyFrame, ScoreBatchFrame, CorpusAppendFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
-                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
+                 AudioPcmEvent, MaskRequestEvent, DoneEvent, ErrorEvent,
+                 StatusJsonEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

@@ -112,7 +112,7 @@ inline RichSparseList richengine_sparse_list(device const uint *lists, device co
 // tile, lane * row_tiles + t of the row_capacity/8 eight-row tiles of the
 // lane's rows, which attend through list block_list + t. The reduce takes
 // the KV head in group.x. A tile past the lane's active rows is inactive.
-#define SPARSE_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                    \
+#define SPARSE_VERIFY_SPLIT(Name, Heads, Group, CacheElement, HeadDim)                    \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                   \
@@ -127,7 +127,7 @@ inline RichSparseList richengine_sparse_list(device const uint *lists, device co
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint Rows = RichSparseTileRows;                                  \
-    threadgroup RichSparseScratch<CacheElement, Rows * Group> scratch;         \
+    threadgroup RichSparseScratch<CacheElement, Rows * Group, HeadDim> scratch;         \
     const uint row_tiles = (params[0].row_capacity + Rows - 1) / Rows;         \
     const uint batch = group.z / row_tiles, tile = group.z % row_tiles;        \
     constant RichVerifyAttentionParams &lane = params[batch];                  \
@@ -140,10 +140,10 @@ inline RichSparseList richengine_sparse_list(device const uint *lists, device co
     const uint active_rows = min(Rows, lane.active_rows - first_row);          \
     const uint first_position = lane.committed_tokens + first_row;             \
     constexpr ulong group_stride =                                             \
-        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * RichKvHeadDimension;   \
+        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * HeadDim;   \
     const ulong offset =                                                       \
         (ulong(batch) * Heads + kv_head) * group_stride +                      \
-        ulong(first_row) * Group * RichKvHeadDimension;                        \
+        ulong(first_row) * Group * HeadDim;                        \
     const ulong slot =                                                         \
         ((ulong(batch) * Heads + kv_head) * row_tiles + tile) *                \
             lane.slot_splits +                                                 \
@@ -151,7 +151,7 @@ inline RichSparseList richengine_sparse_list(device const uint *lists, device co
     const RichSparseList list = richengine_sparse_list(                        \
         lists, counts, lane.block_stride, lane.block_list + tile,              \
         first_position, active_rows);                                          \
-    richengine_sparse_attention_tile<Heads, Group, Rows, CacheElement>(        \
+    richengine_sparse_attention_tile<Heads, Group, Rows, CacheElement, HeadDim>(        \
         queries + offset,                                                    \
         RICHENGINE_LANE_BINDING(batch, page_table0, page_table1, page_table2,  \
                                 page_table3),                                  \
@@ -159,13 +159,16 @@ inline RichSparseList richengine_sparse_list(device const uint *lists, device co
         list.count, lane.split_count, split, partials, statistics, slot,       \
         lane.score_scale, scratch, thread_index);                              \
   }
-SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_kv2_g12, 2, 12, int8_t)
-SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
+SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_kv2_g12, 2, 12, int8_t, RICHENGINE_KV_HEAD_DIMENSION)
+SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat, RICHENGINE_KV_HEAD_DIMENSION)
+// LFM3's global layers: the sparse splits on the k4q4d128 core.
+SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_k4q4d128, 4, 4, int8_t, 128)
+SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_k4q4d128, 4, 4, bfloat, 128)
 #undef SPARSE_VERIFY_SPLIT
 
 // Combines the splits that took entries of the lane tile's list: the same
 // lane-tile decode as the split, one threadgroup per fused row.
-#define SPARSE_VERIFY_REDUCE(Name, Heads, Group)                                 \
+#define SPARSE_VERIFY_REDUCE(Name, Heads, Group, HeadDim)                                 \
   kernel void Name(                                                            \
       device const bfloat *partials [[buffer(0)]],                             \
       device const float *statistics [[buffer(1)]],                            \
@@ -184,7 +187,7 @@ SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
     const uint first_row = tile * Rows;                                        \
     if (!richengine_verify_attention_contract_valid(lane) ||                   \
         kv_head >= Heads || fused_row >= Rows * Group ||                       \
-        thread_index >= RichKvHeadDimension)                                   \
+        thread_index >= HeadDim)                                   \
       return;                                                                  \
     const uint active_rows =                                                   \
         first_row < lane.active_rows                                           \
@@ -198,24 +201,25 @@ SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
                                  active_rows)                                  \
                            : 0u;                                               \
     constexpr ulong group_stride =                                             \
-        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * RichKvHeadDimension;   \
+        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * HeadDim;   \
     const ulong offset =                                                       \
         (ulong(batch) * Heads + kv_head) * group_stride +                      \
-        ulong(first_row) * Group * RichKvHeadDimension;                        \
+        ulong(first_row) * Group * HeadDim;                        \
     const ulong head_slot =                                                    \
         ((ulong(batch) * Heads + kv_head) * row_tiles + tile) *                \
         lane.slot_splits;                                                      \
-    richengine_sparse_combine_splits<Group, Rows>(                             \
+    richengine_sparse_combine_splits<Group, Rows, HeadDim>(                             \
         partials, statistics, output + offset, active_rows,                    \
         richengine_sparse_written_splits(count, lane.split_count), head_slot,  \
         fused_row, thread_index, weights, group_values);                       \
   }
-SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12)
+SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12, RICHENGINE_KV_HEAD_DIMENSION)
+SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_k4q4d128, 4, 4, 128)
 #undef SPARSE_VERIFY_REDUCE
 
 // Prefill: group.x is the KV head, group.y the query tile and group.z the
 // split; tile t of the chunk attends through list block_list + t.
-#define SPARSE_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                   \
+#define SPARSE_PREFILL_SPLIT(Name, Heads, Group, CacheElement, HeadDim)                   \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                   \
@@ -227,7 +231,7 @@ SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12)
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint Rows = RichSparseTileRows;                                  \
-    threadgroup RichSparseScratch<CacheElement, Rows * Group> scratch;         \
+    threadgroup RichSparseScratch<CacheElement, Rows * Group, HeadDim> scratch;         \
     const uint kv_head = group.x, tile = group.y, split = group.z;             \
     const uint start = tile * Rows;                                            \
     if (!richengine_prefill_attention_contract_valid(params) ||                \
@@ -238,23 +242,25 @@ SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12)
     const uint first_position = params.committed_tokens + start;               \
     const ulong offset =                                                       \
         (ulong(kv_head) * params.chunk_stride + start) * Group *               \
-        RichKvHeadDimension;                                                   \
+        HeadDim;                                                   \
     const ulong slot =                                                         \
         (ulong(tile) * Heads + kv_head) * params.split_count + split;          \
     const RichSparseList list = richengine_sparse_list(                        \
         lists, counts, params.block_stride, params.block_list + tile,          \
         first_position, active_rows);                                          \
-    richengine_sparse_attention_tile<Heads, Group, Rows, CacheElement>(        \
+    richengine_sparse_attention_tile<Heads, Group, Rows, CacheElement, HeadDim>(        \
         queries + offset, page_table, params.kv, kv_head, first_position,      \
         active_rows, list.entries, list.count, params.split_count, split,      \
         partials, statistics, slot, params.score_scale, scratch,               \
         thread_index);                                                         \
   }
-SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_kv2_g12, 2, 12, int8_t)
-SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
+SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_kv2_g12, 2, 12, int8_t, RICHENGINE_KV_HEAD_DIMENSION)
+SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, bfloat, RICHENGINE_KV_HEAD_DIMENSION)
+SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_k4q4d128, 4, 4, int8_t, 128)
+SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_k4q4d128, 4, 4, bfloat, 128)
 #undef SPARSE_PREFILL_SPLIT
 
-#define SPARSE_PREFILL_REDUCE(Name, Heads, Group)                                \
+#define SPARSE_PREFILL_REDUCE(Name, Heads, Group, HeadDim)                                \
   kernel void Name(                                                            \
       device const bfloat *partials [[buffer(0)]],                             \
       device const float *statistics [[buffer(1)]],                            \
@@ -270,7 +276,7 @@ SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
     const uint start = tile * Rows;                                            \
     if (!richengine_prefill_attention_contract_valid(params) ||                \
         kv_head >= Heads || fused_row >= Rows * Group ||                       \
-        thread_index >= RichKvHeadDimension || start >= params.rows)           \
+        thread_index >= HeadDim || start >= params.rows)           \
       return;                                                                  \
     const uint active_rows = min(Rows, params.rows - start);                   \
     const uint first_position = params.committed_tokens + start;               \
@@ -279,12 +285,13 @@ SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
         first_position, active_rows);                                          \
     const ulong offset =                                                       \
         (ulong(kv_head) * params.chunk_stride + start) * Group *               \
-        RichKvHeadDimension;                                                   \
-    richengine_sparse_combine_splits<Group, Rows>(                             \
+        HeadDim;                                                   \
+    richengine_sparse_combine_splits<Group, Rows, HeadDim>(                             \
         partials, statistics, output + offset, active_rows,                    \
         richengine_sparse_written_splits(count, params.split_count),           \
         (ulong(tile) * Heads + kv_head) * params.split_count, fused_row,       \
         thread_index, weights, group_values);                                  \
   }
-SPARSE_PREFILL_REDUCE(prefill_attention_sparse_reduce_kv2_g12, 2, 12)
+SPARSE_PREFILL_REDUCE(prefill_attention_sparse_reduce_kv2_g12, 2, 12, RICHENGINE_KV_HEAD_DIMENSION)
+SPARSE_PREFILL_REDUCE(prefill_attention_sparse_reduce_k4q4d128, 4, 4, 128)
 #undef SPARSE_PREFILL_REDUCE

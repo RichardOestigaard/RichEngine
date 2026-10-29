@@ -32,6 +32,11 @@ gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout) {
   geometry.rotaryTheta = layout.rotaryTheta;
   geometry.fullAttentionPeriod = layout.fullAttentionPeriod;
   geometry.attentionMask = layout.attentionMask;
+  geometry.globalAttentionMask = layout.globalAttentionMask;
+  geometry.altRotaryTheta = layout.altRotaryTheta;
+  geometry.slidingWindowTokens = layout.slidingWindowTokens;
+  geometry.attentionGateRows = layout.attentionGateRows;
+  geometry.sandwichNorm = layout.sandwichNorm;
   if (layout.rmsEpsilon) geometry.rmsEpsilon = layout.rmsEpsilon;
   geometry.attentionScale = layout.attentionScale;
   // The packed query rows interleave a gate row each on the hybrids alone.

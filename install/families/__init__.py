@@ -184,7 +184,9 @@ FAMILIES = _load()
 # kModelFamilies keeps the same rows marked Legacy alias; the installer
 # never offers them.
 LEGACY_NAMES = {
-    "Bonsai-2-27B": "Qwen3.8-27B",
+    # LFM3-1.7B-Base: the base checkpoint of the same architecture; the
+    # runtime keeps the row so installed packages naming it still load.
+    "LFM3-1.7B-Base": "LFM3-1.7B",
 }
 
 
@@ -199,7 +201,7 @@ def named(name):
 def _names(family, hint):
     """Whether the hint names the family: its name bounded by characters a
     repository or file name separates tokens with, never inside another
-    word (NotBonsai-2-27B names no Bonsai)."""
+    word (NotOrnith-1.5-9B names no Ornith)."""
     pattern = r"(?<![0-9a-z])" + re.escape(family.name.lower()) + r"(?![0-9a-z])"
     return re.search(pattern, hint.lower()) is not None
 

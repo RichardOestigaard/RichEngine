@@ -201,7 +201,9 @@ void NativeRuntime::announceReady() {
     throw std::logic_error("ready was already announced");
   if (!send(protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth,
                                  config_.engine.maxContext,
-                                 config_.engine.maxImagePatches != 0})) {
+                                 config_.engine.maxImagePatches != 0,
+                                 config_.engine.maxAudioMelFrames != 0,
+                                 config_.engine.speech})) {
     throw std::runtime_error("failed to serialize ready event");
   }
   ready_ = true;
@@ -303,6 +305,8 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.sharedPrefixTokens = request.sharedPrefixTokens;
     engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
+    engineRequest.audio = std::move(request.audioSpans);
+    engineRequest.audioMel = std::move(request.audioMel);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.scoreTokens = std::move(request.scoreTokens);
     engineRequest.sampling = request.sampling;
@@ -539,6 +543,14 @@ void NativeRuntime::tokens(uint64_t requestId,
   telemetry.lastTokenMilliseconds = now;
   send(protocol::TokensEvent{
       requestId, offset, std::vector<uint32_t>(values.begin(), values.end())});
+}
+
+void NativeRuntime::audioPcm(uint64_t requestId,
+                             std::span<const float> samples) {
+  RequestTelemetry &telemetry = telemetry_.at(requestId);
+  send(protocol::AudioPcmEvent{
+      requestId, telemetry.audioFrames++,
+      std::vector<float>(samples.begin(), samples.end())});
 }
 
 void NativeRuntime::maskRequested(uint64_t requestId,

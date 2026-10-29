@@ -376,6 +376,8 @@ class ModelHost:
                 announce_served_name=self.args.announce_served_name,
                 default_reasoning_effort=self.args.default_reasoning_effort,
                 vision=readiness.vision,
+                audio=readiness.audio,
+                speech=readiness.speech,
                 contract=contract,
                 serving=serving_contract,
                 shared_prefix_states=self.args.shared_prefix_state,

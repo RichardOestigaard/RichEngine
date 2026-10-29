@@ -312,6 +312,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/LfmConv.cpp \
+	runtime/ops/LfmSpeechGen.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
@@ -363,17 +364,25 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Lfm2.cpp \
 	runtime/model/Lfm2Moe.cpp \
 	runtime/model/Lfm2Moe24B.cpp \
+	runtime/model/Lfm3.cpp \
 	runtime/model/MiniCpmV47.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Ornith9B.cpp \
+	runtime/model/LfmVision.cpp \
+	runtime/model/LfmVisionLoader.cpp \
+	runtime/model/LfmAudio.cpp \
+	runtime/model/LfmAudioLoader.cpp \
+	runtime/model/LfmGen.cpp \
+	runtime/model/LfmGenLoader.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
 	runtime/model/TargetModel.cpp \
 	runtime/model/TargetModelGemma.cpp \
 	runtime/model/TargetModelHybrid.cpp \
+	runtime/model/TargetModelLfm3.cpp \
 	runtime/model/TargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DFlashTwoDraft.cpp \
@@ -399,6 +408,7 @@ ENGINE_MM_SOURCES := \
 	runtime/model/families/MiniCpmV.mm \
 	runtime/model/families/Lfm2.mm \
 	runtime/model/families/Lfm2Moe24B.mm \
+	runtime/model/families/Lfm3.mm \
 	runtime/model/families/Granite.mm \
 	runtime/model/families/Gemma.mm \
 	runtime/model/Runtime.mm \
@@ -412,6 +422,8 @@ ENGINE_MM_SOURCES := \
 	runtime/model/DecodeArena.mm \
 	runtime/metal/MetalArena.mm \
 	runtime/metal/MetalEncode.mm \
+	runtime/ops/LfmVision.mm \
+	runtime/ops/LfmAudioEnc.mm \
 	runtime/ops/Vision.mm \
 	runtime/ops/PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \

@@ -69,6 +69,26 @@ struct RuntimeImageState final {
   std::shared_ptr<RuntimeImageRows> rows;
 };
 
+// One audio clip's mel and its encoded rows, shared by every placement of
+// the same content that still has rows to inject. `mel` holds the float32
+// [128 x melFrames] payload; `embeddings` one bf16 outputHiddenSize row
+// per placeholder token. No embedding cache: identical clips across
+// requests re-encode once their last placement releases the rows.
+struct RuntimeAudioRows final {
+  RuntimeImageKey key;
+  MetalBuffer mel;
+  MetalBuffer embeddings;
+  bool encoding = false;
+  bool encoded = false;
+};
+// A placement keeps its rows until its last row is injected; audio rows
+// take ordinary sequential rotary positions, so nothing else depends on
+// the span once its tokens are prefilled.
+struct RuntimeAudioState final {
+  AudioSpan span;
+  std::shared_ptr<RuntimeAudioRows> rows;
+};
+
 // A request's compiled byte-DFA constraint (CONSTRAINT_DFA frame): the
 // row-major states x 256 i16 transition table (-1 = dead) and its accepting
 // bitset, kept host-side for resend after a weight release and uploaded to
@@ -158,6 +178,7 @@ struct RuntimeRequest final {
   DecodeStage decodeStage = DecodeStage::Regular;
   std::optional<DraftContextPlan> draftContextPlan;
   std::vector<RuntimeImageState> images;
+  std::vector<RuntimeAudioState> audios;
   // What its activation took from a cached state: the images that end
   // there were left out (ModelRequest::restoredTokens).
   uint32_t restoredTokens = 0;
@@ -199,6 +220,30 @@ struct RuntimeRequest final {
   // packed-prefill length check by the unapplied advance.
   uint32_t prefillUnapplied = 0;
   uint32_t prefillUnappliedRows = 0;
+  // LFM3-Omni speech output (docs in dev/omni-reference/NOTES.md section 6).
+  // Every emitted audio position is one LM slot whose input embedding is
+  // the last frame's feedback row instead of a token embedding: while the
+  // pending anchor is the audio placeholder (125032), the step's Hidden0
+  // anchor row is patched with `feedback` (bf16 row, staged per lane).
+  // `mode`: 0 text, 1 audio, 2 interleaved. Audio slots run a single
+  // host-controlled step — the lane's proposals are anchor-only, its lm_head
+  // output is discarded, the sampled codec frame drives the emission.
+  struct SpeechState final {
+    uint32_t mode = 0;           // 0 TEXT, 1 AUDIO, 2 INTERLEAVED
+    uint32_t slotsLeft = 0;      // interleaved: slots until the block flips
+    bool speaking = false;       // interleaved: current block is audio
+    bool textDone = false;       // interleaved: text half ended (text_end)
+    // bf16 feedback embedding of the last sampled frame: the next audio or
+    // post-audio text slot's anchor input while pendingToken == 125032.
+    std::vector<uint16_t> feedback;
+    MetalBuffer feedbackBuffer;  // its Metal staging slot for the row patch
+    uint32_t frames = 0;         // frames emitted this request (PCM offset)
+  };
+  SpeechState speech;
+  // The request's speech decoder (depthformer + codec + ISTFT state), lazily
+  // bound while a speech-capable model serves the turn. Type-erased: the
+  // ops type is complete only where the runtime compiles it.
+  std::shared_ptr<void> speechGen;
 };
 
 namespace {

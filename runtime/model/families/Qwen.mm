@@ -128,8 +128,8 @@ ModelDescriptor ornith36Descriptor(std::string name) {
   return descriptor;
 }
 
-// What was kModelFamilies' qwen3_5 rows: the 27B (plus its Bonsai legacy
-// alias) and both 35B-A3B family names.
+// What was kModelFamilies' qwen3_5 rows: the 27B and both 35B-A3B family
+// names.
 // The registry's erased-signature entry for the qwen3_8 target.
 TargetWeights loadQwen38Target(metal::MetalBackend &backend,
                      const TargetLayout &layout,
@@ -148,15 +148,6 @@ const bool kRegisteredQwenFamilies = [] {
   registerTargetArch({"qwen3_8", &loadQwen38Target});
   registerTargetArch({"qwen3_6moe", &loadQwen36MoeTarget});
   registerModelFamily({.name = "Qwen3.8-27B", .modelType = "qwen3_5_text",
-                       .legacyType = "",
-                       .makeDescriptor = &qwen38Descriptor,
-                       .draftLayout = &qwen38DraftLayout,
-                       .refineSourceConfig = &refineQwenSourceText,
-                       .servesVisionTower = true});
-  // Legacy alias: packages assembled while Bonsai-2-27B was its own
-  // family name still resolve — it is the Qwen3.8 architecture and the
-  // installer no longer offers it. The parity test exempts this row.
-  registerModelFamily({.name = "Bonsai-2-27B", .modelType = "qwen3_5_text",
                        .legacyType = "",
                        .makeDescriptor = &qwen38Descriptor,
                        .draftLayout = &qwen38DraftLayout,

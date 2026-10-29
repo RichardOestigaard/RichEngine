@@ -23,7 +23,7 @@ from urllib.parse import unquote
 
 from huggingface_hub.utils import validate_repo_id
 
-from . import disk, installer, json_codec, judgments, serve_options, tuner
+from . import audio, disk, installer, json_codec, judgments, serve_options, tuner
 from . import runtime as engine_runtime
 from .api_shapes import (
     anthropic_response,
@@ -159,6 +159,9 @@ class Collected:
     # The id of the call the token limit cut, whose arguments are
     # unfinished; None when it cut none.
     cut_call: str | None
+    # Generated speech: the concatenated fp32 LE PCM of every AudioPcm
+    # event, 24 kHz mono; empty when the turn emitted none.
+    audio_pcm: bytes = b""
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -1427,6 +1430,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         on_tool_delta=None,
         on_idle=None,
         on_progress=None,
+        on_audio=None,
     ):
         """Gather a generation until it is done. The callbacks receive the
         start, each piece of output, the idle waits and prompt progress:
@@ -1450,6 +1454,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else None
         )
         reasoning, content, result = [], [], None
+        pcm = []
 
         def publish(events):
             if on_text is None:
@@ -1476,6 +1481,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     append(field, text)
             elif kind == "progress" and on_progress is not None:
                 on_progress(value)
+            elif kind == "audio":
+                pcm.append(value)
+                if on_audio is not None:
+                    on_audio(value)
             elif kind == "done":
                 result = value
         for field, text in splitter.finish():
@@ -1491,6 +1500,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             result,
             splitter.reasoning,
             None if projector is None else projector.call_id,
+            b"".join(pcm),
         )
 
     def _message(self, job, collected):
@@ -1503,6 +1513,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             message["reasoning_content"] = collected.reasoning
         if collected.tool_calls:
             message["tool_calls"] = collected.tool_calls
+        if collected.audio_pcm:
+            import base64
+
+            # The assembled speech as one base64 WAV (24 kHz mono s16le),
+            # beside the content like OpenAI's audio-capable chat shape.
+            message["audio"] = {
+                "data": base64.b64encode(
+                    audio.wav_s16le(audio.pcm_f32_to_s16le(collected.audio_pcm))
+                ).decode(),
+                "format": "wav",
+                "sample_rate": audio.SPEECH_RATE,
+            }
         return message
 
     def _complete(self, job):
@@ -2042,6 +2064,26 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else:
                 self._sse_keepalive()
 
+        def audio_delta(pcm):
+            # One codec frame's PCM, base64 16-bit LE at 24 kHz mono, as a
+            # delta field on the ordinary completion chunk — the shape
+            # OpenAI-realtime-style clients recognize under delta.audio.
+            import base64
+
+            self._sse(
+                chunk(
+                    {
+                        "audio": {
+                            "data": base64.b64encode(
+                                audio.pcm_f32_to_s16le(pcm)
+                            ).decode(),
+                            "format": "pcm_s16le",
+                            "sample_rate": audio.SPEECH_RATE,
+                        }
+                    }
+                )
+            )
+
         def run():
             collected = self._collect(
                 job,
@@ -2052,6 +2094,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 on_progress=lambda progress: self._sse(
                     chunk(empty) | {"prompt_progress": progress}
                 ),
+                on_audio=audio_delta,
             )
             result = collected.result
             self._sse(

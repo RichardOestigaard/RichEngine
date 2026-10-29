@@ -155,12 +155,15 @@ PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_h256, 8, bfloat, 2
 PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_gemma_hd512, 2, int8_t, 512)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
 PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_q8_store_k4d128, 4, int8_t, 128)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_int4_store_k4d128, 4, RichKvPacked4, 128)
+PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_k4d128, 4, bfloat, 128)
 #undef PREFILL_ATTENTION_STORE_HD
 
 // Token-major-values variants (_tm) for a valuesTokenMajor layout's pages
 // (the QSA sparse attention's KV2 pages of 256): packed-INT4 values are
 // already token-major, so only INT8 and BF16 need a variant.
-#define PREFILL_ATTENTION_STORE_TM(Name, Heads, CacheElement)                  \
+#define PREFILL_ATTENTION_STORE_TM(Name, Heads, CacheElement, HeadDim)         \
   kernel void Name(                                                          \
       device const bfloat *chunk_keys [[buffer(0)]],                         \
       device const bfloat *chunk_values [[buffer(1)]],                       \
@@ -171,11 +174,13 @@ PREFILL_ATTENTION_STORE_HD(prefill_attention_bf16_store_gemma_hd512, 2, bfloat, 
       uint simd_lane [[thread_index_in_simdgroup]],                          \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
     threadgroup float maxima[8];                                             \
-    richengine_store_chunk_phase<Heads, CacheElement,                        \
-                                 RICHENGINE_KV_HEAD_DIMENSION, true>(        \
+    richengine_store_chunk_phase<Heads, CacheElement, HeadDim, true>(        \
         chunk_keys, chunk_values, page_table, params, maxima, group,         \
         thread_index, simd_lane, simd_group);                                \
   }
-PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_kv2_g8_tm, 2, int8_t)
-PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_kv2_g8_tm, 2, bfloat)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_kv2_g8_tm, 2, int8_t, RICHENGINE_KV_HEAD_DIMENSION)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_kv2_g8_tm, 2, bfloat, RICHENGINE_KV_HEAD_DIMENSION)
+// LFM3's sparse global layers: the k4q4d128 core's token-major stores.
+PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_k4q4d128_tm, 4, int8_t, 128)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_k4q4d128_tm, 4, bfloat, 128)
 #undef PREFILL_ATTENTION_STORE_TM

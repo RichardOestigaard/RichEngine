@@ -410,7 +410,7 @@ class FakeRuntime:
         self.threads = []
         self.corpus_docs = []
 
-    def corpus_append(self, tokens):
+    def corpus_append(self, tokens, session=0):
         self.corpus_docs.append(tuple(tokens))
 
     @property
@@ -525,6 +525,8 @@ class FakeRuntime:
             1_000,
             2_000,
             3_000,
+            0,
+            0,
             tuple(plan.logits) if plan.logits is not None else (),
         )
         call.complete(result=done)
@@ -1378,10 +1380,18 @@ class ServerTest(unittest.TestCase):
                 "total_tokens": 5,
                 "prompt_tokens_details": {"cached_tokens": 1},
                 "completion_tokens_details": {"reasoning_tokens": 3},
+                "draft_tokens_details": {
+                    "drafted_tokens": 0,
+                    "accepted_draft_tokens": 0,
+                    "draft_acceptance_rate": None,
+                },
             },
         )
         self.assertEqual(response["metrics"]["prefill"], {"tokens": 1})
-        self.assertEqual(response["metrics"]["decode"], {"tokens": 2})
+        self.assertEqual(
+            response["metrics"]["decode"],
+            {"tokens": 2, "drafted_tokens": 0, "accepted_draft_tokens": 0},
+        )
         self.assertEqual(
             response["metrics"]["request_latency"],
             {
@@ -3436,7 +3446,7 @@ class ServerTest(unittest.TestCase):
             ([self._image_message("data:image/png;base64,@@@")], "not valid base64"),
             (
                 [{"role": "user", "content": [{"type": "video", "video": "x"}]}],
-                "video content is not supported",
+                "video input is not supported",
             ),
             (
                 [{"role": "user", "content": [{"type": "image_url", "image_url": 5}]}],
@@ -6935,20 +6945,27 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn("enable_thinking", tokenizer.templates[-1][1])
 
     def test_explicit_thinking_mode_must_be_honored(self):
-        for prefix, effort in (
-            ("<think>\\n", "none"),
-            ("<think>\\n\\n</think>\\n\\n", "low"),
+        for prefix, effort, honored in (
+            ("<think>\\n", "none", False),
+            ("<think>\\n\\n</think>\\n\\n", "low", True),
         ):
             tokenizer = TemplateTokenizer(
                 "{% if add_generation_prompt %}"
                 "{{ '<|im_start|>assistant\\n" + prefix + "' }}{% endif %}"
             )
             app = make_frontend(tokenizer, None, "test-model", 128, 1, 2, vision=True)
-            with (
-                self.subTest(effort=effort),
-                self.assertRaisesRegex(api.APIError, "requested thinking mode"),
-            ):
-                app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
+            with self.subTest(effort=effort):
+                if honored:
+                    # A closed think block answers "low" already: the empty
+                    # block is the minimal reasoning that effort asks for.
+                    app.prepare(self.body(reasoning_effort=effort), deadline=FOREVER)
+                else:
+                    with self.assertRaisesRegex(
+                        api.APIError, "requested thinking mode"
+                    ):
+                        app.prepare(
+                            self.body(reasoning_effort=effort), deadline=FOREVER
+                        )
 
     def test_generation_prompt_decides_thinking_and_its_token_count(self):
         history = "<|im_start|>assistant\n<think>old</think>answer<|im_end|>\n"
@@ -7885,6 +7902,11 @@ class ServerTest(unittest.TestCase):
                 return []
 
             factory = mock.Mock()
+            # The factory's deferred compile would join later; the expiry
+            # check this tests wants the compile inside prepare. The DFA
+            # fast path is declined so create() runs and expires the clock.
+            factory.defer = lambda build: build()
+            factory.create_dfa.return_value = None
             app.constraint_factory = factory
             with (
                 self.subTest(stage=stage),
@@ -10357,14 +10379,13 @@ class ServerTest(unittest.TestCase):
             ("authentication_error", None, "authentication_error"),
         )
 
-        harness = self.harness(FakeRuntime())
+        harness = self.harness(FakeRuntime(Plan([[4]]), Plan([[4]])))
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body(n=2)
         )
-        error = json.loads(payload)["error"]
-        self.assertEqual(status, 400)
-        self.assertEqual(error["type"], "invalid_request_error")
-        self.assertIsNone(error["param"])
+        # n > 1 expands into one choice per sibling lane.
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(json.loads(payload)["choices"]), 2)
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body(logprobs=True)
         )

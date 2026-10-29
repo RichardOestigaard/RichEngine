@@ -381,3 +381,127 @@ kernel void verify_attention_qkv_gemma_hd512(
 VERIFY_ATTENTION_GATHER(verify_attention_gather_gemma_h256, 16, 8, 256)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_gemma_hd512, 16, 2, 512)
 #undef VERIFY_ATTENTION_GATHER
+
+// LFM3's 16x4 heads of 128, all 64 pairs rotated (the global layers' rope
+// table's zero tail leaves its last 32 pairs unrotated) with per-head RMS
+// norms of epsilon 1e-5.
+#define VERIFY_ATTENTION_QKV_K4Q4D128(Name, W) \
+  kernel void Name( \
+      device const bfloat *qkv [[buffer(0)]], \
+      device const W *q_norm [[buffer(1)]], \
+      device const W *k_norm [[buffer(2)]], \
+      device const float *rope_cos [[buffer(3)]], \
+      device const float *rope_sin [[buffer(4)]], \
+      device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]], \
+      device bfloat *values [[buffer(7)]], \
+      constant FullDecodeBatchParams &params [[buffer(8)]], \
+      uint2 group [[threadgroup_position_in_grid]], \
+      uint thread_index [[thread_index_in_threadgroup]], \
+      uint lane [[thread_index_in_simdgroup]], \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    threadgroup bfloat normalized[256]; \
+    full_qkv_decode_phase_hd<16, 4, 128, true, W>( \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values, \
+        reductions, normalized, params, group, thread_index, lane, \
+        simd_group, 1e-5f); \
+  }
+VERIFY_ATTENTION_QKV_K4Q4D128(verify_attention_qkv_k4q4d128, bfloat)
+VERIFY_ATTENTION_QKV_K4Q4D128(verify_attention_qkv_k4q4d128_f32, float)
+#undef VERIFY_ATTENTION_QKV_K4Q4D128
+
+// LFM3's head-wise gate: `gates` holds each lane-row's QHeads sigmoid
+// inputs (the gate projection's output), one scalar per query head.
+template <uint QHeads, uint KHeads, uint HeadDim>
+inline bfloat full_attention_headgate_value(device const bfloat *gates,
+                                            device const bfloat *attention,
+                                            uint element, uint rows) {
+  constexpr uint HeadsPerKV = QHeads / KHeads;
+  const uint per_lane = rows * QHeads * HeadDim;
+  const uint batch = element / per_lane;
+  const uint lane_element = element % per_lane;
+  const uint row = lane_element / (QHeads * HeadDim);
+  const uint remainder = lane_element % (QHeads * HeadDim);
+  const uint query_head = remainder / HeadDim;
+  const uint dim = remainder % HeadDim;
+  const float gate = richengine_sigmoid(
+      float(gates[(ulong(batch) * rows + row) * 256u + query_head]));
+  const uint kv_head = query_head / HeadsPerKV;
+  const uint local_head = query_head % HeadsPerKV;
+  const ulong attention_index =
+      (((ulong(batch) * KHeads + kv_head) * RICHENGINE_VERIFY_CHUNK_STRIDE +
+        row) *
+           HeadsPerKV +
+       local_head) *
+          HeadDim +
+      dim;
+  return bfloat(float(attention[attention_index]) * gate);
+}
+
+template <uint QHeads, uint KHeads, uint HeadDim>
+inline void full_attention_headgate_decode_phase(
+    device const bfloat *gates, device const bfloat *attention,
+    device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
+    uint grid_size) {
+  const uint count = params.lanes * params.rows * QHeads * HeadDim;
+  for (uint element = index; element < count; element += grid_size)
+    hidden[element] = full_attention_headgate_value<QHeads, KHeads, HeadDim>(
+        gates, attention, element, params.rows);
+}
+
+kernel void verify_attention_headgate_k4q4d128(
+    device const bfloat *gates [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullDecodeBatchParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_headgate_decode_phase<16, 4, 128>(
+      gates, attention, hidden, params, index, grid_size);
+}
+
+// The operand-table variants for a non-Plain out-projection input, as the
+// ATTENTION_GATE_TABLE/PACKED kernels' but reading the scalar gate buffer.
+#define ATTENTION_HEADGATE_TABLE(Name, QHeads, KHeads, Layout, HeadDim) \
+  kernel void Name( \
+      device const bfloat *gates [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      constant FullDecodeBatchParams &params [[buffer(5)]], \
+      uint index [[thread_position_in_grid]], \
+      uint lane [[thread_index_in_simdgroup]]) { \
+    constexpr uint width = QHeads * HeadDim; \
+    const uint element = 2 * index; \
+    const bfloat a = full_attention_headgate_value<QHeads, KHeads, HeadDim>(gates, attention, element, params.rows); \
+    const bfloat b = full_attention_headgate_value<QHeads, KHeads, HeadDim>(gates, attention, element + 1, params.rows); \
+    hidden[element] = a; hidden[element + 1] = b; \
+    const uint row = element / width; \
+    Layout::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * Layout::sums_per_tile(width), \
+                  width, (element % width) / 64, row % 8, lane, a, b); \
+  }
+ATTENTION_HEADGATE_TABLE(verify_attention_headgate_table64_k4q4d128, 16, 4, q4sg::Table64, 128)
+ATTENTION_HEADGATE_TABLE(verify_attention_headgate_table16_k4q4d128, 16, 4, gguf_sg::Table16, 128)
+#undef ATTENTION_HEADGATE_TABLE
+
+#define ATTENTION_HEADGATE_PACKED(Name, QHeads, KHeads, HeadDim) \
+  kernel void Name( \
+      device const bfloat *gates [[buffer(0)]], \
+      device const bfloat *attention [[buffer(1)]], \
+      device bfloat *hidden [[buffer(2)]], \
+      device half *plane [[buffer(3)]], device uchar *exponents [[buffer(4)]], \
+      constant FullDecodeBatchParams &params [[buffer(5)]], \
+      uint index [[thread_position_in_grid]], \
+      uint lane [[thread_index_in_simdgroup]]) { \
+    constexpr uint width = QHeads * HeadDim; \
+    const uint element = 2 * index; \
+    const bfloat a = full_attention_headgate_value<QHeads, KHeads, HeadDim>(gates, attention, element, params.rows); \
+    const bfloat b = full_attention_headgate_value<QHeads, KHeads, HeadDim>(gates, attention, element + 1, params.rows); \
+    hidden[element] = a; hidden[element + 1] = b; \
+    const uint row = element / width; \
+    gguf_sg::Packed::write(plane + ulong(row / 8) * width * 8, \
+                           exponents + ulong(row / 8) * gguf_sg::Packed::sums_per_tile(width), \
+                           width, (element % width) / 64, row % 8, lane, a, b); \
+  }
+ATTENTION_HEADGATE_PACKED(verify_attention_headgate_packed_k4q4d128, 16, 4, 128)
+#undef ATTENTION_HEADGATE_PACKED

@@ -1,0 +1,95 @@
+1169-    A_ENC_EMBD_POS        = auto()
+1170-    A_ENC_EMBD_NORM       = auto()
+1171:    A_ENC_EMBD_TO_LOGITS  = auto() # lfm2
+1172-    A_ENC_INP_PROJ        = auto() # gemma4
+1173-    A_ENC_CONV1D          = auto()
+--
+1183-    A_ENC_ATTN_K          = auto()
+1184-    A_ENC_ATTN_V          = auto()
+1185:    A_ENC_ATTN_Q_NORM     = auto() # lfm3a
+1186:    A_ENC_ATTN_K_NORM     = auto() # lfm3a
+1187-    A_ENC_ATTN_POST_NORM  = auto()
+1188-    A_ENC_ATTN_PRE_NORM   = auto()
+--
+1198-    A_ENC_FFN_GATE        = auto()
+1199-    A_ENC_FFN_DOWN        = auto()
+1200:    A_ENC_FFN_UP_1        = auto() # lfm2, gemma3n
+1201:    A_ENC_FFN_NORM_1      = auto() # lfm2, gemma3n (pre-norm)
+1202-    A_ENC_FFN_POST_NORM_1 = auto() # gemma3n
+1203-    A_ENC_FFN_SCALE_1     = auto() # gemma3n
+1204:    A_ENC_FFN_GATE_1      = auto() # lfm2, gemma3n
+1205:    A_ENC_FFN_DOWN_1      = auto() # lfm2, gemma3n
+1206-    A_ENC_DOWNSAMPLE_CONV = auto() # mimo-audio-tokenizer: post-transformer downsample conv
+1207-    A_ENC_DOWNSAMPLE_NORM = auto() # mimo-audio-tokenizer: post-transformer downsample norm
+--
+1229-    A_GEN_CODE_FFN_DOWN    = auto()
+1230-    A_GEN_CODE_OUTPUT_NORM = auto()
+1231:    A_GEN_CODE_ATTN_GATE   = auto() # lfm3a: per-head sigmoid gate on the attention output
+1232:    A_GEN_CODE_HEAD_NORM   = auto() # lfm3a: per-codebook norm before the output head, merged 2D [n_codebooks, dim]
+1233:    A_GEN_CODE_MASK_EMBD   = auto() # lfm3a: MaskGIT mask embedding
+1234-    # qwen3tts code2wav: RVQ codes -> raw PCM
+1235-    A_GEN_WAV_QUANT_FIRST_IN       = auto() # semantic RVQ, in_proj (1x1 conv, loaded as 2D)
+--
+1254-    A_GEN_WAV_TFM_FFN_DOWN         = auto()
+1255-    A_GEN_WAV_TFM_FFN_SCALE        = auto() # layer scale (gamma) on the FFN output
+1256:    A_GEN_WAV_TFM_ATTN_Q_NORM      = auto() # lfm3a
+1257:    A_GEN_WAV_TFM_ATTN_K_NORM      = auto() # lfm3a
+1258:    A_GEN_WAV_TFM_CONV_PW1         = auto() # lfm3a: short conv in_proj
+1259:    A_GEN_WAV_TFM_CONV_DW          = auto() # lfm3a: short conv depthwise kernel
+1260:    A_GEN_WAV_TFM_CONV_PW2         = auto() # lfm3a: short conv out_proj
+1261:    A_GEN_WAV_TFM_ATTN_GATE        = auto() # lfm3a: per-head sigmoid gate on the attention output
+1262:    A_GEN_WAV_TFM_ATTN_POST_NORM   = auto() # lfm3a: sandwich norm after the operator
+1263:    A_GEN_WAV_TFM_FFN_POST_NORM    = auto() # lfm3a: sandwich norm after the FFN
+1264-    A_GEN_WAV_UP_CONV              = auto() # causal ConvTranspose1d, 2x upsample
+1265-    A_GEN_WAV_UP_DWCONV            = auto() # ConvNeXt depthwise conv
+--
+1376-    LILICORR_IN_HEAD              = auto()
+1377-    LILICORR_ANCHOR_OUT_HEAD      = auto()
+1378:    # lfm2 audio
+1379-    A_ENC_NORM_CONV        = auto()
+1380-    A_ENC_LINEAR_POS       = auto()
+--
+1542-    MODEL_ARCH.SMOLLM3:          "smollm3",
+1543-    MODEL_ARCH.GPT_OSS:          "gpt-oss",
+1544:    MODEL_ARCH.LFM2:             "lfm2",
+1545:    MODEL_ARCH.LFM2MOE:          "lfm2moe",
+1546:    MODEL_ARCH.LFM3:             "lfm3",
+1547-    MODEL_ARCH.DREAM:            "dream",
+1548-    MODEL_ARCH.SMALLTHINKER:     "smallthinker",
+--
+2172-    MODEL_TENSOR.A_PER_DIM_K_SCALE:         "a.blk.{bid}.per_dim_k_scale", # gemma4
+2173-    MODEL_TENSOR.A_PER_DIM_SCALE:           "a.blk.{bid}.per_dim_scale",   # gemma4
+2174:    # lfm2 audio
+2175-    MODEL_TENSOR.A_ENC_NORM_CONV:           "a.blk.{bid}.norm_conv",
+2176-    MODEL_TENSOR.A_ENC_LINEAR_POS:          "a.blk.{bid}.linear_pos",
+--
+6543-    VLLM_DECISION2 = "vllm-decision2"  # head over the end token of each option and the last token, one score per option
+6544-    VLLM_D3 = "vllm-d3"  # same as pplx-decider, non-causal attention
+6545:    LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
+6546:    LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
+6547:    LFM3_D1 = "lfm3-d1"  # same as lfm2-d1 on LFM3-VL, full attention layers read the prompt both ways
+6548:    LFM3_D1_OMNI = "lfm3-d1-omni"  # same as lfm3-d1 on LFM3-Omni
+6549-    GRANITE_SWITCH = "granite-switch"  # same as openjev, run by the decision aLoRA of granite switch
+6550-    H2O_LIGHTNING = "h2o-lightning"  # same as openjev, labels read after an answer prefill
+--
+6579-    VOXTRAL_RT = "voxtral_rt"
+6580-    MERALION = "meralion"  # audio: Whisper + gated MLP adaptor
+6581:    LFM2 = "lfm2"
+6582:    LFM3VL = "lfm3vl"
+6583-    KIMIVL = "kimivl"
+6584-    PADDLEOCR = "paddleocr"
+--
+6594-    DEEPSEEK4V = "deepseek4v"
+6595-    DEEPSEEK41V = "deepseek41v"
+6596:    LFM2A = "lfm2a" # audio
+6597:    LFM3A = "lfm3a" # audio
+6598:    LFM3A_GEN = "lfm3a_gen" # audio generation: MaskGIT depthformer + liquid-codec decoder
+6599-    MUSIC_FLAMINGO = "musicflamingo" # audio
+6600-    GLM4V = "glm4v"
+--
+6620-    MUSE_GLIMMER   = "muse-glimmer"
+6621-    COHERE2V       = "cohere2v"
+6622:    D1OMNI_V       = "d1omni_v"  # lfm2 vision, without separator tokens
+6623:    D1OMNI_A       = "d1omni_a"  # lfm2a audio, with a residual block after the projector
+6624-    MUSE_SPARK_AUDIO = "muse-spark-audio"
+6625-

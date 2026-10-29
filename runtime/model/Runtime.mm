@@ -79,7 +79,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
-  Impl::VisionRollback rollback{*impl_, impl_->vision};
+  Impl::VisionRollback rollback{*impl_, impl_->vision, impl_->audio};
   StateAdmission admission = admitIdleLane(
       impl_->states, [&](uint32_t lane) { return beginAt(request, lane); });
   rollback.committed = admission.granted();
@@ -118,16 +118,18 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   if (request.prompt.size() < entry.promptTokens) {
     throw std::invalid_argument("recomputed history cannot shorten the prompt");
   }
-  Impl::VisionRollback rollback{*impl_, impl_->vision};
+  Impl::VisionRollback rollback{*impl_, impl_->vision, impl_->audio};
   std::vector<Impl::ImageState> images;
+  std::vector<Impl::AudioState> audios;
   StateAdmission admission = admitIdleLane(impl_->states, [&](uint32_t lane) {
-    return impl_->activate(request, lane, images);
+    return impl_->activate(request, lane, images, audios);
   });
   if (admission.granted()) {
     entry.stateLane = *admission.lane;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.images = std::move(images);
+    entry.audios = std::move(audios);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
     impl_->seedNgramHistory(entry, request.prompt);
@@ -153,12 +155,15 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.scoreTokens.assign(request.scoreTokens.begin(),
                            request.scoreTokens.end());
   std::vector<Impl::ImageState> images;
-  const StateAdmission admission = impl_->activate(request, stateLane, images);
+  std::vector<Impl::AudioState> audios;
+  const StateAdmission admission =
+      impl_->activate(request, stateLane, images, audios);
   if (!admission.granted())
     return admission;
   entry.stateLane = stateLane;
   entry.resident = true;
   entry.images = std::move(images);
+  entry.audios = std::move(audios);
   entry.restoredTokens = request.restoredTokens;
   impl_->bindPenalties(entry, request.prompt);
   impl_->seedNgramHistory(entry, request.prompt);
@@ -214,6 +219,63 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
     entry.pendingToken.reset();
   }
   entry.draftContextPlan.reset();
+}
+
+ops::LfmSpeechGen &Runtime::Impl::speechGen(Request &entry) {
+  if (!entry.speechGen) {
+    if (!speechWeights)
+      throw std::logic_error("speech slot without a speech tower");
+    entry.speechGen = std::make_shared<ops::LfmSpeechGen>(
+        *speechWeights, entry.sampling.seed);
+  }
+  return *static_cast<ops::LfmSpeechGen *>(entry.speechGen.get());
+}
+
+void Runtime::Impl::beginSpeechGeneration(Request &entry, uint32_t lane,
+                                          ModelStepResult &result) {
+  // The last prompt row's hidden state is the first frame's h_state, as
+  // the reference generate() samples it: no text token is emitted for the
+  // slot (its placeholder anchor rides the next decode's output, like
+  // every later frame's).
+  captureFinalHidden(entry, lane);
+  const uint32_t hidden = geometry.target.hiddenSize;
+  std::vector<float> h(hidden);
+  for (uint32_t d = 0; d < hidden; ++d) {
+    const uint32_t bits = uint32_t{entry.finalTargetHidden[d]} << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    h[d] = f;
+  }
+  entry.finalTargetHidden.clear();
+  auto &s = entry.speech;
+  s.mode = 1;
+  ops::LfmSpeechGen &gen = speechGen(entry);
+  std::array<int32_t, ops::LfmSpeechGen::kCodebooks> codes{};
+  bool eos = false;
+  std::vector<float> fb;
+  if (!gen.sampleFrame(h, codes, eos, fb)) {
+    result.failure = "speech weights are unavailable";
+    return;
+  }
+  const auto bf16 = [](float v) {
+    const uint32_t bits = std::bit_cast<uint32_t>(v);
+    return static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1)) >> 16);
+  };
+  s.feedback.resize(hidden);
+  for (uint32_t d = 0; d < hidden; ++d)
+    s.feedback[d] = bf16(fb[d]);
+  std::memcpy(speechFeedbackBuffer(entry).contents(), s.feedback.data(),
+              hidden * sizeof(uint16_t));
+  result.audioPcm = eos ? gen.flush() : gen.decodeFrame(codes);
+  ++s.frames;
+  const uint32_t placeholder = kSpeechAudioOut;
+  commitSelected(entry, {&placeholder, 1});
+  if (eos) {
+    // The end-of-audio frame's feedback still feeds the next position;
+    // the state returns to text, as the decode slot's transition does.
+    s.mode = 0;
+    s.speaking = false;
+  }
 }
 
 void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
@@ -428,8 +490,27 @@ Runtime::prefillAsync(const BatchPlan &plan,
           }
           result.finished = true;
         } else if (selected) {
-          impl->commitSelected(entry, {&*selected, 1});
-          impl->emitTerminalAnchor(entry, result);
+          // A prompt that ends on an audio marker opens the speech state
+          // machine instead of taking the lm_head's first token: AUDIO
+          // samples its first frame from the last prompt row now; MIXED
+          // opens with a six-slot text block the text path counts down.
+          const uint32_t lastPrompt =
+              item.inputTokens.empty() ? 0 : item.inputTokens.back();
+          if (impl->speechWeights &&
+              (lastPrompt == Impl::kSpeechAudioStart ||
+               lastPrompt == Impl::kSpeechAudioOut)) {
+            impl->beginSpeechGeneration(entry, lane, result);
+          } else {
+            if (impl->speechWeights &&
+                lastPrompt == Impl::kSpeechMixedStart) {
+              entry.speech.mode = 2;
+              entry.speech.slotsLeft = 6;
+              entry.speech.speaking = false;
+              entry.speech.textDone = false;
+            }
+            impl->commitSelected(entry, {&*selected, 1});
+            impl->emitTerminalAnchor(entry, result);
+          }
         } else if (!impl->diffusion) {
           // The first token waits for the request's first mask. A replay
           // never gets here: it keeps its stage, and a request that holds
@@ -539,6 +620,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
     proposals[lane] =
         std::min(budget, laneResult.maximumRetained - 1);
     liveRows[lane] = proposals[lane] + 1;
+    // An audio slot is a single host-controlled position: the lm_head
+    // output is discarded, so the lane verifies its anchor alone and the
+    // draft machinery never proposes or accepts rows for it. Its anchor's
+    // KV was already committed — the placeholder position's own row is
+    // the re-forward whose input the feedback patch supplies.
+    if (impl_->speechAudioSlot(entry)) {
+      proposals[lane] = 0;
+      liveRows[lane] = 1;
+    }
     // A Null draft's n-gram proposals carry no draft probabilities, so a
     // sampled lane cannot verify them: it decodes its anchor row alone.
     if (std::holds_alternative<NullDraft>(impl_->draftModel) &&
@@ -797,6 +887,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width, 1,
                                 impl_->geometry.draft.verifyRows());
+    // Audio slots: overwrite the anchor row's gathered embedding with the
+    // last frame's feedback row — identical to the KV commit's semantics
+    // (the placeholder position's KV keeps its injected value).
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Impl::Request &entry = impl_->request(items[lane].requestId);
+      if (!impl_->speechPatchAnchor(entry))
+        continue;
+      ops::RowCopy::add(
+          commandGraph, impl_->speechFeedbackBuffer(entry),
+          {0, impl_->geometry.target.hiddenSize, 0},
+          impl_->decodeArena->get(lane, DecodeTensor::Hidden0),
+          {0, impl_->geometry.target.hiddenSize, 0}, 1,
+          impl_->geometry.target.hiddenSize);
+    }
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false,
                                           {liveRows.data(), width});
     impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, false,
@@ -1116,7 +1220,7 @@ ModelBatchItem warmupItem(uint64_t id, uint64_t position, uint32_t tokens,
   return {.requestId = id,
           .logicalPosition = position,
           .tokenCount = tokens,
-          .pageTable = pages,
+          .pageTable = std::vector<uint32_t>(pages.begin(), pages.end()),
           .pageTableRevision = 1};
 }
 

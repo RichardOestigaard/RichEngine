@@ -103,3 +103,50 @@ struct BlockIndexerBlock {
 
 static_assert(sizeof(BlockIndexerBlock) == 16,
               "block indexer blocks are 16 bytes on both sides");
+
+// The fused selection's threads, a threadgroup per row like the select
+// kernel's (block_indexer_topk, RICHENGINE_QSA_FUSED_TOPK): it scores the
+// row's complete blocks and writes its bitmap in one dispatch. Blocks each
+// thread scores itself stay in a local run of this many; a row with more
+// blocks falls back to the score+select pair.
+#define BLOCK_INDEXER_TOPK_THREADS 1024u
+#define BLOCK_INDEXER_TOPK_LOCAL 16u
+
+// block_indexer_topk's parameters: the selection half of
+// BlockIndexerParams (the score scratch needs none), plus the optional
+// post-selection window (RICHENGINE_QSA_DECODE_WINDOW: keep only a row's
+// newest `window_blocks` complete blocks and its first `sink_blocks`,
+// Kara-style; both zero selects the plain top-k) and `prefilter`, a
+// LOCKS-style page probe pass (RICHENGINE_QSA_LOCKS: only blocks of the
+// pages whose first block probes highest are scored; experimental).
+struct BlockIndexerTopkParams {
+  uint32_t lanes;
+  uint32_t rows;
+  uint32_t first_position[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t top_blocks;
+  uint32_t mask_words;
+  uint32_t score_stride;
+  uint32_t index_offset;
+  uint32_t window_blocks;
+  uint32_t sink_blocks;
+  uint32_t prefilter;
+};
+
+static_assert(sizeof(BlockIndexerTopkParams) == 36 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
+              "block indexer topk parameters are the same size on both sides");
+
+// block_indexer_window's parameters: the decode-time window over an
+// already-selected mask (ops::BlockIndexer::addWindow), keeping a row's
+// tail and its blocks below `sink_blocks` or at and past
+// `complete - window_blocks`.
+struct BlockIndexerWindowParams {
+  uint32_t lanes;
+  uint32_t rows;
+  uint32_t first_position[RICHENGINE_MAXIMUM_BATCH_WIDTH];
+  uint32_t mask_words;
+  uint32_t window_blocks;
+  uint32_t sink_blocks;
+};
+
+static_assert(sizeof(BlockIndexerWindowParams) == 20 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
+              "block indexer window parameters are the same size on both sides");

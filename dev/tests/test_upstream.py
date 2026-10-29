@@ -155,8 +155,10 @@ class UpstreamTest(unittest.TestCase):
             source_path.read_text() for source_path in sorted(families_dir.glob("*.mm"))
         )
         rows = re.findall(
-            r'registerModelFamily\(\s*\{\s*"([^"]+)",\s*"([^"]+)",\s*"[^"]*"',
+            r'^\s*registerModelFamily\(\s*\{.*?\.name\s*=\s*"([^"]+)".*?'
+            r'\.modelType\s*=\s*"([^"]+)"',
             source,
+            re.MULTILINE | re.DOTALL,
         )
         table = {name: model_type for name, model_type in rows}
         installer = {
@@ -164,7 +166,7 @@ class UpstreamTest(unittest.TestCase):
             for family in families.FAMILIES
         }
         legacy_names = set(
-            re.findall(r'// Legacy alias[^}]*\{"([^"]+)"', source)
+            re.findall(r'// Legacy alias[^}]*\.name\s*=\s*"([^"]+)"', source)
         )
         extra = set(table) - set(installer)
         self.assertLessEqual(extra, legacy_names)

@@ -431,3 +431,243 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
     before += popcount(equals);
   }
 }
+
+// The index plane's keys addressed like indexer_index_keys, but through the
+// fused kernel's parameters (its index_offset field).
+inline device bfloat *indexer_index_keys_topk(RichKvPage entry, uint index_offset) {
+  const uint index = richengine_kv_page_index(entry);
+  return reinterpret_cast<device bfloat *>(richengine_kv_extent(entry, index) + index_offset) +
+         ulong(index) * kPageBlocks * kDimension;
+}
+
+// A row's decoded mask under the decode-time window: its blocks before
+// sink_blocks or at and after complete - window_blocks survive, the tail
+// bit always does (block_indexer_window, ops::BlockIndexer::addWindow).
+kernel void block_indexer_window(device uint *mask [[buffer(0)]],
+                                 constant BlockIndexerWindowParams &p [[buffer(1)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+  const uint batch = group.y;
+  if (group.x >= p.rows || batch >= min(p.lanes, RICHENGINE_MAXIMUM_BATCH_WIDTH))
+    return;
+  const uint complete = (p.first_position[batch] + group.x + 1) / kBlock;
+  if (complete <= p.window_blocks + p.sink_blocks) return;
+  const uint words = min(p.mask_words, (complete + BLOCK_INDEXER_TILE_SLACK) / 32 + 1);
+  device uint *bits = mask + (ulong(batch) * p.rows + group.x) * p.mask_words;
+  const uint hi = complete - p.window_blocks;
+  for (uint w = tid; w < words; w += BLOCK_INDEXER_TOPK_THREADS) {
+    const uint first = w * 32;
+    const uint d0 = max(first, p.sink_blocks), d1 = min(first + 32, hi);
+    if (d0 < d1)
+      bits[w] &= ~(((d1 - d0) >= 32 ? ~0u : (1u << (d1 - d0)) - 1u) << (d0 - first));
+  }
+}
+
+// Fused score and select (ops::BlockIndexer::addTopk): one threadgroup per
+// row scores its complete blocks' pooled keys into the score scratch —
+// strided, one dot per head per block per thread — then selects its top
+// blocks exactly as block_indexer_select does, in the same radix passes
+// and the same earliest-first tie order. A threadgroup-local page probe
+// pass runs first when the parameters' prefilter is set (LOCKS-style:
+// pages whose first block probes below the kept pages' threshold score no
+// blocks). The window fields fold the decode-time window into the emit.
+kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
+                               device const RichKvPage *index_table0 [[buffer(1)]],
+                               device const RichKvPage *index_table1 [[buffer(2)]],
+                               device const RichKvPage *index_table2 [[buffer(3)]],
+                               device const RichKvPage *index_table3 [[buffer(4)]],
+                               device float *scores [[buffer(5)]],
+                               device uint *mask [[buffer(6)]],
+                               constant BlockIndexerTopkParams &p [[buffer(7)]],
+                               uint2 group [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kThreads = BLOCK_INDEXER_TOPK_THREADS;
+  constexpr uint kBins = 1u << kSelectBits;
+  constexpr uint kLocal = BLOCK_INDEXER_TOPK_LOCAL;
+  const uint batch = group.y;
+  if (group.x >= p.rows || batch >= min(p.lanes, RICHENGINE_MAXIMUM_BATCH_WIDTH))
+    return;
+  const uint row = group.x;
+  const uint complete = (p.first_position[batch] + row + 1) / kBlock;
+  const uint words = min(p.mask_words, (complete + BLOCK_INDEXER_TILE_SLACK) / 32 + 1);
+  device uint *bits = mask + (ulong(batch) * p.rows + row) * p.mask_words;
+  if (complete <= p.top_blocks) {
+    for (uint w = tid; w < words; w += kThreads) {
+      const uint first = w * 32;
+      const uint end = complete + 1;
+      bits[w] = first >= end ? 0u : (end - first >= 32 ? ~0u : (1u << (end - first)) - 1u);
+    }
+    return;
+  }
+  threadgroup atomic_uint histogram[kBins];
+  threadgroup uint candidates[kCandidates];
+  threadgroup atomic_uint candidate_count;
+  threadgroup uint simd_counts[kThreads / 32];
+  threadgroup uint threshold[3];
+  // The row's query heads, staged as floats once for the whole score pass.
+  threadgroup float q[kHeads * kDimension];
+  device const bfloat *qrow =
+      queries + (ulong(batch) * p.rows + row) * kHeads * kDimension;
+  for (uint i = tid; i < kHeads * kDimension; i += kThreads) q[i] = float(qrow[i]);
+  threadgroup atomic_uint pageAllow[(kLocal * kThreads / kPageBlocks + 31) / 32];
+  for (uint i = tid; i < (kLocal * kThreads / kPageBlocks + 31) / 32; i += kThreads)
+    atomic_store_explicit(&pageAllow[i], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device const RichKvPage *index_table =
+      RICHENGINE_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
+  device float *s = scores + (ulong(batch) * p.rows + row) * p.score_stride;
+  const auto keyOf = [&](uint block) -> device const bfloat * {
+    return indexer_index_keys_topk(index_table[block / kPageBlocks], p.index_offset) +
+           (block % kPageBlocks) * kDimension;
+  };
+  // The page probe pass (prefilter): each page's first block's score picks
+  // the pages whose blocks get scored — the kept pages' probe threshold
+  // keeps at least twice the wanted blocks' pages, plus the first page.
+  if (p.prefilter) {
+    const uint pages = (complete + kPageBlocks - 1) / kPageBlocks;
+    threadgroup float probes[(kLocal * kThreads / kPageBlocks + 31) / 32 * 32];
+    for (uint page = tid; page < pages; page += kThreads) {
+      const uint probeBlock = min(page * kPageBlocks, complete - 1);
+      device const bfloat *k = keyOf(probeBlock);
+      float score = 0.0f;
+      for (uint h = 0; h < kHeads; ++h) {
+        float dot = 0.0f;
+        for (uint d = 0; d < kDimension; ++d) dot += q[h * kDimension + d] * float(k[d]);
+        score += max(dot, 0.0f);
+      }
+      probes[page] = score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < kBins; i += kThreads)
+      atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint page = tid; page < pages; page += kThreads) {
+      const uint v = as_type<uint>(probes[page]);
+      atomic_fetch_add_explicit(&histogram[v >> 21], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint wantedPages =
+        min(pages, (2 * p.top_blocks + kPageBlocks - 1) / kPageBlocks + 1);
+    indexer_threshold(histogram, kBins, wantedPages, simd_counts, threshold,
+                      tid, lane, sg);
+    const uint probePrefix = threshold[0];
+    for (uint page = tid; page < pages; page += kThreads) {
+      const uint v = as_type<uint>(probes[page]);
+      if (page == 0 || (v >> 21) >= probePrefix)
+        atomic_fetch_or_explicit(&pageAllow[page / 32], 1u << (page % 32),
+                                 memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const auto allowed = [&](uint block) -> bool {
+    return !p.prefilter ||
+           (atomic_load_explicit(&pageAllow[(block / kPageBlocks) / 32],
+                                 memory_order_relaxed) &
+            (1u << ((block / kPageBlocks) % 32)));
+  };
+  // The score pass: each thread scores its strided run of the complete
+  // blocks straight into the score scratch.
+  const float norm = rsqrt(float(kDimension));
+  for (uint b = tid; b < complete; b += kThreads) {
+    if (!allowed(b)) {
+      s[b] = 0.0f;
+      continue;
+    }
+    device const bfloat *k = keyOf(b);
+    float score = 0.0f;
+    for (uint h = 0; h < kHeads; ++h) {
+      float dot = 0.0f;
+      for (uint d = 0; d < kDimension; ++d) dot += q[h * kDimension + d] * float(k[d]);
+      score += max(dot, 0.0f);
+    }
+    s[b] = score * norm;
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  // The selection: the select kernel's radix passes and its emit, the
+  // optional window applied where a bit could rise.
+  uint prefix = 0, prefix_mask = 0, wanted = p.top_blocks;
+  bool gathered = false, all = false;
+  for (int high = 30; high >= 0 && !all; high -= int(kSelectBits)) {
+    const uint width = min(kSelectBits, uint(high) + 1), shift = uint(high) + 1 - width;
+    const uint bins = 1u << width;
+    for (uint i = tid; i < kBins; i += kThreads)
+      atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gathered) {
+      const uint count = atomic_load_explicit(&candidate_count, memory_order_relaxed);
+      for (uint i = tid; i < count; i += kThreads) {
+        const uint v = candidates[i];
+        if ((v & prefix_mask) == prefix)
+          atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u,
+                                    memory_order_relaxed);
+      }
+    } else {
+      for (uint b = tid; b < complete; b += kThreads) {
+        if (!allowed(b)) continue;
+        const uint v = as_type<uint>(s[b]);
+        if ((v & prefix_mask) == prefix)
+          atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u,
+                                    memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    indexer_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
+    prefix |= threshold[0] << shift;
+    prefix_mask |= (bins - 1) << shift;
+    wanted = threshold[1];
+    all = threshold[2];
+    if (high == 30 && !all && atomic_load_explicit(&histogram[threshold[0]], memory_order_relaxed) <= kCandidates) {
+      if (tid == 0) atomic_store_explicit(&candidate_count, 0u, memory_order_relaxed);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint b = tid; b < complete; b += kThreads) {
+        if (!allowed(b)) continue;
+        const uint v = as_type<uint>(s[b]);
+        if ((v & prefix_mask) == prefix)
+          candidates[atomic_fetch_add_explicit(&candidate_count, 1u, memory_order_relaxed)] = v;
+      }
+      gathered = true;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  constexpr uint kSimdgroups = kThreads / 32;
+  const uint per = (words + kSimdgroups - 1) / kSimdgroups;
+  const uint w0 = min(sg * per, words), w1 = min(w0 + per, words);
+  const uint windowHi = p.window_blocks && complete > p.window_blocks
+                            ? complete - p.window_blocks
+                            : 0u;
+  const auto kept = [&](uint b) -> bool {
+    if (!allowed(b)) return false;
+    if (windowHi) return b < p.sink_blocks || b >= windowHi;
+    return true;
+  };
+  uint before = 0;
+  if (!all) {
+    uint equal = 0;
+    for (uint w = w0; w < w1; ++w) {
+      const uint b = w * 32 + lane;
+      equal += b < complete && kept(b) &&
+                       (as_type<uint>(s[b]) & prefix_mask) == prefix
+                   ? 1u
+                   : 0u;
+    }
+    equal = simd_sum(equal);
+    if (lane == 0) simd_counts[sg] = equal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = 0; g < sg; ++g) before += simd_counts[g];
+  }
+  for (uint w = w0; w < w1; ++w) {
+    const uint b = w * 32 + lane;
+    const uint v = b < complete ? as_type<uint>(s[b]) & prefix_mask : 0u;
+    const bool equal = b < complete && v == prefix;
+    const uint equals = uint(static_cast<simd_vote::vote_t>(simd_ballot(equal && kept(b))));
+    const bool take =
+        kept(b) && ((b < complete && v > prefix) ||
+                    (equal && (all || before + popcount(equals & ((1u << lane) - 1u)) < wanted)));
+    uint word = uint(static_cast<simd_vote::vote_t>(simd_ballot(take)));
+    if (w == complete / 32) word |= 1u << (complete % 32);
+    if (lane == 0) bits[w] = word;
+    before += popcount(equals);
+  }
+}

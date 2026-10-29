@@ -16,8 +16,11 @@ from pathlib import Path
 
 from . import constraints, decisions, json_codec, judgments
 from . import dfa as dfa_compiler
+from . import audio as audio_input
 from . import images as image_input
+from . import video as video_input
 from . import protocol as wire
+from . import serving as serving_mod
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
     canonical_responses_input,
@@ -311,6 +314,10 @@ SHARED_PREFIX_PROBE = {"role": "user", "content": "⁣"}
 
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__richengine_image_{secrets.token_hex(16)}__"
+AUDIO_RENDER_MARKER = f"__richengine_audio_{secrets.token_hex(16)}__"
+VIDEO_RENDER_MARKER = f"__richengine_video_{secrets.token_hex(16)}__"
+AUDIO_PAD_TOKEN = "<|audio|>"
+VIDEO_PAD_TOKEN = "<|video|>"
 
 
 def _generation_prompt(
@@ -451,6 +458,10 @@ class RenderedPrompt:
     # Leading tokens other requests with the same system prompt and tools
     # share; zero unless requested, or when an image lies within them.
     shared_prefix_tokens: int = 0
+    audios: list = field(default_factory=list)
+    audio_positions: list[int] = field(default_factory=list)
+    videos: list = field(default_factory=list)
+    video_positions: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -469,6 +480,7 @@ class Frontend:
     # Class-level fallbacks for harnesses that bypass __init__ (tests): the
     # served model's contract overrides each at construction.
     image_pad_token = IMAGE_PAD_TOKEN
+    audio_pad_token = AUDIO_PAD_TOKEN
     image_geometry = image_input.DEFAULT_GEOMETRY
     sampling_defaults: dict = {}
     serving_dialect = None
@@ -488,6 +500,8 @@ class Frontend:
         chat_templates,
         thinking_codec,
         vision,
+        audio=False,
+        speech=False,
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
@@ -501,6 +515,15 @@ class Frontend:
         # Announced by the engine in its Ready event. Without it, message
         # normalization rejects image and PDF input before any decoding.
         self.vision = vision
+        # The same Ready event's audio capability: the lfm3a omni encoder.
+        self.audio = audio
+        # Its speech capability: generated audio frames stream as PCM.
+        self.speech = speech
+        # Video needs the vision tower's temporal pair path (protocol 9)
+        # and a serving contract that declares the pipeline's geometry.
+        self.video = bool(
+            vision and serving is not None and serving.video is not None
+        )
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         # Probed at startup; requests choose among these, never the
@@ -541,6 +564,20 @@ class Frontend:
             serving.vision.pad_token
             if serving is not None and serving.vision is not None
             else IMAGE_PAD_TOKEN
+        )
+        self.audio_pad_token = (
+            serving.audio.pad_token
+            if serving is not None and serving.audio is not None
+            else AUDIO_PAD_TOKEN
+        )
+        self.video_pad_token = (
+            serving.video.pad_token
+            if serving is not None and serving.video is not None
+            else VIDEO_PAD_TOKEN
+        )
+        self.video_spec = (
+            serving.video if serving is not None and serving.video is not None
+            else serving_mod.VideoSpec()
         )
         self.image_geometry = (
             image_input.ImageGeometry(
@@ -596,8 +633,19 @@ class Frontend:
         self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
-        self.max_image_pixels = max_image_pixels
+        # The tower's own cap wins where the family's serving spec states
+        # one below the --max-image-pixels default (LFM3-VL: 2 Mi pixels).
+        self.max_image_pixels = min(
+            max_image_pixels,
+            serving.vision.max_pixels
+            if serving is not None
+            and serving.vision is not None
+            and serving.vision.max_pixels is not None
+            else image_input.MAX_PIXELS,
+        )
         self.images = image_input.ImageCache(self.image_geometry)
+        self.audios = audio_input.AudioCache()
+        self.videos = video_input.VideoCache()
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         # RICHENGINE_SYSTEMONE_WINDOW caps /v1/systemone's in-flight
@@ -655,7 +703,14 @@ class Frontend:
     @property
     def input_modalities(self):
         """The one list /status, /v1/models and client setup report."""
-        return ["text", "image", "pdf"] if self.vision else ["text"]
+        modalities = ["text"]
+        if self.vision:
+            modalities += ["image", "pdf"]
+        if self.audio:
+            modalities.append("audio")
+        if self.video:
+            modalities.append("video")
+        return modalities
 
     def status(self):
         status = self.backend.status()
@@ -673,7 +728,9 @@ class Frontend:
             self.constraint_factory, "resolved_dfa_mode", constraints.dfa_mode
         )()
         status["response_store"] = self.response_store.stats()
+        status["audio"] = self.audio
         status["image_cache"] = self.images.stats()
+        status["audio_cache"] = self.audios.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
         return status
@@ -716,6 +773,83 @@ class Frontend:
                 raise APIError(400, str(error)) from error
         return prepared
 
+    def _prepare_audio(self, messages, deadline):
+        """Prepared audio clips in template render order: canonical
+        {type: audio} parts in message order."""
+        parts = [
+            part
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "audio"
+        ]
+        limit = wire.MAX_AUDIO_SPANS
+        if len(parts) > limit:
+            raise APIError(400, f"requests support at most {limit} audio clips")
+        prepared = self.audios.request_batch()
+        tokens = mel_bytes = 0
+        for part in parts:
+            remaining_request_time(deadline)
+            try:
+                payload = audio_input.decode_data_url(part["audio"]["data"])
+                clip = self.audios.prepare(payload)
+                tokens += clip.tokens
+                mel_bytes += len(clip.mel)
+                self._check_audio_request_size(tokens, len(prepared) + 1, mel_bytes)
+                prepared.append(clip)
+            except audio_input.AudioCapacityError as error:
+                raise APIError(503, str(error), "frontend_overloaded") from error
+            except audio_input.AudioError as error:
+                raise APIError(400, str(error)) from error
+        return prepared
+
+    def _prepare_videos(self, messages, deadline):
+        """Prepared videos in template render order: canonical
+        {type: video} parts in message order."""
+        parts = [
+            part
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "video"
+        ]
+        if len(parts) > 8:
+            raise APIError(400, "requests support at most 8 videos")
+        prepared = self.videos.request_batch()
+        for part in parts:
+            remaining_request_time(deadline)
+            try:
+                video_url = part.get("video_url") or {}
+                soundtrack = bool(video_url.get("use_audio_in_video"))
+                if soundtrack and not self.audio:
+                    raise video_input.VideoError(
+                        "use_audio_in_video needs the audio encoder "
+                        "(the model is serving without one)"
+                    )
+                payload = video_input.decode_data_url(video_url.get("url"))
+                prepared.append(
+                    self.videos.prepare(
+                        payload, self.video_spec, soundtrack=soundtrack
+                    )
+                )
+            except video_input.VideoCapacityError as error:
+                raise APIError(503, str(error), "frontend_overloaded") from error
+            except video_input.VideoError as error:
+                raise APIError(400, str(error)) from error
+        return prepared
+
+    def _check_audio_request_size(self, tokens, audio_count, mel_bytes):
+        if tokens >= self.max_context:
+            raise ContextLengthError(tokens, self.max_context - 1)
+        frame_bytes = (
+            wire.REQUEST_FIXED_BYTES
+            + 4 * tokens
+            + wire.AUDIO_SPAN_BYTES * audio_count
+            + mel_bytes
+        )
+        if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
+            raise APIError(400, "audio exceeds the request size limit")
+
     def _check_image_request_size(
         self,
         tokens,
@@ -738,82 +872,350 @@ class Frontend:
         if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")
 
-    def _render_image_tokens(self, messages, template):
+    @staticmethod
+    def _template_messages(messages, marked):
+        """Translate canonical media parts into the part types this template
+        renders. Omni-family templates handle "image"/"video"/"audio" parts
+        but not the OpenAI-style image_url/video_url names, which they would
+        serialize as JSON instead of emitting pad markers."""
+        aliases = {}
+        for ours, theirs in (
+            ("image_url", "image"),
+            ("video_url", "video"),
+            ("input_audio", "audio"),
+        ):
+            if f'"{ours}"' not in marked and f'"{theirs}"' in marked:
+                aliases[ours] = theirs
+        if not aliases:
+            return messages
+        translated = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                translated.append(message)
+                continue
+            parts = []
+            changed = False
+            for part in content:
+                alias = (
+                    aliases.get(part.get("type"))
+                    if isinstance(part, dict)
+                    else None
+                )
+                if alias:
+                    parts.append({"type": alias})
+                    changed = True
+                else:
+                    parts.append(part)
+            translated.append(
+                {**message, "content": parts} if changed else message
+            )
+        return translated
+
+    def _render_media_tokens(self, messages, template, images, audios, videos=()):
         """Track placeholders emitted by the template, not quoted in input text.
 
-        A temporary render marker is removed before tokenization, so the pinned
+        Temporary render markers are removed before tokenization, so the pinned
         template's final text and token IDs remain unchanged. Token offsets tie
-        each real image to its placeholder even when a coding agent has read
-        documentation or source containing literal vision tokens.
+        each real image or clip to its placeholder even when a coding agent has
+        read documentation or source containing literal media tokens.
         """
-        rendered = self._apply_chat_template(
-            messages,
-            {
-                **template,
-                "tokenize": False,
-                "chat_template": template["chat_template"].replace(
-                    self.image_pad_token, IMAGE_RENDER_MARKER
-                ),
-            },
+        marked = template["chat_template"].replace(
+            self.image_pad_token, IMAGE_RENDER_MARKER
         )
-        parts = rendered.split(IMAGE_RENDER_MARKER)
-        image_offsets = set()
-        offset = 0
-        for part in parts[:-1]:
-            offset += len(part)
-            image_offsets.add((offset, offset + len(self.image_pad_token)))
-            offset += len(self.image_pad_token)
-        rendered = self.image_pad_token.join(parts)
+        if audios:
+            marked = marked.replace(self.audio_pad_token, AUDIO_RENDER_MARKER)
+        if videos:
+            marked = marked.replace(self.video_pad_token, VIDEO_RENDER_MARKER)
+        rendered = self._apply_chat_template(
+            self._template_messages(messages, marked),
+            {**template, "tokenize": False, "chat_template": marked},
+        )
+        # Marker positions in the final string, pad tokens spliced in: each
+        # recorded span is where the pad token lands once markers leave.
+        image_offsets, audio_offsets, video_offsets = set(), set(), set()
+        parts, clean_len, cursor = [], 0, 0
+        while True:
+            at = {
+                marker: rendered.find(marker, cursor)
+                for marker in (
+                    IMAGE_RENDER_MARKER, AUDIO_RENDER_MARKER, VIDEO_RENDER_MARKER)
+            }
+            marker = min(
+                (m for m, where in at.items() if where >= 0),
+                key=lambda m: at[m],
+                default=None,
+            )
+            if marker is None:
+                break
+            at_ = at[marker]
+            # Lazy pad lookup: a frontend without a tower has no token id
+            # for its marker (which a template could only emit anyway when
+            # that media kind was marked).
+            if marker == IMAGE_RENDER_MARKER:
+                pad, which = self.image_pad_token, image_offsets
+            elif marker == AUDIO_RENDER_MARKER:
+                pad, which = self.audio_pad_token, audio_offsets
+            else:
+                pad, which = self.video_pad_token, video_offsets
+            parts.append(rendered[cursor:at_])
+            clean_len += at_ - cursor
+            which.add((clean_len, clean_len + len(pad)))
+            parts.append(pad)
+            clean_len += len(pad)
+            cursor = at_ + len(marker)
+        parts.append(rendered[cursor:])
+        clean = "".join(parts)
         encoded = self._tokenize(
-            rendered,
+            clean,
             add_special_tokens=False,
             return_offsets_mapping=True,
         )
-        positions = [
-            index
+        offsets = [
+            (index, tuple(span))
             for index, span in enumerate(encoded["offset_mapping"])
-            if tuple(span) in image_offsets
         ]
-        return list(encoded["input_ids"]), positions, rendered
+        image_positions = [i for i, span in offsets if span in image_offsets]
+        audio_positions = [i for i, span in offsets if span in audio_offsets]
+        video_positions = [i for i, span in offsets if span in video_offsets]
+        return (
+            list(encoded["input_ids"]),
+            image_positions,
+            audio_positions,
+            video_positions,
+            clean,
+        )
 
-    def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(self.image_pad_token)
-        if len(positions) != len(prepared) or any(
-            prompt_tokens[position] != pad_id for position in positions
+    def _render_image_tokens(self, messages, template, images=()):
+        """The image-only case of the media render: pad-marker positions in
+        the tokenized output, for tests and image-only callers."""
+        tokens, positions, _audio, _video, clean = self._render_media_tokens(
+            messages, template, images, ()
+        )
+        return tokens, positions, clean
+
+    def _image_token_count(
+        self,
+        prompt_tokens,
+        prepared,
+        positions,
+        audios=(),
+        audio_positions=(),
+        videos=(),
+        video_positions=(),
+        video_expansions=(),
+    ):
+        def pads_match(pad_attr, position_list, media):
+            # Lazy pad lookup: a frontend without a tower has no token id
+            # for it, and no positions can name it either.
+            if len(position_list) != len(media):
+                return False
+            if not position_list:
+                return True
+            pad_id = self.tokenizer.convert_tokens_to_ids(getattr(self, pad_attr))
+            return all(
+                prompt_tokens[position] == pad_id for position in position_list
+            )
+
+        if not (
+            pads_match("image_pad_token", positions, prepared)
+            and pads_match("audio_pad_token", audio_positions, audios)
+            and pads_match("video_pad_token", video_positions, videos)
         ):
-            raise APIError(400, "image count does not match the rendered template")
-        return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
+            raise APIError(400, "media count does not match the rendered template")
+        return (
+            len(prompt_tokens)
+            + sum(image.tokens - 1 for image in prepared)
+            + sum(clip.tokens - 1 for clip in audios)
+            + sum(len(expansion) - 1 for expansion in video_expansions)
+        )
 
-    def _expand_image_pads(self, prompt_tokens, prepared, positions):
-        """Widens the template's single placeholder per image to the image's
-        merged token count and returns the spans the engine injects into."""
-        token_count = self._image_token_count(prompt_tokens, prepared, positions)
+    def _video_expansions(self, videos):
+        """One video's placeholder expansion, per video: for each temporal
+        frame pair a timestamp text, an inner media span of pad tokens and,
+        when a soundtrack rides along, its interleaved audio pad run
+        (processing_lfm3_omni.py's _video_expansion; the pair consumes the
+        two temporal conv slices' frames)."""
+        expansions = []
+        for video in videos:
+            spec = video.geometry
+            start_id = self.tokenizer.convert_tokens_to_ids(
+                spec.vision_start_token
+            )
+            end_id = self.tokenizer.convert_tokens_to_ids(spec.vision_end_token)
+            if start_id is None or end_id is None:
+                raise APIError(
+                    400, "the tokenizer does not define the media span tokens"
+                )
+            bounds = video.soundtrack[2] if video.soundtrack else None
+            plan = []
+            for index, timestamp in enumerate(video.timestamps):
+                stamp = self._tokenize(
+                    f"<{timestamp:.1f} seconds>", add_special_tokens=False
+                )["input_ids"]
+                plan.append(("tokens", list(stamp)))
+                plan.append(("tokens", [start_id]))
+                plan.append(("pair", index, video.tokens))
+                plan.append(("tokens", [end_id]))
+                if bounds is not None:
+                    piece = bounds[index + 1] - bounds[index]
+                    if piece:
+                        plan.append(("sound", index, piece))
+            expansions.append(plan)
+        return expansions
+
+    def _expand_media_pads(
+        self,
+        prompt_tokens,
+        prepared,
+        positions,
+        audios,
+        audio_positions,
+        videos=(),
+        video_positions=(),
+    ):
+        """Widens each placeholder to its media's token count and returns the
+        spans and payloads the engine injects into, images, clips and video
+        frame pairs alike."""
+        video_expansions = self._video_expansions(videos)
+        token_count = self._image_token_count(
+            prompt_tokens,
+            prepared,
+            positions,
+            audios,
+            audio_positions,
+            videos,
+            video_positions,
+            video_expansions,
+        )
         # Validate lengths before expanding tokens or copying repeated pixels.
-        # HTTP body and image-cache limits do not bound decoded request size.
+        # HTTP body and media-cache limits do not bound decoded request size.
+        pair_count = sum(video.pairs for video in videos)
         self._check_image_request_size(
             token_count,
-            len(prepared),
-            sum(len(image.pixels) for image in prepared),
+            len(prepared) + pair_count,
+            sum(len(image.pixels) for image in prepared)
+            + sum(
+                len(pair_pixels)
+                for video in videos
+                for pair_pixels in video.pair_pixels
+            ),
         )
-        expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(self.image_pad_token)
-        for position, image in zip(positions, prepared):
-            expanded.extend(prompt_tokens[cursor:position])
-            spans.append(
-                wire.ImageSpan(
-                    len(expanded),
-                    image.tokens,
-                    image.grid_height,
-                    image.grid_width,
-                    image.digest_lo,
-                    image.digest_hi,
+        mel_bytes = sum(len(clip.mel) for clip in audios) + sum(
+            len(video.soundtrack[0]) for video in videos if video.soundtrack
+        )
+        piece_count = len(audios) + sum(
+            1
+            for video in videos
+            if video.soundtrack
+            for a, b in zip(video.soundtrack[2], video.soundtrack[2][1:])
+            if b - a
+        )
+        self._check_audio_request_size(token_count, piece_count, mel_bytes)
+        media = sorted(
+            [(position, "image", index) for index, position in enumerate(positions)]
+            + [
+                (position, "audio", index)
+                for index, position in enumerate(audio_positions)
+            ]
+            + [
+                (position, "video", index)
+                for index, position in enumerate(video_positions)
+            ]
+        )
+        expanded, image_spans, audio_spans, cursor = [], [], [], 0
+        # Pad ids resolve lazily per kind: a frontend without a tower has no
+        # token id for it, and no media of its kind can land here either.
+        pad_ids = {}
+
+        def pad_id(attr):
+            if attr not in pad_ids:
+                pad_ids[attr] = self.tokenizer.convert_tokens_to_ids(
+                    getattr(self, attr)
                 )
-            )
-            expanded.extend([pad_id] * image.tokens)
+            return pad_ids[attr]
+        import hashlib as _hashlib
+        for position, kind, index in media:
+            expanded.extend(prompt_tokens[cursor:position])
+            if kind == "image":
+                image = prepared[index]
+                image_spans.append(
+                    wire.ImageSpan(
+                        len(expanded),
+                        image.tokens,
+                        image.grid_height,
+                        image.grid_width,
+                        image.digest_lo,
+                        image.digest_hi,
+                    )
+                )
+                expanded.extend([pad_id("image_pad_token")] * image.tokens)
+            elif kind == "audio":
+                clip = audios[index]
+                audio_spans.append(
+                    wire.AudioSpan(
+                        len(expanded),
+                        clip.tokens,
+                        clip.mel_frames,
+                        clip.digest_lo,
+                        clip.digest_hi,
+                    )
+                )
+                expanded.extend([pad_id("audio_pad_token")] * clip.tokens)
+            else:
+                video = videos[index]
+                for step in video_expansions[index]:
+                    if step[0] == "tokens":
+                        expanded.extend(step[1])
+                    elif step[0] == "pair":
+                        lo, hi = video.pair_digests[step[1]]
+                        image_spans.append(
+                            wire.ImageSpan(
+                                len(expanded),
+                                video.tokens,
+                                video.grid_height,
+                                video.grid_width,
+                                lo,
+                                hi,
+                                frames=2,
+                            )
+                        )
+                        expanded.extend([pad_id("video_pad_token")] * video.tokens)
+                    else:
+                        mel, mel_frames, bounds = video.soundtrack
+                        begin = bounds[step[1]] * audio_input.ENCODER_STRIDE
+                        end = min(
+                            bounds[step[1] + 1] * audio_input.ENCODER_STRIDE,
+                            mel_frames,
+                        )
+                        slice_mel = mel[begin * 512 : end * 512]
+                        digest = _hashlib.sha256(slice_mel).digest()
+                        lo, hi = __import__("struct").unpack_from("<QQ", digest)
+                        audio_spans.append(
+                            wire.AudioSpan(
+                                len(expanded), step[2], end - begin, lo, hi
+                            )
+                        )
+                        expanded.extend([pad_id("audio_pad_token")] * step[2])
             cursor = position + 1
         expanded.extend(prompt_tokens[cursor:])
-        pixels = b"".join(image.pixels for image in prepared)
-        return expanded, tuple(spans), pixels
+        pixels = b"".join(image.pixels for image in prepared) + b"".join(
+            pair for video in videos for pair in video.pair_pixels
+        )
+        mel = b"".join(clip.mel for clip in audios) + b"".join(
+            video.soundtrack[0] for video in videos if video.soundtrack
+        )
+        return expanded, tuple(image_spans), pixels, tuple(audio_spans), mel
+
+    def _expand_image_pads(self, prompt_tokens, prepared, positions):
+        """The image-only case of the media expansion: placeholder widening,
+        the image spans and the concatenated pixels the engine injects."""
+        if len(positions) != len(prepared):
+            raise APIError(400, "image count does not match the rendered template")
+        expanded, spans, pixels, _audio_spans, _mel = self._expand_media_pads(
+            prompt_tokens, prepared, positions, (), ()
+        )
+        return expanded, spans, pixels
 
     def request_deadline(self, body, started_at):
         timeout = body.get("timeout")
@@ -914,7 +1316,14 @@ class Frontend:
             prompt = self._prepare_prompt(body, None, deadline=deadline)
             rendered = self._render_prompt(prompt, deadline, check_context=False)
             return self._image_token_count(
-                rendered.tokens, rendered.images, rendered.image_positions
+                rendered.tokens,
+                rendered.images,
+                rendered.image_positions,
+                rendered.audios,
+                rendered.audio_positions,
+                rendered.videos,
+                rendered.video_positions,
+                self._video_expansions(rendered.videos),
             )
 
     def tokenize(self, body, *, deadline):
@@ -1113,7 +1522,11 @@ class Frontend:
         messages = move_volatile_system_fields(
             template_messages(
                 normalize_messages(
-                    body.get("messages"), vision=self.vision, deadline=deadline
+                    body.get("messages"),
+                    vision=self.vision,
+                    deadline=deadline,
+                    audio=self.audio,
+                    video=self.video,
                 )
             )
         )
@@ -1238,14 +1651,26 @@ class Frontend:
             images = self._prepare_images(
                 prompt.messages, deadline, check_context=check_context
             )
+        with self.latencies.measure("audio"):
+            audios = self._prepare_audio(prompt.messages, deadline)
+        with self.latencies.measure("video"):
+            videos = self._prepare_videos(prompt.messages, deadline)
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(self.image_pad_token) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
+        if audios and self.tokenizer.convert_tokens_to_ids(self.audio_pad_token) is None:
+            raise APIError(400, "the tokenizer does not define the audio pad token")
+        if videos and self.tokenizer.convert_tokens_to_ids(self.video_pad_token) is None:
+            raise APIError(400, "the tokenizer does not define the video pad token")
         positions = []
+        audio_positions = []
+        video_positions = []
         try:
-            if images:
-                tokens, positions, rendered = self._render_image_tokens(
-                    prompt.messages, template
+            if images or audios or videos:
+                tokens, positions, audio_positions, video_positions, rendered = (
+                    self._render_media_tokens(
+                        prompt.messages, template, images, audios, videos
+                    )
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
@@ -1311,8 +1736,9 @@ class Frontend:
             if ours != probed:
                 break
             shared_prefix_tokens += 1
-        # Expanding an image before it would move it.
-        if positions and positions[0] < shared_prefix_tokens:
+        # Expanding media before it would move it.
+        first_media = min(positions + audio_positions + video_positions, default=None)
+        if first_media is not None and first_media < shared_prefix_tokens:
             shared_prefix_tokens = 0
         return RenderedPrompt(
             rendered,
@@ -1322,6 +1748,10 @@ class Frontend:
             thinking,
             generation_prompt_tokens,
             shared_prefix_tokens,
+            audios=audios,
+            audio_positions=audio_positions,
+            videos=videos,
+            video_positions=video_positions,
         )
 
     def _request_generation_prompt(self, messages, template, rendered, tokens):
@@ -1451,9 +1881,18 @@ class Frontend:
             ).hexdigest()[:8]
             tools_signature = (len(tools), digest)
         image_spans, image_pixels = (), b""
-        if prepared_images:
-            prompt_tokens, image_spans, image_pixels = self._expand_image_pads(
-                prompt_tokens, prepared_images, image_positions
+        audio_spans, audio_mel = (), b""
+        if prepared_images or rendered.audios or rendered.videos:
+            prompt_tokens, image_spans, image_pixels, audio_spans, audio_mel = (
+                self._expand_media_pads(
+                    prompt_tokens,
+                    prepared_images,
+                    image_positions,
+                    rendered.audios,
+                    rendered.audio_positions,
+                    rendered.videos,
+                    rendered.video_positions,
+                )
             )
         remaining_request_time(deadline)
         requested = body.get("max_completion_tokens", body.get("max_tokens"))
@@ -1482,6 +1921,9 @@ class Frontend:
             image_spans=image_spans,
             image_pixels=image_pixels,
             image_owner=prepared_images if prepared_images else None,
+            audio_spans=audio_spans,
+            audio_mel=audio_mel,
+            audio_owner=rendered.audios if rendered.audios else None,
             tools_signature=tools_signature,
             reply_memory=self.prompt_tokenizer,
             generation_prompt_tokens=rendered.generation_prompt_tokens,

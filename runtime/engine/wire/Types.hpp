@@ -46,6 +46,10 @@ struct EngineRequest final {
   uint32_t sharedPrefixTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
+  // Sorted, non-overlapping audio spans and their float32 [128 x melFrames]
+  // log-mel payload, concatenated in span order; both empty without audio.
+  std::vector<AudioSpan> audio;
+  std::vector<uint8_t> audioMel;
   uint32_t maxNewTokens = 0;
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
@@ -60,7 +64,8 @@ struct EngineRequest final {
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,       prompt,     images,      imagePixels, maxNewTokens,
-            sampling, constraint, scoreTokens, flags};
+            sampling, constraint, scoreTokens, flags,       0,
+            audio,    audioMel};
   }
 };
 
@@ -121,6 +126,9 @@ public:
                        uint32_t lane) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
+  // Speech output: one decoded frame's fp32 PCM bytes (24 kHz). Default
+  // drops it — a transport that never serves speech stays unaffected.
+  virtual void audioPcm(uint64_t, std::span<const float>) {}
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;
   virtual void completed(uint64_t requestId, EngineFinishReason reason,

@@ -69,9 +69,13 @@ inline constexpr uint32_t kMaximumImagePatches = 16384;
 }
 // Patch-grid sides are multiples of the 2x2 spatial merge. Each merged token
 // covers four patches and follows row-major order over the merged grid.
+// `frames` is the temporal depth the pixel payload carries: 1 for a still
+// image, 2 for a video frame pair the tower merges into one token set (the
+// LFM3-VL tower's two temporal patch-embed slices).
 struct ImageGrid final {
   uint32_t height = 0; // patches
   uint32_t width = 0;
+  uint32_t frames = 1;
 
   [[nodiscard]] bool valid() const noexcept {
     return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;
@@ -83,9 +87,27 @@ struct ImageGrid final {
   [[nodiscard]] uint32_t mergedTokens() const noexcept {
     return (height / 2) * (width / 2);
   }
+  // The payload bytes: every temporal frame carries a whole grid of pixels.
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return imagePixelBytes(height, width);
+    return uint64_t{frames} * imagePixelBytes(height, width);
   }
+};
+
+// The interface the runtime's image-row machinery encodes through: one
+// arena-bound encoder per tower kind (Vision for the Qwen3.5 tower,
+// LfmVision for LFM3-VL).
+class VisionEncoder {
+public:
+  virtual ~VisionEncoder() = default;
+  // The scratch arena's footprint, released when the encoder is.
+  [[nodiscard]] virtual uint64_t arenaBytes() const noexcept = 0;
+  // The most patches an image it encodes may have.
+  [[nodiscard]] virtual uint32_t maximumPatches() const noexcept = 0;
+  // Appends one image's dispatches: resized uint8 RGB pixels to bf16 language
+  // embeddings in the caller's buffer.
+  virtual void encode(metal::CommandGraph &graph, ImageGrid grid,
+                      const metal::MetalBuffer &pixels,
+                      const metal::MetalBuffer &embeddings) const = 0;
 };
 
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches.
@@ -93,7 +115,7 @@ struct ImageGrid final {
 // bf16 language embeddings in the caller's buffer, so the arena can be
 // released after encoding while later chunks copy the image's rows into their
 // hidden rows (ops::RowCopy).
-class Vision final {
+class Vision final : public VisionEncoder {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
   [[nodiscard]] static uint64_t
@@ -107,17 +129,17 @@ public:
   Vision(const Vision &) = delete;
   Vision &operator=(const Vision &) = delete;
 
-  [[nodiscard]] uint64_t arenaBytes() const noexcept {
+  [[nodiscard]] uint64_t arenaBytes() const noexcept override {
     return arena_.sizeBytes();
   }
   // The most patches an image it encodes may have.
-  [[nodiscard]] uint32_t maximumPatches() const noexcept {
+  [[nodiscard]] uint32_t maximumPatches() const noexcept override {
     return maximumPatches_;
   }
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
-              const metal::MetalBuffer &embeddings) const;
+              const metal::MetalBuffer &embeddings) const override;
 
 private:
   enum class Scratch : uint32_t {

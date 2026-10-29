@@ -22,7 +22,7 @@ void projection(Image &image, std::initializer_list<std::pair<std::string, uint3
                 uint32_t rows, uint32_t columns, uint32_t bits, uint32_t experts,
                 const QuantResolver &resolve, bool forceFloat,
                 bool preferAffine) {
-  validateQ4Layout(rows, columns);
+  if (!forceFloat) validateQ4Layout(rows, columns);
   const bool oq = static_cast<bool>(resolve);
   Section section;
   section.kind = oq ? SectionKind::Oq : SectionKind::Projection;

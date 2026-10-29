@@ -19,7 +19,14 @@ void RoPE::addTables(
   // its forward and the target's after the tree input pass wrote them.
   if ((!rows.target_rows && !rows.draft_rows) ||
       rows.target_rows > maximumRows || rows.draft_rows > maximumRows) {
-    throw std::invalid_argument("invalid RoPE table row count");
+    throw std::invalid_argument(
+        "invalid RoPE table row count: target=" +
+        std::to_string(rows.target_rows) + " draft=" +
+        std::to_string(rows.draft_rows) + " max=" +
+        std::to_string(maximumRows) + " dims=" +
+        std::to_string(rows.target_dims) + "/" +
+        std::to_string(rows.draft_dims) + " axes=" +
+        std::to_string(rows.target_axes));
   }
   const uint64_t elements =
       std::max<uint64_t>(uint64_t{rows.target_rows} * rows.target_dims,

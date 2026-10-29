@@ -179,13 +179,19 @@ public:
   // every lane keeps all RICHENGINE_TARGET_VERIFY_ROWS rows.
   // verifyStride is the lanes' packed verify row stride: the draft's trained
   // verify depth (draft.verifyRows()), at most RICHENGINE_TARGET_VERIFY_ROWS.
+  // fusedLaneMask names the greedy lanes the fused head's argmax answers
+  // (RICHENGINE_HEAD_PER_LANE): the other greedy lanes still run the
+  // sharded argmax over the logits rows the head's *_logits variant wrote
+  // for them. Zero under the all-or-nothing fused head, where it changes
+  // nothing — a fused head then implies every lane clean.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties,
                  std::span<const uint32_t> liveRows = {},
                  uint32_t fusedHead = 0,
-                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS) const;
+                 uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+                 uint32_t fusedLaneMask = 0) const;
   // The tree batch's selection: RICHENGINE_TREE_VERIFY_NODES argmax rows per
   // lane. Tree mode is greedy-only — a sampled, constrained or penalized
   // lane throws (the runtime falls back to the chain batch).
@@ -280,7 +286,7 @@ private:
                     const SamplingBuffers &buffers, const TargetRows &rows,
                     uint32_t stopToken0, uint32_t stopToken1,
                     std::span<const uint32_t> liveRows = {},
-                    uint32_t fusedHead = 0) const;
+                    uint32_t fusedHead = 0, uint32_t fusedLaneMask = 0) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t logitsStride_ = 0;

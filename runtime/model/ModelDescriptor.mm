@@ -318,6 +318,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
   using Core = ops::DraftContextCore;
   if (hiddenSize == 5120 && dynamicSize == 1280) return Core::Hidden5120;
   if (hiddenSize == 2048 && dynamicSize == 512) return Core::Hidden2048;
+  if (hiddenSize == 4096 && dynamicSize == 1024) return Core::Hidden4096;
   if (dynamicSize == 0) {
     if (hiddenSize == 5120) return Core::Plain5120;
     if (hiddenSize == 4096) return Core::Plain4096;
@@ -1206,21 +1207,84 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
   else {
-    // Only the Qwen VL tower is served; every other family is text-only.
-    if (!entry->servesVisionTower)
-      throw std::invalid_argument("unsupported vision source format: " + vision);
-    if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
-    else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
-    else throw std::invalid_argument("unsupported vision source format: " + vision);
     NSDictionary *v = requireObject(config, @"vision_config", "vision config");
-    const auto &l = result.vision;
-    requireNumbers(v, "vision config", {{"depth", l.depth}, {"hidden_size", l.hiddenSize}, {"num_heads", l.heads},
-        {"intermediate_size", l.intermediateSize}, {"out_hidden_size", l.outputHiddenSize},
-        {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
-        {"temporal_patch_size", 2}, {"in_channels", 3}, {"num_position_embeddings", l.positionGridSide * l.positionGridSide}});
-    requireEqual(requireString(v, @"hidden_act", "vision activation"), "gelu_pytorch_tanh", "vision activation");
-    NSArray *deepstack = requireArray(v, @"deepstack_visual_indexes", "vision deepstack layers");
-    if (deepstack.count) throw std::invalid_argument("vision deepstack layers are unsupported");
+    id projector = v[@"projector_type"];
+    const std::string tower =
+        [projector isKindOfClass:[NSString class]]
+            ? std::string(static_cast<NSString *>(projector).UTF8String)
+            : "qwen3vl_merger";
+    if (tower == "lfm3vl") {
+      // The LFM3-VL tower comes only from the lfm3vl GGUF mmproj.
+      if (!entry->servesLfmVisionTower || vision != "gguf")
+        throw std::invalid_argument("unsupported vision source format: " + vision);
+      result.visionSource = VisionSource::Gguf;
+      result.visionTower = VisionTower::Lfm3Vl;
+      const auto &l = result.lfmVision;
+      requireNumbers(v, "vision config", {{"depth", l.depth}, {"hidden_size", l.hiddenSize},
+          {"num_heads", l.heads}, {"num_key_value_heads", l.kvHeads},
+          {"intermediate_size", l.intermediateSize}, {"out_hidden_size", l.outputHiddenSize},
+          {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
+          {"temporal_patch_size", 2}, {"in_channels", 3}});
+      requireEqual(requireString(v, @"hidden_act", "vision activation"), "silu", "vision activation");
+    } else {
+      if (tower != "qwen3vl_merger")
+        throw std::invalid_argument("unsupported vision projector type: " + tower);
+      // Only the Qwen VL tower is served; every other family is text-only.
+      if (!entry->servesVisionTower)
+        throw std::invalid_argument("unsupported vision source format: " + vision);
+      if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
+      else if (vision == "gguf") result.visionSource = VisionSource::Gguf;
+      else throw std::invalid_argument("unsupported vision source format: " + vision);
+      const auto &l = result.vision;
+      requireNumbers(v, "vision config", {{"depth", l.depth}, {"hidden_size", l.hiddenSize}, {"num_heads", l.heads},
+          {"intermediate_size", l.intermediateSize}, {"out_hidden_size", l.outputHiddenSize},
+          {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
+          {"temporal_patch_size", 2}, {"in_channels", 3}, {"num_position_embeddings", l.positionGridSide * l.positionGridSide}});
+      requireEqual(requireString(v, @"hidden_act", "vision activation"), "gelu_pytorch_tanh", "vision activation");
+      NSArray *deepstack = requireArray(v, @"deepstack_visual_indexes", "vision deepstack layers");
+      if (deepstack.count) throw std::invalid_argument("vision deepstack layers are unsupported");
+    }
+  }
+  // The lfm3a audio encoder rides the same shared GGUF mmproj as the LFM3-VL
+  // tower: a record's config names it through audio_config, and only an omni
+  // family's descriptor carries the matching layout.
+  if ([config objectForKey:@"audio_config"]) {
+    if (!entry->servesAudioTower || vision != "gguf")
+      throw std::invalid_argument("unsupported audio source format: " + vision);
+    NSDictionary *a = requireObject(config, @"audio_config", "audio config");
+    const auto &l = result.lfmAudio;
+    requireNumbers(a, "audio config",
+                   {{"depth", l.depth}, {"hidden_size", l.hiddenSize},
+                    {"num_heads", l.heads}, {"num_key_value_heads", l.kvHeads},
+                    {"head_dim", l.headDimension},
+                    {"intermediate_size", l.intermediateSize},
+                    {"out_hidden_size", l.outputHiddenSize},
+                    {"n_mel", l.melBins},
+                    {"sliding_window", l.window},
+                    {"sampling_rate", 16000}, {"n_fft", 400},
+                    {"win_length", 400}, {"hop_length", 160},
+                    {"encoder_stride", l.tokenStride}});
+    id projector = a[@"projector_type"];
+    if (![projector isKindOfClass:[NSString class]] ||
+        std::string(static_cast<NSString *>(projector).UTF8String) != "lfm3a")
+      throw std::invalid_argument("unsupported audio projector type");
+    if (l.outputHiddenSize != result.target.hiddenSize)
+      throw std::invalid_argument("audio projector output does not match this model");
+    result.audioSource = AudioSource::Gguf;
+  }
+  // The lfm3a_gen speech decoder (the mmproj's a.gen.* sections) rides the
+  // same shared file: the record's config names it through speech_config,
+  // and only an omni family's registration serves it. The gen loader
+  // validates the GGUF's own metadata at load (LfmGenLoader).
+  if ([config objectForKey:@"speech_config"]) {
+    if (!entry->servesSpeechTower || vision != "gguf")
+      throw std::invalid_argument("unsupported speech source format: " + vision);
+    NSDictionary *s = requireObject(config, @"speech_config", "speech config");
+    id projector = s[@"projector_type"];
+    if (![projector isKindOfClass:[NSString class]] ||
+        std::string(static_cast<NSString *>(projector).UTF8String) != "lfm3a_gen")
+      throw std::invalid_argument("unsupported speech projector type");
+    result.speechSource = SpeechSource::Gguf;
   }
   // The tokenizer's copy of the model configuration agrees with the family
   // the record named, as the packed manifest's tokenizer check does.
@@ -1286,7 +1350,9 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      (visionTower == VisionTower::Lfm3Vl ? lfmVision.outputHiddenSize
+                                         : vision.outputHiddenSize) !=
+          draft.hiddenSize) {
     return false;
   }
   return target.vocabularySize == capabilities.vocabularySize &&
@@ -1429,6 +1495,18 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
                            packedFamily->draftLayout());
       }
       validateNewPackedFormat(manifest, root, descriptor, "lfm2_moe");
+    } else if (canonicalFormat == "richengine-packed-q4-lfm3") {
+      descriptor = findModelFamily("LFM3-1.7B")->makeDescriptor(model);
+      descriptor.family = "LFM3-1.7B";
+      if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]])
+        throw std::invalid_argument("lfm3 targets take no draft");
+      validateNewPackedFormat(manifest, root, descriptor, "lfm3");
+    } else if (canonicalFormat == "richengine-packed-q4-d1v3") {
+      descriptor = findModelFamily("d1-2B")->makeDescriptor(model);
+      descriptor.family = "d1-2B";
+      if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]])
+        throw std::invalid_argument("d1-2B targets take no draft");
+      validateNewPackedFormat(manifest, root, descriptor, "lfm3");
     } else if (canonicalFormat == "richengine-packed-q4-gemma4") {
       descriptor = findModelFamily("Gemma4-26B-A4B")->makeDescriptor(model);
       descriptor.family = "Gemma4-26B-A4B";

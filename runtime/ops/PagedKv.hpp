@@ -138,6 +138,8 @@ enum class Core : uint8_t {
   GemmaKv8H256,
   GemmaKv2H512,
   Kv2Group12H256,
+  // LFM3: 4 KV heads of 128 dimensions, 16 query heads (group 4).
+  Kv4Group4D128,
 };
 
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric

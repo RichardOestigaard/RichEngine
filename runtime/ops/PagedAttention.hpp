@@ -342,13 +342,15 @@ public:
                        metal::MetalBuffer chunkValues, uint32_t tokens,
                        uint32_t stride, uint32_t queryHeads, kv::Layout layout);
   // `queryGate` selects the sigmoid gate of the gated rows or the plain
-  // gather of the no-gate targets (dense, LFM2).
+  // gather of the no-gate targets (dense, LFM2); `headGate` selects LFM3's
+  // per-head sigmoid gate, reading `packed` as the [row][head] gate buffer.
   static void addPrefillGate(metal::CommandGraph &graph,
                              metal::MetalBuffer packed,
                              metal::MetalBuffer attention,
                              metal::MetalBuffer hidden, uint32_t tokens,
                              uint32_t stride, uint32_t queryHeads,
-                             kv::Layout layout, bool queryGate = true);
+                             kv::Layout layout, bool queryGate = true,
+                             bool headGate = false);
   // The *_sums variant for the gated layouts: the gate also writes the
   // out-projection's input sums beside the gated rows.
   static void addPrefillGateSums(metal::CommandGraph &graph,
@@ -357,7 +359,7 @@ public:
                                  metal::MetalBuffer hidden,
                                  metal::MetalBuffer sums, uint32_t tokens,
                                  uint32_t stride, uint32_t queryHeads,
-                                 kv::Layout layout);
+                                 kv::Layout layout, bool headGate = false);
   // `rows` is the lanes' row count of this verify step:
   // RICHENGINE_TARGET_VERIFY_ROWS chain, RICHENGINE_TREE_VERIFY_NODES tree.
   static void
@@ -377,7 +379,8 @@ public:
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch,
                                      LinearInput input, bool queryGate = true,
-                                     uint32_t rows = kv::kVerifyRows);
+                                     uint32_t rows = kv::kVerifyRows,
+                                     bool headGate = false);
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.
@@ -433,7 +436,7 @@ public:
                         const VerifyAttentionPlan &plan,
                         metal::MetalBuffer gatePacked = {},
                         metal::MetalBuffer gateHidden = {},
-                        AttentionBlocks blocks = {});
+                        AttentionBlocks blocks = {}, bool headGate = false);
   // One dispatch of the block lists of up to a batch of sequences of query
   // rows, whose block masks are rows of `mask`, `maskWords` words each
   // (metal/abi/PagedAttention.h) that cover each sequence's history: each

@@ -7,10 +7,6 @@
 namespace richengine::model {
 namespace {
 
-// Ornith 9B declares no DFlash2 draft layout: no compiled context core
-// covers hidden 4096/dynamic 1024, so a source assembly or packed manifest
-// naming DFlash2DraftModel is refused rather than mis-bound.
-
 // Ornith 1.5 9B's released DFlash draft (ornith-ai/Ornith-1.5-9B-DFlash): a
 // plain six-layer transformer over hidden 4096 reading the target's eight
 // capture layers — fused fc + hidden_norm features injected as every layer's
@@ -32,6 +28,29 @@ DFlashDraftLayout ornith9DFlashV1DraftLayout() {
   layout.blockSize = 16;
   layout.headCore = ops::DraftHeadCore::Q32K8D128;
   layout.contextCore = ops::DraftContextCore::Plain4096;
+  return layout;
+}
+
+// The 9B's DFlash2 draft, when a checkpoint lands (dev/distill converts the
+// V1 checkpoint's trunk with no-op convs and a zeroed selector): six layers
+// over hidden 4096 with 1024-wide dynamic convolutions and the 256-rank
+// candidate selector, geometry pinned by the bootstrap fixture.
+DFlashDraftLayout ornith9DFlash2DraftLayout() {
+  DFlashDraftLayout layout;
+  layout.kind = DraftKind::DFlashTwo;
+  layout.slidingWindow = 2048;
+  layout.layers = 6;
+  layout.hiddenSize = 4096;
+  layout.dynamicSize = 1024;
+  layout.qkvSize = 6144;
+  layout.attentionSize = 4096;
+  layout.intermediateSize = 12288;
+  layout.targetHiddenSize = 32768;
+  layout.selectorRank = 256;
+  layout.kvHeads = 8;
+  layout.blockSize = 8;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
+  layout.contextCore = ops::DraftContextCore::Hidden4096;
   return layout;
 }
 
@@ -63,6 +82,7 @@ const bool kRegisteredOrnithFamilies = [] {
   registerModelFamily({.name = "Ornith-1.5-9B", .modelType = "qwen3_5_text",
                        .legacyType = "",
                        .makeDescriptor = &ornithDescriptor,
+                       .draftLayout = &ornith9DFlash2DraftLayout,
                        .dflashV1Layout = &ornith9DFlashV1DraftLayout,
                        .refineSourceConfig = &refineQwenSourceText});
   return true;

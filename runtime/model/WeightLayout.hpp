@@ -25,6 +25,10 @@ inline constexpr uint32_t kQ4StorageN = 256;
 
 // The packed vision tower.
 inline constexpr std::string_view kVisionMagic = "MDFV0001";
+// The packed LFM3-VL tower (LfmVisionLoader.cpp).
+inline constexpr std::string_view kLfmVisionMagic = "MDFL0001";
+// The packed lfm3a audio encoder (LfmAudioLoader.cpp).
+inline constexpr std::string_view kLfmAudioMagic = "MDFA0001";
 
 // offset rounded up to the next section boundary.
 [[nodiscard]] inline constexpr uint64_t alignWeightOffset(uint64_t offset) {

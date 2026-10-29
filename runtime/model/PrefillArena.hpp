@@ -156,11 +156,19 @@ public:
     if (const metal::MetalBuffer alt =
             get(PrefillTensor::TargetInverseFrequencies2)) {
       auto *frequencies = static_cast<float *>(alt.contents());
+      // LFM3's zero-tail partial rotary: only the first altRotaryRealPairs
+      // entries carry the progression; the rest read 0, leaving those dims
+      // unrotated (cos 1, sin 0).
+      const uint32_t real = geometry.target.altRotaryRealPairs
+                                ? geometry.target.altRotaryRealPairs
+                                : geometry.target.altRotaryPairs;
       for (uint32_t dim = 0; dim < geometry.target.altRotaryPairs; ++dim)
         frequencies[dim] =
-            std::pow(geometry.target.altRotaryTheta,
-                     -2.0F * static_cast<float>(dim) /
-                         geometry.target.altHeadDimension);
+            dim < real
+                ? std::pow(geometry.target.altRotaryTheta,
+                           -2.0F * static_cast<float>(dim) /
+                               geometry.target.altHeadDimension)
+                : 0.0F;
     }
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))

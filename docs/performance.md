@@ -215,10 +215,10 @@ room. A request that cannot get memory waits for it, then fails with
 `resource_timeout`: close memory-heavy applications, or serve with
 `--language-only`. Critical memory pressure can suspend a long request. Startup
 suggests `--max-cache-disk` when memory may not hold the advertised context.
-The tier then writes whenever memory runs short: serving Ternary-Bonsai-2-27B
-PQ2_0 to six clients' mixed traffic for 30 minutes, a 16 GiB tier on the M6
+The tier then writes whenever memory runs short: serving a 27B PQ2_0 target
+to six clients' mixed traffic for 30 minutes, a 16 GiB tier on the M6
 wrote 26 GB, about 50 GB an hour, and read 36 GB.
 
 See [the low-bit GGUF measurements](https://github.com/incoai/richengine/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and
-[the Bonsai measurements](https://github.com/incoai/richengine/pull/166) for PQ2_0.
+[the PQ2_0 measurements](https://github.com/incoai/richengine/pull/166) for PQ2_0.

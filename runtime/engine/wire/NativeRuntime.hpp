@@ -117,6 +117,7 @@ private:
     std::optional<double> firstTokenMilliseconds;
     std::optional<double> lastTokenMilliseconds;
     uint32_t emittedTokens = 0;
+    uint32_t audioFrames = 0;
   };
 
   struct PendingMask {
@@ -153,6 +154,7 @@ private:
                       double cycleMilliseconds) override;
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
+  void audioPcm(uint64_t requestId, std::span<const float> samples) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;
   void completed(uint64_t requestId, EngineFinishReason reason,

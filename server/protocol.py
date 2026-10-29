@@ -15,9 +15,9 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 9
 FRAME_HEADER_BYTES = 24
-STATUS_SCHEMA_VERSION = 7
+STATUS_SCHEMA_VERSION = 8
 # Score-only requests carry 2..255 distinct option token ids and produce no
 # generated tokens; a successful score DoneEvent returns one raw
 # final-position logit per requested token, in request order.
@@ -34,9 +34,17 @@ MAX_ERROR_STRING_BYTES = 1024 * 1024
 MAX_PROMPT_TOKENS = 1 << 20
 MAX_LOGICAL_OUTPUT_TOKENS = 1 << 20
 MAX_TOKEN_BATCH = 4096
+# Speech frames carry fp32 samples: 1920 per codec frame plus the flush tail.
+MAX_AUDIO_PCM_SAMPLES = 1 << 16
 MAX_SIMULATION_TOKENS = 32
 MAX_FORCED_TOKENS = 4096
-MAX_IMAGE_SPANS = 64
+# Video input spends spans fast: one per temporal frame pair (up to 192
+# for a 384-frame clip) and one per soundtrack piece.
+MAX_IMAGE_SPANS = 256
+MAX_AUDIO_SPANS = 256
+# One mel frame is 128 float32 values (10 ms of 16 kHz audio); a clip is
+# bounded by the frontend's duration cap, the protocol by this frame count.
+MAX_AUDIO_MEL_FRAMES = 64_000
 MAX_MASK_WORDS = 1 << 20
 # A shipped vocabulary names at most 4M tokens of at most 64 MiB of bytes.
 MAX_VOCABULARY_TOKENS = 1 << 22
@@ -48,8 +56,9 @@ _MAGIC = b"RICH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQBIIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIIffIffffQBIIII")
+_IMAGE_SPAN = struct.Struct("<IIIIQQI")
+_AUDIO_SPAN = struct.Struct("<IIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
@@ -59,7 +68,8 @@ _CONSTRAINT_DFA = struct.Struct("<QII")
 # The u32 length prefixes on the frames' variable tails (spec-bitset bytes,
 # eos ids, marker bytes).
 _SPEC_BITS_LEN = struct.Struct("<I")
-_READY = struct.Struct("<IIB")
+_READY = struct.Struct("<IIBBBx")
+_AUDIO_PCM = struct.Struct("<QII")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
 _TOKENS = struct.Struct("<QII")
@@ -74,9 +84,10 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 91
-assert _IMAGE_SPAN.size == 32
-assert _READY.size == 9
+assert _REQUEST.size == 95
+assert _IMAGE_SPAN.size == 36
+assert _AUDIO_SPAN.size == 28
+assert _READY.size == 12
 assert _START.size == 16
 assert _DONE.size == 53
 assert _ERROR.size == 18
@@ -84,6 +95,7 @@ assert _STATUS_JSON.size == 8
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
+AUDIO_SPAN_BYTES = _AUDIO_SPAN.size
 
 
 class FrameType(IntEnum):
@@ -105,6 +117,7 @@ class FrameType(IntEnum):
     ERROR = 0x0105
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
+    AUDIO_PCM = 0x0109
 
 
 # The frame types the engine sends; the others are the server's.
@@ -118,6 +131,7 @@ _EVENT_TYPES = frozenset(
         FrameType.ERROR,
         FrameType.STATUS_JSON,
         FrameType.PROMPT_PROGRESS,
+        FrameType.AUDIO_PCM,
     }
 )
 
@@ -251,10 +265,31 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    # Temporal frames the pixel payload carries: 1 for a still image, 2 for
+    # a video frame pair (the LFM3-VL tower's two temporal conv slices,
+    # frame 0 first). The token count is the merged grid's either way.
+    frames: int = 1
 
     @property
     def pixel_bytes(self) -> int:
-        return self.grid_height * 16 * self.grid_width * 16 * 3
+        return self.frames * self.grid_height * 16 * self.grid_width * 16 * 3
+
+
+@dataclass(slots=True, frozen=True)
+class AudioSpan:
+    """One audio clip in the prompt: the run of placeholder tokens it
+    occupies (one per 8 mel frames), its mel frame count, and a 128-bit
+    digest of the float32 [128, mel_frames] mel payload it carries."""
+
+    offset: int
+    tokens: int
+    mel_frames: int
+    digest_lo: int
+    digest_hi: int
+
+    @property
+    def mel_bytes(self) -> int:
+        return self.mel_frames * 128 * 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -272,6 +307,10 @@ class RequestFrame:
     # concatenated in span order; both empty for text-only requests.
     image_spans: tuple[ImageSpan, ...]
     image_pixels: bytes
+    # Sorted, non-overlapping audio spans and their float32 [128, T] mels
+    # concatenated in span order; both empty without audio input.
+    audio_spans: tuple[AudioSpan, ...]
+    audio_mel: bytes
     return_progress: bool
     # Option token ids for score-only requests; empty means ordinary
     # generation. Score tokens serialize after the image pixel bytes.
@@ -398,6 +437,11 @@ class ReadyEvent:
     max_context_tokens: int
     # Requests may carry image spans; false for a model serving without vision.
     vision: bool
+    # Requests may carry audio spans; false without the audio encoder.
+    audio: bool = False
+    # The speech tower is loaded: generated audio frames stream as
+    # AudioPcmEvent beside the text tokens (lfm3a_gen mmproj sections).
+    speech: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -420,6 +464,20 @@ class TokensEvent:
     request_id: int
     sequence_offset: int
     tokens: tuple[int, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class AudioPcmEvent:
+    """One decoded speech segment of a generating request.
+
+    A non-EOS codec frame carries 1920 fp32 samples (6 STFT columns x 320 @
+    24 kHz); the end-of-audio frame carries the ISTFT tail. frame_index
+    counts the request's emitted frames.
+    """
+
+    request_id: int
+    frame_index: int
+    pcm: bytes  # fp32 little-endian samples
 
 
 @dataclass(slots=True, frozen=True)
@@ -497,6 +555,7 @@ EngineEvent: TypeAlias = (
     | StartEvent
     | PromptProgressEvent
     | TokensEvent
+    | AudioPcmEvent
     | MaskRequestEvent
     | DoneEvent
     | ErrorEvent
@@ -662,6 +721,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_START.size, _START.size)
         case FrameType.TOKENS:
             bounds = (_TOKENS.size, _TOKENS.size + MAX_TOKEN_BATCH * 4)
+        case FrameType.AUDIO_PCM:
+            bounds = (_AUDIO_PCM.size, _AUDIO_PCM.size + MAX_AUDIO_PCM_SAMPLES * 4)
         case FrameType.MASK_REQUEST:
             bounds = (
                 _MASK_REQUEST.size,
@@ -707,6 +768,9 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         grid_width = _u32(span.grid_width, "image grid width")
         _u64(span.digest_lo, "image digest")
         _u64(span.digest_hi, "image digest")
+        frames = _u32(span.frames, "image span frames")
+        if frames not in (1, 2):
+            raise ValueError("image span frames must be 1 or 2")
         if (
             grid_height < 2
             or grid_width < 2
@@ -725,6 +789,29 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         pixel_bytes += span.pixel_bytes
     if len(_bytes(request.image_pixels, "image pixels")) != pixel_bytes:
         raise ValueError("image pixels do not match the image grids")
+
+
+def _audio_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
+    previous_end = 0
+    mel_bytes = 0
+    for span in request.audio_spans:
+        offset = _u32(span.offset, "audio span offset")
+        tokens = _u32(span.tokens, "audio span tokens")
+        mel_frames = _u32(span.mel_frames, "audio mel frames")
+        _u64(span.digest_lo, "audio digest")
+        _u64(span.digest_hi, "audio digest")
+        if not mel_frames or mel_frames > MAX_AUDIO_MEL_FRAMES:
+            raise ValueError("audio mel frame count exceeds its limit")
+        if tokens != -(-mel_frames // 8):
+            raise ValueError("audio span tokens must equal ceil(frames/8)")
+        if offset < previous_end or offset + tokens > prompt_tokens:
+            raise ValueError(
+                "audio spans must be sorted, non-overlapping runs inside the prompt"
+            )
+        previous_end = offset + tokens
+        mel_bytes += span.mel_bytes
+    if len(_bytes(request.audio_mel, "audio mel")) != mel_bytes:
+        raise ValueError("audio mel payload does not match the audio spans")
 
 
 def _validated_request(
@@ -802,6 +889,8 @@ def _validated_request(
             raise ValueError("prompt token count exceeds its limit")
         if len(request.image_spans) > MAX_IMAGE_SPANS:
             raise ValueError("image span count exceeds its limit")
+        if len(request.audio_spans) > MAX_AUDIO_SPANS:
+            raise ValueError("audio span count exceeds its limit")
     except ValueError as error:
         _fail(
             FailureClass.REQUEST_ERROR,
@@ -811,13 +900,16 @@ def _validated_request(
         )
     try:
         _image_spans_check(request, len(prompt))
+        _audio_spans_check(request, len(prompt))
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
         shared = _u32(request.shared_prefix_tokens, "shared prefix tokens")
         if shared > len(prompt):
             raise ValueError("shared prefix must lie within the prompt")
-        if scores and (request.image_spans or request.image_pixels):
+        if scores and (
+            request.image_spans or request.image_pixels or request.audio_spans
+        ):
             raise ValueError("score requests are text-only")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
@@ -927,8 +1019,10 @@ def _request_frame(request: RequestFrame) -> bytearray:
     prompt, scores, sampling = _validated_request(request)
     prompt_offset = FRAME_HEADER_BYTES + _REQUEST.size
     spans_offset = prompt_offset + 4 * len(prompt)
-    pixels_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
-    scores_offset = pixels_offset + len(request.image_pixels)
+    audio_offset = spans_offset + _IMAGE_SPAN.size * len(request.image_spans)
+    pixels_offset = audio_offset + _AUDIO_SPAN.size * len(request.audio_spans)
+    mel_offset = pixels_offset + len(request.image_pixels)
+    scores_offset = mel_offset + len(request.audio_mel)
     payload_bytes = scores_offset + 4 * len(scores) - FRAME_HEADER_BYTES
     if issue := _payload_length_issue(FrameType.REQUEST, payload_bytes):
         _fail(FailureClass.REQUEST_ERROR, issue.code, issue.message, request.request_id)
@@ -944,6 +1038,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
         request.logical_max_output_tokens,
         len(request.prompt_tokens),
         len(request.image_spans),
+        len(request.audio_spans),
         *sampling,
         request.seed,
         request.return_progress,
@@ -962,11 +1057,23 @@ def _request_frame(request: RequestFrame) -> bytearray:
             span.grid_width,
             span.digest_lo,
             span.digest_hi,
+            span.frames,
+        )
+    for index, span in enumerate(request.audio_spans):
+        _AUDIO_SPAN.pack_into(
+            frame,
+            audio_offset + index * _AUDIO_SPAN.size,
+            span.offset,
+            span.tokens,
+            span.mel_frames,
+            span.digest_lo,
+            span.digest_hi,
         )
     # A bytearray copies a slice assignment's source first; its view does not.
     with memoryview(frame) as view:
         view[prompt_offset:spans_offset] = memoryview(prompt).cast("B")
-        view[pixels_offset:scores_offset] = request.image_pixels
+        view[pixels_offset:mel_offset] = request.image_pixels
+        view[mel_offset:scores_offset] = request.audio_mel
         view[scores_offset:] = memoryview(scores).cast("B")
     return frame
 
@@ -1399,12 +1506,12 @@ def _tail(
 def _decode_event(frame: Frame) -> EngineEvent:
     frame_type, payload = _checked_frame(frame)
     if frame_type is FrameType.READY:
-        concurrent, context, vision = _READY.unpack(payload)
-        if vision > 1:
-            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready vision must be a boolean")
+        concurrent, context, vision, audio, speech = _READY.unpack(payload)
+        if vision > 1 or audio > 1 or speech > 1:
+            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready capabilities must be booleans")
         if not concurrent or not context:
             _fatal(IssueCode.INVALID_COUNT, "ready event capacities must be non-zero")
-        return ReadyEvent(concurrent, context, bool(vision))
+        return ReadyEvent(concurrent, context, bool(vision), bool(audio), bool(speech))
     if frame_type is FrameType.START:
         request_id, lane, matched = _START.unpack(payload)
         if not request_id:
@@ -1439,6 +1546,17 @@ def _decode_event(frame: Frame) -> EngineEvent:
                 request_id,
             )
         return TokensEvent(request_id, offset, tokens)
+    if frame_type is FrameType.AUDIO_PCM:
+        request_id, frame_index, count = _AUDIO_PCM.unpack_from(payload)
+        pcm = _tail(payload, _AUDIO_PCM.size, count, "f", "pcm sample", request_id)
+        if not request_id:
+            _fatal(
+                IssueCode.INVALID_REQUEST_ID,
+                "audio event request id must be non-zero",
+            )
+        return AudioPcmEvent(
+            request_id, frame_index, array.array("f", pcm).tobytes()
+        )
     if frame_type is FrameType.MASK_REQUEST:
         request_id, mask_request_id, words_per_mask, count = _MASK_REQUEST.unpack_from(
             payload

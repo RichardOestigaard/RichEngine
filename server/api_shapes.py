@@ -58,7 +58,73 @@ def _require_vision(modality, vision):
         raise APIError(400, f"{modality} input is not supported: {VISION_UNAVAILABLE}")
 
 
-def _user_content(content, document_budget, vision):
+AUDIO_UNAVAILABLE = (
+    "this model is serving without an audio encoder (started with --language-only)"
+)
+
+
+def _require_audio(audio):
+    """Reject audio input before it is decoded or rendered."""
+    if not audio:
+        raise APIError(400, f"audio input is not supported: {AUDIO_UNAVAILABLE}")
+
+
+VIDEO_UNAVAILABLE = (
+    "this model is serving without video (its contract declares none, or "
+    "it was started with --language-only)"
+)
+
+
+def _require_video(video):
+    """Reject video input before it is decoded or rendered."""
+    if not video:
+        raise APIError(400, f"video input is not supported: {VIDEO_UNAVAILABLE}")
+
+
+def _video_part(part, kind):
+    """The canonical video part: a data-URL clip plus the soundtrack flag;
+    the frontend decodes `url` to frame pairs."""
+    if kind == "video_url":
+        video_url = part.get("video_url")
+        url = video_url.get("url") if isinstance(video_url, dict) else video_url
+    else:
+        # OpenAI's variant: {"type": "video", "video": url-or-list}; a list
+        # of frame URLs is refused — the container decodes whole.
+        url = part.get("video")
+        if isinstance(url, list):
+            raise APIError(400, "frame-list video parts are not supported")
+        video_url = {}
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise APIError(400, "video content needs a base64 data: URL")
+    soundtrack = part.get("use_audio_in_video")
+    if soundtrack is None and isinstance(video_url, dict):
+        soundtrack = video_url.get("use_audio_in_video")
+    if soundtrack is not None and not isinstance(soundtrack, bool):
+        raise APIError(400, "use_audio_in_video must be a boolean")
+    return {
+        "type": "video",
+        "video_url": {
+            "url": url,
+            "use_audio_in_video": bool(soundtrack),
+        },
+    }
+
+
+def _audio_part(payload):
+    """The canonical audio part: the chat template places the clip's
+    placeholder where the author put it, and the frontend decodes `data`."""
+    if not isinstance(payload, dict):
+        raise APIError(400, "invalid audio content part")
+    data = payload.get("data")
+    fmt = payload.get("format")
+    if not isinstance(data, str):
+        raise APIError(400, "input_audio requires base64 data")
+    if fmt is not None and not isinstance(fmt, str):
+        raise APIError(400, "input_audio format must be a string")
+    return {"type": "audio", "audio": {"data": data, "format": fmt or "wav"}}
+
+
+def _user_content(content, document_budget, vision, audio=False, video=False):
     """Text for plain user content; a canonical parts list when it carries
     images, so the chat template places each image where the author put it.
 
@@ -85,8 +151,16 @@ def _user_content(content, document_budget, vision):
         elif kind == "file":
             _require_vision("PDF", vision)
             parts.extend(file_content(part.get("file"), budget=document_budget))
-        elif kind in ("video", "video_url", "input_audio"):
-            raise APIError(400, f"{kind} content is not supported")
+        elif kind == "input_audio":
+            _require_audio(audio)
+            parts.append(_audio_part(part.get("input_audio")))
+        elif kind == "audio":
+            # Canonical audio parts (from the Responses shape) pass through.
+            _require_audio(audio)
+            parts.append(_audio_part(part.get("audio") or part.get("input_audio")))
+        elif kind in ("video", "video_url"):
+            _require_video(video)
+            parts.append(_video_part(part, kind))
         else:
             raise APIError(400, "unsupported message content part")
     return _media_content(parts)
@@ -199,7 +273,7 @@ def _unfinished_json(text):
     return stack != ["done"]
 
 
-def normalize_messages(messages, *, vision, deadline):
+def normalize_messages(messages, *, vision, deadline, audio=False, video=False):
     document_budget = DocumentBudget(deadline=deadline)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
@@ -226,7 +300,7 @@ def normalize_messages(messages, *, vision, deadline):
         content = message.get("content")
         item = {
             "role": role,
-            "content": _user_content(content, document_budget, vision)
+            "content": _user_content(content, document_budget, vision, audio, video)
             if role in ("user", "tool")
             else _text_content(content),
         }
@@ -344,6 +418,10 @@ def _responses_content(content):
             image_url = part.get("image_url")
             url = image_url.get("url") if isinstance(image_url, dict) else image_url
             parts.append(_image_part(url))
+        elif kind == "input_audio":
+            parts.append(_audio_part(part.get("input_audio")))
+        elif kind == "input_video":
+            parts.append(_video_part(part, "video_url"))
         elif kind == "input_file":
             parts.append(
                 {"type": "file", "file": {k: v for k, v in part.items() if k != "type"}}

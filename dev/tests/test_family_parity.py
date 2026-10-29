@@ -15,8 +15,14 @@ from install import families, legacy, pack
 
 FAMILIES_DIR = Path(__file__).resolve().parents[2] / "runtime/model/families"
 
-# One registerModelFamily row: {"Name", "model_type", ""-or-"legacy", &make, ...}.
-ROW = re.compile(r'registerModelFamily\(\s*\{\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]*)"')
+# One registerModelFamily row: {.name = "Name", .modelType = "model_type",
+# .legacyType = ""-or-"legacy", ...}. Anchored at line start so a commented
+# row does not parse.
+ROW = re.compile(
+    r'^\s*registerModelFamily\(\s*\{.*?\.name\s*=\s*"([^"]+)".*?'
+    r'\.modelType\s*=\s*"([^"]+)".*?\.legacyType\s*=\s*"([^"]*)"',
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def cpp_families():

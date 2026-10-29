@@ -42,6 +42,49 @@ class VisionSpec:
     image_mean: tuple = (0.5, 0.5, 0.5)
     image_std: tuple = (0.5, 0.5, 0.5)
     min_pixels: int = 65_536
+    # The tower's own resize cap where it states one narrower than the
+    # server's default; the frontend prepares under the tighter bound.
+    max_pixels: int | None = None
+
+
+@dataclass(frozen=True)
+class VideoSpec:
+    """The video pipeline's sampling and markup contract: the pad token the
+    chat template emits per clip, the span markers each timestamped frame
+    group wraps in, and the frame-sampling and pixel-budget geometry the
+    video pipeline decodes with. None for a family serving no video."""
+
+    pad_token: str = "<|video|>"
+    vision_start_token: str = "<|vision_start|>"
+    vision_end_token: str = "<|vision_end|>"
+    # The sampler's target rate and the clip's frame-count bounds.
+    fps: float = 2.0
+    min_frames: int = 4
+    max_frames: int = 384
+    # The temporal conv's pair depth: frames are consumed two at a time and
+    # the last odd frame pairs with itself.
+    temporal_patch_size: int = 2
+    # The frame-volume pixel bounds (padded count x h x w) the video
+    # processor resizes inside; the budget is shared by every sampled frame.
+    min_pixels: int = 4_096
+    max_pixels: int = 25_165_824
+
+
+@dataclass(frozen=True)
+class AudioSpec:
+    """The audio encoder's front end and markup contract: the pad token the
+    chat template emits per clip (one token per 8 mel frames after span
+    expansion) and the mel geometry the audio pipeline computes with. None
+    for a family serving no audio tower."""
+
+    pad_token: str = "<|audio|>"
+    sampling_rate: int = 16_000
+    n_mel: int = 128
+    n_fft: int = 400
+    win_length: int = 400
+    hop_length: int = 160
+    # Mel frames per language token (80 ms at hop 160/16 kHz).
+    encoder_stride: int = 8
 
 
 @dataclass(frozen=True)
@@ -56,6 +99,10 @@ class ServingContract:
     # None where the family declares none and the template probe decides.
     tool_dialect: str | None = None
     vision: VisionSpec | None = None
+    audio: AudioSpec | None = None
+    # The video pipeline's contract; None where the family serves no video
+    # even though the tower could take frame pairs.
+    video: VideoSpec | None = None
     # Sampling defaults the model's generation config states; a request's
     # own value always wins. Keys are protocol.SAMPLING_FIELDS members.
     sampling: dict = field(default_factory=dict)
@@ -88,6 +135,8 @@ class ServingContract:
             doc = {}
         think = doc.get("think")
         vision = doc.get("vision")
+        audio = doc.get("audio")
+        video = doc.get("video")
         return cls(
             family=family,
             think=(
@@ -110,8 +159,45 @@ class ServingContract:
                     image_mean=tuple(vision.get("image_mean", (0.5, 0.5, 0.5))),
                     image_std=tuple(vision.get("image_std", (0.5, 0.5, 0.5))),
                     min_pixels=int(vision.get("min_pixels", 65_536)),
+                    max_pixels=(
+                        None
+                        if vision.get("max_pixels") is None
+                        else int(vision["max_pixels"])
+                    ),
                 )
                 if isinstance(vision, dict)
+                else None
+            ),
+            audio=(
+                AudioSpec(
+                    pad_token=audio.get("pad_token", "<|audio|>"),
+                    sampling_rate=int(audio.get("sampling_rate", 16_000)),
+                    n_mel=int(audio.get("n_mel", 128)),
+                    n_fft=int(audio.get("n_fft", 400)),
+                    win_length=int(audio.get("win_length", 400)),
+                    hop_length=int(audio.get("hop_length", 160)),
+                    encoder_stride=int(audio.get("encoder_stride", 8)),
+                )
+                if isinstance(audio, dict)
+                else None
+            ),
+            video=(
+                VideoSpec(
+                    pad_token=video.get("pad_token", '<|video|>'),
+                    vision_start_token=video.get(
+                        "vision_start_token", '<|vision_start|>'
+                    ),
+                    vision_end_token=video.get(
+                        "vision_end_token", '<|vision_end|>'
+                    ),
+                    fps=float(video.get("fps", 2.0)),
+                    min_frames=int(video.get("min_frames", 4)),
+                    max_frames=int(video.get("max_frames", 384)),
+                    temporal_patch_size=int(video.get("temporal_patch_size", 2)),
+                    min_pixels=int(video.get("min_pixels", 4_096)),
+                    max_pixels=int(video.get("max_pixels", 25_165_824)),
+                )
+                if isinstance(video, dict)
                 else None
             ),
             sampling=dict(doc.get("sampling", {})),

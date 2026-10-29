@@ -91,6 +91,13 @@ struct ModelFamilyRegistration {
   bool takesNoDraft = false;
   // The family serves the Qwen VL tower; every other is text-only.
   bool servesVisionTower = false;
+  // The family serves the LFM3-VL tower from a GGUF mmproj.
+  bool servesLfmVisionTower = false;
+  // The family serves the lfm3a audio encoder from the same shared mmproj.
+  bool servesAudioTower = false;
+  // The family serves the lfm3a_gen speech decoder (the a.gen.* sections
+  // of the same shared mmproj): generated audio frames stream as PCM.
+  bool servesSpeechTower = false;
 };
 
 // Both return true so a family's translation unit can register at static

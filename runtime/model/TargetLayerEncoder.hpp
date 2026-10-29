@@ -79,4 +79,10 @@ makeGemmaLayerEncoder(const TargetModel &model);
 [[nodiscard]] std::unique_ptr<TargetLayerEncoder>
 makeQwen4LayerEncoder(const TargetModel &model);
 
+// The lfm3 target's layer encoder (TargetModelLfm3.cpp): the tri-hybrid
+// conv/sliding/global schedule, sandwich norms and the head-wise attention
+// gate.
+[[nodiscard]] std::unique_ptr<TargetLayerEncoder>
+makeLfm3LayerEncoder(const TargetModel &model);
+
 } // namespace richengine::model

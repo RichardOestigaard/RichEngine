@@ -126,6 +126,10 @@ struct ModelRequest final {
   // before it are neither staged nor encoded; their spans still place
   // rotary positions.
   uint32_t restoredTokens = 0;
+  // Audio clips' placeholder runs and their float32 [128 x melFrames]
+  // log-mel payload, concatenated in span order; both empty without audio.
+  std::span<const struct AudioSpan> audio{};
+  std::span<const uint8_t> audioMel{};
 };
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
@@ -140,16 +144,73 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  // Temporal frames the span's pixel payload carries: 1 for a still image,
+  // 2 for a video frame pair (the LFM3-VL tower's two temporal conv slices,
+  // frame 0 first). The token count is the merged grid's either way.
+  uint32_t frames = 1;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth};
+    return {gridHeight, gridWidth, frames};
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
     return grid().pixelBytes();
   }
   bool operator==(const ImageSpan &) const = default;
 };
+
+// The most temporal frames one span's pixel payload may carry: the LFM3-VL
+// patch embed has two temporal kernels, so a video pair is the maximum.
+inline constexpr uint32_t kMaximumSpanFrames = 2;
+
+// One audio clip in the prompt: the run of placeholder tokens it occupies
+// (one per eight mel frames), its mel frame count and a 128-bit digest of
+// the float32 [128 x melFrames] log-mel payload it carries. The mel arrives
+// precomputed server-side; the runtime's audio encoder turns it into the
+// language embeddings the placeholder rows receive.
+struct AudioSpan final {
+  uint32_t offset = 0;
+  uint32_t tokens = 0;
+  uint32_t melFrames = 0;
+  uint64_t digestLo = 0;
+  uint64_t digestHi = 0;
+
+  [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
+  // The float32 [nMel=128 x melFrames] bytes this span's payload holds.
+  [[nodiscard]] uint64_t melBytes() const noexcept {
+    return uint64_t{melFrames} * 128 * sizeof(float);
+  }
+  bool operator==(const AudioSpan &) const = default;
+};
+
+inline constexpr uint32_t kAudioMelBins = 128;
+inline constexpr uint32_t kAudioTokenStride = 8;
+inline constexpr uint32_t kMaximumAudioMelFrames = 64000;
+
+// The first rule a request's audio spans break, or none: tokens cover
+// ceil(frames/8) each, the runs are sorted, disjoint and inside the prompt,
+// and the mel payload is the frames' own.
+[[nodiscard]] inline std::optional<std::string_view>
+audioSpansValidationError(std::span<const AudioSpan> spans, size_t promptTokens,
+                          uint64_t melBytes) noexcept {
+  uint64_t previousEnd = 0;
+  uint64_t payloadBytes = 0;
+  for (const AudioSpan &span : spans) {
+    if (!span.melFrames || span.melFrames > kMaximumAudioMelFrames)
+      return "audio mel frame count exceeds its limit";
+    if (span.tokens != (span.melFrames + kAudioTokenStride - 1) / kAudioTokenStride)
+      return "audio span tokens must equal ceil(mel frames / 8)";
+    const uint64_t end = uint64_t{span.offset} + span.tokens;
+    if (span.offset < previousEnd || end > promptTokens)
+      return "audio spans must be sorted, non-overlapping runs inside the "
+             "prompt";
+    previousEnd = end;
+    payloadBytes += span.melBytes();
+  }
+  if (melBytes != payloadBytes)
+    return "audio mel payload does not match the audio spans";
+  return std::nullopt;
+}
 
 // The first rule a request's image spans break, or none: each covers a valid
 // grid within the patch limit with one token per merged patch group, the
@@ -164,6 +225,8 @@ imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
     const ops::ImageGrid grid = span.grid();
     if (!grid.valid() || grid.patches() > ops::kMaximumImagePatches)
       return "image grid must be even-sided and within the patch limit";
+    if (!span.frames || span.frames > kMaximumSpanFrames)
+      return "image span frames must be 1 or 2";
     if (span.tokens != grid.mergedTokens())
       return "image span tokens must equal the merged grid size";
     const uint64_t end = uint64_t{span.offset} + span.tokens;
@@ -299,7 +362,9 @@ struct ModelBatchItem final {
   uint64_t requestId = 0;
   uint64_t logicalPosition = 0;
   uint32_t tokenCount = 0;
-  std::span<const uint32_t> pageTable;
+  // Owned: the cache's pages vector may reallocate between a batch item's
+  // assembly and its encode; a captured span would dangle.
+  std::vector<uint32_t> pageTable;
   // pageTableRevision names the page list and is nonzero; the list equals
   // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
@@ -328,6 +393,11 @@ struct ModelStepResult final {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> scoreLogits{};
+  // LFM3-Omni speech output: the PCM bytes (fp32 LE, 24 kHz) the audio
+  // steps of this batch decoded — non-EOS frames carry 1920 samples, the
+  // end-of-audio frame carries the flushed tail. Empty for text-only
+  // steps and models without a speech tower.
+  std::vector<float> audioPcm{};
   // Set when the model computed an unusable result for this lane alone, such
   // as a non-finite score logit or a selection outside the vocabulary (the
   // sampling kernels' sentinel for a non-finite logit row). The engine fails

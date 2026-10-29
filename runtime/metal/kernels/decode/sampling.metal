@@ -1371,7 +1371,11 @@ kernel void decode_sample_argmax_sharded(
   threadgroup float group_values[8];
   threadgroup uint group_indices[8];
   const uint s = group / RICHENGINE_TARGET_SAMPLING_SHARDS;
-  if (lane_samples(params, s) || row_dead(params, s))
+  // A fused-mask lane's rows have no written logits: the fused head's
+  // argmax answered it (RICHENGINE_HEAD_PER_LANE). fused_mask is zero on
+  // the unfused path, which gates nothing.
+  if (lane_samples(params, s) || row_dead(params, s) ||
+      (params.fused_mask & (1u << selected_lane(params, s))))
     return;
   argmax_shard(selected_row(logits, token_mask, dfa_next, params, s),
                group % RICHENGINE_TARGET_SAMPLING_SHARDS, partial_values[group],
@@ -1400,7 +1404,8 @@ kernel void decode_sample_argmax_reduce(
     constant TargetSamplingParams &params [[buffer(3)]],
     uint s [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-  if (lane_samples(params, s) || row_dead(params, s))
+  if (lane_samples(params, s) || row_dead(params, s) ||
+      (params.fused_mask & (1u << selected_lane(params, s))))
     return;
   const uint token = argmax_reduce(partial_values, partial_indices, s, lane);
   if (lane == 0)
@@ -1707,11 +1712,16 @@ constant constexpr ushort kHeadArgmaxCols = 128;
 // The fused-M variants size the logits tile to the live rows: a lane's
 // verify depth times the batch width, so the narrow steps skip three
 // quarters of the tile's MMA work (the same weight bytes stream either way).
-template <ushort M, ushort TN, class TileT = float>
+// EmitLogits additionally stores the rows of the lanes in
+// params.logits_lane_mask to the logits buffer (RICHENGINE_HEAD_PER_LANE):
+// sampled, penalized and constrained lanes still read theirs, and the
+// batch's clean lanes keep the fused argmax.
+template <ushort M, ushort TN, class TileT = float, bool EmitLogits = false>
 __attribute__((always_inline)) inline void head_argmax_q4_tile(
     device bfloat *input, device uchar *weights, device bfloat *scales,
     device bfloat *biases, device float *partial_values,
-    device uint *partial_indices, constant HeadArgmaxParams &params,
+    device uint *partial_indices, device float *logits,
+    constant HeadArgmaxParams &params,
     threadgroup TileT *tg_tile, threadgroup float *input_sums,
     uint tile, uint simd_lane, uint simd_group, uint thread_index) {
   const uint col0 = tile * TN;
@@ -1729,6 +1739,18 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
         });
       });
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (EmitLogits) {
+    // One strided store per tile element; a row's lane bit gates the whole
+    // row, so unflagged lanes stay unwritten. output_stride is the logits
+    // buffer's row stride (the padded vocabulary).
+    for (uint index = thread_index; index < uint(M) * TN; index += 256) {
+      const uint s = index / TN;
+      if (!(params.logits_lane_mask & (1u << (s / params.rows))))
+        continue;
+      logits[ulong(s) * params.output_stride + col0 + (index % TN)] =
+          float(tg_tile[index]);
+    }
+  }
   if (thread_index >= M) return;
   const uint s = thread_index;
   // The partials' row stride is the head's packed tile count; the tail
@@ -1758,7 +1780,7 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
   partial_indices[s * tiles + tile] = best_index;
 }
 
-#define HEAD_ARGMAX_Q4_T(Name, M, TN, TileT)                                   \
+#define HEAD_ARGMAX_Q4_T(Name, M, TN, TileT, EmitLogits)                       \
   kernel void Name(                                                            \
       device bfloat *input [[buffer(0)]],                                      \
       device uchar *weights [[buffer(1)]],                                     \
@@ -1766,19 +1788,22 @@ __attribute__((always_inline)) inline void head_argmax_q4_tile(
       device bfloat *biases [[buffer(3)]],                                     \
       device float *partial_values [[buffer(4)]],                              \
       device uint *partial_indices [[buffer(5)]],                              \
-      constant HeadArgmaxParams &params [[buffer(6)]],                         \
+      device float *logits [[buffer(6)]],                                      \
+      constant HeadArgmaxParams &params [[buffer(7)]],                         \
       uint tile [[threadgroup_position_in_grid]],                              \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]],                      \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup TileT tg_tile[M * TN];                                         \
     threadgroup float input_sums[8 * M];                                       \
-    head_argmax_q4_tile<M, TN, TileT>(input, weights, scales, biases,          \
-                                    partial_values, partial_indices, params,   \
-                                    tg_tile, input_sums, tile, simd_lane,      \
-                                    simd_group, thread_index);                 \
+    head_argmax_q4_tile<M, TN, TileT, EmitLogits>(                             \
+        input, weights, scales, biases, partial_values, partial_indices,       \
+        logits, params, tg_tile, input_sums, tile, simd_lane, simd_group,      \
+        thread_index);                                                         \
   }
-#define HEAD_ARGMAX_Q4(Name, M, TN) HEAD_ARGMAX_Q4_T(Name, M, TN, float)
+#define HEAD_ARGMAX_Q4(Name, M, TN) HEAD_ARGMAX_Q4_T(Name, M, TN, float, false)
+#define HEAD_ARGMAX_Q4_L(Name, M, TN)                                          \
+  HEAD_ARGMAX_Q4_T(Name, M, TN, float, true)
 HEAD_ARGMAX_Q4(decode_head_argmax_q4, kHeadArgmaxRows, kHeadArgmaxCols)
 // The 48-row variant covers three-lane verify batches; its tile needs
 // 24 KB of threadgroup, under the 32 KB cap. 64 rows would exceed it.
@@ -1794,8 +1819,22 @@ HEAD_ARGMAX_Q4(decode_head_argmax_q4_m16_t256, 16, 256)
 // half rounding can flip argmax ties vs the unfused f32 path, so the host
 // only selects this behind RICHENGINE_HEAD_M64 (off by default until
 // parity is proven).
-HEAD_ARGMAX_Q4_T(decode_head_argmax_q4_m64h, 64, kHeadArgmaxCols, half)
+HEAD_ARGMAX_Q4_T(decode_head_argmax_q4_m64h, 64, kHeadArgmaxCols, half, false)
+// The *_logits variants (RICHENGINE_HEAD_PER_LANE): same fused argmax,
+// plus each logits_lane_mask lane's rows written to the logits buffer the
+// masked and sampled selection kernels then read.
+HEAD_ARGMAX_Q4_L(decode_head_argmax_q4_logits, kHeadArgmaxRows,
+                 kHeadArgmaxCols)
+HEAD_ARGMAX_Q4_L(decode_head_argmax_q4_m48_logits, 48, kHeadArgmaxCols)
+HEAD_ARGMAX_Q4_L(decode_head_argmax_q4_m16_logits, 16, kHeadArgmaxCols)
+HEAD_ARGMAX_Q4_L(decode_head_argmax_q4_m8_logits, 8, kHeadArgmaxCols)
+HEAD_ARGMAX_Q4_L(decode_head_argmax_q4_m16_t256_logits, 16, 256)
+// Its half tile rounds the written logits the way it rounds the argmax's —
+// the same parity caveat selects it only behind RICHENGINE_HEAD_M64.
+HEAD_ARGMAX_Q4_T(decode_head_argmax_q4_m64h_logits, 64, kHeadArgmaxCols,
+                 half, true)
 #undef HEAD_ARGMAX_Q4
+#undef HEAD_ARGMAX_Q4_L
 #undef HEAD_ARGMAX_Q4_T
 
 // Reduces the fused head's per-(row, column tile) partials to each selected

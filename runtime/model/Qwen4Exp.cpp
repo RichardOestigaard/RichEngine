@@ -9,6 +9,7 @@
 #include "model/TargetModelGemmaHelpers.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightStore.hpp"
+#include "Tuning.hpp"
 #include "metal/abi/GDN.h"
 #include "ops/BlockIndexer.hpp"
 #include "ops/Embedding.hpp"
@@ -1004,7 +1005,15 @@ private:
     };
     addIndexerProjections(step.graph, indexer, b.normalized, h.indexerQuery,
                           h.indexerKey, step.rows);
-    std::vector<ops::AttentionBlocks> blocks(step.sequences.size());
+    // RICHENGINE_QSA_INDEX_SHARE: a layer the interval does not select
+    // reuses the last selecting layer's block lists (IndexCache); its own
+    // index stays maintained so the next selecting layer's is complete.
+    const uint32_t share = tuning().qsaIndexShare;
+    const bool shareBlocks =
+        share > 1 && layer % share != 0 && sharedQsaBlocksValid_;
+    std::vector<ops::AttentionBlocks> blocks =
+        shareBlocks ? sharedPrefillBlocks_
+                    : std::vector<ops::AttentionBlocks>(step.sequences.size());
     std::vector<ops::BlockListRows> sparseRows;
     std::vector<uint32_t> counts(step.sequences.size());
     uint32_t lists = 0;
@@ -1035,7 +1044,8 @@ private:
       ops::BlockIndexer::addPending(step.graph, keys, pending,
                                     qsaPending(sequence.auxiliaryOut, layer),
                                     firstPositions[at], sequence.rows);
-      if (!ops::BlockIndexer::sparse(firstPositions[at], sequence.rows,
+      if (shareBlocks ||
+          !ops::BlockIndexer::sparse(firstPositions[at], sequence.rows,
                                      topBlocks))
         continue;
       ops::BlockIndexer::addSelect(
@@ -1053,6 +1063,10 @@ private:
       ops::PagedAttention::addBlockLists(
           step.graph, h.qsaMask, maskWords, sparseRows,
           {h.qsaLists, h.qsaListCounts, listStride, 0});
+    if (share > 1 && !shareBlocks) {
+      sharedPrefillBlocks_ = blocks;
+      sharedQsaBlocksValid_ = true;
+    }
     // The attention itself: QKV projection, store, sparse or full sweep
     // per sequence, the query gate with the out-projection's sums, then
     // the output projection into the branch (the combine adds it).
@@ -1178,16 +1192,40 @@ private:
          kQsaLaneRecords, keys, std::span(pending).first(step.lanes)},
         indexer.keyNorm, ropeInverseFrequencies_, 1.0F, qsa);
     ops::AttentionBlocks blocks{h.qsaLists, h.qsaListCounts, 0, 0};
-    if (sparse) {
+    // RICHENGINE_QSA_INDEX_SHARE: as in prefill, a layer the interval does
+    // not select reuses the last selecting layer's lists.
+    const uint32_t share = tuning().qsaIndexShare;
+    const bool shareBlocks =
+        share > 1 && layer % share != 0 && sharedQsaBlocksValid_;
+    if (shareBlocks) {
+      blocks = sharedVerifyBlocks_;
+    } else if (sparse) {
       blocks.stride = listStride;
-      ops::BlockIndexer::addSelect(
-          step.graph,
-          rowsOf<uint16_t>(model_.backend_, h.qsaQueries, 0, step.rows,
-                           queryWidth),
-          h.qsaScores, step.rows,
-          rowsOf<uint32_t>(model_.backend_, h.qsaMask, 0, step.rows,
-                           maskWords),
-          qsa);
+      if (tuning().qsaFusedTopk || tuning().qsaLocks) {
+        ops::BlockIndexer::addTopk(
+            step.graph,
+            rowsOf<uint16_t>(model_.backend_, h.qsaQueries, 0, step.rows,
+                             queryWidth),
+            h.qsaScores,
+            rowsOf<uint32_t>(model_.backend_, h.qsaMask, 0, step.rows,
+                             maskWords),
+            qsa, tuning().qsaLocks);
+      } else {
+        ops::BlockIndexer::addSelect(
+            step.graph,
+            rowsOf<uint16_t>(model_.backend_, h.qsaQueries, 0, step.rows,
+                             queryWidth),
+            h.qsaScores, step.rows,
+            rowsOf<uint32_t>(model_.backend_, h.qsaMask, 0, step.rows,
+                             maskWords),
+            qsa);
+      }
+      if (tuning().qsaDecodeWindow)
+        ops::BlockIndexer::addWindow(
+            step.graph,
+            rowsOf<uint32_t>(model_.backend_, h.qsaMask, 0, step.rows,
+                             maskWords),
+            tuning().qsaDecodeWindow, tuning().qsaDecodeWindowSink, qsa);
       std::array<ops::BlockListRows, ExecutionLimits::maximumBatchWidth>
           laneLists{};
       for (uint32_t lane = 0; lane < step.lanes; ++lane)
@@ -1195,6 +1233,10 @@ private:
       ops::PagedAttention::addBlockLists(
           step.graph, h.qsaMask, maskWords,
           std::span(laneLists).first(step.lanes), blocks);
+    }
+    if (share > 1 && !shareBlocks) {
+      sharedVerifyBlocks_ = blocks;
+      sharedQsaBlocksValid_ = true;
     }
     // The attention body (upstream's verify mixer): the input projection,
     // the lanes' chunk stores, the sparse or dense reduce into the
@@ -1417,6 +1459,13 @@ private:
       verifyBlockCounts_{};
   mutable uint32_t verifyLanes_ = 0;
   mutable uint32_t verifyStride_ = 0;
+  // RICHENGINE_QSA_INDEX_SHARE (IndexCache): the block lists the last
+  // selecting full-attention layer wrote, which the share interval's
+  // non-selecting layers reuse. The buffers stay valid because a shared
+  // layer never overwrites them.
+  mutable ops::AttentionBlocks sharedVerifyBlocks_{};
+  mutable std::vector<ops::AttentionBlocks> sharedPrefillBlocks_;
+  mutable bool sharedQsaBlocksValid_ = false;
 };
 
 std::unique_ptr<TargetLayerEncoder>

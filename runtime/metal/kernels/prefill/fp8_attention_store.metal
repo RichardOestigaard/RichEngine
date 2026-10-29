@@ -47,6 +47,7 @@ PAGED_FP8_STORE(prefill_attention_fp8_store_kv2_g8, 2, 256)
 PAGED_FP8_STORE(prefill_attention_fp8_store_hd128, 2, 128)
 PAGED_FP8_STORE(prefill_attention_fp8_store_hd64, 8, 64)
 PAGED_FP8_STORE(prefill_attention_fp8_store_k8d128, 8, 128)
+PAGED_FP8_STORE(prefill_attention_fp8_store_k4d128, 4, 128)
 #undef PAGED_FP8_STORE
 
 #endif // __HAVE_METAL_FP8_E4M3_FORMAT_TYPE__

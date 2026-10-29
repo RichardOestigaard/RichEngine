@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 #include "Env.hpp"
 #include "TestConfig.hpp"
+#include "Tuning.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +116,16 @@ void Engine::submit(EngineRequest value) {
     throw std::invalid_argument(
         "image has more patches than the server's pixel cap allows");
   }
+  if (!value.audio.empty() && !config_.maxAudioMelFrames) {
+    throw std::invalid_argument("this model is serving without audio");
+  }
+  if (std::any_of(value.audio.begin(), value.audio.end(),
+                  [&](const AudioSpan &audio) {
+                    return audio.melFrames > config_.maxAudioMelFrames;
+                  })) {
+    throw std::invalid_argument(
+        "audio has more mel frames than the server's clip cap allows");
+  }
   const uint64_t id = value.id;
   // A request the protocol saw end may still be here, finalized, until the
   // next sweepTerminal; its id is free again.
@@ -128,6 +139,19 @@ void Engine::submit(EngineRequest value) {
   requestState.exactTokens = std::move(value.prompt);
   requestState.promptTokens = static_cast<uint32_t>(requestState.exactTokens.size());
   requestState.replayTokens = requestState.promptTokens;
+  // Cache identity folds every media span a block may cover: images and
+  // audio alike, the audio span's mel frame count in the grid fields.
+  requestState.mediaSpans = value.images;
+  requestState.mediaSpans.reserve(value.images.size() + value.audio.size());
+  for (const AudioSpan &audio : value.audio) {
+    requestState.mediaSpans.push_back(ImageSpan{audio.offset, audio.tokens,
+                                                audio.melFrames, 1,
+                                                audio.digestLo, audio.digestHi});
+  }
+  std::sort(requestState.mediaSpans.begin(), requestState.mediaSpans.end(),
+            [](const ImageSpan &left, const ImageSpan &right) {
+              return left.offset < right.offset;
+            });
   requestState.request = std::move(value);
   const Request &stored =
       requests_.emplace(id, std::move(requestState)).first->second;
@@ -543,9 +567,9 @@ bool Engine::admitQueued(double now) {
     if (active.skipCache)
       return 0;
     if (active.admissionProbe)
-      cache_.refresh(*active.admissionProbe, active.exactTokens, active.request.images);
+      cache_.refresh(*active.admissionProbe, active.exactTokens, active.mediaSpans);
     else
-      active.admissionProbe = cache_.probe(active.exactTokens, active.request.images);
+      active.admissionProbe = cache_.probe(active.exactTokens, active.mediaSpans);
     return active.admissionProbe->cachedTokens();
   };
   // A request starts only in a free lane. While every lane is resident,
@@ -687,8 +711,18 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
 
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
-  const auto a = std::span<const uint32_t>(left.exactTokens).first(left.promptTokens);
-  const auto b = std::span<const uint32_t>(right.exactTokens).first(right.promptTokens);
+  // The comparison spans generated history too, not just prompts: a sibling
+  // turn's rendered prompt contains the earlier generation's tokens, so a
+  // junction can be planned at a page boundary inside that shared suffix
+  // (SuffixReplay's cross-request case).
+  const std::span<const uint32_t> a =
+      tuning().noHistoryJunctions
+          ? std::span<const uint32_t>(left.exactTokens).first(left.promptTokens)
+          : std::span<const uint32_t>(left.exactTokens);
+  const std::span<const uint32_t> b =
+      tuning().noHistoryJunctions
+          ? std::span<const uint32_t>(right.exactTokens).first(right.promptTokens)
+          : std::span<const uint32_t>(right.exactTokens);
   const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
   uint32_t boundary = std::min<uint32_t>(
       static_cast<uint32_t>(end - a.begin()),
@@ -698,11 +732,11 @@ uint32_t Engine::sharedPrefillBoundary(const Request &left,
   // spans that start below it are equal; otherwise the first differing
   // block holds the earliest start of the first unequal span.
   const auto startingBelow = [&](const Request &value) {
-    const std::span<const ImageSpan> images = value.request.images;
+    const std::span<const ImageSpan> spans = value.mediaSpans;
     const auto end = std::partition_point(
-        images.begin(), images.end(),
+        spans.begin(), spans.end(),
         [&](const ImageSpan &span) { return span.offset < boundary; });
-    return std::span<const ImageSpan>(images.begin(), end);
+    return std::span<const ImageSpan>(spans.begin(), end);
   };
   const auto leftImages = startingBelow(left);
   const auto rightImages = startingBelow(right);
@@ -746,7 +780,7 @@ bool Engine::admit(Request &active, double now) {
   CacheLookup lookup =
       active.skipCache
           ? CacheLookup{}
-          : cache_.lookup(modelRequest.prompt, active.request.images,
+          : cache_.lookup(modelRequest.prompt, active.mediaSpans,
                           active.admissionProbe ? &*active.admissionProbe
                                                 : nullptr);
   // Only unstarted requests wait for a resident producer. Recheck planned
@@ -817,7 +851,7 @@ bool Engine::admit(Request &active, double now) {
                           active.pendingDfa->costs);
   }
   if (droppedLease)
-    lookup = cache_.lookup(modelRequest.prompt, active.request.images);
+    lookup = cache_.lookup(modelRequest.prompt, active.mediaSpans);
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -1322,7 +1356,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     item.logicalPosition = position;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
-    item.pageTable = pageTable.pages;
+    item.pageTable.assign(pageTable.pages.begin(), pageTable.pages.end());
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
     item.requestTokens = active.exactTokens;
@@ -1543,7 +1577,7 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
     item.logicalPosition = position;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
-    item.pageTable = pageTable.pages;
+    item.pageTable.assign(pageTable.pages.begin(), pageTable.pages.end());
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
     items.push_back(std::move(item));
@@ -1934,7 +1968,7 @@ void Engine::apply(const BatchPlan &plan,
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
       cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    promptProcessed, active.request.images);
+                                    promptProcessed, active.mediaSpans);
       publishReachedStateBoundaries(active, promptProcessed, now);
       // Recovery may replay an already reported prefix, including generated
       // history.
@@ -1952,6 +1986,8 @@ void Engine::apply(const BatchPlan &plan,
       outputTokens += static_cast<uint32_t>(result.outputTokens.size());
       events_.tokens(active.request.id, result.outputTokens);
     }
+    if (!result.audioPcm.empty())
+      events_.audioPcm(active.request.id, result.audioPcm);
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
       acceptedDraftTokens += result.acceptedDraftTokens;
@@ -1963,7 +1999,7 @@ void Engine::apply(const BatchPlan &plan,
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
       cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
-                                    storedTokens, active.request.images);
+                                    storedTokens, active.mediaSpans);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
@@ -2094,6 +2130,33 @@ void Engine::finish(Request &active, EngineFinishReason reason,
     ++counters_.cancelled;
   } else {
     ++counters_.completed;
+  }
+  // SuffixReplay: leave a resumable state at the generation's last full
+  // page, so a follow-up turn sharing this conversation resumes there
+  // instead of replaying every generated token through the recurrent
+  // layers. snapshot() captures committed state at its own page-aligned
+  // boundary, so the publication matches the block it names. Best effort:
+  // a missing block or a pool without a free cell leaves nothing.
+  if (active.lane && tuning().suffixReplay) {
+    const uint32_t boundary = static_cast<uint32_t>(active.exactTokens.size()) /
+                              KvCache::pageTokens * KvCache::pageTokens;
+    if (boundary) {
+      try {
+        const uint64_t block = cache_.blockAt(active.request.id, boundary);
+        // snapshot() requires the lane's committed length to be
+        // page-aligned, so only an end on the boundary can publish — the
+        // deep win needs decode-time boundary snapshots (the prefill-only
+        // publication loop, SCOPED_BUT_NOT_WIRED.md).
+        if (block && boundary == active.exactTokens.size() &&
+            !cache_.reuseCompositeState(block, false)) {
+          std::shared_ptr<const CompositeState> state =
+              model_.snapshot(active.request.id);
+          if (state)
+            cache_.publishCompositeState(block, std::move(state), false);
+        }
+      } catch (const std::exception &) {
+      }
+    }
   }
   release(active);
 }

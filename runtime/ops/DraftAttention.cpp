@@ -151,6 +151,10 @@ using KernelLayout = DraftContextCore;
     if (shape.hiddenSize == 2048 && shape.dynamicSize == 512)
       return KernelLayout::Hidden2048;
     break;
+  case KernelLayout::Hidden4096:
+    if (shape.hiddenSize == 4096 && shape.dynamicSize == 1024)
+      return KernelLayout::Hidden4096;
+    break;
   case KernelLayout::Plain5120:
     if (shape.dynamicSize == 0 && shape.hiddenSize == 5120)
       return KernelLayout::Plain5120;
@@ -228,6 +232,9 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
     break;
   case KernelLayout::Hidden2048:
     name = kDraftConvH2048.data();
+    break;
+  case KernelLayout::Hidden4096:
+    name = kDraftConvH4096.data();
     break;
   default:
     throw std::invalid_argument("a plain draft has no dynamic convolutions");

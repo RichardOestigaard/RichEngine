@@ -180,7 +180,8 @@ void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
       (package.descriptor.draft.kind != model::DraftKind::Null &&
        !package.draftActualAllocatedBytes()) ||
-      (package.descriptor.hasVision() && !package.vision.actualAllocatedBytes) ||
+      (package.descriptor.hasVision() && !package.visionActualAllocatedBytes()) ||
+      (package.descriptor.hasSpeech() && !package.speechActualAllocatedBytes()) ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(
@@ -451,7 +452,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     ModelMemoryFootprint footprint{
         package.targetActualAllocatedBytes(),
         package.draftActualAllocatedBytes(),
-        package.vision.actualAllocatedBytes,
+        package.visionActualAllocatedBytes(),
         modelMemoryPlan,
         package.descriptor.draft.kind != model::DraftKind::Null,
         stateStagingBytes,
@@ -710,7 +711,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
   report.draftWeightsBytes = model_.draftActualAllocatedBytes();
-  report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
+  report.visionWeightsBytes = model_.visionActualAllocatedBytes();
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
@@ -740,7 +741,9 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::ModelPackage 
   model.dense = !layers->empty();
   // The d1 decision models serve one forward per judgment; a d1 given
   // (RICHENGINE_ANE_D1) is their opt-in.
-  model.decisionModel = package.descriptor.family == "d1-3B" || package.descriptor.family == "d1-omni";
+  model.decisionModel = package.descriptor.family == "d1-3B" ||
+                        package.descriptor.family == "d1-omni" ||
+                        package.descriptor.family == "d1-2B";
   if (!model.dense) return model;
   const char *reason = ops::AneFfn::unsupported(*layers);
   const char *coreaiReason = ops::CoreAiFfn::unsupported(*layers);

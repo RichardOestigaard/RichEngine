@@ -192,7 +192,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // Gemma's layer scratch: the post-attention residual and the zeroed rows
   // the routed combine adds to.
   put(DecodeTensor::GemmaResidual,
-      geometry.target.gemmaMoe
+      geometry.target.gemmaMoe || geometry.target.sandwichNorm
           ? bytesFor<uint16_t>(r * geometry.target.hiddenSize)
           : 0);
   put(DecodeTensor::ZeroResidual,

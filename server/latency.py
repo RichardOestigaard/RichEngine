@@ -35,6 +35,8 @@ STAGES = (
     "tokenization",
     "grammar",
     "images",
+    "audio",
+    "video",
     "native_queue",
     "http_ttft",
     "output_interval",

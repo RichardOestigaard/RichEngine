@@ -40,7 +40,8 @@ inline void richengine_attention_page_softmax_fp8(
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start, uint fused_row_offset,
     uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index, float qk_scale = 0.0f) {
+    uint thread_index, float qk_scale = 0.0f,
+    uint window_tokens = 0) {
   constexpr uint N = RichKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
@@ -57,6 +58,12 @@ inline void richengine_attention_page_softmax_fp8(
   const uint causal_end =
       committed_tokens + min(query_row, active_rows - 1) + 1;
   const uint limit = min(visible_tokens, causal_end);
+  // As the INT8 tile: a nonzero window admits only the last window_tokens
+  // tokens ending at the row's causal end (LFM3's sliding layers).
+  const uint window_begin =
+      window_tokens != 0 && causal_end > window_tokens
+          ? causal_end - window_tokens
+          : 0;
   const uint token = token_start + column;
   threadgroup const float4 *scores4 =
       reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
@@ -80,7 +87,8 @@ inline void richengine_attention_page_softmax_fp8(
   float local_max = -INFINITY;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    score[j] = token + j < limit ? score[j] : -INFINITY;
+    const uint t = token + j;
+    score[j] = t >= window_begin && t < limit ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -91,7 +99,9 @@ inline void richengine_attention_page_softmax_fp8(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+    const uint t = token + j;
+    probability[j] =
+        t >= window_begin && t < limit ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -142,7 +152,8 @@ inline void richengine_paged_attention_tile_fp8(
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     threadgroup half *staged_queries,
-    uint thread_index, float qk_scale = 0.0f) {
+    uint thread_index, float qk_scale = 0.0f,
+    uint window_tokens = 0, uint pass_begin = 0, uint pass_end = 2) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort MP = M / 2;
   constexpr ushort N = RichKvPageTokens;
@@ -176,7 +187,7 @@ inline void richengine_paged_attention_tile_fp8(
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
 
-  for (ushort pass = 0; pass < 2; ++pass) {
+  for (ushort pass = pass_begin; pass < pass_end; ++pass) {
     const uint row_offset = uint(pass) * MP;
     for (uint index = thread_index; index < uint(MP) * D; index += 256)
       staged_queries[index] = half(tile_queries[row_offset * D + index]);
@@ -236,7 +247,7 @@ inline void richengine_paged_attention_tile_fp8(
           reinterpret_cast<device const float4 *>(key_scales),
           reinterpret_cast<device const float4 *>(value_scales), token_start,
           row_offset, visible_tokens, committed_tokens, active_rows,
-          thread_index, qk_scale);
+          thread_index, qk_scale, window_tokens);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

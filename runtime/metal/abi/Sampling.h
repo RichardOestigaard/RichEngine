@@ -49,10 +49,16 @@ struct HeadArgmaxParams {
   // vocabulary that is not a tile multiple pads the last tile's rows; the
   // pad tokens' argmax stays out by the output_size bound.
   uint32_t output_stride;
+  // Per-lane logits writeback (the *_logits variants,
+  // RICHENGINE_HEAD_PER_LANE): rows of a flagged lane are stored to the
+  // logits buffer beside the argmax partials, so the batch keeps the fused
+  // head while sampled, penalized and constrained lanes still read their
+  // rows. Zero writes nothing — the all-greedy behavior.
+  uint32_t logits_lane_mask;
 };
 
-static_assert(sizeof(HeadArgmaxParams) == 44,
-              "Head argmax parameters are 44 bytes on both sides");
+static_assert(sizeof(HeadArgmaxParams) == 48,
+              "Head argmax parameters are 48 bytes on both sides");
 
 struct TargetSamplingParams {
   uint32_t vocabulary;
@@ -91,10 +97,15 @@ struct TargetSamplingParams {
   // RICHENGINE_TARGET_VERIFY_ROWS + 1 rows of vocabulary int16s, and a token
   // is admitted iff its entry is not -1.
   uint32_t dfa_mask;
+  // Lanes the fused head's argmax already answered
+  // (RICHENGINE_HEAD_PER_LANE): the sharded argmax and reduce skip their
+  // rows, since their logits rows were never written. Zero runs every
+  // greedy lane — the unfused behavior.
+  uint32_t fused_mask;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 140,
-              "Target sampling parameters are 140 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 144,
+              "Target sampling parameters are 144 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its

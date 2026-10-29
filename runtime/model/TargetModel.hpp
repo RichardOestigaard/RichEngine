@@ -51,6 +51,9 @@ struct AttentionMixerWeights final {
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
+  // LFM3's head-wise gate: hidden -> queryHeads sigmoid scalars on the
+  // attention output. Empty on every other target.
+  ops::Projection gateProjection;
 };
 
 // LFM2's double-gated short convolution: in_proj produces [B|C|x], the
@@ -140,6 +143,10 @@ struct TargetLayerWeights final {
   MixerWeights mixer;
   ops::NormWeights postAttentionNorm;
   TargetLayerFfn ffn;
+  // LFM3's sandwich norms: the mixer output's and the FFN output's, applied
+  // before each joins the residual. Empty on every other target.
+  ops::NormWeights postMixerNorm;
+  ops::NormWeights postFfnNorm;
 };
 
 // The weights of a target: its canonical layout and every layer. Not final:
@@ -219,11 +226,28 @@ struct TargetModelGeometry final {
   // full causal. The rest run the primary geometry masked to the trailing
   // slidingWindowTokens. kvLayout carries the same mask and alternate sizes.
   uint64_t altAttentionMask = 0;
+  // altAttentionMask is attention-ordinal space (it must equal
+  // kvLayout.altLayerMask); hybrid schedules like LFM3's — where attention
+  // ordinals and absolute layer indices differ — additionally carry the
+  // absolute-index mask the layer-kind checks read.
+  uint64_t altAbsoluteMask = 0;
   uint32_t altKvHeads = 0;
   uint32_t altHeadDimension = 0;
   uint32_t altRotaryPairs = 0;
   float altRotaryTheta = 0.0F;
   uint32_t slidingWindowTokens = 0;
+  // The alt layers' packed rows carry a V block (LFM3's globals — Gemma's
+  // k_eq_v alt layers store keys only).
+  bool altCarriesValues = false;
+  // LFM3's additions: the sandwich norms between each sublayer and the
+  // residual, the per-head sigmoid gate on the attention output, and the
+  // alt rope table's real prefix (its tail carries zeros — the zero-tail
+  // partial rotary of the global layers).
+  bool sandwichNorm = false;
+  bool attentionHeadGate = false;
+  // The gate projection's padded storage rows — the gate buffer's stride.
+  uint32_t attentionGateRows = 0;
+  uint32_t altRotaryRealPairs = 0;
   // Gemma 4's MoE routes from the post-attention residual and runs its
   // shared expert as a dense GeGLU block beside the routed experts, whose
   // slab width is the padded packed width (768), not the logical 704.
@@ -276,9 +300,11 @@ struct TargetModelGeometry final {
     return {convolutionDimension, convolutionTaps, packedGdnWidth};
   }
   // The dual-geometry accessors: without altAttentionMask every layer takes
-  // the primary geometry.
+  // the primary geometry. `layer` is the absolute index; a hybrid target's
+  // altAbsoluteMask names it directly, a dense one shares ordinals.
   [[nodiscard]] constexpr bool isAltAttentionLayer(uint32_t layer) const noexcept {
-    return (altAttentionMask >> layer) & 1;
+    const uint64_t mask = altAbsoluteMask ? altAbsoluteMask : altAttentionMask;
+    return layer < 64 && (mask >> layer) & 1;
   }
   // The per-layer kernel layout: attentionLayers 1, the layer kind's KV
   // geometry and, on the sliding layers, the window. Kernel names and
@@ -311,11 +337,12 @@ struct TargetModelGeometry final {
   [[nodiscard]] constexpr uint32_t rotaryPairsAt(uint32_t layer) const noexcept {
     return isAltAttentionLayer(layer) ? altRotaryPairs : rotaryPairs;
   }
-  // The packed QKV row width of `layer`: the globals' rows have no V block.
+  // The packed QKV row width of `layer`: the globals' rows have no V block
+  // unless the target declares they carry values (LFM3's globals do).
   [[nodiscard]] constexpr uint32_t layerPackedWidth(uint32_t layer) const noexcept {
     if (isAltAttentionLayer(layer))
       return attentionQueryHeads * altHeadDimension +
-             altKvHeads * altHeadDimension;
+             altKvHeads * altHeadDimension * (altCarriesValues ? 2 : 1);
     return packedFullWidth;
   }
   [[nodiscard]] constexpr uint32_t layerAttentionWidth(uint32_t layer) const noexcept {
@@ -331,7 +358,8 @@ struct TargetModelGeometry final {
   [[nodiscard]] constexpr uint32_t maximumPackedWidth() const noexcept {
     const uint32_t alt =
         altAttentionMask
-            ? attentionQueryHeads * altHeadDimension + altKvHeads * altHeadDimension
+            ? attentionQueryHeads * altHeadDimension +
+                  altKvHeads * altHeadDimension * (altCarriesValues ? 2 : 1)
             : 0;
     return std::max(packedFullWidth, alt);
   }
@@ -723,6 +751,7 @@ private:
   friend class StandardLayerEncoder;
   friend class GemmaLayerEncoder;
   friend class Qwen4LayerEncoder;
+  friend class Lfm3LayerEncoder;
 
   const TargetModelWeights *weights_;
   const TargetModelWeightsBase &weightsBase_;

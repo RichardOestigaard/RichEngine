@@ -9,8 +9,9 @@ from dataclasses import replace
 from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHHHQI")
-_REQUEST = struct.Struct("<QBBQQIIIffIffffQBIIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_REQUEST = struct.Struct("<QBBQQIIIIffIffffQBIIII")
+_IMAGE_SPAN = struct.Struct("<IIIIQQI")
+_AUDIO_SPAN = struct.Struct("<IIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _FORCED_TOKENS = struct.Struct("<QI")
 _VOCABULARY = struct.Struct("<II")
@@ -34,6 +35,8 @@ def request_frame(**overrides) -> wire.RequestFrame:
         constraint=wire.ConstraintMode.NONE,
         image_spans=(),
         image_pixels=b"",
+        audio_spans=(),
+        audio_mel=b"",
         return_progress=False,
         score_tokens=(),
         generation_prompt_tokens=0,
@@ -65,10 +68,12 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
     match event:
         case wire.ReadyEvent():
             return wire.FrameType.READY, struct.pack(
-                "<IIB",
+                "<IIBBBx",
                 event.max_concurrent_requests,
                 event.max_context_tokens,
                 event.vision,
+                event.audio,
+                event.speech,
             )
         case wire.StartEvent():
             return wire.FrameType.START, struct.pack(
@@ -158,6 +163,7 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         max_output,
         prompt_count,
         span_count,
+        audio_count,
         *sampling,
         seed,
         return_progress,
@@ -176,9 +182,19 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         for index in range(span_count)
     )
     offset += _IMAGE_SPAN.size * span_count
+    audios = tuple(
+        wire.AudioSpan(
+            *_AUDIO_SPAN.unpack_from(payload, offset + index * _AUDIO_SPAN.size)
+        )
+        for index in range(audio_count)
+    )
+    offset += _AUDIO_SPAN.size * audio_count
     pixel_bytes = sum(span.pixel_bytes for span in spans)
     pixels = bytes(payload[offset : offset + pixel_bytes])
-    scores = _words(payload, offset + pixel_bytes, score_count)
+    offset += pixel_bytes
+    mel_bytes = sum(span.mel_bytes for span in audios)
+    mel = bytes(payload[offset : offset + mel_bytes])
+    scores = _words(payload, offset + mel_bytes, score_count)
     return wire.RequestFrame(
         request_id,
         wire.RequestPriority(priority),
@@ -191,6 +207,8 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
         wire.ConstraintMode(constraint),
         spans,
         pixels,
+        audios,
+        mel,
         bool(return_progress),
         scores,
         generation_prompt_tokens,

@@ -69,6 +69,10 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.captureLayerCount = layout.captureLayerCount;
   std::copy_n(layout.hiddenCaptureLayers.begin(), layout.captureLayerCount,
               result.captureLayerValues.begin());
+  result.sandwichNorm = layout.sandwichNorm;
+  result.attentionHeadGate = layout.attentionHeadGate;
+  result.attentionGateRows = layout.attentionGateRows;
+  result.altRotaryRealPairs = layout.altRotaryRealPairs;
   return result;
 }
 
@@ -104,6 +108,19 @@ TargetModelGeometry geometryFor(const TargetLayout &layout) {
   } else {
     result.denseIntermediateSize = layout.intermediateSize;
     result.expertIntermediateSize = layout.expertIntermediateSize;
+    // LFM3's mask-declared dual geometry: same KV sizes on both kinds, the
+    // global (alt) layers differing only in their rope table — windowed
+    // sliding layers stay primary, full-causal globals alt.
+    if (layout.globalAttentionMask) {
+      result.altAttentionMask = layout.globalLayerMask();
+      result.altAbsoluteMask = layout.globalAttentionMask;
+      result.altKvHeads = layout.altKvHeads;
+      result.altHeadDimension = layout.altHeadDimension;
+      result.altRotaryPairs = layout.altRotaryPairs;
+      result.altRotaryTheta = layout.altRotaryTheta;
+      result.altCarriesValues = layout.altCarriesValues;
+      result.slidingWindowTokens = layout.slidingWindowTokens;
+    }
   }
   if (layout.ffnKind == FfnKind::SparseMoe) {
     result.experts = layout.experts;
@@ -305,6 +322,11 @@ TargetModelGeometry targetModelGeometry(const TargetModelWeights &weights) {
     std::visit([&](const auto &mixer) {
       includeProjection(geometry, mixer.inputProjection);
       includeProjection(geometry, mixer.outputProjection);
+      // LFM3's head-wise gate projection (hidden -> query heads).
+      if constexpr (std::is_same_v<std::decay_t<decltype(mixer)>,
+                                   AttentionMixerWeights>)
+        if (mixer.gateProjection.outputSize)
+          includeProjection(geometry, mixer.gateProjection);
     }, layer.mixer);
     includeFfn(geometry, layer);
   }
@@ -464,6 +486,20 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
         step.graph, u16(b.fullPacked, geometry_.packedFullWidth), mixer.queryNorm, mixer.keyNorm,
         f32(b.ropeCos, geometry_.rotaryPairs), f32(b.ropeSin, geometry_.rotaryPairs), queries, keys, values,
         sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
+    if (std::getenv("RICHENGINE_VERIFY_DUMP2")) {
+      auto fnv = [](const void *p, size_t n) {
+        const auto *b = static_cast<const unsigned char *>(p);
+        uint64_t h = 1469598103934665603ull;
+        const size_t step = n / 32 + 1;
+        for (size_t i = 0; i < n; i += step)
+          h = (h * 1099511628211ull) ^ b[i];
+        return h;
+      };
+      fprintf(stderr, "dump2 kvview seq=%zu kvoff=%llu kh=%016llx vh=%016llx\n",
+              index, (unsigned long long)sequence.kvOffset,
+              (unsigned long long)fnv(keys.contents(), keys.sizeBytes()),
+              (unsigned long long)fnv(values.contents(), values.sizeBytes()));
+    }
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
                                          sequence.chunk, geometry_.kvLayout);
     ops::PagedAttention::addPrefill(
@@ -602,7 +638,15 @@ void TargetModel::addVerify(
     step.moe = operators_.moeDecode(geometry_.moeShape(), planLanes,
                                     rowCapacity);
   encoder_->beginVerify(step);
+  // RICHENGINE_LAYER_LIMIT=N: stop after N layers — divergence bisection
+  // aid (the head then runs on garbage; only buffer dumps matter).
+  static const uint32_t layerLimit = [] {
+    const char *e = std::getenv("RICHENGINE_LAYER_LIMIT");
+    return e ? static_cast<uint32_t>(std::atoi(e)) : 0u;
+  }();
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    if (layerLimit && index >= layerLimit)
+      break;
     const metal::MetalBuffer input = buffers.hidden[index & 1];
     const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
     encoder_->addVerifyLayer(step, index, input, output);
@@ -618,8 +662,12 @@ void TargetModel::addVerify(
       graph.endBakedSpan();
     }
   }
-  requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-  addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, planLanes,
+  if (!layerLimit)
+    requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
+  const metal::MetalBuffer headInput =
+      layerLimit ? buffers.hidden[layerLimit & 1]
+                 : buffers.hidden[geometry_.layers & 1];
+  addHeadBatch(graph, headInput, buffers.finalHidden, buffers.logits, planLanes,
                buffers.linearScratch, &buffers,
                tree ? uint32_t{RICHENGINE_TREE_VERIFY_NODES} : verifyStride);
 }
@@ -805,16 +853,22 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
       const bool t256 =
           liveRows <= 16 && head.outputSize % 256 == 0 &&
           fused->headArgs.output_stride % 256 == 0;
-      const std::string_view kernel =
-          t256             ? "decode_head_argmax_q4_m16_t256"
-          : liveRows <= 8  ? "decode_head_argmax_q4_m8"
-          : liveRows <= 16 ? "decode_head_argmax_q4_m16"
-          : liveRows <= 32 ? "decode_head_argmax_q4"
-          : liveRows <= 48 ? "decode_head_argmax_q4_m48"
-                           : "decode_head_argmax_q4_m64h";
-      graph.add(std::string(kernel),
+      // The *_logits variants (RICHENGINE_HEAD_PER_LANE) additionally store
+      // the logits_lane_mask lanes' rows to the logits buffer; the plain
+      // ones bind it and never touch it.
+      const bool emitLogits = fused->headArgs.logits_lane_mask != 0;
+      const std::string kernel =
+          std::string(
+              t256             ? "decode_head_argmax_q4_m16_t256"
+              : liveRows <= 8  ? "decode_head_argmax_q4_m8"
+              : liveRows <= 16 ? "decode_head_argmax_q4_m16"
+              : liveRows <= 32 ? "decode_head_argmax_q4"
+              : liveRows <= 48 ? "decode_head_argmax_q4_m48"
+                               : "decode_head_argmax_q4_m64h") +
+          (emitLogits ? "_logits" : "");
+      graph.add(std::move(kernel),
                 {finalHidden, w.weights, w.scales, w.biases,
-                 fused->headArgmaxValues, fused->headArgmaxIndices},
+                 fused->headArgmaxValues, fused->headArgmaxIndices, logits},
                 fused->headArgs, {head.outputSize / (t256 ? 256 : 128), 1, 1},
                 {256, 1, 1});
       graph.endBakedSpan();

@@ -15,8 +15,10 @@ namespace richengine::model {
                               ? PrefillTensor::DraftInverseFrequencies
                               : PrefillTensor::TargetInverseFrequencies);
     // The dual-geometry target's second target table: the same positions at
-    // the alternate pairs and theta; its draft side stays unwritten.
-    if (targetCosAlt) {
+    // the alternate pairs and theta; its draft side stays unwritten. A
+    // draft-only call (the tree path builds the target's tables later)
+    // skips it — a 0/0 request is meaningless.
+    if (targetCosAlt && targetRows) {
       ops::RoPE::addTables(
           graph, targetPositions, draftPositions,
           prefillArena->get(PrefillTensor::TargetInverseFrequencies2),

@@ -193,11 +193,14 @@ VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_h256, 8, bfloat, 256
 VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_gemma_hd512, 2, int8_t, 512)
 VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_gemma_hd512, 2, RichKvPacked4, 512)
 VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_hd512, 2, bfloat, 512)
+VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_k4d128, 4, int8_t, 128)
+VERIFY_ATTENTION_STORE_HD(verify_attention_int4_store_k4d128, 4, RichKvPacked4, 128)
+VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_k4d128, 4, bfloat, 128)
 #undef VERIFY_ATTENTION_STORE_HD
 
 // Token-major-values variants (_tm) for a valuesTokenMajor layout's pages
 // (the QSA sparse attention's KV2 pages of 256).
-#define VERIFY_ATTENTION_STORE_TM(Name, Heads, CacheElement)                   \
+#define VERIFY_ATTENTION_STORE_TM(Name, Heads, CacheElement, HeadDim)        \
   kernel void Name(                                                          \
       device const bfloat *chunk_keys [[buffer(0)]],                         \
       device const bfloat *chunk_values [[buffer(1)]],                       \
@@ -211,14 +214,16 @@ VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_gemma_hd512, 2, bfloat, 51
       uint simd_lane [[thread_index_in_simdgroup]],                          \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
     threadgroup float maxima[8];                                             \
-    richengine_store_verify_phase<Heads, CacheElement,                       \
-                                  RICHENGINE_KV_HEAD_DIMENSION, true>(       \
+    richengine_store_verify_phase<Heads, CacheElement, HeadDim, true>(       \
         chunk_keys, chunk_values, page_table0, page_table1, page_table2,     \
         page_table3, params, maxima, group, thread_index, simd_lane,         \
         simd_group);                                                         \
   }
-VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_kv2_g8_tm, 2, int8_t)
-VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_kv2_g8_tm, 2, bfloat)
+VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_kv2_g8_tm, 2, int8_t, RICHENGINE_KV_HEAD_DIMENSION)
+VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_kv2_g8_tm, 2, bfloat, RICHENGINE_KV_HEAD_DIMENSION)
+// LFM3's sparse global layers: the k4q4d128 core's token-major stores.
+VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_k4q4d128_tm, 4, int8_t, 128)
+VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_k4q4d128_tm, 4, bfloat, 128)
 #undef VERIFY_ATTENTION_STORE_TM
 
 // Tree verify compaction. A tree lane's retained path names the scratch rows
@@ -345,4 +350,7 @@ VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_hd64, 8, bfloat, 64)
 VERIFY_TREE_COMPACT(verify_tree_attention_q8_compact_k8d128, 8, int8_t, 128)
 VERIFY_TREE_COMPACT(verify_tree_attention_int4_compact_k8d128, 8, RichKvPacked4, 128)
 VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_k8d128, 8, bfloat, 128)
+VERIFY_TREE_COMPACT(verify_tree_attention_q8_compact_k4d128, 4, int8_t, 128)
+VERIFY_TREE_COMPACT(verify_tree_attention_int4_compact_k4d128, 4, RichKvPacked4, 128)
+VERIFY_TREE_COMPACT(verify_tree_attention_bf16_compact_k4d128, 4, bfloat, 128)
 #undef VERIFY_TREE_COMPACT

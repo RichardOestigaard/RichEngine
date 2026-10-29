@@ -187,6 +187,10 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k8q4d128, 8, 4, bfloat, 
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_hd512, 2, 8, int8_t, 512)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_hd512, 2, 8, RichKvPacked4, 512)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_hd512, 2, 8, bfloat, 512)
+// LFM3's KV4 group-4 core of 128: 16 query heads.
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_k4q4d128, 4, 4, int8_t, 128)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k4q4d128, 4, 4, RichKvPacked4, 128)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k4q4d128, 4, 4, bfloat, 128)
 #undef PREFILL_ATTENTION_SPLIT_HD
 
 // The _m2 hd512 variants run the tile in two fused-row passes (MP = M/2 =
@@ -242,6 +246,7 @@ PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_hd128, 2, 8, 128)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_hd64, 8, 4, 64)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k8q5d64, 8, 5, 64)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k8q4d128, 8, 4, 128)
+PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k4q4d128, 4, 4, 128)
 #undef PREFILL_ATTENTION_REDUCE_HD
 
 // ---------------------------------------------------------------------------
@@ -296,6 +301,9 @@ PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_bf16_split_swa_h256, 8, 2, bfloat,
 PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_q8_split_swa_hd512, 2, 8, int8_t, 512)
 PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_int4_split_swa_hd512, 2, 8, RichKvPacked4, 512)
 PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_bf16_split_swa_hd512, 2, 8, bfloat, 512)
+PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_q8_split_swa_k4q4d128, 4, 4, int8_t, 128)
+PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_int4_split_swa_k4q4d128, 4, 4, RichKvPacked4, 128)
+PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_bf16_split_swa_k4q4d128, 4, 4, bfloat, 128)
 #undef PREFILL_ATTENTION_SPLIT_SWA
 
 // Windowed _m2 hd512 variants: the same two-pass tile as _hd512_m2 plus the

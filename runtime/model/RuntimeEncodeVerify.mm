@@ -87,31 +87,56 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     // m64h is opt-in: its half-precision tile can flip argmax near-ties.
     static const bool headM64 = envFlag("RICHENGINE_HEAD_M64");
     const uint32_t affineBound = headM64 ? 64 : 48;
-    buffers.fusedHead = !headFusedOff && !tree &&
+    // RICHENGINE_HEAD_PER_LANE: a lane that is not clean-greedy keeps its
+    // logits rows, which the fused head's *_logits variant writes beside the
+    // argmax partials — sampled and penalized selection and masked argmax
+    // read them, and a greedy GPU-DFA lane's correction row does too.
+    static const bool perLaneHead = tuning().headPerLane;
+    uint32_t logitsLaneMask = 0, coverableMask = 0;
+    const uint32_t gpuDfa = perLaneHead ? gpuDfaLaneMask(entries) : 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const ops::SamplingPolicy policy = samplingPolicy(*entries[lane]);
+      const bool clean = !policy.samples() && !policy.constrained &&
+                         !policy.penalties.active();
+      if (!clean)
+        logitsLaneMask |= uint32_t{1} << lane;
+      // A lane the fused argmax answers: clean greedy, or a greedy GPU-DFA
+      // lane whose proposal check argmaxes unmasked anyway. Penalized lanes
+      // stay out — their logits change after the head wrote them. A skipped
+      // DFA lane counts coverable here although the policy pass excludes
+      // it: the fused head then only wastes its partials.
+      if (clean || (perLaneHead && !policy.samples() &&
+                    !policy.penalties.active() &&
+                    (gpuDfa & (uint32_t{1} << lane))))
+        coverableMask |= uint32_t{1} << lane;
+    }
+    // The GGUF amax family has no logits writeback variant: a batch with a
+    // logits-reading lane on a GGUF head keeps the all-or-nothing rule.
+    const bool fusedShape =
+        affine48 ? (perLaneHead ? coverableMask != 0 : !logitsLaneMask)
+                 : ggufHead && !logitsLaneMask;
+    buffers.fusedHead = !headFusedOff && !tree && fusedShape &&
         uint64_t{lanes} * geometry.draft.verifyRows() <=
-            (affine48 ? affineBound : 32) &&
-        (affine48 || ggufHead);
+            (affine48 ? affineBound : 32);
     buffers.headArgs.output_size = geometry.target.vocabularySize;
     buffers.headArgs.output_stride = geometry.target.paddedVocabularySize;
     buffers.headArgs.input_size = geometry.target.hiddenSize;
     buffers.headArgs.rows = geometry.draft.verifyRows();
     buffers.headArgs.stop_token_0 = geometry.target.stopTokens[0];
     buffers.headArgs.stop_token_1 = geometry.target.stopTokens[1];
-    for (uint32_t lane = 0; lane < lanes && buffers.fusedHead; ++lane) {
-      const ops::SamplingPolicy policy = samplingPolicy(*entries[lane]);
-      if (policy.samples() || policy.constrained || policy.penalties.active()) {
-        buffers.fusedHead = false;
-        break;
-      }
-      if (policy.excludesStopTokens)
-        buffers.headArgs.exclude_stop_mask |= uint32_t{1} << lane;
-      buffers.headArgs.live_rows[lane] =
-          lane < liveRows.size()
-              ? std::clamp(liveRows[lane], uint32_t{1},
-                           geometry.draft.verifyRows())
-              : geometry.draft.verifyRows();
-    }
+    buffers.headArgs.logits_lane_mask =
+        buffers.fusedHead ? logitsLaneMask : 0;
     if (buffers.fusedHead) {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const ops::SamplingPolicy policy = samplingPolicy(*entries[lane]);
+        if (policy.excludesStopTokens)
+          buffers.headArgs.exclude_stop_mask |= uint32_t{1} << lane;
+        buffers.headArgs.live_rows[lane] =
+            lane < liveRows.size()
+                ? std::clamp(liveRows[lane], uint32_t{1},
+                             geometry.draft.verifyRows())
+                : geometry.draft.verifyRows();
+      }
       buffers.headArgmaxValues = d(DecodeTensor::HeadArgmaxValues);
       buffers.headArgmaxIndices = d(DecodeTensor::HeadArgmaxIndices);
     }
@@ -288,13 +313,6 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                          ? 3
                          : 1)
                   : ggufHead ? 2 : 0;
-    for (uint32_t lane = 0; lane < lanes && fusedHead; ++lane) {
-      if (policies[lane].samples() || policies[lane].constrained ||
-          policies[lane].penalties.active()) {
-        fusedHead = false;
-        break;
-      }
-    }
     auto vBuffers = samplingBuffers(lanes);
     // Full-mode DFA lanes read their next-state admission rows; a skipped
     // lane (an abandoned mask wait) keeps the host-filled bitmask, as do
@@ -306,6 +324,33 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     vBuffers.dfaLanes =
         (gpuDfaLaneMask(entries) & ~dfaLaneSkip) & ~unmasked;
     vBuffers.unmaskedLanes = unmasked;
+    // RICHENGINE_HEAD_PER_LANE: the fused argmax answers clean-greedy lanes
+    // and greedy GPU-DFA lanes (their proposal check argmaxes unmasked
+    // anyway); every other lane reads the logits rows the head's *_logits
+    // variant wrote. Penalized lanes stay out of fusedLaneMask — the
+    // penalties rewrite their logits after the head ran. The mask matches
+    // the forward pass's coverable set minus lanes skipped here: a
+    // coverable-only-skip batch ran the fused head needlessly, never the
+    // reverse (a fused reduce over unwritten partials).
+    uint32_t logitsLaneMask = 0, fusedLaneMask = 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const bool clean = !policies[lane].samples() &&
+                         !policies[lane].constrained &&
+                         !policies[lane].penalties.active();
+      if (clean ||
+          (tuning().headPerLane && !policies[lane].penalties.active() &&
+           (unmasked & (uint32_t{1} << lane)))) {
+        fusedLaneMask |= uint32_t{1} << lane;
+      } else {
+        logitsLaneMask |= uint32_t{1} << lane;
+      }
+    }
+    // The GGUF amax family has no logits writeback variant: it keeps the
+    // all-or-nothing rule under the flag too.
+    if (tuning().headPerLane
+            ? (fusedHead == 2 ? logitsLaneMask : !fusedLaneMask)
+            : logitsLaneMask)
+      fusedHead = 0;
     if (fusedHead) {
       vBuffers.headArgmaxValues =
           decodeArena->packed(DecodeTensor::HeadArgmaxValues,
@@ -318,7 +363,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                        vBuffers, geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
                        {penaltyTable, std::span(stateLanes).first(lanes)},
-                       liveRows, fusedHead, geometry.draft.verifyRows());
+                       liveRows, fusedHead, geometry.draft.verifyRows(),
+                       fusedLaneMask);
   }
 
   void Runtime::Impl::encodeBatchAcceptance(CommandGraph &graph,
@@ -392,6 +438,18 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         decodeArena->packed(DecodeTensor::ProposedTokens, lanes);
     const MetalBuffer verifyInput =
         decodeArena->packed(DecodeTensor::InputTokens, lanes);
+    // The staged anchors: draft_predraft_pack fills draft_input only for
+    // the chained-predraft path, so a target without it (LFM3) would leave
+    // the verify input's proof fallback reading zeros. The kernels stride
+    // draft_input by queryRows — the arena's kDecodeRows allocation is one
+    // row wider — so stride by the same, never by the buffer's lane size.
+    {
+      uint32_t *staged =
+          contents<uint32_t>(draftInput, "verify staged anchors");
+      const uint64_t stride = geometry.draft.queryRows();
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        staged[lane * stride] = *entries[lane]->pendingToken;
+    }
     if (deviceVerifyParams_) {
       // The device variant binds the step pack: each lane takes its
       // anchor and live count from the pack when it proves to be that

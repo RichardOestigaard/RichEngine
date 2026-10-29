@@ -88,6 +88,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.u32(request.logicalMaxOutputTokens);
   out.u32(static_cast<uint32_t>(request.promptTokens.size()));
   out.u32(static_cast<uint32_t>(request.imageSpans.size()));
+  out.u32(static_cast<uint32_t>(request.audioSpans.size()));
   out.f32(request.sampling.temperature);
   out.f32(request.sampling.topP);
   out.u32(request.sampling.topK);
@@ -109,8 +110,17 @@ FrameType write(Writer &out, const RequestFrame &request) {
     out.u32(span.gridWidth);
     out.u64(span.digestLo);
     out.u64(span.digestHi);
+    out.u32(span.frames);
+  }
+  for (const AudioSpan &span : request.audioSpans) {
+    out.u32(span.offset);
+    out.u32(span.tokens);
+    out.u32(span.melFrames);
+    out.u64(span.digestLo);
+    out.u64(span.digestHi);
   }
   out.raw(request.imagePixels);
+  out.raw(request.audioMel);
   out.words(request.scoreTokens);
   return FrameType::Request;
 }
@@ -225,6 +235,9 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.maxConcurrentRequests = in.u32();
     event.maxContextTokens = in.u32();
     event.vision = in.u8() != 0;
+    event.audio = in.u8() != 0;
+    event.speech = in.u8() != 0;
+    static_cast<void>(in.u8()); // reserved
     return event;
   }
   case FrameType::Start: {

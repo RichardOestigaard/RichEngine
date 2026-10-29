@@ -144,6 +144,31 @@ def vision_fixture():
     }
 
 
+def lfm_vision_fixture():
+    """The lfm3vl clip section of an LFM3-Omni mmproj: fourteen hybrid
+    conv/attention blocks at hidden 1024, silu FFNs, axial rope and the
+    LayerNorm + GELU(erf) merge projector."""
+    return {
+        "general.architecture": "clip",
+        "clip.vision.projector_type": "lfm3vl",
+        "clip.use_silu": True,
+        "clip.vision.block_count": 14,
+        "clip.vision.embedding_length": 1024,
+        "clip.vision.attention.head_count": 16,
+        "clip.vision.attention.head_count_kv": 8,
+        "clip.vision.feed_forward_length": 2560,
+        "clip.vision.projection_dim": 2048,
+        "clip.vision.patch_size": 16,
+        "clip.vision.spatial_merge_size": 2,
+        "clip.vision.attention.layer_norm_epsilon": 1e-5,
+        "clip.vision.image_resize_algo": "bicubic",
+        "clip.vision.image_min_pixels": 65536,
+        "clip.vision.image_max_pixels": 16777216,
+        "clip.vision.image_mean": [0.5] * 3,
+        "clip.vision.image_std": [0.5] * 3,
+    }
+
+
 class GgufMetadataTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -724,6 +749,86 @@ class GgufMetadataTests(unittest.TestCase):
             ):
                 gguf.vision_config(self.metadata(values))
 
+    def test_vision_config_accepts_the_lfm3vl_tower(self):
+        config = gguf.vision_config(self.metadata(lfm_vision_fixture()))
+        self.assertEqual(
+            {
+                key: config[key]
+                for key in (
+                    "projector_type",
+                    "depth",
+                    "hidden_size",
+                    "num_heads",
+                    "num_key_value_heads",
+                    "intermediate_size",
+                    "out_hidden_size",
+                    "patch_size",
+                    "spatial_merge_size",
+                    "temporal_patch_size",
+                    "in_channels",
+                    "hidden_act",
+                )
+            },
+            {
+                "projector_type": "lfm3vl",
+                "depth": 14,
+                "hidden_size": 1024,
+                "num_heads": 16,
+                "num_key_value_heads": 8,
+                "intermediate_size": 2560,
+                "out_hidden_size": 2048,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "in_channels": 3,
+                "hidden_act": "silu",
+            },
+        )
+        for key, value, reason in (
+            ("clip.use_silu", False, "unsupported GGUF vision architecture"),
+            ("clip.use_gelu", True, "unsupported GGUF vision architecture"),
+            ("clip.vision.spatial_merge_size", 4, "unsupported GGUF vision architecture"),
+            ("clip.vision.image_resize_algo", "bilinear", "unsupported GGUF vision architecture"),
+            (
+                "clip.vision.attention.layer_norm_epsilon",
+                0.1,
+                "unsupported GGUF vision norm epsilon",
+            ),
+        ):
+            values = lfm_vision_fixture()
+            values[key] = value
+            with (
+                self.subTest(key=key, value=value),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
+                gguf.vision_config(self.metadata(values))
+        # head_count_kv must divide the query heads.
+        values = lfm_vision_fixture()
+        values["clip.vision.attention.head_count_kv"] = 12
+        with self.assertRaisesRegex(models.ModelError, "head grouping"):
+            gguf.vision_config(self.metadata(values))
+
+    def test_vision_projector_takes_the_lfm3vl_mixed_quantization(self):
+        tensors = (
+            ("v.blk.0.conv2d_in_proj.weight", GGML["Q8_0"]),
+            ("v.blk.0.conv2d_spatial.weight", GGML["F32"]),
+            ("v.patch_embd.weight", GGML["F16"]),
+        )
+        root = self.root / "lfm-projectors"
+        root.mkdir()
+        write_gguf(root / "mmproj-Model-F16.gguf", lfm_vision_fixture(), tensors)
+        repo = hub.Repository.local_directory(root)
+        name, _ = upstream.select_vision(repo)
+        self.assertEqual(name, "mmproj-Model-F16.gguf")
+        # A stray type the tower never carries rejects the file.
+        write_gguf(
+            root / "mmproj-Model-F16.gguf",
+            lfm_vision_fixture(),
+            tensors + (("v.extra.weight", GGML["Q4_K"]),),
+        )
+        with self.assertRaisesRegex(models.ModelError, "no supported vision projector"):
+            upstream.select_vision(repo)
+
     def derived(self, models_root, path):
         """The metadata derived from a target GGUF, as installations derive
         it, under the lock."""
@@ -767,7 +872,7 @@ class GgufMetadataTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             models.ModelError,
-            r"no BF16 or F32 vision projector \(mmproj-f16.gguf \(clip: F16, F32\); "
+            r"no supported vision projector \(mmproj-f16.gguf \(clip: F16, F32\); "
             r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\); use --language-only",
         ):
             upstream.select_vision(projectors(**{"mmproj-f16": f16, "mmproj-x": text}))

@@ -108,16 +108,27 @@ def select_gguf(files, variant):
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
 
 
+# The tensor types each projector kind may carry. qwen3vl_merger ships BF16,
+# or F32 which preparation converts only where every value is exact — the
+# tower runs in BF16 and preparation never rounds a weight: F16 has a
+# narrower exponent than BF16, so an F16 projector has already rounded small
+# weights, as a quantized one has. lfm3vl quantizes its blocks (Q8_0 with F32
+# norms and depthwise kernels, F16 patch embeddings); the weights are already
+# rounded, and the loader dequantizes into the same BF16 image.
+PROJECTOR_TYPES = {
+    "qwen3vl_merger": {"BF16", "F32"},
+    "lfm3vl": {"Q8_0", "F16", "F32", "BF16"},
+}
+
+
 def select_vision(repo):
     """The name and header of the GGUF repository's vision projector, chosen
     by content among its root GGUF files named mmproj, whatever the publisher
-    calls them: a clip model whose weights are BF16, or F32, which
-    preparation converts only where every value is exact; BF16 is preferred.
-    The tower runs in BF16 and preparation never rounds a weight: F16 has a
-    narrower exponent than BF16, so an F16 projector has already rounded
-    small weights, as a quantized one has. Each header costs a few range
+    calls them: a clip model of a supported projector kind whose tensor types
+    are the ones it loads with (PROJECTOR_TYPES); BF16 is preferred where two
+    precisions could describe the same tower. Each header costs a few range
     requests."""
-    usable, found = {"BF16": [], "F32": []}, []
+    usable, found = {"BF16": [], "F32": [], "quantized": []}, []
     for name in filter(_projector_named, _root_ggufs(repo.files)):
         with repo.open(name) as stream:
             header = gguf.Metadata(stream, tensors=True)
@@ -127,7 +138,21 @@ def select_vision(repo):
             for kind in header.tensors.values()
         }
         found.append(f"{name} ({architecture}: {', '.join(sorted(types))})")
-        if architecture == "clip" and types and types <= {"BF16", "F32"}:
+        if architecture != "clip":
+            continue
+        projector = header.values.get("clip.projector_type") or header.values.get(
+            "clip.vision.projector_type"
+        )
+        accepted = PROJECTOR_TYPES.get(projector, set())
+        if not types or not types <= accepted:
+            continue
+        if projector == "lfm3vl":
+            # BF16 still wins where two precisions describe the omni tower;
+            # quantized projectors pool below it.
+            usable["BF16" if "BF16" in types else "quantized"].append(
+                (name, header)
+            )
+        else:
             usable["BF16" if "BF16" in types else "F32"].append((name, header))
     for precision, projectors in usable.items():
         if len(projectors) == 1:
@@ -139,7 +164,7 @@ def select_vision(repo):
                 + ", describe no single tower; use --language-only to serve text only"
             )
     raise models.ModelError(
-        "the GGUF repository has no BF16 or F32 vision projector ("
+        "the GGUF repository has no supported vision projector ("
         + ("; ".join(found) or "no GGUF named mmproj")
         + "); use --language-only to serve text only"
     )
@@ -208,6 +233,13 @@ def _gguf_target(repo, variant, language_only):
         files[layout.GGUF_VISION], vision_header = select_vision(repo)
         _validate_processor(gguf.processor_config(vision_header), family)
         config["vision_config"] = gguf.vision_config(vision_header)
+        # The omni mmproj's shared lfm3a encoder; absent sections leave the
+        # config without an audio_config key and the model text/vision only.
+        if audio := gguf.audio_config(vision_header):
+            config["audio_config"] = audio
+        # The same file's lfm3a_gen speech decoder, when it carries one.
+        if speech := gguf.speech_config(vision_header):
+            config["speech_config"] = speech
     print(f"Selected {models.accent(name)} from {repo.name}.", flush=True)
     return Target("gguf", "none" if language_only else "gguf", config, files)
 

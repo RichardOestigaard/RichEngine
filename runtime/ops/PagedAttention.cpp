@@ -53,6 +53,7 @@ using KernelLayout = kv::Core;
   case KernelLayout::GemmaKv8H256:
     return 256;
   case KernelLayout::Kv2Group8D128:
+  case KernelLayout::Kv4Group4D128:
     return 128;
   case KernelLayout::Kv8Group4D64:
   case KernelLayout::Kv8Group5D64:
@@ -85,6 +86,8 @@ using KernelLayout = kv::Core;
     return "_k8q5d64";
   case KernelLayout::Kv8Group4D128:
     return "_k8q4d128";
+  case KernelLayout::Kv4Group4D128:
+    return "_k4q4d128";
   case KernelLayout::GemmaKv8H256:
     return "_gemma_h256";
   case KernelLayout::GemmaKv2H512:
@@ -117,6 +120,8 @@ using KernelLayout = kv::Core;
     return KernelLayout::Kv8Group4D64;
   else if (layout.headDimension == 128 && layout.kvHeads == 8)
     return KernelLayout::Kv8Group4D128;
+  else if (layout.headDimension == 128 && layout.kvHeads == 4)
+    return KernelLayout::Kv4Group4D128;
   throw std::invalid_argument("unsupported attention layout");
 }
 
@@ -133,6 +138,7 @@ using KernelLayout = kv::Core;
   if (layout.headDimension == 128 && layout.kvHeads == 2) return "_hd128";
   if (layout.headDimension == 64 && layout.kvHeads == 8) return "_hd64";
   if (layout.headDimension == 128 && layout.kvHeads == 8) return "_k8d128";
+  if (layout.headDimension == 128 && layout.kvHeads == 4) return "_k4d128";
   throw std::invalid_argument("unsupported attention layout");
 }
 
@@ -162,6 +168,9 @@ using KernelLayout = kv::Core;
   case KernelLayout::Kv8Group4D128:
     return layout.kvHeads == 8 && layout.headDimension == 128 &&
            queryHeads == 32;
+  case KernelLayout::Kv4Group4D128:
+    return layout.kvHeads == 4 && layout.headDimension == 128 &&
+           queryHeads == 16;
   case KernelLayout::GemmaKv8H256:
     return layout.kvHeads == 8 && layout.headDimension == 256 &&
            queryHeads == 16;
@@ -241,8 +250,15 @@ using KernelLayout = kv::Core;
   if (kernel == KernelLayout::GemmaKv8H256 ||
       kernel == KernelLayout::GemmaKv2H512)
     return gemmaSplitKernel(stem, layout.format, kernel, layout.windowTokens);
-  std::string name = splitKernel(stem, layout.format, kernel);
-  if (stem == kVerifyTreeAttention &&
+  // A non-Gemma windowed layer (LFM3's sliding kind) takes the
+  // *_split_swa<suffix> kernels, which read the window from the trailing
+  // constant — including the tree splits' buffer(9).
+  std::string name =
+      layout.windowTokens
+          ? std::string(stem) + "_" + formatTag(layout.format) +
+                "_split_swa" + std::string(kernelSuffix(kernel))
+          : splitKernel(stem, layout.format, kernel);
+  if (stem == kVerifyTreeAttention && !layout.windowTokens &&
       (kernel == KernelLayout::Kv2Group8 ||
        kernel == KernelLayout::Kv2Group8D128))
     name += "_m2";
@@ -259,7 +275,9 @@ using KernelLayout = kv::Core;
   // untested and tree verify keeps its own _m2 pass split.
   // RICHENGINE_VERIFY_SPLIT_R2_OFF restores the single-group split for a
   // model that disagrees.
-  if (chainR2 && stem == kVerifyAttention) {
+  if (chainR2 && stem == kVerifyAttention &&
+      (!layout.windowTokens ||
+       kernel == KernelLayout::Kv4Group4D128)) {
     const uint32_t group = [kernel] {
       switch (kernel) {
       case KernelLayout::Kv4Group6:
@@ -271,6 +289,7 @@ using KernelLayout = kv::Core;
         return 8u;
       case KernelLayout::Kv8Group4D64:
       case KernelLayout::Kv8Group4D128:
+      case KernelLayout::Kv4Group4D128:
         return 4u;
       case KernelLayout::Kv8Group5D64:
         return 5u;
@@ -314,7 +333,8 @@ using KernelLayout = kv::Core;
 // Whether the layout's core compiles sparse kernels and its pages hold
 // values the gather can read: token-major, INT8 or BF16.
 void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
-  if (kernel != KernelLayout::Kv2Group12H256)
+  if (kernel != KernelLayout::Kv2Group12H256 &&
+      kernel != KernelLayout::Kv4Group4D128)
     throw std::invalid_argument("no sparse attention kernel for layout");
   if (!layout.valuesTokenMajor)
     throw std::invalid_argument("sparse attention requires token-major values");
@@ -329,9 +349,12 @@ void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
 
 [[nodiscard]] std::string gateKernel(std::string_view stem, bool queryGate,
                                      KernelLayout layout,
-                                     std::string_view tableTag = {}) {
+                                     std::string_view tableTag = {},
+                                     bool headGate = false) {
   std::string kernel(stem);
-  kernel += queryGate ? "_gate" : "_gather";
+  // LFM3's head-wise gate: a per-head scalar buffer, not the packed [q|gate]
+  // rows of the query-gate targets.
+  kernel += headGate ? "_headgate" : queryGate ? "_gate" : "_gather";
   kernel += tableTag;
   kernel += kernelSuffix(layout);
   return kernel;
@@ -577,10 +600,11 @@ void PagedAttention::addPrefillProjection(
 void PagedAttention::addPrefillGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden, uint32_t tokens,
-    uint32_t stride, uint32_t queryHeads, kv::Layout layout, bool queryGate) {
+    uint32_t stride, uint32_t queryHeads, kv::Layout layout, bool queryGate,
+    bool headGate) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   FullPrefillParams params{.tokens = tokens, .stride = stride};
-  graph.add(gateKernel(kPrefillAttention, queryGate, kernelLayout),
+  graph.add(gateKernel(kPrefillAttention, queryGate, kernelLayout, {}, headGate),
             {packed, attention, hidden}, params,
             {elementwiseGroups(uint64_t{tokens} * queryHeads *
                                layout.headDimension),
@@ -591,12 +615,13 @@ void PagedAttention::addPrefillGateSums(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
     metal::MetalBuffer sums, uint32_t tokens, uint32_t stride,
-    uint32_t queryHeads, kv::Layout layout) {
+    uint32_t queryHeads, kv::Layout layout, bool headGate) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
-  if (kernelLayoutHeadDim(kernelLayout) != RICHENGINE_KV_HEAD_DIMENSION)
+  if (kernelLayoutHeadDim(kernelLayout) != RICHENGINE_KV_HEAD_DIMENSION &&
+      kernelLayout != KernelLayout::Kv4Group4D128)
     throw std::invalid_argument("no paged prefill gate sums kernel for layout");
   FullPrefillParams params{.tokens = tokens, .stride = stride};
-  graph.add(gateKernel(kPrefillAttention, true, kernelLayout, "_sums"),
+  graph.add(gateKernel(kPrefillAttention, true, kernelLayout, "_sums", headGate),
             {packed, attention, hidden, sums}, params,
             {elementwiseGroups(uint64_t{tokens} * queryHeads *
                                layout.headDimension),
@@ -631,13 +656,14 @@ PreparedInput PagedAttention::addVerifyGate(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     metal::MetalBuffer attention, metal::MetalBuffer hidden,
     uint32_t queryHeads, kv::Layout layout, uint32_t lanes,
-    LinearScratch scratch, LinearInput input, bool queryGate, uint32_t rows) {
+    LinearScratch scratch, LinearInput input, bool queryGate, uint32_t rows,
+    bool headGate) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   FullDecodeBatchParams params{.lanes = lanes,
                                .rows = rows,
                                .rope_stride = RICHENGINE_TARGET_VERIFY_ROWS};
   if (input == LinearInput::Plain) {
-    graph.addPatchable(gateKernel(kVerifyAttention, queryGate, kernelLayout),
+    graph.addPatchable(gateKernel(kVerifyAttention, queryGate, kernelLayout, {}, headGate),
               {packed, attention, hidden}, params,
               {elementwiseGroups(uint64_t{lanes} * rows * queryHeads *
                                  layout.headDimension),
@@ -647,7 +673,8 @@ PreparedInput PagedAttention::addVerifyGate(
   const uint32_t width = queryHeads * layout.headDimension;
   requireTableScratch(scratch, input, width, lanes * rows);
   const std::string kernel =
-      gateKernel(kVerifyAttention, queryGate, kernelLayout, tableSuffix(input));
+      gateKernel(kVerifyAttention, queryGate, kernelLayout, tableSuffix(input),
+                 headGate);
   graph.add(kernel,
             {packed, attention, hidden, scratch.input, scratch.sums},
             params,
@@ -695,6 +722,17 @@ void PagedAttention::addPrefillStore(
   chunk.kv = layer;
   if (std::string_view error = kv::chunkedPrefillValidationError(chunk); !error.empty())
     throw std::invalid_argument(std::string(error));
+  if (std::getenv("RICHENGINE_VERIFY_DUMP2")) {
+    const auto *te =
+        static_cast<const uint64_t *>(pageTable.contents());
+    fprintf(stderr,
+            "dump2 store c=%u t=%u s=%u pte=%u pt0=%llx pt1=%llx\n",
+            chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
+            chunk.page_table_entries,
+            te ? (unsigned long long)te[0] : 0ull,
+            te && chunk.page_table_entries > 1 ? (unsigned long long)te[1]
+                                               : 0ull);
+  }
   graph.add(storeKernel(kPrefillAttention, layout.format, layout),
             {chunkKeys, chunkValues, pageTable}, chunk,
             {2 * params.chunk_tokens * layout.kvHeads, 1, 1},
@@ -753,7 +791,7 @@ void PagedAttention::addVerify(
     PagedVerifyBuffers buffers,
     std::span<const kv::ChunkedPrefillParams> chunks,
     const VerifyAttentionPlan &plan, metal::MetalBuffer gatePacked,
-    metal::MetalBuffer gateHidden, AttentionBlocks blocks) {
+    metal::MetalBuffer gateHidden, AttentionBlocks blocks, bool headGate) {
   constexpr uint32_t maximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes)
     throw std::invalid_argument("invalid paged verify batch");
@@ -777,7 +815,20 @@ void PagedAttention::addVerify(
                        chunks[lane].chunk_tokens,
                        plan.rowCapacity, plan.scoreScale,
                        blocks.stride,
-                       blocks.list + lane * plan.rowTiles};
+                       // Dense verifies must leave block_list at zero — the
+                       // contract reads block_lists[block_list] when nonzero.
+                       plan.sparse
+                           ? uint32_t(blocks.list + lane * plan.rowTiles)
+                           : uint32_t{0}};
+    if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+      fprintf(stderr,
+              "addVerify lane=%u committed=%u pte=%u splits=%u slots=%u "
+              "active=%u cap=%u kvpages=%u kvoff=%u\n",
+              lane, attention[lane].committed_tokens,
+              attention[lane].page_table_entries, attention[lane].split_count,
+              attention[lane].slot_splits, attention[lane].active_rows,
+              attention[lane].row_capacity, attention[lane].kv.extent_pages,
+              attention[lane].kv.offset);
   }
   std::array<metal::MetalBuffer, 4> tables = {buffers.pageTables[0], buffers.pageTables[1],
                                               buffers.pageTables[2], buffers.pageTables[3]};
@@ -833,13 +884,15 @@ void PagedAttention::addVerify(
             : kVerifyAttentionReduce.size()));
     if (gatePacked) {
       const std::string gate =
-          std::string(tree ? kVerifyTreeAttentionReduceGate
-                           : kVerifyAttentionReduceGate) +
+          std::string(headGate ? (tree ? kVerifyTreeAttentionReduceHeadGate
+                                       : kVerifyAttentionReduceHeadGate)
+                               : (tree ? kVerifyTreeAttentionReduceGate
+                                       : kVerifyAttentionReduceGate)) +
           suffix;
       graph.addPatchable(gate,
                 {buffers.partials, buffers.statistics, buffers.output,
                  std::move(gatePacked), std::move(gateHidden)},
-                attention, plan.reduceGroups);
+                attention, plan.reduceGroups, plan.reduceThreads_);
     } else {
       // The no-gate targets' reduce/gather fusion: the hidden layout alone
       // is written, so the reduce threads bound is the head dimension.

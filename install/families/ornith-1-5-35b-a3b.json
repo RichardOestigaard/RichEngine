@@ -18,8 +18,8 @@
     "router_aux_loss_coef": 0.0
   },
   "draft": {
-    "repo": "ornith-ai/Ornith-1.5-35B-A3B-DFlash",
-    "base": "dflash",
+    "repo": "resolvo-cloud/Ornith-1.5-35B-A3B-DFlash2",
+    "base": "dflash2",
     "signature": {
       "num_hidden_layers": 6,
       "num_target_layers": 40,
@@ -29,6 +29,7 @@
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
       "head_dim": 128,
+      "dflash_config.selector_rank": 256,
       "dflash_config.mask_token_id": 248077,
       "dflash_config.target_layer_ids": [
         1,

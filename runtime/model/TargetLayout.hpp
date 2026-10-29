@@ -38,6 +38,8 @@ struct MixerGeometry final {
   uint32_t attentionWidth = 0;
   uint32_t attentionHeadDimension = 0;
   uint32_t convolutionTaps = 0;
+  // The head-wise gate projection's padded storage rows (LFM3: 256).
+  uint32_t attentionGateRows = 0;
 };
 
 // The capture slots the geometry's captureLayerValues holds
@@ -166,6 +168,26 @@ struct TargetLayout final {
   uint32_t altRotaryPairs = 0;
   float altRotaryTheta = 0.0F;
   uint32_t slidingWindowTokens = 0;
+  // LFM3's declared global-layer set: the alt geometry applies to these
+  // attention layers where globalLayerPeriod's periodic rule does not
+  // describe the schedule. altCarriesValues keeps a V block in the alt
+  // layers' packed rows (LFM3; Gemma's k_eq_v globals carry none), and
+  // altRotaryRealPairs zeroes the alt rope table's tail past them (the
+  // zero-tail partial rotary).
+  uint64_t globalAttentionMask = 0;
+  // The head-wise gate projection's storage width: its 16 output rows pad
+  // to one 256-row Q4 tile (gate weights outside row 15 are zeros the
+  // kernels never read).
+  uint32_t attentionGateRows = 0;
+  bool altCarriesValues = false;
+  uint32_t altRotaryRealPairs = 0;
+  // LFM3's sandwich norm: each block also normalizes the mixer output and
+  // the FFN output before they join the residual.
+  bool sandwichNorm = false;
+  // LFM3's head-wise gated attention: a per-head sigmoid gate from a
+  // gate_proj the packed QKV row does not interleave, applied to the
+  // attention output before the out-projection.
+  bool attentionHeadGate = false;
   // Gemma's expert slabs pad the logical expertIntermediateSize to the
   // tiles' column granularity; the shared expert's dense GeGLU pads its
   // intermediate to packedSharedWidth alike.
@@ -243,14 +265,28 @@ struct TargetLayout final {
     // Every layer is attention under a global schedule or a period of 1.
     return fullAttentionPeriod > 1 ? layers / fullAttentionPeriod : layers;
   }
-  // Gemma's global layers: the last layer of each period.
+  // Gemma's global layers are the last layer of each period; LFM3's are
+  // the declared globalAttentionMask.
   [[nodiscard]] constexpr bool
   isGlobalAttentionLayer(uint32_t layer) const noexcept {
-    return globalLayerPeriod &&
-           layer % globalLayerPeriod == globalLayerPeriod - 1;
+    if (globalLayerPeriod)
+      return layer % globalLayerPeriod == globalLayerPeriod - 1;
+    return layer < 64 && (globalAttentionMask >> layer) & 1;
   }
   [[nodiscard]] constexpr uint64_t globalLayerMask() const noexcept {
     uint64_t mask = 0;
+    if (!globalLayerPeriod) {
+      // altLayerMask indexes attention ordinals, not absolute layers:
+      // fold the declared absolute mask down over the attention layers.
+      if (!globalAttentionMask) return 0;
+      uint32_t ordinal = 0;
+      for (uint32_t layer = 0; layer < layers && layer < 64; ++layer) {
+        if (!isFullAttentionLayer(layer)) continue;
+        if (isGlobalAttentionLayer(layer)) mask |= uint64_t{1} << ordinal;
+        ++ordinal;
+      }
+      return mask;
+    }
     for (uint32_t layer = 0; layer < layers; ++layer)
       mask |= uint64_t{isGlobalAttentionLayer(layer)} << layer;
     return mask;
@@ -340,7 +376,8 @@ struct TargetLayout final {
   [[nodiscard]] constexpr MixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,           packedGdnWidth,        packedFullWidth,
             convolutionDimension, gdnValueHeads,         gdnHeadDimension,
-            attentionWidth,       attentionHeadDimension, convolutionTaps};
+            attentionWidth,       attentionHeadDimension, convolutionTaps,
+            attentionGateRows};
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
@@ -371,7 +408,8 @@ struct TargetLayout final {
   // The fused QKV row width: queries, keys and — the locals only — values
   // (Gemma's globals run k_eq_v, so their rows carry no V block).
   [[nodiscard]] constexpr uint32_t packedWidthAt(uint32_t layer) const noexcept {
-    const uint32_t values = isGlobalAttentionLayer(layer) ? 1 : 2;
+    const uint32_t values =
+        isGlobalAttentionLayer(layer) && !altCarriesValues ? 1 : 2;
     return attentionQueryHeads * headDimensionAt(layer) +
            values * kvHeadsAt(layer) * headDimensionAt(layer);
   }

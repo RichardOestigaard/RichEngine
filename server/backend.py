@@ -164,6 +164,11 @@ class Job:
     image_spans: tuple = ()
     image_pixels: bytes = b""
     image_owner: object | None = None
+    # Audio placeholder spans with their mel frame counts and digests, plus
+    # the concatenated float32 [128, T] mels the engine encodes during prefill.
+    audio_spans: tuple = ()
+    audio_mel: bytes = b""
+    audio_owner: object | None = None
     public_id: str = ""
     created_at: int = field(default_factory=lambda: int(time.time()))
     response_store: bool = False
@@ -773,6 +778,8 @@ class NativeBackend:
             constraint=constraint,
             image_spans=job.image_spans,
             image_pixels=job.image_pixels,
+            audio_spans=job.audio_spans,
+            audio_mel=job.audio_mel,
             return_progress=job.return_progress,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
@@ -824,6 +831,7 @@ class NativeBackend:
         # The engine copies the pixels at admission; only the frame written
         # below needs them, and the job lives until the response ends.
         job.image_pixels = b""
+        job.audio_mel = b""
 
         def on_event(call, event):
             with self.lock:
@@ -1113,13 +1121,17 @@ class NativeBackend:
                     # answer it would compute is discarded — skip it.
                     job.constraint.commit(event.tokens, forced=False)
             state.streamer.put_tokens(event.tokens)
+        elif isinstance(event, wire.AudioPcmEvent):
+            # One decoded codec frame's PCM (fp32 LE, 24 kHz); the
+            # collector streams or assembles it.
+            job.events.put(("audio", event.pcm))
 
     def _remember_reply(self, job, streamer):
         """Hand the job's reply memory the ids this turn emitted for the
         content a client resends as the assistant message: the span after the
         think block and before any tool call, decoded as the streamer emits
         it. A later prompt resending that text splices the same ids back."""
-        ids = streamer.token_ids
+        ids = getattr(streamer, "token_ids", ())
         if not ids:
             return
         start = 0
@@ -1256,7 +1268,9 @@ class NativeBackend:
         self.recent_prompts.append(
             tuple(job.prefix_tokens) + tuple(job.prompt_tokens)
         )
-        self.recent_outputs.append(tuple(state.streamer.token_ids))
+        self.recent_outputs.append(
+            tuple(getattr(state.streamer, "token_ids", ()))
+        )
         self._record(job, result=result, error=error)
         job.events.put(("error", error) if error else ("done", result))
 

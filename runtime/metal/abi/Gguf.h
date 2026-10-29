@@ -83,8 +83,8 @@ struct GgufHeadArgmaxParams {
   GgufDecodeParams decode;
   HeadArgmaxParams head;
 };
-static_assert(sizeof(GgufHeadArgmaxParams) == 64,
-              "GGUF head argmax parameters are 64 bytes on both sides");
+static_assert(sizeof(GgufHeadArgmaxParams) == 68,
+              "GGUF head argmax parameters are 68 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.

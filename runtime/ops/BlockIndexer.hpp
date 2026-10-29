@@ -80,6 +80,18 @@ struct BlockIndexer final {
   // rows at once, which the scratch must hold.
   static void addSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, metal::MetalBuffer scores,
                         uint32_t scoreRows, metal::MetalBuffer mask, const IndexerRows &rows);
+  // The fused score-and-select (block_indexer_topk): one dispatch per row
+  // does both, into `mask`, the score scratch `scores` reused as working
+  // space. `locks` runs the kernel's page-probe prefilter first (a
+  // LOCKS-style restriction of which pages' blocks get scored).
+  static void addTopk(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                      metal::MetalBuffer scores, metal::MetalBuffer mask,
+                      const IndexerRows &rows, bool locks = false);
+  // The decode-time window over an already-selected mask
+  // (block_indexer_window): each row keeps only its blocks below
+  // `sink` and at or past `complete - window`, its tail always kept.
+  static void addWindow(metal::CommandGraph &graph, metal::MetalBuffer mask,
+                        uint32_t window, uint32_t sink, const IndexerRows &rows);
   // A sequence's pending keys of one layer after its first `retained` rows
   // from `firstPosition`, of which `keys` holds the raw keys: those of the
   // block they leave open, from `keys` and `pendingIn`, its pending keys

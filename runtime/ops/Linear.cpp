@@ -840,7 +840,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (gate) requireLeadingInputs(selected, *gate);
   const uint64_t rows = selected.storageRows();
   requireBytes(b.input, rows * k * 2, "input");
-  requireBytes(b.output, rows * n * elementBytes(selected.destination()), "output");
+  requireBytes(b.output, rows * n * elementBytes(selected.destination()),
+               (std::string("output ") + std::to_string(rows) + "x" +
+                std::to_string(n))
+                   .c_str());
   if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "residual");
   requireBytes(b.sums, selected.sumsBytes(), "sums");
   requireBytes(b.gateScratch, selected.gateScratchBytes(), "gate scratch");

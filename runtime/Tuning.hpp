@@ -105,6 +105,13 @@ struct Tuning {
   // ops/Embedding.cpp: a presence flag restores the pre-anchor-fill verify
   // routing (every row live), the A/B kill switch for the anchor-fill path.
   bool verifyAllLive = false;   // RICHENGINE_VERIFY_ALL_LIVE (presence)
+  // model/RuntimeEncodeVerify.mm, model/TargetModel.cpp: the fused greedy
+  // head's all-or-nothing rule becomes per-lane — the *_logits kernel
+  // variants write the rows of sampled, penalized and constrained lanes
+  // beside the argmax partials, so one such lane no longer forfeits the
+  // fused head for the whole packed batch. Opt-in A/B: absent keeps the
+  // whole batch unfused whenever any lane needs logits.
+  bool headPerLane = false;     // RICHENGINE_HEAD_PER_LANE (presence)
   // metal/CommandGraph.hpp
   bool patchableOff = false;    // RICHENGINE_PATCHABLE_OFF (presence)
   // model/TargetModelGemma.cpp
@@ -207,6 +214,29 @@ struct Tuning {
   // RICHENGINE_SYSTEMONE_WINDOW — server/frontend.py caps /v1/systemone's
   // in-flight questions below the preparation bound; the runtime never
   // reads it.
+  // model/Qwen4Exp.cpp QSA opt-ins (experimental):
+  // Cross-layer index reuse (IndexCache): every Nth full-attention layer
+  // runs the indexer's select; the N-1 layers after it reuse its block
+  // lists. 0 or 1 keeps per-layer selection.
+  uint32_t qsaIndexShare = 0;       // RICHENGINE_QSA_INDEX_SHARE
+  // Fused score+top-k selection for verify (one dispatch, no scores
+  // buffer round trip); the score+select pair stays for prefill.
+  bool qsaFusedTopk = false;        // RICHENGINE_QSA_FUSED_TOPK (presence)
+  // Decode-time sliding window over the indexer's selection (Kara-style):
+  // after selection, a row keeps only its newest window blocks plus the
+  // first sink blocks. In BLOCK_INDEXER_BLOCK blocks; 0 disables.
+  uint32_t qsaDecodeWindow = 0;     // RICHENGINE_QSA_DECODE_WINDOW
+  uint32_t qsaDecodeWindowSink = 0; // RICHENGINE_QSA_DECODE_WINDOW_SINK
+  // Page-probe prefilter inside the fused selection (LOCKS-style: only
+  // pages whose first block probes high enough get their blocks scored).
+  bool qsaLocks = false;            // RICHENGINE_QSA_LOCKS (presence)
+  // engine/Engine.cpp: a finished request publishes its recurrent state at
+  // the generation's last full page (SuffixReplay), so the next turn
+  // resumes there instead of replaying the whole suffix. Experimental.
+  bool suffixReplay = false;        // RICHENGINE_SUFFIX_REPLAY (presence)
+  // engine/Engine.cpp sharedPrefillBoundary: revert to prompt-only
+  // comparison (no junctions over shared generated history). Opt-out.
+  bool noHistoryJunctions = false;  // RICHENGINE_NO_HISTORY_JUNCTIONS (presence)
   // ops/LinearGguf.cpp, model/TargetModel.cpp: an all-score batch's head
   // dispatches only the quant tiles holding a wanted logit column.
   bool scoreGather = false;         // RICHENGINE_SCORE_GATHER=1
@@ -286,6 +316,7 @@ inline Tuning makeTuning() {
   t.dfaBudgetOff = envFlag("RICHENGINE_DFA_BUDGET_OFF");
   t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
   t.verifyAllLive = envFlag("RICHENGINE_VERIFY_ALL_LIVE");
+  t.headPerLane = envFlag("RICHENGINE_HEAD_PER_LANE");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");
@@ -374,6 +405,13 @@ inline Tuning makeTuning() {
   t.proposalCapSet = envFlag("RICHENGINE_PROPOSAL_CAP");
   t.proposalCap = envUint("RICHENGINE_PROPOSAL_CAP", 0);
   t.denyDebug = envFlag("RICHENGINE_DENY_DEBUG");
+  t.qsaIndexShare = envUint("RICHENGINE_QSA_INDEX_SHARE", 0);
+  t.qsaFusedTopk = envFlag("RICHENGINE_QSA_FUSED_TOPK");
+  t.qsaDecodeWindow = envUint("RICHENGINE_QSA_DECODE_WINDOW", 0);
+  t.qsaDecodeWindowSink = envUint("RICHENGINE_QSA_DECODE_WINDOW_SINK", 0);
+  t.qsaLocks = envFlag("RICHENGINE_QSA_LOCKS");
+  t.suffixReplay = envFlag("RICHENGINE_SUFFIX_REPLAY");
+  t.noHistoryJunctions = envFlag("RICHENGINE_NO_HISTORY_JUNCTIONS");
   t.scoreGather = envFlagOn("RICHENGINE_SCORE_GATHER");
   t.scoreTensor = envFlagOn("RICHENGINE_SCORE_TENSOR");
   t.scoreFused = envFlagOn("RICHENGINE_SCORE_FUSED");

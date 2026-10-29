@@ -969,26 +969,7 @@ class ConstraintFactory:
             for tokens, message in prefixes() if prefixes else ():
                 if matcher.deep_copy().consume_tokens(tokens):
                     continue
-                # Name the token the grammar refuses, so the caller's
-                # generic message says where consumption stopped.
-                probe = matcher.deep_copy()
-                bad = next(
-                    (
-                        token_id
-                        for token_id in tokens
-                        if not probe.consume_tokens([token_id])
-                    ),
-                    None,
-                )
-                detail = ""
-                if bad is not None:
-                    spelling = self._vocabulary()[0][bad]
-                    detail = (
-                        f" at token {bad} {spelling!r}"
-                        if spelling
-                        else f" at token {bad}"
-                    )
-                raise APIError(400, f"{message}{detail}")
+                raise APIError(400, message)
             initial_mask = self._compile_initial_mask(matcher)
             size = len(grammar.encode())
             # Oversized grammars remain usable without displacing the cache.

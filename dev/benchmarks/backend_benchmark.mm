@@ -689,6 +689,12 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
                 static_cast<double>(result.draftedTokens)
           : 0.0;
   result.firstLaneOutputTokens = reference->outputTokens;
+  if (getenv("RICHENGINE_DUMP_TOKENS")) {
+    fprintf(stderr, "width=%u tokens:", width);
+    for (uint32_t t : reference->outputTokens)
+      fprintf(stderr, " %u", t);
+    fprintf(stderr, "\n");
+  }
   if (progress) {
     progress->complete("decode_throughput", "B" + std::to_string(width),
                        sample, tokens.size(), width,

@@ -156,6 +156,12 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   if (!grid.valid() || grid.patches() > maximumPatches_) {
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
+  // The Qwen tower's patch embed has no temporal slices; a frame pair is
+  // the LFM3-VL encoder's input.
+  if (grid.frames != 1) {
+    throw std::invalid_argument(
+        "temporal frame pairs are the LFM3-VL encoder's input");
+  }
   const auto tokens = static_cast<uint32_t>(grid.patches());
   if (!pixels || pixels.sizeBytes() < grid.pixelBytes()) {
     throw std::invalid_argument("image pixels do not cover the grid");

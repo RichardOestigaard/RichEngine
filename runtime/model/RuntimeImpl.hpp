@@ -27,6 +27,8 @@
 #include "metal/abi/StepPack.h"
 #include "ops/Embedding.hpp"
 #include "ops/KernelNames.hpp"
+#include "ops/LfmAudioEnc.hpp"
+#include "ops/LfmSpeechGen.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
@@ -196,6 +198,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   using ImageKeyHash = richengine::model::RuntimeImageKeyHash;
   using ImageRows = richengine::model::RuntimeImageRows;
   using ImageState = richengine::model::RuntimeImageState;
+  using AudioRows = richengine::model::RuntimeAudioRows;
+  using AudioState = richengine::model::RuntimeAudioState;
   using Request = richengine::model::RuntimeRequest;
   struct DecodeLaneResult final {
     Request *request = nullptr;
@@ -231,6 +235,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   kv::PageStorage &kvPages;
   CompositeStateStorage &states;
   std::unique_ptr<PrefillArena> prefillArena;
+  // RICHENGINE_VERIFY_DUMP2 plumbing: the last prefill's finalHidden and
+  // each completing sequence's last row in it, for per-sequence carry
+  // comparison at the first verify's sync point.
+  MetalBuffer lastFinalHidden_{};
+  std::vector<uint32_t> lastFinalRows_{};
   // Submit-ahead input banks (PrefillArena::get(tensor, bank)): one bit per
   // bank an unconsumed prefill command wrote. At most one submit-ahead
   // command overlaps a running one, so two banks cover the ring.
@@ -287,11 +296,17 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // start that built it staged, and reclaimable once no image waits for one
   // and no refused start holds it. Injecting already encoded rows needs no
   // vision arena.
-  std::shared_ptr<ops::Vision> vision;
+  std::shared_ptr<ops::VisionEncoder> vision;
   // Every image's rows while anything holds them, so that a placement of
   // the same image anywhere shares them. Entries of rows nothing holds any
   // more go when a lookup or a walk finds them.
   std::unordered_map<ImageKey, std::weak_ptr<ImageRows>, ImageKeyHash> imageRows;
+  // Allocated for audio clips that need an encode, sized for the largest
+  // one the start that built it staged; reclaimable once no clip waits.
+  std::shared_ptr<ops::LfmAudioEnc> audio;
+  // Every audio clip's rows while anything holds them (the mel frame count
+  // in the key's grid fields keeps an image digest from matching a clip).
+  std::unordered_map<ImageKey, std::weak_ptr<AudioRows>, ImageKeyHash> audioRows;
   // Encoded rows kept for reuse once no placement has rows of them left to
   // inject, including prefix hits that land inside an image and still need
   // its remaining rows. Most recently used first, bounded by bytes; the
@@ -747,6 +762,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                        },
                        value.package.draft)),
         aneFfn(value.aneFfn) {
+    speechWeights =
+        package.speech ? &package.speech->tensors : nullptr;
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -830,8 +847,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // M-RoPE: text rows advance one counter shared by all three axes;
   // an image's rows spread over (t, h, w) from the counter at the image start
   // and the counter then advances by max(merged height, merged width).
-  static std::array<uint32_t, 3> ropePosition(const Request &entry,
-                                              uint64_t logical) {
+  // Single-axis targets (ropeAxes 1) place every token, image rows included,
+  // on the plain sequential counter.
+  std::array<uint32_t, 3> ropePosition(const Request &entry,
+                                       uint64_t logical) const {
+    if (geometry.target.ropeAxes == 1) {
+      const uint32_t position = static_cast<uint32_t>(logical);
+      return {position, position, position};
+    }
     int64_t delta = 0;
     for (const ImageState &image : entry.images) {
       const ImageSpan &span = image.span;
@@ -897,11 +920,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // the start threw.
   struct VisionRollback final {
     Impl &runtime;
-    std::shared_ptr<ops::Vision> previous;
+    std::shared_ptr<ops::VisionEncoder> previous;
+    std::shared_ptr<ops::LfmAudioEnc> previousAudio;
     bool committed = false;
     ~VisionRollback() {
-      if (!committed)
+      if (!committed) {
         runtime.vision = std::move(previous);
+        runtime.audio = std::move(previousAudio);
+      }
     }
   };
   // What a refused start matched (StateAdmission::held): the rows it would
@@ -909,7 +935,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // covers it, that encoder.
   struct Matched final {
     std::vector<std::shared_ptr<ImageRows>> rows;
-    std::shared_ptr<ops::Vision> encoder;
+    std::shared_ptr<ops::VisionEncoder> encoder;
+    std::shared_ptr<ops::LfmAudioEnc> audioEncoder;
   };
   // A request's lane with everything else its start allocates, in one
   // admission: the pixel and embedding buffers of the images nothing holds
@@ -926,10 +953,105 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // retry spares it; a grant hands the request's images to `images` and
   // counts the rows it shares as reuses, each once.
   StateAdmission activate(const ModelRequest &request, uint32_t stateLane,
-                          std::vector<ImageState> &images);
+                          std::vector<ImageState> &images,
+                          std::vector<AudioState> &audios);
 
   // No image waits for its encode, so the vision arena can go.
   [[nodiscard]] bool visionIdle() noexcept;
+  // No audio clip waits for its encode, so the audio arena can go.
+  [[nodiscard]] bool audioIdle() noexcept;
+
+  // ---- LFM3-Omni audio input -------------------------------------------
+  static ImageKey audioKey(const AudioSpan &span) noexcept;
+  // The embedding rows a clip's span needs: one bf16 hidden row per
+  // placeholder token.
+  [[nodiscard]] uint64_t audioEmbeddingBytes(const AudioSpan &span) const;
+  // The rows of an identical clip that something still holds, else null.
+  std::shared_ptr<AudioRows> findAudioRows(const AudioSpan &span);
+  // Encodes every clip whose rows first appear in this chunk and overwrites
+  // the chunk's placeholder embedding rows with the audio rows. The audio
+  // rows take ordinary sequential rotary positions, so nothing else reads
+  // the spans here.
+  void addAudioRows(CommandGraph &graph, Request &entry,
+                    const ModelBatchItem &item, uint32_t rowBegin) {
+    const uint64_t chunkBegin = item.logicalPosition;
+    const uint64_t chunkEnd = chunkBegin + item.tokenCount;
+    for (AudioState &clip : entry.audios) {
+      const uint64_t begin = std::max<uint64_t>(chunkBegin, clip.span.offset);
+      const uint64_t end = std::min<uint64_t>(chunkEnd, clip.span.end());
+      if (begin >= end)
+        continue;
+      if (!clip.rows)
+        throw std::logic_error("prefill reached an audio its activation left out");
+      AudioRows &rows = *clip.rows;
+      if (!rows.encoded && !rows.encoding) {
+        if (!audio)
+          throw std::logic_error("audio request has no audio encoder");
+        audio->encode(graph, clip.span.melFrames, rows.mel, rows.embeddings);
+        rows.encoding = true;
+      }
+      const uint32_t width = geometry.target.hiddenSize;
+      ops::RowCopy::add(
+          graph, rows.embeddings,
+          {static_cast<uint32_t>(begin - clip.span.offset), width, 0},
+          prefillArena->get(PrefillTensor::Hidden0),
+          {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
+          static_cast<uint32_t>(end - begin), width);
+    }
+  }
+
+  // ---- LFM3-Omni speech output -------------------------------------------
+  // Token ids of the speech state machine (dev/omni-reference/NOTES.md
+  // section 6). Angle-bracket spellings stay out of comments per task.
+  static constexpr uint32_t kSpeechAudioStart = 125012;
+  static constexpr uint32_t kSpeechTextEnd = 125014;
+  static constexpr uint32_t kSpeechMixedStart = 125015;
+  static constexpr uint32_t kSpeechAudioOut = 125032;
+  // The model's speech tower weights (audio/lfm-gen.bin decoded to fp32),
+  // bound when the package carries the a.gen.* sections — absent on models
+  // without speech output, which never enter an audio slot. Owned by the
+  // package, which outlives the runtime and every request's LfmSpeechGen.
+  const ops::LfmSpeechWeights *speechWeights = nullptr;
+  // True when the lane's next step is an audio slot: the speech state says
+  // AUDIO (or an interleaved block's audio half) — the pending anchor is
+  // then the audio placeholder or a mode marker the LM just emitted.
+  [[nodiscard]] bool speechAudioSlot(const Request &entry) const {
+    if (!speechWeights || !entry.pendingToken)
+      return false;
+    const auto &s = entry.speech;
+    if (s.mode == 1)
+      return true;
+    if (s.mode == 2)
+      return s.speaking || *entry.pendingToken == kSpeechAudioStart ||
+             *entry.pendingToken == kSpeechMixedStart;
+    return *entry.pendingToken == kSpeechAudioStart ||
+           *entry.pendingToken == kSpeechMixedStart;
+  }
+  // The lane's anchor row takes the stored feedback embedding instead of
+  // the placeholder token's embedding whenever the pending anchor is the
+  // audio placeholder and a feedback row was produced by a prior frame.
+  [[nodiscard]] bool speechPatchAnchor(const Request &entry) const {
+    return speechWeights && entry.pendingToken &&
+           *entry.pendingToken == kSpeechAudioOut &&
+           entry.speech.feedback.size() == geometry.target.hiddenSize;
+  }
+  // Per-lane feedback staging slot for the anchor patch (Shared storage —
+  // finalizeDecode writes the bf16 row, the graph copies it).
+  [[nodiscard]] const MetalBuffer &speechFeedbackBuffer(Request &entry) {
+    if (!entry.speech.feedbackBuffer) {
+      entry.speech.feedbackBuffer = backend.allocateBuffer(
+          geometry.target.hiddenSize * sizeof(uint16_t),
+          BufferStorage::Shared, "speech-feedback");
+    }
+    return entry.speech.feedbackBuffer;
+  }
+  ops::LfmSpeechGen &speechGen(Request &entry);
+  // A prompt ending on an audio marker opens generation in AUDIO mode:
+  // the last prompt row's hidden samples the first frame now — its
+  // feedback embedding is the input the next (placeholder) position's
+  // anchor row is patched with — and its PCM rides this prefill's result.
+  void beginSpeechGeneration(Request &entry, uint32_t lane,
+                             ModelStepResult &result);
 
   // Encodes every image whose rows first appear in this chunk and overwrites
   // the chunk's placeholder embedding rows with the image rows. Text-only
@@ -953,7 +1075,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         rows.encoding = true;
         ++counters.imageEncodes;
       }
-      const uint32_t width = package.vision.tensors.layout.outputHiddenSize;
+      const uint32_t width = geometry.target.hiddenSize;
       ops::RowCopy::add(
           graph, rows.embeddings,
           {static_cast<uint32_t>(begin - image.span.offset), width, 0},
@@ -1596,6 +1718,23 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                 attentionStride, queryOffset, kvOffset,
                                 batch.capturedRows, chunk, std::move(pageTable),
                                 std::move(captures), {}, {}});
+      if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+        fprintf(stderr,
+                "dump2 prefill seq=%u id=%llu sl=%u tokens=%u pos=%llu "
+                "astride=%u qoff=%llu kvoff=%llu "
+                "chunk[c=%u t=%u s=%u pte=%u] pt=[",
+                lane, (unsigned long long)item.requestId, entry.stateLane,
+                item.tokenCount,
+                (unsigned long long)item.logicalPosition, attentionStride,
+                (unsigned long long)queryOffset,
+                (unsigned long long)kvOffset, chunk.committed_tokens,
+                chunk.chunk_tokens, chunk.chunk_stride,
+                chunk.page_table_entries);
+      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+        for (const auto p : item.pageTable)
+          fprintf(stderr, "%llx ", (unsigned long long)p);
+        fprintf(stderr, "]\n");
+      }
       // qwen4exp's n-gram tails and QSA block records span the whole
       // prompt: the chunk's inputTokens alone lacks both.
       if (const auto *qwen4 =
@@ -1732,6 +1871,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                              p(PrefillTensor::Hidden0), batch.rows);
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
+      addAudioRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
     }
 
     std::array<TargetModelPrefillSequence, kLaneCount> modelSequences{};
@@ -1825,6 +1965,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // first token.
     std::array<InitialSelection, kLaneCount> selections{};
     uint32_t selectionCount = 0;
+    lastFinalRows_.clear();
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       Request &entry = *sequence.entry;
       const ModelBatchItem &item = *sequence.item;
@@ -1838,6 +1979,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           {item.tokenCount - 1, hidden, 0},
           decodeArena->get(sequence.lane, DecodeTensor::Hidden0),
           {0, hidden, 0}, 1, hidden);
+      lastFinalHidden_ = finalHidden;
+      lastFinalRows_.push_back(sequence.rowBegin + item.tokenCount - 1);
       if (entry.constraint != ConstraintMode::None)
         continue;
       const bool scoring = !entry.scoreTokens.empty();
@@ -2076,6 +2219,439 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // target row can also accept a sentinel draft proposal as an interior
       // token, so every retained token is checked.
       const uint32_t *targetTokens = outputTokens;
+      // RICHENGINE_VERIFY_DFA_DUMP: the lane's live/trunc bookkeeping beside
+      // its raw selected rows — a dead row read as live shows as a sentinel
+      // inside the retained span.
+      if (envFlag("RICHENGINE_VERIFY_DFA_DUMP")) {
+        const uint32_t trunc = *contents<uint32_t>(
+            d(DecodeTensor::DfaTrunc), "dfa trunc rows");
+        std::string toks;
+        for (uint32_t r = 0; r < rowStride && r < 17; ++r)
+          toks += (r ? " " : "") + std::to_string(targetTokens[r]);
+        fprintf(stderr,
+                "dfadump lane=%u maskRows=%u verifyRows=%u retained=%u "
+                "accepted=%u trunc=%u dfa=%d toks=[%s]\n",
+                lane, lanes[lane].request->verifyMaskRows,
+                laneResult.verifyRows, laneResult.retained,
+                laneResult.accepted, trunc,
+                lanes[lane].request->dfa ? 1 : 0, toks.c_str());
+        if (lanes[lane].request->dfa) {
+          const uint32_t *rs = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::DfaRowStates,
+                                  uint32_t(items.size())),
+              "row states") +
+              lane * 17;
+          const uint32_t *vin = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::InputTokens,
+                                  uint32_t(items.size())),
+              "verify input") +
+              lane * geometry.draft.verifyRows();
+          fprintf(stderr,
+                  "  states=[%u %u %u %u %u] vin=[%u %u %u %u %u] "
+                  "pending=%u stateLane=%u dfacur=%u\n",
+                  rs[0], rs[1], rs[2], rs[3], rs[4],
+                  vin[0], vin[1], vin[2], vin[3], vin[4],
+                  lanes[lane].request->pendingToken
+                      ? *lanes[lane].request->pendingToken
+                      : 0,
+                  lanes[lane].request->stateLane,
+                  lanes[lane].request->dfaState);
+        }
+      }
+      // RICHENGINE_VERIFY_DUMP2: per-lane FNV of the verify step's arena
+      // tensors — lane N should hash like lane 0 on replayed prompts; the
+      // first mismatch pins the mis-strided buffer.
+      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+        static uint64_t dumpStep = 0;
+        if (!lane) fprintf(stderr, "dumpstep %llu items=%zu\n",
+                           (unsigned long long)++dumpStep, items.size());
+        fprintf(stderr, "dump2 lane=%u committed=%llu tokenCount=%u pt=%zu\n",
+                lane, (unsigned long long)items[lane].logicalPosition,
+                items[lane].tokenCount, items[lane].pageTable.size());
+        if (items[lane].pageTable.size()) {
+          fprintf(stderr, "dump2 lane=%u ptdata=[", lane);
+          for (size_t e = 0; e < items[lane].pageTable.size() && e < 8; ++e)
+            fprintf(stderr, "%x ", items[lane].pageTable[e]);
+          fprintf(stderr, "]\n");
+          // Hash the page's global-layer (ordinal 0) bytes: identical
+          // histories must hash identically across lanes.
+          try {
+            for (size_t p = 0; p < items[lane].pageTable.size(); ++p) {
+              const auto spans = kvPages.spans(items[lane].pageTable[p]);
+              if (spans.empty()) break;
+              // Layer 0 spans only: keys, k-scale, values, v-scale.
+              const size_t want = spans.size() >= 4 ? 4 : spans.size();
+              fprintf(stderr, "dump2 lane=%u blk%zu page%llx nsp=%zu l0=[",
+                      lane, p, (unsigned long long)items[lane].pageTable[p],
+                      spans.size());
+              for (size_t s = 0; s < want; ++s) {
+                uint64_t h = 1469598103934665603ULL;
+                for (const auto byte : spans[s])
+                  h = (h ^ static_cast<uint8_t>(byte)) * 1099511628211ULL;
+                fprintf(stderr, "%llx ", (unsigned long long)h);
+              }
+              fprintf(stderr, "]\n");
+            }
+          } catch (...) {
+          }
+          // The GPU table entries the kernels actually read.
+          try {
+            const auto *te = contents<uint64_t>(
+                decodeArena->get(request(items[lane].requestId).stateLane,
+                                 DecodeTensor::PageTable),
+                "gpu page table");
+            fprintf(stderr, "dump2 lane=%u sl=%u gpt=[", lane,
+                    request(items[lane].requestId).stateLane);
+            for (size_t e = 0; e < items[lane].pageTable.size() && e < 8; ++e)
+              fprintf(stderr, "%llx ", (unsigned long long)te[e]);
+            fprintf(stderr, "]\n");
+          } catch (...) {
+          }
+        }
+        static const auto fnv64 = [](const void *ptr, size_t bytes) {
+          uint64_t h = 1469598103934665603ULL;
+          const auto *b = static_cast<const uint8_t *>(ptr);
+          for (size_t i = 0; i < bytes; ++i)
+            h = (h ^ b[i]) * 1099511628211ULL;
+          return h;
+        };
+        // Post-GPU prefill projection: seq0 vs seq1 ChunkKeys/ChunkValues
+        // regions (32768-byte lane stride for 4kv x 32tok x 128d x u16).
+        try {
+          const MetalBuffer ck =
+              prefillArena->get(PrefillTensor::ChunkKeys);
+          const MetalBuffer cv =
+              prefillArena->get(PrefillTensor::ChunkValues);
+          const auto *cb = static_cast<const uint8_t *>(ck.contents());
+          const auto *vb = static_cast<const uint8_t *>(cv.contents());
+          if (cb && ck.sizeBytes() >= 65536) {
+            fprintf(stderr, "dump2 cklive ");
+            for (int s = 0; s < 2; ++s)
+              for (int h = 0; h < 4; ++h)
+                fprintf(stderr, "s%dh%d=%016llx ", s, h,
+                        (unsigned long long)fnv64(
+                            cb + s * 32768 + h * 8192, 7 * 128 * 2));
+            fprintf(stderr, "\n");
+          }
+          if (vb && cv.sizeBytes() >= 65536) {
+            // V is dim-major: (head*D + dim)*stride + token. Live tokens
+            // 0..6 = 14B at each (head,dim) run start.
+            fprintf(stderr, "dump2 cvlive ");
+            for (int s = 0; s < 2; ++s)
+              for (int h = 0; h < 4; ++h) {
+                uint64_t h64 = 1469598103934665603ULL;
+                for (int d = 0; d < 128; ++d) {
+                  const uint8_t *base =
+                      vb + s * 32768 + (h * 128 + d) * 32 * 2;
+                  for (int t = 0; t < 14; ++t)
+                    h64 = (h64 ^ base[t]) * 1099511628211ULL;
+                }
+                fprintf(stderr, "s%dh%d=%016llx ", s, h,
+                        (unsigned long long)h64);
+              }
+            fprintf(stderr, "\n");
+          }
+        } catch (...) {
+        }
+        // Packed prefill input tokens: seq0 rows [0,7), seq1 [7,14).
+        try {
+          for (uint32_t bank = 0; bank < 2; ++bank) {
+            const MetalBuffer it =
+                prefillArena->get(PrefillTensor::InputTokens, bank);
+            const auto *ip = static_cast<const uint32_t *>(it.contents());
+            if (!ip || it.sizeBytes() < 14 * 4) continue;
+            fprintf(stderr, "dump2 ptokens b%u s0=[", bank);
+            for (int i = 0; i < 7; ++i) fprintf(stderr, "%u ", ip[i]);
+            fprintf(stderr, "] s1=[");
+            for (int i = 7; i < 14; ++i) fprintf(stderr, "%u ", ip[i]);
+            fprintf(stderr, "]\n");
+          }
+        } catch (...) {
+        }
+        // Prefill hidden rows: seq0 [0,7) vs seq1 at its rowBegin —
+        // hidden width = hiddenSize u16. Localizes divergence inside the
+        // packed prefill (post-GPU contents at this sync point).
+        try {
+          const MetalBuffer ph =
+              prefillArena->get(PrefillTensor::Hidden0);
+          const auto *hb = static_cast<const uint8_t *>(ph.contents());
+          const size_t rowB = size_t(geometry.target.hiddenSize) * 2u;
+          if (hb && ph.sizeBytes() >= 14 * rowB)
+            fprintf(stderr, "dump2 phidden s0=%016llx s1=%016llx\n",
+                    (unsigned long long)fnv64(hb, 7 * rowB),
+                    (unsigned long long)fnv64(hb + 7 * rowB, 7 * rowB));
+        } catch (...) {
+        }
+        const uint32_t nlane = uint32_t(lanes.size());
+        const auto laneHash = [&](const MetalBuffer &buf, const char *name,
+                                  size_t cap) {
+          if (!buf || !buf.sizeBytes())
+            return;
+          const size_t stride = buf.sizeBytes() / nlane;
+          const uint8_t *base =
+              contents<uint8_t>(buf, name) + size_t(lane) * stride;
+          fprintf(stderr, "dump2 lane=%u %s=%016llx (stride=%zu)\n", lane,
+                  name,
+                  (unsigned long long)fnv64(base, std::min(cap, stride)),
+                  stride);
+        };
+        laneHash(decodeArena->packed(DecodeTensor::FullPacked, nlane),
+                 "fullPacked", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::FullQueries, nlane),
+                 "fullQueries", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::FullAttention, nlane),
+                 "fullAttention", 1 << 20);
+        {
+          const auto &fa = decodeArena->packed(DecodeTensor::FullAttention,
+                                               nlane);
+          const auto *raw =
+              contents<uint16_t>(fa, "fullAttention bytes") +
+              lane * (fa.sizeBytes() / nlane / 2);
+          uint64_t nz = 0;
+          for (size_t i = 0; i < 64; ++i)
+            if (raw[i]) ++nz;
+          fprintf(stderr, "dump2 lane=%u faNz=%llu fa=%04x %04x %04x %04x\n",
+                  lane, (unsigned long long)nz, raw[0], raw[1], raw[2],
+                  raw[3]);
+        }
+        laneHash(decodeArena->packed(DecodeTensor::AttentionHidden, nlane),
+                 "attentionHidden", 1 << 20);
+        {
+          const auto &ah = decodeArena->packed(
+              DecodeTensor::AttentionHidden, nlane);
+          const auto *raw =
+              contents<uint16_t>(ah, "attentionHidden bytes") +
+              lane * (ah.sizeBytes() / nlane / 2);
+          fprintf(stderr, "dump2 lane=%u ah=[%04x %04x %04x %04x %04x %04x "
+                          "%04x %04x]\n", lane, raw[0], raw[1], raw[2],
+                  raw[3], raw[4], raw[5], raw[6], raw[7]);
+        }
+        {
+          // Gates are packed lanes-contiguous at row_capacity*256 u16 per
+          // lane (8192B), not the denseIntermediate 7680-wide stride.
+          const auto &gb = decodeArena->packed(DecodeTensor::Intermediate,
+                                               nlane);
+          const auto *gp = contents<uint8_t>(gb, "gate bytes");
+          if (gp) {
+            const size_t stride = 16u * 256u * 2u;
+            if (gb.sizeBytes() >= (lane + 1) * stride) {
+              const auto *gw =
+                  reinterpret_cast<const uint16_t *>(gp + lane * stride);
+              fprintf(stderr,
+                      "dump2 lane=%u gates256=%016llx gv=[%04x %04x %04x "
+                      "%04x %04x %04x %04x %04x]\n",
+                      lane,
+                      (unsigned long long)fnv64(gp + lane * stride, stride),
+                      gw[0], gw[1], gw[2], gw[3], gw[4], gw[5], gw[6],
+                      gw[7]);
+              const size_t arena =
+                  decodeArena->get(lane, DecodeTensor::Intermediate)
+                      .sizeBytes();
+              if (gb.sizeBytes() >= (lane + 1) * arena) {
+                const auto *gwA =
+                    reinterpret_cast<const uint16_t *>(gp + lane * arena);
+                fprintf(stderr,
+                        "dump2 lane=%u gatesArena=%016llx "
+                        "gvA=[%04x %04x %04x %04x]\n",
+                        lane,
+                        (unsigned long long)fnv64(gp + lane * arena, stride),
+                        gwA[0], gwA[1], gwA[2], gwA[3]);
+              }
+              // Interleaved hypothesis: lane's gate row r at flat row
+              // r*lanes + lane. Hash 256-elem rows at those offsets.
+              {
+                uint64_t ih = 1469598103934665603ULL;
+                const auto *iw =
+                    reinterpret_cast<const uint16_t *>(gp);
+                for (int r = 0; r < 16; ++r)
+                  for (int e = 0; e < 256; ++e)
+                    ih = (ih ^ iw[(r * nlane + lane) * 256 + e]) *
+                         1099511628211ULL;
+                fprintf(stderr, "dump2 lane=%u gatesInter=%016llx "
+                        "gvi=[%04x %04x %04x %04x]\n",
+                        lane, (unsigned long long)ih,
+                        iw[lane * 256], iw[lane * 256 + 1],
+                        iw[lane * 256 + 2], iw[lane * 256 + 3]);
+              }
+            }
+          }
+        }
+        laneHash(decodeArena->packed(DecodeTensor::Normalized, nlane),
+                 "normalized", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::GemmaResidual, nlane),
+                 "residual", 1 << 20);
+        laneHash(decodeArena->attentionBatchSlice(
+                     DecodeTensor::ChunkKeysBase, 0,
+                     nlane), "chunkKeys0", 1 << 20);
+        laneHash(decodeArena->attentionBatchSlice(
+                     DecodeTensor::ChunkValuesBase, 0,
+                     nlane), "chunkValues0", 1 << 20);
+        laneHash(decodeArena->attentionBatchSlice(
+                     DecodeTensor::ChunkKeysBase,
+                     geometry.target.kvLayout.attentionLayers - 1,
+                     nlane), "chunkKeysN", 1 << 20);
+        laneHash(decodeArena->gdnBatchSlice(DecodeTensor::VerifyMixedBase, 0,
+                                            nlane), "gdnMixed0", 1 << 20);
+        laneHash(decodeArena->gdnBatchSlice(DecodeTensor::VerifyPackedBase, 0,
+                                            nlane), "gdnPacked0", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::GdnHidden, nlane),
+                 "gdnHidden", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::Hidden0, nlane),
+                 "hidden0", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::Hidden1, nlane),
+                 "hidden1", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::VerifyRows, nlane),
+                 "verifyRows", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::InputTokens, nlane),
+                 "inputTokens", 1 << 20);
+        {
+          const uint32_t *di = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::DraftInputTokens, nlane),
+              "draft input tokens");
+          const uint32_t *pp = contents<uint32_t>(
+              decodeArena->packed(DecodeTensor::ProposedTokens, nlane),
+              "proposed tokens");
+          const uint64_t each =
+              decodeArena->packed(DecodeTensor::DraftInputTokens, nlane)
+                  .sizeBytes() / nlane / sizeof(uint32_t);
+          fprintf(stderr, "dump2 lane=%u anchor=%u prop=[%u %u %u %u %u]\n",
+                  lane, di[lane * each], pp[lane * each],
+                  pp[lane * each + 1], pp[lane * each + 2],
+                  pp[lane * each + 3], pp[lane * each + 4]);
+          const auto *pack = contents<DecodeStepPackLane>(
+              stepPackBuffer(), "step pack");
+          const DecodeStepPackLane &p = pack[lane];
+          fprintf(stderr,
+                  "dump2 lane=%u pack id=%llu base=%u live=%u anchor=%u "
+                  "maxret=%u ret=%u pos=%llu req=%llu\n",
+                  lane, (unsigned long long)p.request_id, p.position_base,
+                  p.live_rows, p.anchor, p.maximum_retained, p.retained,
+                  (unsigned long long)items[lane].logicalPosition,
+                  (unsigned long long)items[lane].requestId);
+        }
+        laneHash(decodeArena->packed(DecodeTensor::RopeCos, nlane),
+                 "ropeCos", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::RopeSin, nlane),
+                 "ropeSin", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::AttentionPartials, nlane),
+                 "partials", 1 << 20);
+        laneHash(decodeArena->packed(DecodeTensor::AttentionStatistics, nlane),
+                 "stats", 1 << 20);
+        // Per-slot statistics hashes: the reduce weights partials by these.
+        {
+          const auto &sb = decodeArena->packed(
+              DecodeTensor::AttentionStatistics, nlane);
+          const auto *base =
+              contents<uint8_t>(sb, "stats bytes");
+          // stats slot = M floats (row max) + M floats (row sum) +
+          // rescale word: probe 1 KiB per slot at the same flat indexing.
+          const size_t stile = 16u * 4u * 2u * 4u;
+          for (uint32_t s = 0; s < 32; ++s) {
+            const size_t off = (lane * 32 + s) * stile;
+            if (off + stile > sb.sizeBytes()) break;
+            uint64_t h = 1469598103934665603ULL;
+            for (size_t i = 0; i < stile; ++i)
+              h = (h ^ base[off + i]) * 1099511628211ULL;
+            fprintf(stderr, "dump2 lane=%u stat%u=%016llx\n", lane, s,
+                    (unsigned long long)h);
+          }
+        }
+        // Slot-region probe: slots are (batch*KVHeads+kv)*slot_splits+split
+        // — flat, not lane-major. Lane b's slots live at
+        // [b*KVHeads*slot_splits*tileBytes, +KVHeads*slot_splits*tileBytes).
+        {
+          const auto &pb = decodeArena->packed(
+              DecodeTensor::AttentionPartials, nlane);
+          const auto *base =
+              contents<uint8_t>(pb, "partials bytes");
+          // tile = M x D elements: M = 4 fused q-heads x 16 rows, D = 128,
+          // bf16 => 16 KiB per slot; probe each lane's 32 slots' first KiB.
+          const size_t tile = 16u * 4u * 128u * 2u;
+          // Keyed debug slots: the split wrote its own keys+values bytes
+          // into dead slot (slot+4) — lane0 kv0 slots 4,5; lane1 36,37.
+          for (uint32_t s = 0; s < 2; ++s) {
+            const size_t off =
+                ((lane * 4u + 0u) * 8u + s + 4u) * tile;
+            if (off + 104 <= pb.sizeBytes()) {
+              const auto *q =
+                  reinterpret_cast<const uint16_t *>(base + off);
+              fprintf(stderr,
+                      "dump2 lane=%u kv0s%u kvd=[%04x %04x %04x %04x | %04x "
+                      "%04x %04x %04x | %04x %04x %04x %04x] acc=%04x "
+                      "sc=[%04x %04x %04x %04x] ct=[%04x %04x %04x %04x "
+                      "%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x "
+                      "%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x] "
+                      "q=[%04x %04x %04x %04x %04x %04x %04x %04x]\n",
+                      lane, s, q[0], q[1], q[2], q[3], q[4], q[5], q[6],
+                      q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14],
+                      q[15], q[16], q[20], q[21], q[22], q[23], q[24],
+                      q[25], q[26], q[27], q[28], q[29], q[30], q[31],
+                      q[32], q[33], q[34], q[35], q[36], q[37], q[38],
+                      q[39], q[40], q[41], q[42], q[43], q[44], q[45],
+                      q[46], q[47], q[48], q[49], q[50], q[51]);
+            }
+          }
+          for (uint32_t s = 0; s < 32; ++s) {
+            const size_t off = (lane * 32 + s) * tile;
+            if (off + tile > pb.sizeBytes()) break;
+            uint64_t h = 1469598103934665603ULL;
+            for (size_t i = 0; i < tile; ++i)
+              h = (h ^ base[off + i]) * 1099511628211ULL;
+            fprintf(stderr, "dump2 lane=%u slot%u=%016llx\n", lane, s,
+                    (unsigned long long)h);
+          }
+        }
+        laneHash(decodeArena->packed(DecodeTensor::Normalized, nlane),
+                 "normalized", 1 << 20);
+        // Row 0 alone: the carried hidden + anchor token the lanes share.
+        laneHash(decodeArena->packed(DecodeTensor::Hidden0, nlane),
+                 "hidden0row0", 4096);
+        laneHash(decodeArena->packed(DecodeTensor::InputTokens, nlane),
+                 "inputRow0", 16);
+        {
+          const MetalBuffer tok =
+              decodeArena->packed(DecodeTensor::InputTokens, nlane);
+          const uint32_t *ids = contents<uint32_t>(tok, "input ids") +
+                                size_t(lane) * tok.sizeBytes() / nlane / 4;
+          fprintf(stderr,
+                  "dump2 lane=%u inputIds=[%u %u %u %u %u %u %u %u]\n", lane,
+                  ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6],
+                  ids[7]);
+        }
+        {
+          const MetalBuffer h0 =
+              decodeArena->packed(DecodeTensor::Hidden0, nlane);
+          const uint16_t *row = contents<uint16_t>(h0, "hidden0") +
+                                size_t(lane) * h0.sizeBytes() / nlane / 2;
+          float vals[8];
+          for (uint32_t i = 0; i < 8; ++i) {
+            const uint32_t bits = uint32_t{row[i]} << 16;
+            std::memcpy(&vals[i], &bits, 4);
+          }
+          fprintf(stderr,
+                  "dump2 lane=%u h0row0=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f "
+                  "%.4f]\n",
+                  lane, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+                  vals[6], vals[7]);
+        }
+        // The last prefill batch's per-sequence last rows — for a packed
+        // batch of identical prompts, every sequence's last row must hash
+        // identically; a mismatch means batched prefill diverged.
+        if (lane == 0 && lastFinalHidden_ && lastFinalHidden_.sizeBytes() &&
+            lastFinalRows_.size() > 1) {
+          const uint8_t *base =
+              contents<uint8_t>(lastFinalHidden_, "last final hidden");
+          const size_t rowBytes = geometry.target.hiddenSize * 2;
+          for (uint32_t s = 0; s < lastFinalRows_.size(); ++s) {
+            const size_t off = size_t(lastFinalRows_[s]) * rowBytes;
+            if (off + 4096 > lastFinalHidden_.sizeBytes())
+              continue;
+            fprintf(stderr, "dump2 finalHidden seq%u row%u=%016llx\n", s,
+                    lastFinalRows_[s],
+                    (unsigned long long)fnv64(base + off, 4096));
+          }
+        }
+      }
       if (draftDebug_ && !tree) {
         const uint32_t *props = contents<uint32_t>(
             d(DecodeTensor::ProposedTokens), "proposed tokens");
@@ -2636,6 +3212,88 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
       const uint32_t *targetTokens =
           packedOutputTokens + lane * rowStride;
+      // ---- LFM3-Omni audio slot --------------------------------------
+      // The forward's real work is done; the lm_head result is ignored.
+      // FinalHidden row 0 is the depthformer's h_state (the LM's normed
+      // last-layer hidden at the anchor position). The host samples the
+      // frame, streams its PCM and feeds the feedback embedding back at
+      // the next placeholder position.
+      if (speechAudioSlot(entry)) {
+        const uint32_t hidden = geometry.target.hiddenSize;
+        const uint16_t *fh =
+            contents<uint16_t>(
+                decodeArena->packed(
+                    DecodeTensor::FinalHidden,
+                    targetModel.decodeStorageLanes(
+                        static_cast<uint32_t>(items.size()))),
+                "speech final hidden") +
+            size_t(lane) * geometry.draft.verifyRows() * hidden;
+        std::vector<float> h(hidden);
+        for (uint32_t d = 0; d < hidden; ++d) {
+          const uint32_t bits = uint32_t{fh[d]} << 16;
+          float f;
+          std::memcpy(&f, &bits, 4);
+          h[d] = f;
+        }
+        ops::LfmSpeechGen &gen = speechGen(entry);
+        std::array<int32_t, ops::LfmSpeechGen::kCodebooks> codes{};
+        bool eos = false;
+        std::vector<float> fb;
+        if (!gen.sampleFrame(h, codes, eos, fb)) {
+          results.push_back({.requestId = entry.id,
+                             .failure = "speech weights are unavailable"});
+          continue;
+        }
+        const auto bf16 = [](float v) {
+          const uint32_t bits = std::bit_cast<uint32_t>(v);
+          return static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1)) >> 16);
+        };
+        entry.speech.feedback.resize(hidden);
+        for (uint32_t d = 0; d < hidden; ++d)
+          entry.speech.feedback[d] = bf16(fb[d]);
+        std::memcpy(speechFeedbackBuffer(entry).contents(),
+                    entry.speech.feedback.data(), hidden * sizeof(uint16_t));
+        std::vector<float> pcm =
+            eos ? gen.flush() : gen.decodeFrame(codes);
+        ++entry.speech.frames;
+        // Emission: the anchor (already this step's output[0] convention)
+        // and the placeholder the next slot decodes. generatedTokens moves
+        // one position per frame, exactly like a text slot.
+        std::vector<uint32_t> output{*entry.pendingToken};
+        states.swapParity(entry.stateLane);
+        states.updateLengths(
+            entry.stateLane,
+            advanceDraftContext(states.metadata(entry.stateLane).lengths,
+                                items[lane].logicalPosition + 1,
+                                items[lane].logicalPosition,
+                                items[lane].logicalPosition + 1, false,
+                                geometry.draft.draftWindow()));
+        ++entry.generatedTokens;
+        const uint32_t placeholder = kSpeechAudioOut;
+        commitSelected(entry, {&placeholder, 1});
+        entry.maskWords.clear();
+        entry.verifyMaskInFlight = false;
+        entry.verifyMaskRows = 0;
+        entry.gpuMaskInFlight = false;
+        auto &s = entry.speech;
+        // State machine: AUDIO runs to the end-of-audio frame, INTERLEAVED
+        // flips text/audio blocks at slots 0 (6 text / 12 audio).
+        if (eos) {
+          if (s.mode == 1)
+            s.mode = 0;
+          s.speaking = false;
+        }
+        if (s.mode == 2) {
+          if (--s.slotsLeft == 0) {
+            s.speaking = !s.speaking;
+            s.slotsLeft = s.speaking ? 12 : 6;
+          }
+        }
+        results.push_back({entry.id, 0, std::move(output), false,
+                           DecodeStage::Regular, 0, 0, 0, {},
+                           std::move(pcm)});
+        continue;
+      }
       std::vector<uint32_t> output;
       output.reserve(laneResult.retained);
       output.push_back(laneResult.currentAnchor);
@@ -2699,6 +3357,29 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
       }
       commitSelected(entry, {targetTokens, laneResult.retained});
+      // Mode transitions decided by the freshly committed anchor: the LM
+      // emits a marker token and the next slot follows it.
+      if (speechWeights) {
+        auto &s = entry.speech;
+        if (*entry.pendingToken == kSpeechAudioStart) {
+          s.mode = 1;
+          s.textDone = false;
+        } else if (*entry.pendingToken == kSpeechMixedStart) {
+          s.mode = 2;
+          s.slotsLeft = 6;
+          s.speaking = false;
+          s.textDone = false;
+        } else if (s.mode == 2) {
+          if (*entry.pendingToken == kSpeechTextEnd) {
+            s.textDone = true;
+            s.speaking = true;
+          }
+          if (!s.textDone && --s.slotsLeft == 0) {
+            s.speaking = !s.speaking;
+            s.slotsLeft = s.speaking ? 12 : 6;
+          }
+        }
+      }
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.verifyMaskRows = 0;

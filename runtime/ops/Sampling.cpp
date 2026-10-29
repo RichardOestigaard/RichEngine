@@ -151,7 +151,8 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          SamplingBuffers buffers, uint32_t stopToken0,
                          uint32_t stopToken1, const PenaltyTable &penalties,
                          std::span<const uint32_t> liveRows,
-                         uint32_t fusedHead, uint32_t verifyStride) const {
+                         uint32_t fusedHead, uint32_t verifyStride,
+                         uint32_t fusedLaneMask) const {
   if (policies.empty() || policies.size() > kMaximumLanes || !verifyStride ||
       verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
       (!liveRows.empty() && liveRows.size() != policies.size()))
@@ -163,7 +164,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   addSelection(graph, policies, buffers,
                {verifyStride, 0, 1, RICHENGINE_UNIFORM_CORRECTION,
                 RICHENGINE_DRAFT_PROPOSAL_TOKENS, verifyStride},
-               stopToken0, stopToken1, liveRows, fusedHead);
+               stopToken0, stopToken1, liveRows, fusedHead, fusedLaneMask);
 }
 
 void Sampling::addVerifyTree(metal::CommandGraph &graph,
@@ -237,12 +238,17 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                             const TargetRows &rows, uint32_t stopToken0,
                             uint32_t stopToken1,
                             std::span<const uint32_t> liveRows,
-                            uint32_t fusedHead) const {
-  const TargetSamplingParams params =
+                            uint32_t fusedHead, uint32_t fusedLaneMask) const {
+  TargetSamplingParams params =
       targetParams(policies, buffers, rows, stopToken0, stopToken1, liveRows);
+  params.fused_mask = fusedHead ? fusedLaneMask : 0;
   bool greedy = false;
-  for (uint32_t lane = 0; lane < policies.size(); ++lane)
-    greedy = greedy || !policies[lane].samples();
+  uint32_t greedyMask = 0;
+  for (uint32_t lane = 0; lane < policies.size(); ++lane) {
+    const bool laneGreedy = !policies[lane].samples();
+    greedy = greedy || laneGreedy;
+    greedyMask |= uint32_t{laneGreedy} << lane;
+  }
   // Greedy and sampled lanes run their own kernels, each over the selected
   // rows of every lane; the groups of the other kind's lanes return at once.
   const uint64_t selected = uint64_t{policies.size()} * rows.rows;
@@ -257,7 +263,13 @@ void Sampling::addSelection(metal::CommandGraph &graph,
                 {buffers.headArgmaxValues, buffers.headArgmaxIndices,
                  buffers.outputTokens},
                 params, {selected, 1, 1}, {32, 1, 1});
-    } else {
+    }
+    // Under the per-lane head (RICHENGINE_HEAD_PER_LANE) a greedy lane the
+    // fused argmax cannot answer — masked or penalized — still takes the
+    // sharded pass over the logits rows the head wrote for it; the kernels
+    // skip every fused_mask lane. Without a fused head every greedy lane
+    // takes the sharded pass as before.
+    if (!fusedHead || (greedyMask & ~fusedLaneMask)) {
       graph.add(std::string(kDecodeSampleArgmaxSharded),
                 {buffers.logits, buffers.constraintMasks,
                  buffers.dfaNextStates, buffers.argmaxValues,

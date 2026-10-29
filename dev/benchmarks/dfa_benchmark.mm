@@ -823,7 +823,10 @@ ScenarioResult runScenario(engine::Engine &engine, Driver &driver,
   for (uint64_t id : requestIds) {
     const Observation &observed = events.get(id);
     if (!observed.completed || !observed.failure.empty())
-      throw std::runtime_error("constrained request failed: " +
+      throw std::runtime_error("request failed: lane " +
+                               std::to_string(laneOf.at(id)) +
+                               (laneConstrained(laneOf.at(id)) ? " constrained "
+                                                               : " free ") +
                                observed.failure);
     result.outputTokens +=
         static_cast<uint32_t>(observed.outputTokens.size());
@@ -980,14 +983,15 @@ int main(int argc, char **argv) {
       std::cerr << "usage: dfa-benchmark METALLIB MODEL_ROOT --pack PACK "
                    "[--scenario LIST] [--width W] [--steps N] [--samples S] "
                    "[--ane-ffn-share SHARE] [--kv-format FORMAT]\n"
-                   "  LIST: unconstrained,mask,mask-forced,dfa "
+                   "  LIST: unconstrained,mask,mask-forced,dfa,mixed "
                    "(default: all)\n"
                    "  PACK: dev/benchmarks/dfa_pack.py output\n";
       return 2;
     }
     std::filesystem::path packPath;
     std::vector<Scenario> scenarios{Scenario::Unconstrained, Scenario::Mask,
-                                    Scenario::MaskForced, Scenario::Dfa};
+                                    Scenario::MaskForced, Scenario::Dfa,
+                                    Scenario::Mixed};
     uint32_t width = 1;
     uint32_t steps = 128;
     uint32_t samples = 1;

@@ -1,0 +1,132 @@
+{
+  "name": "LFM3-Omni-2B",
+  "repos": [
+    "ggml-org/LFM3-Omni-2B-GGUF",
+    "LiquidAI/LFM3-Omni-2B-GGUF"
+  ],
+  "note": "LFM3-Omni-2B's generative text tower: the same tri-hybrid geometry as LFM3-1.7B (thirteen conv layers, sliding_window_attention at 4, 8, 12, 16, 20, full_attention at 2, 6, 10, 14, 18, 22) at the 128000-token context its GGUF declares. Its mmproj-*.gguf carries the lfm3vl vision tower beside the audio sections; each image occupies one image-token slot per merged 2x2 patch block between vision_start/vision_end. The generative checkpoint is told apart from d1-2B's score-only tower by the decision_type field only d1's config states.",
+  "signature": {
+    "model_type": "lfm3",
+    "hidden_size": 2048,
+    "num_hidden_layers": 24,
+    "vocab_size": 128000,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "intermediate_size": 7680,
+    "conv_L_cache": 7,
+    "use_sandwich_norm": true,
+    "sliding_window": 256,
+    "norm_eps": 1e-05,
+    "tie_word_embeddings": true,
+    "max_position_embeddings": 128000,
+    "layer_types": [
+      "conv",
+      "conv",
+      "full_attention",
+      "conv",
+      "sliding_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "sliding_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "sliding_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "sliding_attention",
+      "conv",
+      "full_attention",
+      "conv",
+      "sliding_attention",
+      "conv",
+      "full_attention",
+      "conv"
+    ]
+  },
+  "forbids": {
+    "decision_type": "lfm3-d1"
+  },
+  "vision": true,
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "vision": {
+      "pad_token": "<|image|>",
+      "patch_size": 16,
+      "temporal_patch_size": 2,
+      "merge_size": 2,
+      "image_mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "image_std": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "min_pixels": 65536,
+      "max_pixels": 2097152
+    },
+    "audio": {
+      "pad_token": "<|audio|>",
+      "sampling_rate": 16000,
+      "n_mel": 128,
+      "n_fft": 400,
+      "win_length": 400,
+      "hop_length": 160,
+      "encoder_stride": 8
+    },
+    "tool_dialect": "lfm25-python",
+    "video": {
+      "pad_token": "<|video|>",
+      "vision_start_token": "<|vision_start|>",
+      "vision_end_token": "<|vision_end|>",
+      "fps": 2.0,
+      "min_frames": 4,
+      "max_frames": 384,
+      "temporal_patch_size": 2,
+      "min_pixels": 4096,
+      "max_pixels": 25165824
+    }
+  },
+  "tuning": [
+    "VERIFY_TREE",
+    "VERIFY_ALL_LIVE",
+    "PREFILL_FAST_INT8",
+    "ADAPTIVE_PROPOSALS",
+    "DRAFT_BYPASS",
+    "DRAFT_BYPASS_EXPECT",
+    "DRAFT_CONF_MIN",
+    "GPU_PREDRAFT",
+    "PROPOSAL_CAP",
+    "DRAFT_SPLITS",
+    "PREFILL_SPLITS_MAX",
+    "VERIFY_SPLITS_MAX",
+    "VERIFY_SPLIT_R2",
+    "HEAD_FUSED",
+    "MTL4",
+    "GGUF_PACKED",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "TREE_ACCEPT_MAX",
+    "TREE_ACCEPT_MIN",
+    "ANE_WAIT",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS",
+    "CONV_FUSE"
+  ]
+}

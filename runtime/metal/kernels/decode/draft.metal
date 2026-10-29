@@ -539,6 +539,19 @@ kernel void draft_conv_h2048(
                                      params, group, thread_index);
 }
 
+kernel void draft_conv_h4096(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *dynamic [[buffer(1)]],
+    device const bfloat *base [[buffer(2)]],
+    device const bfloat *residual [[buffer(3)]],
+    device bfloat *output [[buffer(4)]],
+    constant DraftConvBatchParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  draft_conv_decode_batch_impl<4096>(input, dynamic, base, residual, output,
+                                     params, group, thread_index);
+}
+
 // One instantiation per compiled draft head geometry. AttentionM = the KV
 // group's query heads times the block rows; N the ring tile of the split
 // kernel, halved for the 64-row block to keep the workspace under 32 KB of

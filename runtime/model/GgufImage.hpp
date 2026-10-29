@@ -44,11 +44,28 @@ struct TargetGeometry {
   // tensors); lfm2moe has none — it routes sigmoid probabilities with a
   // per-expert selection bias (exp_probs_b) instead.
   bool sharedExpert = true;
-  // A mask-typed attention schedule (LFM2) when set: bit `layer` is a
+  // A mask-typed attention schedule (LFM2, LFM3) when set: bit `layer` is a
   // full-attention layer. Zero keeps the fullAttentionPeriod schedule.
   uint64_t attentionMask = 0;
-  // The conv kernel's taps (the GDN's 4 when zero; LFM2's conv_L_cache 3).
+  // LFM3's global layers within the attention mask: bit `layer` is a
+  // global (theta-1e6 partial rotary) attention layer; the remaining
+  // attention layers are sliding-window local ones.
+  uint64_t globalAttentionMask = 0;
+  // The conv kernel's taps (the GDN's 4 when zero; LFM2's conv_L_cache 3,
+  // LFM3's 7).
   uint32_t convolutionTaps = 0;
+  // LFM3's alt (global) layers' RoPE base — its GGUF states the global
+  // layers' theta under rope.freq_base and the sliding layers' under
+  // rope.freq_base_swa, where a single-schedule target's layers share
+  // rotaryTheta — and the sliding layers' window.
+  float altRotaryTheta = 0.0F;
+  uint32_t slidingWindowTokens = 0;
+  // LFM3's per-head gate projection's padded row count (0 elsewhere); its
+  // attn_gate tensor is a few rows inside one quantized tile.
+  uint32_t attentionGateRows = 0;
+  // LFM3's layers carry a post norm after the mixer and one after the FFN,
+  // beside the pre norms every target states.
+  bool sandwichNorm = false;
   // The RMS norms' epsilon (1e-6, or LFM2's norm_eps 1e-5).
   float rmsEpsilon = 1e-6F;
   // The q*k softmax scale (Granite's attention.scale); zero selects the
@@ -67,6 +84,10 @@ struct TargetGeometry {
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
     if (attentionMask) return layer < 64 && (attentionMask >> layer) & 1;
     return (layer + 1) % fullAttentionPeriod == 0;
+  }
+  // LFM3's global layers inside its attention mask (zero elsewhere).
+  [[nodiscard]] bool isGlobalAttentionLayer(uint32_t layer) const noexcept {
+    return layer < 64 && (globalAttentionMask >> layer) & 1;
   }
   [[nodiscard]] bool sparseMoe() const noexcept { return experts != 0; }
   // The general.architecture of a GGUF of this target.

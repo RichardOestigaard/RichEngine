@@ -269,9 +269,13 @@ void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geomet
                               const std::string &arch) {
   // A bidirectional target — the d1-omni decision encoder states
   // attention.causal false — has no compiled kernels: refuse by name
-  // rather than report its first differing field.
+  // rather than report its first differing field. An lfm3 decision model's
+  // GGUF declares the flag with its lfm3.decision.type (d1-2B): the
+  // decision pathway runs the tower causally, score-only, so the flag does
+  // not refuse a file that states one.
   if (file.unsignedValue(arch + ".attention.causal") ==
-      std::optional<uint64_t>{0})
+          std::optional<uint64_t>{0} &&
+      !(arch == "lfm3" && file.stringValue(arch + ".decision.type")))
     throw GgufError(
         "this GGUF is a bidirectional encoder (attention.causal false); "
         "RichEngine does not serve it");
@@ -301,6 +305,26 @@ void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geomet
   expect("block_count", geometry.layers);
   expect("embedding_length", geometry.hiddenSize);
   expect("feed_forward_length", geometry.intermediateSize);
+  // LFM3's sliding-window pattern marks its local attention layers: true
+  // exactly on the layers that attend but are not global.
+  if (arch == "lfm3") {
+    if (const std::optional<std::span<const double>> pattern =
+            file.numericArray(arch + ".attention.sliding_window_pattern")) {
+      for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+        if (layer >= pattern->size()) break;
+        const bool expected = geometry.isFullAttentionLayer(layer) &&
+                              !geometry.isGlobalAttentionLayer(layer);
+        if (static_cast<bool>((*pattern)[layer]) != expected)
+          mismatched += (mismatched.empty() ? "" : ", ") +
+                        std::string("attention.sliding_window_pattern[") +
+                        std::to_string(layer) + "]";
+      }
+    }
+    if (geometry.slidingWindowTokens)
+      expect("attention.sliding_window", geometry.slidingWindowTokens);
+    if (geometry.altRotaryTheta)
+      expectFloat("rope.freq_base_swa", geometry.rotaryTheta);
+  }
   // LFM2 writes per-layer head arrays; a scalar means the whole model.
   if (const std::optional<std::span<const double>> heads =
           file.numericArray(arch + ".attention.head_count")) {
@@ -333,9 +357,13 @@ void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geomet
   expectOptional("attention.key_length", geometry.attentionHeadDimension);
   expectOptional("attention.value_length", geometry.attentionHeadDimension);
   expectOptional("rope.dimension_count", 2ull * geometry.rotaryPairs);
-  expectFloat("rope.freq_base", geometry.rotaryTheta);
+  // An lfm3's global layers carry the declared rope.freq_base; the sliding
+  // layers' rope.freq_base_swa is checked above.
+  expectFloat("rope.freq_base",
+              geometry.altRotaryTheta ? geometry.altRotaryTheta
+                                      : geometry.rotaryTheta);
   expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
-  if (arch == "lfm2" || arch == "lfm2moe")
+  if (arch == "lfm2" || arch == "lfm2moe" || arch == "lfm3")
     expect("shortconv.l_cache", geometry.convolutionTaps ? geometry.convolutionTaps : 3);
   if (arch == "granite") {
     // Granite's fixed softmax multiplier, and the unit scales we do not
@@ -365,7 +393,8 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   const std::string arch = geometry.architecture();
   if (file.architecture() != arch)
     throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
-  if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe" || arch == "granite") {
+  if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe" ||
+      arch == "lfm3" || arch == "granite") {
     requireNewTargetMetadata(file, geometry, arch);
     return;
   }
@@ -441,7 +470,10 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
       b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
     }
     b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
-  } else if (arch == "lfm2" || arch == "lfm2moe") {
+    // LFM3's per-head gate is a few stored rows inside one quantized tile.
+    if (g.attentionGateRows)
+      b.quantized(p + "attn_gate.weight", g.attentionGateRows, g.hiddenSize);
+  } else if (arch == "lfm2" || arch == "lfm2moe" || arch == "lfm3") {
     // The double-gated short convolution: in_proj's [B|C|x] rows, the
     // channel-major kernel and out_proj.
     b.quantized(p + "shortconv.in_proj.weight", 3ull * g.convolutionDimension, g.hiddenSize);
@@ -483,6 +515,12 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
   }
+  // LFM3's sandwich norms: post-mixer, then post-FFN, after the FFN
+  // section as the layer image's section order states them.
+  if (g.sandwichNorm) {
+    b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    b.floatNorm(p + "post_ffw_norm.weight", g.hiddenSize);
+  }
   return b.finish();
 }
 
@@ -517,9 +555,11 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
     images.push_back(layerImage(file, geometry, problems, layer));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
   // The LFM2 targets name their final norm token_embd_norm and tie their
-  // output head to the token embedding.
-  head.floatNorm(geometry.tiedOutput ? "token_embd_norm.weight"
-                                     : "output_norm.weight",
+  // output head to the token embedding; an lfm3 GGUF ties the head but
+  // keeps the dense targets' output_norm name.
+  head.floatNorm(geometry.tiedOutput && geometry.architecture() != "lfm3"
+                     ? "token_embd_norm.weight"
+                     : "output_norm.weight",
                  geometry.hiddenSize);
   head.quantized(geometry.tiedOutput ? "token_embd.weight" : "output.weight",
                  paddedVocabularySize(geometry.vocabularySize), geometry.hiddenSize);

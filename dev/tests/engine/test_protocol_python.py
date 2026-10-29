@@ -23,6 +23,7 @@ REQUEST_FIELDS = (
     "max_output",
     "prompt_count",
     "image_span_count",
+    "audio_span_count",
     "temperature",
     "top_p",
     "top_k",
@@ -412,6 +413,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.logical_max_output_tokens,
                 len(request.prompt_tokens),
                 len(request.image_spans),
+                len(request.audio_spans),
                 *astuple(request.sampling),
                 request.seed,
                 request.return_progress,
@@ -618,7 +620,7 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<IIIIQQ", wire, span_offset),
             (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
         )
-        self.assertEqual(wire[span_offset + 32 :], image.image_pixels)
+        self.assertEqual(wire[span_offset + p._IMAGE_SPAN.size :], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
 
     def test_generation_prompt_must_leave_a_prompt_token(self):

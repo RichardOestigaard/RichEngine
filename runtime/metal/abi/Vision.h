@@ -30,13 +30,28 @@ struct VisionGridParams {
 static_assert(sizeof(VisionGridParams) == 8,
               "Vision grid parameters are 8 bytes on both sides");
 
+// The LFM3-VL patchify's grid plus the temporal frame count its pixel
+// payload carries (1 still image, 2 video pair).
+struct VisionPatchifyParams {
+  uint32_t grid_height;
+  uint32_t grid_width;
+  uint32_t frames;
+};
+
+static_assert(sizeof(VisionPatchifyParams) == 12,
+              "Vision patchify parameters are 12 bytes on both sides");
+
 struct VisionQkvParams {
   uint32_t tokens;
   uint32_t padded_tokens;
+  // LFM3-VL only: nonzero when the q/k/v inputs are one fused
+  // [Q | K | V]-per-token buffer produced by lfm_vision_gemm_qkv instead
+  // of three separate projection outputs.
+  uint32_t fused = 0;
 };
 
-static_assert(sizeof(VisionQkvParams) == 8,
-              "Vision QKV parameters are 8 bytes on both sides");
+static_assert(sizeof(VisionQkvParams) == 12,
+              "Vision QKV parameters are 12 bytes on both sides");
 
 struct VisionAttentionParams {
   uint32_t tokens;

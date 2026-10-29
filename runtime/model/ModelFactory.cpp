@@ -171,7 +171,11 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
               : DraftFiles(PackedDraftFiles{images, root / "draft", result.descriptor.draft}),
         result.descriptor.draft);
   }
-  result.vision = loadVisionWeights(backend, images, root, result.descriptor, vision.get());
+  result.vision = loadVisionWeights(backend, images, root, result.descriptor, vision);
+  // The audio encoder binds its own sections of the same shared mmproj.
+  result.audio = loadAudioWeights(backend, images, root, result.descriptor);
+  // As does the speech decoder (its a.gen.* sections), decoded host-side.
+  result.speech = loadSpeechWeights(backend, images, root, result.descriptor);
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
@@ -179,26 +183,58 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
       [](const auto &weights) { return std::span<const WeightFileRecord>(weights.files); },
       result.draft);
   records.insert(records.end(), draftFiles.begin(), draftFiles.end());
-  records.insert(records.end(), result.vision.files.begin(),
-                 result.vision.files.end());
+  const std::span<const WeightFileRecord> visionFiles = result.visionFiles();
+  records.insert(records.end(), visionFiles.begin(), visionFiles.end());
+  const std::span<const WeightFileRecord> audioFiles = result.audioFiles();
+  records.insert(records.end(), audioFiles.begin(), audioFiles.end());
+  const std::span<const WeightFileRecord> speechFiles = result.speechFiles();
+  records.insert(records.end(), speechFiles.begin(), speechFiles.end());
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;
 }
 
-std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+VisionLoaderPlan planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   if (descriptor.visionSource != VisionSource::Mlx && descriptor.visionSource != VisionSource::Gguf)
-    return nullptr;
+    return std::monostate{};
+  if (descriptor.visionTower == VisionTower::Lfm3Vl)
+    return std::make_unique<LfmVisionLoader>(root / "vision", descriptor.lfmVision);
   return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const std::filesystem::path &root, const ModelDescriptor &descriptor,
-                                    const VisionLoader *loader) {
-  if (loader) return loadQwenVisionWeights(backend, images, *loader);
+VisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                const VisionLoaderPlan &loader) {
+  if (const auto *qwen = std::get_if<std::unique_ptr<VisionLoader>>(&loader))
+    return loadQwenVisionWeights(backend, images, **qwen);
+  if (const auto *lfm = std::get_if<std::unique_ptr<LfmVisionLoader>>(&loader))
+    return loadLfmVisionWeights(backend, images, **lfm);
   if (descriptor.visionSource == VisionSource::Packed)
     return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
-  return {};
+  return QwenVisionWeights{};
+}
+
+AudioWeights loadAudioWeights(metal::MetalBackend &backend, WeightImages &images,
+                              const std::filesystem::path &root,
+                              const ModelDescriptor &descriptor) {
+  if (descriptor.audioSource != AudioSource::Gguf)
+    return std::monostate{};
+  // The encoder and the vision tower share the omni mmproj file; each
+  // loader binds only the tensors it names.
+  LfmAudioLoader loader(root / "vision", descriptor.lfmAudio);
+  return loadLfmAudioWeights(backend, images, loader);
+}
+
+std::optional<LfmSpeechModel>
+loadSpeechWeights(metal::MetalBackend &backend, WeightImages &images,
+                  const std::filesystem::path &root,
+                  const ModelDescriptor &descriptor) {
+  if (descriptor.speechSource != SpeechSource::Gguf)
+    return std::nullopt;
+  // The decoder and the towers share the omni mmproj file; the loader
+  // binds only the a.gen.* tensors it names and validates their metadata.
+  LfmGenLoader loader(root / "vision");
+  return loadLfmSpeechWeights(backend, images, loader);
 }
 
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
@@ -254,7 +290,13 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     }
   }
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
-    bytes += visionImageBytes(descriptor.vision);
+    bytes += descriptor.visionTower == VisionTower::Lfm3Vl
+                 ? lfmVisionImageBytes(descriptor.lfmVision)
+                 : visionImageBytes(descriptor.vision);
+  if (descriptor.audioSource == AudioSource::Gguf)
+    bytes += lfmAudioImageBytes(descriptor.lfmAudio);
+  if (descriptor.speechSource == SpeechSource::Gguf)
+    bytes += lfmGenImageBytes();
   for (std::string_view directory : {"target", "draft", "vision"}) {
     if (directory == "vision" && descriptor.visionSource != VisionSource::Packed) continue;
     if (directory == "draft" &&

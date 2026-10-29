@@ -193,6 +193,7 @@ class RuntimeCall:
         self._start: wire.StartEvent | None = None
         self._progress: wire.PromptProgressEvent | None = None
         self._next_token_offset = 0
+        self._next_audio_frame = 0
         self._mask_error: MaskComputationFailed | None = None
         self._callback_error: BaseException | None = None
         self._cancel_requested = False
@@ -315,6 +316,21 @@ class RuntimeCall:
                     f"maximum {self._logical_max}"
                 )
             self._next_token_offset = next_offset
+        self._emit(event)
+        return None
+
+    def _record_audio(self, event: wire.AudioPcmEvent) -> str | None:
+        with self._lock:
+            if self._event.is_set():
+                return "AudioPcmEvent arrived after the request became terminal"
+            if self._start is None:
+                return "AudioPcmEvent arrived before StartEvent"
+            if event.frame_index != self._next_audio_frame:
+                return (
+                    f"AudioPcmEvent frame {event.frame_index} out of order; "
+                    f"expected {self._next_audio_frame}"
+                )
+            self._next_audio_frame += 1
         self._emit(event)
         return None
 
@@ -1285,6 +1301,11 @@ class MultiplexedRuntime:
         if isinstance(message, wire.TokensEvent):
             call = self._require_call(generation, message.request_id)
             if issue := call._record_tokens(message):
+                raise ProtocolFatal(issue)
+            return
+        if isinstance(message, wire.AudioPcmEvent):
+            call = self._require_call(generation, message.request_id)
+            if issue := call._record_audio(message):
                 raise ProtocolFatal(issue)
             return
         if isinstance(message, wire.MaskRequestEvent):

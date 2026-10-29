@@ -481,6 +481,88 @@ def _lfm2_fields(arch, text, metadata):
     text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
 
 
+def _lfm3_fields(arch, text, metadata):
+    layers = text["num_hidden_layers"]
+    # The per-layer KV head count names the conv layers (0); among the
+    # attention layers, the sliding-window pattern names the local ones, as
+    # the config's layer_types does.
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    pattern = metadata.values.get(arch + ".attention.sliding_window_pattern")
+    if (
+        not isinstance(kv, list)
+        or len(kv) < layers
+        or not all(type(count) is int and count >= 0 for count in kv[:layers])
+        or not isinstance(pattern, list)
+        or len(pattern) < layers
+        or not all(type(local) is bool for local in pattern[:layers])
+        or any(pattern[layer] and not kv[layer] for layer in range(layers))
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.head_count_kv or .attention.sliding_window_pattern"
+        )
+    text["layer_types"] = [
+        (
+            "conv"
+            if kv[layer] == 0
+            else "sliding_attention" if pattern[layer] else "full_attention"
+        )
+        for layer in range(layers)
+    ]
+    # Every attention layer is K == V.
+    if metadata.values.get(arch + ".attention.value_length") != metadata.values.get(
+        arch + ".attention.key_length"
+    ):
+        raise ModelError(
+            "unsupported GGUF metadata: "
+            + arch
+            + ".attention.key_length and its value_length differ"
+        )
+    text["conv_L_cache"] = metadata.positive(arch + ".shortconv.l_cache")
+    text["sliding_window"] = metadata.positive(arch + ".attention.sliding_window")
+    text["use_sandwich_norm"] = True
+    text["tie_word_embeddings"] = True
+    epsilon = metadata.values.get(arch + ".attention.layer_norm_rms_epsilon")
+    if type(epsilon) is not float or epsilon <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.layer_norm_rms_epsilon"
+        )
+    # The GGUF stores the F32 rounding of config.json's norm_eps; emit the
+    # config's literal when the stored value is its image, else the value
+    # itself (a family signature or the runtime's layout check refuses it).
+    text["norm_eps"] = (
+        1e-5 if abs(epsilon - 1e-5) <= 1e-5 * 1e-6 else epsilon
+    )
+    # The GGUF states the two rope bases flat, where config.json nests them
+    # under rope_parameters by layer kind; emit config.json's shape. The
+    # global layers' partial rotary covers the first half of each head.
+    bases = {}
+    for kind, key in (
+        ("full_attention", "rope.freq_base"),
+        ("sliding_attention", "rope.freq_base_swa"),
+    ):
+        theta = metadata.values.get(arch + "." + key)
+        if type(theta) is not float or theta <= 0:
+            raise ModelError(
+                "missing or invalid GGUF metadata: " + arch + "." + key
+            )
+        bases[kind] = theta
+    text["rope_parameters"] = {
+        "full_attention": {
+            "partial_rotary_factor": 0.5,
+            "rope_theta": bases["full_attention"],
+            "rope_type": "default",
+        },
+        "sliding_attention": {
+            "rope_theta": bases["sliding_attention"],
+            "rope_type": "default",
+        },
+    }
+
+
 def _qwen35moe_fields(arch, text, metadata):
     text.update(
         num_experts=metadata.positive(arch + ".expert_count"),
@@ -714,7 +796,69 @@ def model_config(metadata, vision=None):
     }
     if vision is not None:
         config["vision_config"] = vision_config(vision)
+        audio = audio_config(vision)
+        if audio is not None:
+            config["audio_config"] = audio
+        speech = speech_config(vision)
+        if speech is not None:
+            config["speech_config"] = speech
     return config
+
+
+def audio_config(vision):
+    """The omni mmproj's lfm3a audio encoder section, or None for a mmproj
+    that declares none: 17 hybrid conv/attention blocks at hidden 768
+    feeding the LayerNorm + GELU(erf) projector into the text hidden. The
+    GGUF's clip.audio.feed_forward_length (1792) is authoritative — the HF
+    config's audio_encoder_config states 2560 for a different module."""
+    if vision.values.get("clip.audio.projector_type") != "lfm3a":
+        return None
+    if vision.values.get("clip.has_audio_encoder") is not True:
+        raise ModelError("unsupported GGUF audio architecture")
+    epsilon = vision.require("clip.audio.attention.layer_norm_epsilon", float)
+    if not 0 < epsilon <= 1e-5:
+        raise ModelError("unsupported GGUF audio norm epsilon")
+    fields = {
+        "depth": "block_count",
+        "hidden_size": "embedding_length",
+        "num_heads": "attention.head_count",
+        "num_key_value_heads": "attention.head_count_kv",
+        "intermediate_size": "feed_forward_length",
+        "out_hidden_size": "projection_dim",
+        "n_mel": "num_mel_bins",
+        "sliding_window": "window_size",
+    }
+    result = {
+        name: vision.positive("clip.audio." + key) for name, key in fields.items()
+    }
+    if result["hidden_size"] % result["num_heads"] or (
+        result["num_heads"] % result["num_key_value_heads"]
+    ):
+        raise ModelError("invalid GGUF audio head geometry")
+    result.update(
+        projector_type="lfm3a",
+        head_dim=result["hidden_size"] // result["num_heads"],
+        # 16 kHz mono, n_fft/win 400, hop 160, 8 mel frames per LM token.
+        sampling_rate=16000,
+        n_fft=400,
+        win_length=400,
+        hop_length=160,
+        encoder_stride=8,
+    )
+    return result
+
+
+def speech_config(vision):
+    """The omni mmproj's lfm3a_gen speech decoder section, or None for a
+    mmproj that declares none. The runtime's gen loader validates the
+    section's tensors and metadata itself; the record only names the
+    projector."""
+    if vision.values.get("clip.gen.audio.projector_type") != "lfm3a_gen":
+        return None
+    epsilon = vision.require("clip.gen.audio.attention.layer_norm_epsilon", float)
+    if not 0 < epsilon <= 1e-5:
+        raise ModelError("unsupported GGUF speech norm epsilon")
+    return {"projector_type": "lfm3a_gen"}
 
 
 def loaded_layers(metadata, arch):
@@ -728,9 +872,18 @@ def loaded_layers(metadata, arch):
 
 
 def vision_config(vision):
+    if vision.require("general.architecture", str) != "clip":
+        raise ModelError("unsupported GGUF vision architecture")
+    # clip.projector_type is llama.cpp's single-modality key; a
+    # mixed-modality mmproj (LFM3-Omni carries vision and audio towers in
+    # one file) states the modality key instead.
+    projector = vision.values.get("clip.projector_type") or vision.values.get(
+        "clip.vision.projector_type"
+    )
+    if projector == "lfm3vl":
+        return _lfm3vl_vision_config(vision)
     if (
-        vision.require("general.architecture", str) != "clip"
-        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
+        projector != "qwen3vl_merger"
         or vision.require("clip.use_gelu", bool) is not True
     ):
         raise ModelError("unsupported GGUF vision architecture")
@@ -754,11 +907,56 @@ def vision_config(vision):
     # qwen3vl_merger uses RGB patches with two temporal slices; the native loader
     # independently checks both patch tensors and every other weight shape.
     result.update(
+        projector_type="qwen3vl_merger",
         temporal_patch_size=2,
         in_channels=3,
         num_position_embeddings=(image_size // result["patch_size"]) ** 2,
         hidden_act="gelu_pytorch_tanh",
         deepstack_visual_indexes=[],
+    )
+    return result
+
+
+def _lfm3vl_vision_config(vision):
+    """The LFM3-Omni vision tower's clip section: a fourteen-block hybrid of
+    depthwise-conv and bidirectional GQA blocks, silu-gated FFNs, axial 2D
+    rope, and a LayerNorm + GELU(erf) 2x2-merge projector. Its mmproj quantizes
+    the blocks (Q8_0 with F32 norms and conv kernels, F16 patch embeddings),
+    which select_vision admits for this projector alone."""
+    if (
+        vision.require("clip.use_silu", bool) is not True
+        or vision.values.get("clip.use_gelu") is True
+        or vision.positive("clip.vision.spatial_merge_size") != 2
+        or vision.require("clip.vision.image_resize_algo", str) != "bicubic"
+    ):
+        raise ModelError("unsupported GGUF vision architecture")
+    epsilon = vision.require("clip.vision.attention.layer_norm_epsilon", float)
+    if not 0 < epsilon <= 1e-5:
+        raise ModelError("unsupported GGUF vision norm epsilon")
+    fields = {
+        "depth": "block_count",
+        "hidden_size": "embedding_length",
+        "num_heads": "attention.head_count",
+        "num_key_value_heads": "attention.head_count_kv",
+        "intermediate_size": "feed_forward_length",
+        "out_hidden_size": "projection_dim",
+        "patch_size": "patch_size",
+        "spatial_merge_size": "spatial_merge_size",
+    }
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    if result["num_heads"] % result["num_key_value_heads"]:
+        raise ModelError("invalid GGUF vision head grouping")
+    # RGB patches with two temporal slices, as the v.patch_embd pair states;
+    # the tower carries no learned position table (axial rope instead).
+    result.update(
+        projector_type="lfm3vl",
+        temporal_patch_size=2,
+        in_channels=3,
+        hidden_act="silu",
+        min_pixels=vision.positive("clip.vision.image_min_pixels"),
+        max_pixels=vision.positive("clip.vision.image_max_pixels"),
     )
     return result
 
@@ -939,6 +1137,29 @@ LFM2_OMNI_MODEL_TENSORS = {
     "cls.output.weight": F32,
     "cls.output.bias": F32,
 }
+# The tri-hybrid lfm3 target (LFM3, d1-2B): its attention layers carry QK
+# norms and the narrow per-head gate projection, its conv layers lfm2's
+# shortconv triple, and every layer the sandwich norms — a post norm after
+# the mixer and one after the FFN, beside the tied embedding's output_norm.
+LFM3_ATTENTION_TENSORS = {
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_q_norm.weight": F32,
+    "attn_k_norm.weight": F32,
+    "attn_output.weight": QUANTIZED_TYPES,
+    "attn_gate.weight": QUANTIZED_TYPES,
+}
+LFM3_LAYER_TENSORS = {
+    "attn_norm.weight": F32,
+    "post_attention_norm.weight": F32,
+    "ffn_norm.weight": F32,
+    "post_ffw_norm.weight": F32,
+}
+LFM3_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output_norm.weight": F32,
+}
 # The lfm2moe MoE blocks: sigmoid router with an expert bias, no shared
 # experts, dense FFNs only on the leading dense layers.
 LFM2MOE_TENSORS = {
@@ -1027,6 +1248,25 @@ def _dense_tensors(metadata, layers):
     return tensors
 
 
+def _lfm3_tensors(metadata, layers):
+    arch = text_architecture(metadata)
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    if (
+        not isinstance(kv, list)
+        or len(kv) < layers
+        or not all(type(count) is int and count >= 0 for count in kv[:layers])
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".attention.head_count_kv"
+        )
+    tensors = dict(LFM3_MODEL_TENSORS)
+    for layer in range(layers):
+        mixer = LFM2_CONV_TENSORS if kv[layer] == 0 else LFM3_ATTENTION_TENSORS
+        for name, types in (LFM3_LAYER_TENSORS | mixer | DENSE_TENSORS).items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
 def _lfm2_tensors(metadata, layers):
     arch = text_architecture(metadata)
     kv = metadata.values.get(arch + ".attention.head_count_kv")
@@ -1110,6 +1350,13 @@ GGUF_ARCHS = {
         feed_forward=True,
         fields=_lfm2_fields,
         tensors=_lfm2_tensors,
+    ),
+    "lfm3": GgufArch(
+        "lfm3",
+        kv_per_layer=True,
+        feed_forward=True,
+        fields=_lfm3_fields,
+        tensors=_lfm3_tensors,
     ),
     "gemma4": GgufArch(
         "gemma4_text",
