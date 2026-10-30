@@ -56,7 +56,7 @@ SCHEMA = {
 PROMPT_TEXT = (
     "You are a precise tool-calling assistant. Call the weather tool and "
     "reply only with the JSON object for get_weather(city='Paris', days=3, "
-    "units='metric'). Do not explain the call."
+    "units='metric'). Do not explain the call.\n\nTool call: get_weather("
 )
 
 
@@ -68,7 +68,8 @@ def main():
     out_path = Path(sys.argv[2])
 
     hf = AutoTokenizer.from_pretrained(
-        model_root / "tokenizer", local_files_only=True
+        model_root / "tokenizer", local_files_only=True,
+        fix_mistral_regex=True,
     )
     contract = constraints.validate_tokenizer(
         hf, str(model_root), serving.load(str(model_root))

@@ -316,7 +316,7 @@ inline Tuning makeTuning() {
   t.dfaBudgetOff = envFlag("RICHENGINE_DFA_BUDGET_OFF");
   t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
   t.verifyAllLive = envFlag("RICHENGINE_VERIFY_ALL_LIVE");
-  t.headPerLane = envFlag("RICHENGINE_HEAD_PER_LANE");
+  t.headPerLane = !envFlag("RICHENGINE_HEAD_PER_LANE_OFF");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");
@@ -360,7 +360,10 @@ inline Tuning makeTuning() {
   t.draftBypass = unlessZero("RICHENGINE_DRAFT_BYPASS");
   t.gpuPredraft = unlessZero("RICHENGINE_GPU_PREDRAFT");
   t.chainPredraft = unlessZero("RICHENGINE_CHAIN_PREDRAFT");
-  t.dfaMode = stringOrEmpty("RICHENGINE_DFA_MODE");
+  {
+    const char *dfaModeEnv = std::getenv("RICHENGINE_DFA_MODE");
+    t.dfaMode = dfaModeEnv && *dfaModeEnv ? dfaModeEnv : "full";
+  }
   t.draftBypassExpectSet = envFlag("RICHENGINE_DRAFT_BYPASS_EXPECT");
   t.draftBypassExpect = envDouble("RICHENGINE_DRAFT_BYPASS_EXPECT", 0.15);
   t.ngramDraftExpectSet = envFlag("RICHENGINE_NGRAM_DRAFT_EXPECT");

@@ -91,6 +91,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     // logits rows, which the fused head's *_logits variant writes beside the
     // argmax partials — sampled and penalized selection and masked argmax
     // read them, and a greedy GPU-DFA lane's correction row does too.
+    // Affine-only: the GGUF amax head has no *_logits variant, and the
+    // flag's mask plumbing is not exercised on that family.
     static const bool perLaneHead = tuning().headPerLane;
     uint32_t logitsLaneMask = 0, coverableMask = 0;
     const uint32_t gpuDfa = perLaneHead ? gpuDfaLaneMask(entries) : 0;

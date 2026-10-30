@@ -2235,7 +2235,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                 laneResult.verifyRows, laneResult.retained,
                 laneResult.accepted, trunc,
                 lanes[lane].request->dfa ? 1 : 0, toks.c_str());
-        if (lanes[lane].request->dfa) {
+        {
           const uint32_t *rs = contents<uint32_t>(
               decodeArena->packed(DecodeTensor::DfaRowStates,
                                   uint32_t(items.size())),

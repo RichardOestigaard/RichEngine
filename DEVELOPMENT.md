@@ -710,7 +710,7 @@ image takes the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's
 padded meta units (1/16 bit more) and IQ3_S's chunk words (4.06 bits for its
 3.44).
 
-Prism ML's GGUFs, such as `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0`, store
+Prism ML's rotated GGUFs store
 every projection for rotated inputs: the `prism.hadamard.*` metadata names the
 tensors whose weights multiply H (D x), H the normalized Walsh-Hadamard
 transform of each block of 1024 inputs and D an explicit sign per input, and
