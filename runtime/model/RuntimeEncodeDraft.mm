@@ -101,10 +101,13 @@ namespace richengine::model {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     std::visit([&](const auto &model) {
-      if constexpr (std::is_same_v<std::decay_t<decltype(model)>,
-                                   DFlashV1Draft> ||
-                    std::is_same_v<std::decay_t<decltype(model)>,
-                                   DSparkDraft>) {
+      using DraftModelType = std::decay_t<decltype(model)>;
+      // Every GPU draft whose decode binds the step pack: the V1/DSpark
+      // variants and the DFlash2 width subclasses (its selectors take the
+      // anchor from the draft-input rows the pack staged, like DSpark's).
+      if constexpr (std::is_same_v<DraftModelType, DFlashV1Draft> ||
+                    std::is_same_v<DraftModelType, DSparkDraft> ||
+                    std::is_base_of_v<DFlashDraft, DraftModelType>) {
         model.addDecode(graph, std::move(buffers),
                         targetModel.vocabularyProjection(),
                         std::span(cacheLengths).first(lanes), devicePack);
@@ -221,7 +224,25 @@ namespace richengine::model {
     const auto p1 = std::chrono::steady_clock::now();
     predraft.epoch = arenaEpoch_;
     predraft.lanes = width;
-    predraft.ticket = backend.submitCommandAsync(graph.dispatches());
+    // The overlap variant raises a queue-level event at the tail: the next
+    // decode's verify submits behind this command and waits on the signal
+    // — Metal 4 commits are not implicitly serialized — while its host
+    // encode already ran during this draft's execution.
+    if (predraftOverlap_) {
+      if (!predraftEvent_)
+        predraftEvent_ = backend.newSharedEvent();
+      const EventStep step{.before = graph.dispatches().size(),
+                           .event = predraftEvent_,
+                           .value = ++predraftEventValue_,
+                           .kind = EventStep::Kind::Signal};
+      const EventStep steps[1] = {step};
+      const metal::Command command{graph.dispatches(),
+                                   std::span<const EventStep>(steps)};
+      predraft.ticket = backend.submitCommandAsync(command);
+      predraft.waitValue = predraftEventValue_;
+    } else {
+      predraft.ticket = backend.submitCommandAsync(graph.dispatches());
+    }
     if (pdTiming) {
       const auto p2 = std::chrono::steady_clock::now();
       fprintf(stderr, "predraft-detail build=%.3fms submit=%.3fms\n",
@@ -235,14 +256,15 @@ namespace richengine::model {
   bool Runtime::Impl::adoptGpuPredraft(std::span<Request *const> entries,
                                        std::span<const ModelBatchItem> items,
                                        uint32_t width, bool allowed) {
-    // armed, not submitted: the ticket may already be consumed by a
-    // settleGpuPredraft on this decode path — the lane bookkeeping is the
-    // proposal proof either way.
+    // Armed, maybe still in flight (RICHENGINE_PREDRAFT_OVERLAP keeps the
+    // ticket pending through this cycle's encode and submit) or already
+    // drained by a settleGpuPredraft on this decode path — the adoption
+    // proof is host facts only: the epoch, the request ids and the anchors
+    // and positions it assumed. Its writes arrive through queue order,
+    // never through the host's wait.
     if (!gpuPredraft_.lanes)
       return false;
-    settleGpuPredraft();
-    GpuPredraft predraft = std::move(gpuPredraft_);
-    gpuPredraft_ = GpuPredraft{};
+    const GpuPredraft &predraft = gpuPredraft_;
     // The epoch proves no other decode wrote the arena's proposal buffers
     // since the predraft ran; the per-lane match proves the same requests
     // continue at the anchors and positions it assumed.
@@ -320,10 +342,18 @@ namespace richengine::model {
       CommandGraph &graph, std::span<Request *const> entries,
       std::span<const ModelBatchItem> items) {
     static_cast<void>(items);
-    if (!gpuPredraftOn_ || !chainPredraft_ || entries.empty() ||
-        entries.size() > kLaneCount ||
-        !(std::holds_alternative<DFlashV1Draft>(draftModel) ||
-          std::holds_alternative<DSparkDraft>(draftModel)))
+    // The chainable drafts: variants whose decode binds the step pack for
+    // its cache lengths and whose selector takes the anchor from the
+    // pack-staged draft-input rows instead of the encode's host constants.
+    // The DFlash2 width subclasses cover the base via is_base_of.
+    const bool chainable = std::visit([](const auto &model) {
+      using DraftModelType = std::decay_t<decltype(model)>;
+      return std::is_same_v<DraftModelType, DFlashV1Draft> ||
+             std::is_same_v<DraftModelType, DSparkDraft> ||
+             std::is_base_of_v<DFlashDraft, DraftModelType>;
+    }, draftModel);
+    if (!gpuPredraftOn_ || !chainPredraft_ || !chainable ||
+        entries.empty() || entries.size() > kLaneCount)
       return;
     const uint32_t width = static_cast<uint32_t>(entries.size());
     GpuPredraft predraft;

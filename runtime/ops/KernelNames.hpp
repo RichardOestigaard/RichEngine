@@ -279,6 +279,41 @@ inline constexpr std::string_view kPrefillLinearQ4N256Residual = "prefill_linear
 inline constexpr std::string_view kPrefillLinearQ4N128ResidualSg4 = "prefill_linear_q4_n128_residual_sg4";
 inline constexpr std::string_view kPrefillLinearQ4N128UpSiluSumsSg4 = "prefill_linear_q4_n128_up_silu_sums_sg4";
 inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSums = "prefill_linear_q4_n256_up_silu_sums";
+inline constexpr std::string_view kPrefillLinearQ4N128M64 = "prefill_linear_q4_n128_m64";
+inline constexpr std::string_view kPrefillLinearQ4N256M64 = "prefill_linear_q4_n256_m64";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualM64 = "prefill_linear_q4_n128_residual_m64";
+inline constexpr std::string_view kPrefillLinearQ4N256ResidualM64 = "prefill_linear_q4_n256_residual_m64";
+inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSumsM64 = "prefill_linear_q4_n256_up_silu_sums_m64";
+// Opt-in prefill experiments (ops::Linear's baseline): _ksplit splits K over
+// the grid's third dimension with fp32 partials and a last-arrival reduce,
+// _persist loops column tiles inside params.groups threadgroups per row
+// tile (dispatched through the MTL4 "|persistent" pipeline option).
+inline constexpr std::string_view kPrefillLinearQ4N128Ksplit = "prefill_linear_q4_n128_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256Ksplit = "prefill_linear_q4_n256_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualKsplit = "prefill_linear_q4_n128_residual_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256ResidualKsplit = "prefill_linear_q4_n256_residual_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSumsKsplit = "prefill_linear_q4_n256_up_silu_sums_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128Sg4Ksplit = "prefill_linear_q4_n128_sg4_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualSg4Ksplit = "prefill_linear_q4_n128_residual_sg4_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128UpSiluSumsSg4Ksplit = "prefill_linear_q4_n128_up_silu_sums_sg4_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128M64Ksplit = "prefill_linear_q4_n128_m64_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256M64Ksplit = "prefill_linear_q4_n256_m64_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualM64Ksplit = "prefill_linear_q4_n128_residual_m64_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256ResidualM64Ksplit = "prefill_linear_q4_n256_residual_m64_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSumsM64Ksplit = "prefill_linear_q4_n256_up_silu_sums_m64_ksplit";
+inline constexpr std::string_view kPrefillLinearQ4N128Persist = "prefill_linear_q4_n128_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256Persist = "prefill_linear_q4_n256_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualPersist = "prefill_linear_q4_n128_residual_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256ResidualPersist = "prefill_linear_q4_n256_residual_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSumsPersist = "prefill_linear_q4_n256_up_silu_sums_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128Sg4Persist = "prefill_linear_q4_n128_sg4_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualSg4Persist = "prefill_linear_q4_n128_residual_sg4_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128UpSiluSumsSg4Persist = "prefill_linear_q4_n128_up_silu_sums_sg4_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128M64Persist = "prefill_linear_q4_n128_m64_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256M64Persist = "prefill_linear_q4_n256_m64_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N128ResidualM64Persist = "prefill_linear_q4_n128_residual_m64_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256ResidualM64Persist = "prefill_linear_q4_n256_residual_m64_persist|persistent";
+inline constexpr std::string_view kPrefillLinearQ4N256UpSiluSumsM64Persist = "prefill_linear_q4_n256_up_silu_sums_m64_persist|persistent";
 inline constexpr std::string_view kDecodeLinearQ4Sg = "decode_linear_q4_sg";
 inline constexpr std::string_view kDecodeLinearQ4SgGateUp = "decode_linear_q4_sg_gate_up";
 inline constexpr std::string_view kDecodeLinearQ4SgGateUpT64 = "decode_linear_q4_sg_gate_up_t64";

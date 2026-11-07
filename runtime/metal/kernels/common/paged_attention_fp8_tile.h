@@ -36,7 +36,8 @@ template <uint QueryHeadsPerKVHead, uint RowsPerTile,
 inline void richengine_attention_page_softmax_fp8(
     threadgroup const float *scores, threadgroup half *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start, uint fused_row_offset,
     uint visible_tokens, uint committed_tokens, uint active_rows,
@@ -150,7 +151,8 @@ inline void richengine_paged_attention_tile_fp8(
     uint split, device bfloat *partials, device float *statistics, ulong slot,
     threadgroup float *scores, threadgroup half *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     threadgroup half *staged_queries,
     uint thread_index, float qk_scale = 0.0f,
     uint window_tokens = 0, uint pass_begin = 0, uint pass_end = 2) {
@@ -195,7 +197,7 @@ inline void richengine_paged_attention_tile_fp8(
       row_max[thread_index] = -INFINITY;
       row_sum[thread_index] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto qt = HalfTensorTg(staged_queries, dextents<int, 2>{D, MP},
                            array<int, 2>{1, D});
@@ -241,14 +243,14 @@ inline void richengine_paged_attention_tile_fp8(
       page_scores.store(st.template slice<N, MP>(0, 0));
       if (thread_index == 0)
         atomic_store_explicit(rescale, 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       richengine_attention_page_softmax_fp8<QueryHeadsPerKVHead, RowsPerTile / 2, HeadDim>(
           scores, probabilities, row_max, row_sum, previous_scale, rescale,
           reinterpret_cast<device const float4 *>(key_scales),
           reinterpret_cast<device const float4 *>(value_scales), token_start,
           row_offset, visible_tokens, committed_tokens, active_rows,
           thread_index, qk_scale, window_tokens);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
         for (ushort index = 0; index < running.get_capacity(); ++index) {
@@ -260,7 +262,7 @@ inline void richengine_paged_attention_tile_fp8(
       }
       auto vs = vt.template slice<N, D>(0, 0);
       pv.run(p0, vs, running);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
     // bf16 on the bus: half the partial round-trip at ~0.2% per element.
 #pragma unroll
@@ -277,7 +279,7 @@ inline void richengine_paged_attention_tile_fp8(
       statistics[(slot * M + row_offset + thread_index) * 2 + 1] =
           row_sum[thread_index];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 

@@ -183,7 +183,8 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
   };
-  const MoeGgufTile device = richengine::ops::moeGgufTile(backend.capabilities().appleGpuFamily, ggufShape);
+  const MoeGgufTile device = richengine::ops::moeGgufTile(
+      richengine::ops::DevicePolicy::of(backend.capabilities()), ggufShape);
   const MoeGgufTile other = device == MoeGgufTile::Register ? MoeGgufTile::Staged : MoeGgufTile::Register;
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
@@ -195,11 +196,12 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
          time(gguf, plans.moePrefill(ggufShape, kRowsMax)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     b.input = bfloatBuffer(backend, input(lanes * 8, a1b ? E : 24), "input");
-    MoeConfig config = plans.moeDecode(ggufShape, lanes).configuration();
+    MoeConfig config = plans.moeDecode(ggufShape, lanes, 8).configuration();
     config.ggufTile = other;
-    const double a = time(affine, plans.moeDecode(affineShape, lanes));
-    const double g = time(gguf, plans.moeDecode(ggufShape, lanes));
-    const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, config));
+    if (other == MoeGgufTile::Register) config.expertTile = richengine::ops::MoeExpertTile::M8;
+    const double a = time(affine, plans.moeDecode(affineShape, lanes, 8));
+    const double g = time(gguf, plans.moeDecode(ggufShape, lanes, 8));
+    const double o = time(gguf, MoE::decodePlan(ggufShape, lanes, 8, config));
     const double ap = time(affine, plans.moePrefill(affineShape, lanes * 8));
     const double gp = time(gguf, plans.moePrefill(ggufShape, lanes * 8));
     printf("  decode B%u: affine %.3f  gguf %s %.3f  gguf %s %.3f  | prefill chunk of %u rows: affine %.3f  "
@@ -217,10 +219,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   for (const auto &[label, weights, plan] :
        {std::tuple{"affine prefill", &affine, plans.moePrefill(affineShape, kRowsMax)},
         std::tuple{"gguf prefill", &gguf, plans.moePrefill(ggufShape, kRowsMax)},
-        std::tuple{"affine B1", &affine, plans.moeDecode(affineShape, 1)},
-        std::tuple{"gguf B1", &gguf, plans.moeDecode(ggufShape, 1)},
-        std::tuple{"affine B4", &affine, plans.moeDecode(affineShape, 4)},
-        std::tuple{"gguf B4", &gguf, plans.moeDecode(ggufShape, 4)}}) {
+        std::tuple{"affine B1", &affine, plans.moeDecode(affineShape, 1, 8)},
+        std::tuple{"gguf B1", &gguf, plans.moeDecode(ggufShape, 1, 8)},
+        std::tuple{"affine B4", &affine, plans.moeDecode(affineShape, 4, 8)},
+        std::tuple{"gguf B4", &gguf, plans.moeDecode(ggufShape, 4, 8)}}) {
     b.input = bfloatBuffer(backend, input(plan.rows(), plan.rows() == kRowsMax || a1b ? E : 24), "input");
     allocate(backend, b, plan);
     CommandGraph graph;

@@ -65,7 +65,8 @@ kernel void draft_select_edges(
     device const bfloat *hidden [[buffer(4)]],
     device const bfloat *predecessor_codebook [[buffer(5)]],
     device const bfloat *successor_codebook [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
+    device const uint *draft_input [[buffer(7)]],
+    constant SelectorBatchParams &params [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -89,7 +90,11 @@ kernel void draft_select_edges(
       successors[lane] = token;
     }
   } else if (simd_group == 1) {
-    uint token = params.anchor[batch];
+    // The anchor comes from the lane's packed draft input (row 0 of its
+    // query stride), not the parameter block: a GPU-chained predraft's
+    // anchor is written there by draft_predraft_pack after this dispatch
+    // was encoded, while every host path stages the same token.
+    uint token = draft_input[batch * params.query_rows];
     if (position > 0) {
       float value;
       top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
@@ -160,7 +165,8 @@ kernel void dflash_select_pool_edges(
     device const bfloat *hidden [[buffer(2)]],
     device const bfloat *predecessor_codebook [[buffer(3)]],
     device const bfloat *successor_codebook [[buffer(4)]],
-    constant SelectorBatchParams &params [[buffer(5)]],
+    device const uint *draft_input [[buffer(5)]],
+    constant SelectorBatchParams &params [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -186,7 +192,7 @@ kernel void dflash_select_pool_edges(
         task % (Pool / TaskCandidates) * TaskCandidates;
     const uint previous =
         position ? partial_ids[(row - 1) * Pool + predecessor_index]
-                 : params.anchor[batch];
+                 : draft_input[batch * params.query_rows];
     const uint safe_predecessor = min(previous, params.vocabulary - 1u);
     float context[Dims];
     float successor[TaskCandidates][Dims];
@@ -308,7 +314,8 @@ kernel void draft_select_tree(
     device uint *tree_tokens [[buffer(6)]],
     device uint *tree_nodes [[buffer(7)]],
     device uint *tree_counts [[buffer(8)]],
-    constant SelectorBatchParams &params [[buffer(9)]],
+    device const uint *draft_input [[buffer(9)]],
+    constant SelectorBatchParams &params [[buffer(10)]],
     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
@@ -329,7 +336,7 @@ kernel void draft_select_tree(
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
-  tree_tokens[0] = params.anchor[batch];
+  tree_tokens[0] = draft_input[batch * params.query_rows];
   tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
                   (RICHENGINE_TREE_NODE_NONE << 16);
 

@@ -22,7 +22,7 @@ struct Timing final {
 // What calibration times: the split at two shares, and a full chunk's FFN
 // layer on the GPU alone.
 struct Timings final {
-  Timing low, high;
+  Timing low, mid, high;
   double gpuAlone = 0.0;
 };
 
@@ -53,6 +53,11 @@ struct Model final {
 // The model through the timings of a low and a high share
 // (AneFfnCalibration.cpp). Throws unless the low share is the lower.
 [[nodiscard]] Model fit(const Timing &low, const Timing &high);
+// The model through three shares: the ANE's part through the two it binds,
+// affine — a fixed per-evaluation cost the proportional fit of two shares
+// folds into its rate, which pushed the chosen share below the least. The
+// two-share call above is its degenerate case.
+[[nodiscard]] Model fit(const Timing &low, const Timing &mid, const Timing &high);
 
 // The ANE's channel units, of the `units` the intermediate channels hold, at
 // which chunks split, at most `maxAneUnits` of them: those at which T, or T a

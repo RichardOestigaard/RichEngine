@@ -67,6 +67,9 @@ ModelDescriptor ornithDescriptor(std::string name) {
   // a tool-call burst. The family's serving block declares the same mode so
   // the server ships the DFA and skips the pushed spans.
   descriptor.tuning.dfaMode = "full";
+  // Chained predraft measured slower here (+4-11% decode wall, DFlashV1):
+  // the predraft's GPU work serializes inside the command and costs more
+  // than the host gap it removes on this family's shorter cycles.
   return descriptor;
 }
 

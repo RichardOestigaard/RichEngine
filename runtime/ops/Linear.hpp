@@ -236,6 +236,7 @@ public:
   [[nodiscard]] LinearConfig configuration() const noexcept { return config_; }
   [[nodiscard]] FloatOutput destination() const noexcept { return destination_; }
   [[nodiscard]] uint32_t storageRows() const noexcept;
+  [[nodiscard]] uint32_t prefillTileRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
   // Threadgroups over the column tiles: the configured groups of a
   // persistent decode tile, every column tile otherwise.

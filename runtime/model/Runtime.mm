@@ -545,15 +545,33 @@ Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
   validatePlan(plan, items, WorkKind::Decode);
-  // A pending speculative draft holds the one in-flight command slot.
-  impl_->settleGpuPredraft();
+  // A pending speculative draft holds one of the two in-flight command
+  // slots — by default it drains before any encode touches the arena.
+  // RICHENGINE_PREDRAFT_OVERLAP keeps it in flight through this cycle's
+  // encode and submit instead: adoption is host facts only, the predraft's
+  // writes reach the verify through queue order, and every host write it
+  // could still be racing is either identical-valued (the anchors and
+  // draft positions adoption requires match, anything else drops the arm)
+  // or proposal-hint-only (uniforms, bypass fills — a verify row's emitted
+  // token is always the target's, whatever the proposals were). The
+  // ticket drains in the step's finish, before the next launch.
+  static const bool overlapPredraft =
+      envFlag("RICHENGINE_PREDRAFT_OVERLAP");
+  if (!overlapPredraft)
+    impl_->settleGpuPredraft();
   const auto encodeStart = std::chrono::steady_clock::now();
-  if (plan.decodeStage != DecodeStage::Regular)
+  // Every non-regular path keeps the drain up front: their host writes are
+  // not the adoption-identical draft inputs the overlap path relies on,
+  // and their staged submissions want the free in-flight slot.
+  if (plan.decodeStage != DecodeStage::Regular) {
+    impl_->settleGpuPredraft();
     return impl_->submitInitialSelection(items, std::move(completion));
+  }
   // DiffusionGemma's decode is the whole canvas denoising loop, synchronous
   // and single-lane: it selects no anchors and commits up to a canvas of
   // tokens per step (RuntimeDiffusion.mm).
   if (impl_->diffusion) {
+    impl_->settleGpuPredraft();
     return impl_->decodeDiffusion(plan, items, std::move(completion));
   }
 
@@ -829,11 +847,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
           (!impl_->gpuDfaMasks(entry) || !entry.forcedTokens.empty()))
         merged = false;
     }
+    impl_->settleGpuPredraft();
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, std::move(commandGraph),
         std::move(completion), merged);
   }
   if (tree) {
+    // A comb's tables are host-written and nothing like the predraft's
+    // assumed inputs — drain it before the tree passes write theirs.
+    impl_->settleGpuPredraft();
     const bool skipForward = impl_->treeSkip_.find('f') != std::string::npos;
     const bool skipPolicy = impl_->treeSkip_.find('p') != std::string::npos;
     const bool skipCommits = impl_->treeSkip_.find('c') != std::string::npos;
@@ -925,6 +947,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  items = std::move(copiedItems), tree,
                  encodeStart, encodeEnd](CommandTiming timing) mutable {
     const auto t0 = std::chrono::steady_clock::now();
+    // A predraft left in flight by the overlap path ended on the queue
+    // before this command did — its ticket wait is a bookkeeping read,
+    // freeing the slot the next launch needs. It runs first so its GPU
+    // seconds count in this cycle's lastDecodeGpuSeconds.
+    impl->settleGpuPredraft();
     auto result = impl->finalizeDecode(lanes, items, timing, tree);
     const auto t1 = std::chrono::steady_clock::now();
     // The committed step's anchors and positions are host-known now: the
@@ -950,8 +977,24 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
     return result;
   };
-  CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(), std::move(completion));
+  // A predraft still in flight orders this command behind its tail signal
+  // on the queue — Metal 4 commits are not implicitly serialized — so the
+  // verify's GPU work still starts only once the draft's reads and writes
+  // of the shared arena ended, while this host submission already ran
+  // during its execution. The event step keeps the command off the baked
+  // span replay (MetalEncode.mm), so each dispatch encodes directly.
+  CommandTicket command;
+  if (const std::optional<EventStep> wait =
+          overlapPredraft ? impl_->inFlightPredraftWait() : std::nullopt) {
+    const EventStep steps[1] = {*wait};
+    const metal::Command behind{commandGraph.dispatches(),
+                                std::span<const EventStep>(steps)};
+    command =
+        impl_->backend.submitCommandAsync(behind, std::move(completion));
+  } else {
+    command = impl_->backend.submitCommandAsync(commandGraph.dispatches(),
+                                                std::move(completion));
+  }
   return std::make_unique<detail::DeferredMetalTicket>(std::move(command),
                                                std::move(finish));
 }

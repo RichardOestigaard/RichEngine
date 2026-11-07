@@ -1,9 +1,12 @@
 {
   "name": "Ornith-1.5-9B",
   "repos": [
-    "ornith-ai/Ornith-1.5-9B-MLX-4bit"
+    "ornith-ai/Ornith-1.5-9B-MLX-4bit",
+    "OBLITERATUS/Ornith-1.5-9B-OBLITERATED",
+    "mradermacher/Ornith-1.5-9B-OBLITERATED-i1-GGUF",
+    "mradermacher/Cyber-Ornith-1.5-9B-OBLITERATED-i1-GGUF"
   ],
-  "note": "Ornith's released weights carry a vision tower the runtime does not serve.",
+  "note": "Ornith's released weights carry a vision tower the runtime does not serve. Obliterated derivatives (OBLITERATUS's abliteration, DuoNeural's Cyber-Ornith fine-tune on it) keep the identical text architecture and resolve to this family; the DFlash2 draft still pairs, though the fine-tune's shifted logits lower acceptance versus stock.",
   "signature": {
     "model_type": "qwen3_5_text",
     "max_position_embeddings": 262144,

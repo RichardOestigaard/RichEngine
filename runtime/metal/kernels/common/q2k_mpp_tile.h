@@ -93,7 +93,7 @@ inline void gguf_decode_q2k_tile(device bfloat *input, device uchar *w0, device 
   };
   const uint g0 = split_index * per, g1 = (split_index + 1) * per;
   stage32(g0, 0);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint g = g0; g < g1; ++g) {
     if (g + 1 < g1) stage32(g + 1, ((g + 1 - g0) & 1));
     const ulong b0 = (ulong(plane_tile) * groups + g) * QUANT_TILE_ROWS + plane_row;
@@ -117,7 +117,7 @@ inline void gguf_decode_q2k_tile(device bfloat *input, device uchar *w0, device 
                        fma(sums[buf * 2 * Rows + row], c.z,
                            fma(sums[buf * 2 * Rows + Rows + row], c.w, acc[i]))));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   gguf_store_sums<Rows>(acc, splits, split_index, partials, counter,
                         out_stride, column0, simd_group * 32 + simd_lane, arrival,

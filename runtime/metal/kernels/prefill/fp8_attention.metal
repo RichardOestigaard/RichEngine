@@ -24,7 +24,7 @@
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     uint kv_head = group.x;                                                    \
     uint split = group.z;                                                      \
     uint tile = group.y;                                                       \
@@ -81,7 +81,7 @@ PAGED_PREFILL_FP8_SPLIT(prefill_attention_fp8_split_k4q4d128, 4, 4, 128)
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     uint kv_head = group.x;                                                    \
     uint split = group.z;                                                      \
     uint tile = group.y;                                                       \

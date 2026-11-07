@@ -20,7 +20,8 @@
 // A plain projection reads no auxiliary input (its input stands in) and
 // writes a destination of type Out.
 #define Q4_SPLIT_OUTPUT(Name, Rows, Out)                                       \
-  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
+                   device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \
@@ -42,7 +43,8 @@
   Q4_SPLIT_OUTPUT(Name##_f32, Rows, float)
 
 #define Q4_SPLIT_AUXILIARY(Name, Rows, AddResidual, MultiplySiluGate)          \
-  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
+                   device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \

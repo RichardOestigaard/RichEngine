@@ -131,8 +131,11 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
       const uint col = item % Cols, gi = item / Cols, g = step * GPS + gi;
       dequant32<F>(packed[it], hdr[it], g % F::MetaGroups, tl, buf + col * KS + gi * 32);
     }
-    if constexpr (Threads == 32) simdgroup_barrier(mem_flags::mem_threadgroup);
-    else threadgroup_barrier(mem_flags::mem_threadgroup);
+    if constexpr (Threads == 32)
+      simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                        thread_scope_simdgroup);
+    else
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (more) {
 #pragma unroll
       for (ushort it = 0; it < IPT; ++it) {
@@ -171,7 +174,8 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
                      uint step_first, thread Acc &acc) {
   gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
                                            step_end, step_first, true, acc);
-  simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);   // the stage may be reused by a following accumulate
 }
 
 // One tensor's weights in a one-simdgroup decode tile of GGUF_STAGED_COLUMNS columns: lane l stages column l, one
@@ -235,12 +239,14 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
   const auto run_step = [&](uint step, uint next, bool more) __attribute__((always_inline)) {
     g.stage(step, tl, stage, lane);
     u.stage(step, tl, stage + KS * Cols, lane);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
     if (more) { g.load(step, next); u.load(step, next); }
     auto a_slice = a.template slice<KS, Rows>(step * KS, 0);
     operation.run(a_slice, bg, gate);
     operation.run(a_slice, bu, up);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
   };
   uint walked = 0;
   for (uint run = 0; run < 2; ++run) {

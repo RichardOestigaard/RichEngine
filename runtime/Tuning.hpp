@@ -37,9 +37,14 @@ struct Tuning {
   // splitting the command (NEW_DSP_FINDINGS.md §3.4). Default on, opt-out
   // for A/B.
   bool mixedDecodePack = true;  // RICHENGINE_MIXED_DECODE_PACK_OFF (presence)
-  // ops/MoE.cpp, ops/MoE.hpp
-  bool moeGgufFused = false;      // RICHENGINE_MOE_GGUF_FUSED (presence)
+  // ops/MoE.cpp, ops/MoE.hpp: the staged, unpacked gate and up passes run the
+  // fused `_gu` tile (measured −7% at a 512-row GGUF prefill chunk, bitwise
+  // outputs on the gguf-moe suite) — default on, opt-out for A/B.
+  bool moeGgufFused = true;       // RICHENGINE_MOE_GGUF_FUSED_OFF (presence)
   std::string_view moeGgufTile;   // RICHENGINE_MOE_GGUF_TILE=register|staged
+  // ops/ExecutionPlans.cpp: GGUF decode plans take 32-row expert tiles
+  // (wideGgufDecode) so a hot expert's weights stream once, for A/Bs.
+  bool moeDecodeM32 = false;      // RICHENGINE_MOE_DECODE_M32 (presence)
   // ops/ExecutionPlans.cpp: forces the four-simdgroup affine expert tiles
   // (moe_expert_*_sg4) on families that default to eight, for A/Bs.
   bool moeSg4 = false;            // RICHENGINE_MOE_SG4 (presence)
@@ -50,6 +55,14 @@ struct Tuning {
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
   // ops/Linear.cpp, model/RuntimeArenas.mm
   bool prefillFastInt8 = false; // RICHENGINE_PREFILL_FAST_INT8 (presence)
+  // ops/Linear.cpp
+  bool prefillQ4M64 = false;  // RICHENGINE_PREFILL_Q4_M64 (presence)
+  // Opt-in prefill experiments: >1 splits K across that many threadgroups of
+  // each prefill tile (the *_ksplit kernels' fp32 partials + reduce), >0
+  // loops column tiles inside that many threadgroups per row tile
+  // (the *_persist kernels; 1 picks a per-core heuristic).
+  uint32_t prefillQ4Ksplit = 0;     // RICHENGINE_PREFILL_Q4_KSPLIT
+  uint32_t prefillQ4Persistent = 0; // RICHENGINE_PREFILL_Q4_PERSISTENT
   // metal/MetalEncode.mm
   bool icbOff = false;          // RICHENGINE_ICB_OFF (presence)
   bool mtl4 = false;            // RICHENGINE_MTL4_OFF disables (default on)
@@ -293,13 +306,17 @@ inline Tuning makeTuning() {
   t.moeVerifiedRows = !envFlag("RICHENGINE_MOE_VERIFIED_ROWS_OFF");
   t.moeSharedDense = envFlag("RICHENGINE_MOE_SHARED_DENSE");
   t.mixedDecodePack = !envFlag("RICHENGINE_MIXED_DECODE_PACK_OFF");
-  t.moeGgufFused = envFlag("RICHENGINE_MOE_GGUF_FUSED");
+  t.moeGgufFused = !envFlag("RICHENGINE_MOE_GGUF_FUSED_OFF");
   t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
+  t.moeDecodeM32 = envFlag("RICHENGINE_MOE_DECODE_M32");
   t.moeSg4 = envFlag("RICHENGINE_MOE_SG4");
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
   t.prefillFastInt8 = envFlag("RICHENGINE_PREFILL_FAST_INT8");
+  t.prefillQ4M64 = envFlag("RICHENGINE_PREFILL_Q4_M64");
+  t.prefillQ4Ksplit = envUint("RICHENGINE_PREFILL_Q4_KSPLIT", 0);
+  t.prefillQ4Persistent = envUint("RICHENGINE_PREFILL_Q4_PERSISTENT", 0);
   t.icbOff = envFlag("RICHENGINE_ICB_OFF");
   // A/B-measured winners default on; the *_OFF flag is the escape hatch.
   t.mtl4 = !envFlag("RICHENGINE_MTL4_OFF");

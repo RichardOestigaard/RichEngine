@@ -42,7 +42,8 @@ template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized,
 inline void richengine_canvas_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start,
     uint visible_tokens, uint committed_tokens,
@@ -159,7 +160,8 @@ inline void richengine_canvas_attention_tile(
     float qk_scale,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     uint thread_index, uint window_tokens = 0) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort MP = M / MPasses;

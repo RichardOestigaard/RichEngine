@@ -59,7 +59,7 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
 // INT8 and BF16 entries share one signature: pages are reached through the
 // tables, so no entry binds KV storage.
 #define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
-  kernel void Name(                                                            \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
@@ -79,7 +79,7 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
   threadgroup float row_max[M];                                                \
   threadgroup float row_sum[M];                                                \
   threadgroup float previous_scale[M];                                         \
-  threadgroup atomic_uint rescale;
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                            \
   const RichVerifyTile tile =                                                \
@@ -160,7 +160,7 @@ PAGED_VERIFY_SPLIT_BOTH(verify_attention_bf16_split_k4q4d128, verify_attention_b
   threadgroup float row_max[MP];                                             \
   threadgroup float row_sum[MP];                                             \
   threadgroup float previous_scale[MP];                                      \
-  threadgroup atomic_uint rescale;
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_SPLIT_M2(Name, Heads, Group, CacheElement, HeadDim,     \
                               VRows)                                       \
@@ -250,7 +250,7 @@ PAGED_VERIFY_SPLIT_R2_BOTH(verify_attention_bf16_split_k4q4d128_r2, verify_atten
   threadgroup float row_max[MP];                                             \
   threadgroup float row_sum[MP];                                             \
   threadgroup float previous_scale[MP];                                      \
-  threadgroup atomic_uint rescale;
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_SPLIT_RP(Name, Heads, Group, CacheElement, HeadDim,    \
                               Passes)                                       \
@@ -451,7 +451,7 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
   threadgroup float row_max[M];                                                \
   threadgroup float row_sum[M];                                                \
   threadgroup float previous_scale[M];                                         \
-  threadgroup atomic_uint rescale;
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_TREE_SPLIT(Name, Heads, Group, CacheElement, HeadDim)     \
   kernel void Name(                                                            \
@@ -513,7 +513,7 @@ PAGED_VERIFY_TREE_SPLIT(verify_tree_attention_bf16_split_k4q4d128, 4, 4, bfloat,
   threadgroup float row_max[MP];                                             \
   threadgroup float row_sum[MP];                                             \
   threadgroup float previous_scale[MP];                                      \
-  threadgroup atomic_uint rescale;
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_TREE_SPLIT_M2(Name, Heads, Group, CacheElement, HeadDim)  \
   kernel void Name(                                                            \

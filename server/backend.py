@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+from array import array
 from dataclasses import dataclass, field
 
 from tokenizers.decoders import DecodeStream
@@ -59,6 +60,15 @@ NGRAM_HINT = os.environ.get("RICHENGINE_NGRAM_HINT", "1") != "0"
 # tail the corpus probe looks.
 _NGRAM_HINT_RING = 64
 _NGRAM_SUFFIX_PROBE = 16
+
+
+def _pack_tokens(tokens):
+    """Token ids as the little-endian uint32 stream the hint probes search;
+    b"" where they cannot pack — a hint miss, never an error."""
+    try:
+        return array("I", tokens).tobytes()
+    except (OverflowError, TypeError, ValueError):
+        return b""
 
 
 def trace_tokens(job, streamer, result, error):
@@ -884,21 +894,19 @@ class NativeBackend:
         # fixed emission format — the corpus's strongest reuse case.
         if job.constraint is not None or job.may_call_tools:
             return True
-        prompt = list(job.prefix_tokens) + list(job.prompt_tokens)
+        prompt = _pack_tokens(job.prefix_tokens) + _pack_tokens(job.prompt_tokens)
         if not prompt:
             return False
         for earlier in self.recent_prompts:
-            if len(earlier) <= len(prompt) and prompt[: len(earlier)] == list(
-                earlier
-            ):
+            if earlier and prompt.startswith(earlier):
                 return True
-        tail = prompt[-_NGRAM_SUFFIX_PROBE:]
-        if len(tail) == _NGRAM_SUFFIX_PROBE:
+        tail = prompt[-_NGRAM_SUFFIX_PROBE * 4 :]
+        if len(tail) == _NGRAM_SUFFIX_PROBE * 4:
+            # A 64-byte hit is token-level evidence enough for a hint;
+            # speculation it arms self-corrects, so no alignment check.
             for emitted in self.recent_outputs:
-                text = list(emitted)
-                for i in range(len(text) - len(tail) + 1):
-                    if text[i : i + len(tail)] == tail:
-                        return True
+                if emitted.find(tail) >= 0:
+                    return True
         return False
 
     def submit(self, job):
@@ -1266,10 +1274,10 @@ class NativeBackend:
             error = APIError(503, "server is shutting down", "server_shutdown")
         trace_tokens(job, state.streamer, result, error)
         self.recent_prompts.append(
-            tuple(job.prefix_tokens) + tuple(job.prompt_tokens)
+            _pack_tokens(job.prefix_tokens) + _pack_tokens(job.prompt_tokens)
         )
         self.recent_outputs.append(
-            tuple(getattr(state.streamer, "token_ids", ()))
+            _pack_tokens(getattr(state.streamer, "token_ids", ()))
         )
         self._record(job, result=result, error=error)
         job.events.put(("error", error) if error else ("done", result))

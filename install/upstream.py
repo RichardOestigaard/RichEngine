@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,16 +65,32 @@ def _projector_named(name):
     return "mmproj" in Path(name).stem.lower()
 
 
+def _imatrix_named(name):
+    """Whether a root GGUF is a quantization's importance matrix, not a
+    model: the *.imatrix.gguf GGUF converters ship beside their quants."""
+    return Path(name).stem.lower().endswith(".imatrix")
+
+
+def _stem_words(name):
+    """A GGUF stem as the tokens a repository separates with - or .:
+    X-Q4_K_M and X.i1-Q4_K_M both end in a Q4_K_M word."""
+    return re.split(r"[-.]", Path(name).stem)
+
+
 def select_gguf(files, variant):
     """The target GGUF among a repository's root files, and whether it was
     taken by its -VARIANT ending from several, which the caller reports.
     :VARIANT names the file whose name is the model name all of them share,
     then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
-    only file whose name ends in -VARIANT. A repository of one GGUF names no
-    variant apart from its model, so its one match needs no report. Without
-    :VARIANT, the preferred default. Anything else is an error listing the
-    candidates."""
-    candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
+    only file whose name ends in -VARIANT or .VARIANT. A repository of one
+    GGUF names no variant apart from its model, so its one match needs no
+    report. Without :VARIANT, the preferred default. Anything else is an
+    error listing the candidates."""
+    candidates = [
+        n
+        for n in _root_ggufs(files)
+        if not _projector_named(n) and not _imatrix_named(n)
+    ]
     if variant is None:
         if len(candidates) == 1:
             return candidates[0], False
@@ -90,17 +107,21 @@ def select_gguf(files, variant):
             return qad[0], False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
-        parts = [Path(name).stem.split("-") for name in candidates]
+        parts = [_stem_words(name) for name in candidates]
         shared = len(os.path.commonprefix(parts))
+        wanted = tuple(word.lower() for word in re.split(r"[-.]", variant))
         exact = [
             name
             for name, words in zip(candidates, parts, strict=True)
-            if "-".join(words[shared:]).lower() == variant.lower()
+            if tuple(word.lower() for word in words[shared:]) == wanted
         ]
         if len(exact) == 1:
             return exact[0], False
-        suffix = "-" + variant.lower()
-        ending = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
+        ending = [
+            name
+            for name, words in zip(candidates, parts, strict=True)
+            if tuple(word.lower() for word in words[-len(wanted) :]) == wanted
+        ]
         if len(ending) == 1:
             return ending[0], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
@@ -281,9 +302,19 @@ def _mlx_target(repo, language_only):
     # globally (local.quantization_support); a module with no entry keeps
     # its float weight.
     if reason := local.quantization_support(config):
+        ggufs = [
+            n
+            for n in _root_ggufs(repo.files)
+            if not _projector_named(n) and not _imatrix_named(n)
+        ]
+        hint = (
+            f"; select one with {repo.name}:VARIANT ({', '.join(ggufs)})"
+            if ggufs
+            else ""
+        )
         raise models.ModelError(
             "this model requires an MLX affine checkpoint (4-8 bit, "
-            f"group 64/128) or a supported GGUF: {reason}"
+            f"group 64/128) or a supported GGUF{hint}: {reason}"
         )
     # A family the runtime serves text-only takes no tower, whether or not
     # the repository describes one; _install resolves the family again.
@@ -575,6 +606,19 @@ def _retain_installed(selection):
     return None
 
 
+def _gc_hint(models_root):
+    """Point at `disk gc` when the Hub cache holds collectable weight;
+    never deletes on its own — the cache is shared with other tools."""
+    try:
+        from . import gc as hub_gc
+
+        hint = hub_gc.reclaimable_hint(models_root)
+        if hint:
+            print(models.dim(hint), flush=True)
+    except Exception:
+        pass
+
+
 def _install(selection, repo, installed, draft=None):
     """Assemble repo's target and its draft, and publish the assembly at the
     selection link. draft is the draft's repository as this start resolved
@@ -608,6 +652,7 @@ def _install(selection, repo, installed, draft=None):
             f"in {models.dim(selection.link)}",
             flush=True,
         )
+        _gc_hint(selection.models_root)
         return
     files |= {path: downloaded[name] for path, name in target.files.items()}
     # The record self-describes: the resolved signature and serving contract
@@ -650,6 +695,7 @@ def _install(selection, repo, installed, draft=None):
         )
         hub.retire_other_pins(pins, replaced)
         assembly.collect_garbage(models_root)
+    _gc_hint(models_root)
 
 
 def _changes(installed, family, draft):

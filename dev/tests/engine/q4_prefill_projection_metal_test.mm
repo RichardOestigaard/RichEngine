@@ -39,6 +39,22 @@ void requireFinite(const MetalBuffer &buffer, uint64_t elements,
   }
 }
 
+// Differing-element count and worst absolute delta of two bf16 buffers.
+std::pair<uint64_t, float> diffStats(const MetalBuffer &a, const MetalBuffer &b,
+                                     uint64_t elements) {
+  const auto *x = static_cast<const __bf16 *>(a.contents());
+  const auto *y = static_cast<const __bf16 *>(b.contents());
+  uint64_t diffs = 0;
+  float worst = 0.0f;
+  for (uint64_t index = 0; index < elements; ++index) {
+    if (std::memcmp(&x[index], &y[index], sizeof(__bf16))) {
+      ++diffs;
+      worst = std::max(worst, std::fabs(float(x[index]) - float(y[index])));
+    }
+  }
+  return {diffs, worst};
+}
+
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   return backend.allocateBuffer(bytes, BufferStorage::Shared, label);
 }
@@ -122,38 +138,45 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
     std::memset(output.contents(), 0xA5, outputBytes);
     return output;
   };
+  const uint32_t storageRowCount = rowTiles * kTileRows;
   auto runPlain = [&](const char *pipeline, uint32_t tileColumns,
-                      uint32_t threads, MetalBuffer output) {
+                      uint32_t threads, MetalBuffer output,
+                      uint32_t variantTileRows = kTileRows) {
     ComputeDispatch dispatch;
     dispatch.pipelineName = pipeline;
     dispatch.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                         {4, std::move(output)}, {5, sums}};
     dispatch.bytes = {{6, &params, sizeof(params)}};
-    dispatch.threadgroups = {rowTiles, shape.outputSize / tileColumns, 1};
+    dispatch.threadgroups = {storageRowCount / variantTileRows,
+                             shape.outputSize / tileColumns, 1};
     dispatch.threadsPerThreadgroup = {threads, 1, 1};
     (void)backend.submit(dispatch);
   };
   auto runResidual = [&](const char *pipeline, uint32_t tileColumns,
-                         uint32_t threads, MetalBuffer output) {
+                         uint32_t threads, MetalBuffer output,
+                         uint32_t variantTileRows = kTileRows) {
     ComputeDispatch dispatch;
     dispatch.pipelineName = pipeline;
     dispatch.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                         {4, residual}, {5, std::move(output)}, {6, sums}};
     dispatch.bytes = {{7, &params, sizeof(params)}};
-    dispatch.threadgroups = {rowTiles, shape.outputSize / tileColumns, 1};
+    dispatch.threadgroups = {storageRowCount / variantTileRows,
+                             shape.outputSize / tileColumns, 1};
     dispatch.threadsPerThreadgroup = {threads, 1, 1};
     (void)backend.submit(dispatch);
   };
   auto runUpSilu = [&](const char *pipeline, uint32_t tileColumns,
                        uint32_t threads, MetalBuffer output,
-                       MetalBuffer outputSumsSink) {
+                       MetalBuffer outputSumsSink,
+                       uint32_t variantTileRows = kTileRows) {
     ComputeDispatch dispatch;
     dispatch.pipelineName = pipeline;
     dispatch.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
                         {4, gate}, {5, std::move(output)}, {6, sums},
                         {7, std::move(outputSumsSink)}};
     dispatch.bytes = {{8, &params, sizeof(params)}};
-    dispatch.threadgroups = {rowTiles, shape.outputSize / tileColumns, 1};
+    dispatch.threadgroups = {storageRowCount / variantTileRows,
+                             shape.outputSize / tileColumns, 1};
     dispatch.threadsPerThreadgroup = {threads, 1, 1};
     (void)backend.submit(dispatch);
   };
@@ -165,10 +188,14 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
       uint32_t tileColumns;
       uint32_t threads;
     };
+    struct M64Variant : Variant { uint32_t tileRows; };
     const std::vector<Variant> variants{
         {richengine::ops::kPrefillLinearQ4N256.data(), 256, 256},
         {richengine::ops::kPrefillLinearQ4N128.data(), 128, 256},
         {richengine::ops::kPrefillLinearQ4N128Sg4.data(), 128, 128}};
+    const std::vector<M64Variant> m64{
+        {{"prefill_linear_q4_n128_m64", 128, 256}, 64},
+        {{"prefill_linear_q4_n256_m64", 256, 256}, 64}};
     MetalBuffer reference = freshOutput(variants.front().pipeline);
     runPlain(variants.front().pipeline, variants.front().tileColumns,
              variants.front().threads, reference);
@@ -184,6 +211,103 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
              " differs from the N256 prefill reference at " + label);
       std::cout << "PASS q4 prefill " << variants[index].pipeline << " "
                 << label << " exact=true\n";
+    }
+    for (const M64Variant &v : m64) {
+      if (storageRowCount % v.tileRows) continue;
+      MetalBuffer candidate = freshOutput(v.pipeline);
+      runPlain(v.pipeline, v.tileColumns, v.threads, candidate, v.tileRows);
+      requireFinite(candidate, outputElements,
+                    std::string(label) + " " + v.pipeline);
+      const size_t diff =
+          std::memcmp(reference.contents(), candidate.contents(), outputBytes);
+      std::cout << (diff ? "DIFF q4 prefill " : "PASS q4 prefill ") << v.pipeline
+                << " " << label << " exact=" << (diff ? "false" : "true") << "\n";
+    }
+    // The opt-in K-split and persistent plain variants (see the shared
+    // experiment runners below).
+    MetalBuffer partials =
+        shared(backend, 4 * outputElements * sizeof(float), "q4-ksplit-partials");
+    MetalBuffer counters = shared(
+        backend, uint64_t{rowTiles} * (shape.outputSize / 128) * sizeof(uint32_t),
+        "q4-ksplit-counters");
+    std::memset(counters.contents(), 0, counters.sizeBytes());
+    auto runKsplit = [&](const char *pipeline, uint32_t tileColumns,
+                         uint32_t threads, uint32_t splits, MetalBuffer output,
+                         uint32_t variantTileRows = kTileRows) {
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
+                          {4, std::move(output)},
+                          {5, sums},   {6, partials}, {7, counters}};
+      dispatch.bytes = {{8, &params, sizeof(params)}};
+      dispatch.threadgroups = {storageRowCount / variantTileRows,
+                               shape.outputSize / tileColumns, splits};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    auto runPersistent = [&](const char *pipeline, uint32_t threads,
+                             uint32_t groups, MetalBuffer output,
+                             uint32_t variantTileRows = kTileRows) {
+      const Q4PersistentParams persistent{shape.outputSize, shape.inputSize,
+                                          groups};
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input}, {1, weights}, {2, scales}, {3, biases},
+                          {4, std::move(output)}, {5, sums}};
+      dispatch.bytes = {{6, &persistent, sizeof(persistent)}};
+      dispatch.threadgroups = {storageRowCount / variantTileRows, groups, 1};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    const std::vector<Variant> ksplitVariants{
+        {"prefill_linear_q4_n128_ksplit", 128, 256},
+        {"prefill_linear_q4_n256_ksplit", 256, 256},
+        {"prefill_linear_q4_n128_sg4_ksplit", 128, 128}};
+    for (uint32_t splits : {2u, 4u}) {
+      for (const Variant &v : ksplitVariants) {
+        MetalBuffer candidate = freshOutput(v.pipeline);
+        runKsplit(v.pipeline, v.tileColumns, v.threads, splits, candidate);
+        requireFinite(candidate, outputElements,
+                      std::string(label) + " " + v.pipeline);
+        const auto [diffs, worst] =
+            diffStats(reference, candidate, outputElements);
+        std::cout << (diffs ? "DIFF q4 prefill " : "PASS q4 prefill ")
+                  << v.pipeline << " x" << splits << " " << label
+                  << " exact=" << (diffs ? "false" : "true") << " diffs=" << diffs
+                  << " max_abs=" << worst << "\n";
+      }
+      if (storageRowCount % 64 == 0) {
+        for (const M64Variant &v : m64) {
+          const std::string pipeline = std::string(v.pipeline) + "_ksplit";
+          MetalBuffer candidate = freshOutput(pipeline.c_str());
+          runKsplit(pipeline.c_str(), v.tileColumns, v.threads, splits,
+                    candidate, v.tileRows);
+          requireFinite(candidate, outputElements, label + " " + pipeline);
+          const auto [diffs, worst] =
+              diffStats(reference, candidate, outputElements);
+          std::cout << (diffs ? "DIFF q4 prefill " : "PASS q4 prefill ")
+                    << pipeline << " x" << splits << " " << label
+                    << " exact=" << (diffs ? "false" : "true")
+                    << " diffs=" << diffs << " max_abs=" << worst << "\n";
+        }
+      }
+    }
+    for (const auto &[pipeline, tileColumns, threads] : std::vector<Variant>{
+             {richengine::ops::kPrefillLinearQ4N128Persist.data(), 128, 256},
+             {richengine::ops::kPrefillLinearQ4N256Persist.data(), 256, 256},
+             {richengine::ops::kPrefillLinearQ4N128Sg4Persist.data(), 128, 128}}) {
+      const uint32_t columns = shape.outputSize / tileColumns;
+      for (uint32_t groups : {columns, std::max(1u, columns / 7)}) {
+        MetalBuffer candidate = freshOutput(pipeline);
+        runPersistent(pipeline, threads, groups, candidate);
+        requireFinite(candidate, outputElements,
+                      std::string(label) + " " + pipeline);
+        if (diffStats(reference, candidate, outputElements).first)
+          fail(std::string(pipeline) + " persistent differs from the N256 "
+               "prefill reference at " + label);
+        std::cout << "PASS q4 prefill " << pipeline << " g" << groups << " "
+                  << label << " exact=true\n";
+      }
     }
   }
 
@@ -214,10 +338,93 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
       std::cout << "PASS q4 prefill " << variants[index].pipeline << " "
                 << label << " exact=true\n";
     }
+    struct M64Variant : Variant { uint32_t tileRows; };
+    const std::vector<M64Variant> m64res{
+        {{"prefill_linear_q4_n128_residual_m64", 128, 256}, 64},
+        {{"prefill_linear_q4_n256_residual_m64", 256, 256}, 64}};
+    MetalBuffer resRef = freshOutput("prefill_linear_q4_n256_residual");
+    runResidual("prefill_linear_q4_n256_residual", 256, 256, resRef);
+    for (const M64Variant &v : m64res) {
+      if (storageRowCount % v.tileRows) continue;
+      MetalBuffer candidate = freshOutput(v.pipeline);
+      runResidual(v.pipeline, v.tileColumns, v.threads, candidate, v.tileRows);
+      requireFinite(candidate, outputElements,
+                    std::string(label) + " " + v.pipeline);
+      const size_t diff =
+          std::memcmp(resRef.contents(), candidate.contents(), outputBytes);
+      std::cout << (diff ? "DIFF q4 prefill " : "PASS q4 prefill ") << v.pipeline
+                << " " << label << " exact=" << (diff ? "false" : "true") << "\n";
+    }
+    // The opt-in K-split and persistent residual variants.
+    MetalBuffer partials = shared(
+        backend, 4 * outputElements * sizeof(float), "q4-res-ksplit-partials");
+    MetalBuffer counters = shared(
+        backend, uint64_t{rowTiles} * (shape.outputSize / 128) * sizeof(uint32_t),
+        "q4-res-ksplit-counters");
+    std::memset(counters.contents(), 0, counters.sizeBytes());
+    auto runKsplit = [&](const char *pipeline, uint32_t tileColumns,
+                         uint32_t threads, uint32_t splits, MetalBuffer output,
+                         uint32_t variantTileRows = kTileRows) {
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input},  {1, weights},  {2, scales},
+                          {3, biases}, {4, residual}, {5, std::move(output)},
+                          {6, sums},   {7, partials}, {8, counters}};
+      dispatch.bytes = {{9, &params, sizeof(params)}};
+      dispatch.threadgroups = {storageRowCount / variantTileRows,
+                               shape.outputSize / tileColumns, splits};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    auto runPersistent = [&](const char *pipeline, uint32_t threads,
+                             uint32_t groups, MetalBuffer output) {
+      const Q4PersistentParams persistent{shape.outputSize, shape.inputSize,
+                                          groups};
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input},  {1, weights}, {2, scales},
+                          {3, biases}, {4, residual}, {5, std::move(output)},
+                          {6, sums}};
+      dispatch.bytes = {{7, &persistent, sizeof(persistent)}};
+      dispatch.threadgroups = {rowTiles, groups, 1};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    for (uint32_t splits : {2u, 4u}) {
+      for (const Variant &v : std::vector<Variant>{
+               {"prefill_linear_q4_n128_residual_ksplit", 128, 256},
+               {"prefill_linear_q4_n256_residual_ksplit", 256, 256},
+               {"prefill_linear_q4_n128_residual_sg4_ksplit", 128, 128}}) {
+        MetalBuffer candidate = freshOutput(v.pipeline);
+        runKsplit(v.pipeline, v.tileColumns, v.threads, splits, candidate);
+        requireFinite(candidate, outputElements,
+                      std::string(label) + " " + v.pipeline);
+        const auto [diffs, worst] =
+            diffStats(resRef, candidate, outputElements);
+        std::cout << (diffs ? "DIFF q4 prefill " : "PASS q4 prefill ")
+                  << v.pipeline << " x" << splits << " " << label
+                  << " exact=" << (diffs ? "false" : "true") << " diffs=" << diffs
+                  << " max_abs=" << worst << "\n";
+      }
+    }
+    for (const auto &[pipeline, tileColumns, threads] : std::vector<Variant>{
+             {richengine::ops::kPrefillLinearQ4N128ResidualPersist.data(), 128, 256},
+             {richengine::ops::kPrefillLinearQ4N256ResidualPersist.data(), 256, 256},
+             {richengine::ops::kPrefillLinearQ4N128ResidualSg4Persist.data(), 128, 128}}) {
+      const uint32_t columns = shape.outputSize / tileColumns;
+      for (uint32_t groups : {columns, std::max(1u, columns / 7)}) {
+        MetalBuffer candidate = freshOutput(pipeline);
+        runPersistent(pipeline, threads, groups, candidate);
+        requireFinite(candidate, outputElements,
+                      std::string(label) + " " + pipeline);
+        if (diffStats(resRef, candidate, outputElements).first)
+          fail(std::string(pipeline) + " persistent differs from the N256 "
+               "residual reference at " + label);
+        std::cout << "PASS q4 prefill " << pipeline << " g" << groups << " "
+                  << label << " exact=true\n";
+      }
+    }
   }
-
-  // Fused up projection: activations and the fused output sums must both
-  // match across the N256/8 and N128/4 kernels.
   {
     MetalBuffer reference = freshOutput(richengine::ops::kPrefillLinearQ4N256UpSiluSums.data());
     MetalBuffer candidate =
@@ -243,6 +450,111 @@ void runShape(MetalBackend &backend, const ProjectionShape &shape,
            "the N256 reference at " + label);
     std::cout << "PASS q4 prefill prefill_linear_q4_n128_up_silu_sums_sg4 "
               << label << " exact=true\n";
+    if (storageRowCount % 64 == 0) {
+      MetalBuffer m64 = freshOutput("prefill_linear_q4_n256_up_silu_sums_m64");
+      MetalBuffer m64Sums = shared(
+          backend, outputSumElements * sizeof(float), "up-sums-m64");
+      std::memset(m64Sums.contents(), 0, m64Sums.sizeBytes());
+      runUpSilu("prefill_linear_q4_n256_up_silu_sums_m64", 256, 256, m64,
+                m64Sums, 64);
+      requireFinite(m64, outputElements, label + " up/silu m64");
+      const bool outDiff =
+          std::memcmp(reference.contents(), m64.contents(), outputBytes);
+      const bool sumDiff = std::memcmp(referenceSums.contents(),
+                                       m64Sums.contents(), m64Sums.sizeBytes());
+      std::cout << (outDiff || sumDiff ? "DIFF" : "PASS")
+                << " q4 prefill prefill_linear_q4_n256_up_silu_sums_m64 " << label
+                << " exact=" << (!outDiff && !sumDiff ? "true" : "false")
+                << " sums_exact=" << (!sumDiff ? "true" : "false") << "\n";
+    }
+    // The opt-in K-split and persistent up/silu variants; both also write
+    // the output's Q4 input sums, compared the same way.
+    MetalBuffer partials = shared(
+        backend, 4 * outputElements * sizeof(float), "q4-up-ksplit-partials");
+    MetalBuffer counters = shared(
+        backend, uint64_t{rowTiles} * (shape.outputSize / 128) * sizeof(uint32_t),
+        "q4-up-ksplit-counters");
+    std::memset(counters.contents(), 0, counters.sizeBytes());
+    const auto runUpKsplit = [&](const char *pipeline, uint32_t tileColumns,
+                                 uint32_t threads, uint32_t splits,
+                                 MetalBuffer output,
+                                 MetalBuffer outputSumsSink) {
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input},   {1, weights},         {2, scales},
+                          {3, biases},  {4, gate},            {5, std::move(output)},
+                          {6, sums},    {7, std::move(outputSumsSink)},
+                          {8, partials}, {9, counters}};
+      dispatch.bytes = {{10, &params, sizeof(params)}};
+      dispatch.threadgroups = {rowTiles, shape.outputSize / tileColumns, splits};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    const auto runUpPersistent = [&](const char *pipeline, uint32_t threads,
+                                     uint32_t groups, MetalBuffer output,
+                                     MetalBuffer outputSumsSink) {
+      const Q4PersistentParams persistent{shape.outputSize, shape.inputSize,
+                                          groups};
+      ComputeDispatch dispatch;
+      dispatch.pipelineName = pipeline;
+      dispatch.buffers = {{0, input},  {1, weights}, {2, scales},
+                          {3, biases}, {4, gate},    {5, std::move(output)},
+                          {6, sums},   {7, std::move(outputSumsSink)}};
+      dispatch.bytes = {{8, &persistent, sizeof(persistent)}};
+      dispatch.threadgroups = {rowTiles, groups, 1};
+      dispatch.threadsPerThreadgroup = {threads, 1, 1};
+      (void)backend.submit(dispatch);
+    };
+    const auto freshSums = [&](const char *name) {
+      MetalBuffer sink =
+          shared(backend, outputSumElements * sizeof(float), name);
+      std::memset(sink.contents(), 0, sink.sizeBytes());
+      return sink;
+    };
+    struct UpVariant {
+      const char *pipeline;
+      uint32_t tileColumns, threads;
+    };
+    for (uint32_t splits : {2u, 4u}) {
+      for (const auto &[pipeline, tileColumns, threads] : std::vector<UpVariant>{
+               {"prefill_linear_q4_n256_up_silu_sums_ksplit", 256, 256},
+               {"prefill_linear_q4_n128_up_silu_sums_sg4_ksplit", 128, 128}}) {
+        MetalBuffer upCandidate = freshOutput(pipeline);
+        MetalBuffer upSums = freshSums("up-ksplit-sums");
+        runUpKsplit(pipeline, tileColumns, threads, splits, upCandidate, upSums);
+        requireFinite(upCandidate, outputElements, label + " up/silu ksplit");
+        const auto [diffs, worst] =
+            diffStats(reference, upCandidate, outputElements);
+        const bool sumDiff =
+            std::memcmp(referenceSums.contents(), upSums.contents(),
+                        upSums.sizeBytes());
+        std::cout << (diffs || sumDiff ? "DIFF" : "PASS") << " q4 prefill "
+                  << pipeline << " x" << splits << " " << label
+                  << " exact=" << (diffs ? "false" : "true") << " diffs=" << diffs
+                  << " max_abs=" << worst
+                  << " sums_exact=" << (sumDiff ? "false" : "true") << "\n";
+      }
+    }
+    for (const auto &[pipeline, tileColumns, threads] : std::vector<UpVariant>{
+             {richengine::ops::kPrefillLinearQ4N256UpSiluSumsPersist.data(), 256, 256},
+             {richengine::ops::kPrefillLinearQ4N128UpSiluSumsSg4Persist.data(), 128, 128}}) {
+      const uint32_t columns = shape.outputSize / tileColumns;
+      for (uint32_t groups : {columns, std::max(1u, columns / 7)}) {
+        MetalBuffer upCandidate = freshOutput(pipeline);
+        MetalBuffer upSums = freshSums("up-persist-sums");
+        runUpPersistent(pipeline, threads, groups, upCandidate, upSums);
+        requireFinite(upCandidate, outputElements, label + " up/silu persist");
+        const bool outDiff =
+            std::memcmp(reference.contents(), upCandidate.contents(), outputBytes);
+        const bool sumDiff = std::memcmp(referenceSums.contents(),
+                                         upSums.contents(), upSums.sizeBytes());
+        if (outDiff || sumDiff)
+          fail(std::string(pipeline) + " persistent differs from the N256 "
+               "up/silu reference at " + label);
+        std::cout << "PASS q4 prefill " << pipeline << " g" << groups << " "
+                  << label << " exact=true\n";
+      }
+    }
   }
 }
 

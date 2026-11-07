@@ -235,7 +235,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, uint3
 
     const ane_ffn::Timings timings = model.time();
     const std::optional<uint32_t> chosen =
-        ane_ffn::choose(ane_ffn::fit(timings.low, timings.high), timings.gpuAlone, model.units, maxAneUnits);
+        ane_ffn::choose(ane_ffn::fit(timings.low, timings.mid, timings.high), timings.gpuAlone, model.units, maxAneUnits);
     if (!chosen)
       return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer +
                     " by enough (calibrated in " + seconds() + ")");

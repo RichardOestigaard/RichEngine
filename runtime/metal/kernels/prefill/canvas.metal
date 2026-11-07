@@ -35,7 +35,7 @@
     threadgroup float row_max[M];                                           \
     threadgroup float row_sum[M];                                           \
     threadgroup float previous_scale[M];                                    \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     constexpr uint D = HeadDim;                                             \
     uint kv_head = group.x;                                                 \
     uint split = group.z;                                                   \
@@ -102,7 +102,7 @@ PREFILL_ATTENTION_SPLIT_CANVAS(prefill_attention_bf16_split_canvas_h256, 8, 2, b
     threadgroup float row_max[MP];                                          \
     threadgroup float row_sum[MP];                                          \
     threadgroup float previous_scale[MP];                                   \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     constexpr uint D = HeadDim;                                             \
     uint kv_head = group.x;                                                 \
     uint split = group.z;                                                   \

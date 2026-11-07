@@ -1249,6 +1249,8 @@ def disk(args):
         return _disk_wipe(args)
     if args.disk_command == "dedupe":
         return dedupe(args)
+    if args.disk_command == "gc":
+        return _disk_gc(args)
     rows = _store_rows(calc=args.calc)
     if args.calc:
         rows.sort(key=lambda row: -(row["bytes"] or 0))
@@ -1578,6 +1580,29 @@ def _disk_wipe(args):
             f"Wiped {row['title']}: {_size(row['bytes'])} across "
             f"{len(wiped)} director{'y' if len(wiped) == 1 else 'ies'}."
         )
+    return 0
+
+
+def _disk_gc(args):
+    from . import gc as hub_gc
+
+    result = hub_gc.plan()
+    if result is None:
+        print("no Hugging Face cache to collect.")
+        return 0
+    shared_bytes = sum(result["shared_blobs"].values())
+    print(
+        f"Hub cache: {result['repos']} repos, {result['live_revisions']} revisions "
+        f"referenced by installed models; "
+        f"{len(result['dead_repos'])} repos and {len(result['dead_revisions'])} "
+        f"revisions unreferenced, {len(result['shared_blobs'])} shared blobs "
+        f"({_size(shared_bytes)}), {len(result['incomplete'])} partial downloads."
+    )
+    if not args.yes:
+        print("Plan only — rerun with --yes to collect.")
+        return 0
+    freed = hub_gc.execute(result)
+    print(f"Collected {_size(freed)} of Hub cache.")
     return 0
 
 
@@ -1971,6 +1996,18 @@ def _build_parser():
         "--yes",
         action="store_true",
         help="confirm the wipe; required, there is no undo",
+    )
+    gc_command = disk_commands.add_parser(
+        "gc",
+        help="collect Hugging Face cache entries no installed model references",
+        description="Walk the models root for Hub-cache links, then drop cached repos, revisions, shared blobs and partial downloads nothing references. Without --yes it only reports.",
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    gc_command.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm the collection; without it only the plan prints",
     )
     for name in clients.INSTALL_URLS:
         commands.add_parser(

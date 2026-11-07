@@ -109,7 +109,7 @@ inline void gguf_decode_mxfp4_tile(device bfloat *input, device uchar *w0, devic
   };
   const uint g0 = split_index * per, g1 = (split_index + 1) * per;
   stage32(g0, 0);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint g = g0; g < g1; ++g) {
     if (g + 1 < g1) stage32(g + 1, ((g + 1 - g0) & 1));
     Scales scales(meta + (ulong(plane_tile) * groups + g) * QUANT_TILE_ROWS + plane_row);
@@ -127,7 +127,7 @@ inline void gguf_decode_mxfp4_tile(device bfloat *input, device uchar *w0, devic
         acc[i] = fma(partial[i], as_type<float>(uint(sc[buf * Rows + row]) << 23), acc[i]);
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   gguf_store_sums<Rows>(acc, splits, split_index, partials, counter,
                         out_stride, column0, simd_group * 32 + simd_lane, arrival,
@@ -229,7 +229,7 @@ inline void gguf_decode_packed_tile(device bfloat *input, device uchar *w0, devi
   };
   const uint g0 = split_index * per, g1 = (split_index + 1) * per;
   stage32(g0, 0);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint g = g0; g < g1; ++g) {
     if (g + 1 < g1) stage32(g + 1, ((g + 1 - g0) & 1));
     const ulong b0 = (ulong(plane_tile) * groups + g) * QUANT_TILE_ROWS + plane_row;
@@ -250,7 +250,7 @@ inline void gguf_decode_packed_tile(device bfloat *input, device uchar *w0, devi
       else
         acc[i] = fma(partial[i], c.x, acc[i]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   gguf_store_sums<Rows>(acc, splits, split_index, partials, counter,
                         out_stride, column0, simd_group * 32 + simd_lane, arrival,

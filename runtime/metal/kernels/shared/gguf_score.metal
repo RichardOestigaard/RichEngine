@@ -78,10 +78,12 @@ kernel void gguf_decode_score(device bfloat *input [[buffer(0)]],
     const uint unit = step / F::MetaGroups;
     typename F::Meta hdr = F::loadMeta(tmeta + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
     dequant32<F>(packed, hdr, step % F::MetaGroups, tl, my + lane * KS);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
     auto aslice = a.template slice<KS, kScoreRows>(step * KS, 0);
     operation.run(aslice, b0, acc);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
   }
   // Row r is lane r; column c of the accumulator is the gather's column
   // base + c. Dead rows and tail columns store nothing.

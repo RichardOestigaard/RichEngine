@@ -92,6 +92,7 @@ inline void norm_rms_row(device const bfloat *input, device const W *weight,
   }
 }
 #define NORM_RMS(Name, W, Eps) \
+  [[max_total_threads_per_threadgroup(kNormThreads)]] \
   kernel void Name(device const bfloat *input [[buffer(0)]], \
       device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
       constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
@@ -142,6 +143,7 @@ inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *we
     output[row * vectors + column] = bfloat4((float4(stage[column]) * inverse) * float4(weight[column]));
 }
 #define NORM_RMS_STAGED(Name, WV, Eps) \
+  [[max_total_threads_per_threadgroup(RICHENGINE_STAGED_NORM_THREADS)]] \
   kernel void Name(device const bfloat4 *input [[buffer(0)]], \
       device const WV *weight [[buffer(1)]], device bfloat4 *output [[buffer(2)]], \
       constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \

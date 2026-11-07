@@ -43,7 +43,8 @@ HTTP_SMOKE_ARGS ?=
 	install-development _install-development release-check test \
 	test-agent-real test-http-real test-performance-real test-release-real \
 	test-models test-python test-real verify-models \
-	test-engine test-engine-cpu test-engine-metal test-sanitizers
+	test-dfa-parity test-engine test-engine-cpu test-engine-metal \
+	test-sanitizers
 
 # Decided by the stamp's content, as the environment is: a rebuilt
 # environment has no stamp, and under -j make may read the stamp's time
@@ -69,19 +70,28 @@ check-native-cpu: platform-check $(TARGET) test-engine-cpu
 check-native-metal: platform-check $(TARGET) test-engine-metal
 
 # Discovering dev/tests/engine keeps this gate complete as new current runtime
-# Python tests are added.
+# Python tests are added. The named modules cover the server-side pieces the
+# engine suite does not: the fast DFA constraint suites, webfetch/websearch
+# SSRF bounds, and the HTTP server.
 test-python: install-development
 	$(PYTHON) -m unittest discover -s dev/tests/engine -p '$(ENGINE_PYTHON_TEST_PATTERN)'
-	$(PYTHON) -m unittest dev/tests/test_server.py
+	$(PYTHON) -m unittest dev/tests/test_server.py dev/tests/test_dfa.py \
+		dev/tests/test_webfetch.py dev/tests/test_websearch.py
 
-# Installer, model manifest, upstream resolution and GGUF metadata tests;
-# none downloads or loads real weights.
+# The DFA compiler's llguidance parity walks are thorough and slow (~2
+# minutes): they gate with check-python-engine, not inside test-python.
+test-dfa-parity: install-development
+	$(PYTHON) -m unittest dev/tests/test_dfa_parity.py
+
+# Installer, local-scan, autotune, model manifest, upstream resolution and
+# GGUF metadata tests; none downloads or loads real weights.
 test-models: install-development
 	$(PYTHON) -m unittest dev/tests/test_models.py dev/tests/test_upstream.py \
 		dev/tests/test_gguf_metadata.py dev/tests/test_installer_restarts.py \
-		dev/tests/test_family_parity.py
+		dev/tests/test_family_parity.py dev/tests/test_pack.py \
+		dev/tests/test_local.py dev/tests/test_tuning.py
 
-check-python-engine: install-development test-python test-models
+check-python-engine: install-development test-python test-models test-dfa-parity
 	$(PYTHON) -m compileall -q server install/*.py \
 		dev/tools dev/tests dev/benchmarks
 	$(PYTHON) -m ruff check --config ruff.toml server \

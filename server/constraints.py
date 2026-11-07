@@ -309,12 +309,16 @@ def _vocab_token_bytes(tokenizer, vocabulary):
 # CompiledDfa.masks_for_state — a pure-Python walk of the whole vocabulary
 # that costs far more per miss than the matcher's mask, so a miss is
 # expensive and a hit is near-free; tool-call DFAs revisit the same states
-# every step, which keeps the hit rate high enough to serve. On by default;
-# set to "0" to restore the always-delegate path. The constraint's
-# mask_stats() records what hits save and what misses cost.
+# every step, which keeps the hit rate high enough to serve. The cache
+# holds each state's packed bitmap row, not its token ids: packing the
+# vocabulary bitmap in Python costs more per mask request than the walk
+# it replaces. On by default; set to "0" to restore the always-delegate
+# path. The constraint's mask_stats() records what hits save and what
+# misses cost.
 _MASK_ROW_CACHE_SIZE = 512
-# (id(dfa), state) -> (dfa, allowed ids). The stored reference pins the
-# compiled DFA, so an id freed and reused can never alias a stale row.
+# (id(dfa), words, state) -> (dfa, packed row or None). The stored
+# reference pins the compiled DFA, so an id freed and reused can never
+# alias a stale row.
 _mask_row_cache = OrderedDict()
 _mask_row_cache_lock = threading.Lock()
 
@@ -518,8 +522,8 @@ class DfaConstraint:
             raise ConstraintError("too many simulation tokens")
         self._consume_committed()
         rows = len(simulation_tokens) + 1
-        words = self._words
-        mask = array.array("I", [0] * (rows * words))
+        row_bytes = self._words * 4
+        mask = bytearray(rows * row_bytes)
         states = [self._state]
         cursor = self._state
         for token_id in simulation_tokens:
@@ -530,25 +534,27 @@ class DfaConstraint:
                 break
             states.append(cursor)
         for row in range(len(states)):
-            allowed = self._mask_row(states[row])
-            if not allowed:
+            packed = self._mask_row(states[row])
+            if packed is None:
                 # A state the DFA has no row for — a stopped request, or an
                 # empty row — is the delegate's question to answer anyway.
                 self._mask_timing["delegate_fallbacks"] += 1
                 return self._inner.masks(simulation_tokens)
-            base = row * words
-            for token_id in allowed:
-                mask[base + (token_id >> 5)] |= 1 << (token_id & 31)
+            base = row * row_bytes
+            mask[base : base + row_bytes] = packed
         if len(states) < rows:
-            mask[len(states) * words :] = mask[(len(states) - 1) * words : len(states) * words]
-        return mask.tobytes()
+            mask[len(states) * row_bytes :] = mask[
+                (len(states) - 1) * row_bytes : len(states) * row_bytes
+            ]
+        return bytes(mask)
 
     def _mask_row(self, state):
-        """One state's sorted allowed-token ids, LRU-cached per compiled
-        DFA; None for the stopped state the table has no row for."""
+        """One state's packed mask row — `self._words` little-endian uint32
+        words as bytes — LRU-cached per compiled DFA; None for the stopped
+        state or an empty row the table has no answer for."""
         if state >= self.dfa.n_states:
             return None
-        key = (id(self.dfa), state)
+        key = (id(self.dfa), self._words, state)
         with _mask_row_cache_lock:
             entry = _mask_row_cache.get(key)
             if entry is not None:
@@ -557,20 +563,27 @@ class DfaConstraint:
             self._mask_timing["cached_rows"] += 1
             return entry[1]
         started = time.perf_counter()
-        allowed = tuple(
-            self.dfa.masks_for_state(
-                state, self.vocab_tokens, self._eos, self.special_tokens
-            )
+        allowed = self.dfa.masks_for_state(
+            state, self.vocab_tokens, self._eos, self.special_tokens
         )
+        packed = self._pack_row(allowed) if allowed else None
         timing = self._mask_timing
         timing["computed_rows"] += 1
         timing["compute_ms_total"] += (time.perf_counter() - started) * 1000.0
         with _mask_row_cache_lock:
-            _mask_row_cache[key] = (self.dfa, allowed)
+            _mask_row_cache[key] = (self.dfa, packed)
             _mask_row_cache.move_to_end(key)
             while len(_mask_row_cache) > _MASK_ROW_CACHE_SIZE:
                 _mask_row_cache.popitem(last=False)
-        return allowed
+        return packed
+
+    def _pack_row(self, allowed):
+        """`allowed` token ids as the row's little-endian uint32 bitmap:
+        token t's bit sits at byte t >> 3, bit t & 7."""
+        packed = bytearray(self._words * 4)
+        for token_id in allowed:
+            packed[token_id >> 3] |= 1 << (token_id & 7)
+        return bytes(packed)
 
     def mask_stats(self):
         """A copy of the RICHENGINE_DFA_MASK_CACHE counters."""

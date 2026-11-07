@@ -70,7 +70,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
-             codebooks.successor},
+             codebooks.successor, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   graph.add(std::string(kDraftSelectDflash),
@@ -108,7 +108,7 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
-             codebooks.successor},
+             codebooks.successor, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   // The tree comb always emits kDraftQueryRows-deep nodes; on a draft
@@ -118,7 +118,7 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
              buffers.proposalProbabilities, buffers.treeTokens,
-             buffers.treeNodes, buffers.treeCounts},
+             buffers.treeNodes, buffers.treeCounts, buffers.draftInput},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 
@@ -180,7 +180,7 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.candidates, buffers.proposalProbabilities,
              buffers.proposedTokens, buffers.treeTokens, buffers.treeNodes,
-             buffers.treeCounts},
+             buffers.treeCounts, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1}, {32, 1, 1});
 }
 
@@ -284,7 +284,7 @@ void DraftSelector::addPool(metal::CommandGraph &graph,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,
-             codebooks.predecessor, codebooks.successor},
+             codebooks.predecessor, codebooks.successor, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   // The DSpark walk carries no Markov logic of its own — it only reads the
@@ -324,7 +324,7 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,
-             codebooks.predecessor, codebooks.successor},
+             codebooks.predecessor, codebooks.successor, buffers.draftInput},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
   graph.add(std::string(kDraftSelectDsparkTree),

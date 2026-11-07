@@ -87,7 +87,8 @@ template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized,
 inline void richengine_attention_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start, uint fused_row_offset,
     uint visible_tokens, uint committed_tokens, uint active_rows,
@@ -242,7 +243,8 @@ inline void richengine_paged_attention_tile(
     device const uint *row_masks, float qk_scale,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     uint thread_index, uint window_tokens = 0, uint pass_begin = 0,
     uint pass_end = MPasses) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
@@ -290,7 +292,7 @@ inline void richengine_paged_attention_tile(
       row_max[thread_index] = -INFINITY;
       row_sum[thread_index] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto qt = tensor(tile_queries + row_offset * D, dextents<int, 2>{D, MP},
                      array<int, 2>{1, D});
@@ -339,7 +341,7 @@ inline void richengine_paged_attention_tile(
         page_scores.store(st.template slice<N, MP>(0, 0));
         if (thread_index == 0)
           atomic_store_explicit(rescale, 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         richengine_attention_page_softmax<QueryHeadsPerKVHead,
             RowsPerTile / MPasses, Quantized, HeadDim,
             (MP > 64 ? 16 : 8)>(
@@ -348,7 +350,7 @@ inline void richengine_paged_attention_tile(
             reinterpret_cast<device const float4 *>(value_scales), token_start,
             row_offset, visible_tokens, committed_tokens, active_rows,
             row_masks, thread_index, qk_scale, window_tokens);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
           for (ushort index = 0; index < running.get_capacity(); ++index) {
@@ -359,7 +361,7 @@ inline void richengine_paged_attention_tile(
           }
         }
         pv.run(p0, vs, running);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       };
 
       if constexpr (Packed) {
@@ -393,7 +395,7 @@ inline void richengine_paged_attention_tile(
       statistics[(slot * M + row_offset + thread_index) * 2 + 1] =
           row_sum[thread_index];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 
@@ -434,13 +436,13 @@ inline bfloat richengine_attention_reduce_value(
                   statistics[((head_slot + split) * M + fused_row) * 2]);
   const float group_maximum = simd_max(maximum);
   if (lane == 0) group_values[sg] = group_maximum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float row_maximum =
       simd_max(lane < Groups ? group_values[lane] : -INFINITY);
   for (uint split = thread_index; split < written; split += D)
     weights[split] = fast::exp(
         statistics[((head_slot + split) * M + fused_row) * 2] - row_maximum);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float numerator = 0.0f, denominator = 0.0f;
   // Keep both accumulations in the original split order. A parallel sum of
   // the denominator changes speculative acceptance on real model prompts.

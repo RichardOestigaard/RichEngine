@@ -94,6 +94,11 @@ ModelDescriptor qwen38Descriptor(std::string name) {
   // loses tail tokens: measured ~10 tok/s slower at B1 on M5 Pro.
   // RICHENGINE_ADAPTIVE_PROPOSALS=1 restores it.
   descriptor.tuning.adaptiveProposals = false;
+  // The in-command chained predraft removes the second submission's host
+  // gap on this target (~5 ms per decode cycle on the 20-core M5 Pro —
+  // 3.5percentgap.md). The DFlashV1/DSpark device-pack selectors it needs
+  // are already in the kernel set.
+  descriptor.tuning.chainPredraft = true;
   return descriptor;
 }
 
@@ -104,16 +109,17 @@ ModelDescriptor qwen36Descriptor(std::string name) {
 }
 
 // Ornith's own policy on the same qwen3_6moe target: measured on its
-// released DFlashV1 draft (M5 Pro, decode ABBA). A 12-proposal cap lands
-// +4-6% at B1-B4 — the flat acceptance tail past position 11 pays verify
-// rows it never returns — and baked indirect dispatch measures a few
-// points behind direct encoding on this step graph.
+// released DFlashV1 draft (M5 Pro, decode ABBA). An 8-proposal cap lands
+// +4-11% over the earlier 12-proposal cap at B1-B4 (backend-benchmark,
+// build/ab-ornith/m35-cap8) — the flat acceptance tail past position 7
+// pays verify rows it never returns — and baked indirect dispatch
+// measures a few points behind direct encoding on this step graph.
 ModelDescriptor ornith36Descriptor(std::string name) {
   const TargetLayout target = qwen36MoeTargetLayout();
   ModelDescriptor descriptor =
       makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
                           qwenVisionLayout(target.hiddenSize));
-  descriptor.tuning.proposalCap = 12;
+  descriptor.tuning.proposalCap = 8;
   descriptor.tuning.icbOff = true;
   // The in-command chained predraft: neutral-to-good here (the host gap a
   // second command would overlap is thin), a measured -2..4% on Ornith-9B

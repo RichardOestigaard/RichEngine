@@ -129,7 +129,8 @@ kernel void draft_select_plain_tree(
     device uint *tree_tokens [[buffer(6)]],
     device uint *tree_nodes [[buffer(7)]],
     device uint *tree_counts [[buffer(8)]],
-    constant SelectorBatchParams &params [[buffer(9)]],
+    device const uint *draft_input [[buffer(9)]],
+    constant SelectorBatchParams &params [[buffer(10)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
@@ -173,7 +174,7 @@ kernel void draft_select_plain_tree(
     device uint *tt = tree_tokens + batch * Nodes;
     device uint *tn = tree_nodes + batch * Nodes;
     if (position == 0) {
-      tt[0] = params.anchor[batch];
+      tt[0] = draft_input[batch * params.query_rows];
       tn[0] = RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 16);
       tree_counts[batch] = min(ulong(1) + Positions, ulong(Nodes));
     }

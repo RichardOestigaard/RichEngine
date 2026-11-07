@@ -345,10 +345,44 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  pass(weights.gate, false, scratch.groupedInput, scratch.groupedPacked,
-       scratch.expertOutput, intermediate, hidden);
-  pass(weights.up, true, scratch.groupedInput, scratch.groupedPacked,
-       scratch.expertIntermediate, intermediate, hidden);
+  // The `_gu` tile runs gate and up in one pass, storing silu(gate) * up to
+  // the intermediate — the split passes' EpUpWithGate association without the
+  // expertOutput round trip or a second grouped-input read. Staged, unpacked
+  // plans only (no register or `_p` variant); a plan whose gate or up holds
+  // an MXFP4 segment keeps the split `_n` kernels, which decode it natively.
+  // RICHENGINE_MOE_GGUF_FUSED_OFF restores the split passes for A/Bs.
+  const auto mxfp4 = [](const QuantizedSegment &a, const QuantizedSegment &b) {
+    return a.formatId == GGUF_FMT_MXFP4 || b.formatId == GGUF_FMT_MXFP4;
+  };
+  const bool nativeSegments =
+      plan.configuration().mxfp4Native &&
+      (mxfp4(weights.gate.routed, weights.gate.shared) ||
+       mxfp4(weights.up.routed, weights.up.shared));
+  if (!table16 && !packed && !nativeSegments && tuning().moeGgufFused) {
+    const QuantizedSegment &gateShared =
+        shape.sharedExpert ? weights.gate.shared : weights.gate.routed;
+    const QuantizedSegment &upShared =
+        shape.sharedExpert ? weights.up.shared : weights.up.routed;
+    graph.add(std::string(kMoeExpertGgufM) + std::to_string(plan.tileRows()) + "_gu",
+              {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+               weights.gate.routed.plane0, weights.gate.routed.plane1Slot(),
+               weights.gate.routed.meta, gateShared.plane0,
+               gateShared.plane1Slot(), gateShared.meta,
+               weights.up.routed.plane0, weights.up.routed.plane1Slot(),
+               weights.up.routed.meta, upShared.plane0,
+               upShared.plane1Slot(), upShared.meta,
+               scratch.expertIntermediate},
+              MoeGgufFusedParams{hidden, intermediate, shape.experts,
+                                 weights.gate.routed.formatId, gateShared.formatId,
+                                 weights.up.routed.formatId, upShared.formatId, 0},
+              {intermediate / GGUF_TILE_COLUMNS, tiles, 1},
+              {GGUF_STAGED_THREADS, 1, 1});
+  } else {
+    pass(weights.gate, false, scratch.groupedInput, scratch.groupedPacked,
+         scratch.expertOutput, intermediate, hidden);
+    pass(weights.up, true, scratch.groupedInput, scratch.groupedPacked,
+         scratch.expertIntermediate, intermediate, hidden);
+  }
   if (table16)
     graph.add(std::string(kMoePrepareTable16),
               {scratch.expertIntermediate, scratch.tileCount,

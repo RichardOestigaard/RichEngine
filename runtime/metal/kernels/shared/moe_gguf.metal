@@ -73,6 +73,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   moe_live_rows<Rows>(tile.rows, run);
 }
 template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                             device const uint *tile_count [[buffer(2)]], device uchar *w0 [[buffer(3)]],
                             device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]], device uchar *sw0 [[buffer(6)]],
@@ -166,6 +167,7 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
 }
 
 template <ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_expert_gguf_fused(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                                   device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
                                   device uchar *gw1 [[buffer(4)]], device uchar *gmeta [[buffer(5)]],
@@ -252,6 +254,7 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
 }
 
 template <ushort Rows, GgufEpilogue Ep>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_expert_gguf_packed(device bfloat *input [[buffer(0)]], device half *packed [[buffer(1)]],
                                    device uchar *exponents [[buffer(2)]],
                                    device const MoeTileDescriptor *tiles [[buffer(3)]],

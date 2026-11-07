@@ -121,6 +121,148 @@ id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) 
         return result;
     }
 
+namespace {
+
+uint32_t cooperativeTensorThreads(std::string_view entry) noexcept {
+    if (entry.starts_with("decode_linear_q4_n") ||
+        entry.starts_with("prefill_linear_q4_n") ||
+        entry.starts_with("prefill_linear_i8_n") ||
+        entry.starts_with("prefill_moe_expert_q4_n") ||
+        entry.starts_with("moe_expert_gate_up_q4_") ||
+        entry.starts_with("moe_expert_down_q4_") ||
+        entry.starts_with("moe_shared_gate_up_q4_") ||
+        entry.starts_with("moe_shared_down_q4_")) {
+        if (entry.find("_sg4") != std::string_view::npos) return 128;
+        if (entry.find("_sg16") != std::string_view::npos) return 512;
+        return 256;
+    }
+    if (entry.starts_with("moe_route_scores_q8_")) return 256;
+    if (entry.starts_with("gguf_decode_") &&
+        !entry.starts_with("gguf_decode_r_") &&
+        !entry.starts_with("gguf_decode_sg_")) {
+        if (entry.starts_with("gguf_decode_score_")) return 256;
+        if (entry.ends_with("_gate_up")) return 32;
+        return 64;
+    }
+    if (entry.starts_with("gguf_prefill_") ||
+        entry.starts_with("gguf_float_na_")) {
+        return 128;
+    }
+    if (entry.starts_with("moe_expert_gguf_") &&
+        !entry.starts_with("moe_expert_gguf_sg_")) {
+        return 64;
+    }
+    if ((entry.starts_with("verify_attention_") ||
+         entry.starts_with("prefill_attention_") ||
+         entry.starts_with("draft_attention_")) &&
+        entry.find("_split") != std::string_view::npos) {
+        return 256;
+    }
+    return 0;
+}
+
+bool usesSimdMultipleThreads(std::string_view entry) noexcept {
+    if (cooperativeTensorThreads(entry) != 0) return true;
+    return entry.starts_with("decode_linear_q4_") ||
+           entry.starts_with("prefill_linear_q4_") ||
+           entry.starts_with("decode_linear_gguf_") ||
+           entry.starts_with("gguf_") ||
+           entry.starts_with("moe_") ||
+           entry.starts_with("norm_rms") ||
+           entry.starts_with("verify_gdn_") ||
+           entry.starts_with("verify_tree_gdn_") ||
+           entry.starts_with("prefill_gdn_") ||
+           entry.starts_with("verify_attention_") ||
+           entry.starts_with("prefill_attention_") ||
+           entry.starts_with("draft_attention_") ||
+           entry.starts_with("draft_conv") ||
+           entry.starts_with("rope_") ||
+           entry == "gpu_encode";
+}
+
+// Bitmask of buffer indices that `entry` only reads (weights, scales, biases,
+// inputs, page tables), so read/read overlaps between consecutive dispatches
+// skip unnecessary dispatch-stage barriers.
+uint32_t readOnlyBufferMask(std::string_view entry) noexcept {
+    const size_t cut = entry.find_first_of("[|");
+    if (cut != std::string_view::npos) entry = entry.substr(0, cut);
+    if (entry.starts_with("decode_linear_q4_n")) {
+        if (entry.find("_split") != std::string_view::npos) {
+            return (entry.find("_residual") != std::string_view::npos ||
+                    entry.find("_up_silu") != std::string_view::npos)
+                       ? 0b011111u
+                       : 0b001111u;
+        }
+        if (entry.find("_gate_up") != std::string_view::npos) {
+            return 0b11101111u;
+        }
+        return (entry.find("_residual") != std::string_view::npos ||
+                entry.find("_up_silu") != std::string_view::npos)
+                   ? 0b011111u
+                   : 0b001111u;
+    }
+    if (entry.starts_with("prefill_linear_q4_n")) {
+        return (entry.find("_residual") != std::string_view::npos ||
+                entry.find("_up_silu") != std::string_view::npos)
+                   ? 0b1011111u
+                   : 0b0101111u;
+    }
+    if (entry.starts_with("gguf_decode_fused_")) {
+        return 0b00001111111111u;
+    }
+    if (entry.starts_with("gguf_decode_") &&
+        !entry.starts_with("gguf_decode_score_")) {
+        if (entry.ends_with("_gate_up")) return 0b0001111111u;
+        if (entry.ends_with("_amax")) return 0b00001111u;
+        return 0b00001111u;
+    }
+    if (entry.starts_with("gguf_prefill_")) {
+        return 0b001111u;
+    }
+    if (entry.starts_with("moe_expert_gguf_")) {
+        if (entry.find("_gu") != std::string_view::npos) {
+            return 0b0111111111111111u;
+        }
+        if (entry.ends_with("_p")) {
+            return 0b000011111111111u;
+        }
+        return 0b000111111111u;
+    }
+    if (entry.starts_with("moe_expert_gate_up_q4_")) {
+        return 0b01111111u;
+    }
+    if (entry.starts_with("moe_expert_down_q4_")) {
+        return 0b011111u;
+    }
+    if (entry.starts_with("moe_shared_gate_up_q4_")) {
+        return 0b01111u;
+    }
+    if (entry.starts_with("moe_shared_down_q4_")) {
+        return 0b0111u;
+    }
+    if (entry.starts_with("norm_rms")) {
+        return 0b011u;
+    }
+    if ((entry.starts_with("verify_attention_") ||
+         entry.starts_with("prefill_attention_")) &&
+        entry.find("_split") != std::string_view::npos) {
+        return 0b1111001u;
+    }
+    return 0;
+}
+
+bool isBindingWritable(std::string_view pipelineName,
+                       const BufferBinding &binding) noexcept {
+    if (!binding.writable) return false;
+    if (binding.index < 32 &&
+        (readOnlyBufferMask(pipelineName) & (uint32_t{1} << binding.index))) {
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
         id<MTLFunction> function =
@@ -132,8 +274,27 @@ id<MTLComputePipelineState> MetalBackend::Impl::newPipeline(std::string_view nam
                 "missing Metal function: " + std::string(name));
         }
         NSError *error = nil;
-        id<MTLComputePipelineState> result =
-            [device newComputePipelineStateWithFunction:function error:&error];
+        const uint32_t coopThreads = cooperativeTensorThreads(name);
+        const bool simdMultiple = usesSimdMultipleThreads(name);
+        id<MTLComputePipelineState> result = nil;
+        if (coopThreads || simdMultiple) {
+            MTLComputePipelineDescriptor *descriptor =
+                [MTLComputePipelineDescriptor new];
+            descriptor.computeFunction = function;
+            descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            if (coopThreads) {
+                descriptor.requiredThreadsPerThreadgroup =
+                    MTLSizeMake(coopThreads, 1, 1);
+            }
+            result =
+                [device newComputePipelineStateWithDescriptor:descriptor
+                                                      options:MTLPipelineOptionNone
+                                                   reflection:nil
+                                                        error:&error];
+        } else {
+            result =
+                [device newComputePipelineStateWithFunction:function error:&error];
+        }
         if (!result) {
             throw MetalBackendError(
                 "unable to create Metal pipeline " + std::string(name) +
@@ -343,6 +504,14 @@ struct PipelineOptionSpec {
             descriptor.computeFunctionDescriptor = specialized;
             descriptor.supportIndirectCommandBuffers =
                 MTL4IndirectCommandBufferSupportStateEnabled;
+            const uint32_t coopThreads = cooperativeTensorThreads(spec.entry);
+            if (coopThreads || usesSimdMultipleThreads(spec.entry)) {
+                descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            }
+            if (coopThreads) {
+                descriptor.requiredThreadsPerThreadgroup =
+                    MTLSizeMake(coopThreads, 1, 1);
+            }
             descriptor.optimizeForPersistentKernel = spec.persistent;
             descriptor.forwardProgressUsage =
                 static_cast<MTLForwardProgressUsage>(spec.forwardProgress);
@@ -426,6 +595,14 @@ struct PipelineOptionSpec {
             [MTLComputePipelineDescriptor new];
         descriptor.computeFunction = function;
         descriptor.supportIndirectCommandBuffers = YES;
+        const uint32_t coopThreads = cooperativeTensorThreads(name);
+        if (coopThreads || usesSimdMultipleThreads(name)) {
+            descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+        }
+        if (coopThreads) {
+            descriptor.requiredThreadsPerThreadgroup =
+                MTLSizeMake(coopThreads, 1, 1);
+        }
         NSError *error = nil;
         id<MTLComputePipelineState> result =
             [device newComputePipelineStateWithDescriptor:descriptor
@@ -550,22 +727,26 @@ MetalBackend::Impl::spanBarrierPlan(std::span<const ComputeDispatch> run) {
         id<MTLBuffer> buffer;
         uint64_t begin;
         uint64_t end;
+        bool writable;
     };
     std::vector<uint8_t> needsBarrier(run.size(), 0);
     std::vector<BoundRange> frontier;
     std::vector<BoundRange> ranges;
     for (size_t index = 0; index < run.size(); ++index) {
         ranges.clear();
+        const std::string_view name = run[index].pipelineName;
         for (const BufferBinding &binding : run[index].buffers) {
             const MetalBuffer::Impl &view = *binding.buffer.impl_;
             ranges.push_back({view.allocation->buffer, view.offsetBytes,
-                              view.offsetBytes + view.lengthBytes});
+                              view.offsetBytes + view.lengthBytes,
+                              isBindingWritable(name, binding)});
         }
         bool dependent = false;
         for (const BoundRange &earlier : frontier) {
             for (const BoundRange &range : ranges) {
                 if (earlier.buffer == range.buffer &&
-                    earlier.begin < range.end && range.begin < earlier.end) {
+                    earlier.begin < range.end && range.begin < earlier.end &&
+                    (earlier.writable || range.writable)) {
                     dependent = true;
                     break;
                 }
@@ -833,16 +1014,21 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
     MetalBackend::Impl::bakeGpuSpan(std::span<const ComputeDispatch> run) {
         auto span = std::make_shared<GpuSpan>();
         span->dispatches.reserve(run.size());
+        span->dispatchPipelines.reserve(run.size());
         // The run's distinct pipelines, in first-use order: a command names
         // its table index.
         std::unordered_map<std::string_view, uint32_t> pipelineIndices;
         uint64_t paramsBytes = 0;
         uint32_t maxBindCount = 0;
         for (const ComputeDispatch &dispatch : run) {
-            const auto [_, fresh] = pipelineIndices.try_emplace(
+            const auto [it, fresh] = pipelineIndices.try_emplace(
                 dispatch.pipelineName,
                 static_cast<uint32_t>(pipelineIndices.size()));
-            (void)fresh;
+            if (fresh) {
+                span->pipelineTable.emplace_back(dispatch.pipelineName,
+                                                 it->second);
+            }
+            span->dispatchPipelines.push_back(it->second);
             for (const BufferBinding &binding : dispatch.buffers)
                 maxBindCount = std::max(maxBindCount, binding.index + 1);
             for (const BytesBinding &binding : dispatch.bytes) {
@@ -851,6 +1037,69 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
             }
         }
         if (pipelineIndices.size() > kGpuSpanPipelines) return nullptr;
+        span->paramsBytes = paramsBytes;
+        span->maxBindCount = maxBindCount;
+        uint64_t cursor = 0;
+        for (size_t i = 0; i < run.size(); ++i) {
+            const ComputeDispatch &dispatch = run[i];
+            BakedSpan::DispatchSnapshot snapshot;
+            snapshot.pipelineName = dispatch.pipelineName;
+            snapshot.threadgroups = dispatch.threadgroups;
+            snapshot.threadsPerThreadgroup = dispatch.threadsPerThreadgroup;
+            snapshot.patchableBytes = dispatch.patchableBytes;
+            uint32_t bindings = 0;
+            for (const BufferBinding &binding : dispatch.buffers) {
+                if (bindings == kGpuSpanBindings || binding.index > 0xFF)
+                    return nullptr;
+                const MetalBuffer::Impl &view = *binding.buffer.impl_;
+                ++bindings;
+                snapshot.bufferIndices.push_back(binding.index);
+                snapshot.buffers.push_back(
+                    {view.allocation, view.allocation->buffer,
+                     view.offsetBytes, view.lengthBytes});
+            }
+            for (const BytesBinding &binding : dispatch.bytes) {
+                if (bindings == kGpuSpanBindings || binding.index > 0xFF)
+                    return nullptr;
+                ++bindings;
+                snapshot.bytes.push_back({binding.index, {}, cursor,
+                                          binding.sizeBytes});
+                cursor += (binding.sizeBytes + 255) & ~uint64_t{255};
+            }
+            span->dispatches.push_back(std::move(snapshot));
+        }
+        encodeGpuBank(*span, 0);
+        if (span->paramsBytes && span->paramsAllocation[0]) {
+            auto *params = static_cast<uint8_t *>(
+                span->paramsAllocation[0]->buffer.contents);
+            for (size_t i = 0; i < run.size(); ++i) {
+                const BakedSpan::DispatchSnapshot &snapshot =
+                    span->dispatches[i];
+                for (size_t b = 0; b < snapshot.bytes.size(); ++b) {
+                    std::memcpy(params + snapshot.bytes[b].paramsOffset,
+                                run[i].bytes[b].data,
+                                run[i].bytes[b].sizeBytes);
+                }
+            }
+        }
+        {
+            std::vector<id<MTLBuffer>> bound;
+            for (const BakedSpan::DispatchSnapshot &snapshot :
+                 span->dispatches)
+                for (const BakedSpan::BufferSnapshot &saved : snapshot.buffers)
+                    bound.push_back(saved.object);
+            std::ranges::sort(bound);
+            const auto repeated = std::ranges::unique(bound);
+            bound.erase(repeated.begin(), repeated.end());
+            for (id<MTLBuffer> buffer : bound)
+                span->usedBuffers.push_back(buffer);
+        }
+        sampleDeviceMemory();
+        return span;
+    }
+
+    void MetalBackend::Impl::encodeGpuBank(const GpuSpan &span, uint32_t bank) {
+        if (span.icb[bank]) return;
         const auto allocate = [&](uint64_t bytes, NSString *label) {
             auto allocation = std::make_shared<MetalAllocation>();
             allocation->accounting = accounting;
@@ -866,20 +1115,18 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
         descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
         descriptor.inheritPipelineState = NO;
         descriptor.inheritBuffers = NO;
-        descriptor.maxKernelBufferBindCount = maxBindCount;
-        span->icb = [device
+        descriptor.maxKernelBufferBindCount = span.maxBindCount;
+        span.icb[bank] = [device
             newIndirectCommandBufferWithDescriptor:descriptor
-                                   maxCommandCount:run.size()
+                                   maxCommandCount:span.dispatches.size()
                                            options:0];
-        if (!span->icb)
+        if (!span.icb[bank])
             throw MetalBackendError(
                 "unable to create a Metal indirect command buffer");
-        span->icb.label = @"gpu-span";
+        span.icb[bank].label = @"gpu-span";
 #if RICHENGINE_MTL4_AVAILABLE
-        if (mtl4Enabled()) residency->add(span->icb);
+        if (mtl4Enabled()) residency->add(span.icb[bank]);
 #endif
-        // The encoder kernel's argument buffer: the ICB at index 0, the
-        // run's indirect-capable pipelines at 1..kGpuSpanPipelines.
         id<MTLFunction> encodeFunction =
             [library newFunctionWithName:@"gpu_encode"
                           constantValues:functionConstantValues()
@@ -888,99 +1135,64 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
             throw MetalBackendError("missing Metal function: gpu_encode");
         id<MTLArgumentEncoder> argEncoder =
             [encodeFunction newArgumentEncoderWithBufferIndex:0];
-        span->argsAllocation = allocate(argEncoder.encodedLength,
-                                        @"gpu-span-args");
-        [argEncoder setArgumentBuffer:span->argsAllocation->buffer offset:0];
-        [argEncoder setIndirectCommandBuffer:span->icb atIndex:0];
-        for (const auto &[name, index] : pipelineIndices)
+        span.argsAllocation[bank] =
+            allocate(argEncoder.encodedLength, @"gpu-span-args");
+        [argEncoder setArgumentBuffer:span.argsAllocation[bank]->buffer
+                               offset:0];
+        [argEncoder setIndirectCommandBuffer:span.icb[bank] atIndex:0];
+        for (const auto &[name, index] : span.pipelineTable)
             [argEncoder setComputePipelineState:indirectPipeline(name)
                                         atIndex:1 + index];
-        span->descAllocation = allocate(
-            kGpuSpanDescHeader + run.size() * sizeof(GpuDispatchDesc),
+        span.descAllocation[bank] = allocate(
+            kGpuSpanDescHeader +
+                span.dispatches.size() * sizeof(GpuDispatchDesc),
             @"gpu-span-descs");
-        if (paramsBytes)
-            span->paramsAllocation =
-                allocate(paramsBytes, @"gpu-span-params");
+        if (span.paramsBytes)
+            span.paramsAllocation[bank] =
+                allocate(span.paramsBytes, @"gpu-span-params");
         auto *header = static_cast<uint8_t *>(
-            span->descAllocation->buffer.contents);
+            span.descAllocation[bank]->buffer.contents);
         std::memset(header, 0,
                     kGpuSpanDescHeader +
-                        run.size() * sizeof(GpuDispatchDesc));
-        const uint32_t count = static_cast<uint32_t>(run.size());
+                        span.dispatches.size() * sizeof(GpuDispatchDesc));
+        const uint32_t count = static_cast<uint32_t>(span.dispatches.size());
         std::memcpy(header, &count, sizeof(uint32_t));
         auto *descs = reinterpret_cast<GpuDispatchDesc *>(
             header + kGpuSpanDescHeader);
-        uint8_t *params = span->paramsAllocation
-            ? static_cast<uint8_t *>(span->paramsAllocation->buffer.contents)
-            : nullptr;
         const uint64_t paramsAddress =
-            span->paramsAllocation ? span->paramsAllocation->buffer.gpuAddress : 0;
-        uint64_t cursor = 0;
-        for (size_t i = 0; i < run.size(); ++i) {
-            const ComputeDispatch &dispatch = run[i];
+            span.paramsAllocation[bank]
+                ? span.paramsAllocation[bank]->buffer.gpuAddress
+                : 0;
+        for (size_t i = 0; i < span.dispatches.size(); ++i) {
+            const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
             GpuDispatchDesc &desc = descs[i];
-            desc.pipeline = pipelineIndices.at(dispatch.pipelineName);
-            desc.groups_x = static_cast<uint32_t>(dispatch.threadgroups.x);
-            desc.groups_y = static_cast<uint32_t>(dispatch.threadgroups.y);
-            desc.groups_z = static_cast<uint32_t>(dispatch.threadgroups.z);
+            desc.pipeline = span.dispatchPipelines[i];
+            desc.groups_x = static_cast<uint32_t>(snapshot.threadgroups.x);
+            desc.groups_y = static_cast<uint32_t>(snapshot.threadgroups.y);
+            desc.groups_z = static_cast<uint32_t>(snapshot.threadgroups.z);
             desc.threads_x =
-                static_cast<uint32_t>(dispatch.threadsPerThreadgroup.x);
+                static_cast<uint32_t>(snapshot.threadsPerThreadgroup.x);
             desc.threads_y =
-                static_cast<uint32_t>(dispatch.threadsPerThreadgroup.y);
+                static_cast<uint32_t>(snapshot.threadsPerThreadgroup.y);
             desc.threads_z =
-                static_cast<uint32_t>(dispatch.threadsPerThreadgroup.z);
-            BakedSpan::DispatchSnapshot snapshot;
-            snapshot.pipelineName = dispatch.pipelineName;
-            snapshot.threadgroups = dispatch.threadgroups;
-            snapshot.threadsPerThreadgroup = dispatch.threadsPerThreadgroup;
-            snapshot.patchableBytes = dispatch.patchableBytes;
+                static_cast<uint32_t>(snapshot.threadsPerThreadgroup.z);
             uint32_t bindings = 0;
-            for (const BufferBinding &binding : dispatch.buffers) {
-                if (bindings == kGpuSpanBindings || binding.index > 0xFF)
-                    return nullptr;
-                const MetalBuffer::Impl &view = *binding.buffer.impl_;
+            for (size_t b = 0; b < snapshot.buffers.size(); ++b) {
+                const BakedSpan::BufferSnapshot &saved = snapshot.buffers[b];
                 desc.buffers[bindings] =
-                    view.allocation->buffer.gpuAddress + view.offsetBytes;
+                    saved.object.gpuAddress + saved.offsetBytes;
                 desc.binding_index[bindings] =
-                    static_cast<uint8_t>(binding.index);
+                    static_cast<uint8_t>(snapshot.bufferIndices[b]);
                 ++bindings;
-                snapshot.bufferIndices.push_back(binding.index);
-                snapshot.buffers.push_back(
-                    {view.allocation, view.allocation->buffer,
-                     view.offsetBytes, view.lengthBytes});
             }
-            for (const BytesBinding &binding : dispatch.bytes) {
-                if (bindings == kGpuSpanBindings || binding.index > 0xFF)
-                    return nullptr;
-                std::memcpy(params + cursor, binding.data,
-                            binding.sizeBytes);
-                desc.buffers[bindings] = paramsAddress + cursor;
+            for (const BakedSpan::BytesSnapshot &saved : snapshot.bytes) {
+                desc.buffers[bindings] = paramsAddress + saved.paramsOffset;
                 desc.binding_index[bindings] =
-                    static_cast<uint8_t>(binding.index);
+                    static_cast<uint8_t>(saved.index);
                 ++bindings;
-                snapshot.bytes.push_back({binding.index, {}, cursor,
-                                          binding.sizeBytes});
-                cursor += (binding.sizeBytes + 255) & ~uint64_t{255};
             }
             desc.bindings = bindings;
-            span->dispatches.push_back(std::move(snapshot));
         }
-        {
-            std::vector<id<MTLBuffer>> bound;
-            for (const BakedSpan::DispatchSnapshot &snapshot :
-                 span->dispatches)
-                for (const BakedSpan::BufferSnapshot &saved : snapshot.buffers)
-                    bound.push_back(saved.object);
-            std::ranges::sort(bound);
-            const auto repeated = std::ranges::unique(bound);
-            bound.erase(repeated.begin(), repeated.end());
-            for (id<MTLBuffer> buffer : bound)
-                span->usedBuffers.push_back(buffer);
-            if (span->paramsAllocation)
-                span->usedBuffers.push_back(span->paramsAllocation->buffer);
-        }
-        sampleDeviceMemory();
-        return span;
     }
 
 // Finds a gpu span matching this run or bakes a new one; nullptr means the
@@ -1021,10 +1233,12 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
 // Restages every bytes payload of the run into the span's parameter arena:
     // the descriptors bind it by address, so only contents change.
     void MetalBackend::Impl::stageGpuSpanParams(const GpuSpan &span,
-                            std::span<const PreparedDispatch> run) {
-        if (!span.paramsAllocation || !span.paramsAllocation->buffer) return;
+                            std::span<const PreparedDispatch> run,
+                            uint32_t bank) {
+        const auto &allocation = span.paramsAllocation[bank & 1];
+        if (!allocation || !allocation->buffer) return;
         auto *contents =
-            static_cast<uint8_t *>(span.paramsAllocation->buffer.contents);
+            static_cast<uint8_t *>(allocation->buffer.contents);
         for (size_t i = 0; i < run.size(); ++i) {
             const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
             const ComputeDispatch &dispatch = *run[i].source;
@@ -1082,7 +1296,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             throw MetalBackendError("Metal command must contain a dispatch");
         }
         PreparedCommand command;
-        command.dispatches.reserve(dispatches.size());
+        command.ownedDispatches.reserve(dispatches.size());
         size_t bindings = 0;
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
@@ -1171,10 +1385,10 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                               "indirect span range");
             }
             bindings += dispatch.buffers.size();
-            command.dispatches.push_back(item);
+            command.ownedDispatches.push_back(item);
         }
 
-        for (PreparedDispatch &item : command.dispatches) {
+        for (PreparedDispatch &item : command.ownedDispatches) {
             item.pipeline = pipeline(item.source->pipelineName);
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
@@ -1211,7 +1425,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     dispatches.subspan(begin, end - begin);
                 if (std::shared_ptr<const BakedSpan> span =
                         resolveBakedSpan(begin, run)) {
-                    command.dispatches[begin].span = span.get();
+                    command.ownedDispatches[begin].span = span.get();
                     for (const auto &arena : span->paramsAllocation)
                         if (arena)
                             command.retainedAllocations.push_back(arena);
@@ -1237,21 +1451,24 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     dispatches.subspan(begin, end - begin);
                 if (std::shared_ptr<const GpuSpan> span =
                         resolveGpuSpan(begin, run)) {
-                    command.dispatches[begin].gpuSpan = span.get();
-                    if (span->argsAllocation)
-                        command.retainedAllocations.push_back(
-                            span->argsAllocation);
-                    if (span->descAllocation)
-                        command.retainedAllocations.push_back(
-                            span->descAllocation);
-                    if (span->paramsAllocation)
-                        command.retainedAllocations.push_back(
-                            span->paramsAllocation);
+                    command.ownedDispatches[begin].gpuSpan = span.get();
+                    for (uint32_t b = 0; b < 2; ++b) {
+                        if (span->argsAllocation[b])
+                            command.retainedAllocations.push_back(
+                                span->argsAllocation[b]);
+                        if (span->descAllocation[b])
+                            command.retainedAllocations.push_back(
+                                span->descAllocation[b]);
+                        if (span->paramsAllocation[b])
+                            command.retainedAllocations.push_back(
+                                span->paramsAllocation[b]);
+                    }
                     command.gpuSpanRefs.push_back(std::move(span));
                 }
                 begin = end;
             }
         }
+        command.dispatches = command.ownedDispatches;
         return command;
     }
 
@@ -1387,7 +1604,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             cached->boundBuffers += dispatch.buffers.size();
             cached->dispatches.push_back(std::move(snapshot));
         }
-        cached->prepared = command.dispatches;
+        cached->prepared = command.ownedDispatches;
+#if RICHENGINE_MTL4_AVAILABLE
+        cached->barrierPlan =
+            computeBarrierPlan(cached->prepared, true, !tuning().opTimings);
+#endif
         for (PreparedDispatch &item : cached->prepared) item.source = nullptr;
         cached->spanRefs = command.spanRefs;
         cached->gpuSpanRefs = command.gpuSpanRefs;
@@ -1424,30 +1645,36 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             ++matchEpoch;
             if (!commandMatches(*candidate, dispatches)) continue;
             candidate->touched = ++bakedClock;
+            for (size_t i = 0; i < dispatches.size(); ++i)
+                candidate->prepared[i].source = &dispatches[i];
             PreparedCommand command;
             command.dispatches = candidate->prepared;
-            command.spanRefs = candidate->spanRefs;
-            command.gpuSpanRefs = candidate->gpuSpanRefs;
-            for (size_t i = 0; i < dispatches.size(); ++i)
-                command.dispatches[i].source = &dispatches[i];
+            command.barrierPlan = &candidate->barrierPlan;
             command.retainedAllocations.reserve(
                 candidate->boundBuffers + 2 * candidate->spanRefs.size() +
-                3 * candidate->gpuSpanRefs.size());
+                6 * candidate->gpuSpanRefs.size());
             retainBound(dispatches, command.retainedAllocations);
-            for (const auto &span : command.spanRefs)
+            for (const auto &span : candidate->spanRefs)
                 for (const auto &arena : span->paramsAllocation)
                     if (arena) command.retainedAllocations.push_back(arena);
-            for (const auto &span : command.gpuSpanRefs) {
-                command.retainedAllocations.push_back(span->argsAllocation);
-                command.retainedAllocations.push_back(span->descAllocation);
-                if (span->paramsAllocation)
-                    command.retainedAllocations.push_back(
-                        span->paramsAllocation);
+            for (const auto &span : candidate->gpuSpanRefs) {
+                for (uint32_t b = 0; b < 2; ++b) {
+                    if (span->argsAllocation[b])
+                        command.retainedAllocations.push_back(
+                            span->argsAllocation[b]);
+                    if (span->descAllocation[b])
+                        command.retainedAllocations.push_back(
+                            span->descAllocation[b]);
+                    if (span->paramsAllocation[b])
+                        command.retainedAllocations.push_back(
+                            span->paramsAllocation[b]);
+                }
             }
             return command;
         }
         PreparedCommand command = prepare(dispatches);
         auto cached = snapshotCommand(dispatches, command);
+        command.barrierPlan = &cached->barrierPlan;
         slots.push_back(std::move(cached));
         if (slots.size() > 2) {
             const auto stale = std::min_element(
@@ -1489,9 +1716,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                  : (overlapping ? lastSpanBank ^ 1u
                                                 : lastSpanBank);
         lastSpanBank = spanBank;
-        // GPU-encoded spans restage their one arena per submission, so they
-        // keep the GPU-idle requirement.
-        const bool replayGpuSpans = replaySpans && !overlapping;
+        const bool replayGpuSpans = replaySpans;
 
         auto failBeforeCommit = [&](std::string message) {
             markUnhealthy(message);
@@ -1647,37 +1872,48 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     index + item.gpuSpan->dispatches.size() <=
                         dispatches.size()) {
                     const GpuSpan &span = *item.gpuSpan;
+                    if (!span.icb[spanBank]) {
+                        encodeGpuBank(span, spanBank);
+                        if (span.argsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.argsAllocation[spanBank]);
+                        if (span.descAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.descAllocation[spanBank]);
+                        if (span.paramsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.paramsAllocation[spanBank]);
+                    }
                     stageGpuSpanParams(
                         span, dispatches.subspan(
-                                  index, span.dispatches.size()));
+                                  index, span.dispatches.size()),
+                        spanBank);
                     const NSUInteger count = span.dispatches.size();
-                    // gpu_encode writes commands that are a pure function
-                    // of the span's descriptor table; the match that found
-                    // this span keeps the table static, so only the first
-                    // replay encodes — later ones replay the ICB as it
-                    // stands, with only the params arena restaged above.
-                    if (!span.encoded) {
+                    if (!span.encoded[spanBank]) {
                         [encoder setComputePipelineState:pipeline("gpu_encode")];
-                        [encoder setBuffer:span.argsAllocation->buffer
+                        [encoder setBuffer:span.argsAllocation[spanBank]->buffer
                                     offset:0
                                    atIndex:0];
-                        [encoder setBuffer:span.descAllocation->buffer
+                        [encoder setBuffer:span.descAllocation[spanBank]->buffer
                                     offset:kGpuSpanDescHeader
                                    atIndex:1];
-                        [encoder setBuffer:span.descAllocation->buffer
+                        [encoder setBuffer:span.descAllocation[spanBank]->buffer
                                     offset:0
                                    atIndex:2];
-                        [encoder useResource:span.icb
+                        [encoder useResource:span.icb[spanBank]
                                        usage:MTLResourceUsageWrite];
                         [encoder
                             dispatchThreadgroups:MTLSizeMake(
                                 (count + 255) / 256, 1, 1)
                          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                        span.encoded = true;
+                        span.encoded[spanBank] = true;
                     }
-                    [encoder useResource:span.icb
+                    [encoder useResource:span.icb[spanBank]
                                    usage:MTLResourceUsageRead];
+                    if (const auto &arena = span.paramsAllocation[spanBank])
+                        [encoder useResource:arena->buffer
+                                       usage:MTLResourceUsageRead];
                     for (__weak id<MTLBuffer> buffer : span.usedBuffers) {
                         if (id<MTLBuffer> resource = buffer)
                             [encoder useResource:resource
@@ -1689,11 +1925,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                             *item.source->indirectRange.impl_;
                         [encoder useResource:range.allocation->buffer
                                        usage:MTLResourceUsageRead];
-                        [encoder executeCommandsInBuffer:span.icb
+                        [encoder executeCommandsInBuffer:span.icb[spanBank]
                                           indirectBuffer:range.allocation->buffer
                                      indirectBufferOffset:range.offsetBytes];
                     } else {
-                        [encoder executeCommandsInBuffer:span.icb
+                        [encoder executeCommandsInBuffer:span.icb[spanBank]
                                                withRange:
                             NSMakeRange(0, count)];
                     }
@@ -1762,6 +1998,104 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
     }
 
 #if RICHENGINE_MTL4_AVAILABLE
+    std::vector<uint8_t>
+    MetalBackend::Impl::computeBarrierPlan(
+        std::span<const PreparedDispatch> dispatches,
+        bool replaySpans, bool replayGpuSpans) {
+        struct BoundRange {
+            __unsafe_unretained id<MTLBuffer> buffer;
+            uint64_t begin;
+            uint64_t end;
+            bool writable;
+        };
+        std::vector<uint8_t> needsBarrier(dispatches.size(), 0);
+        std::vector<BoundRange> frontier;
+        std::vector<BoundRange> ranges;
+        for (size_t index = 0; index < dispatches.size(); ++index) {
+            const PreparedDispatch &item = dispatches[index];
+            const bool replaysSpan =
+                item.span && replaySpans &&
+                index + item.span->dispatches.size() <= dispatches.size();
+            const bool replaysGpuSpan =
+                item.gpuSpan && replayGpuSpans &&
+                index + item.gpuSpan->dispatches.size() <= dispatches.size();
+            ranges.clear();
+            if (replaysSpan) {
+                for (__weak id<MTLBuffer> weak : item.span->usedBuffers) {
+                    if (id<MTLBuffer> buffer = weak) {
+                        ranges.push_back({buffer, 0, buffer.length, true});
+                    }
+                }
+            } else if (replaysGpuSpan) {
+                for (uint32_t b = 0; b < 2; ++b) {
+                    if (item.gpuSpan->descAllocation[b]) {
+                        id<MTLBuffer> descBuf =
+                            item.gpuSpan->descAllocation[b]->buffer;
+                        ranges.push_back({descBuf, 0, descBuf.length, true});
+                    }
+                    if (item.gpuSpan->paramsAllocation[b]) {
+                        id<MTLBuffer> paramBuf =
+                            item.gpuSpan->paramsAllocation[b]->buffer;
+                        ranges.push_back({paramBuf, 0, paramBuf.length, true});
+                    }
+                }
+                for (__weak id<MTLBuffer> weak : item.gpuSpan->usedBuffers) {
+                    if (id<MTLBuffer> buffer = weak) {
+                        ranges.push_back({buffer, 0, buffer.length, true});
+                    }
+                }
+            }
+            if ((replaysSpan || replaysGpuSpan) && item.source->indirectRange) {
+                const MetalBuffer::Impl &range =
+                    *item.source->indirectRange.impl_;
+                ranges.push_back({range.allocation->buffer, range.offsetBytes,
+                                  range.offsetBytes + range.lengthBytes,
+                                  false});
+            }
+            if (!replaysSpan && !replaysGpuSpan) {
+                const std::string_view name = item.source->pipelineName;
+                for (const BufferBinding &binding : item.source->buffers) {
+                    const MetalBuffer::Impl &view = *binding.buffer.impl_;
+                    ranges.push_back(
+                        {view.allocation->buffer, view.offsetBytes,
+                         view.offsetBytes + view.lengthBytes,
+                         isBindingWritable(name, binding)});
+                }
+                for (const MetalBuffer &indirect :
+                     {item.source->indirectGrid, item.source->indirectRange}) {
+                    if (!indirect) continue;
+                    const MetalBuffer::Impl &view = *indirect.impl_;
+                    ranges.push_back({view.allocation->buffer, view.offsetBytes,
+                                      view.offsetBytes + view.lengthBytes,
+                                      false});
+                }
+            }
+            bool dependent = false;
+            for (const BoundRange &earlier : frontier) {
+                for (const BoundRange &range : ranges) {
+                    if (earlier.buffer == range.buffer &&
+                        earlier.begin < range.end &&
+                        range.begin < earlier.end &&
+                        (earlier.writable || range.writable)) {
+                        dependent = true;
+                        break;
+                    }
+                }
+                if (dependent) break;
+            }
+            if (dependent) {
+                needsBarrier[index] = 1;
+                frontier.clear();
+            }
+            frontier.insert(frontier.end(), ranges.begin(), ranges.end());
+            if (replaysSpan)
+                index += item.span->dispatches.size() - 1;
+            else if (replaysGpuSpan)
+                index += item.gpuSpan->dispatches.size() - 1;
+        }
+        return needsBarrier;
+    }
+
     // The Metal 4 encoding of commit(): same prepared dispatches, same
     // ticket contract, encoded through one reused allocator and argument
     // table and committed with a commit-feedback handler in place of the
@@ -1769,6 +2103,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
     // waitForEvent between the split's commits, where commit() encoded
     // them into command buffers instead.
     CommandTicket MetalBackend::Impl::commit4(std::span<const PreparedDispatch> dispatches,
+                          const std::vector<uint8_t> *cachedBarrierPlan,
                           std::span<const EventStep> events,
                           std::vector<std::shared_ptr<MetalAllocation>> retained,
                           CommandCompletion completion) {
@@ -1798,9 +2133,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                  : (overlapping ? lastSpanBank ^ 1u
                                                 : lastSpanBank);
         lastSpanBank = spanBank;
-        // GPU-encoded spans restage their one arena per submission, so they
-        // keep the GPU-idle requirement.
-        const bool replayGpuSpans = replaySpans && !overlapping;
+        const bool replayGpuSpans = replaySpans;
         // RICHENGINE_OP_TIMINGS on Metal 4 brackets each encoded unit with a
         // counter-heap timestamp pair, resolved in the final commit's
         // feedback — the per-op probe commit() gets by committing every
@@ -1814,16 +2147,21 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         // baked span's parameters use. Span-covered runs stage their
         // payloads in the span's own parameter arena instead.
         uint64_t stagingBytes = 0;
-        for (size_t index = 0; index < dispatches.size(); ++index) {
-            const PreparedDispatch &item = dispatches[index];
-            if (item.span && replaySpans &&
-                index + item.span->dispatches.size() <= dispatches.size()) {
-                index += item.span->dispatches.size() - 1;
-                continue;
+            for (size_t index = 0; index < dispatches.size(); ++index) {
+                const PreparedDispatch &item = dispatches[index];
+                if (item.span && replaySpans &&
+                    index + item.span->dispatches.size() <= dispatches.size()) {
+                    index += item.span->dispatches.size() - 1;
+                    continue;
+                }
+                if (item.gpuSpan && replayGpuSpans && !opTimings &&
+                    index + item.gpuSpan->dispatches.size() <= dispatches.size()) {
+                    index += item.gpuSpan->dispatches.size() - 1;
+                    continue;
+                }
+                for (const BytesBinding &binding : item.source->bytes)
+                    stagingBytes += (binding.sizeBytes + 255) & ~uint64_t{255};
             }
-            for (const BytesBinding &binding : item.source->bytes)
-                stagingBytes += (binding.sizeBytes + 255) & ~uint64_t{255};
-        }
         if (stagingBytes && (!staging || staging->length < stagingBytes)) {
             auto allocation = std::make_shared<MetalAllocation>();
             allocation->accounting = accounting;
@@ -1950,102 +2288,14 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // as one unit at the whole-buffer granularity of its
             // usedBuffers snapshot. Byte bindings stage in staging4, which
             // the GPU only reads, so they take no part in the frontier.
-            struct BoundRange {
-                // The ticket retains every bound allocation, so the buffer
-                // objects outlive this analysis.
-                __unsafe_unretained id<MTLBuffer> buffer;
-                uint64_t begin;
-                uint64_t end;
-            };
-            std::vector<uint8_t> needsBarrier(dispatches.size(), 0);
-            {
-                std::vector<BoundRange> frontier;
-                std::vector<BoundRange> ranges;
-                for (size_t index = 0; index < dispatches.size(); ++index) {
-                    const PreparedDispatch &item = dispatches[index];
-                    const bool replaysSpan =
-                        item.span && replaySpans &&
-                        index + item.span->dispatches.size() <=
-                            dispatches.size();
-                    const bool replaysGpuSpan =
-                        item.gpuSpan && replayGpuSpans &&
-                        index + item.gpuSpan->dispatches.size() <=
-                            dispatches.size();
-                    ranges.clear();
-                    if (replaysSpan) {
-                        for (__weak id<MTLBuffer> weak :
-                             item.span->usedBuffers) {
-                            if (id<MTLBuffer> buffer = weak) {
-                                ranges.push_back(
-                                    {buffer, 0, buffer.length});
-                            }
-                        }
-                    } else if (replaysGpuSpan) {
-                        ranges.push_back(
-                            {item.gpuSpan->descAllocation->buffer, 0,
-                             item.gpuSpan->descAllocation->buffer.length});
-                        for (__weak id<MTLBuffer> weak :
-                             item.gpuSpan->usedBuffers) {
-                            if (id<MTLBuffer> buffer = weak) {
-                                ranges.push_back(
-                                    {buffer, 0, buffer.length});
-                            }
-                        }
-                    }
-                    if ((replaysSpan || replaysGpuSpan) &&
-                        item.source->indirectRange) {
-                        const MetalBuffer::Impl &range =
-                            *item.source->indirectRange.impl_;
-                        ranges.push_back({range.allocation->buffer,
-                                          range.offsetBytes,
-                                          range.offsetBytes +
-                                              range.lengthBytes});
-                    }
-                    if (!replaysSpan && !replaysGpuSpan) {
-                        for (const BufferBinding &binding :
-                             item.source->buffers) {
-                            const MetalBuffer::Impl &view =
-                                *binding.buffer.impl_;
-                            ranges.push_back({view.allocation->buffer,
-                                              view.offsetBytes,
-                                              view.offsetBytes +
-                                                  view.lengthBytes});
-                        }
-                        for (const MetalBuffer &indirect :
-                             {item.source->indirectGrid,
-                              item.source->indirectRange}) {
-                            if (!indirect) continue;
-                            const MetalBuffer::Impl &view = *indirect.impl_;
-                            ranges.push_back({view.allocation->buffer,
-                                              view.offsetBytes,
-                                              view.offsetBytes +
-                                                  view.lengthBytes});
-                        }
-                    }
-                    bool dependent = false;
-                    for (const BoundRange &earlier : frontier) {
-                        for (const BoundRange &range : ranges) {
-                            if (earlier.buffer == range.buffer &&
-                                earlier.begin < range.end &&
-                                range.begin < earlier.end) {
-                                dependent = true;
-                                break;
-                            }
-                        }
-                        if (dependent) break;
-                    }
-                    if (dependent) {
-                        needsBarrier[index] = 1;
-                        frontier.clear();
-                    }
-                    frontier.insert(frontier.end(), ranges.begin(),
-                                    ranges.end());
-                    if (replaysSpan)
-                        index += item.span->dispatches.size() - 1;
-                    else if (replaysGpuSpan)
-                        index += item.gpuSpan->dispatches.size() - 1;
-                }
-            }
+            std::vector<uint8_t> fallbackBarrier;
+            const std::vector<uint8_t> &needsBarrier =
+                (cachedBarrierPlan && replaySpans &&
+                 cachedBarrierPlan->size() == dispatches.size())
+                    ? *cachedBarrierPlan
+                    : (fallbackBarrier = computeBarrierPlan(
+                           dispatches, replaySpans,
+                           replayGpuSpans && !opTimings));
             const auto orderAfterPrevious = [&](size_t index) {
                 if (!needsBarrier[index]) return;
                 [encoder barrierAfterEncoderStages:MTLStageDispatch
@@ -2180,23 +2430,36 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     index + item.gpuSpan->dispatches.size() <=
                         dispatches.size()) {
                     const GpuSpan &span = *item.gpuSpan;
+                    if (!span.icb[spanBank]) {
+                        encodeGpuBank(span, spanBank);
+                        if (span.argsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.argsAllocation[spanBank]);
+                        if (span.descAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.descAllocation[spanBank]);
+                        if (span.paramsAllocation[spanBank])
+                            ticketState->retainedAllocations.push_back(
+                                span.paramsAllocation[spanBank]);
+                    }
                     stageGpuSpanParams(
                         span, dispatches.subspan(
-                                  index, span.dispatches.size()));
+                                  index, span.dispatches.size()),
+                        spanBank);
                     orderAfterPrevious(index);
                     const NSUInteger count = span.dispatches.size();
-                    if (!span.encoded) {
+                    if (!span.encoded[spanBank]) {
                         [encoder setComputePipelineState:
                                      pipeline("gpu_encode")];
                         [argumentTable4 setAddress:
-                            span.argsAllocation->buffer.gpuAddress
+                            span.argsAllocation[spanBank]->buffer.gpuAddress
                                            atIndex:0];
                         [argumentTable4 setAddress:
-                            span.descAllocation->buffer.gpuAddress +
+                            span.descAllocation[spanBank]->buffer.gpuAddress +
                                 kGpuSpanDescHeader
                                            atIndex:1];
                         [argumentTable4 setAddress:
-                            span.descAllocation->buffer.gpuAddress
+                            span.descAllocation[spanBank]->buffer.gpuAddress
                                            atIndex:2];
                         [encoder setArgumentTable:argumentTable4];
                         [encoder dispatchThreadgroups:
@@ -2206,9 +2469,9 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                     beforeEncoderStages:MTLStageDispatch
                                        visibilityOptions:
                             MTL4VisibilityOptionDevice];
-                        span.encoded = true;
+                        span.encoded[spanBank] = true;
                     }
-                    executeSpan(span.icb, count, index);
+                    executeSpan(span.icb[spanBank], count, index);
                     index += count - 1;
                     continue;
                 }
@@ -2302,13 +2565,34 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
     // timing, so callers observe the usual asynchronous contract. Built
     // unconditionally: this file's submitCommandAsync is one object for the
     // instrumented and plain Impls that share it.
-    CommandTicket MetalBackend::Impl::submitProfiled(std::span<const ComputeDispatch> dispatches,
+    CommandTicket MetalBackend::Impl::submitProfiled(const Command &command,
                                  CommandCompletion completion) {
-        const PreparedCommand command = prepare(dispatches);
+        const PreparedCommand prepared = prepare(command.dispatches);
         CommandTiming total;
-        for (const PreparedDispatch &item : command.dispatches) {
+        // Event steps replay through commit()'s own split: a Wait at a
+        // boundary holds the next dispatch's buffer (before=0 in its
+        // single-dispatch command), a Signal fires once the preceding
+        // dispatch's commit ran (before=1 in that command).
+        size_t step = 0;
+        std::vector<EventStep> steps;
+        for (size_t index = 0; index < prepared.dispatches.size(); ++index) {
+            steps.clear();
+            while (step < command.events.size() &&
+                   (command.events[step].before == index ||
+                    (command.events[step].kind == EventStep::Kind::Signal &&
+                     command.events[step].before == index + 1))) {
+                const EventStep &s = command.events[step++];
+                steps.push_back(
+                    EventStep{.before =
+                                  s.kind == EventStep::Kind::Wait ? 0u : 1u,
+                              .event = s.event,
+                              .value = s.value,
+                              .kind = s.kind});
+            }
+            const PreparedDispatch &item = prepared.dispatches[index];
             const CommandTiming timing =
-                commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
+                commit({&item, 1}, steps, prepared.retainedAllocations, {})
+                    .wait();
             dispatchProfile.push_back(
                 {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
@@ -2316,8 +2600,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         }
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
+        // The replayed work is done; this registers bookkeeping for an
+        // already-completed ticket, so the in-flight bound is commit()'s —
+        // a predraft may still be pending (RICHENGINE_PREDRAFT_OVERLAP).
         ticketState->sequence =
-            asyncState->beginSubmission(command.dispatches.size());
+            asyncState->beginSubmission(command.dispatches.size(), 2);
         ticketState->timing = total;
         ticketState->completed = true;
         if (completion) completion();
@@ -2350,10 +2637,7 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     // Always present, whatever this translation unit's instrumentation flag:
     // submitProfiled is only reachable in objects that carry it.
     if (impl_->dispatchProfiling) {
-        if (!command.events.empty())
-            throw MetalBackendError(
-                "dispatch profiling does not replay event steps");
-        return impl_->submitProfiled(command.dispatches, std::move(completion));
+        return impl_->submitProfiled(command, std::move(completion));
     }
     checkEvents(command.events, command.dispatches.size());
     static const bool subTiming = envFlag("RICHENGINE_DECODE_TIMING");
@@ -2366,7 +2650,8 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     // prefill output and wall time once. RICHENGINE_MTL4_EVENTS is the A/B
     // switch that re-enables it.
     if (impl_->useMtl4() && (command.events.empty() || tuning().mtl4Events)) {
-        auto ticket = impl_->commit4(prepared.dispatches, command.events,
+        auto ticket = impl_->commit4(prepared.dispatches, prepared.barrierPlan,
+                                     command.events,
                                      std::move(prepared.retainedAllocations),
                                      std::move(completion));
         if (subTiming) {

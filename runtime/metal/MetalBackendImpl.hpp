@@ -790,16 +790,20 @@ struct MetalBackend::Impl {
     // a staged-parameter arena, so a matching submission reuses the whole
     // span while only the bytes payloads are restaged.
     struct GpuSpan {
-        __strong id<MTLIndirectCommandBuffer> icb = nil;
+        mutable __strong id<MTLIndirectCommandBuffer> icb[2] = {nil, nil};
         // The gpu_encode kernel's argument buffer (the ICB object plus the
         // run's indirect-capable pipeline table).
-        std::shared_ptr<MetalAllocation> argsAllocation;
+        mutable std::shared_ptr<MetalAllocation> argsAllocation[2];
         // The descriptor table the encoder reads; its header holds the run's
         // command count (abi/GpuDispatch.h).
-        std::shared_ptr<MetalAllocation> descAllocation;
+        mutable std::shared_ptr<MetalAllocation> descAllocation[2];
         // The bytes payloads every descriptor binds by address, restaged
         // per submission like a baked span's patchable arena.
-        std::shared_ptr<MetalAllocation> paramsAllocation;
+        mutable std::shared_ptr<MetalAllocation> paramsAllocation[2];
+        uint64_t paramsBytes = 0;
+        uint32_t maxBindCount = 0;
+        std::vector<std::pair<std::string, uint32_t>> pipelineTable;
+        std::vector<uint32_t> dispatchPipelines;
         std::vector<BakedSpan::DispatchSnapshot> dispatches;
         // The distinct buffers the span binds, including the parameter
         // arena: the encoder declares their usage at replay.
@@ -810,13 +814,15 @@ struct MetalBackend::Impl {
         // the span's lifetime, so replays after the first skip the encode
         // pass — the byte payloads it binds restage into the params arena
         // without touching a command.
-        mutable bool encoded = false;
+        mutable bool encoded[2] = {false, false};
     };
 
     // A command as submission encodes it: its dispatches and every
     // allocation they bind, which its ticket retains.
     struct PreparedCommand {
-        std::vector<PreparedDispatch> dispatches;
+        std::vector<PreparedDispatch> ownedDispatches;
+        std::span<const PreparedDispatch> dispatches;
+        const std::vector<uint8_t> *barrierPlan = nullptr;
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
         // Keeps the spans dispatches[].span points at alive: the baked
         // cache may evict one while a prepared command still names it.
@@ -860,6 +866,7 @@ struct MetalBackend::Impl {
         // The prepared form to reuse; its source pointers are rebound to
         // the new run on every hit.
         std::vector<PreparedDispatch> prepared;
+        std::vector<uint8_t> barrierPlan;
         std::vector<std::shared_ptr<const BakedSpan>> spanRefs;
         std::vector<std::shared_ptr<const GpuSpan>> gpuSpanRefs;
         uint64_t boundBuffers = 0;
@@ -1064,11 +1071,16 @@ struct MetalBackend::Impl {
     resolveGpuSpan(size_t begin, std::span<const ComputeDispatch> run);
 
 
+    // Builds one bank of a gpu span: its ICB, argument buffer, descriptor
+    // table and parameter arena.
+    void encodeGpuBank(const GpuSpan &span, uint32_t bank);
+
     // Rewrites a gpu span's staged parameters from the run's payloads —
     // every bytes binding, patchable or not, since the descriptors bind
     // the arena by address.
     static void stageGpuSpanParams(const GpuSpan &span,
-                                   std::span<const PreparedDispatch> run);
+                                   std::span<const PreparedDispatch> run,
+                                   uint32_t bank);
 
 
     // The escape hatch: GPU-encoded spans are off unless
@@ -1135,12 +1147,17 @@ struct MetalBackend::Impl {
 
 
 #if RICHENGINE_MTL4_AVAILABLE
+    static std::vector<uint8_t>
+    computeBarrierPlan(std::span<const PreparedDispatch> dispatches,
+                       bool replaySpans, bool replayGpuSpans);
+
     // The Metal 4 encoding of commit(): same prepared dispatches, same
     // event steps, same ticket contract, encoded through one reused
     // allocator and argument table and committed with a commit-feedback
     // handler in place of the completed handler. Event steps map to
     // queue-level signalEvent/waitForEvent between the split's commits.
     CommandTicket commit4(std::span<const PreparedDispatch> dispatches,
+                          const std::vector<uint8_t> *cachedBarrierPlan,
                           std::span<const EventStep> events,
                           std::vector<std::shared_ptr<MetalAllocation>> retained,
                           CommandCompletion completion);
@@ -1151,7 +1168,7 @@ struct MetalBackend::Impl {
     // for it, then hands back an already-completed ticket with the summed
     // timing, so callers observe the usual asynchronous contract. The flag
     // selecting it is unconditional, so the method is too.
-    CommandTicket submitProfiled(std::span<const ComputeDispatch> dispatches,
+    CommandTicket submitProfiled(const Command &command,
                                  CommandCompletion completion);
 };
 

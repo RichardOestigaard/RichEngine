@@ -186,13 +186,15 @@ inline void decode(device const bfloat *table, device const float *sums, device 
       const uint e = lane + 32 * i;
       if (e < NC * S::J) src[i] = coefficient_source<F>(w0, w1, meta, plane_tile, groups, plane_row + e % NC, u, e / NC);
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
 #pragma unroll
     for (uint i = 0; i < I; ++i) {
       const uint e = lane + 32 * i;
       if (e < NC * S::J) cu[e] = coefficient<F>(src[i], u, e / NC);
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
 #pragma unroll
     for (uint us = 0; us < S::UnitSpans; ++us) {
       const bool more = us + 1 < S::UnitSpans || u + 1 < u1;

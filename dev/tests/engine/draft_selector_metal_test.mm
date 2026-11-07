@@ -164,6 +164,8 @@ void runCase(MetalBackend &backend, const Case &c) {
   const DraftCodebooks codebooks{
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F),
       randomBfloat(backend, uint64_t{c.vocabulary} * kRank, random, 0.1F)};
+  const MetalBuffer draftInput =
+      allocate(backend, uint64_t{c.lanes} * kRows * sizeof(uint32_t));
   DraftSelectorBuffers buffers{
       logits,
       allocate(backend, workspace.partialIdsBytes),
@@ -175,11 +177,13 @@ void runCase(MetalBackend &backend, const Case &c) {
                uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, uint64_t{c.lanes} * kPositions * sizeof(float)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
-      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t))};
+      allocate(backend, uint64_t{c.lanes} * sizeof(uint32_t)),
+      draftInput};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
   for (uint32_t index = 0; index < c.lanes * RICHENGINE_SAMPLING_UNIFORMS; ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
@@ -188,6 +192,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   for (uint32_t lane = 0; lane < c.lanes; ++lane) {
     anchors[lane] = random.next() % c.vocabulary;
     policies[lane] = SamplingPolicy{16, c.sampling ? 0.8F : 0.0F, 1.0F, false};
+    static_cast<uint32_t *>(draftInput.contents())[lane * kRows] = anchors[lane];
   }
 
   CommandGraph graph;
@@ -409,6 +414,7 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
                uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, uint64_t{c.lanes} * kPositions * sizeof(float)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
@@ -681,6 +687,7 @@ void runDFlashPoolCase(MetalBackend &backend, const Case &c, bool tree) {
                uint64_t{c.lanes} * RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, uint64_t{c.lanes} * kPositions * sizeof(float)),
       allocate(backend,
                uint64_t{c.lanes} * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend,
@@ -919,9 +926,11 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, RICHENGINE_SAMPLING_UNIFORMS * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
+      allocate(backend, kLanes * kPositions * sizeof(float)),
       allocate(backend, kLanes * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
       allocate(backend, kLanes * RICHENGINE_TREE_VERIFY_NODES * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t))};
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      allocate(backend, kLanes * kRows * sizeof(uint32_t))};
   const DraftCodebooks codebooks{allocate(backend, uint64_t{1024} * kRank * 2),
                                  allocate(backend, uint64_t{1024} * kRank * 2)};
   const std::array<uint32_t, 2> anchors{1, 2};

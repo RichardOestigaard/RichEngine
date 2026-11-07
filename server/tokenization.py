@@ -18,6 +18,11 @@ def _reply_memory_disabled():
     return os.environ.get(_REPLY_MEMORY_DISABLED) == "1"
 
 
+# Reply texts index on their last _REPLY_SUFFIX chars; _reply_at probes at
+# most that many suffix slices per turn boundary.
+_REPLY_SUFFIX = 24
+
+
 class PromptTokenizer:
     def __init__(self, tokenizer, marker=None):
         self.tokenizer = tokenizer
@@ -38,12 +43,17 @@ class PromptTokenizer:
         self.bytes = self.hits = self.reused_tokens = 0
         # Reply text -> the ids the model emitted for it, a small LRU.
         self.replies = OrderedDict()
+        # Reply text suffix -> the reply texts carrying it, so _reply_at
+        # checks a handful of buckets per boundary instead of every reply.
+        self.reply_buckets = {}
         self.reply_hits = 0
         self.lock = threading.Lock()
 
     MIN_PREFIX_CHARS = 4096
     BUDGET_BYTES = 8 * 1024 * 1024
-    CAPACITY = 4
+    # One entry per live conversation prefix; BUDGET_BYTES is the real
+    # memory bound, so this only needs to outnumber concurrent sessions.
+    CAPACITY = 32
     REPLY_CAPACITY = 256
 
     def _supports_boundaries(self, tokenizer):
@@ -112,10 +122,29 @@ class PromptTokenizer:
         if not ids:
             return
         with self.lock:
+            self._unindex_reply(text)
             self.replies.pop(text, None)
             self.replies[text] = ids
+            self._index_reply(text)
             while len(self.replies) > self.REPLY_CAPACITY:
-                self.replies.popitem(last=False)
+                evicted, _ = self.replies.popitem(last=False)
+                self._unindex_reply(evicted)
+
+    @staticmethod
+    def _reply_key(text):
+        return text[-_REPLY_SUFFIX:]
+
+    def _index_reply(self, text):
+        self.reply_buckets.setdefault(self._reply_key(text), set()).add(text)
+
+    def _unindex_reply(self, text):
+        key = self._reply_key(text)
+        bucket = self.reply_buckets.get(key)
+        if bucket is None:
+            return
+        bucket.discard(text)
+        if not bucket:
+            del self.reply_buckets[key]
 
     def _replies_active(self):
         if _reply_memory_disabled():
@@ -127,21 +156,27 @@ class PromptTokenizer:
         """The remembered reply whose text ends at `boundary` in `text`, as
         (ids, start) with the longest text winning; None without a match."""
         with self.lock:
-            entries = list(self.replies.items())
-        key = ids = None
-        for candidate, candidate_ids in entries:
-            if len(candidate) <= boundary and (
-                key is None or len(candidate) > len(key)
-            ):
-                if text.endswith(candidate, 0, boundary):
-                    key, ids = candidate, candidate_ids
-        if key is None:
-            return None
-        with self.lock:
-            if key in self.replies:
-                self.replies.move_to_end(key)
+            # A reply ending at `boundary` keys on its last _REPLY_SUFFIX
+            # chars — or its whole text when shorter — so the slices ending
+            # at `boundary` name every bucket that can hold a match.
+            found = None
+            for length in range(1, min(_REPLY_SUFFIX, boundary) + 1):
+                bucket = self.reply_buckets.get(text[boundary - length : boundary])
+                if not bucket:
+                    continue
+                for candidate in bucket:
+                    if (
+                        len(candidate) <= boundary
+                        and text.endswith(candidate, 0, boundary)
+                        and (found is None or len(candidate) > len(found))
+                    ):
+                        found = candidate
+            if found is None:
+                return None
+            ids = self.replies[found]
+            self.replies.move_to_end(found)
             self.reply_hits += 1
-        return ids, boundary - len(key)
+        return ids, boundary - len(found)
 
     def _encode_middle(self, text):
         """Tokens for `text`, which ends just past a turn marker, splicing

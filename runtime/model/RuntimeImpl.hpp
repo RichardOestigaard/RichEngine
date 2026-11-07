@@ -70,6 +70,8 @@ namespace richengine::model {
 using metal::BufferStorage;
 using metal::CommandGraph;
 using metal::CommandTicket;
+using metal::EventStep;
+using metal::SharedEvent;
 using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
@@ -624,8 +626,32 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::array<uint64_t, kLaneCount> requestIds{};
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<uint64_t, kLaneCount> positions{};
+    // The shared-event value the predraft's tail signal carries: the next
+    // decode's verify waits on it when the overlap keeps this command in
+    // flight past submission.
+    uint64_t waitValue = 0;
   };
   GpuPredraft gpuPredraft_;
+  SharedEvent predraftEvent_;
+  uint64_t predraftEventValue_ = 0;
+  // RICHENGINE_PREDRAFT_OVERLAP keeps the second-command predraft in
+  // flight through the next decode's encode and submit: its queue-level
+  // signal orders the verify's GPU work after it (Metal 4 commits are not
+  // implicitly serialized), while the host's encode and the Metal submit
+  // already ran during the draft's execution. Every host write the
+  // overlap window overlaps is either identical-valued — anchors and
+  // draft positions, which adoption requires match anyway — or
+  // proposal-hint-only (uniforms, bypass fills), and the ticket drains
+  // in the step's finish before the next launch.
+  const bool predraftOverlap_ = envFlag("RICHENGINE_PREDRAFT_OVERLAP");
+  // GPU/wall seconds of the last settleGpuPredraft drain, folded into the
+  // next finalizeDecode's lastDecodeGpuSeconds/lastDecodeWallSeconds: a
+  // second-command predraft serializes on the same queue between the
+  // measured commands, so the cycle's GPU measure must include it or
+  // wall−GPU reads its execution as a host gap. Chained predrafts leave
+  // these at zero — their dispatches are inside the measured command.
+  double settledPredraftGpu_ = 0.0;
+  double settledPredraftWall_ = 0.0;
   const bool gpuPredraftOn_ =
       modelPolicy().gpuPredraft && geometry.tuning.gpuPredraft;
   // RICHENGINE_CHAIN_PREDRAFT=0 keeps the post-finalize second-command
@@ -648,7 +674,19 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     const CommandTiming timing = gpuPredraft_.ticket.wait();
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.totalDecodeWallSeconds += timing.wallSeconds;
+    settledPredraftGpu_ = timing.gpuSeconds;
+    settledPredraftWall_ = timing.wallSeconds;
     gpuPredraft_.submitted = false;
+  }
+  // The queue-level wait a submitted-behind verify takes on the in-flight
+  // predraft's tail signal — empty unless the overlap armed one.
+  std::optional<EventStep> inFlightPredraftWait() const {
+    if (!predraftOverlap_ || !gpuPredraft_.submitted || !predraftEvent_)
+      return std::nullopt;
+    return EventStep{.before = 0,
+                     .event = predraftEvent_,
+                     .value = gpuPredraft_.waitValue,
+                     .kind = EventStep::Kind::Wait};
   }
   // Packs one lane's next-step draft inputs without prepareDecodeLane's
   // readiness asserts or page-table work: the anchor the step just
@@ -3400,10 +3438,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     }
 
     counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
-    counters.lastDecodeGpuSeconds = timing.gpuSeconds;
+    counters.lastDecodeGpuSeconds = timing.gpuSeconds + settledPredraftGpu_;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
-    counters.lastDecodeWallSeconds = timing.wallSeconds;
+    counters.lastDecodeWallSeconds =
+        timing.wallSeconds + settledPredraftWall_;
     counters.totalDecodeWallSeconds += timing.wallSeconds;
+    settledPredraftGpu_ = 0.0;
+    settledPredraftWall_ = 0.0;
     kickAnePredictors(lanes, items);
     if (finTiming) {
       const auto f2 = std::chrono::steady_clock::now();

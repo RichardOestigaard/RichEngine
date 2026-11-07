@@ -365,10 +365,15 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                                                                                       : stagedTiers(policy_)),
                              .spread = spreads};
   // Measured per-shape splits scope themselves to the devices they name
-  // (DeviceTuning.cpp).
-  if (!onePass)
-    if (const uint32_t splits = measuredGgufSplits(policy_, n, k, stagedTileRows(w.rows), native))
+  // (DeviceTuning.cpp). The actual row count wins, so a 24-row batch can
+  // take a plan distinct from the 32-row tile it pads into; the tile-row
+  // lookup stays the fallback.
+  if (!onePass) {
+    if (const uint32_t splits = measuredGgufSplits(policy_, n, k, w.rows, native))
       config.splits = splits;
+    else if (const uint32_t splits = measuredGgufSplits(policy_, n, k, stagedTileRows(w.rows), native))
+      config.splits = splits;
+  }
   // Under 4.5 bits a lane's rows run on the 16-row tile in two halves (the
   // tile's bit rows carry its lane) where its own plan is unsplit.
   // sixteenRows needs the input arena's storageRows pad to 16

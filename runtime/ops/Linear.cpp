@@ -92,6 +92,32 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
 constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return uint64_t{width} * rows * 2; }
 
+// Opt-in prefill experiments (Tuning.hpp). RICHENGINE_PREFILL_Q4_KSPLIT=N
+// splits K across N threadgroups of each output tile (the *_ksplit kernels'
+// fp32 partials and last-arrival reduce); RICHENGINE_PREFILL_Q4_PERSISTENT=N
+// runs N column-striding threadgroups per row tile (the *_persist kernels,
+// N=1 picks a per-core count).
+uint32_t prefillKsplit() noexcept {
+  static const uint32_t splits = tuning().prefillQ4Ksplit;
+  return splits;
+}
+uint32_t prefillPersistent() noexcept {
+  static const uint32_t groups = tuning().prefillQ4Persistent;
+  return groups;
+}
+// A prefill plan may split K when the flag names a power of two no larger
+// than the projection's quant-group count.
+bool prefillSplitsK(LinearWorkload w, LinearTile tile) noexcept {
+  return w.phase == LinearPhase::Prefill && prefillKsplit() > 1 &&
+         (tile == LinearTile::N128 || tile == LinearTile::N256);
+}
+// A prefill plan may loop column tiles inside persistent threadgroups when
+// the flag is set.
+bool prefillPersistentTile(LinearWorkload w, LinearTile tile) noexcept {
+  return w.phase == LinearPhase::Prefill && prefillPersistent() &&
+         (tile == LinearTile::N128 || tile == LinearTile::N256);
+}
+
 // The four-simdgroup kernels: every prefill N128 tile, the decode M24 N128
 // plain and residual projections, all matrix row tiles, and the one-lane
 // Paired256 (plain) tile.
@@ -230,10 +256,19 @@ void requireAffineProjection(const Projection &p, LinearMatrix matrix) {
   requireBytes(p.affine().biases, parameters * 2, "projection bias");
 }
 
+uint32_t LinearPlan::prefillTileRows() const noexcept {
+  // RICHENGINE_PREFILL_Q4_M64 opts the 64-row prefill tile in for chunks wider
+  // than the 32-row tile; narrower chunks keep it.
+  // sg4 plans have no 64-row instantiation — they keep the 32-row tile.
+  return tuning().prefillQ4M64 && workload_.rows > kAffinePrefillTileRows &&
+                 config_.simdgroups != LinearSimdgroups::Four
+             ? 64 : kAffinePrefillTileRows;
+}
 uint32_t LinearPlan::storageRows() const noexcept {
   if (workload_.weightLayout == WeightLayout::Block32) return blockStorageRows();
   if (workload_.phase != LinearPhase::Prefill) return workload_.rows;
-  return ((workload_.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows) * kAffinePrefillTileRows;
+  const uint32_t tileRows = prefillTileRows();
+  return ((workload_.rows + tileRows - 1) / tileRows) * tileRows;
 }
 uint32_t LinearPlan::tileColumns() const noexcept {
   switch (config_.tile) {
@@ -281,6 +316,12 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (config_.tile == LinearTile::Split128)
     return {0, 0, uint64_t{config_.splits} * workload_.rows * n * sizeof(float),
             uint64_t{n / tileColumns()} * sizeof(uint32_t)};
+  // The opt-in prefill K split publishes fp32 partials [split][rows][columns]
+  // and holds one arrival counter per (row tile, column tile).
+  if (workload_.phase == LinearPhase::Prefill && config_.splits > 1)
+    return {0, 0,
+            uint64_t{config_.splits} * storageRows() * n * sizeof(float),
+            uint64_t{storageRows() / prefillTileRows()} * (n / tileColumns()) * sizeof(uint32_t)};
   if (!usesSimdgroup()) return {};
   const uint64_t rows = workload_.rows;
   const uint64_t lanes = rows / kDecodeActivationRows;
@@ -321,17 +362,29 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool ggufTile = blockTile(config.tile);
   if (ggufTile != (w.weightLayout == WeightLayout::Block32))
     throw std::invalid_argument("block projections run the GGUF tiles, affine ones the Q4 tiles");
-  if (w.phase == LinearPhase::Decode && persistentTile(config.tile)
+  const bool persistentGrid =
+      (w.phase == LinearPhase::Decode && persistentTile(config.tile)) ||
+      prefillPersistentTile(w, config.tile);
+  if (persistentGrid
           ? !config.groups || config.groups > w.matrix.outputSize / tileColumns()
           : config.groups != 0)
-    throw std::invalid_argument("a persistent decode tile takes 1 to its column tiles in groups, every other plan 0");
+    throw std::invalid_argument("a persistent tile takes 1 to its column tiles in groups, every other plan 0");
   if (ggufTile) {
     // Kernel names follow the segment formats (LinearGguf.cpp).
     requireBlockConfiguration();
     return;
   }
   const bool splitsK = config.tile == LinearTile::Simdgroup || config.tile == LinearTile::Split128;
-  if (!splitsK && config.splits != 1)
+  // The opt-in prefill K split keeps the N128/N256 tiles and splits whole
+  // quant groups over the grid's third dimension.
+  const bool prefillSplit = prefillSplitsK(w, config.tile) && config.splits > 1;
+  if (prefillSplit &&
+      (!config.validSplits() || config.splits < 2 ||
+       w.matrix.inputSize / kQuantGroup < config.splits ||
+       (w.matrix.inputSize / kQuantGroup) % config.splits))
+    throw std::invalid_argument(
+        "prefill K splits require whole power-of-two quant-group partitions");
+  if (!splitsK && !prefillSplit && config.splits != 1)
     throw std::invalid_argument("K splits require the simdgroup or Split128 Q4 tile");
   if (config.simdgroups == LinearSimdgroups::Four && !supportsFourSimdgroups(w, config.tile))
     throw std::invalid_argument("invalid Q4 cooperative execution scope");
@@ -340,23 +393,54 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   const bool residual = w.epilogue == LinearEpilogue::Residual;
   const bool four = config.simdgroups == LinearSimdgroups::Four;
   if (w.phase == LinearPhase::Prefill) {
-    if (oneLaneTile(config.tile) || splitsK)
+    if (oneLaneTile(config.tile) || splitsK || (prefillSplit && config.groups))
       throw std::invalid_argument("invalid Q4 prefill configuration");
+    const bool m64 = prefillTileRows() == 64;
+    // The opt-in variants of each kernel: the K-split kernels (1) and the
+    // column-looping persistent kernels (2), both only where instantiated.
+    const uint32_t experiment = prefillSplit ? 1 : config.groups ? 2 : 0;
+    const auto pick = [experiment](std::string_view base, std::string_view ksplit,
+                                   std::string_view persist) {
+      return experiment == 1 ? ksplit : experiment == 2 ? persist : base;
+    };
     if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
-          ? kPrefillLinearQ4N128UpSiluSumsSg4
-          : residual ? kPrefillLinearQ4N128ResidualSg4 : kPrefillLinearQ4N128Sg4;
+          ? pick(kPrefillLinearQ4N128UpSiluSumsSg4, kPrefillLinearQ4N128UpSiluSumsSg4Ksplit,
+                 kPrefillLinearQ4N128UpSiluSumsSg4Persist)
+          : residual
+              ? pick(kPrefillLinearQ4N128ResidualSg4, kPrefillLinearQ4N128ResidualSg4Ksplit,
+                     kPrefillLinearQ4N128ResidualSg4Persist)
+              : pick(kPrefillLinearQ4N128Sg4, kPrefillLinearQ4N128Sg4Ksplit,
+                     kPrefillLinearQ4N128Sg4Persist);
     } else if (w.epilogue == LinearEpilogue::UpWithGate) {
       if (config.tile != LinearTile::N256)
         throw std::invalid_argument(
             "Q4 fused prefill up requires N256 or four simdgroups");
-      pipeline_ = kPrefillLinearQ4N256UpSiluSums;
+      pipeline_ = m64
+          ? pick(kPrefillLinearQ4N256UpSiluSumsM64, kPrefillLinearQ4N256UpSiluSumsM64Ksplit,
+                 kPrefillLinearQ4N256UpSiluSumsM64Persist)
+          : pick(kPrefillLinearQ4N256UpSiluSums, kPrefillLinearQ4N256UpSiluSumsKsplit,
+                 kPrefillLinearQ4N256UpSiluSumsPersist);
     } else if (residual) {
       pipeline_ = config.tile == LinearTile::N128
-          ? kPrefillLinearQ4N128Residual : kPrefillLinearQ4N256Residual;
+          ? (m64 ? pick(kPrefillLinearQ4N128ResidualM64, kPrefillLinearQ4N128ResidualM64Ksplit,
+                        kPrefillLinearQ4N128ResidualM64Persist)
+                 : pick(kPrefillLinearQ4N128Residual, kPrefillLinearQ4N128ResidualKsplit,
+                        kPrefillLinearQ4N128ResidualPersist))
+          : (m64 ? pick(kPrefillLinearQ4N256ResidualM64, kPrefillLinearQ4N256ResidualM64Ksplit,
+                        kPrefillLinearQ4N256ResidualM64Persist)
+                 : pick(kPrefillLinearQ4N256Residual, kPrefillLinearQ4N256ResidualKsplit,
+                        kPrefillLinearQ4N256ResidualPersist));
     } else {
       pipeline_ = config.tile == LinearTile::N128
-          ? kPrefillLinearQ4N128 : kPrefillLinearQ4N256;
+          ? (m64 ? pick(kPrefillLinearQ4N128M64, kPrefillLinearQ4N128M64Ksplit,
+                        kPrefillLinearQ4N128M64Persist)
+                 : pick(kPrefillLinearQ4N128, kPrefillLinearQ4N128Ksplit,
+                        kPrefillLinearQ4N128Persist))
+          : (m64 ? pick(kPrefillLinearQ4N256M64, kPrefillLinearQ4N256M64Ksplit,
+                        kPrefillLinearQ4N256M64Persist)
+                 : pick(kPrefillLinearQ4N256, kPrefillLinearQ4N256Ksplit,
+                        kPrefillLinearQ4N256Persist));
     }
     return;
   }
@@ -570,6 +654,17 @@ uint32_t apple10Splits(LinearMatrix matrix, uint32_t cores) noexcept {
 constexpr uint32_t kPaired256TilesPerCore = 3;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
+// The residual kernel a view of leading inputs runs for `config` — the
+// unsplit, non-persistent instance, the only one with a _leading_inputs
+// variant.
+std::string_view prefillResidualBase(LinearConfig config, bool m64) noexcept {
+  if (config.simdgroups == LinearSimdgroups::Four)
+    return kPrefillLinearQ4N128ResidualSg4;
+  return config.tile == LinearTile::N128
+      ? (m64 ? kPrefillLinearQ4N128ResidualM64 : kPrefillLinearQ4N128Residual)
+      : (m64 ? kPrefillLinearQ4N256ResidualM64 : kPrefillLinearQ4N256Residual);
+}
+
 std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
   // validate() requires outputSize % 256 == 0, so every tile width divides it.
   const uint32_t n = w.matrix.outputSize;
@@ -603,14 +698,49 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
     // until a canvas-only tile measures better (see moe-prefill-bench).
     // Measured per-shape plans (DeviceTuning.cpp) scope themselves to the
     // devices they name.
-    if (const auto measured = measuredLinearPlan(policy_, w)) return *measured;
-    if (policy_.apple10Plus() || policy_.cores <= kApple9MeasuredPrefillCores)
-      return {LinearTile::N128, 0, LinearSimdgroups::Four};
-    const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
-    const bool wide = double(rowTiles) * tiles256 >=
-        kApple9WidePrefillGroupsPerCore * policy_.cores;
-    return {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
-                                                              : LinearTile::N128, 0};
+    LinearConfig config;
+    if (const auto measured = measuredLinearPlan(policy_, w)) {
+      config = *measured;
+    } else if (policy_.apple10Plus() || policy_.cores <= kApple9MeasuredPrefillCores) {
+      config = {LinearTile::N128, 0, LinearSimdgroups::Four};
+    } else {
+      const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
+      const bool wide = double(rowTiles) * tiles256 >=
+          kApple9WidePrefillGroupsPerCore * policy_.cores;
+      config = {w.epilogue == LinearEpilogue::UpWithGate || wide ? LinearTile::N256
+                                                                : LinearTile::N128, 0};
+    }
+    // The opt-in experiments reshape the selected plan, never the tile or
+    // scope the policy picked: a K split multiplies the grid, a persistent
+    // grid divides it.
+    if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256)
+      return config;
+    if (config.groups || config.splits != 1) return config;
+    if (const uint32_t wanted = prefillKsplit(); wanted > 1) {
+      // Largest power of two no larger than the flag, still dividing the
+      // projection's quant groups evenly.
+      uint32_t splits = LinearConfig::kMaximumSplits;
+      const uint32_t quantGroups = w.matrix.inputSize / kQuantGroup;
+      while (splits > 1 && (splits > wanted || quantGroups % splits))
+        splits >>= 1;
+      config.splits = splits;
+      return config;
+    }
+    if (const uint32_t wanted = prefillPersistent()) {
+      const uint32_t tileRows = tuning().prefillQ4M64 && w.rows > kAffinePrefillTileRows &&
+              config.simdgroups != LinearSimdgroups::Four
+          ? 64 : kAffinePrefillTileRows;
+      const uint32_t rowTiles = (w.rows + tileRows - 1) / tileRows;
+      const uint32_t colTiles =
+          w.matrix.outputSize / (config.tile == LinearTile::N128 ? 128 : 256);
+      // Four 128- to 256-thread groups per core keeps the machine covered;
+      // larger flag values pin the groups per row tile directly.
+      const uint32_t groups =
+          wanted == 1 ? std::max(1u, 4 * policy_.cores / rowTiles) : wanted;
+      config.groups = std::min(colTiles, groups);
+      return config;
+    }
+    return config;
   }
   const uint32_t lanes = w.rows / kDecodeActivationRows;
   // Keep the existing broad-column plain projection path for wider batches:
@@ -821,6 +951,14 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   bound.include(plan({{shape.outputSize, shape.inputSize}, RICHENGINE_PREFILL_TOKEN_BUDGET,
                       LinearPhase::Prefill, LinearEpilogue::None, shape.layout})
                     .scratchSize());
+  // The opt-in prefill K split may run at any chunk size on every epilogue;
+  // its partials and counters scale with the row count, so bound them at the
+  // budget.
+  if (prefillKsplit() > 1)
+    for (const auto epilogue : {LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      bound.include(plan({{shape.outputSize, shape.inputSize}, RICHENGINE_PREFILL_TOKEN_BUDGET,
+                          LinearPhase::Prefill, epilogue, shape.layout})
+                        .scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(RICHENGINE_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, RICHENGINE_PREFILL_TOKEN_BUDGET);
@@ -951,14 +1089,29 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const auto dispatch = [&](std::string_view name,
       std::initializer_list<metal::MetalBuffer> bindings) {
     if (w.phase == LinearPhase::Prefill) {
-      const metal::DispatchSize groups{selected.storageRows() / kAffinePrefillTileRows,
-                                       n / selected.tileColumns(), 1};
+      const LinearConfig config = selected.configuration();
+      const uint32_t rowTiles = selected.storageRows() / selected.prefillTileRows();
+      const uint32_t colTiles = n / selected.tileColumns();
       const metal::DispatchSize threads{selected.threadsPerThreadgroup(), 1, 1};
-      if (p.planeInputs())
-        graph.add(leadingInputsInstance(name), bindings, Q4PrefillLeadingParams{{n, k}, p.planeInputs()}, groups,
+      if (p.planeInputs()) {
+        // A view of leading inputs keeps its dedicated residual instance;
+        // the opt-in experiments have none.
+        graph.add(leadingInputsInstance(prefillResidualBase(config, selected.prefillTileRows() == 64)),
+                  bindings, Q4PrefillLeadingParams{{n, k}, p.planeInputs()}, {rowTiles, colTiles, 1},
                   threads);
-      else
-        graph.add(std::string(name), bindings, Q4Params{n, k}, groups, threads);
+      } else if (config.splits > 1) {
+        // The K-split kernels take the split's partials and counters after
+        // the epilogue buffers and dispatch one split column per z.
+        std::vector<metal::MetalBuffer> buffers(bindings);
+        buffers.insert(buffers.end(), {b.scratch.partials, b.scratch.counters});
+        graph.add(std::string(name), std::move(buffers), Q4Params{n, k},
+                  {rowTiles, colTiles, config.splits}, threads);
+      } else if (config.groups) {
+        graph.add(std::string(name), std::vector<metal::MetalBuffer>(bindings),
+                  Q4PersistentParams{n, k, config.groups}, {rowTiles, config.groups, 1}, threads);
+      } else {
+        graph.add(std::string(name), bindings, Q4Params{n, k}, {rowTiles, colTiles, 1}, threads);
+      }
     } else {
       // Split128 binds its partials and counters after the sequential
       // kernel's buffers; every other decode tile runs one K split.

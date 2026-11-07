@@ -141,6 +141,7 @@ struct DispatchSize {
 struct BufferBinding {
   uint32_t index = 0;
   MetalBuffer buffer;
+  bool writable = true;
 };
 
 // The pointed-to data only needs to remain valid until submit() returns.

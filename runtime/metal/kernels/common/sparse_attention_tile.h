@@ -94,7 +94,7 @@ struct RichSparseScratch {
   float row_max[M];
   float row_sum[M];
   float previous_scale[M];
-  atomic_uint rescale;
+  atomic<uint, thread_scope_threadgroup> rescale;
 };
 
 // The place in its page of the block of a step's slot.
@@ -140,7 +140,8 @@ template <uint QueryHeadsPerKVHead, uint Tokens, bool Quantized>
 inline void richengine_sparse_softmax_lane(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     threadgroup const float *key_scales, threadgroup const float *value_scales,
     threadgroup const uint *entries, uint first_position, uint active_rows,
     uint lane_index, float qk_scale) {

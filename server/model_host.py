@@ -43,8 +43,15 @@ def _engine_binary(binary: str, assembly_dir: Path) -> str:
     Older builds kept a block-8 variant in a sibling build8/ directory
     (packaged: engine8/) for drafts trained at eight rows; the unified
     richengine's dispatch picks the variant itself from the model's draft
-    geometry. Keep returning one for trees still built that way.
+    geometry. Keep returning one for trees still built that way — detected
+    by the main binary lacking the dispatcher's marker, since a stale
+    sibling can predate the model's features.
     """
+    try:
+        if b"Verify geometry" in Path(binary).read_bytes():
+            return binary
+    except OSError:
+        pass
     try:
         draft = json.loads((assembly_dir / "draft" / "config.json").read_text())
     except (OSError, json.JSONDecodeError):

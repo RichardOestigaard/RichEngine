@@ -71,6 +71,7 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
 }
 // The staged decode kernels: grid (column tiles, K partitions), two simdgroups.
 template <class F, ushort Rows, GgufEpilogue Ep, class Out>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],
                         device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]],
                         device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
@@ -102,6 +103,7 @@ QUANT_FORMATS(GGUF_DECODE_FORMAT)
 // fused head: dead rows write -inf partials; the excluded stop tokens never
 // win.
 template <class F, ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
                              device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
                              device float *argmax_values [[buffer(4)]], device uint *argmax_indices [[buffer(5)]],
@@ -214,6 +216,7 @@ GGUF_DECODE_FORMAT(FmtMXFP4N, mxfp4n)
 // kernels, Apple GPU family 10 and up): the packed-FP4 decode tile of
 // kernels/common/gguf_mxfp4_tile.h over one tensor's planes.
 template <ushort Rows, GgufEpilogue Ep, class Out>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void gguf_decode_mxfp4(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
                               device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
                               device Out *output [[buffer(4)]],
@@ -248,6 +251,7 @@ GGUF_DECODE_MXFP4_ROWS(r, EpResidual, bfloat) GGUF_DECODE_MXFP4_ROWS(g, EpUpWith
 // up): the packed-B tile of kernels/common/gguf_mxfp4_tile.h over plane0,
 // the group's (s, m - s * Zero) coefficient applied in the epilogue.
 template <class F, class BT, ushort Rows, GgufEpilogue Ep, class Out>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void gguf_decode_packed(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
                                device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
                                device Out *output [[buffer(4)]],
@@ -295,6 +299,7 @@ GGUF_DECODE_PACKED_FORMAT(FmtPQ20, pq20, uint2b_format)
 // of the up pass's sums, and the output is bf16(up) * silu(bf16(gate)) as the up pass writes it. Split partials
 // [split][Rows][2 * out_stride]: the gate's columns, then the up's at out_stride on; one counter per 32 columns.
 template <class F, ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_GATE_UP_THREADS)]]
 kernel void gguf_decode_gate_up(device bfloat *input [[buffer(0)]], device uchar *gw0 [[buffer(1)]],
                                 device uchar *gw1 [[buffer(2)]], device uchar *gmeta [[buffer(3)]],
                                 device uchar *uw0 [[buffer(4)]], device uchar *uw1 [[buffer(5)]],
@@ -365,6 +370,7 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 // template instantiations (weak_odr) the compiler infers fewer parameter attributes and inlines differently.
 #define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
 #define GGUF_DECODE_FUSED(R, SUFFIX, NATIVE)                                                                       \
+  [[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]                                                       \
   kernel void gguf_decode_fused_m##R##SUFFIX(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),          \
                                      GGUF_SEGMENT(4, w0b, w1b, mb), GGUF_SEGMENT(7, w0c, w1c, mc),                \
                                      device bfloat *output [[buffer(10)]],                                        \
@@ -422,6 +428,7 @@ GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS);                                      \
   threadgroup half stage[kPrefillStages]
 #define GGUF_PREFILL(F, f)                                                                                         \
+  [[max_total_threads_per_threadgroup(GGUF_PREFILL_THREADS)]]                                                      \
   kernel void gguf_prefill_##f##_a(GGUF_PREFILL_BUFFERS, constant GgufPrefillParams &p [[buffer(5)]],            \
                                    GGUF_PREFILL_THREAD) {                                                          \
     GGUF_PREFILL_TABLES(F);                                                                                        \
@@ -432,6 +439,7 @@ GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED
                                          p.out_stride, p.out_offset);                                              \
   }
 #define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
+  [[max_total_threads_per_threadgroup(GGUF_PREFILL_THREADS)]]                                                      \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
     GGUF_PREFILL_TABLES(F);                                                                                        \

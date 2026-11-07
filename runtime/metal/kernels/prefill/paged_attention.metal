@@ -12,7 +12,8 @@ inline void richengine_prefill_attention_split_phase(
     constant RichPrefillAttentionParams &params,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
-    threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
+    threadgroup float *previous_scale,
+    threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     uint3 group, uint thread_index) {
   constexpr uint D = HeadDim;
   uint kv_head = group.x;
@@ -67,7 +68,7 @@ inline void richengine_prefill_attention_reduce_phase(
 }
 
 #define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \
-  kernel void Name(                                                            \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
@@ -82,7 +83,7 @@ inline void richengine_prefill_attention_reduce_phase(
     threadgroup float row_max[M];                                              \
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     richengine_prefill_attention_split_phase<Heads, Group, CacheElement>(          \
         queries, partials, statistics, page_table, params, scores,             \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
@@ -148,7 +149,7 @@ kernel void prefill_attention_reduce_kv2_g8(
 // dimensions (_hd128) and LFM2's KV8/Group4 pages of 64 (_hd64). The reduce
 // threadgroup is the head dimension.
 #define PREFILL_ATTENTION_SPLIT_HD(Name, Heads, Group, CacheElement, HeadDim) \
-  kernel void Name(                                                         \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(              \
       device bfloat *queries [[buffer(0)]],                                 \
       device bfloat *partials [[buffer(1)]],                                 \
       device float *statistics [[buffer(2)]],                               \
@@ -163,7 +164,7 @@ kernel void prefill_attention_reduce_kv2_g8(
     threadgroup float row_max[M];                                           \
     threadgroup float row_sum[M];                                           \
     threadgroup float previous_scale[M];                                    \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     richengine_prefill_attention_split_phase<Heads, Group, CacheElement,        \
                                          HeadDim>(                          \
         queries, partials, statistics, page_table, params, scores,          \
@@ -216,7 +217,7 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k4q4d128, 4, 4, bfloat, 
     threadgroup float row_max[MP];                                          \
     threadgroup float row_sum[MP];                                          \
     threadgroup float previous_scale[MP];                                   \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     richengine_prefill_attention_split_phase<Heads, Group, CacheElement,        \
                                          HeadDim, 2>(                       \
         queries, partials, statistics, page_table, params, scores,          \
@@ -272,7 +273,7 @@ PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k4q4d128, 4, 4, 128)
     threadgroup float row_max[M];                                           \
     threadgroup float row_sum[M];                                           \
     threadgroup float previous_scale[M];                                    \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     constexpr uint D = HeadDim;                                             \
     uint kv_head = group.x;                                                 \
     uint split = group.z;                                                   \
@@ -326,7 +327,7 @@ PREFILL_ATTENTION_SPLIT_SWA(prefill_attention_bf16_split_swa_k4q4d128, 4, 4, bfl
     threadgroup float row_max[MP];                                          \
     threadgroup float row_sum[MP];                                          \
     threadgroup float previous_scale[MP];                                   \
-    threadgroup atomic_uint rescale;                                        \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     constexpr uint D = HeadDim;                                             \
     uint kv_head = group.x;                                                 \
     uint split = group.z;                                                   \

@@ -53,11 +53,13 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # macOS 27 is the tested floor: the engine refuses older systems at
 # startup, and every binary and metallib records it. The MPP kernels need
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
-MACOS_MIN_VERSION := 27
+MACOS_MIN_VERSION := 27.2
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+HOST_CPU_BRAND := $(shell sysctl -n machdep.cpu.brand_string 2>/dev/null)
+M5_CXXFLAGS := $(if $(findstring Apple M5,$(HOST_CPU_BRAND)),-mcpu=apple-m5 -flto=thin)
 PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
-ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
+ENGINE_CXXFLAGS := -std=c++20 -O3 $(M5_CXXFLAGS) -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/richengine.metallib

@@ -1,6 +1,6 @@
-"""DFA-compiled constraints produce the same masks as the llguidance
-grammar path — random token walks compare LLMatcher's next-token mask
-against the compiled DFA's at every step."""
+"""DFA-compiled constraints: the shared DfaCase fixture plus the fast
+suites — constraint commit/mask/finish, wire frames, factory modes. The
+slow llguidance parity walks live in test_dfa_parity.py."""
 
 import array
 import os
@@ -83,7 +83,21 @@ def strict_tool(name, properties, required):
     }
 
 
-class DfaParityTest(unittest.TestCase):
+class DfaCase:
+    """Shared fixture for the DFA suites: a byte-level vocabulary, the
+    llguidance tokenizer/executor pair, spec/grammar builders and the
+    random-walk driver. Not a TestCase itself; the slow parity walks live
+    in test_dfa_parity.py."""
+
+    TOOLS = [
+        strict_tool(
+            "lookup",
+            {"query": {"type": "string"}, "k": {"type": "integer"}},
+            ["query", "k"],
+        ),
+        strict_tool("finish", {}, []),
+    ]
+
     @classmethod
     def setUpClass(cls):
         vocabulary = {char: token for token, char in _byte_alphabet().items()}
@@ -156,9 +170,7 @@ class DfaParityTest(unittest.TestCase):
                 if tid not in expected and tid not in self.eos
             ]
             for tid in dead:
-                self.assertLess(
-                    self.advance(state, tid), 0, f"step {step} token {tid}"
-                )
+                self.assertLess(self.advance(state, tid), 0, f"step {step} token {tid}")
             # llguidance's mask can list a special token its consumer then
             # refuses; skip such picks — the walk continues with the rest.
             candidates = list(sorted(expected))
@@ -206,130 +218,8 @@ class DfaParityTest(unittest.TestCase):
     def json_spec(self, schema, thinking):
         return dfa.json_spec(schema, thinking, think_end="</think>")
 
-    # --- JSON schemas -------------------------------------------------------
 
-    def test_flat_json_schema(self):
-        spec = self.json_spec(SCHEMA, False)
-        self.compile(spec)
-        self.assertLess(self.compiled.n_states, dfa.MAX_DFA_STATES)
-        self.walk(self.json_grammar(SCHEMA, False), seed=1)
-
-    def test_flat_json_schema_with_thinking(self):
-        spec = self.json_spec(SCHEMA, True)
-        self.compile(spec)
-        self.walk(self.json_grammar(SCHEMA, True), seed=2)
-
-    def test_nested_json_schema(self):
-        spec = self.json_spec(NESTED_SCHEMA, False)
-        self.compile(spec)
-        self.walk(self.json_grammar(NESTED_SCHEMA, False), seed=3)
-
-    # --- Tool calls -----------------------------------------------------------
-
-    TOOLS = [
-        strict_tool(
-            "lookup",
-            {"query": {"type": "string"}, "k": {"type": "integer"}},
-            ["query", "k"],
-        ),
-        strict_tool("finish", {}, []),
-    ]
-
-    def test_qwen3_tool_calls(self):
-        for thinking in (False, True):
-            for choice in ("required", "auto"):
-                for schema in (None, SCHEMA):
-                    if not (choice == "required" or schema is SCHEMA):
-                        continue
-                    policy = tool_schema.normalize_tools(
-                        self.TOOLS, choice, True, dialect=tool_schema.QWEN3_XML
-                    )[1]
-                    with self.subTest(thinking=thinking, choice=choice, schema=schema):
-                        self.compile(self.tool_spec(policy, thinking, schema))
-                        self.walk(
-                            self.tool_grammar(policy, thinking, schema),
-                            seed=(thinking, choice, schema is not None).__hash__() & 0xFFFF,
-                            steps=60,
-                        )
-
-    def test_minicpm5_tool_calls(self):
-        policy = tool_schema.normalize_tools(
-            self.TOOLS, "required", True, dialect=tool_schema.MINICPM5_XML
-        )[1]
-        self.compile(self.tool_spec(policy, False, None))
-        self.walk(self.tool_grammar(policy, False, None), seed=11)
-
-    def test_minicpm5_tool_calls_bound(self):
-        # The served dialect, its marker spellings bound to this tokenizer's
-        # ids: `<function` and `<param` spell `<[id]>` atoms since a special
-        # token cannot satisfy a literal.
-        dialect = tool_schema.bind_dialect(
-            tool_schema.MINICPM5_XML, self.tokenizer.get_vocab()
-        )
-        policy = tool_schema.normalize_tools(
-            self.TOOLS, "required", True, dialect=dialect
-        )[1]
-        self.compile(self.tool_spec(policy, False, None))
-        self.walk(self.tool_grammar(policy, False, None), seed=15)
-
-    def test_lfm25_python_tool_calls(self):
-        policy = tool_schema.normalize_tools(
-            self.TOOLS, "required", False, dialect=tool_schema.LFM25_PYTHON
-        )[1]
-        self.compile(self.tool_spec(policy, False, None))
-        self.walk(self.tool_grammar(policy, False, None), seed=12)
-
-    def test_gemma4_tool_calls(self):
-        policy = tool_schema.normalize_tools(
-            self.TOOLS, "required", False, dialect=tool_schema.GEMMA4
-        )[1]
-        self.compile(self.tool_spec(policy, False, None))
-        self.walk(self.tool_grammar(policy, False, None), seed=13)
-
-    def test_xml_free_arguments_compile(self):
-        tools = [
-            {
-                "type": "function",
-                "function": {"name": "anything", "parameters": {}},
-            }
-        ]
-        policy = tool_schema.normalize_tools(
-            tools, "required", True, dialect=tool_schema.QWEN3_XML
-        )[1]
-        self.compile(self.tool_spec(policy, False, None))
-        self.walk(self.tool_grammar(policy, False, None), seed=14)
-
-    # --- Fallbacks -------------------------------------------------------------
-
-    def test_uncompilable_specs_return_none(self):
-        recursive = {
-            "type": "object",
-            "properties": {"next": {"$ref": "#/$defs/node"}},
-            "$defs": {"node": {"type": "object"}},
-            "additionalProperties": False,
-        }
-        self.assertIsNone(dfa.compile_dfa(self.json_spec(recursive, False)))
-        # json_object mode: an open object is not regular here.
-        self.assertIsNone(
-            dfa.compile_dfa(self.json_spec({"type": "object"}, False))
-        )
-        # A non-strict tool's free arguments on the python dialect hold free
-        # JSON — not regular.
-        tools = [
-            {
-                "type": "function",
-                "function": {"name": "free", "parameters": {}},
-            }
-        ]
-        policy = tool_schema.normalize_tools(
-            tools, "required", True, dialect=tool_schema.LFM25_PYTHON
-        )[1]
-        self.assertIsNone(
-            dfa.compile_dfa(self.tool_spec(policy, False, None), self.markers)
-        )
-
-
-class DfaConstraintTest(DfaParityTest):
+class DfaConstraintTest(DfaCase, unittest.TestCase):
     """The constraint object's commit/mask/finish contract."""
 
     def constraint(self):
@@ -365,7 +255,9 @@ class DfaConstraintTest(DfaParityTest):
         self.assertIn(ord("{"), first[0])
         self.assertNotIn(self.eos[0], first[0])
         # Commit the whole document token by token.
-        for text, accepting in (('{"answer":"x","count":3,"ok":true,"mode":"fast"}', True),):
+        for text, accepting in (
+            ('{"answer":"x","count":3,"ok":true,"mode":"fast"}', True),
+        ):
             c = self.constraint()
             for tid in self.tokenizer.encode(text).ids:
                 c.commit([tid])
@@ -391,14 +283,17 @@ class DfaConstraintTest(DfaParityTest):
         self.assertEqual(c.forced_tokens(), ())
         # After the call opener token, the fixed literal is forced.
         policy = tool_schema.normalize_tools(
-            DfaParityTest.TOOLS, "required", True, dialect=tool_schema.QWEN3_XML
+            self.TOOLS, "required", True, dialect=tool_schema.QWEN3_XML
         )[1]
         compiled = dfa.compile_dfa(self.tool_spec(policy, False, None), self.markers)
         contract = constraints.TokenizerContract(
             self.guidance.vocab_size, self.eos, "<eos>", self.think_end_id
         )
         c = constraints.DfaConstraint(
-            compiled, self.vocab_tokens, self.specials, contract,
+            compiled,
+            self.vocab_tokens,
+            self.specials,
+            contract,
             encode=self.tokenizer.encode,
         )
         forced = c.commit([self.tokenizer.token_to_id("<tool_call>")])
@@ -407,7 +302,7 @@ class DfaConstraintTest(DfaParityTest):
         self.assertTrue("\n<function=lookup>\n<parameter=query>\n".startswith(text))
 
 
-class DfaWireTest(DfaParityTest):
+class DfaWireTest(DfaCase, unittest.TestCase):
     """The CONSTRAINT_DFA/VOCABULARY frame payload the engine walks."""
 
     def round_trip(self, message):
@@ -476,7 +371,10 @@ class DfaWireTest(DfaParityTest):
         """The cost table is the unmarked-edge walk fixpoint: accepting
         states cost 0, every other state 1 + its cheapest unmarked-edge
         successor (32767 where no walk a regular token can take ends)."""
-        for spec in (self.json_spec(SCHEMA, False), self.json_spec(NESTED_SCHEMA, True)):
+        for spec in (
+            self.json_spec(SCHEMA, False),
+            self.json_spec(NESTED_SCHEMA, True),
+        ):
             compiled = self.compile(spec)
             rows = array.array("h", bytes(compiled.table)).tolist()
             table = [rows[s * 256 : (s + 1) * 256] for s in range(compiled.n_states)]
@@ -532,7 +430,9 @@ class DfaWireTest(DfaParityTest):
         self.assertEqual(compiled.advance_token(0, 2, vocab3, eos, special), 1)
         self.assertLess(compiled.advance_token(0, 0, vocab, eos, special), 0)
         # A special token whose bytes are the unmarked edge dies.
-        self.assertLess(compiled.advance_token(0, 2, (b"a", b"b", b"b"), eos, special), 0)
+        self.assertLess(
+            compiled.advance_token(0, 2, (b"a", b"b", b"b"), eos, special), 0
+        )
         # Grammar eos stops only at an EOS-admitting state.
         self.assertEqual(compiled.advance_token(1, 9, vocab, eos, special), n_states)
         self.assertLess(compiled.advance_token(0, 9, vocab, eos, special), 0)
@@ -563,7 +463,10 @@ class DfaWireTest(DfaParityTest):
         c.finish()
         # A regular token still errors there.
         c = constraints.DfaConstraint(
-            compiled, self.vocab_tokens, self.specials, contract,
+            compiled,
+            self.vocab_tokens,
+            self.specials,
+            contract,
             encode=self.tokenizer.encode,
         )
         for tid in self.tokenizer.encode(text).ids:
@@ -573,7 +476,7 @@ class DfaWireTest(DfaParityTest):
             c.masks(())
 
 
-class DfaFactoryTest(DfaParityTest):
+class DfaFactoryTest(DfaCase, unittest.TestCase):
     """ConstraintFactory.create_dfa: the DFA ships to the engine while a
     TokenConstraint delegate on the same grammar serves masks, commits and
     the finishing check — identical output to the grammar path."""
@@ -582,9 +485,7 @@ class DfaFactoryTest(DfaParityTest):
         # A factory on the class tokenizer without the hf wrapper: its
         # fields are what __init__ sets, minus the from_tokenizer conversion
         # the class fixture already did.
-        factory = constraints.ConstraintFactory.__new__(
-            constraints.ConstraintFactory
-        )
+        factory = constraints.ConstraintFactory.__new__(constraints.ConstraintFactory)
         factory.contract = constraints.TokenizerContract(
             self.guidance.vocab_size, self.eos, "<eos>", self.think_end_id
         )

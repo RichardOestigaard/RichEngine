@@ -20,9 +20,9 @@ constexpr double kMinimumGain = 0.05;
 // a prefill, so a chunk that splits within this prefills at most about 1%
 // slower.
 constexpr double kChunkNoise = 0.02;
-// The first word of a Calibration's text, which a change to its fields
-// renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
+// The first word of a Calibration's text, which a change to the model
+// it was chosen by renumbers (the three-share fit picks other units).
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -69,6 +69,24 @@ Model fit(const Timing &low, const Timing &high) {
   if (!(low.share < high.share)) throw std::invalid_argument("ANE FFN calibration needs a low and a high share");
   const double slope = (high.gpu - low.gpu) / (high.share - low.share);
   Model model{{low.gpu - slope * low.share, slope}, {0.0, high.split / high.share}};
+  const double gpu = model.gpu(low.share), ane = model.ane(low.share);
+  if (gpu > ane) model.u = std::clamp((low.split - gpu) / ane, 0.0, 1.0);
+  return model;
+}
+
+// The affine ANE line through the two shares it binds. On an M5 Pro it lifts
+// the chosen share from 0.38 to the measured optimum of 0.42 — the
+// proportional fit charged each share a fixed evaluation cost it only pays
+// once. Where the mid share is not the ANE's — a GPU-bound machine times it
+// on the GPU's side — the rate goes through the high share, as the
+// two-share fit does.
+Model fit(const Timing &low, const Timing &mid, const Timing &high) {
+  if (!(low.share < mid.share && mid.share < high.share))
+    return fit(low, high);
+  Model model = fit(low, high);
+  const double slope = (high.split - mid.split) / (high.share - mid.share);
+  const double intercept = mid.split - slope * mid.share;
+  if (intercept >= 0.0 && slope > 0.0) model.ane = {intercept, slope};
   const double gpu = model.gpu(low.share), ane = model.ane(low.share);
   if (gpu > ane) model.u = std::clamp((low.split - gpu) / ane, 0.0, 1.0);
   return model;

@@ -238,6 +238,12 @@ constexpr MeasuredSplit kMeasuredStagedSplits[] = {
     {kApple10Plus20Cores, 5'120, 17'408, 8, 8}, {kApple10Plus20Cores, 5'120, 17'408, 16, 8},
     {kApple10Plus20Cores, 14'336, 5'120, 8, 4}, {kApple10Plus20Cores, 14'336, 5'120, 16, 4},
     {kApple10Plus20Cores, 16'640, 5'120, 8, 4}, {kApple10Plus20Cores, 16'640, 5'120, 16, 4},
+    // Three-lane decode (24 rows) pads to the 32-row staged tile: the 20-core
+    // M5 Pro keeps the 32-row shapes' measured splits until an M24 tile or a
+    // per-row measurement says otherwise — the same splits the tier picks
+    // for these Qwen3.8-27B shapes at 32 rows.
+    {kApple10Plus20Cores, 17'408, 5'120, 24, 4}, {kApple10Plus20Cores, 5'120, 17'408, 24, 8},
+    {kApple10Plus20Cores, 14'336, 5'120, 24, 4}, {kApple10Plus20Cores, 16'640, 5'120, 24, 4},
     // Granite-4.2-3B and -8B shapes on the 20-core M5 Pro: the fused QKV and
     // gate/up packs, the narrow KV segments at 8 rows, the 8B attention out,
     // gate/up and 32-row KV, and the LFM2.5 16-row down.

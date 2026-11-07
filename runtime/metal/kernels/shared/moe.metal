@@ -37,6 +37,7 @@ inline float moe_route_group_term(float dot, float scale, float sum,
 // Eight rows by 32 experts per threadgroup. Simdgroup s owns K slice s and
 // stages its rows in threadgroup memory, so a ragged tail never reads past
 // the last live row; the threadgroup then sums the slice partials in order.
+[[max_total_threads_per_threadgroup(256)]]
 kernel void moe_route_scores_q8_m8(
     device bfloat *input [[buffer(0)]],
     device uint8_t *router_weights [[buffer(1)]],
@@ -112,7 +113,8 @@ kernel void moe_route_scores_q8_m8(
         ulong(quant_group) * StorageN + expert_origin + simd_lane;
     slice_parameters[simd_lane] = float(router_scales[parameter]);
     slice_parameters[TileN + simd_lane] = float(router_biases[parameter]);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
     for (uint row = 0; row < Rows; ++row) {
       const float sum = moe_route_row_sum(staged + row * 64, simd_lane);
       if (simd_lane == 0)
@@ -123,7 +125,8 @@ kernel void moe_route_scores_q8_m8(
         dextents<int, 2>{64, TileN}, array<int, 2>{1, 64});
     auto b_slice = b.slice<64, TileN>(0, 0);
     operation.run(a_slice, b_slice, partial);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
     q4_visit(accumulated, traversal,
              [&](ushort i) __attribute__((always_inline)) {
       auto index = accumulated.get_multidimensional_index(i);
@@ -132,14 +135,15 @@ kernel void moe_route_scores_q8_m8(
                                slice_sums[index[1]],
                                slice_parameters[TileN + index[0]]);
     });
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                      thread_scope_simdgroup);
   }
   q4_visit(accumulated, traversal, [&](ushort i) {
     auto index = accumulated.get_multidimensional_index(i);
     partials[(simd_group * Rows + index[1]) * TileN + index[0]] =
         accumulated[i];
   });
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const uint row = thread_index / TileN;
   const uint column = thread_index % TileN;
   float total = 0.0f;
@@ -153,6 +157,7 @@ kernel void moe_route_scores_q8_m8(
 // 32 rows by 128 experts per threadgroup: all eight simdgroups run each
 // quant group's matmul from the staged rows, accumulating the K slices in the
 // same order as the 8-row tile.
+[[max_total_threads_per_threadgroup(256)]]
 kernel void moe_route_scores_q8_m32(
     device bfloat *input [[buffer(0)]],
     device uint8_t *router_weights [[buffer(1)]],
@@ -364,7 +369,8 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
       selected[row_routes + rank] = winner;
     }
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     float denominator = 0.0f;
     for (uint other = 0; other < params.top_k; ++other) {
@@ -739,7 +745,8 @@ kernel void moe_route_select_sigmoid(
       selected[row_routes + rank] = winner;
     }
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);
   // norm_topk_prob: the winners' sigmoid scores over their sum.
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     float denominator = 0.0f;
@@ -785,7 +792,8 @@ inline void moe_sigmoid_select_row(device uint *selected,
       selected[row_routes + rank] = winner;
     }
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);
   // norm_topk_prob: the winners' sigmoid scores over their sum.
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     float denominator = 0.0f;
@@ -1023,6 +1031,7 @@ inline void moe_expert_tile(device bfloat *grouped_input,
       simd_lane, simd_group);
 }
 
+[[max_total_threads_per_threadgroup(256)]]
 kernel void moe_expert_gate_up_q4_m8(
     device bfloat *grouped_input [[buffer(0)]],
     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -1042,6 +1051,7 @@ kernel void moe_expert_gate_up_q4_m8(
                         group, input_sums, simd_lane, simd_group);
 }
 
+[[max_total_threads_per_threadgroup(256)]]
 kernel void moe_expert_down_q4_m8(
     device bfloat *grouped_input [[buffer(0)]],
     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -1066,6 +1076,7 @@ kernel void moe_expert_down_q4_m8(
 // (runtime/ops/MoE.hpp). Every output element sums its quant groups in the
 // same order at either width or simdgroup count, so the outputs are
 // bit-identical to the tiles above.
+[[max_total_threads_per_threadgroup(128)]]
 kernel void moe_expert_gate_up_q4_m8_n128_sg4(
     device bfloat *grouped_input [[buffer(0)]],
     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -1086,6 +1097,7 @@ kernel void moe_expert_gate_up_q4_m8_n128_sg4(
                                 input_sums, simd_lane, simd_group);
 }
 
+[[max_total_threads_per_threadgroup(128)]]
 kernel void moe_expert_down_q4_m8_n256_sg4(
     device bfloat *grouped_input [[buffer(0)]],
     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -1142,6 +1154,7 @@ inline void moe_shared_tile(device bfloat *input, device const uint *tile_count,
 }
 
 #define MOE_SHARED_KERNELS(Tag, Rows, TileNGateUp, TileNDown, Simdgroups)     \
+  [[max_total_threads_per_threadgroup((Simdgroups) * 32)]]                    \
   kernel void moe_shared_gate_up_q4_##Tag(                                    \
       device bfloat *input [[buffer(0)]],                                   \
       device const uint *tile_count [[buffer(1)]],                          \
@@ -1157,6 +1170,7 @@ inline void moe_shared_tile(device bfloat *input, device const uint *tile_count,
         input, tile_count, shared_gate, shared_up, output, params, group,   \
         input_sums, simd_lane, simd_group);                                 \
   }                                                                         \
+  [[max_total_threads_per_threadgroup((Simdgroups) * 32)]]                    \
   kernel void moe_shared_down_q4_##Tag(                                     \
       device bfloat *input [[buffer(0)]],                                   \
       device const uint *tile_count [[buffer(1)]],                          \

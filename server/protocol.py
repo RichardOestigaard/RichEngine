@@ -664,10 +664,15 @@ def _words(values: object, label: str) -> array.array:
     """A tuple of uint32 words, packed as the frame carries them."""
     if type(values) is not tuple:
         raise ValueError(f"{label} must be a tuple of uint32 values")
-    # Prompts run to a million words, so accept the common valid case in C:
-    # the array refuses an int outside uint32. Anything else falls through to
-    # the per-word check for its exact error.
-    if set(map(type, values)) == {int}:
+    # Prompts run to a million words, so scan for a non-int word first —
+    # bools and IntEnums pack silently through __index__ but are not the
+    # exact ints the frame means — then let array refuse an out-of-range
+    # int in C. Anything else falls through to the per-word check for its
+    # exact error.
+    for value in values:
+        if type(value) is not int:
+            break
+    else:
         try:
             return array.array("I", values)
         except OverflowError:

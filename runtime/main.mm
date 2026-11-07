@@ -388,6 +388,29 @@ bootstrapConfig(const NativeArguments &arguments) {
     if (share > 1.0) throw UsageError("RICHENGINE_COREAI_FFN wants a share in (0, 1]");
     config.resources.aneFfn.coreai = engine::AneFfnSetting::Given{share};
   }
+  // RICHENGINE_ANE_FFN=<share>[,<minimumRows>]: the opt-in private-program
+  // split without calibrating — the measured winner where the calibration's
+  // chunk margin stays conservative (on the 20-core M5 Pro a share of 0.5
+  // takes the 512-row chunk the calibrated 0.38/minimum-684 refuses: ~8%
+  // faster prefill on Qwen3.8-27B). 0 or unset calibrates as usual.
+  if (const char *env = std::getenv("RICHENGINE_ANE_FFN"); env && *env) {
+    char *end = nullptr;
+    const double share = std::strtod(env, &end);
+    if (!(share > 0.0 && share <= 1.0))
+      throw UsageError("RICHENGINE_ANE_FFN wants a share in (0, 1]");
+    uint32_t minimumRows = ops::FfnSplit::kMinimumRows;
+    if (end && *end == ',') {
+      char *rowsEnd = nullptr;
+      const unsigned long rows = std::strtoul(end + 1, &rowsEnd, 10);
+      if (rowsEnd == end + 1)
+        throw UsageError("RICHENGINE_ANE_FFN wants integer minimum rows after the comma");
+      minimumRows = static_cast<uint32_t>(rows);
+      end = rowsEnd;
+    }
+    if (end && *end)
+      throw UsageError("RICHENGINE_ANE_FFN wants <share>[,<minimumRows>]");
+    config.resources.aneFfn.given = engine::AneFfnSetting::Given{share, minimumRows};
+  }
   config.resources.moeUnionCap = arguments.moeUnionCap;
   config.preferBlockWeights = arguments.weightLayout == "block";
   config.nativeLoop.engine.maxContext = arguments.maxContext;

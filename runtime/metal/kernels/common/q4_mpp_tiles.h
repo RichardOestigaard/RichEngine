@@ -187,7 +187,7 @@ __attribute__((always_inline)) inline void q4_mpp_tile_sums(
                                         input_sums,
                                         ((first_group >> 2) & 1) * (4 * Rows),
                                         simd_lane, simd_group);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // Both steps are inlined so the loop is one body in the AIR; left as calls,
   // the 16- to 32-row tiles measured 1-3% slower.
   auto run_group = [&](uint quant_group,
@@ -239,7 +239,7 @@ __attribute__((always_inline)) inline void q4_mpp_tile_sums(
       q4_store_input_sums<Rows, Simdgroups>(
           input, input_size, quant_group * 64 + 64, input_sums,
           (next_group & 1) * (4 * Rows), simd_lane, simd_group);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
   };
   uint quant_group = first_group;
@@ -317,7 +317,7 @@ __attribute__((always_inline)) inline void q4_mpp_tile_sums_indirect(
   const uint stage_thread = simd_group * 32 + simd_lane;
   for (uint block = 0; block < quant_groups / 4; ++block) {
     // Previous block's matmul must be done before staged is rewritten.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint e = stage_thread; e < Rows * 32; e += threads) {
       const uint row = e / 32, col = (e % 32) * 8;
       const uint route = row_routes[row];
@@ -351,7 +351,7 @@ __attribute__((always_inline)) inline void q4_mpp_tile_sums_indirect(
         input_sums[sum_origin + 3 * Rows + row] = fourth;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint g = 0; g < 4; ++g) {
       const uint quant_group = block * 4 + g;
       auto a_slice = a.slice<64, Rows>(g * 64, 0);
@@ -404,7 +404,7 @@ __attribute__((always_inline)) inline void q4_mpp_tile_sums_indirect(
     }
   }
   store(accumulated_0, accumulated_1, traversal);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // The Rows x TileN grouped-input tile over every quant group, stored by
@@ -462,7 +462,7 @@ inline void q4_mpp_tile(
   // and its prologue rewrites input-sum region 0 while a straggling simdgroup
   // may still read that region in the last quant-group block's epilogue (the
   // last block is even when K % 512 == 256). Every simdgroup finishes first.
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // Split-K form of q4_mpp_tile across the grid, one weight stream: threadgroup

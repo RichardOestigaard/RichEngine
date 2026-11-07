@@ -10,6 +10,9 @@
 // cycle pays in dispatch boundaries rather than kernel work.
 
 #include "engine/wire/Types.hpp"
+#include "engine/AneFfnStartup.hpp"
+#include "engine/RuntimeResources.hpp"
+#include "engine/memory/MemoryPlan.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "metal/BackendInstrumentation.hpp"
@@ -26,9 +29,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -229,7 +234,9 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--prompt-file PATH] [--dump-tokens PATH] "
-                     "[--weight-layout auto|affine|block]\n";
+                     "[--weight-layout auto|affine|block] "
+                     "[--ane-ffn-share SHARE|auto] "
+                     "[--ane-ffn-minimum-rows N]\n";
         return 2;
       }
       uint32_t promptTokens = 512;
@@ -238,6 +245,11 @@ int main(int argc, char **argv) {
       const char *dumpTokens = nullptr;
       kv::Format format = kv::Format::Int8;
       bool blockWeights = false;
+      // The prefill FFN's Neural Engine split: a share in [0, 1) serves it as
+      // given without calibrating, "auto" calibrates and remembers.
+      std::optional<double> aneFfnShare;
+      std::optional<uint32_t> aneFfnMinimumRows;
+      bool aneFfnCalibrate = false;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -260,7 +272,20 @@ int main(int argc, char **argv) {
           if (value != "auto" && value != "affine" && value != "block")
             throw std::invalid_argument("--weight-layout takes auto, affine or block");
           blockWeights = value == "block";
-        } else
+        } else if (option == "--ane-ffn-share") {
+          const std::string_view value(argv[index + 1]);
+          if (value == "auto") {
+            aneFfnCalibrate = true;
+          } else {
+            const char *text = argv[index + 1];
+            char *end = nullptr;
+            aneFfnShare = std::strtod(text, &end);
+            if (end == text || *end || !(*aneFfnShare >= 0.0 && *aneFfnShare < 1.0))
+              throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1) or auto");
+          }
+        } else if (option == "--ane-ffn-minimum-rows")
+          aneFfnMinimumRows = parseCount(argv[index + 1], "--ane-ffn-minimum-rows");
+        else
           throw std::invalid_argument("unknown option");
       }
 
@@ -296,7 +321,45 @@ int main(int argc, char **argv) {
       model::CompositeStateStorage states(backend,
                                       governor.allocationAdmission(),
                                       model.stateLayout(), nullptr);
-      model::RuntimeContext context{backend, model, pages, states, operators};
+
+      // The prefill FFN's Neural Engine split (--ane-ffn-share), prepared as
+      // a start prepares it (engine::startAneFfn): a given share serves
+      // without calibrating, "auto" calibrates once and remembers. The pages
+      // above are already committed, so the memory plan here only checks the
+      // split leaves the model's own footprint room, not the pool's.
+      std::unique_ptr<ops::FfnSplit> aneFfn;
+      if (aneFfnShare || aneFfnCalibrate) {
+        if (aneFfnCalibrate && aneFfnMinimumRows)
+          throw std::invalid_argument(
+              "--ane-ffn-minimum-rows takes a share given by --ane-ffn-share");
+        const model::ModelMemoryPlan executorPlan =
+            model::plannedRuntimeMemory(backend.capabilities(), model, operators, format);
+        const auto planMemory = [&](uint64_t aneFfnBytes) {
+          ModelMemoryFootprint footprint{model.targetActualAllocatedBytes(),
+                                         model.draftActualAllocatedBytes(),
+                                         model.visionActualAllocatedBytes(),
+                                         executorPlan,
+                                         model.descriptor.draft.kind != model::DraftKind::Null,
+                                         0, aneFfnBytes};
+          ModelMemoryProfile profile{model.name(), model.maximumContextTokens(),
+                                     model.targetKvLayout(format), footprint};
+          return evaluateEngineMemoryPlan(backend.capabilities(), profile, 0);
+        };
+        const engine::AneFfnSetting setting =
+            aneFfnCalibrate
+                ? engine::AneFfnSetting{}
+                : engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+        engine::AneFfnStart started = engine::startAneFfn(
+            engine::aneFfnModel(backend, model, operators, format, "decode-profile", {}),
+            setting, 0, planMemory, {});
+        std::printf("ane-ffn %s: %s\n",
+                    std::string(engine::aneFfnOutcomeName(started.outcome.kind)).c_str(),
+                    started.outcome.reason.c_str());
+        if (started.outcome.kind == engine::AneFfnOutcome::Kind::Unavailable)
+          throw std::runtime_error("the Neural Engine split is unavailable: " + started.outcome.reason);
+        aneFfn = std::move(started.split);
+      }
+      model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",
@@ -327,14 +390,25 @@ int main(int argc, char **argv) {
       std::printf("prefill %u rows: fused gpu %.2f ms, wall %.2f ms\n",
                   promptTokens, prefillFused * 1e3, prefillWall * 1e3);
       executor.end(lanes[0].id);
-      BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
-      BackendInstrumentation::setDispatchProfiling(backend, false);
-      Table prefillTable;
-      accumulate(prefillTable,
-                 BackendInstrumentation::takeDispatchProfile(backend));
-      print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
-            1.0, prefillFused);
+      if (aneFfn && aneFfn->splits(std::min<uint32_t>(
+              prompt.size(), model::ExecutionLimits::prefillTokenBudget))) {
+        // A chunk the Neural Engine split takes encodes event steps, which
+        // dispatch profiling cannot replay — the fused time above is the
+        // split's measure. The lane still wants a live request for the B1
+        // cycles, as the profiled prefill's would leave it.
+        std::printf("prefill %u rows: dispatch profiling skipped (Neural Engine split)\n",
+                    promptTokens);
+        prefill(executor, lanes[0], prompt);
+      } else {
+        BackendInstrumentation::setDispatchProfiling(backend, true);
+        prefill(executor, lanes[0], prompt);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
+        Table prefillTable;
+        accumulate(prefillTable,
+                   BackendInstrumentation::takeDispatchProfile(backend));
+        print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
+              1.0, prefillFused);
+      }
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;

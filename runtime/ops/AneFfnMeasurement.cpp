@@ -13,7 +13,7 @@ namespace richengine::ops::ane_ffn {
 namespace {
 
 // The shares calibration times the split at.
-constexpr std::array<double, 2> kTimedShares{0.4, 0.8};
+constexpr std::array<double, 3> kTimedShares{0.4, 0.6, 0.8};
 // The layers time() spreads over the model; each of its commands takes all
 // but the last, which gives the last one's next weights to stage.
 constexpr uint32_t kSampledLayers = 5;
@@ -125,7 +125,8 @@ Timings Measurement::time() {
                   layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
   };
   timings.low = measure(kTimedShares[0]);
-  timings.high = measure(kTimedShares[1]);
+  timings.mid = measure(kTimedShares[1]);
+  timings.high = measure(kTimedShares[2]);
   return timings;
 }
 

@@ -782,6 +782,7 @@ inline void gdn_decode_batch_phase(
         table, sums, tape);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(17)]], \
       device uchar *tape [[buffer(20)]], GDN_DECODE_THREADS) { \
@@ -790,6 +791,7 @@ inline void gdn_decode_batch_phase(
   }
 // The out-projection's table (Layout: q4sg::Table64 affine, gguf_sg::Table16 GGUF).
 #define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
       constant GDNDecodeBatchParams &params [[buffer(19)]], \
@@ -815,6 +817,7 @@ GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32, 16, 32, 128, 8192, 12544, 
 // the table path's lane partitioning (elements 2 lane, 2 lane + 1 of a
 // 64-column span). F32 norms only, like Table16.
 #define GDN_DECODE_PACKED_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device half *plane [[buffer(17)]], device uchar *exponents [[buffer(18)]], \
       constant GDNDecodeBatchParams &params [[buffer(19)]], \

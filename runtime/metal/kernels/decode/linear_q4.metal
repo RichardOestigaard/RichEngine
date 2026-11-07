@@ -7,8 +7,9 @@
 // is the residual the epilogue adds or the gate it applies SiLU to; a plain
 // projection reads none (its input stands in) and writes a destination of
 // type Out.
-#define Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, Out)                     \
-  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+#define Q4_DECODE_OUTPUT_THREADS(Name, TileCall, Sums, TileN, Out, Threads)    \
+  [[max_total_threads_per_threadgroup(Threads)]] kernel void Name(             \
+                   device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \
@@ -25,15 +26,21 @@
                input_sums, tile * TileN, simd_lane, simd_group);               \
     }                                                                          \
   }
+#define Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, Out)                     \
+  Q4_DECODE_OUTPUT_THREADS(Name, TileCall, Sums, TileN, Out, 256)
 // Each plain projection the policy runs, into bf16 and into fp32 (Name_f32:
 // the logits, ops::Projection::destination). The plain tiles only
 // tune-kernels times write bf16 alone.
+#define Q4_DECODE_AFFINE_THREADS(Name, TileCall, Sums, TileN, Threads)         \
+  Q4_DECODE_OUTPUT_THREADS(Name, TileCall, Sums, TileN, bfloat, Threads)       \
+  Q4_DECODE_OUTPUT_THREADS(Name##_f32, TileCall, Sums, TileN, float, Threads)
 #define Q4_DECODE_AFFINE(Name, TileCall, Sums, TileN)                          \
-  Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, bfloat)                        \
-  Q4_DECODE_OUTPUT(Name##_f32, TileCall, Sums, TileN, float)
+  Q4_DECODE_AFFINE_THREADS(Name, TileCall, Sums, TileN, 256)
 
-#define Q4_DECODE_AUXILIARY(Name, Auxiliary, TileCall, Sums, TileN)            \
-  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+#define Q4_DECODE_AUXILIARY_THREADS(Name, Auxiliary, TileCall, Sums, TileN,    \
+                                    Threads)                                   \
+  [[max_total_threads_per_threadgroup(Threads)]] kernel void Name(             \
+                   device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
                    device bfloat *scales [[buffer(2)]],                        \
                    device bfloat *biases [[buffer(3)]],                        \
@@ -51,9 +58,12 @@
                input_sums, tile * TileN, simd_lane, simd_group);               \
     }                                                                          \
   }
+#define Q4_DECODE_AUXILIARY(Name, Auxiliary, TileCall, Sums, TileN)            \
+  Q4_DECODE_AUXILIARY_THREADS(Name, Auxiliary, TileCall, Sums, TileN, 256)
 
 #define Q4_DECODE_GATE_UP(Name, TileCall, Sums, TileN)                         \
-  kernel void Name(device bfloat *input [[buffer(0)]],                         \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
+                   device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights_0 [[buffer(1)]],                      \
                    device bfloat *scales_0 [[buffer(2)]],                      \
                    device bfloat *biases_0 [[buffer(3)]],                      \
@@ -81,8 +91,9 @@ Q4_DECODE_AFFINE(decode_linear_q4_n128_m16,
                  (q4_mpp_tile<16, 128, false, false>), 128, 128)
 Q4_DECODE_OUTPUT(decode_linear_q4_n128_m24,
                  (q4_mpp_tile<24, 128, false, false>), 192, 128, bfloat)
-Q4_DECODE_AFFINE(decode_linear_q4_n128_m24_sg4,
-                 (q4_mpp_tile<24, 128, false, false, false, 4>), 192, 128)
+Q4_DECODE_AFFINE_THREADS(decode_linear_q4_n128_m24_sg4,
+                         (q4_mpp_tile<24, 128, false, false, false, 4>), 192,
+                         128, 128)
 Q4_DECODE_OUTPUT(decode_linear_q4_n256_m16,
                  (q4_mpp_tile<16, 256, false, false>), 128, 256, bfloat)
 // Also the gate pass of three-lane gate/up projections.
@@ -94,8 +105,9 @@ Q4_DECODE_AFFINE(decode_linear_q4_n128_paired,
                  (q4_mpp_tile<8, 128, false, false, false, 8, true>), 64, 128)
 // 128 threads: four 8 x 256 tiles per core reach the occupancy knee for very
 // wide one-lane projections, with half the input re-reads of N128 tiles.
-Q4_DECODE_AFFINE(decode_linear_q4_n256_paired_sg4,
-                 (q4_mpp_tile<8, 256, false, false, false, 4, true>), 64, 256)
+Q4_DECODE_AFFINE_THREADS(decode_linear_q4_n256_paired_sg4,
+                         (q4_mpp_tile<8, 256, false, false, false, 4, true>),
+                         64, 256, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_paired, residual,
                     (q4_mpp_tile<8, 128, false, true, false, 8, true>), 64, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual, residual,
@@ -107,8 +119,9 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m16, residual,
                     (q4_mpp_tile<16, 128, false, true>), 128, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m24, residual,
                     (q4_mpp_tile<24, 128, false, true>), 192, 128)
-Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m24_sg4, residual,
-                    (q4_mpp_tile<24, 128, false, true, false, 4>), 192, 128)
+Q4_DECODE_AUXILIARY_THREADS(decode_linear_q4_n128_residual_m24_sg4, residual,
+                            (q4_mpp_tile<24, 128, false, true, false, 4>), 192,
+                            128, 128)
 Q4_DECODE_GATE_UP(decode_linear_q4_n256_gate_up_m16,
                   (q4_mpp_tile<16, 256, true, false, false, 8, true>), 128, 256)
 Q4_DECODE_AFFINE(decode_linear_q4_n128_m32,
@@ -129,10 +142,12 @@ Q4_DECODE_AFFINE(decode_linear_q4_n256_m64,
                  (q4_mpp_tile<64, 256, false, false>), 512, 256)
 // Sixteen simdgroups halve the accumulator registers per thread of the
 // 64x256 tile: 8 groups spill its 64 fp32 columns to local memory.
-Q4_DECODE_AFFINE(decode_linear_q4_n256_m64_sg16,
-                 (q4_mpp_tile<64, 256, false, false, false, 16>), 512, 256)
-Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m64_sg16, gate,
-                    (q4_mpp_tile<64, 256, false, false, true, 16>), 512, 256)
+Q4_DECODE_AFFINE_THREADS(decode_linear_q4_n256_m64_sg16,
+                         (q4_mpp_tile<64, 256, false, false, false, 16>), 512,
+                         256, 512)
+Q4_DECODE_AUXILIARY_THREADS(decode_linear_q4_n256_up_silu_m64_sg16, gate,
+                            (q4_mpp_tile<64, 256, false, false, true, 16>), 512,
+                            256, 512)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n128_residual_m64, residual,
                     (q4_mpp_tile<64, 128, false, true>), 512, 128)
 Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m64, gate,
@@ -144,6 +159,9 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m32, gate,
 Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m24, gate,
                     (q4_mpp_tile<24, 256, false, false, true>), 192, 256)
 #undef Q4_DECODE_AFFINE
+#undef Q4_DECODE_AFFINE_THREADS
 #undef Q4_DECODE_OUTPUT
+#undef Q4_DECODE_OUTPUT_THREADS
 #undef Q4_DECODE_AUXILIARY
+#undef Q4_DECODE_AUXILIARY_THREADS
 #undef Q4_DECODE_GATE_UP

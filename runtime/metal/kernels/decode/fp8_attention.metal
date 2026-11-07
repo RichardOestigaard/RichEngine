@@ -9,7 +9,7 @@
 #if defined(__HAVE_METAL_FP8_E4M3_FORMAT_TYPE__)
 
 #define PAGED_VERIFY_FP8_SPLIT(Name, Heads, Group, HeadDim, VRows)             \
-  kernel void Name(                                                            \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
@@ -29,7 +29,7 @@
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     constexpr uint D = HeadDim;                                                \
     constexpr ulong group_stride =                                             \
         ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                         \
@@ -95,7 +95,7 @@ PAGED_VERIFY_FP8_SPLIT_BOTH(verify_attention_fp8_split_k4q4d128, verify_attentio
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     constexpr uint D = HeadDim;                                                \
     constexpr ulong group_stride =                                             \
         ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                         \
@@ -154,7 +154,7 @@ PAGED_VERIFY_FP8_SPLIT_SWA_BOTH(verify_attention_fp8_split_swa_k4q4d128, verify_
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     constexpr uint D = HeadDim;                                                \
     constexpr ulong group_stride =                                             \
         ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                         \
@@ -208,7 +208,7 @@ PAGED_VERIFY_FP8_SPLIT_SWA_R2(verify_attention_fp8_split_swa_k4q4d128_r2, 4, 4, 
     threadgroup float row_max[MP];                                             \
     threadgroup float row_sum[MP];                                             \
     threadgroup float previous_scale[MP];                                      \
-    threadgroup atomic_uint rescale;                                           \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
     constexpr uint D = HeadDim;                                                \
     constexpr ulong group_stride =                                             \
         ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                         \

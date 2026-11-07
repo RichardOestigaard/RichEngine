@@ -84,7 +84,8 @@ __attribute__((always_inline)) inline void richengine_store_kv_row(
       for (uint offset = Groups / 2; offset != 0; offset >>= 1) {
         if (simd_lane < offset)
           maxima[simd_lane] = max(maxima[simd_lane], maxima[simd_lane + offset]);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                          thread_scope_simdgroup);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -125,7 +126,8 @@ __attribute__((always_inline)) inline void richengine_store_kv_row(
       for (uint offset = Groups / 2; offset != 0; offset >>= 1) {
         if (simd_lane < offset)
           maxima[simd_lane] = max(maxima[simd_lane], maxima[simd_lane + offset]);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                          thread_scope_simdgroup);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

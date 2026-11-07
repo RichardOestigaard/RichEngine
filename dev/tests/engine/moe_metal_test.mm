@@ -41,7 +41,7 @@ using richengine::model::q4PackedBytes;
 using richengine::ops::AffineMoeWeights;
 using richengine::ops::ExecutionPlans;
 using richengine::ops::ExpertProjection;
-using richengine::ops::kAssumedGpuCores;
+using richengine::kAssumedGpuCores;
 using richengine::ops::kMoeScratchFields;
 using richengine::ops::MoE;
 using richengine::ops::MoeBuffers;
@@ -568,14 +568,14 @@ void planBounds() {
       checkPlan(plan);
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = shipped.moeDecode(shape, lanes);
+      const MoePlan plan = shipped.moeDecode(shape, lanes, 8);
       require(plan.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)} &&
                   !plan.splitExperts() && plan.rows() == lanes * 8,
               "decode plans run the fused 8-row expert tile over the DFlash rows");
       checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped plan.
-      const MoePlan narrow = plans(9).moeDecode(shape, lanes);
+      const MoePlan narrow = plans(9).moeDecode(shape, lanes, 8);
       require(narrow.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores),
                                                   MoeExpertSimdgroups::Four} &&
                   narrow.rows() == plan.rows() && narrow.tileRows() == plan.tileRows() &&
@@ -589,16 +589,20 @@ void planBounds() {
     rejects([&] { (void)shipped.moeDecode(shape, 5); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
             "affine 8-row prefill tile");
-    rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
+    rejects([&] { (void)MoE::decodePlan(shape, 1, 8, {MoeExpertTile::M32}); },
             "affine 32-row decode tile");
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); }, "invalid shape");
   // Only family 9 runs the four-simdgroup decode tiles; an unknown family
   // and families 10 and later keep the shipped tile.
-  require(richengine::ops::moeDecodeSimdgroups(9) == MoeExpertSimdgroups::Four &&
-              richengine::ops::moeDecodeSimdgroups(10) == MoeExpertSimdgroups::Eight &&
-              richengine::ops::moeDecodeSimdgroups(11) == MoeExpertSimdgroups::Eight &&
-              richengine::ops::moeDecodeSimdgroups(0) == MoeExpertSimdgroups::Eight,
+  const auto simdgroups = [](uint32_t family) {
+    return richengine::ops::moeDecodeSimdgroups(
+        richengine::ops::DevicePolicy{.family = family});
+  };
+  require(simdgroups(9) == MoeExpertSimdgroups::Four &&
+              simdgroups(10) == MoeExpertSimdgroups::Eight &&
+              simdgroups(11) == MoeExpertSimdgroups::Eight &&
+              simdgroups(0) == MoeExpertSimdgroups::Eight,
           "decode expert simdgroups are not gated on GPU family 9");
 }
 
@@ -606,32 +610,35 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   const auto dispatches = graph.dispatches();
   const bool split = plan.splitExperts();
   const size_t expertPasses = split ? 3 : 2;
-  // Two router dispatches, grouping, gather, the expert passes and combine.
-  require(dispatches.size() == 5 + expertPasses,
+  // Two router dispatches, grouping, the gather the fused decode tile reads,
+  // the expert passes and combine. The split passes read the rows through
+  // grouped_routes and gather nothing.
+  const size_t gather = split ? 0 : 1;
+  require(dispatches.size() == 4 + gather + expertPasses,
           "MoE plan must encode the entire operator");
   const auto route =
       richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
   const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
                                              : "moe_route_scores_q8_m32";
-  const size_t experts = 4;
+  const size_t experts = 3 + gather;
   const size_t combine = experts + expertPasses;
   require(dispatches[0].pipelineName == scores &&
               dispatches[1].pipelineName == "moe_route_select_q8" &&
               dispatches[2].pipelineName == "moe_group_routes" &&
-              dispatches[3].pipelineName == "moe_gather_rows" &&
+              (split || dispatches[3].pipelineName == "moe_gather_rows") &&
               dispatches[combine].pipelineName == "moe_combine",
           "MoE plan chose inconsistent pipelines");
   if (split) {
     require(dispatches[experts].pipelineName ==
-                    "prefill_moe_expert_q4_n256_m32" &&
+                    "prefill_moe_expert_q4_n256_indirect_m32" &&
                 dispatches[experts + 1].pipelineName ==
-                    "prefill_moe_expert_q4_n256_up_silu_m32" &&
+                    "prefill_moe_expert_q4_n256_up_silu_indirect_m32" &&
                 dispatches[experts + 2].pipelineName ==
                     "prefill_moe_expert_q4_n256_m32",
             "split MoE plan chose inconsistent expert pipelines");
     // The gate parks in expertOutput and the up pass reads it back.
-    const auto &gate = dispatches[experts].buffers[5].buffer;
-    require(gate.sameView(dispatches[experts + 1].buffers[5].buffer) &&
+    const auto &gate = dispatches[experts].buffers[6].buffer;
+    require(gate.sameView(dispatches[experts + 1].buffers[6].buffer) &&
                 gate.sameView(dispatches[experts + 2].buffers[5].buffer) &&
                 dispatches[experts].threadgroups.x == kIntermediate / 256 &&
                 dispatches[experts + 1].threadgroups.x == kIntermediate / 256 &&
@@ -669,9 +676,11 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   }
   require(dispatches[0].threadgroups.x ==
                   (plan.rows() + route.rows - 1) / route.rows &&
-              dispatches[0].threadgroups.y == kStorageColumns / route.experts &&
+              dispatches[0].threadgroups.y ==
+                  (plan.shape().experts + route.experts - 1) / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
-              dispatches[3].threadgroups.x == plan.maximumTiles() && tileGrids &&
+              (split || dispatches[3].threadgroups.x == plan.maximumTiles()) &&
+              tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
           "MoE plan chose inconsistent dispatch bounds");
 }

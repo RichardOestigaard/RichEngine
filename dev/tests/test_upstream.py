@@ -386,6 +386,47 @@ class UpstreamTest(unittest.TestCase):
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
 
+    def test_gguf_selection_reads_dot_variants(self):
+        # mradermacher's repositories name quants MODEL.QUANT.gguf, and the
+        # imatrix builds MODEL.i1-QUANT.gguf beside a *.imatrix.gguf data
+        # file that is never a target.
+        files = {
+            "Ornith-1.5-9B-OBLITERATED.Q4_K_M.gguf",
+            "Ornith-1.5-9B-OBLITERATED.Q8_0.gguf",
+            "Ornith-1.5-9B-OBLITERATED.mmproj-f16.gguf",
+        }
+        self.assertEqual(
+            upstream.select_gguf(files, "Q4_K_M"),
+            ("Ornith-1.5-9B-OBLITERATED.Q4_K_M.gguf", False),
+        )
+        i1 = {
+            "Cyber-Ornith-1.5-9B-OBLITERATED.i1-IQ4_XS.gguf",
+            "Cyber-Ornith-1.5-9B-OBLITERATED.i1-Q4_K_M.gguf",
+            "Cyber-Ornith-1.5-9B-OBLITERATED.i1-Q6_K.gguf",
+            "Cyber-Ornith-1.5-9B-OBLITERATED.imatrix.gguf",
+        }
+        # The shared .i1 infix resolves exactly, with nothing reported.
+        self.assertEqual(
+            upstream.select_gguf(i1, "Q4_K_M"),
+            ("Cyber-Ornith-1.5-9B-OBLITERATED.i1-Q4_K_M.gguf", False),
+        )
+        self.assertEqual(
+            upstream.select_gguf(i1, "i1-Q4_K_M"),
+            ("Cyber-Ornith-1.5-9B-OBLITERATED.i1-Q4_K_M.gguf", True),
+        )
+        # The imatrix data file is no candidate: it cannot default and no
+        # :imatrix variant selects it.
+        self.assertEqual(
+            upstream.select_gguf({"Model-Q4_K_M.gguf", "Model.imatrix.gguf"}, None),
+            ("Model-Q4_K_M.gguf", False),
+        )
+        for variant in (None, "imatrix"):
+            with (
+                self.subTest(variant=variant),
+                self.assertRaisesRegex(models.ModelError, "repository root: none"),
+            ):
+                upstream.select_gguf({"Model.imatrix.gguf"}, variant)
+
     def test_qad_is_the_default_variant(self):
         files = {
             "LFM2.5-2.6B-MXFP4.gguf",

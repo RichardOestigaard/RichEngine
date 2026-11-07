@@ -189,7 +189,8 @@ void DFlashDraft::addContextPrefill(
 void DFlashDraft::addDecode(
     metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
     const ops::Projection &vocabularyProjection,
-    std::span<const uint32_t> cacheLengths) const {
+    std::span<const uint32_t> cacheLengths,
+    const metal::MetalBuffer &devicePack) const {
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
@@ -238,7 +239,7 @@ void DFlashDraft::addDecode(
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
          buffers.queryValues},
-        cacheLengths, attentionPlan);
+        cacheLengths, attentionPlan, /*causal=*/false, devicePack);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
     linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
