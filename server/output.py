@@ -197,17 +197,20 @@ class _ProjectorBase:
     argument deltas, for streamed and complete responses alike.
 
     Calls read as the chat template lays them out. Names lose the space
-    around them; a call that names no function is dropped, other text inside
-    a call is dropped, and a repeated parameter keeps its first value, which
-    may have streamed. A value converts by the types its tool declares for
-    it (convert_value), and one that may only be a string streams as it is
-    written. Text outside calls streams as it arrives, after a call as
-    before one, and a </think> there is dropped.
+    around them; an opening that names no function, or a name too long to
+    be one, opens no call and reads as the text the model wrote, other text
+    inside a call is dropped, and a repeated parameter keeps its first
+    value, which may have streamed. A value converts by the types its tool
+    declares for it (convert_value), and one that may only be a string
+    streams as it is written. Text outside calls streams as it arrives,
+    after a call as before one, and a </think> there is dropped.
     """
 
-    # The state the text after a call's opening enters, and the state a
-    # finished call leaves for its close.
+    # The state the text after a call's opening enters, the state a read
+    # name leaves for its arguments, and the state a finished call leaves
+    # for its close.
     _after_open = "name"
+    _after_name = "arguments"
     _after_call = "closing"
 
     def __init__(self, policy, request_id, structured, dialect):
@@ -224,7 +227,11 @@ class _ProjectorBase:
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
-        # The open call, None while the text names none or names no function.
+        # The text consumed to open the current name read — the call's
+        # marker, or a calls' join — emitted as content where the text
+        # names no function.
+        self.name_open = ""
+        # The open call, None while the text names none.
         self.call_id = None
         self.function_name = None
         # The types by which its declared parameters and any others convert.
@@ -299,12 +306,20 @@ class _ProjectorBase:
             )
 
     def _begin_call(self, name, events):
+        if not name.strip(NAME_SPACE):
+            # Nothing of a call has streamed yet: the opening, and the text
+            # after it, are content.
+            self.state = "content"
+            self._emit_content(self.name_open + name, events)
+            return
+        # The name's close, which _name kept for the text a nameless
+        # opening emits.
+        self.pending = self.pending[1:]
+        self.state = self._after_name
         self.argument_fragments = []
         self.parameter_count = 0
         self.parameter_names = set()
         name = name.strip(NAME_SPACE)
-        if not name:
-            return
         if not self.streamed_count:
             # Whitespace before the first text only framed the calls.
             self.content_fragments.clear()
@@ -332,8 +347,8 @@ class _ProjectorBase:
     def _begin_parameter(self, name, events):
         name = name.strip(NAME_SPACE)
         # A repeated parameter keeps its first value, which may have streamed;
-        # a parameter without a name, or of a call that names no function,
-        # keeps none.
+        # a parameter without a name, or read while no call is open, keeps
+        # none.
         kept = name and name not in self.parameter_names and self.call_id is not None
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
@@ -404,13 +419,15 @@ class _ProjectorBase:
         found = [(index, tag) for tag in tags if (index := self.pending.find(tag)) >= 0]
         return min(found) if found else (-1, None)
 
-    def _name(self, delimiter):
+    def _name(self, delimiter, keep=False):
         """The name the pending text spells up to `delimiter`, taken off the
-        text; "" for a longer one, and None while it may yet end."""
+        text, `delimiter` left on it where `keep` holds; "" for a longer
+        one, and None while it may yet end."""
         end = self.pending.find(delimiter, 0, MAX_NAME_LENGTH + 1)
         if end < 0:
             return None if len(self.pending) <= MAX_NAME_LENGTH else ""
-        name, self.pending = self.pending[:end], self.pending[end + 1 :]
+        name = self.pending[:end]
+        self.pending = self.pending[end if keep else end + 1 :]
         return name
 
     def _output_state(self, events):
@@ -445,6 +462,9 @@ class _ProjectorBase:
         if tag == separator:
             return True
         if tag == self.call_marker:
+            # What a name read by this call's opening emits back as text
+            # when it names no function.
+            self.name_open = tag
             self.state = self._after_open
         return True
 
@@ -532,10 +552,11 @@ class _XmlToolCallProjector(_ProjectorBase):
 
     def _drain(self, events):
         if self.state == "name":
-            name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
-            self.pending = ""
+            # A name too long to be one stays text, as the content reads it.
+            name = ""
+            if len(self.pending) <= MAX_NAME_LENGTH:
+                name, self.pending = self.pending, ""
             self._begin_call(name, events)
-            self.state = "arguments"
         if self.state == "value":
             self.pending = ""
             self._end_parameter("", events)
@@ -557,10 +578,11 @@ class _XmlToolCallProjector(_ProjectorBase):
                     break
                 continue
             if self.state == "name":
-                if (name := self._name(self.dialect.name_close[0])) is None:
+                # The character that ends the name stays: the arguments
+                # read past it, or the content reads it with the name.
+                if (name := self._name(self.dialect.name_close[0], keep=True)) is None:
                     break
                 self._begin_call(name, events)
-                self.state = "arguments"
                 continue
             if self.state == "arguments":
                 # Text between parameters is dropped, but for a tag it may
@@ -647,6 +669,7 @@ class _PythonCallProjector(_ProjectorBase):
     reads."""
 
     _after_open = "call_started"
+    _after_name = "argument_head"
     _after_call = "call_sep"
 
     def _begin_parameter(self, name, events):
@@ -755,9 +778,14 @@ class _PythonCallProjector(_ProjectorBase):
         return True
 
     def _drain(self, events):
-        if self.state == "call_started" and "(" not in self.pending:
-            # The cut name never began a call's arguments.
-            self.pending = ""
+        if self.state == "call_started":
+            # A name the output ended inside opens the call it names, or
+            # reads as its text; a name too long to be one stays for the
+            # content.
+            name = ""
+            if len(self.pending) <= MAX_NAME_LENGTH:
+                name, self.pending = self.pending, ""
+            self._begin_call(name, events)
         if self.state == "argument_string":
             # A quoted string that never closed keeps the text it decoded.
             self._end_parameter_value("".join(self.value_parts), events)
@@ -782,15 +810,11 @@ class _PythonCallProjector(_ProjectorBase):
                     break
                 continue
             if self.state == "call_started":
-                # ", " joins calls; the space may arrive after the comma.
-                stripped = self.pending.lstrip(" ")
-                if stripped != self.pending:
-                    self.pending = stripped
-                    continue
-                if (name := self._name("(")) is None:
+                # The name runs to "("; space the calls' join leaves
+                # around it reads with a nameless one.
+                if (name := self._name("(", keep=True)) is None:
                     break
                 self._begin_call(name, events)
-                self.state = "argument_head"
                 continue
             if self.state == "argument_head":
                 stripped = self.pending.lstrip(" ")
@@ -833,6 +857,9 @@ class _PythonCallProjector(_ProjectorBase):
             if self.state == "call_sep":
                 if self.pending.startswith(","):
                     self.pending = self.pending[1:]
+                    # What opens a name here is the calls' join, not the
+                    # list's open a first name's text carries.
+                    self.name_open = ","
                     self.state = "call_started"
                     continue
                 if self._literal(self.dialect.call_close):
@@ -886,10 +913,11 @@ class _Gemma4CallProjector(_ProjectorBase):
 
     def _drain(self, events):
         if self.state == "name":
-            name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
-            self.pending = ""
+            # A name too long to be one stays text, as the content reads it.
+            name = ""
+            if len(self.pending) <= MAX_NAME_LENGTH:
+                name, self.pending = self.pending, ""
             self._begin_call(name, events)
-            self.state = "arguments"
         if self.state == "string":
             # A string that never closed keeps the text it decoded; a
             # streamed one closes on the text it already emitted.
@@ -988,10 +1016,11 @@ class _Gemma4CallProjector(_ProjectorBase):
                     break
                 continue
             if self.state == "name":
-                if (name := self._name("{")) is None:
+                # The "{" that ends the name stays: the arguments read
+                # past it, or the content reads it with the name.
+                if (name := self._name("{", keep=True)) is None:
                     break
                 self._begin_call(name, events)
-                self.state = "arguments"
                 continue
             if self.state == "arguments":
                 stripped = self.pending.lstrip(NAME_SPACE)

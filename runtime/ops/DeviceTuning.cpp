@@ -219,6 +219,38 @@ constexpr MeasuredLinear kMeasuredDecode[] = {
      {LinearTile::Paired128, 640, LinearSimdgroups::Eight, 1}}, // +28%
 };
 
+// Measured GGUF (Block32) decode plans, same fields as kMeasuredDecode. The
+// register tile's rows gate (LinearGguf.cpp) sends a 48-row step — the
+// 16-row verify stride's three-lane batch — to it, where it loses to the
+// staged tile's 64-row height on every projection kind of the Ornith-9B
+// DFlash draft (gguf-projection-benchmark, af4, 20-core M5 Pro, best split
+// of each, register vs staged, ms: {4096,4096} 0.28 vs 0.10, {6144,4096}
+// 0.40 vs 0.12, {4096,12288} 0.78 vs 0.26, {12288,4096} 1.5 vs 0.52,
+// {248320,4096} 14.8 vs 4.2), ~14 ms of the batch's step. The staged gate/up
+// here is the two-pass pair: the baseline's one-pass m64 kernel costs
+// 2.86 ms a dispatch on this device at 64 rows, so no row may carry
+// LinearConfig::oneGateUpPass.
+constexpr MeasuredLinear kMeasuredDecodeBlock[] = {
+    // Ornith-1.5-9B's DFlash draft at the three-lane verify step (48 rows).
+    {kApple10Plus20Cores, {6'144, 4'096}, 48, LinearEpilogue::None,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 2}},
+    {kApple10Plus20Cores, {4'096, 4'096}, 48, LinearEpilogue::Residual,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 2}},
+    {kApple10Plus20Cores, {12'288, 4'096}, 48, LinearEpilogue::GateUp,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 1}},
+    {kApple10Plus20Cores, {4'096, 12'288}, 48, LinearEpilogue::Residual,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 2}},
+    {kApple10Plus20Cores, {248'320, 4'096}, 48, LinearEpilogue::None,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 1}},
+    // The four-lane step's gate/up: the baseline's one-pass m64 kernel
+    // measures 2.86 ms a dispatch; the two-pass staged pair is 0.52 ms of
+    // the same step — ~14 ms back per step end to end (B4 450 -> 527 tok/s).
+    {kApple10Plus20Cores, {12'288, 4'096}, 64, LinearEpilogue::GateUp,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 1}},
+    {kApple10Plus20Cores, {248'320, 4'096}, 64, LinearEpilogue::None,
+     {LinearTile::GgufStaged, 0, LinearSimdgroups::Eight, 1}},
+};
+
 // Measured staged-tile splits, the shapes the tiers under-split: each beats
 // the tier's pick by 6-45% on the cores it names (dev/benchmarks/
 // gguf_decode_sweep.mm and gguf_projection_benchmark.mm; zero cores means
@@ -509,10 +541,17 @@ std::optional<LinearConfig> measuredLinearPlan(const DevicePolicy &device, Linea
       if (plan.matrix == w.matrix && plan.rows == w.rows && plan.phase == w.phase &&
           plan.epilogue == w.epilogue && plan.layout == w.weightLayout)
         return plan.config;
-  if (w.weightLayout != WeightLayout::Affine64) return std::nullopt;
+  // Block32 workloads consult the GGUF decode table only: the affine
+  // tiles the other tables name would fail the block plan's validation.
+  if (w.weightLayout != WeightLayout::Affine64 &&
+      !(w.weightLayout == WeightLayout::Block32 && w.phase == LinearPhase::Decode))
+    return std::nullopt;
   const std::span<const MeasuredLinear> table =
-      w.phase == LinearPhase::Prefill ? std::span<const MeasuredLinear>(kMeasuredPrefill)
-                                      : std::span<const MeasuredLinear>(kMeasuredDecode);
+      w.phase == LinearPhase::Prefill
+          ? std::span<const MeasuredLinear>(kMeasuredPrefill)
+          : w.weightLayout == WeightLayout::Block32
+              ? std::span<const MeasuredLinear>(kMeasuredDecodeBlock)
+              : std::span<const MeasuredLinear>(kMeasuredDecode);
   const MeasuredLinear *row = measuredRow(table, device, [&](const MeasuredLinear &r) {
     return r.matrix == w.matrix && r.rows == w.rows && r.epilogue == w.epilogue;
   });

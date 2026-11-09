@@ -1507,6 +1507,18 @@ def _lark_regex(pattern):
     return "/" + pattern.replace("/", r"\/") + "/"
 
 
+def _lark_pattern(pattern):
+    """`pattern` as a lark /.../ literal: a '/' the pattern does not already
+    escape is escaped for it."""
+    out, backslashes = [], 0
+    for character in pattern:
+        if character == "/" and backslashes % 2 == 0:
+            out.append("\\")
+        out.append(character)
+        backslashes = backslashes + 1 if character == "\\" else 0
+    return "/" + "".join(out) + "/"
+
+
 def _regex_text(text):
     """`text` as a regex matching itself inside a lark /.../ literal."""
     return re.escape(text).replace("/", r"\/")
@@ -1678,12 +1690,57 @@ def json_grammar(schema, thinking, *, think_end_id=None, think_end_text=THINK_EN
     return "\n".join(grammar) + "\n"
 
 
-def normalize_response_format(value):
-    if value in (None, {"type": "text"}):
-        return None, None
-    if not isinstance(value, dict):
+# A request's regex is a grammar of its own; past a few kilobytes the
+# grammar compile's own caps are the right refusal.
+MAX_RESPONSE_PATTERN = 16 * 1024
+
+
+def regex_grammar(pattern, thinking, *, think_end_id=None, think_end_text=THINK_END):
+    """The output grammar of a regex response format (or vLLM's
+    guided_regex): the pattern must match the whole reply — a client that
+    wants a search wraps it in (?s:.*) itself."""
+    grammar = [
+        "%llguidance {}",
+        "start: " + ("think " if thinking else "") + _lark_pattern(pattern),
+    ]
+    if thinking:
+        think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
+        grammar.append(f"think: TEXT <[{think_end}]>")
+        grammar.append(
+            r"TEXT: /(?s:.*)/ & ~/(?s:.*)" + _regex_text(think_end_text) + r"(?s:.*)/"
+        )
+    return "\n".join(grammar) + "\n"
+
+
+def _response_pattern(pattern):
+    """The validated output pattern of a regex response format or a
+    guided_regex field."""
+    if not isinstance(pattern, str) or not pattern:
+        raise APIError(400, "response_format regex needs a 'regex' string")
+    if len(pattern) > MAX_RESPONSE_PATTERN:
+        raise APIError(400, "response_format regex is too long")
+    try:
+        re.compile(pattern)
+    except re.error as error:
+        raise APIError(400, f"invalid response_format regex: {error}") from error
+    return pattern
+
+
+def normalize_response_format(value, guided_regex=None):
+    """The response schema, its validator and the output pattern a request's
+    response_format — or its guided_regex field, as vLLM spells it — asks
+    for. A regex validates nothing of the output's JSON, so it pairs with a
+    None schema and validator."""
+    if value is not None and not isinstance(value, dict):
         raise APIError(400, "response_format must be an object")
-    kind = value.get("type")
+    kind = value.get("type") if value else None
+    if kind == "regex" or guided_regex is not None:
+        pattern = guided_regex
+        if kind == "regex":
+            pattern = value.get("regex") or value.get("pattern") or pattern
+        return None, None, _response_pattern(pattern)
+    if value in (None, {"type": "text"}):
+        return None, None, None
     if kind == "json_object":
         schema = {"type": "object"}
     elif kind == "json_schema":
@@ -1700,7 +1757,7 @@ def normalize_response_format(value):
         validator = build_validator(schema)
     except SchemaError as error:
         raise APIError(400, f"invalid response schema: {error.message}") from error
-    return schema, validator
+    return schema, validator, None
 
 
 def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None):
@@ -1803,16 +1860,20 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, dialect=None)
     return tools, policy
 
 
-def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
+def tool_grammar(
+    policy, thinking, response_schema=None, *, think_end_id=None, response_regex=None
+):
     """The output grammar of a request whose tool calls are constrained, or
-    whose tools stand beside a response schema: each call names an offered
+    whose tools stand beside a response format: each call names an offered
     tool in the dialect's layout, with a strict tool's arguments generated
     to its schema and any other's free. A required choice starts with a call
     and a named one is that call; under an auto choice text may come first.
     Parallel calls may be followed by text and further calls, and a single
     call by whitespace only. Beside an auto choice, a response schema admits
-    its JSON answer instead of the calls."""
+    its JSON answer instead of the calls, a response regex one that matches
+    the whole answer."""
     dialect = policy.dialect or QWEN3_XML
+    answer = response_schema is not None or response_regex is not None
     try:
         strict_arguments = {
             name: dialect.argument_grammar(policy.argument_schemas[name])
@@ -1838,9 +1899,9 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
         calls.append(dialect.call_rule(index, name, arguments))
     call = dialect.call_expression(len(calls), policy.parallel)
     if not calls:
-        # tool_choice "none": neither the text nor a JSON answer starts a call.
-        body = "TEXT" if response_schema is None else "answer"
-    elif policy.required or response_schema is not None:
+        # tool_choice "none": neither the text nor a formatted answer starts a call.
+        body = "answer" if answer else "TEXT"
+    elif policy.required or answer:
         # A call comes first, set apart from the reasoning by whitespace.
         body = f"WS {call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
         if not policy.required:
@@ -1848,14 +1909,18 @@ def tool_grammar(policy, thinking, response_schema=None, *, think_end_id=None):
     else:
         body = f"(TEXT {call})* TEXT" if policy.parallel else f"TEXT ({call} WS)?"
     main = ["%llguidance {}", "start: " + ("think " if thinking else "") + body]
-    if response_schema is not None and not policy.required:
-        main.append(
-            "answer: WS %json "
-            + json.dumps(
-                _grammar_compatible_schema(response_schema), separators=(",", ":")
+    if not policy.required:
+        if response_schema is not None:
+            main.append(
+                "answer: WS %json "
+                + json.dumps(
+                    _grammar_compatible_schema(response_schema),
+                    separators=(",", ":"),
+                )
+                + " WS"
             )
-            + " WS"
-        )
+        elif response_regex is not None:
+            main.append("answer: WS " + _lark_pattern(response_regex) + " WS")
     if thinking:
         think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
         main.append(f"think: TEXT <[{think_end}]>")

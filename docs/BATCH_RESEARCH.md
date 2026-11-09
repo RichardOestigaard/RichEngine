@@ -58,7 +58,7 @@ These bind exactly `state0..3`/`table0..3` per lane or hardcode the count:
   constant). `AGENTIC_WIDTHS = (2, BATCH_WIDTH)` (:63).
 - `dev/tests/engine/model_package_test.cpp:68` — contract test pins
   `maximumBatchWidth == 4`; `dev/benchmarks/gguf_moe_benchmark.mm:244,335`,
-  `dev/tests/moe_metal_test.mm:580,932` use literal `lanes <= 4`.
+  `dev/tests/engine/` use literal `lanes <= 4`.
 
 ## What scales with width
 

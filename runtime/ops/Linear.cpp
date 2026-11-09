@@ -896,14 +896,15 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   // single-tensor path (a gate/up pair is two single-tensor dispatches on one
   // input, and a prefill chunk one dispatch per segment) dispatches or reads
   // a packed operand, so only it can take a packed input. A prefill chunk of
-  // up to a decode batch's rows runs the same mxfp4p decode tiles as decode,
-  // so its producer can emit the packed operand the same way; the 128-row
-  // prefill tile still packs its own input.
+  // up to 32 rows runs the same mxfp4p decode tiles as decode — the family
+  // has no 64-row instance for the 64-row staged tile's chunks — so its
+  // producer can emit the packed operand the same way; the 128-row prefill
+  // tile still packs its own input.
   const auto singleTensor = [](const Projection *q) {
     return !q || q->blocks().segments.size() == 1;
   };
   plan.packedInput_ = plan.packs_ &&
-                      (w.phase == LinearPhase::Decode || w.rows <= kMaximumDecodeTileRows) &&
+                      (w.phase == LinearPhase::Decode || w.rows <= 32) &&
                       singleTensor(&p) && singleTensor(gate);
   return plan;
 }
@@ -940,9 +941,9 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
 
 LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
-  // Prefill plans take split scratch only in chunks of up to a decode batch,
-  // which a GGUF projection runs on the staged tile (LinearGguf.cpp).
-  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
+  // Prefill plans take split scratch only in chunks that run the staged
+  // tile, of up to kMaximumStagedPrefillRows rows (LinearGguf.cpp).
+  for (uint32_t rows = 1; rows <= kMaximumStagedPrefillRows; ++rows)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue, shape.layout})
                         .scratchSize());

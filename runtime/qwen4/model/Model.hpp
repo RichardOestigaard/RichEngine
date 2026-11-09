@@ -803,6 +803,16 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // The bytes reclaimIdleState(true, IdleMemory::Buffers), called until it
+  // gives none, releases once the cache has let go of `evictedStates` more
+  // cached states, whose buffers return to the pool: the pooled buffers
+  // beyond those one lane starts from, at the sizes their layout declares,
+  // which no allocation falls short of. Zero where the model does not
+  // describe its pool, which counts on no more than it releases.
+  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept {
+    static_cast<void>(evictedStates);
+    return 0;
+  }
   // The most rows of one lane's prefill command: a prefill group's where
   // the model runs them (one lane's chunks, layer by layer) to read
   // something once for all of them, its streamed experts for every lane or a
@@ -827,6 +837,21 @@ public:
   // retries between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
+  // The store of streamed routed experts above its floor
+  // (model::ExpertStore), between commands. releaseExpertChunk gives one
+  // chunk back while memory is short and returns its bytes; zero when the
+  // store is at its floor or released, or the model has none.
+  // releaseExpertsToFloor gives back every chunk above the floor at once,
+  // while memory is critically short, and returns their bytes, zero where
+  // releaseExpertChunk would give none. expertGrowthBytes is what
+  // growExperts takes next, zero when nothing grows; growExperts takes that
+  // chunk back, its slots free, granted at once when nothing grows and
+  // refused with the admission's cause. A failure inside the store reaches
+  // the caller, whose failure boundary stops the engine.
+  [[nodiscard]] virtual uint64_t releaseExpertChunk() { return 0; }
+  [[nodiscard]] virtual uint64_t releaseExpertsToFloor() { return 0; }
+  [[nodiscard]] virtual uint64_t expertGrowthBytes() const { return 0; }
+  [[nodiscard]] virtual ModelMemoryAdmission growExperts() { return {.ok = true}; }
   // Why this request's mask is unusable, or nothing when the model took it.
   [[nodiscard]] virtual std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) = 0;

@@ -158,6 +158,12 @@ constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one per event
 // signal and one more.
 constexpr NSUInteger kMaximumCommandBuffers = 512;
+// A command whose buffer macOS dropped for the display
+// (droppedForInteractivity) is encoded and committed again this many times
+// at most; each try waits kDroppedRetryBackoffSeconds longer than the one
+// before, so the window server's work goes first.
+constexpr uint32_t kDroppedCommandRetries = 2;
+constexpr double kDroppedRetryBackoffSeconds = 0.25;
 
 // Refuses the event steps of a command of `dispatches` dispatches that its
 // submission cannot encode.
@@ -193,6 +199,40 @@ constexpr NSUInteger kMaximumCommandBuffers = 512;
     case MTLCommandBufferStatusError: return "error";
     }
     return "unknown";
+}
+
+// The one command-buffer death a submission may come back from: while the
+// display or another client needs the GPU, macOS can end an in-flight
+// command buffer instead of preempting it. The driver reports it as a
+// MTLCommandBufferErrorDomain error whose text carries the IOGPU callback
+// code 0x0000000e, kIOGPUCommandBufferCallbackErrorImpactingInteractivity
+// ("Internal Error (0000000e:...)", also written "Impacting
+// Interactivity"): the work dropped is not at fault, and the same commands
+// rerun once the GPU yields (locals/hybrid_batch.py met it mid-prefill and
+// rereads the chunk). Every other error — a page fault, a timeout, a
+// revoked or removed device, an internal error without the interactivity
+// code — stays fatal.
+[[maybe_unused]] bool droppedForInteractivity(NSError *error) noexcept {
+    if (!error ||
+        ![error.domain isEqualToString:MTLCommandBufferErrorDomain])
+        return false;
+    const auto mentions = [](NSString *text) {
+        return text &&
+               ([text rangeOfString:@"0000000e"].location != NSNotFound ||
+                [text rangeOfString:@"nteractivit"
+                            options:NSCaseInsensitiveSearch]
+                        .location != NSNotFound);
+    };
+    // The callback code surfaces in the command buffer error's own text or
+    // in an underlying IOGPU error's.
+    for (NSError *candidate = error; candidate;
+         candidate = candidate.userInfo[NSUnderlyingErrorKey]) {
+        if (mentions(candidate.localizedDescription) ||
+            mentions(candidate.localizedFailureReason) ||
+            mentions(candidate.localizedRecoverySuggestion))
+            return true;
+    }
+    return false;
 }
 
 template <typename T>
@@ -313,6 +353,12 @@ struct BackendAsyncState {
         // Stops the watch on GPU completion even if the model ticket keeps
         // waiting for CPU work; release drops the entry itself.
         bool watching = false;
+        // Set between a dropped command's detection (beginReplay) and its
+        // re-commit (commitReplay) or the replay's failure (endReplay). The
+        // recorded command is the killed one, so the watchdog must not
+        // finish the ticket from its terminal status; the deadline still
+        // bounds the resubmission.
+        bool replaying = false;
     };
 
     __strong id<MTLDevice> device = nil;
@@ -328,6 +374,18 @@ struct BackendAsyncState {
     bool stopping = false;
     // MetalBackend::setWaitInterrupt's predicate.
     std::function<bool()> waitInterrupt;
+    // The newest sequence whose buffers were committed. A replay is allowed
+    // only while it is the killed submission's own: anything committed later
+    // already ran behind the killed buffer and may have consumed the state
+    // it left half-written, which a re-commit cannot put right.
+    uint64_t committedSequence = 0;
+    // Submissions whose commit waits for a dropped command's replay to land:
+    // their work orders after it on the queue exactly as it ordered after
+    // the killed one, so they still read the state it restores.
+    uint32_t pendingReplays = 0;
+    std::condition_variable replayIdle;
+    // Replays begun; BackendInstrumentation reports it.
+    std::atomic<uint64_t> droppedCommandReplays{0};
 
     void sampleDeviceMemory() const noexcept {
         if (!device) return;
@@ -376,12 +434,92 @@ struct BackendAsyncState {
                           const std::vector<id<MTLCommandBuffer>> &leading,
                           id<MTLCommandBuffer> command,
                           std::function<void(id<MTLCommandBuffer>)> completion) {
-        std::lock_guard lock(gateMutex);
+        std::unique_lock lock(gateMutex);
+        // A dropped command's replay lands first: this submission readied
+        // while the killed one was still the newest on the queue, so it
+        // must not overtake the resubmission and see the dropped work's
+        // hole instead of its results.
+        replayIdle.wait(lock, [this] { return pendingReplays == 0; });
         InFlight &entry = inFlightEntry(sequence);
         entry.command = command;
         entry.completion = std::move(completion);
         for (id<MTLCommandBuffer> earlier : leading) [earlier commit];
         [command commit];
+        committedSequence = std::max(committedSequence, sequence);
+    }
+
+    // Whether beginReplay may adopt the killed submission: Started — the
+    // replay owns the ticket's completion now; Busy — a replay of it is
+    // already pending (a second terminal result of the same kill, from the
+    // watchdog recovering what the driver's callback also delivered);
+    // Refused — it cannot be resubmitted without breaking order.
+    enum class ReplayStart : uint8_t { Started, Busy, Refused };
+
+    // Adopts the submission for a dropped-command replay, or reports why it
+    // cannot. A replay re-commits the same work ahead of everything that
+    // commits later — allowed only while nothing later reached the queue
+    // (committedSequence), since a submission that already ran behind the
+    // killed buffer may have consumed the half-written state it left. A
+    // submission begun but not yet committed instead waits at the gate in
+    // commitSubmission and lands after the replay, reading the restored
+    // state — the ordering it would have had anyway.
+    [[nodiscard]] ReplayStart beginReplay(uint64_t sequence) {
+        std::lock_guard lock(gateMutex);
+        for (InFlight &entry : inFlight) {
+            if (entry.sequence != sequence) continue;
+            if (entry.replaying) return ReplayStart::Busy;
+            // The Metal 4 path commits no serializable MTLCommandBuffer
+            // sequence (queue4 commits are not implicitly ordered), so its
+            // kills stay fatal; a dropped buffer without an entry or a
+            // stopping backend has nothing left to replay into.
+            if (stopping || entry.mtl4 || committedSequence != sequence)
+                return ReplayStart::Refused;
+            entry.replaying = true;
+            // The rerun gets a fresh watch: the recorded command's terminal
+            // status belongs to the killed buffer, and the replay's backoff
+            // and re-encode ride this deadline until commitReplay replaces
+            // it. The watchdog may have recovered the kill and stopped the
+            // watch before the driver's own callback arrived; replaying
+            // resumes it either way.
+            entry.watching = true;
+            entry.deadlineSeconds = awakeSeconds() + commandTimeoutSeconds_;
+            ++pendingReplays;
+            droppedCommandReplays.fetch_add(1, std::memory_order_relaxed);
+            return ReplayStart::Started;
+        }
+        return ReplayStart::Refused;
+    }
+
+    // Lands a replay's buffers behind the killed command and ahead of every
+    // submission the gate held, then frees the gate. The entry may be gone —
+    // a ticket whose wait gave up releases its submission — and the work is
+    // still committed: it recomputes only what the killed run would have.
+    void commitReplay(uint64_t sequence,
+                      const std::vector<id<MTLCommandBuffer>> &leading,
+                      id<MTLCommandBuffer> command,
+                      std::function<void(id<MTLCommandBuffer>)> completion) {
+        std::lock_guard lock(gateMutex);
+        for (InFlight &entry : inFlight) {
+            if (entry.sequence != sequence) continue;
+            entry.command = command;
+            entry.completion = std::move(completion);
+            entry.deadlineSeconds = awakeSeconds() + commandTimeoutSeconds_;
+            entry.replaying = false;
+            break;
+        }
+        for (id<MTLCommandBuffer> earlier : leading) [earlier commit];
+        [command commit];
+        if (pendingReplays && --pendingReplays == 0) replayIdle.notify_all();
+    }
+
+    // Frees the gate and the watch flag a replay held when its resubmission
+    // is given up — a refused or failed re-encode never reaches
+    // commitReplay.
+    void endReplay(uint64_t sequence) noexcept {
+        std::lock_guard lock(gateMutex);
+        for (InFlight &entry : inFlight)
+            if (entry.sequence == sequence) entry.replaying = false;
+        if (pendingReplays && --pendingReplays == 0) replayIdle.notify_all();
     }
 
     // The MTL4 equivalent of commitSubmission: the caller commits on its
@@ -421,6 +559,15 @@ struct BackendAsyncState {
             bool expired = false;
             for (InFlight &entry : inFlight) {
                 if (!entry.watching || now < entry.deadlineSeconds) continue;
+                // A submission being replayed recorded the killed buffer,
+                // whose terminal status must neither finish the ticket nor
+                // read as progress; only a resubmission that never lands
+                // (past its own deadline) still gives up.
+                if (entry.replaying) {
+                    markUnhealthy(
+                        "Metal command replay timed out before resubmission");
+                    return true;
+                }
                 expired = true;
                 id<MTLCommandBuffer> command = entry.command;
                 const auto status = command ? command.status
@@ -516,6 +663,10 @@ struct SplitFeedback4 {
 };
 #endif
 
+// Defined after MetalBackend::Impl, whose prepared-dispatch and span types
+// it snapshots (MetalEncode.mm makes the plan when a command is committed).
+struct CommandReplay;
+
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
@@ -527,6 +678,20 @@ struct CommandTicket::State {
     AwakeClock::time_point wallStart;
     // Command buffers committed before the last one, split at event signals.
     std::vector<id<MTLCommandBuffer>> leadingCommands;
+    // The run as it was submitted, kept while the command may still be
+    // asked back from a display kill (MetalEncode.mm encodeSubmission):
+    // dispatches with every caller-owned pointer copied, event steps, spans
+    // and bound allocations, and the encode decisions of the first commit.
+    // Null when a replay cannot be ordered safely — while the Metal 4 path
+    // is enabled, under dispatch profiling, or with
+    // RICHENGINE_DROP_REPLAY_OFF.
+    std::shared_ptr<CommandReplay> replay;
+    // Resubmissions still allowed after a dropped buffer; the ticket
+    // completes with the last try's result.
+    uint32_t replaysLeft = kDroppedCommandRetries;
+    // The delayed retry locks this to reach the state: the completion
+    // handlers keep it strong, the scheduling block must not.
+    std::weak_ptr<State> self;
 #if RICHENGINE_MTL4_AVAILABLE
     // Set by commit4 while event steps split the command into several
     // commits: the leading commits' starts and errors land here for the
@@ -536,6 +701,12 @@ struct CommandTicket::State {
     std::string error;
     bool completed = false;
     bool released = false;
+
+    // Both defined in MetalEncode.mm, where the encode they reschedule
+    // lives: scheduleReplay queues the rerun after the attempt's backoff,
+    // replayEncode encodes and commits the plan on the replay queue.
+    void scheduleReplay() noexcept;
+    void replayEncode() noexcept;
 
     void finishCommand(id<MTLCommandBuffer> command) {
         auto wallEnd = AwakeClock::now();
@@ -567,6 +738,29 @@ struct CommandTicket::State {
                 message << ": " << errorDescription(failed.error);
             }
             error = message.str();
+            // macOS kills an in-flight buffer for the display without the
+            // work being at fault (droppedForInteractivity): encode and
+            // commit the same command again instead of going unhealthy. A
+            // replay is refused when order can no longer be guaranteed —
+            // a later submission already committed behind the killed buffer
+            // may have read the state it left half-written — and the
+            // failure stays fatal exactly as before, as it does once the
+            // retries are spent.
+            if (replaysLeft && replay &&
+                droppedForInteractivity(failed.error)) {
+                switch (backend->beginReplay(sequence)) {
+                case BackendAsyncState::ReplayStart::Started:
+                    --replaysLeft;
+                    scheduleReplay();
+                    return;
+                case BackendAsyncState::ReplayStart::Busy:
+                    // A second terminal result of the same kill; the
+                    // pending replay finishes this ticket.
+                    return;
+                case BackendAsyncState::ReplayStart::Refused:
+                    break;
+                }
+            }
         }
 
         finish(timing, std::move(error));
@@ -1139,11 +1333,73 @@ struct MetalBackend::Impl {
 
 
     // Encodes and commits prepared dispatches and the event steps between
-    // them; the ticket retains `retained` until it is consumed.
+    // them; the ticket retains `retained` until it is consumed. `origin` is
+    // the prepared command the dispatches came from: its span references
+    // join the ticket's replay plan, which a dropped command buffer is
+    // resubmitted from (CommandReplay). Null under dispatch profiling,
+    // which makes the command's tickets unreplayable.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
-                         CommandCompletion completion);
+                         CommandCompletion completion,
+                         const PreparedCommand *origin = nullptr);
+
+    // What encodeSubmission needs beyond the dispatch list itself: the
+    // queue, the ticket whose sequence the commit lands under, the encode
+    // decisions commit() already made, and — for the Metal 4-style pieces
+    // a replay cannot re-derive — the pieces captured at the first encode.
+    // A replayed submission passes the plan's copies: the same flags and
+    // bank, because a retry must not re-decide under changed overlap.
+    struct EncodeRequest {
+        __strong id<MTLCommandQueue> queue = nil;
+        std::shared_ptr<Residency> residency;
+        BackendAsyncState *asyncState = nullptr;
+        CommandTicket::State *ticket = nullptr;
+        std::span<const PreparedDispatch> dispatches;
+        std::span<const EventStep> events;
+        uint32_t spanBank = 0;
+        bool replaySpans = false;
+        bool replayGpuSpans = false;
+        // RICHENGINE_OP_TIMINGS splits the command into one buffer per
+        // encoded unit; a replay repeats that shape.
+        bool opTimings = false;
+        // The gpu_encode pipeline when a GPU span's ICB must be written:
+        // the pipeline cache at the first encode, the plan's captured
+        // object on a retry — the backend may already be gone.
+        std::function<id<MTLComputePipelineState>()> gpuEncode;
+        // Marks the backend unhealthy and throws when encoding cannot
+        // begin; the replay's variant throws to its caller's catch.
+        std::function<void(std::string)> fail;
+        // The backend on the first encode (span banks bake through it);
+        // null on a replay, whose banks the first encode already built.
+        Impl *host = nullptr;
+        // True on a resubmission: the commit goes through commitReplay —
+        // which lands ahead of the submissions waiting at the gate —
+        // instead of commitSubmission.
+        bool replay = false;
+    };
+
+    // The encode-and-commit body of commit() and of a dropped command's
+    // replay: dispatches and event steps into fresh command buffers on
+    // request.queue, committed against the ticket's sequence. Defined in
+    // MetalEncode.mm.
+    static void encodeSubmission(const EncodeRequest &request);
+
+    // Snapshots the run `dispatches` encodes so a dropped command buffer
+    // can be resubmitted from it (CommandReplay). Built while the caller's
+    // storage is still valid: a BytesBinding's data lives only until
+    // submit() returns, and the prepared dispatch list belongs to the
+    // prepared-command cache or the submission's frame.
+    static std::shared_ptr<CommandReplay>
+    makeReplayPlan(id<MTLCommandQueue> queue,
+                   const std::shared_ptr<Residency> &residency,
+                   std::span<const PreparedDispatch> dispatches,
+                   std::span<const EventStep> events,
+                   const PreparedCommand &origin,
+                   const std::vector<std::shared_ptr<MetalAllocation>>
+                       &retained,
+                   uint32_t spanBank, bool replaySpans, bool replayGpuSpans,
+                   bool opTimings);
 
 
 #if RICHENGINE_MTL4_AVAILABLE
@@ -1170,6 +1426,35 @@ struct MetalBackend::Impl {
     // selecting it is unconditional, so the method is too.
     CommandTicket submitProfiled(const Command &command,
                                  CommandCompletion completion);
+};
+
+// The run a killed command buffer is resubmitted from
+// (CommandTicket::State::replay, droppedForInteractivity). Snapshotted at
+// commit time because the caller's data does not outlive submit():
+// BytesBinding payloads are valid only until submit returns, and the
+// prepared dispatch list belongs to the prepared-command cache or the
+// submission's stack. The copies rebind the resolved dispatches' sources,
+// so the replay's encode reads exactly what the first encode did — buffer
+// views keep their allocations alive, spans their arenas, and the queue,
+// residency set and gpu_encode pipeline are held so the replay outlives
+// the backend itself.
+struct CommandReplay {
+    // Stable storage the copied BytesBindings point into; deque so the
+    // pointers survive the dispatches vector's growth.
+    std::deque<std::vector<std::byte>> payloads;
+    std::vector<ComputeDispatch> dispatches;
+    std::vector<MetalBackend::Impl::PreparedDispatch> prepared;
+    std::vector<EventStep> events;
+    std::vector<std::shared_ptr<const MetalBackend::Impl::BakedSpan>> spanRefs;
+    std::vector<std::shared_ptr<const MetalBackend::Impl::GpuSpan>> gpuSpanRefs;
+    std::vector<std::shared_ptr<MetalAllocation>> retained;
+    std::shared_ptr<Residency> residency;
+    __strong id<MTLCommandQueue> queue = nil;
+    __strong id<MTLComputePipelineState> gpuEncodePipeline = nil;
+    uint32_t spanBank = 0;
+    bool replaySpans = false;
+    bool replayGpuSpans = false;
+    bool opTimings = false;
 };
 
 } // namespace richengine::metal

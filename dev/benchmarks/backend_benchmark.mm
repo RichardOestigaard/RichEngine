@@ -1,7 +1,9 @@
+#include "Env.hpp"
 #include "engine/Engine.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/wire/Json.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
 #include "model/WeightStore.hpp"
 #include "PrefillWork.hpp"
@@ -9,6 +11,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <map>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -320,7 +323,10 @@ public:
       if (engine_.tick(milliseconds(Clock::now()))) {
         const uint64_t sequence = events_.batchSequence();
         if (sequence != observedBatchSequence) {
-          if (sequence != observedBatchSequence + 1)
+          // RICHENGINE_DISPATCH_PROFILE's synchronous submits let a tick
+          // finish more than one batch; only the last is observable then.
+          if (sequence != observedBatchSequence + 1 &&
+              !envFlag("RICHENGINE_DISPATCH_PROFILE"))
             throw std::logic_error("benchmark skipped a completed batch");
           observedBatchSequence = sequence;
           if (observer)
@@ -829,10 +835,13 @@ struct BenchmarkScenarios final {
   // Decode throughput against a live history: 32K/64K/128K prompts warmed
   // into the cache, then 64 tokens decoded on top.
   bool longDecode = false;
+  // Resumes of a cached prefix re-reading a few rows, as a conversation's
+  // next turn does.
+  bool resume = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -843,6 +852,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "exact"   ? &selected.exact
                      : name == "transcripts" ? &selected.transcripts
                      : name == "longdecode" ? &selected.longDecode
+                     : name == "resume"      ? &selected.resume
                                          : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -870,7 +880,7 @@ int main(int argc, char **argv) {
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--kv-format FORMAT]\n"
                    "  NAME: decode, partial, short, context, exact, "
-                   "transcripts or longdecode "
+                   "transcripts, longdecode or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -977,6 +987,12 @@ int main(int argc, char **argv) {
     if (progress)
       progress->identity(identity);
 
+    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // Like a start's warmup, what they allocate is memory a request in
+    // service needs (MemoryGovernor::setServing): unmarked, the host's
+    // margins refuse a lane the plan holds, and the run fails. The governor
+    // is not serving here, so the mark clears after the warmups.
+    resources->memoryGovernor().setServing(true);
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1001,6 +1017,7 @@ int main(int argc, char **argv) {
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
+    resources->memoryGovernor().setServing(false);
 
     Events events;
     engine::EngineConfig engineConfig;
@@ -1051,15 +1068,59 @@ int main(int argc, char **argv) {
     decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
     uint64_t requestId = 1;
     if (selected.decode) {
+      // RICHENGINE_DISPATCH_PROFILE: per-pipeline GPU seconds over the
+      // decode samples, for kernel-level step-cost breakdowns.
+      const bool dispatchProfile = envFlag("RICHENGINE_DISPATCH_PROFILE");
+      if (dispatchProfile)
+        metal::BackendInstrumentation::setDispatchProfiling(
+            resources->backend(), true);
+      std::map<uint32_t, std::map<std::string, std::pair<double, uint64_t>>>
+          profileByWidth;
       for (uint32_t sample = 0; sample < samples; ++sample) {
         for (uint32_t offset = 0;
              offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
           const uint32_t width =
               1 + (sample + offset) % model::ExecutionLimits::maximumBatchWidth;
           evictAllCache(resources->cache());
+          if (dispatchProfile)
+            static_cast<void>(
+                metal::BackendInstrumentation::takeDispatchProfile(
+                    resources->backend()));
           decodeThroughput.push_back(runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,
               width, sample, decodePrompt));
+          if (dispatchProfile) {
+            for (const auto &entry :
+                 metal::BackendInstrumentation::takeDispatchProfile(
+                     resources->backend())) {
+              auto &slot = profileByWidth[width][entry.pipelineName];
+              slot.first += entry.gpuSeconds;
+              ++slot.second;
+            }
+          }
+        }
+      }
+      if (dispatchProfile) {
+        metal::BackendInstrumentation::setDispatchProfiling(
+            resources->backend(), false);
+        for (const auto &[width, byPipeline] : profileByWidth) {
+          std::vector<std::pair<std::string, std::pair<double, uint64_t>>> ranked(
+              byPipeline.begin(), byPipeline.end());
+          std::sort(ranked.begin(), ranked.end(),
+                    [](const auto &a, const auto &b) {
+                      return a.second.first > b.second.first;
+                    });
+          double total = 0.0;
+          for (const auto &[name, entry] : ranked) total += entry.first;
+          fprintf(stderr,
+                  "dispatch-profile width %u gpu-seconds per pipeline "
+                  "(%.4f total):\n",
+                  width, total);
+          for (const auto &[name, entry] : ranked)
+            fprintf(stderr, "  %9.4f x%-3llu %9.6f/disp  %s\n", entry.first,
+                    static_cast<unsigned long long>(entry.second),
+                    entry.second ? entry.first / entry.second : 0.0,
+                    name.c_str());
         }
       }
       // A wider batch must not lose aggregate throughput. A dense model can
@@ -1362,6 +1423,49 @@ int main(int argc, char **argv) {
         measurements.push_back(std::move(partialCold));
         measurements.push_back(std::move(partialSeed));
         measurements.push_back(std::move(partialHit));
+      }
+    }
+
+    // Resumes of a cached prefix that re-read a few rows, as a conversation's
+    // next turn does from the replay state of the turn before: a seed of a
+    // page and one token keeps its state at the page boundary, so a prompt of
+    // the seed and `suffix` more tokens re-reads suffix + 1 rows over the
+    // context of that boundary, 2K and 32K. Each context is seeded once; a
+    // resume's own states lie past the seed's last token, where the next
+    // resume's tokens differ.
+    if (selected.resume) {
+      constexpr std::array<uint32_t, 2> resumeContexts{2048, 32768};
+      constexpr std::array<uint32_t, 8> resumeSuffixes{4, 19, 31, 32, 35, 47, 55, 63};
+      for (const uint32_t context : resumeContexts) {
+        // The longest resume, and the token it generates, past what the
+        // memory plan holds on a Mac with less memory.
+        if (context + 1 + resumeSuffixes.back() + 1 >= engineConfig.maxContext) {
+          skippedLengths.push_back(context);
+          continue;
+        }
+        const std::vector<uint32_t> seed =
+            prompt(context + 1, uint64_t{context} << 32 | 0x524553554dULL, promptVocabulary);
+        evictAllCache(resources->cache());
+        const Measurement seeded =
+            runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                       "resume_seed_" + std::to_string(context), 0, seed);
+        if (seeded.cacheStatus != "miss")
+          throw std::runtime_error("resume seed was not a cold miss: " + seeded.cacheStatus);
+        for (uint32_t sample = 0; sample < samples; ++sample)
+          for (const uint32_t suffix : resumeSuffixes) {
+            std::vector<uint32_t> tokens = seed;
+            const std::vector<uint32_t> more =
+                prompt(suffix, (uint64_t{suffix} << 40) ^ (uint64_t{sample} << 32) ^ context ^ 0x5355464658ULL,
+                       promptVocabulary);
+            tokens.insert(tokens.end(), more.begin(), more.end());
+            Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "resume_" + std::to_string(context) + "_r" + std::to_string(suffix + 1),
+                                            sample, std::move(tokens));
+            if (result.cacheStatus != "prefix_hit" || result.matchedTokens != context)
+              throw std::runtime_error("resume of " + std::to_string(suffix + 1) + " rows matched " +
+                                       std::to_string(result.matchedTokens) + " tokens: " + result.cacheStatus);
+            measurements.push_back(std::move(result));
+          }
       }
     }
 

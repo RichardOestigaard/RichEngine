@@ -1,4 +1,5 @@
 #include "model/RuntimeImpl.hpp"
+#include "AwakeClock.hpp"
 
 namespace richengine::model {
 
@@ -206,7 +207,7 @@ namespace richengine::model {
                             predraft.positions[lane]);
     }
     static const bool pdTiming = envFlag("RICHENGINE_DECODE_TIMING");
-    const auto p0 = std::chrono::steady_clock::now();
+    const auto p0 = richengine::AwakeClock::now();
     CommandGraph graph;
     addRopeTables(
         graph, decodeArena->packed(DecodeTensor::Positions, width), 0,
@@ -221,7 +222,7 @@ namespace richengine::model {
                          geometry.draft.queryRows());
     encodeDraftBatchGraph(graph, {entries.data(), width},
                           {logicalPositions.data(), width});
-    const auto p1 = std::chrono::steady_clock::now();
+    const auto p1 = richengine::AwakeClock::now();
     predraft.epoch = arenaEpoch_;
     predraft.lanes = width;
     // The overlap variant raises a queue-level event at the tail: the next
@@ -244,7 +245,7 @@ namespace richengine::model {
       predraft.ticket = backend.submitCommandAsync(graph.dispatches());
     }
     if (pdTiming) {
-      const auto p2 = std::chrono::steady_clock::now();
+      const auto p2 = richengine::AwakeClock::now();
       fprintf(stderr, "predraft-detail build=%.3fms submit=%.3fms\n",
               std::chrono::duration<double, std::milli>(p1 - p0).count(),
               std::chrono::duration<double, std::milli>(p2 - p1).count());

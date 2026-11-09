@@ -258,7 +258,7 @@ struct ForcedTokensFrame {
 // them. Process-wide, request-agnostic.
 struct CorpusAppendFrame {
   // Session tag the corpus doc inherits: 0 = workspace/global, nonzero =
-  // the caller's conversation key (opencode sessionID, a prompt hash, …).
+  // the caller's conversation key (a client session id, a prompt hash, …).
   uint64_t session = 0;
   std::vector<uint32_t> tokens;
 

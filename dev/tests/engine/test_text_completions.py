@@ -389,8 +389,8 @@ class TextCompletionLifecycleTests(unittest.TestCase):
                     self.assertEqual(status, 200, payload)
                     self.assertIn(b"plain answer", payload)
 
-    def test_idle_stream_keeps_alive_with_a_comment_then_empty_chunks(self):
-        # As the chat stream does: an SSE comment until the request starts,
+    def test_idle_stream_keeps_alive_with_a_blank_line_then_empty_chunks(self):
+        # As the chat stream does: an empty line until the request starts,
         # then empty text chunks, data events that clients which time out on
         # missing data events accept.
         for before_start in (True, False):
@@ -404,9 +404,7 @@ class TextCompletionLifecycleTests(unittest.TestCase):
                     try:
                         self.assertEqual(response.status, 200)
                         if before_start:
-                            self.assertEqual(
-                                response.readline(), b": richengine-keepalive\n"
-                            )
+                            self.assertEqual(response.readline(), b"\n")
                             self.assertFalse(plan.started.is_set())
                             plan.start_release.set()
                         chunk = next_data(response)

@@ -7,7 +7,7 @@
 //   bf16 output rounds, bit for bit, each within fp64 before rounding;
 // - fused: three segments of different formats in one projection equal the projections of each segment alone;
 // - gate/up: every gate and up format pair;
-// - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 32
+// - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
 //   picks for 8-80 cores, independent of poisoned partials.
@@ -52,8 +52,10 @@ using richengine::ops::tuning::floatToBf16;
 namespace {
 
 constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * kMaximumLanes;
-// Every K split a plan takes: the powers of two up to the largest.
-constexpr uint32_t kSplits[] = {1, 2, 4, 8};
+// Every K split a plan takes: the powers of two up to the largest. The
+// register tile's splits keep whole 256-input units, so it skips the counts
+// past K / 256.
+constexpr uint32_t kSplits[] = {1, 2, 4, 8, 16};
 static_assert(kSplits[std::size(kSplits) - 1] == LinearConfig::kMaximumSplits);
 // A matrix's columns are a multiple of 256, so the fewest padding columns past its segments.
 constexpr uint32_t kPadding = 256;
@@ -404,7 +406,7 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows.
+// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 64 rows.
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits) {
   return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits};
 }
@@ -431,6 +433,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
       const std::vector<Dot> gateDots = products({&g}, columns, x, kMaximumRows);
       for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
         for (const uint32_t splits : kSplits) {
+          if (tile == LinearTile::GgufRegister && K / 256 < splits) continue;
           const std::string what = std::string(fmtName(formats[fi])) + (inputs == Inputs::Sparse ? " sparse " : " dense ") +
                                    epilogueName(epilogue) + " S=" + std::to_string(splits);
           const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
@@ -465,7 +468,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
         }
     }
   }
-  section(std::string(tileName(tile)) + " decode: " + std::to_string(formats.size()) + " formats, 1-4 lanes, S 1-8, plain/residual/gate-up, dense and "
+  section(std::string(tileName(tile)) + " decode: " + std::to_string(formats.size()) + " formats, 1-4 lanes, S 1-16, plain/residual/gate-up, dense and "
           "sparse inputs within fp64, lanes equal to one-lane projections, fp32 plain outputs rounding to bf16's");
 }
 
@@ -484,7 +487,8 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
     const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
     const std::vector<Dot> dots = products(parts, columns, x, kMaximumRows);
     const std::string formats = std::string(fmtName(a.format)) + "|" + fmtName(b.format) + "|" + fmtName(c.format);
-    for (const uint32_t splits : kSplits)
+    for (const uint32_t splits : kSplits) {
+      if (tile == LinearTile::GgufRegister && K / 256 < splits) continue;
       for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
         const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
         const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
@@ -509,8 +513,9 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile) {
           offset += part->N;
         }
       }
+    }
   }
-  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(formats.size()) + " format triples, 1-4 lanes, S 1-8 within fp64 "
+  section(std::string(tileName(tile)) + " fused: three segments in " + std::to_string(formats.size()) + " format triples, 1-4 lanes, S 1-16 within fp64 "
           "and equal to each segment's projection");
 }
 
@@ -547,8 +552,9 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
 // 168- and 136-row chunks on the 128-row tiles: the second tile holds 40 or 8 rows, so its last two or three 32-row
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
-// splits and lie within fp64 with them. Every format ([1024, 1024]) at each epilogue, and a fused projection at its
-// segments' column offsets.
+// splits and lie within fp64 with them; chunks of 33-64 rows run the 64-row decode tile, alike, and also at eight
+// partitions, which the split rule takes for some shapes. Every format ([1024, 1024]) at each epilogue, and a fused
+// projection at its segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t K = 1024, kChunks[] = {168, 136}, kSimdgroupRows = 32, kSplitChunk = 4;
   constexpr LinearConfig kTiles{.tile = LinearTile::GgufPrefill};
@@ -580,8 +586,9 @@ void prefill(MetalBackend &backend, const Linear &linear) {
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
     }
-    for (const uint32_t rows : {8u, 16u, 24u, 32u})
-      for (const uint32_t splits : {1u, kSplitChunk}) {
+    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
+      for (const uint32_t splits : {1u, kSplitChunk, 8u}) {
+        if (splits == 8 && (rows <= 32 || (K / 32) % 8)) continue;
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue, WeightLayout::Block32};
         const LinearPlan plan =
             Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits), FloatOutput::BFloat16);
@@ -619,7 +626,7 @@ void prefill(MetalBackend &backend, const Linear &linear) {
            std::string(fmtName(fi)) + "|" + fmtName(b.format) + "|" + fmtName(c.format));
   }
   section("prefill: " + std::to_string(FMT_COUNT) + " formats plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row "
-          "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
+          "chunks and chunks of 8-64 rows (S 1 and 4, and 8 past 32 rows) within fp64, equal to the 128-row tiles");
 }
 
 // ---------------------------------------------------------------- leading inputs

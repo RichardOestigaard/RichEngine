@@ -335,6 +335,12 @@ uint64_t BackendInstrumentation::submittedCommands(
     return backend.impl_->asyncState->nextSequence;
 }
 
+uint64_t BackendInstrumentation::droppedCommandReplays(
+    const MetalBackend &backend) {
+    return backend.impl_->asyncState->droppedCommandReplays.load(
+        std::memory_order_relaxed);
+}
+
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {
     return backend.impl_->pipelines.size();
 }

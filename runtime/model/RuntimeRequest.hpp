@@ -199,6 +199,12 @@ struct RuntimeRequest final {
   // 3-gram finds nothing. corpusProbeAt paces those starvation probes.
   bool corpusArmed = false;
   uint32_t corpusProbeAt = 0;
+  // Corpus-sourced acceptance: the EWMA of accepted tokens over rounds the
+  // corpus displaced the lane's own match, which disarms a lane whose
+  // corpus continuations keep failing the verify.
+  uint32_t corpusRounds = 0;
+  double corpusAcceptedAvg = 0;
+  bool corpusInFlight = false;
   // Weak session key (opening-prompt hash) and, on corpus docs this lane
   // committed, self-exclusion: origin skips the lane's own pushed stream,
   // session prefers same-conversation docs on ties.

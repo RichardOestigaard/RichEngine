@@ -879,7 +879,7 @@ uint32_t validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layou
   return static_cast<uint32_t>(blockSize);
 }
 
-// The families an assembly's model.json may name (install/families.py's
+// The families an assembly's model.json may name (install/families/ 's
 // FAMILIES), each with the model_type its upstream config states —
 // registered by the model/families/<family>.mm translation units
 // (ModelRegistry, replacing kModelFamilies). The record's family selects

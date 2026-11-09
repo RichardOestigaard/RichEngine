@@ -1,4 +1,5 @@
 #include "model/GgufPreparation.hpp"
+#include "AwakeClock.hpp"
 
 #include "metal/abi/GgufRepack.h"
 #include "model/Bfloat16.hpp"
@@ -185,7 +186,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 }
 
 // RICHENGINE_REPACK_TIMING=1 logs the read/kernel split of each writeRepack.
-using Clock = std::chrono::steady_clock;
+using Clock = richengine::AwakeClock;
 
 bool timingEnabled() { return std::getenv("RICHENGINE_REPACK_TIMING") != nullptr; }
 

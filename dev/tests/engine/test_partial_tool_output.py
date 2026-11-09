@@ -280,7 +280,9 @@ class PartialToolOutputTests(unittest.TestCase):
         return value
 
     def test_tool_only_whitespace_is_absent_in_every_protocol(self):
-        call = weather_call("Paris")
+        # Two different calls: a call identical to an earlier one is a
+        # reply-loop guard's duplicate and is dropped (reply_guards).
+        first, second = weather_call("Paris"), weather_call("Rome")
         for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
             for stream in (False, True):
                 for thinking in (False, True):
@@ -288,9 +290,9 @@ class PartialToolOutputTests(unittest.TestCase):
                         text = (
                             ("reason</think>" if thinking else "")
                             + " \n"
-                            + call
+                            + first
                             + "\n\t"
-                            + call
+                            + second
                             + "\n"
                         )
                         harness = character_harness(text)

@@ -42,7 +42,8 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
 // threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
-// MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows (these kernels and the fused ones): a 3-lane step
+// MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows, or 64 for a prefill chunk of 33 to 64 rows on
+// Apple10 (these kernels and the fused ones): a 3-lane step
 // runs the 32-row tile over the storage of four lanes (LinearPlan::storageRows) and the padding lane's rows are
 // computed and discarded. Rows are independent, so every active row is the bits of any other tile height
 // (gguf-projection full); on a 16-core M5 Pro the 32-row tile at three lanes costs what it costs at four, 3-15% less
@@ -93,9 +94,12 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   template [[host_name("gguf_decode_" #f "_m" #R "_" #ep)]] kernel GgufDecodeKernel<Out> gguf_decode<F, R, Ep, Out>;
 #define GGUF_DECODE_ROWS(F, f, ep, Ep, Out) \
   GGUF_DECODE(F, f, 8, ep, Ep, Out) GGUF_DECODE(F, f, 16, ep, Ep, Out) GGUF_DECODE(F, f, 32, ep, Ep, Out)
+// Prefill chunks of 33 to 64 rows run the 64-row tile (ops::Linear), whose bf16 epilogues prefill takes.
+#define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
-  GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
-  GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
+  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
+  GGUF_DECODE(F, f, 64, a_f32, EpNone, float)                                                                     \
+  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
 // The fused greedy head: the staged decode with an argmax tail instead of
 // logits stores — one partial per (row, GGUF_TILE_COLUMNS tile), reduced by
@@ -199,7 +203,7 @@ using GgufArgmaxKernel =
 #define GGUF_DECODE_AMAX(F, f, R) \
   template [[host_name("gguf_decode_" #f "_m" #R "_amax")]] kernel GgufArgmaxKernel gguf_decode_amax<F, R>;
 #define GGUF_DECODE_AMAX_ROWS(F, f) \
-  GGUF_DECODE_AMAX(F, f, 8) GGUF_DECODE_AMAX(F, f, 16) GGUF_DECODE_AMAX(F, f, 32)
+  GGUF_DECODE_AMAX(F, f, 8) GGUF_DECODE_AMAX(F, f, 16) GGUF_DECODE_AMAX(F, f, 32) GGUF_DECODE_AMAX(F, f, 64)
 QUANT_FORMATS(GGUF_DECODE_AMAX_ROWS)
 GGUF_DECODE_AMAX_ROWS(FmtMXFP4N, mxfp4n)
 #undef GGUF_DECODE_AMAX_ROWS
@@ -208,6 +212,7 @@ GGUF_DECODE_AMAX_ROWS(FmtMXFP4N, mxfp4n)
 // The native MXFP4 decoders, dispatched on Apple GPU family 10 and up only.
 GGUF_DECODE_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_DECODE_FORMAT
+#undef GGUF_DECODE_ROWS64
 #undef GGUF_DECODE_ROWS
 #undef GGUF_DECODE
 
@@ -277,17 +282,23 @@ kernel void gguf_decode_packed(device bfloat *input [[buffer(0)]], device uchar 
 #define GGUF_DECODE_PACKED_ROWS(F, f, BT, ep, Ep, Out) \
   GGUF_DECODE_PACKED(F, f, BT, 8, ep, Ep, Out) GGUF_DECODE_PACKED(F, f, BT, 16, ep, Ep, Out) \
   GGUF_DECODE_PACKED(F, f, BT, 32, ep, Ep, Out)
+// The staged prefill tile's 64-row height (ops::Linear), which the env-gated
+// packed chunk path (RICHENGINE_SCORE_TENSOR_PREFILL) takes in the bf16
+// epilogues too.
+#define GGUF_DECODE_PACKED_ROWS64(F, f, BT, ep, Ep) \
+  GGUF_DECODE_PACKED_ROWS(F, f, BT, ep, Ep, bfloat) GGUF_DECODE_PACKED(F, f, BT, 64, ep, Ep, bfloat)
 #define GGUF_DECODE_PACKED_FORMAT(F, f, BT)                                              \
-  GGUF_DECODE_PACKED_ROWS(F, f, BT, a, EpNone, bfloat)                                   \
+  GGUF_DECODE_PACKED_ROWS64(F, f, BT, a, EpNone)                                         \
   GGUF_DECODE_PACKED_ROWS(F, f, BT, a_f32, EpNone, float)                                \
-  GGUF_DECODE_PACKED_ROWS(F, f, BT, r, EpResidual, bfloat)                               \
-  GGUF_DECODE_PACKED_ROWS(F, f, BT, g, EpUpWithGate, bfloat)
+  GGUF_DECODE_PACKED_ROWS64(F, f, BT, r, EpResidual)                                     \
+  GGUF_DECODE_PACKED_ROWS64(F, f, BT, g, EpUpWithGate)
 GGUF_DECODE_PACKED_FORMAT(FmtQ40, q40, uint4b_format)
 GGUF_DECODE_PACKED_FORMAT(FmtQ41, q41, uint4b_format)
 GGUF_DECODE_PACKED_FORMAT(FmtQ4K, q4k, uint4b_format)
 GGUF_DECODE_PACKED_FORMAT(FmtQ80, q80, int8_t)
 GGUF_DECODE_PACKED_FORMAT(FmtPQ20, pq20, uint2b_format)
 #undef GGUF_DECODE_PACKED_FORMAT
+#undef GGUF_DECODE_PACKED_ROWS64
 #undef GGUF_DECODE_PACKED_ROWS
 #undef GGUF_DECODE_PACKED
 #endif
@@ -359,7 +370,7 @@ using GgufDecodeGateUpKernel = void(device bfloat *, device uchar *, device ucha
                                     device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
 #define GGUF_DECODE_GATE_UP(F, f, R) \
   template [[host_name("gguf_decode_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpKernel gguf_decode_gate_up<F, R>;
-#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32)
+#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32) GGUF_DECODE_GATE_UP(F, f, 64)
 QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 #undef GGUF_DECODE_GATE_UP_FORMAT
 #undef GGUF_DECODE_GATE_UP
@@ -408,10 +419,11 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_FUSED(8, , false) GGUF_DECODE_FUSED(16, , false) GGUF_DECODE_FUSED(32, , false)
+// The 64-row instances run fused prefill chunks of 33 to 64 rows (ops::Linear).
+GGUF_DECODE_FUSED(8, , false) GGUF_DECODE_FUSED(16, , false) GGUF_DECODE_FUSED(32, , false) GGUF_DECODE_FUSED(64, , false)
 // The `_n` fused kernels an Apple GPU family 10 host dispatches, whose MXFP4
 // segments decode on the native FP4 path.
-GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED(32, _n, true)
+GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED(32, _n, true) GGUF_DECODE_FUSED(64, _n, true)
 #undef GGUF_DECODE_FUSED
 #undef GGUF_SEGMENT
 

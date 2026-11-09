@@ -58,6 +58,9 @@ enum class BufferStorage {
 
 // How kernels reach a buffer: bound to the dispatches that use it, or only
 // through its GPU address held in another buffer, as they reach KV extents.
+// A Bound buffer may also be reached through a dispatch's address table
+// (AddressTable), which the backend writes per dispatch and declares once
+// per encoder.
 enum class BufferReach {
   Bound,
   Addressed,
@@ -163,6 +166,23 @@ struct IndirectGrid {
   uint64_t offsetBytes = 0;
 };
 
+// Buffers a dispatch reaches through their GPU addresses: the backend writes
+// each one's address at encode time, in order, as a constant ulong table at
+// `index` (setBytes, so at most 512 of them), and makes their memory resident
+// for the encoder's dispatches from this one on (useResources, for reading,
+// or reading and writing when `writes`, declared once per table and usage per
+// encoder), never for the queue as BufferReach::Addressed buffers are.
+// Addresses are the buffers' when the command is encoded, so a buffer
+// released and restored since the graph was built is reached where it is
+// now; released memory is refused like a binding of it. Dispatches that
+// reach the same buffers share one list, which the backend resolves once per
+// command and declares once per encoder.
+struct AddressTable {
+  uint32_t index = 0;
+  std::shared_ptr<const std::vector<MetalBuffer>> buffers; // none when null
+  bool writes = false;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
@@ -172,6 +192,7 @@ struct ComputeDispatch {
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
+  AddressTable addresses = {};
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of
@@ -197,6 +218,14 @@ enum class HostStepGpu : uint8_t {
 // event reaches `value`. A command is split into Metal command buffers at its
 // signals, so a signal is never held back behind the dispatches that follow
 // it, and a signal is delivered even when the work before it fails.
+//
+// Metal fails a wait (a Wait, or the work after a host step) still unmet 5 s
+// after its queue reached it ("Caused GPU Timeout Error"), and the command
+// with it. The queue reaches a command's first wait as the command is
+// submitted, whatever work runs ahead of it, and each later one once the
+// wait before it was met: the work between two waits, with the agent's or
+// the step's part, must end within 5 s. Longer work, such as the encodes of
+// a prefill command's images, runs as a command of its own.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
 // holds all later work until it returned, through two shared events the

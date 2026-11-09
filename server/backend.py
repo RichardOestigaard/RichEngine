@@ -41,6 +41,13 @@ RESTART_BACKOFF_SECONDS = 5.0
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
 
+# Engine outcomes whose message the engine words from its own limits and
+# counts, never from a request: the client gets it as it is, and the console
+# prints it beside the code.
+_ENGINE_RESOURCE_CODES = frozenset(
+    {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
+)
+
 # RICHENGINE_TRACE_TOKENS=/path.jsonl records every completed request's prompt
 # and output token ids (plus sampling and linkage fields) for offline replay —
 # the n-gram/spec-decoding corpus analysis in dev/benchmarks/ngram_replay.py.
@@ -1294,6 +1301,18 @@ class NativeBackend:
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
             if code == "capacity_exhausted":
+                # A request that does not fit even alone fails the same way
+                # on a retry; the engine's message names what it lacked. The
+                # engine ends an allocation failure's message_bytes naming
+                # the limits that would fit it, as Engine.cpp's
+                # capacityExhausted appends "--max-memory"/"--max-context";
+                # a refusal that is not an allocation, as an SSD cache that
+                # takes no writes, names its own. An engine whose bare
+                # "could not allocate" names no limits gets the advice here.
+                if not message.startswith("could not allocate"):
+                    return APIError(400, message, code)
+                if "--max-memory" in message:
+                    return APIError(400, message, code)
                 return APIError(
                     400,
                     "the request does not fit in the memory this server may use, even "
@@ -1301,6 +1320,10 @@ class NativeBackend:
                     f"larger --max-memory or a smaller --max-context ({message})",
                     code,
                 )
+            # The SSD cache cannot hold even the prompt's KV of a request that
+            # does not fit in memory; the message names its quota.
+            if code == "kv_disk_quota":
+                return APIError(400, message, code)
             request_codes = {
                 "integer_overflow",
                 "invalid_constraint",
@@ -1349,6 +1372,8 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+            if error.code in _ENGINE_RESOURCE_CODES:
+                record["engine_reason"] = error.message
         try:
             self.request_logger(record)
         except Exception as logging_error:

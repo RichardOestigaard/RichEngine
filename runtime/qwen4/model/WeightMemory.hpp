@@ -20,9 +20,13 @@ public:
   // Takes back the next part released, such as an image whose memory `admit`
   // admits and which it writes again; true once none is left. A part whose
   // memory admission or the driver refuses stays released and throws
-  // metal::MetalAllocationError with the cause. On any other failure the
-  // weights are unusable: the engine stops.
-  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit) = 0;
+  // metal::MetalAllocationError with the cause. Memory a part may take back
+  // but can do without, such as an expert store's chunks above its floor
+  // (model::ExpertStore), comes back only as far as `optional` admits it,
+  // and what that refuses stays released without holding the restore back.
+  // On any other failure the weights are unusable: the engine stops.
+  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit,
+                                     const metal::AllocationAdmission &optional) = 0;
 };
 
 } // namespace splash::model

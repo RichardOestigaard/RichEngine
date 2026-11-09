@@ -111,7 +111,7 @@
 
 ## Unreleased — working tree
 
-- New families: Ornith-1.5-9B, Ornith-1.5-35B-A3B, MiniCPM5-2B, LFM2.5-2.6B, LFM2.5-8B-A1B (`install/families.py`, `install/completions/suggested-models.txt`)
+- New families: Ornith-1.5-9B, Ornith-1.5-35B-A3B, MiniCPM5-2B, LFM2.5-2.6B, LFM2.5-8B-A1B (`install/families/`, `install/completions/suggested-models.txt`)
 - New target/draft loaders: `Ornith9B`, `Dense`, `Lfm2`, `Lfm2Moe`, `PlainDraft`, `DSparkDraft` (Markov + confidence heads), `AnePredictor` (CoreML); `ModelFactory` dispatches draft layout via `std::visit`
 - LFM2 conv support: `runtime/ops/LfmConv.*`, `runtime/metal/abi/LfmConv.h`, `shared/lfm_conv.metal`
 - `--kv-format` gains `int4` (now default), `fp8`, `fp8e4m3`; new FP8 attention/store kernels (decode + prefill), `paged_attention_fp8_tile.h`, `Fp8PageFormatReference` tests

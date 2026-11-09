@@ -41,7 +41,7 @@ management, and per-device kernel autotuning.
 - `install/pack.py` (992 lines) — install-time weight packing: HF
   safetensors → the runtime's affine Q4 format, since no GGUF/MLX loader
   maps gemma4 tensors.
-- `install/families.py` — `Gemma4-26B-A4B` family signature plus the DFlash
+- `install/families/` — `Gemma4-26B-A4B` family signature plus the DFlash
   draft pairing (`z-lab/gemma-4-26B-A4B-it-DFlash`).
 - `install/gguf.py` — SentencePiece/unigram tokenizer support and gemma4
   GGUF metadata.
@@ -56,7 +56,7 @@ management, and per-device kernel autotuning.
 - Server side: `tool_schema.py` gemma4 `<|tool_call>` grammar, `output.py` `_Gemma4CallProjector`
   streaming parser, `chat_templates.py` context-dependent
   generation-prompt probing.
-- `docs/GEMMA4_PLAN.md` research doc; `run-gemma.sh`.
+- `docs/GEMMA_DIFFUSION_OPTIMIZATION_PLAN.md` research doc; `run-gemma.sh`.
 
 ## 2. DiffusionGemma — diffusion decoding
 

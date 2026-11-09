@@ -7,6 +7,9 @@ namespace richengine::model {
   void Runtime::Impl::seedNgramHistory(Request &entry, std::span<const uint32_t> prompt) {
     entry.corpusArmed = false;
     entry.corpusProbeAt = 0;
+    entry.corpusRounds = 0;
+    entry.corpusAcceptedAvg = 0;
+    entry.corpusInFlight = false;
     entry.corpusSession = ngram::sessionKey(prompt);
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
@@ -95,6 +98,7 @@ namespace richengine::model {
     std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
         proposals{};
     std::array<uint32_t, kLaneCount> foundCounts{};
+    std::array<bool, kLaneCount> corpusLanes{};
     double score = 0;
     // The bar the n-gram chain must clear is the GPU draft's own measured
     // expectation — its acceptance EWMA — not a constant: a proposer that
@@ -136,6 +140,13 @@ namespace richengine::model {
             3 + probeExtension >= ngram::kCorpusArmMin)
           entry.corpusArmed = true;
       }
+      // A proven-bad corpus loses its consult: armed on a shared prefix, a
+      // doc whose continuations keep failing the verify wastes the
+      // displacement's margin — the starvation probe's cadence may re-arm
+      // the lane on a fresh match.
+      if (entry.corpusArmed && entry.corpusRounds >= ngram_.ngramWarmup_ &&
+          entry.corpusAcceptedAvg < ngram_.ngramTreeMin_)
+        entry.corpusArmed = false;
       if (ngram_.ngramCorpus_ && ngram_.corpusLane(entry) &&
           !ngram_.ngramCorpusDocs_.docs.empty()) {
         std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> corpus;
@@ -151,6 +162,10 @@ namespace richengine::model {
         if (corpusPattern > selfPattern + ngram_.ngramCorpusMargin_) {
           std::copy(corpus.begin(), corpus.end(), proposals[lane].begin());
           found = corpusFound;
+          corpusLanes[lane] = true;
+          if (ngramDebug_)
+            fprintf(stderr, "  corpus-displaced lane=%u cfound=%u cext=%u\n",
+                    lane, corpusFound, corpusExtension);
         }
       }
       foundCounts[lane] = found;
@@ -187,6 +202,7 @@ namespace richengine::model {
                   proposals[lane].data(),
                   RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
       entries[lane]->ngramInFlight = true;
+      entries[lane]->corpusInFlight = corpusLanes[lane];
     }
     if (!emitTree)
       return true;

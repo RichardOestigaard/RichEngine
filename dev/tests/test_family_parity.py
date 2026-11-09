@@ -1,6 +1,6 @@
 """Parity between the Python and C++ model-family registries.
 
-install/families.py's FAMILIES and the runtime's ModelRegistry
+install/families/'s FAMILIES and the runtime's ModelRegistry
 registrations (the registerModelFamily rows in runtime/model/families/*.mm,
 what kModelFamilies was) name the same served families and the model_type
 each states; drift between them breaks loads. Pure text parsing: no Hub

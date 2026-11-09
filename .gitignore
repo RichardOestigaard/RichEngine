@@ -22,3 +22,6 @@ server/webui/
 /build8
 8
 /dev/distill
+
+# Per-experiment/agent build trees (make BUILD=build-<name>) and bench output.
+build-*/

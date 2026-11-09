@@ -1,4 +1,5 @@
 #include "model/RuntimeImpl.hpp"
+#include "AwakeClock.hpp"
 
 namespace richengine::model {
 
@@ -158,7 +159,7 @@ namespace richengine::model {
       return false;
     {
       std::unique_lock<std::mutex> lock(aneMutex_);
-      aneCv_.wait_for(lock, std::chrono::milliseconds(aneWaitMs_), [&] {
+      aneCv_.wait_until(lock, richengine::AwakeClock::now() + std::chrono::milliseconds(aneWaitMs_), [&] {
         return predraftDone_.load() == predraftSerial_.load();
       });
     }

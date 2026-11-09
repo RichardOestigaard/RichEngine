@@ -23,6 +23,9 @@ class BackendInstrumentation final {
 public:
   // Commands that passed the submission gate since construction.
   [[nodiscard]] static uint64_t submittedCommands(const MetalBackend &backend);
+  // Dropped command buffers (droppedForInteractivity) a replay began for.
+  [[nodiscard]] static uint64_t
+  droppedCommandReplays(const MetalBackend &backend);
   [[nodiscard]] static size_t cachedPipelines(const MetalBackend &backend);
   // While profiling, submitCommandAsync() commits every dispatch as its own
   // command and waits for it, recording its GPU time, then invokes

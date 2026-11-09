@@ -938,22 +938,33 @@ class CompiledDfa:
 @dataclass(frozen=True)
 class DfaSpec:
     """The structural description of one constrained output, mirroring the
-    arguments tool_grammar/json_grammar take."""
+    arguments tool_grammar/json_grammar/regex_grammar take."""
 
-    kind: str  # "json" | "tools"
+    kind: str  # "json" | "regex" | "tools"
     thinking: bool = False
     # The think-close token's byte spelling: marker and default TEXT barrier.
     think_end: str = THINK_END
     policy: object = None  # ToolPolicy for "tools"
     response_schema: object = None
+    # A regex response format's pattern; like response_schema it is also the
+    # answer alternative of a "tools" spec.
+    response_regex: object = None
 
 
-def tool_spec(policy, thinking, response_schema=None, *, think_end=THINK_END):
-    return DfaSpec("tools", thinking, think_end, policy, response_schema)
+def tool_spec(
+    policy, thinking, response_schema=None, *, think_end=THINK_END, response_regex=None
+):
+    return DfaSpec(
+        "tools", thinking, think_end, policy, response_schema, response_regex
+    )
 
 
 def json_spec(schema, thinking, *, think_end=THINK_END):
     return DfaSpec("json", thinking, think_end, None, schema)
+
+
+def regex_spec(pattern, thinking, *, think_end=THINK_END):
+    return DfaSpec("regex", thinking, think_end, None, None, pattern)
 
 
 def _barrier_literals(pattern):
@@ -1554,11 +1565,17 @@ def _call_frag(nfa, dialect, name, policy, markers):
     return _cat(nfa, parts)
 
 
+def _has_answer(spec):
+    return spec.response_schema is not None or spec.response_regex is not None
+
+
 def _answer(nfa, spec):
-    return _cat(
-        nfa,
-        [_ws(nfa), _json_value(nfa, spec.response_schema, 0), _ws(nfa)],
+    value = (
+        _json_value(nfa, spec.response_schema, 0)
+        if spec.response_regex is None
+        else _regex(nfa, spec.response_regex)
     )
+    return _cat(nfa, [_ws(nfa), value, _ws(nfa)])
 
 
 def _tools_body(nfa, spec, policy, dialect, markers):
@@ -1601,9 +1618,9 @@ def _tools_body(nfa, spec, policy, dialect, markers):
         )
 
     if not builders:
-        # tool_choice none: free text, or a JSON answer when one is set.
-        return text() if spec.response_schema is None else _answer(nfa, spec)
-    if policy.required or spec.response_schema is not None:
+        # tool_choice none: free text, or a formatted answer when one is set.
+        return text() if not _has_answer(spec) else _answer(nfa, spec)
+    if policy.required or _has_answer(spec):
         if policy.parallel:
             tail = _cat(
                 nfa,
@@ -1629,6 +1646,17 @@ def _spec_frag(nfa, spec, markers):
                 _lit(nfa, spec.think_end.encode(), marker=True),
             ]
         parts += [_ws(nfa), _json_value(nfa, spec.response_schema, 0)]
+        return _cat(nfa, parts)
+    if spec.kind == "regex":
+        parts = []
+        if spec.thinking:
+            parts += [
+                _embed_dfa(nfa, _not_contains([spec.think_end.encode()])),
+                _lit(nfa, spec.think_end.encode(), marker=True),
+            ]
+        # The pattern matches the whole reply, as the grammar's start: /re/
+        # does — a client wanting a search wraps it in (?s:.*) itself.
+        parts.append(_regex(nfa, spec.response_regex))
         return _cat(nfa, parts)
     if spec.kind == "tools":
         policy = spec.policy

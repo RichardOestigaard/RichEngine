@@ -470,7 +470,7 @@ std::vector<uint16_t> qsaKeys(const QsaLane &lane, uint32_t from, uint32_t rows)
 }
 
 // The records of the blocks whose last token is one of `rows` from `from`
-// (a step's, as model/Qwen4Steps writes them for text).
+// (a step's, as qwen4/model/Qwen4Steps writes them for text).
 std::vector<BlockIndexerBlock> qsaRecords(uint32_t from, uint32_t rows) {
   std::vector<BlockIndexerBlock> records;
   for (uint32_t last = from; last < from + rows; ++last)
@@ -758,7 +758,7 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   };
   uint64_t nativeScores = 0;
   for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}}) {
-    const model::Qwen4Steps steps(weights, *geometry, backend, 1);
+    const qwen4::model::Qwen4Steps steps(weights, *geometry, backend, 1);
     const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kVerify);
     const uint64_t scores = uint64_t{prefill.scoreRows} * prefill.scoreStride;
     if (!nativeScores) nativeScores = scores;
@@ -766,7 +766,7 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
               selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) && scores <= nativeScores,
           "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
   }
-  const model::Qwen4Steps steps(weights, native, backend, 1);
+  const qwen4::model::Qwen4Steps steps(weights, native, backend, 1);
   check(!selects(steps.prefillScratch(0), kChunk, {1'010'000 - kChunk}),
         "QSA scratch of the native window refuses the rows of YaRN's");
 }
@@ -897,7 +897,7 @@ void streamMeanTest(MetalBackend &backend) {
 }
 
 // The PLE hash on the GPU against the same hash on the CPU, as
-// model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
+// qwen4/model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
 // SPLASH_TARGET_VERIFY_ROWS rows each.
 void pleHashTest(MetalBackend &backend) {
   const uint32_t lanes = 3, laneRows = SPLASH_TARGET_VERIFY_ROWS, ngram = 3, perNgram = 8, heads = 16, eos = 248044;

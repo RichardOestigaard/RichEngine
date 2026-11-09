@@ -2731,6 +2731,11 @@ void testEngineLimitBindsThroughTheHostPause() {
   require(events.failures == std::vector<std::string>{"capacity_exhausted"} &&
               executor.suspensions == 0 && pool.snapshot().pagesAllocated == 8,
           "a lone request at the engine's limit waited for the host instead of failing");
+  const std::string &message = events.failureDetails.front().first;
+  require(message.starts_with("could not allocate ") &&
+              message.find("--max-memory") != std::string::npos &&
+              message.find("--max-context") != std::string::npos,
+          "a lone request at the engine's limit did not name the limits that would fit it");
 }
 
 // While the host refuses growth, a lane in service short of a page takes

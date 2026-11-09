@@ -2112,6 +2112,10 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
+  // A lone lane judge failed: only other limits fit it.
+  message += "; the request does not fit in the memory this server may use, even after "
+             "every cached prefix was evicted: restart the server with a larger "
+             "--max-memory or a smaller --max-context";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

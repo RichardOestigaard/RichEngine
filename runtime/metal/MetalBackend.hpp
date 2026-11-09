@@ -432,6 +432,10 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
+  // CommandTicket::State replays a dropped command buffer through Impl's
+  // encode path, and CommandReplay snapshots its prepared-dispatch types.
+  friend class CommandTicket;
+  friend struct CommandReplay;
   friend class BackendInstrumentation;
 };
 

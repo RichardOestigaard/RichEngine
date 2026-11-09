@@ -25,7 +25,7 @@ namespace richengine::ops {
 // The same channel split, GPU staging a layer ahead (coreai_ffn_weights,
 // unrotated) and shared-event handoff (ane::Handoff) apply; encode() binds
 // the staging buffers per layer. A function of a multi-function .aimodel
-// (dev/coreai/gen_ffn_asset.py, RICHENGINE_COREAI_ASSET) with a dynamic
+// (dev/tools/gen_coreai_ffn.py, RICHENGINE_COREAI_ASSET) with a dynamic
 // row dimension covers every chunk; its first call at a row count
 // specializes (~10 ms) inside verify(). Selection is RICHENGINE_COREAI_FFN.
 class CoreAiFfn final : public FfnSplit {

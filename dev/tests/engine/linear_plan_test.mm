@@ -975,7 +975,7 @@ uint64_t gateBytes(const LinearPlan &plan) {
 
 // GGUF projections plan with their segments: the staged split policy for
 // every projection kind, exact split scratch over the tile's rows, and
-// prefill tiles of 8, 16, 32 or 128 rows.
+// prefill tiles of 8, 16, 32, 64 (Apple10) or 128 rows.
 void ggufPlans() {
   const Linear linear = gpu(10, 16);
   // A block projection without segments would reach the dispatch paths with
@@ -1018,17 +1018,20 @@ void ggufPlans() {
               three.scratchSize().partials == splitPartialsBytes(three),
           "GGUF staged three-lane plans run the 32-row tile");
   for (const auto [rows, storage] : {std::pair{1U, 8U}, {8U, 8U}, {9U, 16U}, {17U, 32U}, {25U, 32U}, {32U, 32U},
-                                     {33U, 128U}, {100U, 128U}, {129U, 256U}, {2048U, 2048U}}) {
+                                     {33U, 64U}, {48U, 64U}, {64U, 64U}, {65U, 128U}, {100U, 128U}, {129U, 256U},
+                                     {2048U, 2048U}}) {
     const LinearPlan prefill = linear.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::UpWithGate},
                                            blockProjection(5120, 17408, 1));
     // Chunks of up to 32 rows take the staged tile and its split rule (two
-    // partitions of the 80-tile grid on 16 cores); the 128-row prefill tile
+    // partitions of the 80-tile grid on 16 cores); up to
+    // kMaximumStagedPrefillRows, its 64-row tile; the 128-row prefill tile
     // takes none.
-    const uint32_t splits = rows <= 32 ? 2 : 1;
+    const bool staged = rows <= kMaximumStagedPrefillRows;
+    const uint32_t splits = staged ? 2 : 1;
     const bool ok =
         prefill.storageRows() == storage && prefill.sumsBytes() == 0 && prefill.downSumsBytes() == 0 &&
         prefill.gateScratchBytes() == gateBytes(prefill) &&
-        prefill.configuration().tile == (rows <= 32 ? LinearTile::GgufStaged : LinearTile::GgufPrefill) &&
+        prefill.configuration().tile == (staged ? LinearTile::GgufStaged : LinearTile::GgufPrefill) &&
         prefill.configuration().splits == splits &&
         prefill.scratchSize().partials == (splits > 1 ? splitPartialsBytes(prefill) : 0);
     if (!ok)
@@ -1039,8 +1042,8 @@ void ggufPlans() {
                 << prefill.sumsBytes() << " downSums=" << prefill.downSumsBytes() << "\n";
     require(ok, "GGUF prefill tile rows and splits");
   }
-  // The decode tiles hold at most a decode batch.
-  LinearWorkload longPrefill{{5120, 17408}, 33, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
+  // The staged tile runs prefill chunks of at most 64 rows.
+  LinearWorkload longPrefill{{5120, 17408}, 65, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
   rejects([&] { (void)Linear::plan(longPrefill, {.tile = LinearTile::GgufStaged}, FloatOutput::BFloat16); });
   // Affine and GGUF plans do not mix.
   rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .splits = 8}, FloatOutput::BFloat16); });
@@ -1101,9 +1104,10 @@ void ggufPlans() {
                                             blockProjection(17408, 5120, 1));
   require(registerGateUp.gateScratchBytes() == gateBytes(registerGateUp),
           "Apple9 GGUF gate/up runs a gate pass into the gate scratch");
-  require(m3.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
-                  blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
-          "Apple9 GGUF prefill stages");
+  for (const uint32_t rows : {33U, 64U, 100U})
+    require(m3.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::Residual},
+                    blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
+            "Apple9 GGUF prefill chunks past a decode batch take the prefill tile");
   require(m3.ggufFloatTile(2048, 256) == FloatTile::Simdgroup, "Apple9 float projections take the simdgroup tile");
   LinearWorkload registerDown = down;
   registerDown.weightLayout = WeightLayout::Block32;

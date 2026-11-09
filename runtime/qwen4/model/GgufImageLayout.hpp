@@ -5,7 +5,8 @@
 // come 16 KiB-aligned sections. A quantized tensor is a descriptor section,
 // then its plane0, optional plane1 and meta sections in its format's layout
 // (metal/abi/QuantFormat.h). A tensor copied as stored (the token
-// embedding's native rows; the F32 MoE router, shared-expert gate and
+// embedding's native rows; the MoE router, its F32 or BF16 values or a
+// quantized router's native rows; the F32 shared-expert gate and
 // alpha/beta) is a descriptor and its rows; a norm, the convolution and the
 // GDN head vectors are their rows alone, F32 or narrowed to the bf16 values
 // they equal.

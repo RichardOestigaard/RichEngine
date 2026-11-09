@@ -67,17 +67,20 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // The GGUF tiles run 64 columns per threadgroup. The staged tiles, GgufStaged
 // and GgufPrefill, dequantize GGUF weights into threadgroup memory for
 // matmul2d. GgufStaged: the two-simdgroup staged tile of 8, 16 or 32 rows
-// (decode, and prefill chunks of up to 32 rows), each simdgroup staging its
-// own columns, with optional K splits. GgufPrefill: the 128-row shared-stage
+// (decode, and prefill chunks of up to 32 rows, or on Apple10 the 64-row
+// tile up to kMaximumStagedPrefillRows), each simdgroup staging its own
+// columns, with optional K splits. GgufPrefill: the 128-row shared-stage
 // prefill tile. GgufRegister is the exact register tile on bf16 8x8 matrix
 // operations (Apple9): every request lane in one threadgroup, optional K
 // splits.
 enum class LinearTile : uint8_t {
   N128, N256, Paired128, Split128, Paired256, Simdgroup, GgufStaged, GgufPrefill, GgufRegister
 };
-// The decode tiles hold at most a full decode batch; GGUF prefill chunks of up
-// to this many rows run the staged tile (Linear::ggufBaseline).
+// The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = RICHENGINE_MAXIMUM_BATCH_WIDTH * RICHENGINE_TARGET_VERIFY_ROWS;
+// GGUF prefill chunks of up to 32 rows run the staged tile; on Apple10, of
+// up to this many rows, on its 64-row height (Linear::ggufBaseline).
+inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
 // register tiles build from grid lookups beside their matrix operations
@@ -278,10 +281,11 @@ private:
   bool rotated_ = false;
   // packsActivations(): set by Linear's plan methods.
   bool packs_ = false;
-  // A decode plan — or a prefill chunk plan of up to a decode batch's rows —
-  // whose single-tensor projections dispatch the pre-packed mxfp4p kernels:
-  // input() then asks the producer for the packed operand
-  // (LinearInput::Packed), which addGgufStaged takes instead of packing.
+  // A decode plan — or a prefill chunk plan of up to 32 rows, the heights
+  // the mxfp4p decode kernels instantiate — whose single-tensor projections
+  // dispatch the pre-packed mxfp4p kernels: input() then asks the producer
+  // for the packed operand (LinearInput::Packed), which addGgufStaged takes
+  // instead of packing.
   bool packedInput_ = false;
   std::string_view pipeline_;
   std::string_view secondPipeline_;
@@ -357,7 +361,8 @@ public:
   void addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input, metal::MetalBuffer sums,
                       const Projection &consumer, uint32_t rows) const;
   // The projections of `rows` rows through their own matrix. `scratch` holds
-  // the partials and counters of split plans (GGUF chunks of up to 32 rows);
+  // the partials and counters of split plans (the GGUF chunks the staged
+  // tile runs: up to 32 rows, on Apple10 up to kMaximumStagedPrefillRows);
   // reused serially within one command stream, as in decode. `prepared`
   // describes the scratch as a producer left it (the rotated rows of a
   // rotated projection just run on `input`), and each returns what it

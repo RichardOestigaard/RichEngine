@@ -36,12 +36,15 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // file through a row cache of that many bytes instead of loading into memory
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
-// many bytes (model/ExpertStore.hpp, --expert-memory). Other models load as
-// without them. Streamed weights read on `readers`, the engine's one pool of
-// SSD readers, which KV reads share.
+// many bytes at its cap, which gives memory back down to its floor of
+// expertFloorBytes, zero for the store's own (model/ExpertStore.hpp,
+// ExpertStoreOptions, --expert-memory). Other models load as without them.
+// Streamed weights read on `readers`, the engine's one pool of SSD readers,
+// which KV reads share.
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
+  uint64_t expertFloorBytes = 0;
   std::shared_ptr<SsdReaders> readers;
 };
 
@@ -129,6 +132,11 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  // Admits the memory the expert store takes back toward its cap
+  // (Model::growExperts) as growth it can do without
+  // (engine::MemoryGovernor::growthAdmission).
+  // Without it the store never grows, as in the tools that keep it fixed.
+  metal::AllocationAdmission expertAdmission = {};
 };
 
 // Validates only the interface between independently defined target and draft

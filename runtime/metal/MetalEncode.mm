@@ -1687,55 +1687,90 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         return command;
     }
 
-// Encodes and commits prepared dispatches and the event steps between
-    // them; the ticket retains `retained` until it is consumed.
-    CommandTicket MetalBackend::Impl::commit(std::span<const PreparedDispatch> dispatches,
-                         std::span<const EventStep> events,
-                         std::vector<std::shared_ptr<MetalAllocation>> retained,
-                         CommandCompletion completion) {
-        // A second command may be committed while this one is still in
-        // flight (the submit-ahead ring). Baked spans replay then: the bank
-        // they use is built on first use, so the arena this submission
-        // patches is never one an in-flight replay is reading. A command
-        // with event steps encodes directly: a replayed span would hide the
-        // dispatches its steps order against the other agent (EventStep).
-        const bool overlapping = asyncState->hasActiveSubmission();
-        const bool replaySpans =
-            events.empty() && (!tuning().spanBankOff || !overlapping);
-        auto ticketState = std::make_shared<CommandTicket::State>();
-        ticketState->backend = asyncState;
-        ticketState->completion = std::move(completion);
-        ticketState->retainedAllocations = std::move(retained);
-        ticketState->sequence =
-            asyncState->beginSubmission(dispatches.size(), 2);
-        // A baked span replays the bank the in-flight command is not using,
-        // and reuses the last bank when nothing is in flight, so bank 1 is
-        // built the first time a submission actually overlaps.
-        const uint32_t spanBank =
-            tuning().spanBankOff ? 0u
-                                 : (overlapping ? lastSpanBank ^ 1u
-                                                : lastSpanBank);
-        lastSpanBank = spanBank;
-        const bool replayGpuSpans = replaySpans;
+// Dropped commands re-encode on their own serial queue: the driver
+    // callback that saw the kill must not block on a resubmission, and the
+    // queue serializes the replay against a second one. dispatch_after on
+    // it provides the backoff the display's work goes first through.
+    dispatch_queue_t droppedReplayQueue() {
+        static dispatch_queue_t queue = dispatch_queue_create(
+            "richengine.metal.replay",
+            dispatch_queue_attr_make_with_autorelease_frequency(
+                DISPATCH_QUEUE_SERIAL,
+                DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+        return queue;
+    }
 
-        auto failBeforeCommit = [&](std::string message) {
-            markUnhealthy(message);
-            asyncState->releaseSubmission(ticketState->sequence);
-            throw MetalBackendError(std::move(message));
-        };
+    std::shared_ptr<CommandReplay>
+    MetalBackend::Impl::makeReplayPlan(id<MTLCommandQueue> queue,
+                   const std::shared_ptr<Residency> &residency,
+                   std::span<const PreparedDispatch> dispatches,
+                   std::span<const EventStep> events,
+                   const PreparedCommand &origin,
+                   const std::vector<std::shared_ptr<MetalAllocation>>
+                       &retained,
+                   uint32_t spanBank, bool replaySpans, bool replayGpuSpans,
+                   bool opTimings) {
+        auto plan = std::make_shared<CommandReplay>();
+        plan->queue = queue;
+        plan->residency = residency;
+        plan->spanBank = spanBank;
+        plan->replaySpans = replaySpans;
+        plan->replayGpuSpans = replayGpuSpans;
+        plan->opTimings = opTimings;
+        plan->events.assign(events.begin(), events.end());
+        // The span objects keep their arenas and ICBs alive; `retained`
+        // keeps every bound allocation — including ones a kernel reaches
+        // only by address — until the replayed command ends.
+        plan->spanRefs = origin.spanRefs;
+        plan->gpuSpanRefs = origin.gpuSpanRefs;
+        plan->retained = retained;
+        plan->dispatches.reserve(dispatches.size());
+        plan->prepared.reserve(dispatches.size());
+        for (const PreparedDispatch &item : dispatches) {
+            plan->dispatches.push_back(*item.source);
+            ComputeDispatch &copy = plan->dispatches.back();
+            for (BytesBinding &binding : copy.bytes) {
+                const auto *bytes =
+                    static_cast<const std::byte *>(binding.data);
+                plan->payloads.emplace_back(bytes, bytes + binding.sizeBytes);
+                binding.data = plan->payloads.back().data();
+            }
+        }
+        // The resolved dispatches rebind to the copies only after they
+        // stopped moving; everything else they hold — pipelines, geometry,
+        // span pointers kept by the refs above — copies as it was.
+        for (size_t index = 0; index < dispatches.size(); ++index) {
+            plan->prepared.push_back(dispatches[index]);
+            plan->prepared.back().source = &plan->dispatches[index];
+        }
+        return plan;
+    }
 
-        auto wallStart = AwakeClock::now();
+    // The encode-and-commit body of commit() and of a dropped command's
+    // replay: the submission's dispatches and event steps into fresh
+    // command buffers on request.queue, committed under the ticket's
+    // sequence through the request's commit path.
+    void MetalBackend::Impl::encodeSubmission(const EncodeRequest &request) {
+        CommandTicket::State *ticketState = request.ticket;
+        // The completed handler and the watchdog's recovered finish reach
+        // the state through its self link: it stays what it is for the
+        // command's life.
+        const std::shared_ptr<CommandTicket::State> strongTicket =
+            ticketState->self.lock();
+        if (!strongTicket) {
+            request.fail("Metal command lost its ticket before encoding");
+            return;
+        }
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
         // this submission (under the validation layer an autoreleased
         // command holds every member of the residency set). The command
         // retains everything the GPU still needs.
         @autoreleasepool {
-            id<MTLCommandBuffer> command = [queue commandBuffer];
+            id<MTLCommandBuffer> command = [request.queue commandBuffer];
             if (!command) {
-                failBeforeCommit("unable to create Metal command buffer");
+                request.fail("unable to create Metal command buffer");
             }
-            ticketState->wallStart = wallStart;
             // The buffers before `command`, each ended by an event signal.
             std::vector<id<MTLCommandBuffer>> leading;
             id<MTLComputeCommandEncoder> encoder = nil;
@@ -1748,7 +1783,18 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // GPU family.) Buffers commit eagerly: the queue caps
             // outstanding uncommitted buffers well below a command's
             // dispatch count.
-            const bool opTimings = tuning().opTimings;
+            const bool opTimings = request.opTimings;
+            // The request's pieces under their first-encode names: the same
+            // dispatches, steps, bank and replay decisions for a first
+            // commit as for a resubmission.
+            const std::span<const PreparedDispatch> dispatches =
+                request.dispatches;
+            const std::span<const EventStep> events = request.events;
+            const uint32_t spanBank = request.spanBank;
+            const bool replaySpans = request.replaySpans;
+            const bool replayGpuSpans = request.replayGpuSpans;
+            const std::function<void(std::string)> &failBeforeCommit =
+                request.fail;
             // Encodes the event steps that follow the first `encoded`
             // dispatches.
             auto step = events.begin();
@@ -1781,7 +1827,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     } else {
                         leading.push_back(command);
                     }
-                    command = [queue commandBuffer];
+                    command = [request.queue commandBuffer];
                     if (!command) {
                         failBeforeCommit("unable to create Metal command buffer");
                     }
@@ -1802,7 +1848,7 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                                    finished.GPUEndTime - finished.GPUStartTime);
                 }];
                 [command commit];
-                command = [queue commandBuffer];
+                command = [request.queue commandBuffer];
             };
             for (size_t index = 0; index < dispatches.size(); ++index) {
                 encodeSteps(index);
@@ -1824,7 +1870,13 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                     // snapshot was validated against.
                     const size_t spanLength = item.span->dispatches.size();
                     if (!item.span->icb[spanBank]) {
-                        encodeBank(*item.span, spanBank,
+                        // A replay finds every bank built at the first
+                        // encode; only the backend can bake, so a missing
+                        // bank cannot be encoded now.
+                        if (!request.host)
+                            failBeforeCommit(
+                                "Metal command replay has no baked span bank");
+                        request.host->encodeBank(*item.span, spanBank,
                                    {item.source, spanLength});
                         if (const auto &arena =
                                 item.span->paramsAllocation[spanBank])
@@ -1873,7 +1925,11 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         dispatches.size()) {
                     const GpuSpan &span = *item.gpuSpan;
                     if (!span.icb[spanBank]) {
-                        encodeGpuBank(span, spanBank);
+                        // As for a baked span: a replay's banks exist.
+                        if (!request.host)
+                            failBeforeCommit(
+                                "Metal command replay has no GPU span bank");
+                        request.host->encodeGpuBank(span, spanBank);
                         if (span.argsAllocation[spanBank])
                             ticketState->retainedAllocations.push_back(
                                 span.argsAllocation[spanBank]);
@@ -1890,7 +1946,13 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                         spanBank);
                     const NSUInteger count = span.dispatches.size();
                     if (!span.encoded[spanBank]) {
-                        [encoder setComputePipelineState:pipeline("gpu_encode")];
+                        id<MTLComputePipelineState> gpuEncode =
+                            request.gpuEncode();
+                        if (!gpuEncode)
+                            failBeforeCommit(
+                                "Metal command replay has no gpu_encode "
+                                "pipeline");
+                        [encoder setComputePipelineState:gpuEncode];
                         [encoder setBuffer:span.argsAllocation[spanBank]->buffer
                                     offset:0
                                    atIndex:0];
@@ -1984,17 +2046,186 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // up on the command, it keeps the retained allocations until the
             // GPU ends.
             [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-                ticketState->finishCommand(completed);
+                strongTicket->finishCommand(completed);
             }];
-            residency->use();
-            asyncState->commitSubmission(ticketState->sequence, leading, command,
-                [weakTicket = std::weak_ptr(ticketState)](
+            request.residency->use();
+            const auto recovered =
+                [weakTicket = std::weak_ptr(strongTicket)](
                     id<MTLCommandBuffer> completed) {
                     if (auto ticket = weakTicket.lock())
                         ticket->finishCommand(completed);
-                });
+                };
+            // A resubmission lands ahead of the submissions the replay gate
+            // held back; a first commit takes its place in order.
+            if (request.replay) {
+                request.asyncState->commitReplay(ticketState->sequence,
+                                               leading, command, recovered);
+            } else {
+                request.asyncState->commitSubmission(ticketState->sequence,
+                                                     leading, command,
+                                                     recovered);
+            }
         }
+    }
+
+    // Encodes and commits prepared dispatches and the event steps between
+    // them; the ticket retains `retained` until it is consumed.
+    CommandTicket MetalBackend::Impl::commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const EventStep> events,
+                         std::vector<std::shared_ptr<MetalAllocation>> retained,
+                         CommandCompletion completion,
+                         const PreparedCommand *origin) {
+        // A second command may be committed while this one is still in
+        // flight (the submit-ahead ring). Baked spans replay then: the bank
+        // they use is built on first use, so the arena this submission
+        // patches is never one an in-flight replay is reading. A command
+        // with event steps encodes directly: a replayed span would hide the
+        // dispatches its steps order against the other agent (EventStep).
+        const bool overlapping = asyncState->hasActiveSubmission();
+        const bool replaySpans =
+            events.empty() && (!tuning().spanBankOff || !overlapping);
+        auto ticketState = std::make_shared<CommandTicket::State>();
+        ticketState->backend = asyncState;
+        ticketState->completion = std::move(completion);
+        ticketState->sequence =
+            asyncState->beginSubmission(dispatches.size(), 2);
+        ticketState->self = ticketState;
+        // A baked span replays the bank the in-flight command is not using,
+        // and reuses the last bank when nothing is in flight, so bank 1 is
+        // built the first time a submission actually overlaps.
+        const uint32_t spanBank =
+            tuning().spanBankOff ? 0u
+                                 : (overlapping ? lastSpanBank ^ 1u
+                                                : lastSpanBank);
+        lastSpanBank = spanBank;
+        const bool replayGpuSpans = replaySpans;
+        const bool opTimings = tuning().opTimings;
+
+        // The plan a display-killed command buffer is resubmitted from
+        // (droppedForInteractivity): snapshotted now, while the caller's
+        // payloads are still valid. Nothing is planned while the Metal 4
+        // path exists — its commits are not serialized on one queue, so a
+        // resubmission cannot be ordered against them —
+        // RICHENGINE_DROP_REPLAY_OFF restores marking the backend unhealthy
+        // on any command error for A/B.
+        static const bool dropReplayOff =
+            envFlag("RICHENGINE_DROP_REPLAY_OFF");
+        if (origin && !queue4 && !dropReplayOff) {
+            ticketState->replay =
+                makeReplayPlan(queue, residency, dispatches, events, *origin,
+                               retained, spanBank, replaySpans,
+                               replayGpuSpans, opTimings);
+            // A GPU span already encoded in this bank carries no
+            // gpu_encode fetch into this encode — capture the pipeline now
+            // so the replay, which rewrites the ICB, has it either way.
+            for (const PreparedDispatch &item : dispatches) {
+                if (item.gpuSpan) {
+                    ticketState->replay->gpuEncodePipeline =
+                        pipeline("gpu_encode");
+                    break;
+                }
+            }
+        }
+        ticketState->retainedAllocations = std::move(retained);
+
+        EncodeRequest request;
+        request.queue = queue;
+        request.residency = residency;
+        request.asyncState = asyncState.get();
+        request.ticket = ticketState.get();
+        request.dispatches = dispatches;
+        request.events = events;
+        request.spanBank = spanBank;
+        request.replaySpans = replaySpans;
+        request.replayGpuSpans = replayGpuSpans;
+        request.opTimings = opTimings;
+        // A GPU span's first encode takes the pipeline from the cache and
+        // leaves it in the plan, where a replay reaches it without the
+        // backend.
+        request.gpuEncode = [this, plan = ticketState->replay] {
+            id<MTLComputePipelineState> encode = pipeline("gpu_encode");
+            if (plan) plan->gpuEncodePipeline = encode;
+            return encode;
+        };
+        request.fail = [this, sequence = ticketState->sequence](
+                           std::string message) {
+            markUnhealthy(message);
+            asyncState->releaseSubmission(sequence);
+            throw MetalBackendError(std::move(message));
+        };
+        request.host = this;
+        ticketState->wallStart = AwakeClock::now();
+        encodeSubmission(request);
         return CommandTicket(std::move(ticketState));
+    }
+
+    // Queues the killed command's resubmission after its attempt's backoff
+    // — the display's work goes first — on the replay queue, so the driver
+    // callback that saw the kill returns at once.
+    void CommandTicket::State::scheduleReplay() noexcept {
+        const uint32_t attempt = kDroppedCommandRetries - replaysLeft;
+        const int64_t delay = static_cast<int64_t>(
+            kDroppedRetryBackoffSeconds * (1u << (attempt - 1)) *
+            NSEC_PER_SEC);
+        std::weak_ptr<State> weak = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
+                       droppedReplayQueue(), ^{
+            @autoreleasepool {
+                if (auto ticket = weak.lock()) ticket->replayEncode();
+            }
+        });
+    }
+
+    // Encodes the run the plan kept and commits it through commitReplay,
+    // which lands it ahead of whatever the gate held back. The first
+    // encode's event steps replay with it: a wait sees its value already
+    // signaled, a signal raises the same value again, which Metal ignores
+    // (SharedEvent). A resubmission that cannot start finishes the ticket
+    // with the failure instead.
+    void CommandTicket::State::replayEncode() noexcept {
+        const std::shared_ptr<CommandReplay> plan = replay;
+        if (!plan) {
+            backend->endReplay(sequence);
+            finish(CommandTiming{}, "Metal command " +
+                                    std::to_string(sequence) +
+                                    " has nothing to replay");
+            return;
+        }
+        // A GPU span's gpu_encode may never have run inside the killed
+        // buffer: its ICB is written again. Its commands derive only from
+        // the span's staged descriptors, so rewriting produces what the
+        // first run would have.
+        for (const auto &item : plan->prepared)
+            if (item.gpuSpan) item.gpuSpan->encoded[plan->spanBank] = false;
+        MetalBackend::Impl::EncodeRequest request;
+        request.queue = plan->queue;
+        request.residency = plan->residency;
+        request.asyncState = backend.get();
+        request.ticket = this;
+        request.dispatches = plan->prepared;
+        request.events = plan->events;
+        request.spanBank = plan->spanBank;
+        request.replaySpans = plan->replaySpans;
+        request.replayGpuSpans = plan->replayGpuSpans;
+        request.opTimings = plan->opTimings;
+        request.gpuEncode = [plan] { return plan->gpuEncodePipeline; };
+        // The ticket completes with the failure an encode cannot start;
+        // the catch below frees the gate the beginReplay held.
+        request.fail = [this](std::string message) {
+            backend->markUnhealthy(message);
+            backend->releaseSubmission(sequence);
+            throw MetalBackendError(std::move(message));
+        };
+        request.host = nullptr;
+        request.replay = true;
+        try {
+            MetalBackend::Impl::encodeSubmission(request);
+        } catch (const std::exception &failure) {
+            backend->endReplay(sequence);
+            finish(CommandTiming{},
+                   std::string("Metal command replay failed: ") +
+                       failure.what());
+        }
     }
 
 #if RICHENGINE_MTL4_AVAILABLE
@@ -2641,9 +2872,9 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     }
     checkEvents(command.events, command.dispatches.size());
     static const bool subTiming = envFlag("RICHENGINE_DECODE_TIMING");
-    const auto s0 = std::chrono::steady_clock::now();
+    const auto s0 = richengine::AwakeClock::now();
     Impl::PreparedCommand prepared = impl_->prepared(command.dispatches);
-    const auto s1 = std::chrono::steady_clock::now();
+    const auto s1 = richengine::AwakeClock::now();
 #if RICHENGINE_MTL4_AVAILABLE
     // Event-bearing commands stay on the Metal 3 path unless opted in: the
     // commit4 event split misattributed GPU timing and regressed prefix-hit
@@ -2655,7 +2886,7 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                                      std::move(prepared.retainedAllocations),
                                      std::move(completion));
         if (subTiming) {
-            const auto s2 = std::chrono::steady_clock::now();
+            const auto s2 = richengine::AwakeClock::now();
             fprintf(stderr, "submit-detail dispatches=%zu prepared=%.3fms commit4=%.3fms\n",
                     command.dispatches.size(),
                     std::chrono::duration<double, std::milli>(s1 - s0).count(),
@@ -2674,9 +2905,9 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
 #endif
     auto ticket = impl_->commit(prepared.dispatches, command.events,
                                 std::move(prepared.retainedAllocations),
-                                std::move(completion));
+                                std::move(completion), &prepared);
     if (subTiming) {
-        const auto s2 = std::chrono::steady_clock::now();
+        const auto s2 = richengine::AwakeClock::now();
         fprintf(stderr, "submit-detail dispatches=%zu prepared=%.3fms commit=%.3fms\n",
                 command.dispatches.size(),
                 std::chrono::duration<double, std::milli>(s1 - s0).count(),

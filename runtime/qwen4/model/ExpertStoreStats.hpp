@@ -12,11 +12,22 @@
 namespace splash::model {
 
 struct ExpertStoreStats final {
-  uint64_t arenaBytes = 0;
+  // The store at its cap and at its floor, as ExpertStoreOptions counts
+  // them (its staging and tables too), its chunks at the cap and those live.
+  // The live chunks, their bytes and their slots are zero while the store is
+  // released.
+  uint64_t capBytes = 0;
+  uint64_t floorBytes = 0;
+  uint64_t capChunks = 0;
+  uint64_t chunks = 0;
+  uint64_t arenaBytes = 0; // the live chunks of every size
   uint64_t stagingBytes = 0;
-  uint64_t slots = 0;
+  uint64_t slots = 0;    // the live chunks'
   uint64_t experts = 0;  // every block's routed experts
   uint64_t resident = 0; // slots holding an expert
+  // The chunks given back while memory was short, and taken back after.
+  uint64_t shrinks = 0;
+  uint64_t regrows = 0;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),

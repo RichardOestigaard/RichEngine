@@ -2205,7 +2205,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // shared tile-count scratch; this readback is why the flag is debug-only.
     ops::MoE::logStats(decodeArena->moeScratch(1).tileCount);
     static const bool finTiming = envFlag("RICHENGINE_DECODE_TIMING");
-    const auto f0 = std::chrono::steady_clock::now();
+    const auto f0 = richengine::AwakeClock::now();
     // The acceptance kernels pack a lane's emitted rows at the chain's
     // verify stride (the tree's at its node stride), not the lane's
     // capacity slot — reads follow the packed stride, never get(lane).
@@ -3230,7 +3230,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
     }
 
-    const auto f1 = std::chrono::steady_clock::now();
+    const auto f1 = richengine::AwakeClock::now();
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -3241,6 +3241,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // the request.
         entry.maskWords.clear();
         entry.ngramInFlight = false;
+        entry.corpusInFlight = false;
         entry.verifyMaskInFlight = false;
         entry.verifyMaskRows = 0;
         entry.gpuMaskInFlight = false;
@@ -3393,6 +3394,16 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         ++entry.ngramRounds;
         entry.ngramProbeAt =
             entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
+        // The corpus's own EWMA — the round's proposals were corpus-sourced
+        // only when the displacement marked the lane in applyNgramPredraft.
+        if (entry.corpusInFlight) {
+          entry.corpusInFlight = false;
+          entry.corpusAcceptedAvg = entry.corpusRounds
+                                        ? 0.75 * entry.corpusAcceptedAvg +
+                                              0.25 * observed
+                                        : observed;
+          ++entry.corpusRounds;
+        }
       }
       commitSelected(entry, {targetTokens, laneResult.retained});
       // Mode transitions decided by the freshly committed anchor: the LM
@@ -3447,7 +3458,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     settledPredraftWall_ = 0.0;
     kickAnePredictors(lanes, items);
     if (finTiming) {
-      const auto f2 = std::chrono::steady_clock::now();
+      const auto f2 = richengine::AwakeClock::now();
       fprintf(stderr, "finalize-detail loop=%.3fms tail=%.3fms\n",
               std::chrono::duration<double, std::milli>(f1 - f0).count(),
               std::chrono::duration<double, std::milli>(f2 - f1).count());

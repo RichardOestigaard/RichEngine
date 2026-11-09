@@ -124,7 +124,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 ### Packed prefill encoding
 
 - `Runtime::submit` → `prefillAsync` → `Impl::encodePackedPrefillGraph` (`runtime/model/Runtime.mm:2700-2723, 1259-1404`). All sequences share one row-space (`PackedPrefillBatch`), each with a `ChunkedPrefillParams` (`committed_tokens`, `chunk_tokens`, `chunk_stride`, page table) — `runtime/ops/PagedAttention.hpp:65-95`.
-- `QwenTarget::addPrefill` (`runtime/model/QwenTarget.cpp:353-395`) encodes all layers in one `CommandGraph`: norm → input projection → mixer → FFN, with per-sequence `PrefillAttentionPlan`s (`ops::PagedAttention::prefillPlan`, `runtime/ops/PagedAttention.cpp:208-228`).
+- `QwenTarget::addPrefill` (`runtime/qwen4/model/QwenTarget.hpp`) encodes all layers in one `CommandGraph`: norm → input projection → mixer → FFN, with per-sequence `PrefillAttentionPlan`s (`ops::PagedAttention::prefillPlan`, `runtime/ops/PagedAttention.cpp:208-228`).
 
 ### Kernels used in prefill
 
@@ -140,7 +140,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 
 ### Prefix/prompt caching reuse
 
-- **Content-addressed KV blocks** at `kPageTokens = 32` (`RICHENGINE_TARGET_KV_BLOCK_TOKENS`, `ExecutionGeometry.h:25`): `engine/KvCache.cpp:74` hashes `(parent block hash, tokens, image identity)`; blocks form a tree (`firstChild`/siblings) — hash-chained radix-like prefix cache. `Cache::probe`/`lookup` (`Cache.hpp:266-284`) return `CacheLookup{kvBoundary, state, junctionBoundary}`.
+- **Content-addressed KV blocks** at `kPageTokens = 32` (`RICHENGINE_TARGET_KV_BLOCK_TOKENS`, `ExecutionGeometry.h:25`): `runtime/engine/cache/KvCache.cpp` hashes `(parent block hash, tokens, image identity)`; blocks form a tree (`firstChild`/siblings) — hash-chained radix-like prefix cache. `Cache::probe`/`lookup` (`Cache.hpp:266-284`) return `CacheLookup{kvBoundary, state, junctionBoundary}`.
 - **Composite states for the hybrid model**: GDN layers need recurrent+conv state, so KV alone can't resume. `Engine::plannedCheckpoints` (`Engine.hpp:61-72`) places state boundaries every `kPrefillCheckpointTokens = 4096` (`Engine.hpp:25`); `addSharedPrefillBoundaries`/`pendingSharedPrefill`/`sharedPrefillBoundary` (`Engine.cpp:601-653, 974-987`) let co-resident requests share junction states — a Marconi-style hybrid-model prefix cache.
 - `publishCommittedBlocks` canonicalizes each new Page32 block — duplicate content re-points to the existing immutable page (`Cache.hpp:303-306`). Disk tier: `KvTier`, `WriteBehind`, `--persistent-cache` survives restarts.
 - Measured: cold 8K prefill ~515 tok/s, replay TTFT 0.46 s; ~89% of cold TTFT is GPU prefill; **compute-bound**, weight-streaming floor ~0.2 s (`PREFILL_OPTIMIZATION_PLAN.md:8-25`).
@@ -194,7 +194,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 ### A.2 Pool / block management
 
 - **`runtime/engine/KvPool.{hpp,cpp}`** — sole owner of page references and extent allocation. Per-page refcount split into *active* (request) and *prefixOwner* (cache) references (`PageRecord`, lines 120–126). Free pages are handed out **fullest-extent-first** so cold extents drain to empty (`packingExtent`, lines 70–74, 155). `compactExtent()` (line 114) empties the sparsest extent by moving its pages — a defragmentation pass; `reclaimEmptyExtents()` releases whole extents to the OS, keeping one runway extent warm (lines 106, 80).
-- **`runtime/engine/KvCache.{hpp,cpp}`** — **content-addressed radix-style DAG** of 32-token blocks. Block key = (parent block id, exact tokens, `ImageIdentity` for multimodal content) — `find()`/`insert()` (lines 64–72), `blockImageIdentity()` (line 31). A block holds a pool page, a `KvDiskSlot`, or both; resident blocks form a subtree at the root, disk-only blocks hang below (lines 34–39). O(1) leaf ops via sibling links; `generation_` counter lets scheduling probes stay valid across ticks (lines 228–233). Four LRU orders (`RecencyOrder` sets): `ramLeaves_`, `duplicates_`, `diskLeaves_`, `unneeded_` (lines 234–237).
+- **`runtime/engine/cache/KvCache.{hpp,cpp}`** — **content-addressed radix-style DAG** of 32-token blocks. Block key = (parent block id, exact tokens, `ImageIdentity` for multimodal content) — `find()`/`insert()` (lines 64–72), `blockImageIdentity()` (line 31). A block holds a pool page, a `KvDiskSlot`, or both; resident blocks form a subtree at the root, disk-only blocks hang below (lines 34–39). O(1) leaf ops via sibling links; `generation_` counter lets scheduling probes stay valid across ticks (lines 228–233). Four LRU orders (`RecencyOrder` sets): `ramLeaves_`, `duplicates_`, `diskLeaves_`, `unneeded_` (lines 234–237).
 - **`runtime/engine/Cache.{hpp,cpp}`** — orchestrates it all:
   - `probe()`/`refresh()`/`lookup()` — incremental prefix match; leaves one token unmatched to regenerate anchor logits (`Cache.cpp:183`).
   - `publishCommittedBlocks()` (Cache.cpp:293–332) — canonicalizes completed blocks; **duplicate content swaps the request onto the existing immutable page** (dedup, lines 318–327).
@@ -204,7 +204,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 
 ### A.3 Disk tier (SSD offload + persistence)
 
-- **`runtime/engine/KvTier.hpp`** — tier interface: `demote()`/`restore()` move whole pages between extent memory and a slot file via `KvTransfer` objects; pages stay valid throughout (lines 34–63).
+- **`runtime/engine/cache/KvTier.hpp`** — tier interface: `demote()`/`restore()` move whole pages between extent memory and a slot file via `KvTransfer` objects; pages stay valid throughout (lines 34–63).
 - **`runtime/engine/KvPageTier.{hpp,cpp}`** — implementation over `model::SlotFile`; up to 128 transfers in flight, demotions ≤½, restores ≤¾ (`kTransfers`, line 28).
 - **Persistence**: `Cache::persist()` writes restore points root-first while resident (`Cache.hpp:241`); `Cache::adopt()` takes back chains an earlier process left (`--persistent-cache`); quota eviction keeps whole restore points (`dropOldestPoint`, `Cache.hpp:582`). `WriteBehind.cpp` handles delayed durability.
 
@@ -218,7 +218,7 @@ Serialization: `runtime/engine/Engine.cpp:253–288` — engine holds exactly on
 
 ### A.5 Layer-specific and recurrent-state handling
 
-- **Hybrid targets** (Qwen3.5/3.6 families): `QwenHybridLayout.hpp` — full attention every `fullAttentionPeriod`-th layer, the rest are **GDN (Gated DeltaNet) recurrent layers** (lines 62–80). The KV pool only covers `attentionLayerCount()` layers; GDN state lives in `StateLayout`/`QwenState` and is snapshotted as `CompositeState` at block boundaries in `StateCache` (`engine/StateCache.hpp`). Consequence: **a hybrid model cannot resume from KV alone** — KV blocks are only worth keeping if a state restores through them (`Cache::kvNeededByState`, Cache.cpp:549).
+- **Hybrid targets** (Qwen3.5/3.6 families): `QwenHybridLayout.hpp` — full attention every `fullAttentionPeriod`-th layer, the rest are **GDN (Gated DeltaNet) recurrent layers** (lines 62–80). The KV pool only covers `attentionLayerCount()` layers; GDN state lives in `StateLayout`/`QwenState` and is snapshotted as `CompositeState` at block boundaries in `StateCache` (`runtime/engine/cache/StateCache.hpp`). Consequence: **a hybrid model cannot resume from KV alone** — KV blocks are only worth keeping if a state restores through them (`Cache::kvNeededByState`, Cache.cpp:549).
 - **Draft model KV is separate**: a per-lane **ring buffer of 2048 tokens** (`RICHENGINE_DRAFT_SLIDING_WINDOW`, ExecutionGeometry.h:24; `common/draft_context_kv.h`, `decode/draft.metal`) — the only sliding-window structure in the codebase; the target cache is full-history.
 - **Speculative decode**: verify rows are pre-stored into page slots ahead of acceptance (`RICHENGINE_SPECULATIVE_SCRATCH_TOKENS=15`); tree verify uses per-row ancestor bitmasks (`TREE_VERIFY_DESIGN.md`).
 

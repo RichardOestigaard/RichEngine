@@ -72,7 +72,6 @@ PARSES = {
         call("search", ("limit", "5"), ("query", "a b")),
         [("search", {"limit": 5, "query": "a b"})],
     ),
-    "no function name": (call("", ("item", "x")), []),
     "a value keeps inner newlines and markup": (
         call("roll_cut", ("item", "\nline 1\n<b>line 2</b>\n")),
         [("roll_cut", {"item": "\nline 1\n<b>line 2</b>\n"})],
@@ -201,6 +200,42 @@ class ToolCallReadingTests(unittest.TestCase):
         # A </think> in text is dropped.
         content, calls = self.read("Sure.</think> Here" + call("roll_cut"))
         self.assertEqual((content, calls), ("Sure. Here", [("roll_cut", {})]))
+
+    def test_a_call_that_names_no_function_reads_as_its_text(self):
+        # Nothing of a call has streamed by the time its name is read, so an
+        # opening without a name, or with one too long to be a name, is the
+        # text the model wrote, and a call after it still reads.
+        for name in ("", "  ", "x" * (tool_schema.MAX_NAME_LENGTH + 1)):
+            nameless = call(name, ("item", "x"))
+            with self.subTest(name=name[:8]):
+                self.assertEqual(self.read(nameless), (nameless, []))
+                content, calls = self.read(
+                    nameless + "\n" + call("roll_cut", ("item", "y"))
+                )
+                self.assertEqual(
+                    (content.strip(), calls), (nameless, [("roll_cut", {"item": "y"})])
+                )
+        # Output that ends inside the name.
+        for ending in (
+            "<tool_call>\n<function= ",
+            "<tool_call>\n<function=" + "x" * (tool_schema.MAX_NAME_LENGTH + 1),
+        ):
+            with self.subTest(ending=ending[:24]):
+                self.assertEqual(self.read(ending), (ending, []))
+        # A nameless opening in the minicpm5 dialect reads the same.
+        policy = tool_schema.ToolPolicy(
+            schemas=SCHEMAS,
+            required=False,
+            parallel=True,
+            strict=frozenset(),
+            constrained=False,
+            dialect=tool_schema.MINICPM5_XML,
+        )
+        nameless = '<function name=""><param name="item">x</param></function>'
+        for size in (None, 1, 5):
+            content, calls, events = project(nameless, policy, size=size)
+            self.assertEqual((content, calls), (nameless, []))
+            self.assertEqual(streamed_text(events), nameless)
 
     def test_minicpm5_dialect_reads(self):
         """The minicpm5 dialect's calls — `<function name="n"><param

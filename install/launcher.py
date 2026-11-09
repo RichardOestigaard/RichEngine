@@ -206,12 +206,12 @@ def _installed_details(models_root=None):
     assembly carries: model ID, family, formats and linked bytes. A
     .selections/<hash> link is named by the target repository its record
     states; a legacy package without a record reports its link name alone."""
-    from install import autotune
-    from install.tuning import knobs_for
+    from . import autotune
+    from .tuning import knobs_for
 
     if models_root is None:
         models_root = paths.MODELS
-    from install import layout
+    from . import layout
 
     installed = []
     chip, _, _ = autotune.detect_chip()
@@ -393,7 +393,7 @@ def _check_port(host, port):
 def tune(args):
     """Run the autotune sweep against an installed model and record the
     winning engine knobs in its tuning.json (install/autotune.py)."""
-    from install import assembly, autotune
+    from . import assembly, autotune
 
     models_root = Path(args.models).resolve() if args.models else paths.MODELS
     if args.selection is not None:

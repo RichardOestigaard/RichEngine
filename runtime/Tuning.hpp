@@ -48,12 +48,12 @@ struct Tuning {
   // ops/ExecutionPlans.cpp: forces the four-simdgroup affine expert tiles
   // (moe_expert_*_sg4) on families that default to eight, for A/Bs.
   bool moeSg4 = false;            // RICHENGINE_MOE_SG4 (presence)
-  // ops/GDN.cpp, model/RuntimeArenas.mm
+  // ops/GDN.cpp, model/RuntimeArenas.hpp
   uint32_t gdnChunked = 0;    // RICHENGINE_GDN_CHUNKED
   // ops/Linear.cpp, ops/LinearGguf.cpp
   bool ggufPackedOn = false;  // RICHENGINE_GGUF_PACKED_ON (presence)
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
-  // ops/Linear.cpp, model/RuntimeArenas.mm
+  // ops/Linear.cpp, model/RuntimeArenas.hpp
   bool prefillFastInt8 = false; // RICHENGINE_PREFILL_FAST_INT8 (presence)
   // ops/Linear.cpp
   bool prefillQ4M64 = false;  // RICHENGINE_PREFILL_Q4_M64 (presence)

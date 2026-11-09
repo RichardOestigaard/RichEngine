@@ -1,4 +1,5 @@
 #import "ane/Program.hpp"
+#include "AwakeClock.hpp"
 
 #include "Checked.hpp"
 #ifdef RICHENGINE_ANE_INSTRUMENTATION
@@ -984,8 +985,10 @@ Program::DirectTiming Program::evaluate(const Binding &binding, EvalPath path, u
       // for it briefly, then take the call's own duration as the timing.
       {
         std::unique_lock lock(outcome->mutex);
-        timing.reported = outcome->changed.wait_for(
-            lock, path == EvalPath::Model ? std::chrono::milliseconds(200) : std::chrono::seconds(2),
+        timing.reported = outcome->changed.wait_until(
+            lock,
+            richengine::AwakeClock::now() +
+                (path == EvalPath::Model ? std::chrono::milliseconds(200) : std::chrono::seconds(2)),
             [&] { return outcome->finished; });
         if (outcome->failure) std::rethrow_exception(outcome->failure);
       }

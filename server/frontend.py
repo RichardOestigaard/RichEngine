@@ -14,7 +14,7 @@ from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
-from . import constraints, decisions, json_codec, judgments
+from . import constraints, decisions, json_codec, judgments, reply_guards
 from . import dfa as dfa_compiler
 from . import audio as audio_input
 from . import images as image_input
@@ -51,6 +51,7 @@ from .tool_schema import (
     json_grammar,
     normalize_response_format,
     normalize_tools,
+    regex_grammar,
     tool_grammar,
 )
 
@@ -307,6 +308,39 @@ def move_volatile_system_fields(messages):
     return messages if moved is None else moved
 
 
+# The working-directory line an agent's system prompt names its project root
+# with ("Working directory: <path>", often inside an <env> block).
+_CWD_LINE = re.compile(r"Working directory:\s*(\S+)")
+
+
+def _cwd_hint(messages):
+    """`messages` with the working directory repeated as the last line of
+    each system message that names one. Small models invent absolute paths
+    (/workspace/x.py); the naming line sits far from the end where the model
+    attends least, and a request offering tools gets the reminder, where a
+    file path or command goes to a tool. The same list when nothing matches."""
+    moved = None
+    for index, message in enumerate(messages):
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        match = _CWD_LINE.search(content)
+        if match is None or "Every file path you pass to a tool" in content:
+            continue
+        cwd = match.group(1).rstrip("/")
+        hint = (
+            f"The working directory is {cwd}. Every file path you pass to a "
+            f"tool must start with {cwd}/ (for example {cwd}/main.py); run "
+            f"commands there with: cd {cwd} && <command>."
+        )
+        if moved is None:
+            moved = list(messages)
+        moved[index] = {**message, "content": content.rstrip() + "\n\n" + hint}
+    return messages if moved is None else moved
+
+
 # What follows the leading system prompt and tools in the probe that finds
 # their shared prefix: a first turn no request's own is likely to begin with.
 SHARED_PREFIX_PROBE = {"role": "user", "content": "⁣"}
@@ -438,6 +472,9 @@ class Prompt:
     reasoning_effort: str | None
     response_schema: dict | bool | None = None
     response_validator: object = None
+    # The pattern of a regex response format (or vLLM's guided_regex),
+    # constraining the reply the way a response schema does.
+    response_regex: str | None = None
     preserve_thinking: bool | None = None
     # The request's own chat_template_kwargs enable_thinking, which outranks
     # its reasoning effort (template_options); None where it sets none.
@@ -1539,8 +1576,12 @@ class Frontend:
                 self.chat_templates.select(body.get("tools")).dialect
             ),
         )
-        response_schema, response_validator = normalize_response_format(
-            body.get("response_format")
+        if tools:
+            messages = _cwd_hint(messages)
+        response_schema, response_validator, response_regex = (
+            normalize_response_format(
+                body.get("response_format"), body.get("guided_regex")
+            )
         )
         return Prompt(
             messages,
@@ -1549,6 +1590,7 @@ class Frontend:
             reasoning_effort,
             response_schema,
             response_validator,
+            response_regex,
             preserve_thinking,
             enable_thinking,
             template_kwargs,
@@ -1816,25 +1858,29 @@ class Frontend:
         metadata = _request_metadata(body)
         prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
         tools, tool_policy = prompt.tools, prompt.tool_policy
-        response_schema, response_validator = (
+        response_schema, response_validator, response_regex = (
             prompt.response_schema,
             prompt.response_validator,
+            prompt.response_regex,
+        )
+        constrained_output = (
+            response_schema is not None or response_regex is not None
         )
         # A stop sequence could cut a tool call or a structured result short;
         # under tool_choice none the tools are only described, never called.
         if options.stop_sequences and (
-            (tools and tool_policy.schemas) or response_schema is not None
+            (tools and tool_policy.schemas) or constrained_output
         ):
             raise APIError(
                 400, "stop cannot be combined with tools or structured output"
             )
         # Constrained tool calls and structured output generate under a
         # grammar, which decides where the output ends; tools beside a
-        # response schema share one.
+        # response format share one.
         tool_constrained = tool_policy is not None and (
-            tool_policy.constrained or response_schema is not None
+            tool_policy.constrained or constrained_output
         )
-        constrained = tool_constrained or response_schema is not None
+        constrained = tool_constrained or constrained_output
         if n > 1 and constrained:
             # One compiled constraint carries per-request grammar state; it
             # cannot feed sibling lanes.
@@ -1865,6 +1911,7 @@ class Frontend:
                         tool_policy,
                         thinking,
                         response_schema,
+                        response_regex,
                         deadline,
                     )
 
@@ -1906,7 +1953,7 @@ class Frontend:
         max_new = self._output_budget(
             requested, prompt_tokens, output_field, clamp_output_budget
         )
-        return self._generation_job(
+        job = self._generation_job(
             options,
             prompt_tokens,
             max_new,
@@ -1931,6 +1978,14 @@ class Frontend:
             output_clamped_to_context=requested is not None and max_new < requested,
             n_samples=n,
         )
+        # The reply guards' evidence, read by the collect loop: the previous
+        # assistant turn's calls, which a reply repeating one is decoded
+        # again and steered from, and the response format such a retry may
+        # answer under instead.
+        job.prev_calls = reply_guards.previous_calls(prompt.messages) if tools else {}
+        job.reply_schema = prompt.response_schema
+        job.reply_regex = prompt.response_regex
+        return job
 
     def expand(self, job):
         """Sibling jobs for an n > 1 request: the same prepared prompt on
@@ -1985,7 +2040,13 @@ class Frontend:
         return bound
 
     def _compile_constraint(
-        self, tool_constrained, tool_policy, thinking, response_schema, deadline
+        self,
+        tool_constrained,
+        tool_policy,
+        thinking,
+        response_schema,
+        response_regex,
+        deadline,
     ):
         """Compile the request's constraint. Runs on the factory's compile
         pool so request prep overlaps it."""
@@ -1999,6 +2060,7 @@ class Frontend:
                 thinking,
                 response_schema,
                 think_end_id=self.think_end_id,
+                response_regex=response_regex,
             )
             constraint = create_dfa and create_dfa(
                 dfa_compiler.tool_spec(
@@ -2006,6 +2068,7 @@ class Frontend:
                     thinking,
                     response_schema,
                     think_end=self.think_end,
+                    response_regex=response_regex,
                 ),
                 grammar,
                 timeout=remaining_request_time(deadline),
@@ -2018,16 +2081,28 @@ class Frontend:
                 timeout=remaining_request_time(deadline),
                 prefixes=lambda: self._call_openings(tool_policy, thinking),
             )
-        grammar = json_grammar(
-            response_schema,
-            thinking,
-            think_end_id=self.think_end_id,
-            think_end_text=self.think_end,
-        )
-        constraint = create_dfa and create_dfa(
-            dfa_compiler.json_spec(
+        if response_regex is not None:
+            grammar = regex_grammar(
+                response_regex,
+                thinking,
+                think_end_id=self.think_end_id,
+                think_end_text=self.think_end,
+            )
+            spec = dfa_compiler.regex_spec(
+                response_regex, thinking, think_end=self.think_end
+            )
+        else:
+            grammar = json_grammar(
+                response_schema,
+                thinking,
+                think_end_id=self.think_end_id,
+                think_end_text=self.think_end,
+            )
+            spec = dfa_compiler.json_spec(
                 response_schema, thinking, think_end=self.think_end
-            ),
+            )
+        constraint = create_dfa and create_dfa(
+            spec,
             grammar,
             timeout=remaining_request_time(deadline),
         )

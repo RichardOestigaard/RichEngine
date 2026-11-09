@@ -1,4 +1,5 @@
 #include "ops/LfmSpeechGen.hpp"
+#include "AwakeClock.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -24,7 +25,7 @@ struct Prof {
     static const bool v = std::getenv("LFM_SPEECH_PROFILE") != nullptr;
     return v;
   }
-  using C = std::chrono::steady_clock;
+  using C = richengine::AwakeClock;
   C::time_point t0 = C::now();
   static double us(C::time_point a, C::time_point b) {
     return std::chrono::duration<double, std::micro>(b - a).count();

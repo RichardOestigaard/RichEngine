@@ -15,7 +15,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +23,16 @@ from urllib.parse import unquote
 
 from huggingface_hub.utils import validate_repo_id
 
-from . import audio, disk, installer, json_codec, judgments, serve_options, tuner
+from . import (
+    audio,
+    disk,
+    installer,
+    json_codec,
+    judgments,
+    reply_guards,
+    serve_options,
+    tuner,
+)
 from . import runtime as engine_runtime
 from .api_shapes import (
     anthropic_response,
@@ -41,7 +50,7 @@ from .api_shapes import (
     text_completion_chunk,
     text_completion_response,
 )
-from .backend import NativeResult, remaining_request_time
+from .backend import CacheInfo, NativeResult, remaining_request_time
 from .chat_templates import ChatTemplateError
 from .diagnostics import accent, dim, log_unexpected, print_status
 from .errors import APIError, ContextLengthError
@@ -1435,7 +1444,43 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Gather a generation until it is done. The callbacks receive the
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
-        output into blocks."""
+        output into blocks.
+
+        The reply guards (reply_guards) watch the committed tokens and the
+        calls the projector closes: a token loop, a call repeated within
+        the turn or too many calls stop the decode early, and a first call
+        identical to the previous turn's is decoded again with a steering
+        prefix and a banned-tool grammar, up to STEER_ATTEMPTS times."""
+        callbacks = {
+            "on_start": on_start,
+            "on_text": on_text,
+            "on_tool_delta": on_tool_delta,
+            "on_idle": on_idle,
+            "on_progress": on_progress,
+            "on_audio": on_audio,
+        }
+        # An n > 1 request's siblings share their cancellation: one lane's
+        # loop must not stop the others, so a cohort decodes unguarded.
+        guard = None if getattr(job, "cohort", None) else reply_guards.ReplyGuard(job)
+        while True:
+            collected, stopped = self._collect_once(job, guard, callbacks)
+            if guard is None:
+                return collected
+            job = self._guard_outcome(job, collected, stopped, guard, on_text)
+            if job is None:
+                return collected
+
+    def _collect_once(self, job, guard, callbacks):
+        """One decode of a turn: _collect's gathering loop for a single
+        job, which the guards may stop early (the job is cancelled and its
+        terminal is drained). Returns (the collected output, why the guard
+        stopped it or None)."""
+        on_start = callbacks["on_start"]
+        on_text = callbacks["on_text"]
+        on_tool_delta = callbacks["on_tool_delta"]
+        on_idle = callbacks["on_idle"]
+        on_progress = callbacks["on_progress"]
+        on_audio = callbacks["on_audio"]
         policy = job.tool_policy
         dialect = getattr(policy, "dialect", None)
         splitter = ReasoningSplitter(
@@ -1455,13 +1500,57 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         reasoning, content, result = [], [], None
         pcm = []
+        stopped = None
+
+        def flush_hold(upto):
+            """Vet the closed calls before `upto` against the previous
+            turn's, releasing a held call's buffered deltas once it is
+            clean. False where one repeats the previous turn's call: its
+            held deltas never reach the client."""
+            while guard.vetted < upto and guard.vetted < len(projector.closed_calls):
+                index = guard.vetted
+                call = projector.closed_calls[index]
+                guard.vetted += 1
+                deltas = []
+                if guard.hold == index:
+                    deltas, guard.hold, guard.buffered = guard.buffered, None, []
+                if reply_guards.call_key(call) in guard.prev:
+                    guard.repeat_at = index
+                    return False
+                for delta in deltas:
+                    on_tool_delta(delta)
+            return True
+
+        def tool_delta(delta):
+            index = delta["index"]
+            if guard is None:
+                on_tool_delta(delta)
+                return
+            if guard.hold == index:
+                guard.buffered.append(delta)
+                return
+            # A delta past the vetted calls means the call before it
+            # closed: vet it before this call's deltas pass. A vet that
+            # found a repeat drops the delta — the turn is ending.
+            if index > guard.vetted and not flush_hold(index):
+                return
+            if index == guard.vetted and (
+                delta.get("function", {}).get("name") in guard.prev_names
+            ):
+                # This call names a tool the previous turn called: it could
+                # be a repeat, so it is held until it closes and compares.
+                guard.hold = index
+                guard.buffered.append(delta)
+                return
+            on_tool_delta(delta)
 
         def publish(events):
             if on_text is None:
                 return
             for kind, value in events:
                 if kind == "tool":
-                    on_tool_delta(value)
+                    if on_tool_delta is not None:
+                        tool_delta(value)
                 else:
                     on_text(kind, value)
 
@@ -1472,13 +1561,30 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 (reasoning if field == "reasoning_content" else content).append(text)
                 publish([(field, text)])
 
+        if guard is not None:
+            guard.begin_attempt()
+            if guard.prefix:
+                # The steering text the prompt was continued with: the
+                # client and the reply see it as the model wrote it.
+                field = "reasoning_content" if guard.prefix_reasoning else "content"
+                append(field, guard.prefix)
+                guard.prefix = None
+
         while result is None:
             kind, value = self._next_event(job, on_idle)
-            if kind == "start" and on_start is not None:
+            if kind == "start" and (
+                on_start is not None and (guard is None or guard.attempts == 0)
+            ):
                 on_start()
             elif kind == "text":
                 for field, text in splitter.put(value):
+                    if guard is not None and field == "content":
+                        guard.text += text
                     append(field, text)
+                if guard is not None and stopped is None:
+                    stopped = self._guard_check(job, guard, projector, flush_hold)
+                    if stopped is not None:
+                        self.app.backend.cancel(job)
             elif kind == "progress" and on_progress is not None:
                 on_progress(value)
             elif kind == "audio":
@@ -1488,20 +1594,249 @@ class FrontendHandler(BaseHTTPRequestHandler):
             elif kind == "done":
                 result = value
         for field, text in splitter.finish():
+            if guard is not None and field == "content":
+                guard.text += text
             append(field, text)
         content_text, tool_calls, events = self._finalize_content(
             "".join(content), job, result.reason == "length", projector
         )
         publish(events)
-        return Collected(
-            "".join(reasoning),
-            content_text,
-            tool_calls,
-            result,
-            splitter.reasoning,
-            None if projector is None else projector.call_id,
-            b"".join(pcm),
+        if guard is not None and stopped is None:
+            stopped = self._guard_check(job, guard, projector, flush_hold)
+        if (
+            stopped is None
+            and guard is not None
+            and (repeat := reply_guards.first_repeat(tool_calls, guard.prev))
+            is not None
+        ):
+            # As in the reference, the calls the reply ends with are
+            # compared again: finish() may have closed one the loop did
+            # not vet (a call the output ended inside, whose held deltas
+            # never went out).
+            guard.repeat_at = repeat
+            stopped = "repeat"
+        if (
+            stopped is None
+            and guard is not None
+            and guard.hold is not None
+            and guard.hold < len(tool_calls)
+            and on_text is not None
+            and on_tool_delta is not None
+        ):
+            # A call still open when the output ended was vetted clean
+            # above (a repeat would have set repeat_at); the deltas it was
+            # held for go out now.
+            for delta in guard.buffered:
+                on_tool_delta(delta)
+            guard.hold, guard.buffered = None, []
+        return (
+            Collected(
+                "".join(reasoning),
+                content_text,
+                tool_calls,
+                result,
+                splitter.reasoning,
+                None if projector is None else projector.call_id,
+                b"".join(pcm),
+            ),
+            stopped,
         )
+
+    def _job_output_tokens(self, job):
+        """The ids the job generated so far, as the backend's streamer
+        records them; None where no state is registered for it (a test's
+        job, or a detached one — the text-based checks still run)."""
+        app = getattr(getattr(self, "server", None), "app", None)
+        active = getattr(getattr(app, "backend", None), "active", None)
+        state = active.get(getattr(job, "request_id", None)) if active else None
+        return getattr(getattr(state, "streamer", None), "token_ids", None)
+
+    def _guard_check(self, job, guard, projector, flush_hold):
+        """The reason this decode should stop now, or None. Runs with every
+        piece of output: the calls the projector has closed are vetted
+        against the previous turn's first, then the loop guards read the
+        tokens and text."""
+        closed = () if projector is None else projector.closed_calls
+        if not flush_hold(len(closed)):
+            return "repeat"
+        # The line-loop scan sees the text at most every 512 new
+        # characters; it is O(the reply), not per event.
+        text = None
+        if len(guard.text) - guard.line_scan_at >= 512:
+            guard.line_scan_at = len(guard.text)
+            text = guard.text
+        return reply_guards.detect(
+            self._job_output_tokens(job),
+            text,
+            closed_calls=closed,
+            # A reply that has opened a call reads as inside one for the
+            # loop thresholds (a call's arguments repeat lines on purpose,
+            # as the reference's in_call does once the opener appears).
+            in_call=projector is not None
+            and (
+                projector.call_index > 0
+                or projector.call_id is not None
+                or projector.state not in ("content", "output", "json")
+            ),
+            tools=getattr(job, "may_call_tools", False),
+            state=guard,
+        )
+
+    @staticmethod
+    def _guard_end(collected, reason):
+        """A guard-stopped turn reports the finish its cut means, not the
+        cancellation that delivered it (a client reads "cancelled" as its
+        own abort); finish_reason maps calls to "tool_calls" itself."""
+        collected.result.reason = reason
+        return None
+
+    def _guard_outcome(self, job, collected, stopped, guard, on_text):
+        """Apply the reason a guarded decode stopped: trim the calls the
+        reply keeps and end the turn, or steer and resubmit. Returns the
+        retried job, or None when `collected` is the reply."""
+        calls = collected.tool_calls
+        if stopped == "duplicate_call":
+            # The reply keeps the calls up to the first one it repeated;
+            # a repeated call's deltas went out, so the client sees what
+            # the reply kept, not more.
+            collected.tool_calls = reply_guards.dedupe(calls)
+            return self._guard_end(collected, "stop")
+        if stopped == "max_calls":
+            collected.tool_calls = calls[: reply_guards.MAX_CALLS]
+            return self._guard_end(collected, "stop")
+        if stopped == "loop":
+            # A reply cut by the loop guard without tools is cut short:
+            # "length" says so; with tools the calls it made still count
+            # as its end.
+            reason = "stop" if getattr(job, "may_call_tools", False) else "length"
+            return self._guard_end(collected, reason)
+        if stopped == "loop_in_call":
+            # The call the loop was inside is dropped, as the cut one's.
+            collected.tool_calls = [
+                call for call in calls if call["id"] != collected.cut_call
+            ]
+            return self._guard_end(collected, "length")
+        if stopped != "repeat":
+            return None
+        repeat = guard.repeat_at
+        policy = job.tool_policy
+        if repeat is None or policy is None:
+            return None
+        if repeat > 0 or policy.required:
+            # Calls already sent cannot be steered away from: the reply
+            # keeps them, up to the first repeat — which a required choice
+            # keeps too, as asked.
+            collected.tool_calls = calls[:repeat] if repeat > 0 else calls
+            return self._guard_end(collected, "stop")
+        retry = (
+            self._steer(job, collected, guard)
+            if guard.attempts < reply_guards.STEER_ATTEMPTS
+            else None
+        )
+        if retry is not None:
+            guard.attempts += 1
+            return retry
+        # Still repeating after the steering attempts, or no other tool to
+        # call: end the turn with a message instead of looping.
+        stop = reply_guards.stop_text(calls[repeat:])
+        if on_text is not None:
+            on_text("content", "\n\n" + stop)
+        collected.content = collected.content + "\n\n" + stop
+        collected.tool_calls = []
+        return self._guard_end(collected, "stop")
+
+    def _steer(self, job, collected, guard):
+        """The job that decodes this turn again after its first call
+        repeated the previous turn's: the same prompt continued by the
+        steering text, a grammar that calls at once and never a banned
+        tool, and at most STEERED_MAX_TOKENS of output. Submits it and
+        returns it; None where steering cannot apply and the turn ends
+        with the stop text instead."""
+        app = self.app
+        if not hasattr(app, "ids") or getattr(app, "backend", None) is None:
+            return None
+        calls = collected.tool_calls
+        if guard.attempts > 0:
+            # The steered reply repeated too: this decode may not name the
+            # tools whose call repeats, for this reply only (the next turn
+            # offers them all again).
+            guard.banned |= {
+                call["function"]["name"]
+                for call in calls
+                if reply_guards.call_key(call) in guard.prev
+            }
+        policy = job.tool_policy
+        remaining = [name for name in policy.schemas if name not in guard.banned]
+        output_format = guard.attempts == 0 and (
+            guard.schema is not None or guard.regex is not None
+        )
+        if not output_format and not remaining:
+            return None
+        prefix = "" if output_format else reply_guards.steer_text(calls, guard.prev)
+        try:
+            prefix_ids = (
+                app._tokenize(prefix, add_special_tokens=False)["input_ids"]
+                if prefix
+                else []
+            )
+        except Exception:
+            # Without the text the ban alone still steers: the call it
+            # made is refused by the grammar, so it must call another.
+            prefix, prefix_ids = "", []
+        try:
+            if output_format:
+                # With a response format, the answer once a call's result
+                # is in is the output itself (steering text would not be
+                # the format's): the retry decodes the format instead.
+                constraint = app._compile_constraint(
+                    False, None, False, guard.schema, guard.regex, job.deadline
+                )
+            else:
+                # A call right after the steering text (given room for
+                # text, a small model writes a plan and no call, which a
+                # client takes as the end of its task), to none of the
+                # banned tools, without the think block a reply may open.
+                steered = replace(
+                    policy,
+                    schemas={name: policy.schemas[name] for name in remaining},
+                    strict=policy.strict - guard.banned,
+                    required=True,
+                )
+                constraint = app._compile_constraint(
+                    True, steered, False, None, None, job.deadline
+                )
+        except Exception:
+            # The seam where a banned-tool grammar is optional: the
+            # steering prefix alone still tells the model its call
+            # repeated, and the turn cannot fail for a constraint.
+            constraint = None
+        try:
+            retry = replace(
+                job,
+                request_id=next(app.ids),
+                public_id=secrets.token_hex(16),
+                prompt_tokens=[*job.prompt_tokens, *prefix_ids],
+                max_new_tokens=min(job.max_new_tokens, reply_guards.STEERED_MAX_TOKENS),
+                events=queue.Queue(),
+                cancelled=threading.Event(),
+                cache=CacheInfo(),
+                constraint=constraint,
+                # The steered grammar admits no think block, so the retry's
+                # output is read as content and calls from the start.
+                thinking=False,
+                cohort=[],
+            )
+        except Exception:
+            return None
+        retry.prev_calls = guard.prev
+        retry.reply_schema = guard.schema
+        retry.reply_regex = guard.regex
+        app.backend.submit(retry)
+        guard.prefix = prefix
+        # Inside the think block the prompt opened, the steering text is
+        # reasoning; elsewhere it is content.
+        guard.prefix_reasoning = bool(job.thinking)
+        return retry
 
     def _message(self, job, collected):
         message = {
@@ -1803,14 +2138,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._write_sse(f"event: {event}\ndata: ".encode() + data + b"\n\n")
 
     def _sse_keepalive(self):
-        # An SSE comment is traffic, so socket read timeouts and proxies do
-        # not take a long prefill or resource wait for a dead connection, but
-        # event decoders skip it and clients that time out on missing data
-        # events ignore it. Streams send it only where no data event fits: the
-        # chat and text completion streams until the request starts, the
-        # Responses stream once output has begun.
+        # An empty line is traffic, so socket read timeouts and proxies do
+        # not take a long prefill or resource wait for a dead connection, and
+        # SSE readers skip it: an event ends with one, so a second dispatches
+        # nothing. It was a ": keepalive" comment, which benchmark clients
+        # that JSON-parse every non-empty line (InferenceX, vLLM's
+        # benchmark_serving) failed on. Streams send it only where no data
+        # event fits: the chat and text completion streams until the request
+        # starts, the Responses stream once output has begun.
         self._start_event_stream()
-        self._write_sse(b": richengine-keepalive\n\n")
+        self._write_sse(b"\n")
 
     def _sse_error(self, error):
         self._sse(
@@ -1982,7 +2319,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else:
                 # The data event that adds nothing, response.in_progress,
                 # carries a snapshot of the response, which would replace the
-                # output streamed so far. A comment keeps the stream alive
+                # output streamed so far. An empty line keeps the stream alive
                 # instead, though clients that time out on missing data events
                 # ignore it.
                 self._sse_keepalive()
@@ -2682,8 +3019,24 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _more_files():
+    """Open files for more connections than launchd's default of 256 (each
+    client a socket; agents hold several): past it, new clients were reset.
+    The limit is raised only, never lowered."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 10240 if hard == resource.RLIM_INFINITY else min(10240, hard)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def main():
     args = parse_args()
+    _more_files()
     server = None
     host = None
     # A server started in the background from a non-interactive shell inherits

@@ -559,7 +559,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       envFlag("RICHENGINE_PREDRAFT_OVERLAP");
   if (!overlapPredraft)
     impl_->settleGpuPredraft();
-  const auto encodeStart = std::chrono::steady_clock::now();
+  const auto encodeStart = richengine::AwakeClock::now();
   // Every non-regular path keeps the drain up front: their host writes are
   // not the adoption-identical draft inputs the overlap path relies on,
   // and their staged submissions want the free in-flight slot.
@@ -942,18 +942,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
   static const bool decodeTiming = envFlag("RICHENGINE_DECODE_TIMING");
-  const auto encodeEnd = std::chrono::steady_clock::now();
+  const auto encodeEnd = richengine::AwakeClock::now();
   auto finish = [impl, lanes = std::move(lanes),
                  items = std::move(copiedItems), tree,
                  encodeStart, encodeEnd](CommandTiming timing) mutable {
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = richengine::AwakeClock::now();
     // A predraft left in flight by the overlap path ended on the queue
     // before this command did — its ticket wait is a bookkeeping read,
     // freeing the slot the next launch needs. It runs first so its GPU
     // seconds count in this cycle's lastDecodeGpuSeconds.
     impl->settleGpuPredraft();
     auto result = impl->finalizeDecode(lanes, items, timing, tree);
-    const auto t1 = std::chrono::steady_clock::now();
+    const auto t1 = richengine::AwakeClock::now();
     // The committed step's anchors and positions are host-known now: the
     // next block's draft forward runs on the GPU through the host's
     // result-handling gap. Tree steps predraft nothing — a tree-capable
@@ -966,7 +966,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
         }))
       metal::dumpOpTimings();
     if (decodeTiming) {
-      const auto t2 = std::chrono::steady_clock::now();
+      const auto t2 = richengine::AwakeClock::now();
       fprintf(stderr,
               "decode-timing encode=%.3fms finalize=%.3fms predraft=%.3fms "
               "gpu=%.3fms wall=%.3fms\n",

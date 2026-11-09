@@ -4389,6 +4389,25 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(output.getvalue(), "")
 
+    def test_console_error_names_the_engines_resource_reason(self):
+        reason = (
+            "requests past 147449 tokens keep their KV on the SSD cache, "
+            "which takes no writes"
+        )
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+            diagnostics.print_request(
+                {
+                    "outcome": "error",
+                    "error_code": "capacity_exhausted",
+                    "engine_reason": reason,
+                    "error_message": "private prompt",
+                }
+            )
+        self.assertRegex(
+            errors.getvalue(),
+            r"^\d{2}:\d{2}:\d{2} Error · capacity_exhausted · " + reason + "\n$",
+        )
+
     def test_concurrent_console_lines_stay_whole(self):
         # Status lines on stdout and errors on stderr, both on one unbuffered
         # file, as `python -u server.py > log 2>&1` or launchd writes them.
@@ -5279,7 +5298,7 @@ class ServerTest(unittest.TestCase):
                 response.read()
                 connection.close()
 
-    def test_stream_keepalive_is_a_comment_until_the_role_chunk(self):
+    def test_stream_keepalive_is_a_blank_line_until_the_role_chunk(self):
         plan = Plan([[4]], before_start=True)
         harness = self.harness(FakeRuntime(plan))
         with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
@@ -5288,7 +5307,7 @@ class ServerTest(unittest.TestCase):
                 self.body(stream=True, reasoning_effort="none"),
             )
             try:
-                self.assertEqual(response.readline(), b": richengine-keepalive\n")
+                self.assertEqual(response.readline(), b"\n")
                 self.assertFalse(plan.started.is_set())
                 plan.start_release.set()
                 role = json.loads(self.next_sse_data(response))
@@ -5320,11 +5339,9 @@ class ServerTest(unittest.TestCase):
                 with mock.patch.object(api, "SSE_KEEPALIVE_SECONDS", 0.02):
                     connection, response = harness.open_stream(path, body)
                     try:
-                        # A comment until the request starts, then a chunk
+                        # An empty line until the request starts, then a chunk
                         # that adds nothing.
-                        self.assertEqual(
-                            response.readline(), b": richengine-keepalive\n"
-                        )
+                        self.assertEqual(response.readline(), b"\n")
                         plan.start_release.set()
                         chunk = json.loads(self.next_sse_data(response))
                         if path == "/v1/chat/completions":
@@ -5424,6 +5441,8 @@ class ServerTest(unittest.TestCase):
             return event
 
         job.events = SimpleNamespace(get=next_event)
+        heartbeat = mock.Mock(wraps=handler._sse_keepalive)
+        handler._sse_keepalive = heartbeat
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
             handler._responses_stream(job)
 
@@ -5449,8 +5468,8 @@ class ServerTest(unittest.TestCase):
         before_output, _, after_output = raw.partition(
             b"event: response.output_item.added\n"
         )
-        self.assertNotIn(b": richengine-keepalive", before_output)
-        self.assertEqual(after_output.count(b": richengine-keepalive"), 2)
+        self.assertNotIn(b"\n\n\n", before_output)
+        self.assertEqual(heartbeat.call_count, 2)
         self.assertEqual(kinds[-1], "response.completed")
         response = parsed[-1]["response"]
         self.assertEqual(response["id"], "resp_prefill-heartbeat")
@@ -5502,16 +5521,17 @@ class ServerTest(unittest.TestCase):
             deadline=100,
             events=SimpleNamespace(get=next_event),
         )
+        heartbeat = mock.Mock(wraps=handler._sse_keepalive)
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
             calls = handler._collect(
                 job,
                 on_text=lambda field, text: handler._sse({field: text}),
                 on_tool_delta=handler._sse,
-                on_idle=handler._sse_keepalive,
+                on_idle=heartbeat,
             ).tool_calls
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
-        self.assertGreaterEqual(snapshots[-3].count(b": richengine-keepalive"), 3)
+        self.assertGreaterEqual(heartbeat.call_count, 3)
         self.assertNotIn(b"questions", snapshots[-3])
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"questions": ["a" * 24]}
@@ -8732,10 +8752,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
 
     def test_capacity_failure_is_a_bad_request_naming_the_limits(self):
+        # The engine ends an allocation failure's message naming the limits
+        # that would fit it; the answer carries it as it is.
         native = (
             "could not allocate KV target: engine memory budget exceeded "
-            "(additional_pages=12, free_pages=0)"
+            "(additional_pages=12, free_pages=0); the request does not fit in the "
+            "memory this server may use, even after every cached prefix was "
+            "evicted: restart the server with a larger --max-memory or a smaller "
+            "--max-context"
         )
+        records = []
         capacity = [
             Plan(
                 exception=api.engine_runtime.RequestFailed(
@@ -8744,7 +8770,9 @@ class ServerTest(unittest.TestCase):
             )
             for _ in range(2)
         ]
-        harness = self.harness(FakeRuntime(*capacity, Plan([[4]])))
+        harness = self.harness(
+            FakeRuntime(*capacity, Plan([[4]])), request_logger=records.append
+        )
         # Retrying fails the same way, so no response invites a retry.
         for path, body in (
             ("/v1/chat/completions", self.body()),
@@ -8762,10 +8790,92 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(response.status, 400)
             self.assertIsNone(response.getheader("Retry-After"))
             self.assertEqual(error["type"], "invalid_request_error")
-            for text in ("--max-memory", "--max-context", native):
-                self.assertIn(text, error["message"])
+            self.assertEqual(error["message"], native)
             if path == "/v1/chat/completions":
                 self.assertEqual(error["code"], "capacity_exhausted")
+        status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
+        self.assertEqual(status, 200)
+        # The console line names the engine's reason.
+        failed = [record for record in records if record["outcome"] == "error"]
+        self.assertEqual([record["engine_reason"] for record in failed], [native] * 2)
+
+    def test_capacity_failure_of_a_closed_ssd_cache_does_not_blame_memory(self):
+        # A capacity_exhausted failure that is not an allocation, as an SSD
+        # cache that takes no writes, does not tell the client to raise
+        # --max-memory; the engine's message speaks for itself.
+        native = (
+            "requests past 147449 tokens keep their KV on the SSD cache, "
+            "which takes no writes"
+        )
+        records = []
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1, b"capacity_exhausted", native.encode(), retryable=False
+                )
+            ),
+            Plan([[4]]),
+        )
+        harness = self.harness(runtime, request_logger=records.append)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "capacity_exhausted")
+        self.assertEqual(error["message"], native)
+        self.assertNotIn("--max-memory", error["message"])
+        failed = [record for record in records if record["outcome"] == "error"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["engine_reason"], native)
+
+    def test_capacity_failure_without_engine_limits_keeps_the_advice(self):
+        # An engine whose bare "could not allocate" names no limits gets the
+        # --max-memory/--max-context advice added here, as before.
+        native = (
+            "could not allocate KV target: engine memory budget exceeded "
+            "(additional_pages=12, free_pages=0)"
+        )
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1, b"capacity_exhausted", native.encode(), retryable=False
+                )
+            )
+        )
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        error = json.loads(payload)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "capacity_exhausted")
+        for text in ("--max-memory", "--max-context", native):
+            self.assertIn(text, error["message"])
+
+    def test_disk_quota_failure_is_a_bad_request_naming_the_ssd_cache(self):
+        native = (
+            "this request's KV needs needed_bytes=1703936 of the SSD cache, which may "
+            "hold active_limit_bytes=425984 of active KV now (--max-cache-disk and the "
+            "volume's free space)"
+        )
+        runtime = FakeRuntime(
+            Plan(
+                exception=api.engine_runtime.RequestFailed(
+                    1, b"kv_disk_quota", native.encode(), retryable=False
+                )
+            ),
+            Plan([[4]]),
+        )
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        error = json.loads(payload)["error"]
+        # Retrying fails the same way, and memory is not what it lacks.
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "kv_disk_quota")
+        self.assertEqual(error["message"], native)
         status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
         self.assertEqual(status, 200)
 
