@@ -76,4 +76,24 @@ private:
 
 [[nodiscard]] std::vector<affine::Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout);
 
+// A DSpline checkpoint ("DFlashDraftModel" with a selected_prefix_bridge),
+// config.json and BF16 safetensors -> the packed files DSplineDraft.cpp
+// reads: the plain draft's quantized layer sections, then model.bin with
+// the fc projection, the norms, the code bridge's bf16 tensors and the
+// format-version scalars.
+class DSplineCheckpointLoader final {
+public:
+  DSplineCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                          const DFlashDraftLayout &layout);
+  ~DSplineCheckpointLoader();
+  [[nodiscard]] WeightFile layer(uint32_t index);
+  [[nodiscard]] WeightFile model();
+
+private:
+  WeightImages &images_;
+  std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, then model.bin
+};
+
+[[nodiscard]] std::vector<affine::Image> dsplineDraftCheckpointImages(const DFlashDraftLayout &layout);
+
 } // namespace richengine::model

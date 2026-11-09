@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -153,6 +154,24 @@ float bfloat16Value(const uint8_t *bytes) {
   return std::bit_cast<float>(uint32_t(bits) << 16);
 }
 
+// An IEEE binary16 value as float.
+float halfValue(const uint8_t *bytes) {
+  uint16_t bits;
+  std::memcpy(&bits, bytes, sizeof bits);
+  const uint32_t mantissa = bits & 0x3FF;
+  const uint32_t exponent = (bits >> 10) & 0x1F;
+  float value;
+  if (exponent == 0x1F)
+    value = mantissa ? std::numeric_limits<float>::quiet_NaN()
+                     : std::numeric_limits<float>::infinity();
+  else if (!exponent)
+    value = std::ldexp(static_cast<float>(mantissa), -24);
+  else
+    value = std::ldexp(static_cast<float>(mantissa + 1024),
+                       static_cast<int>(exponent) - 25);
+  return bits & 0x8000 ? -value : value;
+}
+
 // The BF16 nearest a finite value, ties to even.
 uint16_t nearestBfloat16(float value) {
   const uint32_t bits = std::bit_cast<uint32_t>(value);
@@ -192,7 +211,7 @@ void writeQuantizedStep(const Section &section, const Step &step, const std::arr
   }
 }
 
-// float(-exp(double(A_log))) of a BF16 or F32 vector into destination.
+// float(-exp(double(A_log))) of a BF16, F16 or F32 vector into destination.
 void writeDecay(const Section &section, uint8_t *destination, std::vector<uint8_t> &input) {
   const SourceTensor &tensor = *section.input.tensor;
   if (input.size() < tensor.bytes) input.resize(tensor.bytes);
@@ -200,6 +219,7 @@ void writeDecay(const Section &section, uint8_t *destination, std::vector<uint8_
   for (uint64_t i = 0; i < section.bytes / sizeof(float); ++i) {
     float logarithm;
     if (tensor.dtype == "BF16") logarithm = bfloat16Value(input.data() + i * kBFloat16Bytes);
+    else if (tensor.dtype == "F16") logarithm = halfValue(input.data() + i * kBFloat16Bytes);
     else std::memcpy(&logarithm, input.data() + i * 4, 4);
     const auto value = static_cast<float>(-std::exp(static_cast<double>(logarithm)));
     if (!std::isfinite(value)) throw std::runtime_error("non-finite GDN decay");
@@ -255,6 +275,24 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
     const uint64_t fieldRows = uint64_t(section.rows) * (section.columns / kQ4GroupElements);
     switch (section.kind) {
     case SectionKind::Copy:
+      if (section.input.dtypes.front() == "BF16" &&
+          section.input.tensor->dtype == "F16") {
+        // An fp16 oMLX source's float tensors: each element narrows to
+        // the bf16 the image format keeps (OqWrite.cpp's metaValue rounds
+        // the same way).
+        for (uint64_t from = 0; from < section.bytes; from += kLoadStepBytes) {
+          const uint64_t bytes = std::min(kLoadStepBytes, section.bytes - from);
+          tasks.push_back([&section, at, from, bytes](std::vector<uint8_t> &input) {
+            input.resize(bytes);
+            section.input.tensor->read(from, {input.data(), bytes});
+            for (uint64_t i = 0; i + sizeof(uint16_t) <= bytes; i += sizeof(uint16_t)) {
+              const uint16_t value = nearestBfloat16(halfValue(input.data() + i));
+              std::memcpy(at + from + i, &value, sizeof value);
+            }
+          });
+        }
+        break;
+      }
       for (uint64_t from = 0; from < section.bytes; from += kLoadStepBytes) {
         const uint64_t bytes = std::min(kLoadStepBytes, section.bytes - from);
         tasks.push_back([&section, at, from, bytes](std::vector<uint8_t> &) {

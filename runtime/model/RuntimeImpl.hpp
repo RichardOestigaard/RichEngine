@@ -16,6 +16,7 @@
 #include "model/NullDraft.hpp"
 #include "model/DFlashTwo8width.hpp"
 #include "model/DFlashTwo16width.hpp"
+#include "model/DSplineDraft.hpp"
 #include "model/CompositeStateStorage.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/TargetModel.hpp"
@@ -179,7 +180,7 @@ inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
 using DraftModel =
     std::variant<NullDraft, DFlashDraft, DFlashTwo8width, DFlashTwo16width,
                  DFlashV1Draft,
-                 DSparkDraft>;
+                 DSparkDraft, DSplineDraft>;
 
 // The DraftModel alternative each draft weights type constructs. The
 // mapping is total: a weights type with no specialization fails to compile
@@ -191,6 +192,7 @@ template <> struct DraftModelFor<DFlashV1DraftWeights> {
   using Type = DFlashV1Draft;
 };
 template <> struct DraftModelFor<DSparkDraftWeights> { using Type = DSparkDraft; };
+template <> struct DraftModelFor<DSplineDraftWeights> { using Type = DSplineDraft; };
 
 } // namespace detail
 
@@ -2952,6 +2954,183 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
               fclose(fr);
             }
           }
+        }
+      }
+      // RICHENGINE_DSPINE_DUMP: the DSpline draft forward's arena state for
+      // offline oracle replay — the block input ids/positions, the
+      // ping-ponged hidden banks (post-write layer-3 and layer-5 streams),
+      // the normed head input, the lane's draft rings and the step's
+      // captured target hidden / context K/V. Bounded dump count.
+      if (envFlag("RICHENGINE_DSPINE_DUMP") && !tree &&
+          std::holds_alternative<DSplineDraft>(draftModel)) {
+        static uint32_t dumpBudget = 6;
+        if (dumpBudget && lane == 0) {
+          --dumpBudget;
+          const uint32_t qr = geometry.draft.queryRows();
+          const uint32_t hid = geometry.draft.hiddenSize;
+          const uint64_t pos = items[lane].logicalPosition;
+          const uint32_t vs = geometry.draft.verifyRows();
+          char path[160];
+          const auto writeRaw = [&](const char *tag, const void *ptr,
+                                    size_t bytes) {
+            std::snprintf(path, sizeof(path), "/tmp/ds_%llu_%s.bin",
+                          static_cast<unsigned long long>(pos), tag);
+            if (FILE *f = fopen(path, "wb")) {
+              fwrite(ptr, 1, bytes, f);
+              fclose(f);
+            }
+          };
+          writeRaw("input",
+                   contents<uint32_t>(
+                       decodeArena->packed(DecodeTensor::DraftInputTokens,
+                                           kLaneCount),
+                       "dump draft input") +
+                       lane * qr,
+                   qr * sizeof(uint32_t));
+          writeRaw("dpos",
+                   contents<uint32_t>(
+                       decodeArena->get(lane, DecodeTensor::DraftPositions),
+                       "dump draft positions"),
+                   qr * sizeof(uint32_t));
+          writeRaw("h0",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftHidden0,
+                                           uint32_t(lanes.size())),
+                       "dump hidden0") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("h1",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftHidden1,
+                                           uint32_t(lanes.size())),
+                       "dump hidden1") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("dfh",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftFinalHidden,
+                                           uint32_t(lanes.size())),
+                       "dump dfh") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("props",
+                   contents<uint32_t>(d(DecodeTensor::ProposedTokens),
+                                      "dump props"),
+                   kDraftProposalTokens * sizeof(uint32_t));
+          // Per-stage bisection tensors (last-executed layer's values).
+          writeRaw("resid",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftResidual,
+                                           uint32_t(lanes.size())),
+                       "dump residual") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("norm",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftNormalized,
+                                           uint32_t(lanes.size())),
+                       "dump normalized") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("att",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftAttention,
+                                           uint32_t(lanes.size())),
+                       "dump attention") +
+                       size_t(lane) * qr * geometry.draft.attentionSize,
+                   size_t(qr) * geometry.draft.attentionSize * 2);
+          writeRaw("qkv",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftProposalQkv,
+                                           uint32_t(lanes.size())),
+                       "dump qkv") +
+                       size_t(lane) * qr * geometry.draft.qkvSize,
+                   size_t(qr) * geometry.draft.qkvSize * 2);
+          writeRaw("qk",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftQueryKeys,
+                                           uint32_t(lanes.size())),
+                       "dump query keys") +
+                       size_t(lane) * qr * geometry.draft.contextKvSize(),
+                   size_t(qr) * geometry.draft.contextKvSize() * 2);
+          writeRaw("qv",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftQueryValues,
+                                           uint32_t(lanes.size())),
+                       "dump query values") +
+                       size_t(lane) * qr * geometry.draft.contextKvSize(),
+                   size_t(qr) * geometry.draft.contextKvSize() * 2);
+          // The DSpline bridge scratch fields inside the intermediate
+          // buffer: projected|codes|packed|message|delta then fp32 rms —
+          // tileRows(16) rows per field for a lane-1 dump.
+          writeRaw("inter",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftIntermediate,
+                                           uint32_t(lanes.size())),
+                       "dump intermediate"),
+                   size_t(qr) *
+                       (2 * geometry.draft.bridgeCodeSize +
+                        3 * geometry.draft.bridgeRank +
+                        geometry.draft.hiddenSize) * 2 +
+                       size_t(qr) * 4);
+          // The bridge read's normalized input (prepare output).
+          writeRaw("dproj",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::DraftProjected,
+                                           uint32_t(lanes.size())),
+                       "dump bridge input") +
+                       size_t(lane) * qr * hid,
+                   size_t(qr) * hid * 2);
+          writeRaw("out", outputTokens, laneResult.retained * sizeof(uint32_t));
+          writeRaw("cap",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::CapturedTargetHidden,
+                                           uint32_t(lanes.size())),
+                       "dump captured") +
+                       size_t(lane) * vs * geometry.target.capturedHiddenSize(),
+                   size_t(vs) * geometry.target.capturedHiddenSize() * 2);
+          writeRaw("ctxkv",
+                   contents<uint16_t>(
+                       decodeArena->packed(DecodeTensor::ContextKv,
+                                           uint32_t(lanes.size())),
+                       "dump ctxkv") +
+                       size_t(lane) * vs * geometry.draft.contextKvSize(),
+                   size_t(vs) * geometry.draft.contextKvSize() * 2);
+          writeRaw("drope",
+                   contents<float>(
+                       decodeArena->get(lane, DecodeTensor::DraftRopeCos),
+                       "dump rope cos"),
+                   qr * (geometry.draft.attentionHeadDimension / 2) * 4);
+          writeRaw("dropesin",
+                   contents<float>(
+                       decodeArena->get(lane, DecodeTensor::DraftRopeSin),
+                       "dump rope sin"),
+                   qr * (geometry.draft.attentionHeadDimension / 2) * 4);
+          Request &rq = request(items[lane].requestId);
+          for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
+            const auto &ring = states.draft(rq.stateLane)[layer];
+            char tag[16];
+            std::snprintf(tag, sizeof(tag), "ringk%u", layer);
+            writeRaw(tag, contents<uint16_t>(ring.keys, "dump ring k"),
+                     ring.keys.sizeBytes());
+            std::snprintf(tag, sizeof(tag), "ringv%u", layer);
+            writeRaw(tag, contents<uint16_t>(ring.values, "dump ring v"),
+                     ring.values.sizeBytes());
+          }
+          std::snprintf(path, sizeof(path), "/tmp/ds_%llu_meta.txt",
+                        static_cast<unsigned long long>(pos));
+          if (FILE *f = fopen(path, "w")) {
+            fprintf(f,
+                    "pos=%llu retained=%u accepted=%u qr=%u hid=%u vs=%u "
+                    "capw=%u ctxkv=%u layers=%u\n",
+                    static_cast<unsigned long long>(pos), laneResult.retained,
+                    laneResult.accepted, qr, hid, vs,
+                    geometry.target.capturedHiddenSize(),
+                    geometry.draft.contextKvSize(), geometry.draft.layers);
+            fclose(f);
+          }
+          fprintf(stderr, "dsdump pos=%llu lane=%u\n",
+                  static_cast<unsigned long long>(pos), lane);
         }
       }
       // RICHENGINE_DRAFT_CONF: the confidence head ships loaded but unscored.

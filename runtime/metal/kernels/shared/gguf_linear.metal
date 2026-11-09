@@ -324,14 +324,79 @@ kernel void gguf_decode_gate_up(device bfloat *input [[buffer(0)]], device uchar
   threadgroup uint arrival;
   const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
              origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  const auto value = [](float g, float u) { return bfloat(float(bfloat(u)) * richengine_silu(float(bfloat(g)))); };
+  const auto out = [&](uint row, uint column) { return ulong(row) * p.out_stride + column0 + column; };
+  const auto at = [&](uint s, uint row, uint column) {
+    return (ulong(s) * Rows + row) * (2 * p.out_stride) + column0 + column;
+  };
+  // Past 32 rows one accumulator walks K twice, a tensor a walk: gate and up
+  // in one walk take two Rows x GGUF_STAGED_COLUMNS destinations — 128 fp32
+  // a lane at 64 rows against the two-pass staged tile's 64 — plus both
+  // tensors' staged columns, which spills and collapses the tile (5.5x the
+  // two-pass pair at 64 rows). Each tensor's steps still sum in its own
+  // walk's order, so the partials and the output keep the pair's bits; the
+  // walks read every weight once, as the two dispatches they replace do.
+  if constexpr (Rows > 32) {
+    // The gate walk's sums wait out the up walk where the pair's epilogue
+    // leaves them anyway: unsplit, in the output's own columns — the value
+    // the store rounds them to is the bfloat the silu reads, so the scratch
+    // costs nothing — and split, in the pair's partials layout.
+    const uint step_first = staged_first_step(group.x / 2, sb, se, p.spread);
+    auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
+    gguf_zero(acc);
+    staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, gw0, gw1, gmeta, p.input_size, origin,
+                                                                    stage, tl, lane, sb, se, step_first, acc);
+    const bool unsplit = p.splits == 1;
+#pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+      if (!acc.is_valid_element(i)) continue;
+      const auto index = acc.get_multidimensional_index(i);
+      if (unsplit) output[out(index[1], index[0])] = bfloat(acc[i]);
+      else partials[at(group.y, index[1], index[0])] = acc[i];
+    }
+    // The read-back below is the same lane's own store: index i of one
+    // destination is index i's lane in the other.
+    gguf_zero(acc);
+    staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, uw0, uw1, umeta, p.input_size, origin,
+                                                                    stage, tl, lane, sb, se, step_first, acc);
+    if (unsplit) {
+#pragma unroll
+      for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (!acc.is_valid_element(i)) continue;
+        const auto index = acc.get_multidimensional_index(i);
+        const ulong o = out(index[1], index[0]);
+        output[o] = value(float(output[o]), acc[i]);
+      }
+      return;
+    }
+#pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+      if (!acc.is_valid_element(i)) continue;
+      const auto index = acc.get_multidimensional_index(i);
+      partials[at(group.y, index[1], index[0]) + p.out_stride] = acc[i];
+    }
+    device atomic_uint *counter = counters + p.out_offset / GGUF_STAGED_COLUMNS + group.x;
+    if (!split_arrive_last(counter, p.splits, lane, &arrival)) return;
+#pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+      if (!acc.is_valid_element(i)) continue;
+      const auto index = acc.get_multidimensional_index(i);
+      const uint row = index[1], column = index[0];
+      const float g = split_sum(float(partials[at(group.y, row, column)]), group.y, p.splits,
+                                [&](uint s) { return partials[at(s, row, column)]; });
+      const float u = split_sum(float(acc[i]), group.y, p.splits,
+                                [&](uint s) { return partials[at(s, row, column) + p.out_stride]; });
+      output[out(row, column)] = value(g, u);
+    }
+    split_release(counter, lane);
+    return;
+  }
   auto gate = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
   auto up = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, stage);
   gguf_zero(gate);
   gguf_zero(up);
   gguf_staged_pair_steps<F, Rows>(input, gw0, gw1, gmeta, uw0, uw1, umeta, p.input_size, origin, stage, tl, lane, sb,
                                   se, staged_first_step(group.x / 2, sb, se, p.spread), gate, up);
-  const auto value = [](float g, float u) { return bfloat(float(bfloat(u)) * richengine_silu(float(bfloat(g)))); };
-  const auto out = [&](uint row, uint column) { return ulong(row) * p.out_stride + column0 + column; };
   if (p.splits == 1) {
 #pragma unroll
     for (ushort i = 0; i < gate.get_capacity(); ++i) {
@@ -341,9 +406,6 @@ kernel void gguf_decode_gate_up(device bfloat *input [[buffer(0)]], device uchar
     }
     return;
   }
-  const auto at = [&](uint s, uint row, uint column) {
-    return (ulong(s) * Rows + row) * (2 * p.out_stride) + column0 + column;
-  };
 #pragma unroll
   for (ushort i = 0; i < gate.get_capacity(); ++i) {
     if (!gate.is_valid_element(i)) continue;

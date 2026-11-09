@@ -57,10 +57,21 @@ class Draft:
     # inspection requires, with the values it requires: a commit stating
     # others is not installed, so it never replaces a draft that loads.
     signature: tuple[tuple[str, object], ...]
+    # Other drafts the family accepts beside its default — each names the
+    # repository it suggests and the config signature its dialect states
+    # (a --draft-model override resolves to whichever signature matches;
+    # Qwen3.8-27B's DSpine next to its DFlash2).
+    alternates: tuple["Draft", ...] = ()
 
     @property
     def layers(self):
         return dict(self.signature)["num_hidden_layers"]
+
+    @property
+    def candidates(self):
+        """Every signature a draft config may match: the default, then the
+        alternates, in order."""
+        return (self, *self.alternates)
 
 
 @dataclass(frozen=True)
@@ -145,10 +156,17 @@ def _load():
         doc = json.loads(path.read_text())
         draft = None
         if doc.get("draft") is not None:
-            spec = doc["draft"]
-            signature = dict(bases.get(spec.get("base") or "", {}))
-            signature.update(spec.get("signature", {}))
-            draft = Draft(spec["repo"], _pairs(signature))
+
+            def _draft_spec(spec):
+                signature = dict(bases.get(spec.get("base") or "", {}))
+                signature.update(spec.get("signature", {}))
+                return Draft(
+                    spec["repo"],
+                    _pairs(signature),
+                    tuple(_draft_spec(alt) for alt in spec.get("alternates", ())),
+                )
+
+            draft = _draft_spec(doc["draft"])
         serving = doc.get("serving")
         if isinstance(serving, dict):
             serving = {**serving_base, **serving}

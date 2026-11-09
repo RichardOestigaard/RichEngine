@@ -74,14 +74,18 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   const bool nullDraft = result.descriptor.draft.kind == DraftKind::Null;
   const bool dflashV1Draft = result.descriptor.draft.kind == DraftKind::DFlashV1;
   const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
+  const bool dspineDraft = result.descriptor.draft.kind == DraftKind::DSpline;
   std::optional<DFlash2CheckpointLoader> draft;
   std::optional<DFlashV1DraftCheckpointLoader> dflashV1DraftLoader;
   std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
+  std::optional<DSplineCheckpointLoader> dspineDraftLoader;
   if (result.descriptor.draftFromCheckpoint() && !nullDraft) {
     if (dflashV1Draft)
       dflashV1DraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else if (dsparkDraft)
       dsparkDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
+    else if (dspineDraft)
+      dspineDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else
       draft.emplace(images, root / "draft", result.descriptor.draft);
   }
@@ -164,6 +168,20 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
             ? DSparkDraftFiles(std::ref(*dsparkDraftLoader))
             : DSparkDraftFiles(PackedDSparkDraftFiles{images, root / "draft", result.descriptor.draft}),
         result.descriptor.draft);
+  } else if (dspineDraft) {
+    // The serial refinement's tables need the shared vocabulary head; the
+    // target's weights loaded above carry it whichever arch served.
+    const ops::Projection &head = std::visit(
+        [](const auto &weights) -> const ops::Projection & {
+          return weights.logitsProjection;
+        },
+        result.target);
+    result.draft = loadDSplineDraftWeights(
+        backend,
+        dspineDraftLoader
+            ? DSplineDraftFiles(std::ref(*dspineDraftLoader))
+            : DSplineDraftFiles(PackedDSplineDraftFiles{images, root / "draft", result.descriptor.draft}),
+        result.descriptor.draft, &head);
   } else {
     result.draft = loadDFlashDraftWeights(
         backend,
@@ -275,6 +293,8 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
                  ? dflashV1DraftCheckpointImages(descriptor.draft)
                  : descriptor.draft.kind == DraftKind::DSpark
                        ? dsparkDraftCheckpointImages(descriptor.draft)
+                 : descriptor.draft.kind == DraftKind::DSpline
+                       ? dsplineDraftCheckpointImages(descriptor.draft)
                        : draftCheckpointImages(descriptor.draft);
     };
     if (preferBlockWeights) {
@@ -288,6 +308,14 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     } else {
       bytes += imageBytes(draftImagesFor());
     }
+  }
+  if (descriptor.draft.kind == DraftKind::DSpline) {
+    // The serial refinement's persistent tables, built at load for packed
+    // and checkpoint drafts alike (buildSerialTables): TSV
+    // [vocab × 2·bridgeRank] and TG [vocab × bridgeRank], bf16 both.
+    const uint64_t vocab = descriptor.draft.vocabularySize;
+    const uint64_t rank = descriptor.draft.bridgeRank;
+    bytes += vocab * (3 * rank) * 2;
   }
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += descriptor.visionTower == VisionTower::Lfm3Vl

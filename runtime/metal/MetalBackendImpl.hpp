@@ -921,7 +921,9 @@ struct MetalBackend::Impl {
     // plus the snapshot of the run it was baked from. Submission replays the
     // span only while the run still matches the snapshot field for field;
     // drift re-bakes. Indirect commands bind no bytes, so every parameter
-    // payload of the run is staged in paramsAllocation, 256-byte aligned.
+    // payload of the run is staged in paramsAllocation, 256-byte aligned —
+    // matching covers the payload's index and size but never its contents,
+    // which a replay restages (the gpu span contract).
     struct BakedSpan {
         struct BufferSnapshot {
             // Weak so a cached span never keeps a dropped buffer's memory:
@@ -937,10 +939,11 @@ struct MetalBackend::Impl {
         };
         struct BytesSnapshot {
             uint32_t index = 0;
-            // Compared only while the dispatch is not patchable.
+            // Unused: payload contents never take part in matching — every
+            // bytes binding restages into paramsAllocation on replay.
             std::vector<std::byte> data;
             // The payload's staged copy inside paramsAllocation, which a
-            // replay rewrites when the dispatch is patchable.
+            // replay rewrites on every submission.
             uint64_t paramsOffset = 0;
             uint64_t sizeBytes = 0;
         };
@@ -948,9 +951,9 @@ struct MetalBackend::Impl {
             std::string pipelineName;
             DispatchSize threadgroups{};
             DispatchSize threadsPerThreadgroup{};
-            // The run marks payloads that change between submissions:
-            // matching skips their contents and replay rewrites the staged
-            // bytes (ComputeDispatch::patchableBytes).
+            // Kept for snapshot fidelity: payload contents never take part
+            // in matching — every bytes binding restages on replay
+            // (ComputeDispatch::patchableBytes).
             bool patchableBytes = false;
             std::vector<uint32_t> bufferIndices;
             std::vector<BufferSnapshot> buffers;
@@ -1037,8 +1040,8 @@ struct MetalBackend::Impl {
         struct BytesSnapshot {
             uint32_t index = 0;
             uint64_t sizeBytes = 0;
-            // Compared only for bakeable non-patchable payloads, whose
-            // staged bytes a replayed span binds.
+            // Unused: payload contents never take part in matching — a
+            // span's replay restages them, a direct dispatch binds its own.
             std::vector<std::byte> data;
         };
         struct DispatchSnapshot {
@@ -1060,10 +1063,16 @@ struct MetalBackend::Impl {
         // The prepared form to reuse; its source pointers are rebound to
         // the new run on every hit.
         std::vector<PreparedDispatch> prepared;
+        // The retained set of the snapshotted run: a hit's bindings proved
+        // identical to the snapshot's, so its retained allocations are the
+        // same and the per-binding walk skips. Weak like the buffer
+        // snapshots — a cached shape must not pin its run's buffers, or
+        // every held alternate keeps transient workspaces alive past their
+        // views and the accounting reads the pile as unclassified growth.
+        std::vector<std::weak_ptr<MetalAllocation>> retainedAllocations;
         std::vector<uint8_t> barrierPlan;
         std::vector<std::shared_ptr<const BakedSpan>> spanRefs;
         std::vector<std::shared_ptr<const GpuSpan>> gpuSpanRefs;
-        uint64_t boundBuffers = 0;
         uint64_t touched = 0;
     };
 
@@ -1112,8 +1121,9 @@ struct MetalBackend::Impl {
                        PipelineNameHash, std::equal_to<>>
         pipelines;
     // Baked indirect-command spans of earlier submissions, keyed by the
-    // run's position, length and first pipeline. Two alternates per key keep
-    // interleaved graph shapes from re-baking each other every step.
+    // run's position, length and first pipeline. Four alternates per key
+    // keep interleaved graph shapes — parities alternate their bindings —
+    // from re-baking each other every step.
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BakedSpan>>>
         bakedSpans;

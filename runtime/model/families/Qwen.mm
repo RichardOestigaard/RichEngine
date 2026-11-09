@@ -65,6 +65,36 @@ DFlashDraftLayout qwen38DraftLayout() {
   return layout;
 }
 
+// The Qwen3.8-27B DSpine draft (tencent/Qwen3.8-27B-DSpine-b16 and its MLX
+// ports): the plain draft's five all-causal sliding layers over the shared
+// 32x8x128 head geometry, plus the selected-prefix code bridge — code 1024,
+// rank 512, a write after every layer, top-16 serial refinement. Its taps
+// differ from the DFlash2 draft's; the config's target_layer_ids become
+// the descriptor's capture set (ModelDescriptor.mm).
+DFlashDraftLayout qwen38DSplineLayout() {
+  DFlashDraftLayout layout;
+  layout.kind = DraftKind::DSpline;
+  layout.causalLayers = 0x1F;
+  layout.layers = 5;
+  layout.hiddenSize = 5120;
+  layout.dynamicSize = 0;
+  layout.qkvSize = 6144;
+  layout.attentionSize = 4096;
+  layout.intermediateSize = 17408;
+  layout.targetHiddenSize = 25600;
+  layout.selectorRank = 0;
+  layout.kvHeads = 8;
+  layout.blockSize = 16;
+  layout.slidingWindow = 8192;
+  layout.headCore = ops::DraftHeadCore::Q32K8D128;
+  layout.contextCore = ops::DraftContextCore::Plain5120;
+  layout.bridgeCodeSize = 1024;
+  layout.bridgeRank = 512;
+  layout.bridgeWriteLayers = 0x1F;
+  layout.bridgeHeadTopk = 16;
+  return layout;
+}
+
 // The Qwen VL tower both families pack: declared in full — no defaults.
 ops::VisionLayout qwenVisionLayout(uint32_t outputHiddenSize) {
   ops::VisionLayout vision;
@@ -157,6 +187,7 @@ const bool kRegisteredQwenFamilies = [] {
                        .legacyType = "",
                        .makeDescriptor = &qwen38Descriptor,
                        .draftLayout = &qwen38DraftLayout,
+                       .dsplineLayout = &qwen38DSplineLayout,
                        .refineSourceConfig = &refineQwenSourceText,
                        .servesVisionTower = true});
   registerModelFamily({.name = "Qwen3.6-35B-A3B",

@@ -84,6 +84,7 @@ namespace richengine::model {
       buffers.hidden[hidden] = d(static_cast<DecodeTensor>(
           static_cast<uint32_t>(DecodeTensor::DraftHidden0) + hidden));
     }
+    buffers.inputTokens = d(DecodeTensor::DraftInputTokens);
     buffers.normalized = d(DecodeTensor::DraftNormalized);
     buffers.dynamic = d(DecodeTensor::DraftDynamic);
     buffers.convolved = d(DecodeTensor::DraftConvolved);
@@ -108,6 +109,7 @@ namespace richengine::model {
       // anchor from the draft-input rows the pack staged, like DSpark's).
       if constexpr (std::is_same_v<DraftModelType, DFlashV1Draft> ||
                     std::is_same_v<DraftModelType, DSparkDraft> ||
+                    std::is_same_v<DraftModelType, DSplineDraft> ||
                     std::is_base_of_v<DFlashDraft, DraftModelType>) {
         model.addDecode(graph, std::move(buffers),
                         targetModel.vocabularyProjection(),
@@ -351,6 +353,7 @@ namespace richengine::model {
       using DraftModelType = std::decay_t<decltype(model)>;
       return std::is_same_v<DraftModelType, DFlashV1Draft> ||
              std::is_same_v<DraftModelType, DSparkDraft> ||
+             std::is_same_v<DraftModelType, DSplineDraft> ||
              std::is_base_of_v<DFlashDraft, DraftModelType>;
     }, draftModel);
     if (!gpuPredraftOn_ || !chainPredraft_ || !chainable ||

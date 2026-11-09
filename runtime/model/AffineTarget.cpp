@@ -260,7 +260,7 @@ Image gdnLayerImage(const TargetLayout &layout, uint32_t layer, const QuantResol
     copy(result, gdn + "conv1d.weight", {layout.convolutionDimension, layout.convolutionTaps, 1});
     Section decay;
     decay.kind = SectionKind::Decay;
-    decay.input = {gdn + "A_log", {"BF16", "F32"}, {layout.gdnValueHeads}};
+    decay.input = {gdn + "A_log", {"BF16", "F16", "F32"}, {layout.gdnValueHeads}};
     decay.bytes = uint64_t(layout.gdnValueHeads) * sizeof(float);
     append(result, std::move(decay));
     copy(result, gdn + "dt_bias", {layout.gdnValueHeads});

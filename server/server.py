@@ -1878,8 +1878,34 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _complete_n(self, job):
         """n > 1: one choice per sibling lane, submitted together so they
         decode packed. The prompt is billed once — later lanes' prefix reads
-        are cache hits, not new tokens."""
-        results = [self._collect(sibling) for sibling in job.cohort]
+        are cache hits, not new tokens. Siblings gather on one thread each:
+        every lane drains its own event queue as it fills instead of its
+        events piling up behind the sibling the serial pass was on. The
+        first failure cancels the cohort — backend.cancel covers every lane —
+        the way the error escaping the serial pass did."""
+        collected = [None] * len(job.cohort)
+        failures = {}
+
+        def collect(index, sibling):
+            try:
+                collected[index] = self._collect(sibling)
+            except BaseException as error:
+                failures[index] = error
+                self.app.backend.cancel(sibling)
+
+        threads = [
+            threading.Thread(target=collect, args=(index, sibling), daemon=True)
+            for index, sibling in enumerate(job.cohort)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if failures:
+            # The lowest index that failed is the error the serial pass
+            # would have raised first.
+            raise failures[min(failures)]
+        results = collected
         choices = []
         completions = 0
         for index, (sibling, collected) in enumerate(zip(job.cohort, results)):

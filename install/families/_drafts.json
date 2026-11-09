@@ -59,6 +59,38 @@
     "block_size": 16,
     "final_logit_softcapping": 30.0
   },
+  "dspine": {
+    "architectures": [
+      "DFlashDraftModel"
+    ],
+    "model_type": "qwen3",
+    "sliding_window": 8192,
+    "is_causal": true,
+    "use_sliding_window": true,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "rope_parameters.rope_type": "default",
+    "rope_parameters.rope_theta": 10000000,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention"
+    ],
+    "block_size": 16,
+    "dflash_config.draft_block_causal": true,
+    "dflash_config.selected_prefix_feature_writes": true,
+    "dflash_config.selected_prefix_feature_write_mode": "independent",
+    "dflash_config.selected_prefix_decode_mode": "serial",
+    "dflash_config.selected_prefix_terminal": false,
+    "dflash_config.selected_prefix_code_bridge.code_size": 1024,
+    "dflash_config.selected_prefix_code_bridge.rank": 512,
+    "code_bridge_second_pass.mode": "serial_table",
+    "code_bridge_second_pass.head_topk": 16
+  },
   "dspark": {
     "model_type": "qwen3",
     "hidden_act": "silu",

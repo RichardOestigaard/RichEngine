@@ -850,6 +850,13 @@ bool fastInt8Prefill() {
   static const bool on = model::modelPolicy().prefillFastInt8;
   return on;
 }
+// RICHENGINE_PREFILL_I8_SKIP: epilogue bitmask exempting projection classes
+// from the int8 path for divergence triage (1: plain input projections and
+// FFN gate, 2: residual output/down projections, 4: fused up).
+uint32_t fastInt8Skip() noexcept {
+  static const uint32_t mask = envUint("RICHENGINE_PREFILL_I8_SKIP", 0);
+  return mask;
+}
 
 bool packsPrefill(const DevicePolicy &device, LinearWorkload w) noexcept {
   return packedPrefillEnabled() && !packedTilesDisabled() &&
@@ -1020,7 +1027,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (gate) requireAffineProjection(*gate, w.matrix);
   const AffineWeights &weights = p.affine();
   if (fastInt8Prefill() && w.phase == LinearPhase::Prefill &&
-      w.epilogue != LinearEpilogue::GateUp && k % 64 == 0 && n % 256 == 0) {
+      w.epilogue != LinearEpilogue::GateUp && k % 64 == 0 && n % 256 == 0 &&
+      !(fastInt8Skip() & (1u << static_cast<uint32_t>(w.epilogue)))) {
     // Integer NA path: quantize the chunk's input into the two-term uint8
     // split, then run the int32-accumulating tile of its epilogue.
     const uint64_t groups = k / 64;
@@ -1045,12 +1053,17 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
                                                  : b.output;
     const metal::MetalBuffer outSums =
         w.epilogue == LinearEpilogue::UpWithGate ? b.downSums : b.sums;
-    graph.add(std::string(kernel),
-              {b.scratch.i8codes, b.scratch.i8codesLo, b.scratch.i8params,
-               weights.weights, weights.scales,
-               weights.biases, auxiliary, b.output, outSums},
-              Q4Params{n, k}, {rows / kAffinePrefillTileRows, n / 256, 1},
-              {256, 1, 1});
+    // The input's precomputed group sums bind at index 10 behind the
+    // dispatch parameters: the epilogue's bias term is then the same
+    // sum * bias evaluation the bf16 tile runs, not the quantized split's
+    // own dequantized sum.
+    graph.addParamsAt(std::string(kernel),
+                      {b.scratch.i8codes, b.scratch.i8codesLo,
+                       b.scratch.i8params, weights.weights, weights.scales,
+                       weights.biases, auxiliary, b.output, outSums, b.sums},
+                      Q4Params{n, k}, 9,
+                      {rows / kAffinePrefillTileRows, n / 256, 1},
+                      {256, 1, 1});
     return b.prepared;
   }
   if (selected.usesSimdgroup()) {

@@ -68,12 +68,16 @@ private:
 // candidate-selector codebooks, block-bidirectional attention —
 // DFlashTwoDraft.{hpp,cpp}), a plain transformer DFlash draft (no
 // convolutions or selector; its sliding attention layers mask the block
-// rows causally, its full layer does not) or DSpark (no convolutions or
+// rows causally, its full layer does not), DSpark (no convolutions or
 // selector codebooks; block-bidirectional layers like DFlash2, plus a
 // sequential Markov head that corrects each proposal position's logits with
 // a low-rank bias of the previously sampled token and a confidence head the
-// runtime loads but does not score).
-enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, Null };
+// runtime loads but does not score) or DSpline (Tencent's DSpine: the plain
+// draft's all-causal sliding layers plus a selected-prefix code bridge —
+// gated adjacent writes of each position's predicted feature into its
+// successor; the bridge writes run as the dspline_bridge_* kernels between
+// the plain layers, the serial last-write refinement stays deferred).
+enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, DSpline, Null };
 
 // The kind's user-facing name; Null reads "none" since the n-gram predraft
 // still proposes for a draft-less family.
@@ -82,6 +86,7 @@ inline constexpr std::string_view draftKindName(DraftKind kind) {
   case DraftKind::DFlashTwo: return "DFlash2";
   case DraftKind::DFlashV1: return "DFlash";
   case DraftKind::DSpark: return "DSpark";
+  case DraftKind::DSpline: return "DSpline";
   default: return "none";
   }
 }
@@ -131,6 +136,16 @@ struct DFlashDraftLayout final {
   // was never the rejected position's target pick on the 35B-A3B decode
   // benchmark, and the wider edge table costs ~7% of decode throughput.
   bool poolSelector = false;
+  // DSpline only: the selected-prefix code bridge
+  // (dflash_config.selected_prefix_code_bridge): the code width the per-layer
+  // reads and the codebook share, the feature writes' inner rank, the bitmask
+  // of draft layers whose output a write follows (selected_prefix_feature_
+  // layers, 1-based in the config) and the serial last-write refinement's
+  // head_topk, kept for the deferred code_bridge_second_pass.
+  uint32_t bridgeCodeSize = 0;
+  uint32_t bridgeRank = 0;
+  uint32_t bridgeWriteLayers = 0;
+  uint32_t bridgeHeadTopk = 0;
 
   // The trained block's usable proposal count. A plain or DFlash2
   // block_size counts the block's query rows (the anchor among them);
@@ -203,6 +218,10 @@ struct DFlashDraftLayout final {
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
+  // The packed draft input rows (the lane's anchor token at each
+  // queryRows-stride row 0): only the DSpline code bridge reads it, for
+  // its anchor codebook substitution. Empty on every other draft kind.
+  metal::MetalBuffer inputTokens;
   metal::MetalBuffer normalized;
   metal::MetalBuffer dynamic;
   metal::MetalBuffer convolved;

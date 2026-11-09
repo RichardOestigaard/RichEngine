@@ -94,11 +94,13 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
 }
 
 // Reference for one lane and kv head: every row attends to the ring window it
-// can see plus all eight current rows, exactly as the kernel's mask defines.
+// can see plus the current rows — causally (only up to its own block row)
+// when causal, all of them otherwise — exactly as the kernel's mask defines.
 void referenceRows(const uint16_t *queries, const uint16_t *keys,
                    const uint16_t *values, const uint16_t *queryKeys,
                    const uint16_t *queryValues, uint32_t cacheLength,
-                   uint32_t rows, std::vector<float> &output) {
+                   uint32_t rows, std::vector<float> &output,
+                   bool causal = false) {
   const uint32_t groupRows = rows * kQueryHeadsPerKv;
   const uint32_t commonStart =
       cacheLength >= kWindow - 1 ? cacheLength - (kWindow - 1) : 0;
@@ -118,11 +120,13 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
       if (key >= oldCount) {
         const uint32_t current = key - oldCount;
         double dot = 0.0;
-        for (uint32_t d = 0; d < kHeadDim; ++d) {
-          dot += double(tuning::bf16ToFloat(query[d])) *
-                 tuning::bf16ToFloat(queryKeys[current * kHeadDim + d]);
+        if (!causal || current <= proposal) {
+          for (uint32_t d = 0; d < kHeadDim; ++d) {
+            dot += double(tuning::bf16ToFloat(query[d])) *
+                   tuning::bf16ToFloat(queryKeys[current * kHeadDim + d]);
+          }
+          score = dot * kScale;
         }
-        score = dot * kScale;
       } else if (key >= hiddenPrefix) {
         const uint32_t slot = (commonStart + key) % kRing;
         double dot = 0.0;
@@ -159,7 +163,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths,
-             uint32_t rows = kRows) {
+             uint32_t rows = kRows, bool causal = false) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kRing * kHeadDim;
   const auto plan = DraftAttention::plan(shape, lanes, rows);
@@ -200,7 +204,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   CommandGraph graph;
   DraftAttention::addDecode(graph,
       {queries, keys, values, queryKeys, queryValues},
-      std::span(cacheLengths).first(lanes), plan);
+      std::span(cacheLengths).first(lanes), plan, causal);
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads * (rows / 8) &&
@@ -241,7 +245,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * rows * kHeadDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * rows,
-          cacheLengths[lane], rows, reference);
+          cacheLengths[lane], rows, reference, causal);
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const float actual = tuning::bf16ToFloat(output[queryOffset + index]);
         const float expected = reference[index];
@@ -780,6 +784,15 @@ int main(int argc, char **argv) {
       runCase(backend, 1, shape, {512, 0, 0, 0}, 8);
       runCase(backend, 2, shape, {512, 513, 0, 0}, 8);
       runCase(backend, 4, shape, {262137, 4094, 500, 6143}, 8);
+      // The DSpline layers' causal block attention: block keys masked past
+      // each row's own position, context keys unmasked within the window —
+      // over an empty ring, a short prefix, a wrap and a full window.
+      runCase(backend, 1, shape, {0, 0, 0, 0}, kRows, true);
+      runCase(backend, 1, shape, {81, 0, 0, 0}, kRows, true);
+      runCase(backend, 2, shape, {2048, 2047, 0, 0}, kRows, true);
+      runCase(backend, 4, shape, {262137, 4094, 500, 6143}, kRows, true);
+      runCase(backend, 4, shape, {2046, 2049, 4095, 4096}, kRows, true);
+      runCase(backend, 1, shape, {512, 0, 0, 0}, 8, true);
     }
     // The Gemma 4 DFlash draft geometry: a plain draft (no convolutions) of
     // hidden 2816 over the shared 32x8x128 head pattern.

@@ -65,6 +65,10 @@ struct ModelFamilyRegistration {
   ModelDescriptor (*makeDescriptor)(std::string name);
   DFlashDraftLayout (*draftLayout)();
   DFlashDraftLayout (*dflashV1Layout)();
+  // The family's DSpline draft layout (Tencent's DSpine — a plain
+  // "DFlashDraftModel" config carrying dflash_config.selected_prefix_
+  // code_bridge), null where the family has none.
+  DFlashDraftLayout (*dsplineLayout)() = nullptr;
   // The family's check of the source's resolved text object (the config's
   // own fields or its text_config): inspectSourceModel runs it right after
   // makeDescriptor, before the record's target_format resolves. Null for a

@@ -1,9 +1,11 @@
 #include "engine/Engine.hpp"
+#include "AwakeClock.hpp"
 #include "Env.hpp"
 #include "TestConfig.hpp"
 #include "Tuning.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -14,6 +16,12 @@ namespace richengine::engine {
 namespace {
 
 constexpr double kResourceRetryBackoffMilliseconds = 100.0;
+// One allocate() pass's reclaim budget. The attempt–reclaim loop runs inside
+// prepare() and trySubmitAheadDecode — inside the GPU-idle gap a decode step
+// has to submit in — so under sustained refusals it would hold the engine
+// thread for as long as victims remain. A pass that spends this much leaves
+// the rest to the caller's next retry, reported as pending memory.
+constexpr double kReclaimSliceMilliseconds = 3.0;
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
@@ -1681,7 +1689,18 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
   Allocation<Admission> result{tryOnce(), {}};
   Admission &admission = result.admission;
   Denial &denial = result.denial;
+  // Reclaim work is bounded per pass: each step the slice pays for still
+  // runs to completion, but once it is spent the unclaimed remainder defers
+  // as pending rather than block the loop's next command.
+  const auto reclaimDeadline = AwakeClock::now() +
+      std::chrono::duration_cast<AwakeClock::duration>(
+          std::chrono::duration<double, std::milli>(kReclaimSliceMilliseconds));
   while (memoryDenied(admission)) {
+    if (AwakeClock::now() >= reclaimDeadline) {
+      denial.allocationFailure = admission.allocationFailure;
+      denial.pending = true;
+      break;
+    }
     const bool paused =
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     CacheReclaimResult reclaimed;

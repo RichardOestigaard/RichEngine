@@ -5,6 +5,7 @@
 #include "model/DFlashTwoDraft.hpp"
 #include "model/DSparkDraft.hpp"
 #include "model/DFlashV1Draft.hpp"
+#include "model/DSplineDraft.hpp"
 
 #include <string>
 #include <utility>
@@ -119,6 +120,35 @@ Image dsparkModelImage(const DFlashDraftLayout &layout) {
   return result;
 }
 
+// The DSpline draft's model.bin: the plain draft's fc and norms, then the
+// selected-prefix code bridge's tensors, bf16 as stored, and the four
+// I64 format sentinels the loader checks. Section order is the read order
+// of DSplineDraft.cpp's readDraft.
+Image dsplineModelImage(const DFlashDraftLayout &layout) {
+  Image result = affine::image("model.bin", kDSplineDraftMagic, layout.layers, 1);
+  const std::string bridge = "selected_prefix_bridge.";
+  quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
+  copy(result, "hidden_norm.weight", {layout.hiddenSize});
+  copy(result, "norm.weight", {layout.hiddenSize});
+  copy(result, bridge + "codebook", {layout.vocabularySize, layout.bridgeCodeSize});
+  copy(result, bridge + "early_read_weights",
+       {layout.layers - 1, layout.bridgeCodeSize, layout.hiddenSize});
+  copy(result, bridge + "read_weight", {layout.bridgeCodeSize, layout.hiddenSize});
+  copy(result, bridge + "feature_write_weights",
+       {layout.layers, layout.hiddenSize, layout.bridgeRank});
+  copy(result, bridge + "gate.weight", {layout.bridgeRank, layout.bridgeCodeSize});
+  copy(result, bridge + "predecessor_gate.weight",
+       {layout.bridgeRank, layout.bridgeCodeSize});
+  copy(result, bridge + "prev.weight", {layout.bridgeRank, layout.bridgeCodeSize});
+  copy(result, bridge + "gate.bias", {layout.bridgeRank});
+  copy(result, bridge + "out.weight", {layout.bridgeCodeSize, layout.bridgeRank});
+  copy(result, bridge + "independent_write_version", {}, "I64");
+  copy(result, bridge + "terminal_disabled_version", {}, "I64");
+  copy(result, "draft_block_causal_version", {}, "I64");
+  copy(result, "last_write_refine_version", {}, "I64");
+  return result;
+}
+
 } // namespace
 
 std::vector<Image> draftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -188,6 +218,32 @@ WeightFile DSparkCheckpointLoader::layer(uint32_t index) {
   return images_.load(affine::imagePlan(planned_, index, "draft"));
 }
 WeightFile DSparkCheckpointLoader::model() {
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+}
+
+std::vector<Image> dsplineDraftCheckpointImages(const DFlashDraftLayout &layout) {
+  std::vector<Image> result;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    Image layerImage = dflashV1LayerImage(layout, layer);
+    layerImage.magic = std::string(kDSplineDraftMagic);
+    result.push_back(std::move(layerImage));
+  }
+  result.push_back(dsplineModelImage(layout));
+  return result;
+}
+
+DSplineCheckpointLoader::DSplineCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                                               const DFlashDraftLayout &layout)
+    : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
+  planned_->images = affine::blockImages(dsplineDraftCheckpointImages(layout));
+  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+}
+DSplineCheckpointLoader::~DSplineCheckpointLoader() = default;
+WeightFile DSplineCheckpointLoader::layer(uint32_t index) {
+  if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
+  return images_.load(affine::imagePlan(planned_, index, "draft"));
+}
+WeightFile DSplineCheckpointLoader::model() {
   return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
 }
 

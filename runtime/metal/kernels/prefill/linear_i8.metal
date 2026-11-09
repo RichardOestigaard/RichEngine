@@ -9,8 +9,11 @@
 //   y = s_w * (s*I + lo*C) + b_w * Jx
 // where I = sum(q*c) is the integer accumulation, C the weight column's code
 // sum (the group's 64 nibbles, computed per tile in threadgroup memory), b_w
-// the group bias and Jx = s*sum(q) + 64*lo the group's dequantized input
-// sum. The result is not bit-identical to the bf16 path.
+// the group bias and Jx the group's input sum — taken from the same
+// precomputed bf16 input sums the q4 prefill kernels read, so the bias term
+// is bitwise identical to the bf16 path's. The s*I + lo*C term still
+// evaluates the quantized activations: the result is not bit-identical to
+// the bf16 path.
 
 constant constexpr ushort kI8Group = 64;
 
@@ -24,7 +27,7 @@ struct I8GroupParams {
 
 // Quantize a 32-row tile's 64-input groups into two split terms: hi covers
 // [lo, hi] of the group's inputs, lo covers the hi term's signed residual
-// (offset -rmax, scale rmax/255).
+// (offset -rmax, scale 2*rmax/255).
 kernel void prefill_linear_i8_quant(
     device const bfloat *input [[buffer(0)]],
     device uchar *codes_hi [[buffer(1)]], device uchar *codes_lo [[buffer(2)]],
@@ -59,10 +62,11 @@ kernel void prefill_linear_i8_quant(
         r[i] = v[i] - (q * s1 + lo);
         rmax = max(rmax, abs(r[i]));
       }
-      // Residual term: r in [-rmax, rmax] quantizes to [0,255] with offset
-      // -rmax; Jx = s2*sum(q2) - 64*rmax = sum(r) estimate. One packed
-      // record: (s1, s2, lo + -rmax, Jx1 + Jx2).
-      const float s2 = max(rmax / 255.0f, 1e-12f);
+      // Residual term: r + rmax in [0, 2*rmax] quantizes to [0,255] with
+      // offset -rmax (s2 = 2*rmax/255; rmax/255 would clamp every positive
+      // residual at 255 and lose it); Jx = s2*sum(q2) - 64*rmax = sum(r)
+      // estimate. One packed record: (s1, s2, lo + -rmax, Jx1 + Jx2).
+      const float s2 = max(2.0f * rmax / 255.0f, 1e-12f);
       const float rcp2 = 1.0f / s2;
       float j2 = 0.0f;
 #pragma unroll
@@ -86,7 +90,8 @@ __attribute__((always_inline)) inline void i8_prefill(
     device uchar *codes_hi, device uchar *codes_lo,
     device const I8GroupParams *params_hi, device uchar *weights,
     device bfloat *scales, device bfloat *biases, device bfloat *auxiliary,
-    device bfloat *output, device float *output_sums, uint output_size,
+    device bfloat *output, device float *output_sums,
+    device const float *input_sums, uint output_size,
     uint input_size, uint2 group, uint simd_lane, uint simd_group,
     threadgroup float *tg_c) {
   constexpr ushort TileM = 32;
@@ -96,6 +101,7 @@ __attribute__((always_inline)) inline void i8_prefill(
   codes_hi += row0 * input_size;
   codes_lo += row0 * input_size;
   params_hi += row0 * quant_groups;
+  input_sums += row0 * quant_groups;
   auto a_hi = tensor(codes_hi, dextents<int, 2>{int(input_size), TileM},
                      array<int, 2>{1, int(input_size)});
   auto a_lo = tensor(codes_lo, dextents<int, 2>{int(input_size), TileM},
@@ -162,7 +168,8 @@ __attribute__((always_inline)) inline void i8_prefill(
       const float sw = float(scales[parameter]);
       const float bw = float(biases[parameter]);
       acc[i] += sw * (pa.s1 * float(part_hi[i]) + pa.s2 * float(part_lo[i])) +
-                pa.offSum * sw * tg_c[col] + pa.jxSum * bw;
+                pa.offSum * sw * tg_c[col] +
+                input_sums[row * quant_groups + quant_group] * bw;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -202,8 +209,10 @@ __attribute__((always_inline)) inline void i8_prefill(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Bindings: codes_hi/codes_lo (0-1), params_hi/params_lo (2-3), weights,
-// scales, biases (4-6), then per-epilogue auxiliary/output/output_sums.
+// Bindings: codes_hi/codes_lo (0-1), params_hi (2), weights, scales, biases
+// (3-5), then per-epilogue auxiliary/output/output_sums (6-8), the dispatch
+// parameters (9) and the input's precomputed group sums (10), the same
+// buffer the q4 prefill tiles read.
 #define PREFILL_I8(Name, Residual_, UpSilu_)                                 \
   kernel void Name(device uchar *codes_hi [[buffer(0)]],                     \
                    device uchar *codes_lo [[buffer(1)]],                     \
@@ -215,13 +224,14 @@ __attribute__((always_inline)) inline void i8_prefill(
                    device bfloat *output [[buffer(7)]],                      \
                    device float *output_sums [[buffer(8)]],                  \
                    constant Q4Params &params [[buffer(9)]],                 \
+                   device const float *input_sums [[buffer(10)]],            \
                    uint2 group [[threadgroup_position_in_grid]],             \
                    uint simd_lane [[thread_index_in_simdgroup]],             \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {     \
     threadgroup float tg_c[256];                                             \
     i8_prefill<256, Residual_, UpSilu_>(                                     \
         codes_hi, codes_lo, params_hi, weights, scales, biases,           \
-        auxiliary, output, output_sums, params.output_size,                  \
+        auxiliary, output, output_sums, input_sums, params.output_size,      \
         params.input_size, group, simd_lane, simd_group, tg_c);              \
   }
 PREFILL_I8(prefill_linear_i8_n256, false, false)

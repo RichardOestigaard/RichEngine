@@ -5,6 +5,7 @@
 #include "DFlashTwoDraft.hpp"
 #include "DSparkDraft.hpp"
 #include "DFlashV1Draft.hpp"
+#include "DSplineDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "TargetWeights.hpp"
 #include "QwenVision.hpp"
@@ -24,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -37,7 +39,7 @@ class CompositeStateStorage;
 
 using DraftWeights =
     std::variant<NullDraftWeights, DFlashDraftWeights, DFlashV1DraftWeights,
-                 DSparkDraftWeights>;
+                 DSparkDraftWeights, DSplineDraftWeights>;
 
 // The vision tower's weights, whichever tower the model serves; the default
 // alternative is the empty Qwen weights a text-only model carries.
@@ -83,7 +85,18 @@ struct ModelPackage final {
   }
   [[nodiscard]] uint64_t draftActualAllocatedBytes() const noexcept {
     return std::visit([](const auto &weights) {
-      return weights.actualAllocatedBytes;
+      uint64_t bytes = weights.actualAllocatedBytes;
+      if constexpr (std::is_same_v<decltype(weights),
+                                   const DSplineDraftWeights &>) {
+        // The serial refinement's persistent TSV/TG tables are backend
+        // buffers built after the loader's allocation snapshot
+        // (DSplineDraft.cpp buildSerialTables), so the package counts them
+        // here beside the draft's images, as modelWeightBytes plans them.
+        // Empty buffers — the plain-walk fallback — add nothing.
+        bytes += weights.serialTsv.allocatedBytes() +
+                 weights.serialTg.allocatedBytes();
+      }
+      return bytes;
     }, draft);
   }
   [[nodiscard]] const std::string &targetManifestFingerprint() const noexcept {

@@ -811,11 +811,22 @@ def _draft_files(repo, family):
             f" ({error})"
         ) from error
     config = models.read_json(repo.file("config.json"))
-    differences = [
-        f"{key} {_config_value(config, key)!r}, not {expected!r}"
-        for key, expected in family.draft.signature
-        if not _same(_config_value(config, key), expected)
-    ]
+    # The default draft's signature is checked first, then each declared
+    # alternate's (Qwen3.8-27B's DSpine next to its DFlash2): the first
+    # full match accepts; the default's differences name the error.
+    first = None
+    for candidate in family.draft.candidates:
+        differences = [
+            f"{key} {_config_value(config, key)!r}, not {expected!r}"
+            for key, expected in candidate.signature
+            if not _same(_config_value(config, key), expected)
+        ]
+        if first is None:
+            first = differences
+        if not differences:
+            break
+    else:
+        differences = first
     if differences:
         raise models.ModelError(
             f"draft configuration is incompatible with {family.name}: "

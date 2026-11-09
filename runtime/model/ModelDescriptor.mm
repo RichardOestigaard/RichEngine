@@ -5,6 +5,7 @@
 #include "DFlashTwoDraft.hpp"
 #include "DSparkDraft.hpp"
 #include "DFlashV1Draft.hpp"
+#include "DSplineDraft.hpp"
 #include "QwenVision.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -332,6 +333,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
   switch (draft.kind) {
   case DraftKind::DFlashV1: return kDFlashV1DraftMagic;
   case DraftKind::DSpark: return kDSparkDraftMagic;
+  case DraftKind::DSpline: return kDSplineDraftMagic;
   default: return kDFlashLayerMagic;
   }
 }
@@ -346,6 +348,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
   switch (draft.kind) {
   case DraftKind::DFlashV1: return "DFlashDraftModel";
   case DraftKind::DSpark: return "Qwen3DSparkModel";
+  case DraftKind::DSpline: return "DFlashDraftModel";
   default: return "DFlash2DraftModel";
   }
 }
@@ -938,6 +941,13 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       ? std::string(static_cast<NSString *>(architectures[0]).UTF8String) : "";
   const bool dflashV1Draft = draftArch == "DFlashDraftModel";
   const bool dsparkDraft = isDSparkArchitecture(draftArch);
+  // A DSpine checkpoint spells the same DFlashDraftModel architecture as a
+  // plain draft; its dflash_config's selected-prefix code bridge names it.
+  NSDictionary *dspineFlash = draft[@"dflash_config"];
+  const bool dspineDraft =
+      dflashV1Draft && [dspineFlash isKindOfClass:[NSDictionary class]] &&
+      [static_cast<NSDictionary *>(dspineFlash)
+           objectForKey:@"selected_prefix_code_bridge"] != nil;
   if (!dflashV1Draft && !dsparkDraft && draftArch != "DFlash2DraftModel")
     throw std::invalid_argument("draft is not a DFlash, DFlash2 or DSpark model");
   DFlashDraftLayout d = result.draft;
@@ -970,8 +980,21 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     // The plain transformer draft: the layout is read from the config.
     // The compiled attention core fixes the head pattern at 32 x 8 x 128
     // over a 6144-wide fused QKV (DraftAttention.cpp's kernel shapes).
-    d = {};
-    d.kind = DraftKind::DFlashV1;
+    if (dspineDraft) {
+      // The family registers the DSpline layout its taps were trained
+      // with; the config's own fields are checked against it below.
+      const ModelFamilyRegistration *draftFamily =
+          findModelFamily(result.family);
+      d = draftFamily && draftFamily->dsplineLayout
+              ? draftFamily->dsplineLayout()
+              : DFlashDraftLayout{};
+      if (d.kind != DraftKind::DSpline)
+        throw std::invalid_argument(
+            "this family declares no DSpline draft layout");
+    } else {
+      d = {};
+      d.kind = DraftKind::DFlashV1;
+    }
     // No dynamic convolutions or candidate selector exist in this format.
     d.dynamicSize = 0;
     d.selectorRank = 0;
@@ -1022,6 +1045,13 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       const uint32_t all = (uint32_t{1} << d.layers) - 1;
       d.causalLayers = [causalFlag boolValue] ? all : 0;
     }
+    // A DSpine draft trains every layer causal inside the block
+    // (dflash_config.draft_block_causal): a full-attention layer would be
+    // untrained.
+    if (dspineDraft &&
+        d.causalLayers != (uint32_t{1} << d.layers) - 1)
+      throw std::invalid_argument(
+          "a DSpline draft needs every layer sliding and causal");
     d.headCore = draftHeadCoreFor(heads, kvHeads, headDim, d.ropeInterleaved);
     d.contextCore = draftContextCoreFor(d.hiddenSize, d.dynamicSize);
     // Gemma 4's draft shares its target's logit softcap; other families'
@@ -1150,8 +1180,12 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       flash = requireObject(draft, @"dflash_config", "draft configuration");
   }
   if (dflashV1Draft) {
+    // A DSpine draft states its block size at the root, a plain draft
+    // inside dflash_config.
     const uint64_t blockSize =
-        requireUnsigned(flash, @"block_size", "draft block_size");
+        dspineDraft
+            ? requireUnsigned(draft, @"block_size", "draft block_size")
+            : requireUnsigned(flash, @"block_size", "draft block_size");
     // The runtime dispatches the draft's verifyRows query rows: a shorter
     // trained block verifies exactly its own rows.
     if (blockSize < 2)
@@ -1183,6 +1217,99 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     result.draft.blockSize = d.blockSize;
     requireGeometryNumbers(flash, {{"conv_group_size", 16},
         {"conv_kernel_size", 2}, {"selector_rank", d.selectorRank}, {"selector_top_k", 16}});
+  }
+  if (dspineDraft) {
+    // The selected-prefix code bridge: independent learned writes after
+    // the listed layers, serial decode, no terminal write. The teacher
+    // schedule fields are training-time and unchecked.
+    requireBooleans(flash, "draft dflash_config",
+                    {{"selected_prefix_feature_writes", true},
+                     {"selected_prefix_terminal", false},
+                     {"draft_block_causal", true}});
+    requireEqual(requireString(flash, @"selected_prefix_feature_write_mode",
+                             "draft feature write mode"),
+                 "independent", "draft feature write mode");
+    requireEqual(requireString(flash, @"selected_prefix_decode_mode",
+                             "draft decode mode"),
+                 "serial", "draft decode mode");
+    NSDictionary *bridge = requireObject(
+        flash, @"selected_prefix_code_bridge", "draft code bridge");
+    d.bridgeCodeSize = static_cast<uint32_t>(
+        requireUnsigned(bridge, @"code_size", "draft bridge code_size"));
+    d.bridgeRank = static_cast<uint32_t>(
+        requireUnsigned(bridge, @"rank", "draft bridge rank"));
+    requireNumber(bridge[@"eps"], 1e-6, "draft bridge eps");
+    NSArray *featureLayers = requireArray(
+        flash, @"selected_prefix_feature_layers", "draft feature layers");
+    d.bridgeWriteLayers = 0;
+    for (id value : featureLayers) {
+      if (![value isKindOfClass:[NSNumber class]] ||
+          CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
+        throw std::invalid_argument("draft feature layer must be an integer");
+      const uint64_t index =
+          static_cast<NSNumber *>(value).unsignedLongLongValue;
+      if (!index || index > d.layers)
+        throw std::invalid_argument("draft feature layer out of range");
+      d.bridgeWriteLayers |= uint32_t{1} << (index - 1);
+    }
+    if (!(d.bridgeWriteLayers & (uint32_t{1} << (d.layers - 1))))
+      throw std::invalid_argument(
+          "a DSpline draft writes after its last layer");
+    // The serial last-write refinement's width: both spellings must agree
+    // (sglang's resolve_dspine_head_topk rule); the pass itself is
+    // deferred to the bridge kernels.
+    uint64_t headTopk = 0;
+    if (id second = draft[@"code_bridge_second_pass"];
+        [second isKindOfClass:[NSDictionary class]]) {
+      requireEqual(requireString(second, @"mode", "draft second-pass mode"),
+                   "serial_table", "draft second-pass mode");
+      requireEqual(requireUnsigned(second, @"first_exact",
+                                   "draft second-pass first_exact"),
+                   uint64_t{d.layers - 1}, "draft second-pass first_exact");
+      headTopk =
+          requireUnsigned(second, @"head_topk", "draft second-pass head_topk");
+    }
+    if (id refine = flash[@"selected_prefix_last_write_refine"];
+        [refine isKindOfClass:[NSDictionary class]]) {
+      requireEqual(requireString(refine, @"kind", "draft refine kind"),
+                   "exact_sender", "draft refine kind");
+      const uint64_t refineTopk =
+          requireUnsigned(refine, @"head_topk", "draft refine head_topk");
+      if (headTopk && headTopk != refineTopk)
+        throw std::invalid_argument("draft refinement widths disagree");
+      headTopk = refineTopk;
+    }
+    if (!headTopk || headTopk > 64 || (headTopk & (headTopk - 1)))
+      throw std::invalid_argument(
+          "draft head_topk must be a power of two in [2, 64]");
+    d.bridgeHeadTopk = static_cast<uint32_t>(headTopk);
+    if (draft[@"num_target_layers"]) {
+      requireEqual(requireUnsigned(draft, @"num_target_layers",
+                                   "draft num_target_layers"),
+                   result.target.layers, "draft num_target_layers");
+    }
+    // A DSpine draft taps other target layers than the family's primary
+    // draft; the descriptor's capture set follows the checkpoint's
+    // declared target_layer_ids (the shared check below then re-verifies
+    // them against the target).
+    NSArray *taps =
+        requireArray(flash, @"target_layer_ids", "draft target layers");
+    if (!taps.count || taps.count > result.target.hiddenCaptureLayers.size())
+      throw std::invalid_argument("draft target layer count out of range");
+    result.target.captureLayerCount = static_cast<uint32_t>(taps.count);
+    for (NSUInteger i = 0; i < taps.count; ++i) {
+      id value = taps[i];
+      if (![value isKindOfClass:[NSNumber class]] ||
+          CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
+        throw std::invalid_argument("draft target layer must be an integer");
+      const uint64_t layer =
+          static_cast<NSNumber *>(value).unsignedLongLongValue;
+      if (layer >= result.target.layers)
+        throw std::invalid_argument("draft target layer out of range");
+      result.target.hiddenCaptureLayers[i] = static_cast<uint32_t>(layer);
+    }
+    d.targetHiddenSize = static_cast<uint32_t>(taps.count *
+                                             result.target.hiddenSize);
   }
   NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
   {

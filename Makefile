@@ -392,6 +392,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashTwo16width.cpp \
 	runtime/model/DSparkDraft.cpp \
 	runtime/model/DFlashV1Draft.cpp \
+	runtime/model/DSplineDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelRegistry.cpp \
 	runtime/model/SlotFile.cpp \

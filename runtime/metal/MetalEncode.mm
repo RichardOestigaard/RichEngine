@@ -704,11 +704,12 @@ bool MetalBackend::Impl::useMtl4() const noexcept {
                 const BytesBinding &bound = dispatch.bytes[binding];
                 const BakedSpan::BytesSnapshot &saved =
                     snapshot.bytes[binding];
+                // Payload contents never take part: every bytes binding is
+                // restaged into the span's parameter arena on replay, so a
+                // payload change never re-bakes (the same rule the gpu span
+                // match applies).
                 if (saved.index != bound.index ||
-                    saved.sizeBytes != bound.sizeBytes ||
-                    (!snapshot.patchableBytes &&
-                     std::memcmp(saved.data.data(), bound.data,
-                                 bound.sizeBytes) != 0)) {
+                    saved.sizeBytes != bound.sizeBytes) {
                     return false;
                 }
             }
@@ -797,14 +798,8 @@ MetalBackend::Impl::spanBarrierPlan(std::span<const ComputeDispatch> run) {
                      view.offsetBytes, view.lengthBytes});
             }
             for (const BytesBinding &binding : dispatch.bytes) {
-                BakedSpan::BytesSnapshot saved{binding.index, {}, cursor,
-                                               binding.sizeBytes};
-                if (!dispatch.patchableBytes) {
-                    saved.data.resize(binding.sizeBytes);
-                    std::memcpy(saved.data.data(), binding.data,
-                                binding.sizeBytes);
-                }
-                snapshot.bytes.push_back(std::move(saved));
+                snapshot.bytes.push_back({binding.index, {}, cursor,
+                                          binding.sizeBytes});
                 cursor += (binding.sizeBytes + 255) & ~uint64_t{255};
             }
             span->dispatches.push_back(std::move(snapshot));
@@ -913,11 +908,12 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
     }
 }
 
-// Rewrites a span's staged parameters from the run's current patchable
-    // payloads: the indirect commands bind the parameter arena by address,
-    // so the same commands replay with the new parameters. The arena is the
-    // submission's parity bank: the only command that can still be reading
-    // an arena is the one two submissions back, which used the other bank.
+// Restages every bytes payload of the run into the span's parameter
+    // arena: the indirect commands bind the arena by address, so only
+    // contents change — the same contract a gpu span's params arena keeps.
+    // The arena is the submission's parity bank: the only command that can
+    // still be reading an arena is the one two submissions back, which used
+    // the other bank.
     void MetalBackend::Impl::patchSpanParams(const BakedSpan &span,
                                 std::span<const PreparedDispatch> run,
                                 uint32_t bank) {
@@ -926,7 +922,6 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
         auto *contents = static_cast<uint8_t *>(allocation->buffer.contents);
         for (size_t i = 0; i < run.size(); ++i) {
             const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
-            if (!snapshot.patchableBytes) continue;
             const ComputeDispatch &dispatch = *run[i].source;
             for (size_t binding = 0; binding < snapshot.bytes.size();
                  ++binding)
@@ -1216,7 +1211,7 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
             if (!baked) return nullptr;
             baked->touched = ++bakedClock;
             slots.push_back(baked);
-            if (slots.size() > 2) {
+            if (slots.size() > 4) {
                 const auto stale = std::min_element(
                     slots.begin(), slots.end(),
                     [](const auto &left, const auto &right) {
@@ -1275,7 +1270,7 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
             auto baked = bakeSpan(run);
             baked->touched = ++bakedClock;
             slots.push_back(baked);
-            if (slots.size() > 2) {
+            if (slots.size() > 4) {
                 const auto stale = std::min_element(
                     slots.begin(), slots.end(),
                     [](const auto &left, const auto &right) {
@@ -1549,11 +1544,12 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                 const BytesBinding &bound = dispatch.bytes[binding];
                 const CachedCommand::BytesSnapshot &saved =
                     snapshot.bytes[binding];
+                // Payload contents never take part: a span-covered
+                // dispatch's bytes restage into the span's parameter arena
+                // on replay, and a direct one binds its current bytes at
+                // encode — so a payload change never re-prepares.
                 if (saved.index != bound.index ||
-                    saved.sizeBytes != bound.sizeBytes ||
-                    (dispatch.bakeable && !dispatch.patchableBytes &&
-                     std::memcmp(saved.data.data(), bound.data,
-                                 bound.sizeBytes) != 0)) {
+                    saved.sizeBytes != bound.sizeBytes) {
                     return false;
                 }
             }
@@ -1592,16 +1588,9 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
                      view.offsetBytes, view.lengthBytes});
             }
             for (const BytesBinding &binding : dispatch.bytes) {
-                CachedCommand::BytesSnapshot saved{binding.index,
-                                                   binding.sizeBytes, {}};
-                if (dispatch.bakeable && !dispatch.patchableBytes) {
-                    saved.data.resize(binding.sizeBytes);
-                    std::memcpy(saved.data.data(), binding.data,
-                                binding.sizeBytes);
-                }
-                snapshot.bytes.push_back(std::move(saved));
+                snapshot.bytes.push_back(
+                    {binding.index, binding.sizeBytes, {}});
             }
-            cached->boundBuffers += dispatch.buffers.size();
             cached->dispatches.push_back(std::move(snapshot));
         }
         cached->prepared = command.ownedDispatches;
@@ -1612,6 +1601,9 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         for (PreparedDispatch &item : cached->prepared) item.source = nullptr;
         cached->spanRefs = command.spanRefs;
         cached->gpuSpanRefs = command.gpuSpanRefs;
+        cached->retainedAllocations.assign(
+            command.retainedAllocations.begin(),
+            command.retainedAllocations.end());
         cached->touched = ++bakedClock;
         return cached;
     }
@@ -1650,33 +1642,37 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             PreparedCommand command;
             command.dispatches = candidate->prepared;
             command.barrierPlan = &candidate->barrierPlan;
+            // The match proved every bound allocation identical to the
+            // snapshot's — the retained set is the same, arenas included.
+            // Cached weak so a held shape never pins its run's buffers;
+            // the same match keeps every member alive here (bound views
+            // hold theirs, the spanRefs hold the arenas).
             command.retainedAllocations.reserve(
-                candidate->boundBuffers + 2 * candidate->spanRefs.size() +
-                6 * candidate->gpuSpanRefs.size());
-            retainBound(dispatches, command.retainedAllocations);
-            for (const auto &span : candidate->spanRefs)
-                for (const auto &arena : span->paramsAllocation)
-                    if (arena) command.retainedAllocations.push_back(arena);
-            for (const auto &span : candidate->gpuSpanRefs) {
-                for (uint32_t b = 0; b < 2; ++b) {
-                    if (span->argsAllocation[b])
-                        command.retainedAllocations.push_back(
-                            span->argsAllocation[b]);
-                    if (span->descAllocation[b])
-                        command.retainedAllocations.push_back(
-                            span->descAllocation[b]);
-                    if (span->paramsAllocation[b])
-                        command.retainedAllocations.push_back(
-                            span->paramsAllocation[b]);
+                candidate->retainedAllocations.size());
+            for (const std::weak_ptr<MetalAllocation> &saved :
+                 candidate->retainedAllocations) {
+                std::shared_ptr<MetalAllocation> allocation = saved.lock();
+                if (!allocation) {
+                    // Unreachable by the match's identity checks, but a
+                    // short retained set risks the GPU reading freed
+                    // memory: re-prepare rather than under-retain.
+                    return prepare(dispatches);
                 }
+                command.retainedAllocations.push_back(
+                    std::move(allocation));
             }
+            // The prepared list names the same spans the candidate keeps
+            // alive: a dropped command's replay plan reads them through
+            // this command.
+            command.spanRefs = candidate->spanRefs;
+            command.gpuSpanRefs = candidate->gpuSpanRefs;
             return command;
         }
         PreparedCommand command = prepare(dispatches);
         auto cached = snapshotCommand(dispatches, command);
         command.barrierPlan = &cached->barrierPlan;
         slots.push_back(std::move(cached));
-        if (slots.size() > 2) {
+        if (slots.size() > 4) {
             const auto stale = std::min_element(
                 slots.begin(), slots.end(),
                 [](const auto &left, const auto &right) {

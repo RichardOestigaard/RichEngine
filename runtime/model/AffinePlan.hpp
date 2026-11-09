@@ -35,14 +35,22 @@ inline void append(Image &image, Section section) {
 }
 
 // A tensor copied as stored, BF16 or U32 (F32 too — LFM3's narrow
-// gate_proj rides unquantized).
+// gate_proj rides unquantized); I64/U64/F64 land their 8-byte elements
+// (the DSpline checkpoint's format-version scalars). A BF16 copy also
+// takes an F16 source — the fp16 oMLX checkpoints hold the float tensors
+// F16 — which the writer narrows to the bf16 the image format keeps.
 inline void copy(Image &image, const std::string &name, std::vector<uint64_t> shape,
                  const std::string &dtype = "BF16") {
   Section section;
-  section.bytes = dtype == "BF16" ? kBFloat16Bytes : 4;
+  section.bytes = dtype == "BF16" || dtype == "F16" ? kBFloat16Bytes
+                  : (dtype == "I64" || dtype == "U64" || dtype == "F64") ? 8
+                                                                        : 4;
   for (uint64_t dimension : shape)
     section.bytes = checkedMultiply<WeightStoreError>(section.bytes, dimension, "affine tensor");
-  section.input = {name, {dtype}, std::move(shape)};
+  section.input = {name,
+                   dtype == "BF16" ? std::vector<std::string>{"BF16", "F16"}
+                                   : std::vector<std::string>{dtype},
+                   std::move(shape)};
   append(image, std::move(section));
 }
 
