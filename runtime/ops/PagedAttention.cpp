@@ -22,13 +22,35 @@ namespace {
          metal::CommandGraph::kDefaultThreads;
 }
 
-// Each query tile's history splits: the maximum shared out over the chunk's
-// tiles, at least one. RICHENGINE_PREFILL_SPLITS_MAX lowers the maximum —
-// the workspace sizes to the same count, and the shader contract's baked
-// bound still admits it.
-[[nodiscard]] inline uint32_t prefillSplits(uint32_t tiles) {
+// The fewest history splits of a chunk's `tiles` query tiles: the maximum
+// shared out over them (all a short history takes). RICHENGINE_PREFILL_SPLITS_MAX
+// lowers the maximum — the workspace sizes to the same count, and the shader
+// contract's baked bound still admits it.
+[[nodiscard]] inline uint32_t sharedPrefillSplits(uint32_t tiles) {
   const uint32_t maximum = tuning().prefillSplitsMax;
   return std::clamp(maximum / tiles, 1u, maximum);
+}
+// The most: the maximum, nor over all the tiles more than the longest
+// chunk's tiles, whose partials the prefill workspace holds (upstream
+// mostSplits; the tiles-times-splits product stays within the workspace's).
+[[nodiscard]] inline uint32_t mostPrefillSplits(uint32_t tiles) {
+  const uint32_t ceiling =
+      kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);
+  return std::clamp(ceiling / tiles, sharedPrefillSplits(tiles),
+                    tuning().prefillSplitsMax);
+}
+// Each query tile's history splits: one per `pagesPerSplit` pages the chunk
+// reads, between the shared and the most (upstream prefillSplits, whose
+// pages-per-split the fork measures near 128 on the neural accelerators);
+// pagesPerSplit 0 keeps the shared splits at every history — the policy
+// before the history term, which sparse, DuoAttention and windowed layouts
+// keep regardless (their kernels were measured only at the shared count).
+[[nodiscard]] inline uint32_t prefillSplits(uint32_t tiles, uint64_t pages,
+                                            uint32_t pagesPerSplit) {
+  if (!pagesPerSplit) return sharedPrefillSplits(tiles);
+  return static_cast<uint32_t>(std::clamp<uint64_t>(
+      pages / pagesPerSplit, sharedPrefillSplits(tiles),
+      mostPrefillSplits(tiles)));
 }
 
 // Partials (bf16 on the bus) and statistics of `rows` fused rows of
@@ -213,10 +235,14 @@ using KernelLayout = kv::Core;
 }
 
 // The kernel of `stem` for `format` at `layout`, with the layout suffix
-// before any trailing tag ("split"/"store"/"_f32" style).
+// before any trailing tag ("split"/"store"/"_f32" style). int8Queries
+// swaps the format tag for q8q — INT8 queries against INT8 keys; the
+// caller's gate keeps it off every non-INT8 or non-dense layout.
 [[nodiscard]] std::string splitKernel(std::string_view stem, kv::Format format,
-                                      KernelLayout layout) {
-  return std::string(stem) + "_" + formatTag(format) + "_split" +
+                                      KernelLayout layout,
+                                      bool int8Queries = false) {
+  return std::string(stem) + "_" +
+         (int8Queries ? "q8q" : formatTag(format)) + "_split" +
          std::string(kernelSuffix(layout));
 }
 
@@ -243,10 +269,14 @@ using KernelLayout = kv::Core;
 // gemmaSplitKernel, every other layout through splitKernel. A tree lane's
 // scratch doubles the fused rows, so the Group-8 layouts' 128-row tile
 // overflows threadgroup memory and they take the two-pass _m2 variants.
+// int8Queries reaches only the plain splitKernel branch — the Gemma and
+// windowed (_swa) names have no q8q kernels, so the callers' gate keeps
+// the flag off those layouts.
 [[nodiscard]] std::string splitPipeline(std::string_view stem,
                                         const kv::Layout &layout,
                                         KernelLayout kernel,
-                                        bool chainR2 = false) {
+                                        bool chainR2 = false, bool duo = false,
+                                        bool int8Queries = false) {
   if (kernel == KernelLayout::GemmaKv8H256 ||
       kernel == KernelLayout::GemmaKv2H512)
     return gemmaSplitKernel(stem, layout.format, kernel, layout.windowTokens);
@@ -257,11 +287,16 @@ using KernelLayout = kv::Core;
       layout.windowTokens
           ? std::string(stem) + "_" + formatTag(layout.format) +
                 "_split_swa" + std::string(kernelSuffix(kernel))
-          : splitKernel(stem, layout.format, kernel);
+          : splitKernel(stem, layout.format, kernel, int8Queries);
   if (stem == kVerifyTreeAttention && !layout.windowTokens &&
       (kernel == KernelLayout::Kv2Group8 ||
        kernel == KernelLayout::Kv2Group8D128))
     name += "_m2";
+  // The DuoAttention _duo splits (kv4/g6, int8/int4): a streaming KV head's
+  // splits partition its sink-plus-window page range instead of the full
+  // history. The tag sits between the layout/variant suffixes and the _rP
+  // and _m8 tags the caller appends.
+  if (duo) name += "_duo";
   // The chain tile's fused M rows at 16 verify rows cap residency at one
   // threadgroup per core; the _rP splits run the tile's P fused-row passes
   // on P threadgroups at 1/P the footprint. kv4/g6's _r2 pair measured
@@ -343,8 +378,25 @@ void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
     throw std::invalid_argument("sparse attention requires int8 or bf16 pages");
 }
 
-[[nodiscard]] std::string reduceKernel(std::string_view stem, KernelLayout layout) {
-  return std::string(stem) + std::string(kernelSuffix(layout));
+[[nodiscard]] std::string reduceKernel(std::string_view stem,
+                                       KernelLayout layout, bool duo = false) {
+  return std::string(stem) + std::string(kernelSuffix(layout)) +
+         (duo ? "_duo" : "");
+}
+
+// Whether the layout's core compiles DuoAttention kernels: the kv4/g6 set
+// only, on int8 or packed-int4 pages, without a sliding window or block
+// lists of its own.
+void requireDuoLayout(const kv::Layout &layout, KernelLayout kernel,
+                      bool tree) {
+  if (tree)
+    throw std::invalid_argument("tree verify has no duo attention kernels");
+  if (kernel != KernelLayout::Kv4Group6)
+    throw std::invalid_argument("no duo attention kernel for layout");
+  if (layout.format != kv::Format::Int8 && layout.format != kv::Format::Int4)
+    throw std::invalid_argument("duo attention requires int8 or int4 pages");
+  if (layout.windowTokens)
+    throw std::invalid_argument("duo attention has no windowed kernels");
 }
 
 [[nodiscard]] std::string gateKernel(std::string_view stem, bool queryGate,
@@ -406,7 +458,7 @@ AttentionWorkspace PagedAttention::prefillWorkspace(uint32_t maximumRows, uint32
   // Allocation-time bound for every shorter sequence.
   uint64_t slots = 0;
   for (uint32_t tiles = 1; tiles <= kv::prefillAttentionTiles(maximumRows); ++tiles)
-    slots = std::max(slots, uint64_t{tiles} * prefillSplits(tiles));
+    slots = std::max(slots, uint64_t{tiles} * mostPrefillSplits(tiles));
   return attentionWorkspace(
       slots * kv::kPrefillAttentionTileRows * queryHeads,
       kernelLayoutHeadDim(kernelLayout));
@@ -425,30 +477,62 @@ AttentionWorkspace PagedAttention::verifyWorkspace(uint32_t lanes, uint32_t quer
 }
 
 PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHeads,
-                                                   kv::Layout layout, bool sparse) {
+                                                   kv::Layout layout, bool sparse,
+                                                   uint32_t committedTokens,
+                                                   uint32_t int8QueriesFromPages,
+                                                   uint32_t prefillPagesPerSplit) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows ||
       !kv::validFormat(layout.format))
     throw std::invalid_argument("invalid paged prefill attention geometry");
   if (sparse) requireSparseLayout(layout, kernelLayout);
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
-  const uint32_t splits = prefillSplits(tiles);
+  const bool duo = kv::duoEnabled(layout.duo);
+  if (duo) {
+    if (sparse)
+      throw std::invalid_argument("duo attention has no sparse kernels");
+    requireDuoLayout(layout, kernelLayout, false);
+  }
+  const uint64_t pages = (uint64_t{committedTokens} + rows +
+                          kv::kPageTokens - 1) /
+                         kv::kPageTokens;
+  // The history term of the splits: dense layouts only — sparse keeps the
+  // shared splits (its block lists read a few thousand tokens whatever the
+  // history), and DuoAttention and windowed layers keep them until their
+  // kernels are measured against it.
+  const uint32_t splits =
+      sparse || duo || layout.windowTokens
+          ? sharedPrefillSplits(tiles)
+          : prefillSplits(tiles, pages, prefillPagesPerSplit);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  // The q8q gate: the pages one split of the chunk's longest tile reads —
+  // verify applies the same per-split rule to its longest lane, and a
+  // short context never pays the query quantization. Only the dense INT8
+  // page loop qualifies: sparse, DuoAttention, windowed and the Gemma
+  // cores compile no q8q kernels and keep the bf16-query path.
+  const uint64_t splitReads = (pages + splits - 1) / splits;
+  const bool int8Queries =
+      int8QueriesFromPages != 0 && layout.format == kv::Format::Int8 &&
+      !sparse && !duo && !layout.windowTokens &&
+      kernelLayout != KernelLayout::GemmaKv8H256 &&
+      kernelLayout != KernelLayout::GemmaKv2H512 &&
+      splitReads >= int8QueriesFromPages;
   return {rows,
           splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              kernelLayoutHeadDim(kernelLayout)),
           sparse ? sparseSplitKernel(kPrefillAttention, layout.format, kernelLayout)
-                 : splitPipeline(kPrefillAttention, layout, kernelLayout),
+                 : splitPipeline(kPrefillAttention, layout, kernelLayout, false,
+                                 duo, int8Queries),
           sparse ? sparseReduceKernel(kPrefillAttention, kernelLayout)
-                 : reduceKernel(kPrefillAttentionReduce, kernelLayout),
+                 : reduceKernel(kPrefillAttentionReduce, kernelLayout, duo),
           {layout.kvHeads, tiles, splits},
           {layout.kvHeads, sparse ? kv::kSparseTileRows * (queryHeads / layout.kvHeads)
                                   : fusedRows,
            tiles},
           metal::DispatchSize{layout.headDimension, 1, 1},
-          layout.format, layout.scoreScale, layout.windowTokens, sparse};
+          layout.format, layout.scoreScale, layout.windowTokens, sparse, duo};
 }
 
 PrefillAttentionPlan
@@ -478,7 +562,7 @@ PagedAttention::prefillCanvasPlan(uint32_t rows, uint32_t queryHeads,
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, bool tree, uint32_t liveNodes,
-    uint32_t rowStride, bool sparse) {
+    uint32_t rowStride, bool sparse, uint32_t int8QueriesFromPages) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
   if (!kv::validFormat(layout.format))
     throw std::invalid_argument("paged attention requires a kv format");
@@ -487,6 +571,12 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   if (tree && sparse)
     throw std::invalid_argument("tree verify has no sparse kernels");
   if (sparse) requireSparseLayout(layout, kernelLayout);
+  const bool duo = kv::duoEnabled(layout.duo);
+  if (duo) {
+    if (sparse)
+      throw std::invalid_argument("duo attention has no sparse kernels");
+    requireDuoLayout(layout, kernelLayout, tree);
+  }
   if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       historyTokens.size() != lanes)
     throw std::invalid_argument("verify lane count is out of range");
@@ -502,6 +592,10 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
            : rowStride;
   std::array<uint32_t, RICHENGINE_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
+  // The q8q gate reads the pages the longest lane's busiest split covers —
+  // the same per-split rule upstream calibrates; a lane whose history is
+  // short keeps the bf16-query kernels.
+  uint64_t splitReads = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (uint64_t{historyTokens[lane]} + liveRows > kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
@@ -509,7 +603,10 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     // A sparse lane's splits follow the most its tiles' lists can hold: the
     // written splits of a list of every history block, capped like the page
     // loop's. The kernels' partition reads each list's device count, so the
-    // bound only needs to cover it.
+    // bound only needs to cover it. A duo lane's split count sizes to the
+    // streaming heads' bound — the sink plus the window plus two pages of
+    // edge slack covers every masked head's effective range, while an
+    // unmasked head still splits correctly, just coarser.
     laneSplits[lane] =
         sparse
             ? std::min(
@@ -517,8 +614,21 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                       kv::sparseHistoryBlocks(historyTokens[lane], liveRows),
                       kv::kVerifyMaximumSplits),
                   kv::verifyAttentionSplits(historyTokens[lane], liveRows))
-            : kv::verifyAttentionSplits(historyTokens[lane], liveRows);
+            : kv::verifyAttentionSplits(
+                  duo ? std::min(historyTokens[lane],
+                                 layout.duo.sink_tokens +
+                                     layout.duo.window_tokens +
+                                     2 * kv::kPageTokens)
+                      : historyTokens[lane],
+                  liveRows);
     splits = std::max(splits, laneSplits[lane]);
+    if (int8QueriesFromPages) {
+      const uint64_t pages =
+          (uint64_t{historyTokens[lane]} + liveRows + kv::kPageTokens - 1) /
+          kv::kPageTokens;
+      splitReads = std::max(splitReads,
+                            (pages + laneSplits[lane] - 1) / laneSplits[lane]);
+    }
   }
   // The plan's exact scratch uses its own row capacity; the public
   // verifyWorkspace() allocation bound stays sized for a tree lane.
@@ -534,12 +644,21 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                       !envFlag("RICHENGINE_VERIFY_M8_OFF");
   const bool chainR2 = !tree && !narrow && !sparse &&
                        !tuning().verifySplitR2Off;
+  // The q8q gate: INT8 pages, a dense full-attention layout, and a split
+  // read count at the calibrated threshold — sparse, DuoAttention, tree,
+  // windowed and the Gemma cores compile no q8q kernels.
+  const bool int8Queries =
+      int8QueriesFromPages != 0 && layout.format == kv::Format::Int8 &&
+      !sparse && !duo && !tree && !layout.windowTokens &&
+      kernelLayout != KernelLayout::GemmaKv8H256 &&
+      kernelLayout != KernelLayout::GemmaKv2H512 &&
+      splitReads >= int8QueriesFromPages;
   std::string split =
       sparse
           ? sparseSplitKernel(kVerifyAttention, layout.format, kernelLayout)
           : splitPipeline(
                 tree ? kVerifyTreeAttention : kVerifyAttention, layout,
-                kernelLayout, chainR2);
+                kernelLayout, chainR2, duo, int8Queries);
   uint32_t splitGroupX = layout.kvHeads;
   if (split.size() >= 3 && split.compare(split.size() - 3, 2, "_r") == 0)
     splitGroupX *= split.back() - '0';
@@ -557,7 +676,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
               ? sparseReduceKernel(kVerifyAttention, kernelLayout)
               : reduceKernel(tree ? kVerifyTreeAttentionReduce
                                   : kVerifyAttentionReduce,
-                             kernelLayout) +
+                             kernelLayout, duo) +
                     (narrow ? "_m8" : ""),
           {splitGroupX, splits, sparse ? uint64_t{lanes} * rowTiles : lanes},
           {layout.kvHeads,
@@ -571,7 +690,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           metal::DispatchSize{layout.headDimension, 1, 1},
           metal::DispatchSize{layout.headDimension, 1, 1},
           layout.format,
-          rows, layout.scoreScale, layout.windowTokens, sparse};
+          rows, layout.scoreScale, layout.windowTokens, sparse, duo};
 }
 
 void PagedAttention::addPrefillProjection(
@@ -744,7 +863,7 @@ void PagedAttention::addPrefill(
     metal::MetalBuffer output, metal::MetalBuffer partials,
     metal::MetalBuffer statistics, metal::MetalBuffer pageTable,
     const kv::ChunkedPrefillParams &chunk, const PrefillAttentionPlan &plan,
-    AttentionBlocks blocks) {
+    AttentionBlocks blocks, const kv::DuoPolicy &duo) {
   if (chunk.chunk_tokens != plan.rows)
     throw std::invalid_argument("prefill attention rows do not match plan");
   if (const std::string_view error = kv::chunkedPrefillValidationError(chunk);
@@ -755,10 +874,24 @@ void PagedAttention::addPrefill(
     throw std::invalid_argument("prefill attention scratch is smaller than its bound");
   if (plan.sparse != static_cast<bool>(blocks.lists))
     throw std::invalid_argument("prefill attention block lists do not match plan");
+  if (plan.duo != (duo.window_tokens != 0))
+    throw std::invalid_argument("prefill attention duo policy does not match plan");
   const RichPrefillAttentionParams attention{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits, plan.scoreScale,
       blocks.stride, blocks.list};
+  // The _duo kernels take the layer's DuoAttention policy as a patchable
+  // constant after the parameters: their splits and reduce work over the
+  // masked heads' sink-plus-window page range.
+  if (plan.duo) {
+    graph.addPatchableTail(plan.splitPipeline,
+              {queries, partials, statistics, pageTable}, attention, duo,
+              plan.splitGroups);
+    graph.addPatchableTail(plan.reducePipeline,
+              {partials, statistics, output}, attention, duo,
+              plan.reduceGroups, plan.reduceThreads);
+    return;
+  }
   // The _swa splits take the window as a constant after the parameters;
   // every canvas split declares the same trailing constant and ignores it
   // when its name is windowless.
@@ -791,7 +924,8 @@ void PagedAttention::addVerify(
     PagedVerifyBuffers buffers,
     std::span<const kv::ChunkedPrefillParams> chunks,
     const VerifyAttentionPlan &plan, metal::MetalBuffer gatePacked,
-    metal::MetalBuffer gateHidden, AttentionBlocks blocks, bool headGate) {
+    metal::MetalBuffer gateHidden, AttentionBlocks blocks, bool headGate,
+    const kv::DuoPolicy &duo) {
   constexpr uint32_t maximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes)
     throw std::invalid_argument("invalid paged verify batch");
@@ -800,6 +934,8 @@ void PagedAttention::addVerify(
     throw std::invalid_argument("verify attention scratch is smaller than its bound");
   if (plan.sparse != static_cast<bool>(blocks.lists))
     throw std::invalid_argument("verify attention block lists do not match plan");
+  if (plan.duo != (duo.window_tokens != 0))
+    throw std::invalid_argument("verify attention duo policy does not match plan");
   if (plan.sparse && gateHidden)
     throw std::invalid_argument("sparse verify has no fused gate reduce");
   std::array<kv::ChunkedPrefillParams, maximumLanes> stores{};
@@ -857,8 +993,13 @@ void PagedAttention::addVerify(
                : std::vector<metal::MetalBuffer>{buffers.queries,
                    buffers.partials, buffers.statistics, tables[0],
                    tables[1], tables[2], tables[3]};
-  // The _swa splits take the window as a constant after the lane parameters.
-  if (plan.splitPipeline.find("_swa_") != std::string::npos) {
+  // The _duo splits take the layer's DuoAttention policy as a patchable
+  // constant after the lane parameters; the _swa splits take the window the
+  // same way.
+  if (plan.duo) {
+    graph.addPatchableTail(plan.splitPipeline, std::move(splitBuffers),
+                           attention, duo, plan.splitGroups);
+  } else if (plan.splitPipeline.find("_swa_") != std::string::npos) {
     graph.addPatchableTail(plan.splitPipeline, std::move(splitBuffers),
                            attention, plan.windowTokens, plan.splitGroups);
   } else {
@@ -889,19 +1030,32 @@ void PagedAttention::addVerify(
                                : (tree ? kVerifyTreeAttentionReduceGate
                                        : kVerifyAttentionReduceGate)) +
           suffix;
-      graph.addPatchable(gate,
-                {buffers.partials, buffers.statistics, buffers.output,
-                 std::move(gatePacked), std::move(gateHidden)},
-                attention, plan.reduceGroups, plan.reduceThreads_);
+      if (plan.duo) {
+        graph.addPatchableTail(gate,
+                  {buffers.partials, buffers.statistics, buffers.output,
+                   std::move(gatePacked), std::move(gateHidden)},
+                  attention, duo, plan.reduceGroups, plan.reduceThreads_);
+      } else {
+        graph.addPatchable(gate,
+                  {buffers.partials, buffers.statistics, buffers.output,
+                   std::move(gatePacked), std::move(gateHidden)},
+                  attention, plan.reduceGroups, plan.reduceThreads_);
+      }
     } else {
       // The no-gate targets' reduce/gather fusion: the hidden layout alone
       // is written, so the reduce threads bound is the head dimension.
       if (tree)
         throw std::invalid_argument("tree verify has no fused gather");
+      if (plan.duo)
+        throw std::invalid_argument("duo verify has no fused gather");
       graph.addPatchable(std::string(kVerifyAttentionReduceGather) + suffix,
                 {buffers.partials, buffers.statistics, std::move(gateHidden)},
                 attention, plan.reduceGroups, plan.reduceThreads_);
     }
+  } else if (plan.duo) {
+    graph.addPatchableTail(plan.reducePipeline,
+              {buffers.partials, buffers.statistics, buffers.output},
+              attention, duo, plan.reduceGroups, plan.reduceThreads_);
   } else {
     graph.addPatchable(plan.reducePipeline,
               {buffers.partials, buffers.statistics, buffers.output},

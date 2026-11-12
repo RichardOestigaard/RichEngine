@@ -59,6 +59,10 @@ HOST_CPU_BRAND := $(shell sysctl -n machdep.cpu.brand_string 2>/dev/null)
 M5_CXXFLAGS := $(if $(findstring Apple M5,$(HOST_CPU_BRAND)),-mcpu=apple-m5 -flto=thin)
 PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
+# gguf_prefill_int8.metal's int8 cooperative tensors compile under metal4.0
+# only: metal4.1's cooperative_tensor rules reject the int32 destination
+# layout MPP generates for them (upstream 1.6.1 built them at metal4.0).
+METAL40_FLAGS := $(subst metal4.1,metal4.0,$(PROD_METALFLAGS))
 ENGINE_CXXFLAGS := -std=c++20 -O3 $(M5_CXXFLAGS) -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
@@ -210,6 +214,9 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 		| $(METAL_BUILD)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(METAL_BUILD)/prefill/gguf_prefill_int8.air \
+	$(METAL8_BUILD)/prefill/gguf_prefill_int8.air: PROD_METALFLAGS := $(METAL40_FLAGS)
 
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
@@ -396,6 +403,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelRegistry.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/SparseRowStore.cpp \
+	runtime/model/SsdReaders.cpp \
+	runtime/model/PackedExpertStore.cpp \
+	runtime/model/ExpertArena.cpp \
+	runtime/model/ExpertSlotRecycler.cpp \
 	runtime/model/VerifyBudget.cpp \
 	runtime/model/CompositeStateStorage.cpp
 ENGINE_MM_SOURCES := \

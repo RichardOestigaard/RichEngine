@@ -250,6 +250,11 @@ struct PipelineNameHash {
         return std::hash<std::string_view>{}(name);
     }
 };
+// The pipeline caches' shape: pipeline name → state object, probed by
+// view so a lookup builds no string.
+using PipelineCache =
+    std::unordered_map<std::string, id<MTLComputePipelineState>,
+                       PipelineNameHash, std::equal_to<>>;
 [[maybe_unused]] NSString *checkedNSString(std::string_view value, std::string_view field) {
     NSString *result = [[NSString alloc]
         initWithBytes:value.data()
@@ -1110,6 +1115,24 @@ struct MetalBackend::Impl {
     // before the bank's next reuse. Grown to 2 entries per dispatch.
     __strong id<MTL4CounterHeap> counterHeap4[2] = {nil, nil};
     NSUInteger counterHeap4Count[2] = {0, 0};
+    // The Metal 4 compiler, created on first use: stitched pipelines and
+    // the |opt: name flags are the MTL4 compiler pathway's clients. The
+    // pipeline batch's workers reach it through here, so the lazy create
+    // takes pipelineCreateMutex.
+    id<MTL4Compiler> ensureCompiler4() {
+        std::lock_guard lock(pipelineCreateMutex);
+        if (!compiler4) {
+            NSError *error = nil;
+            compiler4 = [device newCompilerWithDescriptor:
+                            [MTL4CompilerDescriptor new]
+                                        error:&error];
+            if (!compiler4)
+                throw MetalBackendError(
+                    "unable to create a Metal 4 compiler: " +
+                    errorDescription(error));
+        }
+        return compiler4;
+    }
 #endif
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
@@ -1117,9 +1140,7 @@ struct MetalBackend::Impl {
     // Looked up for every dispatch when its command is prepared, which the
     // GPU may be waiting for; a hit allocates nothing. Used only by the
     // submitting thread.
-    std::unordered_map<std::string, id<MTLComputePipelineState>,
-                       PipelineNameHash, std::equal_to<>>
-        pipelines;
+    PipelineCache pipelines;
     // Baked indirect-command spans of earlier submissions, keyed by the
     // run's position, length and first pipeline. Four alternates per key
     // keep interleaved graph shapes — parities alternate their bindings —
@@ -1146,14 +1167,17 @@ struct MetalBackend::Impl {
     uint64_t matchEpoch = 0;
     // Pipelines baked spans bind: only an indirect-command-capable pipeline
     // (supportIndirectCommandBuffers) may be set on an indirect command.
-    std::unordered_map<std::string, id<MTLComputePipelineState>,
-                       PipelineNameHash, std::equal_to<>>
-        icbPipelines;
+    PipelineCache icbPipelines;
     // Stitched libraries behind stitched pipeline names, keyed by the hook
     // bindings that built them.
     std::unordered_map<std::string, id<MTLLibrary>,
                        PipelineNameHash, std::equal_to<>>
         stitchedLibraries;
+    // The one write a pipeline creation makes off the submitting thread —
+    // a stitched library's registration, the Metal 4 compiler's lazy
+    // create — takes this; createPipelineBatch's workers compile without
+    // it.
+    std::mutex pipelineCreateMutex;
 
     DeviceCapabilities capabilities;
     std::shared_ptr<AllocationAccounting> accounting =
@@ -1199,6 +1223,27 @@ struct MetalBackend::Impl {
     // pipeline(), created with indirect command buffer support, which the
     // default pipeline object does not carry.
     id<MTLComputePipelineState> indirectPipeline(std::string_view name);
+
+
+    // pipeline()'s and indirectPipeline()'s creation halves, cache-free:
+    // a plain function's pipeline or the stitched/optioned one the name's
+    // extended grammar selects, and the indirect-command-capable variant.
+    // createPipelineBatch's workers run them concurrently: each reads the
+    // device and the library and writes only under pipelineCreateMutex.
+    id<MTLComputePipelineState> createDispatchPipeline(std::string_view name);
+
+
+    id<MTLComputePipelineState> createIndirectPipeline(std::string_view name);
+
+
+    // Creates the pipelines of `names` the `cache` lacks — each once, in
+    // the order given — kPipelinesCreatedAtOnce at a time, caches each
+    // creation and throws the first failure in name order. `indirect`
+    // selects indirectPipeline()'s pipelines over pipeline()'s. Only this
+    // thread touches `cache`: a worker creates a pipeline state and
+    // nothing else.
+    void createPipelineBatch(PipelineCache &cache, bool indirect,
+                             std::span<const std::string_view> names);
 
 
     // The escape hatch: baked indirect dispatch is off entirely.

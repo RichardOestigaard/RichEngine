@@ -374,8 +374,9 @@ uint32_t decodeSplits(const DevicePolicy &device, uint32_t n, uint32_t k,
   // K splits of a decode tile, one rule for both tiles. A tier asks for more
   // partitions while the grid holds fewer than `threadgroups` threadgroups
   // per core and each partition would still keep `inputs` inputs; the split
-  // count doubles, up to the maximum, while some tier asks. Decode K is a
-  // multiple of 256, so eight partitions always hold whole 32-input groups.
+  // count doubles, up to the maximum, while some tier asks. Narrow block K
+  // (320-input hyper ranks) can leave a pick that fits no tile's partition
+  // units; LinearGguf.cpp's fitBlockSplits halves it back to whole groups.
   // The rule ignores the batch width: bounds that depended on it did not pay
   // on either family.
   const uint64_t grid = n / GGUF_TILE_COLUMNS;

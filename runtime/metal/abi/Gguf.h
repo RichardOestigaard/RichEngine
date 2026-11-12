@@ -66,6 +66,55 @@ struct GgufPrefillLeadingParams {
 static_assert(sizeof(GgufPrefillLeadingParams) == 20,
               "GGUF leading-input prefill parameters are 20 bytes on both sides");
 
+// Int8-activation prefill tile (kernels/prefill/gguf_prefill_int8.metal),
+// opt-in under RICHENGINE_PREFILL_FAST_INT8: gguf_prefill_int8_quantize
+// writes each 64-input group of each chunk row as int8 codes and a float2
+// (scale, scale * sum of the codes); gguf_prefill_int8_<format>_<a|r|g>
+// multiplies them by the weight codes in int8 and folds each group's affine
+// correction in fp32. A tile is a column tile of
+// GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
+// GGUF_PREFILL_INT8_ROWS rows. The formats are the MLX affine weights whose
+// codes fit int8: af4, af5, af6 and af8 at group 64 and af4g128, af5g128,
+// af6g128 and af8g128 at group 128; af8's codes run 0..255 and enter the
+// matmul as code - 128, its effective bias z + 128 s.
+#define GGUF_PREFILL_INT8_GROUP 64u
+#define GGUF_PREFILL_INT8_SIMDGROUPS (GGUF_TILE_COLUMNS / 32u)
+#define GGUF_PREFILL_INT8_ROWS 32u
+#define GGUF_PREFILL_INT8_THREADS (GGUF_PREFILL_INT8_SIMDGROUPS * 32u)
+// Threadgroups take this many row tiles down a column tile before the next
+// column tile, so the column tile's weights stream once per 16 row tiles
+// while those tiles' activations stay cached.
+#define GGUF_PREFILL_INT8_WALK 16u
+// gguf_prefill_int8_quantize: one simdgroup per (row, group), this many per
+// threadgroup; grid (group blocks, rows). Four — the file's cooperative
+// tensors cap a threadgroup at 128 under shader validation.
+#define GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS 4u
+struct GgufPrefillInt8QuantizeParams {
+  uint32_t input_size;    // K
+  uint32_t rows;          // rows of the chunk
+  uint32_t storage_rows;  // row stride of the scales
+};
+static_assert(sizeof(GgufPrefillInt8QuantizeParams) == 12,
+              "int8 prefill quantize parameters are 12 bytes on both sides");
+// gguf_prefill_int8_<format>_<e>: grid (GGUF_PREFILL_INT8_WALK, ceil(tiles /
+// GGUF_PREFILL_INT8_WALK)), the walk of GGUF_PREFILL_INT8_WALK row tiles down
+// each column tile.
+struct GgufPrefillInt8Params {
+  uint32_t input_size;        // K
+  uint32_t rows;              // rows of the chunk
+  uint32_t storage_rows;      // row stride of the scales
+  uint32_t out_stride;        // columns of a destination row
+  uint32_t out_offset;        // first destination column of the segment
+  uint32_t plane_input_size;  // inputs a row of the planes holds (Projection::leadingInputs), K for none
+  uint32_t column_tiles;      // the segment's tiles of GGUF_TILE_COLUMNS columns
+};
+static_assert(sizeof(GgufPrefillInt8Params) == 28, "int8 prefill parameters are 28 bytes on both sides");
+// The formats whose segments run the int8 prefill kernels: the whole private
+// AF id range but AF4P, whose packed-manifest plane order differs.
+inline constexpr bool gguf_prefill_int8_format(uint32_t format) {
+  return format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128;
+}
+
 // Decode tiles of both families (the register tile on Apple9, the staged
 // tile elsewhere and for prefill chunks of up to 32 rows — 64 on Apple10):
 // one tensor per dispatch, over the dispatch's tiles (grid.x) and K

@@ -176,6 +176,9 @@ struct PrefillAttentionPlan final {
   const uint32_t windowTokens;
   // Whether the kernels attend through block lists (AttentionBlocks).
   const bool sparse;
+  // Whether the kernels run the DuoAttention _duo variants: addPrefill
+  // binds the layer's DuoPolicy tail constant (metal/abi/DuoAttention.h).
+  const bool duo;
 
 private:
   friend class PagedAttention;
@@ -184,14 +187,14 @@ private:
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                        metal::DispatchSize reduceThreads, kv::Format format,
                        float scoreScale = 0.0F, uint32_t windowTokens = 0,
-                       bool sparse = false)
+                       bool sparse = false, bool duo = false)
       : format(format), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
         reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups),
         reduceThreads(reduceThreads), scoreScale(scoreScale),
-        windowTokens(windowTokens), sparse(sparse) {}
+        windowTokens(windowTokens), sparse(sparse), duo(duo) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -222,6 +225,10 @@ struct VerifyAttentionPlan final {
   // Eight-row tiles of a lane's rowCapacity rows, the sparse split and
   // reduce grids' tiles per lane.
   const uint32_t rowTiles;
+  // Whether the kernels run the DuoAttention _duo variants: addVerify binds
+  // the layer's DuoPolicy tail constant and sizes its lanes' splits to the
+  // streaming heads' sink-plus-window bound (metal/abi/DuoAttention.h).
+  const bool duo;
 
 private:
   friend class PagedAttention;
@@ -239,7 +246,8 @@ private:
                       metal::DispatchSize storeThreads,
                       metal::DispatchSize reduceThreads, kv::Format format,
                       uint32_t rowCapacity, float scoreScale = 0.0F,
-                      uint32_t windowTokens = 0, bool sparse = false)
+                      uint32_t windowTokens = 0, bool sparse = false,
+                      bool duo = false)
       : format(format), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)),
@@ -248,6 +256,7 @@ private:
         rowCapacity(rowCapacity), scoreScale(scoreScale),
         windowTokens(windowTokens), sparse(sparse),
         rowTiles((rowCapacity + kv::kSparseTileRows - 1) / kv::kSparseTileRows),
+        duo(duo),
         storePipeline_(std::move(storePipeline)), storeGroups_(storeGroups),
         storeThreads_(storeThreads), reduceThreads_(reduceThreads) {}
 };
@@ -296,9 +305,16 @@ public:
   // The kernels read a sequence's history from its chunk parameters, so a
   // plan depends on the rows only. `sparse` selects the block-list kernels
   // (AttentionBlocks), which only the Kv2Group12H256 core compiles.
+  // committedTokens is the chunk's history before its rows — the q8q gate
+  // reads the pages one split covers; int8QueriesFromPages is the
+  // pages-per-split threshold, 0 keeping the bf16-query kernels.
+  // prefillPagesPerSplit adds the history term to the splits — one per that
+  // many pages the chunk reads, 0 keeping the shared splits at every history.
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-              bool sparse = false);
+              bool sparse = false, uint32_t committedTokens = 0,
+              uint32_t int8QueriesFromPages = 0,
+              uint32_t prefillPagesPerSplit = 0);
   // The DiffusionGemma canvas splits: same grids and workspace, but every
   // row admits the whole visible range — the read-only encoder prefix (its
   // pages) plus the canvas positions (scratch pages the host appended to
@@ -318,11 +334,14 @@ public:
   // `sparse` selects the block-list kernels (AttentionBlocks): each lane's
   // rows attend in eight-row tiles through list block_list + t. Tree verify
   // has no sparse kernels; fp8 and int4 have none either.
+  // int8QueriesFromPages is the q8q gate's pages-per-split threshold — the
+  // longest lane's split read count decides, 0 keeping the bf16-query
+  // kernels.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens, bool tree = false,
              uint32_t liveNodes = 0, uint32_t rows = kv::kVerifyRows,
-             bool sparse = false);
+             bool sparse = false, uint32_t int8QueriesFromPages = 0);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -417,7 +436,8 @@ public:
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan,
-                         AttentionBlocks blocks = {});
+                         AttentionBlocks blocks = {},
+                         const kv::DuoPolicy &duo = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts. When `gatePacked` and
   // `gateHidden` are bound (a Plain-input out-projection), the reduce
@@ -436,7 +456,8 @@ public:
                         const VerifyAttentionPlan &plan,
                         metal::MetalBuffer gatePacked = {},
                         metal::MetalBuffer gateHidden = {},
-                        AttentionBlocks blocks = {}, bool headGate = false);
+                        AttentionBlocks blocks = {}, bool headGate = false,
+                        const kv::DuoPolicy &duo = {});
   // One dispatch of the block lists of up to a batch of sequences of query
   // rows, whose block masks are rows of `mask`, `maskWords` words each
   // (metal/abi/PagedAttention.h) that cover each sequence's history: each

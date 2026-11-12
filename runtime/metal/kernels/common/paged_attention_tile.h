@@ -1,6 +1,8 @@
 #pragma once
 
+#include "metal/abi/DuoAttention.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/int8_activations.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/kv_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -68,6 +70,41 @@ inline uint richengine_attention_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
+// A KV head's virtual page space under a DuoAttention policy (the _duo
+// kernels): a streaming head's splits partition its admitted pages — the
+// sink's leading pages, then the trailing window's — and virtual page v
+// remaps to a physical page of the table (richengine_duo_page). The window's
+// first page is the one covering the EARLIEST row's window start; the
+// per-token mask trims each row's own window exactly, so a tile's rows share
+// the one range. An unmasked head's space is the identity over every visible
+// page: sink_pages 0 and window begin 0 leave the arithmetic untouched.
+struct RichDuoPageRange {
+  uint pages;
+  uint sink_pages;
+  uint window_begin_page;
+};
+
+inline RichDuoPageRange
+richengine_duo_page_range(RichDuoAttentionPolicy duo, uint kv_head,
+                          uint committed_tokens, uint visible_tokens) {
+  const uint total = richengine_attention_pages(visible_tokens);
+  if (!duo.head_mask || !((duo.head_mask >> kv_head) & 1u))
+    return {total, 0, 0};
+  const uint sink =
+      min(richengine_attention_pages(duo.sink_tokens), total);
+  const uint window_begin = committed_tokens + 1 > duo.window_tokens
+                                ? committed_tokens + 1 - duo.window_tokens
+                                : 0;
+  const uint begin = max(window_begin / RichKvPageTokens, sink);
+  return {sink + (total > begin ? total - begin : 0), sink, begin};
+}
+
+inline uint richengine_duo_page(RichDuoPageRange range, uint vpage) {
+  return vpage < range.sink_pages
+             ? vpage
+             : range.window_begin_page + (vpage - range.sink_pages);
+}
+
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
 // probabilities and the row statistics advance. Four lanes own one fused row,
 // eight consecutive tokens each, so the row maximum and sum are two xor
@@ -82,10 +119,15 @@ inline uint richengine_attention_pages_per_split(uint pages, uint splits) {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
+// Score is float for bf16 queries and KV, int for the INT8 x INT8 product
+// of the q8q kernels (int32 is exact: |sum| < 2^24 at 512 dimensions).
+// query_scale is the fused row's INT8 query scale — 1.0 on the bf16 path,
+// whose product is unchanged.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint TokensPerLane = 8>
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint TokensPerLane = 8,
+          typename Score = float>
 inline void richengine_attention_page_softmax(
-    threadgroup const float *scores, threadgroup bfloat *probabilities,
+    threadgroup const Score *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale,
     threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
@@ -93,7 +135,8 @@ inline void richengine_attention_page_softmax(
     uint token_start, uint fused_row_offset,
     uint visible_tokens, uint committed_tokens, uint active_rows,
     device const uint *row_masks, uint thread_index, float qk_scale = 0.0f,
-    uint window_tokens = 0) {
+    uint window_tokens = 0, uint duo_sink_tokens = 0,
+    float query_scale = 1.0f) {
   constexpr uint N = RichKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint LanesPerRow = N / TokensPerLane;
@@ -113,7 +156,10 @@ inline void richengine_attention_page_softmax(
   const uint limit = min(visible_tokens, causal_end);
   // A nonzero window_tokens admits only the last window_tokens tokens ending
   // at the row's causal end (Gemma 4's sliding-window layers); zero is the
-  // full causal history.
+  // full causal history. A nonzero duo_sink_tokens additionally admits the
+  // first duo_sink_tokens tokens unconditionally — a DuoAttention streaming
+  // head's sink range beside its trailing window.
+  const uint duo_sink = duo_sink_tokens;
   const uint window_begin =
       window_tokens != 0 && causal_end > window_tokens
           ? causal_end - window_tokens
@@ -123,20 +169,24 @@ inline void richengine_attention_page_softmax(
   // history it attends. A null mask is the chain's causal limit.
   const uint row_mask = row_masks ? row_masks[query_row] : 0u;
   const uint token = token_start + column;
-  threadgroup const float4 *scores4 =
-      reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
-                                                   column);
+  threadgroup const vec<Score, 4> *scores4 =
+      reinterpret_cast<threadgroup const vec<Score, 4> *>(
+          scores + fused_row * N + column);
   const uint vector = column / 4;
   float score[TokensPerLane];
   {
-    const float score_scale =
+    float score_scale =
         qk_scale != 0.0f ? qk_scale
                          : (HeadDim == 64    ? 0.125f
                             : HeadDim == 128 ? 0.08838834764831845f
                                              : 0.0625f);
+    // An INT8 query row's scale joins the same product — one rounding of
+    // qk_scale * query_scale, as upstream folds it before the loop. A bf16
+    // row's 1.0 leaves the scores bit-identical.
+    score_scale *= query_scale;
 #pragma unroll
     for (uint i = 0; i < TokensPerLane / 4; ++i) {
-      float4 s = scores4[i];
+      float4 s = float4(scores4[i]);
       if constexpr (Quantized)
         s *= key_scales[vector + i];
       s *= score_scale;
@@ -148,7 +198,7 @@ inline void richengine_attention_page_softmax(
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint t = token + j;
-    const bool admitted = t >= window_begin &&
+    const bool admitted = (t < duo_sink || t >= window_begin) &&
         (!row_masks ? t < limit
         : (t < committed_tokens) ||
               (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
@@ -168,7 +218,7 @@ inline void richengine_attention_page_softmax(
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint t = token + j;
-    const bool admitted = t >= window_begin &&
+    const bool admitted = (t < duo_sink || t >= window_begin) &&
         (!row_masks ? t < limit
         : (t < committed_tokens) ||
               (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
@@ -205,6 +255,56 @@ inline void richengine_attention_page_softmax(
   }
 }
 
+// A q8q split's fused queries as INT8 codes with one scale per fused row, by
+// the int8-activation rule (kernels/common/int8_activations.h): q = clamp(
+// rint(x * 127 / m), -127, 127) against the row's largest magnitude m, the
+// product reconstructing as code * (m / 127). A row holding an infinity or
+// a NaN returns a NaN scale, whose scores go on NaN and reduce as a row of
+// zeros — the bf16 path's behaviour; a row of zeros or of subnormal
+// magnitudes codes to zeros with scale 0. A row's softmax lanes quantize
+// it, each a share of its dimensions, so every returned scale belongs to
+// the caller's own fused row and a lane never shuffles another row's. The
+// lane mapping is the page softmax's — LanesPerRow per fused row, each
+// lane's column inside its row — so a scale register is always its row's.
+// Lanes past LanesPerRow * M rows are not softmax lanes and return 0.
+template <uint M, uint HeadDim, uint LanesPerRow>
+inline float richengine_attention_query_codes(device const bfloat *queries,
+                                              device int8_t *codes,
+                                              uint thread_index) {
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  static_assert(Quarter % 4 == 0 && HeadDim % LanesPerRow == 0,
+                "codes store as char4 vectors");
+  if (thread_index >= LanesPerRow * M)
+    return 0.0f;
+  const uint row = thread_index / LanesPerRow;
+  const uint first = row * HeadDim + (thread_index - row * LanesPerRow) * Quarter;
+  device const bfloat4 *source =
+      reinterpret_cast<device const bfloat4 *>(queries + first);
+  float maximum = 0.0f;
+  uint finite = 1;
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i) {
+    const bfloat4 query = source[i];
+    finite &= !int8_activation_not_finite(query);
+    const float4 value = abs(float4(query));
+    maximum = max(maximum, max(max(value.x, value.y), max(value.z, value.w)));
+  }
+  // The lanes of one fused row are contiguous in the threadgroup, so an XOR
+  // butterfly within each row's span reduces its magnitude and finiteness.
+#pragma unroll
+  for (uint lane = 1; lane < LanesPerRow; lane <<= 1) {
+    maximum = max(maximum, simd_shuffle_xor(maximum, lane));
+    finite &= simd_shuffle_xor(finite, lane);
+  }
+  const Int8Block block = int8_activation_block(maximum);
+  device char4 *target = reinterpret_cast<device char4 *>(codes + first);
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i)
+    target[i] = char4(int8_activation_code(float4(source[i]), block.inverse));
+  // NaN's bits make a non-finite row's scale NaN even under fast math.
+  return as_type<float>(int8_activation_bits(block.scale, finite != 0));
+}
+
 // One tile over its split's pages with the INT8 K/V and the scales consumed
 // in place as device tensor operands: the prefill tile, and the verify tile
 // in its direct placement, which differs only in RowsPerTile. Queries are
@@ -233,9 +333,15 @@ inline void richengine_attention_page_softmax(
 // bound the pass loop with pass_begin/pass_end: the _r2 verify splits give
 // each pass its own threadgroup, so the loop runs one pass and partial
 // slots still carry every fused row.
+// Int8Queries selects the q8q product: queries quantize to int8 codes in the
+// threadgroup's own partials slot (the bf16 partials overwrite those bytes
+// only after the pass's last page) and the QK product lands as int32 scores,
+// exact for |sum| < 2^24. The per-row scale then joins the softmax's score
+// scale. Only INT8 pages admit it — see the static_assert.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           typename CacheElement,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint MPasses = 1>
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint MPasses = 1,
+          bool Int8Queries = false>
 inline void richengine_paged_attention_tile(
     device bfloat *tile_queries, device const RichKvPage *page_table,
     RichKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -246,23 +352,39 @@ inline void richengine_paged_attention_tile(
     threadgroup float *previous_scale,
     threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
     uint thread_index, uint window_tokens = 0, uint pass_begin = 0,
-    uint pass_end = MPasses) {
+    uint pass_end = MPasses, RichDuoAttentionPolicy duo = {}) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort MP = M / MPasses;
   static_assert(M % MPasses == 0, "row passes split the fused tile evenly");
   constexpr bool Packed = is_same<CacheElement, RichKvPacked4>::value;
   constexpr bool Quantized = !is_same<CacheElement, bfloat>::value;
+  // The QK product's score type and the query element it consumes: int32
+  // and int8 for q8q, float and bf16 otherwise.
+  using Score = conditional_t<Int8Queries, int, float>;
+  using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
+  static_assert(!Int8Queries || is_same<CacheElement, int8_t>::value,
+                "INT8 queries take INT8 keys");
   constexpr ushort N = RichKvPageTokens;
   constexpr ushort D = HeadDim;
   uint visible_tokens = committed_tokens + active_rows;
-  uint pages = richengine_attention_pages(visible_tokens);
+  // Under a DuoAttention policy the tile's splits partition the head's
+  // virtual page space — a streaming head's sink pages plus its trailing
+  // window's — and each virtual page remaps to its physical page of the
+  // table. An empty policy's identity range costs nothing.
+  const RichDuoPageRange duo_range =
+      richengine_duo_page_range(duo, kv_head, committed_tokens, visible_tokens);
+  const bool duo_streaming =
+      duo.head_mask != 0 && ((duo.head_mask >> kv_head) & 1u) != 0;
+  uint pages = duo_range.pages;
   uint per_split = richengine_attention_pages_per_split(pages, splits);
   uint page_begin = split * per_split;
   if (page_begin >= pages)
     return;
   uint page_end = min(pages, page_begin + per_split);
 
-  auto st = tensor(scores, dextents<int, 2>{N, MP}, array<int, 2>{1, N});
+  threadgroup Score *score_tile =
+      reinterpret_cast<threadgroup Score *>(scores);
+  auto st = tensor(score_tile, dextents<int, 2>{N, MP}, array<int, 2>{1, N});
   // The probability buffer alternates by page parity: whether a tensorop's
   // operand reads are fenced by threadgroup_barrier the way plain loads are
   // is unproven, so a lingering PV read must never collide with the next
@@ -288,13 +410,34 @@ inline void richengine_paged_attention_tile(
 
   for (uint pass = pass_begin; pass < pass_end; ++pass) {
     const uint row_offset = uint(pass) * MP;
+    // q8q codes the pass's rows into this slot of the shared partials before
+    // the page loop: device int8 writes must be ordered against the QK
+    // tensorop's reads, so the mem_device flag joins the first barrier.
+    // The rows' softmax lanes quantize them — the lanes-per-row match is
+    // the page softmax's own, so each lane's scale is its own row's.
+    constexpr uint QueryLanesPerRow = MP > 64 ? 2 : 4;
+    device QueryElement *pass_queries;
+    float query_score_scale = 1.0f;
+    if constexpr (Int8Queries) {
+      device int8_t *codes = reinterpret_cast<device int8_t *>(
+          partials + slot * M * D + row_offset * D);
+      query_score_scale = richengine_attention_query_codes<MP, HeadDim,
+          QueryLanesPerRow>(tile_queries + row_offset * D, codes,
+                            thread_index);
+      pass_queries = codes;
+    } else {
+      pass_queries = tile_queries + row_offset * D;
+    }
     if (thread_index < MP) {
       row_max[thread_index] = -INFINITY;
       row_sum[thread_index] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+    threadgroup_barrier(
+        Int8Queries ? mem_flags::mem_threadgroup | mem_flags::mem_device
+                    : mem_flags::mem_threadgroup,
+        memory_order_acq_rel);
 
-    auto qt = tensor(tile_queries + row_offset * D, dextents<int, 2>{D, MP},
+    auto qt = tensor(pass_queries, dextents<int, 2>{D, MP},
                      array<int, 2>{1, D});
     auto q0 = qt.template slice<D, MP>(0, 0);
     auto running = [&] {
@@ -324,18 +467,21 @@ inline void richengine_paged_attention_tile(
         running[index] = 0.0f;
     }
 
-    for (uint page = page_begin; page < page_end; ++page) {
+    for (uint vpage = page_begin; vpage < page_end; ++vpage) {
+      // A streaming head's virtual page maps onto the sink's leading pages,
+      // then the window's trailing ones; the mask trims tokens per row.
+      const uint page = richengine_duo_page(duo_range, vpage);
       const auto tensors = addressing.page(page_table[page]);
       uint token_start = page * N;
       device const float *key_scales = tensors.key_scales;
       device const float *value_scales = tensors.value_scales;
 
       auto run_page = [&](auto ks, auto vs) {
-        threadgroup bfloat *pbuf = probabilities + (page & 1) * (N * MP);
+        threadgroup bfloat *pbuf = probabilities + (vpage & 1) * (N * MP);
         auto pt = tensor(pbuf, dextents<int, 2>{N, MP}, array<int, 2>{1, N});
         auto p0 = pt.template slice<N, MP>(0, 0);
         auto page_scores = qk.template get_destination_cooperative_tensor<
-            decltype(q0), decltype(ks), float>();
+            decltype(q0), decltype(ks), Score>();
         // One full-dimension product initializes the score CT through MPP.
         qk.run(q0, ks, page_scores);
         page_scores.store(st.template slice<N, MP>(0, 0));
@@ -344,12 +490,14 @@ inline void richengine_paged_attention_tile(
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         richengine_attention_page_softmax<QueryHeadsPerKVHead,
             RowsPerTile / MPasses, Quantized, HeadDim,
-            (MP > 64 ? 16 : 8)>(
-            scores, pbuf, row_max, row_sum, previous_scale, rescale,
+            (MP > 64 ? 16 : 8), Score>(
+            score_tile, pbuf, row_max, row_sum, previous_scale, rescale,
             reinterpret_cast<device const float4 *>(key_scales),
             reinterpret_cast<device const float4 *>(value_scales), token_start,
             row_offset, visible_tokens, committed_tokens, active_rows,
-            row_masks, thread_index, qk_scale, window_tokens);
+            row_masks, thread_index, qk_scale,
+            duo_streaming ? duo.window_tokens : window_tokens,
+            duo_streaming ? duo.sink_tokens : 0, query_score_scale);
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
@@ -417,14 +565,20 @@ inline bfloat richengine_attention_reduce_value(
     uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values,
-    uint visible_tokens = 0) {
+    uint visible_tokens = 0, RichDuoAttentionPolicy duo = {},
+    uint kv_head = 0) {
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint D = HeadDim;
   constexpr uint Groups = D / 32;
   if (fused_row / QueryHeadsPerKVHead >= active_rows)
     return bfloat(0.0f);
-  const uint pages = richengine_attention_pages(
-      visible_tokens ? visible_tokens : committed_tokens + active_rows);
+  // The splits' partition must match the tile's: a DuoAttention streaming
+  // head's splits cover only its sink-plus-window virtual pages.
+  const uint pages =
+      richengine_duo_page_range(duo, kv_head, committed_tokens,
+                                visible_tokens ? visible_tokens
+                                               : committed_tokens + active_rows)
+          .pages;
   const uint per_split = richengine_attention_pages_per_split(pages, splits);
   const uint written = (pages + per_split - 1) / per_split;
   const uint lane = thread_index % 32, sg = thread_index / 32;
@@ -463,10 +617,11 @@ inline void richengine_attention_reduce_row(
     device bfloat *tile_output, uint committed_tokens, uint active_rows,
     uint splits, ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values,
-    uint visible_tokens = 0) {
+    uint visible_tokens = 0, RichDuoAttentionPolicy duo = {},
+    uint kv_head = 0) {
   tile_output[fused_row * HeadDim + thread_index] =
       richengine_attention_reduce_value<QueryHeadsPerKVHead, RowsPerTile, HeadDim>(
           partials, statistics, committed_tokens, active_rows, splits,
           head_slot, fused_row, thread_index, weights, group_values,
-          visible_tokens);
+          visible_tokens, duo, kv_head);
 }

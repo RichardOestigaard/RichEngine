@@ -46,9 +46,30 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
       moeDecodeSimdgroups_(tuning().moeSg4 ? MoeExpertSimdgroups::Four
                                           : moeDecodeSimdgroups(policy_)) {}
 
+uint32_t ExecutionPlans::int8QueriesFromPages() const noexcept {
+  if (!tuning().q8qAttention || !policy_.apple10Plus()) return 0;
+  // Upstream's calibrated threshold: eight pages a split on the neural
+  // accelerators' generation; RICHENGINE_Q8Q_ATTENTION_PAGES retunes it.
+  return tuning().q8qAttentionPages ? tuning().q8qAttentionPages : 8;
+}
+
+uint32_t ExecutionPlans::prefillPagesPerSplit() const noexcept {
+  // RICHENGINE_PREFILL_PAGES_PER_SPLIT overrides on any tier — a value past
+  // the history's pages in one split degenerates to the shared splits, so a
+  // large one disables the history term. Unset, the neural accelerators'
+  // generation takes the measured 128 pages a split (M5 Pro, int8 KV:
+  // 7-34% less attention time at 32K-128K histories); Apple9 keeps the
+  // shared splits until its generation is measured.
+  if (tuning().prefillPagesPerSplit) return tuning().prefillPagesPerSplit;
+  return policy_.apple10Plus() ? 128 : 0;
+}
+
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout);
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout,
+    uint32_t committedTokens) const {
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, false,
+                                     committedTokens, int8QueriesFromPages(),
+                                     prefillPagesPerSplit());
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
@@ -56,7 +77,8 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
     std::span<const uint32_t> historyTokens, bool tree,
     uint32_t liveNodes, uint32_t rows) const {
   return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens,
-                                    tree, liveNodes, rows);
+                                    tree, liveNodes, rows, false,
+                                    int8QueriesFromPages());
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

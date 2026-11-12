@@ -37,7 +37,9 @@ constexpr std::array draftShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128, 0, 0,
                         DraftHeadCore::Q32K8D128, DraftContextCore::Hidden5120},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128, 0, 0,
-                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2048}};
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2048},
+    DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128, 0, 0,
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2560}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};
@@ -254,9 +256,9 @@ void ggufMoePlans() {
                                                        MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
   rejects([&] { (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
                                                  MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
-  // ones for 32-row prefill and 8-row decode tiles.
-  rejects([&] { (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32}); });
+  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles; wide GGUF
+  // decode batches may take the 32-row kernel, affine ones may not.
+  (void)MoE::decodePlan(shape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32});
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M32}); });
   rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); });
 }

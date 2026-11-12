@@ -50,6 +50,7 @@ inline constexpr std::string_view kTreeLeafPatch = "tree_leaf_patch";
 inline constexpr std::string_view kDraftConv = "draft_conv";
 inline constexpr std::string_view kDraftConvH2048 = "draft_conv_h2048";
 inline constexpr std::string_view kDraftConvH4096 = "draft_conv_h4096";
+inline constexpr std::string_view kDraftConvH2560 = "draft_conv_h2560";
 inline constexpr std::string_view kDraftResidualAdd = "draft_residual_add";
 inline constexpr std::string_view kDraftAttentionQkv = "draft_attention_qkv";
 inline constexpr std::string_view kDraftAttentionQkvQ16k2 = "draft_attention_qkv_q16k2";

@@ -60,6 +60,51 @@ void testByteAccounting() {
   static_assert(4608 * kBytesPerModelPage == 4'907'335'680ULL); // 147456 tokens.
 }
 
+// A layout with a block index (qwen4exp's QSA pages): every page also holds,
+// per attention layer, the pooled bf16 keys of its blocks of
+// RICHENGINE_ATTENTION_BLOCK_TOKENS tokens in the extent's index plane after
+// the layers' K/V regions. The extent math prices both parts.
+void testIndexPlaneAccounting() {
+  // qwen4exp's KV geometry: 12 attention layers of 2x256 Int8 K/V and a
+  // 128-wide index, with token-major values for the sparse gathers.
+  constexpr Layout qsa{12, 2, 256, Format::Int8, 0.0F, 0, 0, 0,
+                        0, Core::Unspecified, Core::Unspecified, 128, true};
+  static_assert(qsa.valid());
+  static_assert(qsa.kvBytesPerModelPage() == 399'360);
+  // Eight blocks a page, 128 bf16 values each: 2 KiB a layer page.
+  static_assert(qsa.indexBytesPerLayerPage() == 2'048);
+  static_assert(qsa.indexBytesPerModelPage() == 24'576);
+  static_assert(qsa.bytesPerModelPage() == 423'936);
+  static_assert(qsa.kvBytesPerModelPage() + qsa.indexBytesPerModelPage() ==
+                qsa.bytesPerModelPage());
+  // The index plane joins the alignment stride: its 2 KiB layer pages need
+  // 32 pages per 64 KiB unit, under the Int8 scales' 256.
+  static_assert(qsa.extentAlignmentPages() == 256);
+  // One 256-page extent is ~103.5 MiB, above half the allocation target, so
+  // it is an extent on its own at both ends of the size range.
+  static_assert(qsa.minimumExtentPages() == 256 &&
+                qsa.maximumExtentPages() == 256);
+  static_assert(qsa.extentPagesFor(255) == 0 && qsa.extentPagesFor(256) == 256);
+  // The K/V regions end where the index plane starts: an extent's bytes are
+  // its pages' K/V bytes plus its pages' index bytes, with nothing between.
+  static_assert(uint64_t{qsa.extentAlignmentPages()} *
+                        (qsa.kvBytesPerModelPage() +
+                         qsa.indexBytesPerModelPage()) ==
+                uint64_t{qsa.extentAlignmentPages()} * qsa.bytesPerModelPage());
+  // The same index over BF16 K/V: the plane's share of a page grows, and
+  // the alignment stride drops to the index's own 32-page unit.
+  constexpr Layout qsaBf16{12, 2, 256, Format::BFloat16, 0.0F, 0, 0, 0,
+                           0, Core::Unspecified, Core::Unspecified, 128, true};
+  static_assert(qsaBf16.kvBytesPerModelPage() == 786'432);
+  static_assert(qsaBf16.bytesPerModelPage() == 811'008);
+  static_assert(qsaBf16.extentAlignmentPages() == 32);
+  static_assert(qsaBf16.minimumExtentPages() == 96);
+  // Without an index the page is its K/V alone, as before.
+  constexpr Layout plain{12, 2, 256};
+  static_assert(plain.bytesPerModelPage() == plain.kvBytesPerModelPage() &&
+                plain.indexBytesPerModelPage() == 0);
+}
+
 void testLayouts() {
   assert(richengine_kv_key_element(0, 0, 1) == richengine_kv_key_element(0, 0, 0) + 1);
   assert(richengine_kv_key_element(0, 1, 0) ==
@@ -158,6 +203,7 @@ void testZeroAndInvalidInputs() {
 
 int main() {
   testByteAccounting();
+  testIndexPlaneAccounting();
   testLayouts();
   testBFloat16();
   testQuantization(kPageTokens);

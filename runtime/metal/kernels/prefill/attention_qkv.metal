@@ -31,6 +31,11 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8, 16, 2, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_f32, 24, 4, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g4_f32, 16, 4, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8_f32, 16, 2, float)
+// Qwen3.8-Flash-Next's QSA layers (kv::Core::Kv2Group12H256): 24 query
+// heads of 256 grouped twelve-to-one over 2 KV heads, the [q|gate] packed
+// rows and per-head QK norms the defaults already express.
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12, 24, 2, bfloat)
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12_f32, 24, 2, float)
 #undef PREFILL_ATTENTION_QKV
 
 // Head-dimension variants of the same row walk:
@@ -179,6 +184,17 @@ kernel void prefill_attention_gate_kv2_g8(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
+kernel void prefill_attention_gate_kv2_g12(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullPrefillParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_prefill_phase<24, 2>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
 // The *_sums variants also write the Affine64 out-projection's input sums of
 // the gated rows — the flat [row][64-group] layout and pairing of
 // prefill_linear_q4_sums32, computed post-store like
@@ -213,6 +229,7 @@ kernel void prefill_attention_gate_kv2_g8(
 PREFILL_ATTENTION_GATE_SUMS(prefill_attention_gate_sums, 24, 4)
 PREFILL_ATTENTION_GATE_SUMS(prefill_attention_gate_sums_kv4_g4, 16, 4)
 PREFILL_ATTENTION_GATE_SUMS(prefill_attention_gate_sums_kv2_g8, 16, 2)
+PREFILL_ATTENTION_GATE_SUMS(prefill_attention_gate_sums_kv2_g12, 24, 2)
 #undef PREFILL_ATTENTION_GATE_SUMS
 
 // The no-gate rows of the dense and LFM2 targets: the same elementwise

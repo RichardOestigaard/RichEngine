@@ -1,4 +1,5 @@
 #include "TestBuffers.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "ops/KernelNames.hpp"
 #include "ops/PageStorage.hpp"
 #include "engine/memory/MemoryGovernor.hpp"
@@ -75,6 +76,85 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
         next += span.size();
     }
     require(next == extent + storage.extentBytes(), "the spans of an extent's pages do not cover it");
+}
+
+// A layout with a block index (Layout::indexDimension): a page's spans()
+// end with each layer's pooled keys, the index plane's spans after the
+// layers' K/V regions. Across an extent's pages the tensor and index spans
+// tile the whole extent without gaps or overlaps.
+void requireIndexedSpansTileExtent(const kv::PageStorage &storage,
+                                   uint32_t firstPage) {
+    const kv::Layout layout = storage.layout();
+    const bool scaled = layout.format == kv::Format::Int8;
+    const uint32_t tensors = scaled ? 4 : 2;
+    const uint32_t kvSpans = layout.attentionLayers * tensors;
+    std::byte *const extent = storage.spans(firstPage).front().data();
+    std::vector<std::span<std::byte>> all;
+    for (uint32_t index = 0; index < storage.extentPages(); ++index) {
+        const auto spans = storage.spans(firstPage + index);
+        require(spans.size() == kvSpans + layout.attentionLayers,
+                "an indexed page does not carry its tensor and index spans");
+        for (uint32_t span = 0; span < spans.size(); ++span) {
+            const uint64_t bytes =
+                span < kvSpans
+                    ? (scaled && span % 2 ? layout.scaleBytesPerLayerPage()
+                                          : layout.dataBytesPerLayerPage())
+                    : layout.indexBytesPerLayerPage();
+            require(spans[span].size() == bytes,
+                    "an indexed page's span holds another region's bytes");
+        }
+        // The index spans sit in the plane after every layer's K/V region:
+        // layer by layer, each extentPages() * indexBytesPerLayerPage() apart
+        // from the plane's start.
+        const uint64_t plane =
+            uint64_t{storage.extentPages()} * layout.kvBytesPerModelPage();
+        const auto blocks = storage.indexSpans(firstPage + index);
+        for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
+            require(blocks[layer].data() ==
+                        extent + plane + storage.indexOffset(layer) +
+                            uint64_t{index} * layout.indexBytesPerLayerPage(),
+                    "a layer's index span does not sit in the index plane");
+        }
+        all.insert(all.end(), spans.begin(), spans.end());
+    }
+    std::sort(all.begin(), all.end(),
+              [](auto left, auto right) { return left.data() < right.data(); });
+    std::byte *next = extent;
+    for (const auto span : all) {
+        require(span.data() == next,
+                "the spans of an indexed extent's pages leave a gap or overlap");
+        next += span.size();
+    }
+    require(next == extent + storage.extentBytes(),
+            "the spans of an indexed extent's pages do not cover it");
+}
+
+// An index table's entries reach the pages' index plane: the extent's GPU
+// address moved to where indexPlaneOffset() starts it, with the page's
+// index in the low bits as the KV entries carry theirs.
+void requireIndexEntries(const kv::PageStorage &storage,
+                         const metal::MetalBuffer &kvTable,
+                         const metal::MetalBuffer &indexTable,
+                         std::span<const uint32_t> pages) {
+    auto *kvEntries = static_cast<RichKvPage *>(kvTable.contents());
+    auto *indexEntries = static_cast<RichKvPage *>(indexTable.contents());
+    const uint64_t plane = uint64_t{storage.extentPages()} *
+                           storage.layout().kvBytesPerModelPage();
+    storage.writeEntries(pages, 0, kvTable);
+    storage.writeIndexEntries(pages, 0, indexTable);
+    for (size_t at = 0; at < pages.size(); ++at) {
+        const uint64_t kv = kvEntries[at];
+        const uint64_t index = indexEntries[at];
+        require((kv & RICHENGINE_KV_PAGE_INDEX_MASK) ==
+                    (index & RICHENGINE_KV_PAGE_INDEX_MASK),
+                "an index entry names another page of its extent");
+        require((index & ~uint64_t{RICHENGINE_KV_PAGE_INDEX_MASK}) ==
+                    (kv & ~uint64_t{RICHENGINE_KV_PAGE_INDEX_MASK}) + plane,
+                "an index entry does not reach its extent's index plane");
+    }
+    requireThrows<std::out_of_range>(
+        [&] { (void)storage.indexOffset(storage.layout().attentionLayers); },
+        "an index offset past the layout's layers was accepted");
 }
 
 // Writing a table from an index on leaves the entries before it as they
@@ -270,7 +350,7 @@ void run(const std::string &metallib) {
                     512 * compactLayout.bytesPerModelPage(),
             "model-provided compact Q8 geometry was not honored");
 
-    for (const auto layout : {bf16Layout, compactBf16Layout}) {
+    for (const auto &layout : {bf16Layout, compactBf16Layout}) {
         const uint32_t extent = layout.minimumExtentPages();
         kv::PageStorage bf16(backend, governor.allocationAdmission(), layout,
                              2 * extent, extent);
@@ -288,6 +368,85 @@ void run(const std::string &metallib) {
         bf16.releaseExtent(1);
         require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),
                 "BF16 extent could not be allocated again after release");
+    }
+
+    // A layout with a block index: the extent's K/V regions fill only the
+    // K/V part and the index plane takes the rest. The fill check once
+    // summed the K/V regions against the whole extent and refused every
+    // indexDimension > 0 layout — qwen4exp's QSA pages included.
+    {
+        kv::Layout indexed = compactLayout;
+        indexed.indexDimension = 64;
+        indexed.valuesTokenMajor = true;
+        const uint32_t extent = indexed.minimumExtentPages();
+        kv::PageStorage indexedStorage(
+            backend, governor.allocationAdmission(), indexed, 2 * extent,
+            extent);
+        require(indexedStorage.extentBytes() ==
+                    uint64_t{extent} * indexed.bytesPerModelPage() &&
+                indexedStorage.indexOffset(0) == 0 &&
+                indexedStorage.indexOffset(9) ==
+                    9 * extent * indexed.indexBytesPerLayerPage(),
+                "an indexed extent does not place its index plane");
+        require(indexedStorage.allocateExtent(0) &&
+                    indexedStorage.allocateExtent(1),
+                "an indexed extent was refused");
+        requireIndexedSpansTileExtent(indexedStorage, 0);
+        requireIndexedSpansTileExtent(indexedStorage, extent);
+        metal::MetalBuffer indexKvTable =
+            test::sharedBuffer(backend, 4 * sizeof(RichKvPage));
+        metal::MetalBuffer indexTable =
+            test::sharedBuffer(backend, 4 * sizeof(RichKvPage));
+        requireIndexEntries(indexedStorage, indexKvTable, indexTable,
+                            std::array<uint32_t, 3>{5, 200, 255});
+        // Pages of the second extent name its own index plane.
+        indexedStorage.releaseExtent(1);
+        require(static_cast<bool>(indexedStorage.allocateExtent(1)),
+                "an indexed extent could not be allocated again");
+        requireIndexEntries(indexedStorage, indexKvTable, indexTable,
+                            std::array<uint32_t, 3>{300, 400, 511});
+    }
+
+    // qwen4exp's canonical layout is the production case: 12 QSA attention
+    // layers of 2x256 Int8 K/V pages carrying a 128-wide bf16 block index,
+    // and state cells whose auxiliary bytes hold the PLE history and the
+    // pending keys. Runtime construction sizes its KV extents and state
+    // cells by exactly these numbers.
+    {
+        const model::TargetLayout qwen4 = model::qwen4ExpTargetLayout();
+        const kv::Layout qwen4Kv = qwen4.kvLayout(kv::Format::Int8);
+        require(qwen4Kv.attentionLayers == 12 && qwen4Kv.kvHeads == 2 &&
+                    qwen4Kv.headDimension == 256 &&
+                    qwen4Kv.indexDimension == qwen4.indexerHeadDimension &&
+                    qwen4Kv.valuesTokenMajor && qwen4Kv.valid(),
+                "qwen4exp's KV layout lost its QSA index plane");
+        require(qwen4Kv.indexBytesPerModelPage() ==
+                    uint64_t{qwen4Kv.attentionLayers} *
+                        (kv::kPageTokens / RICHENGINE_ATTENTION_BLOCK_TOKENS) *
+                        qwen4.indexerHeadDimension * 2,
+                "qwen4exp's index plane is not one pooled key per block");
+        const model::GdnStateLayout qwen4State = qwen4.gdnStateLayout();
+        require(qwen4State.valid() &&
+                    qwen4State.auxiliaryBytes ==
+                        qwen4.pleHistoryBytes() + qwen4.indexerPendingBytes() &&
+                    qwen4State.auxiliaryBytes != 0 &&
+                    qwen4State.cellBytes() ==
+                        qwen4State.convolutionBytes() +
+                            qwen4State.recurrentBytes() +
+                            qwen4State.auxiliaryBytes,
+                "qwen4exp's state cells lost their auxiliary bytes");
+        const uint32_t qwen4Extent = qwen4Kv.minimumExtentPages();
+        kv::PageStorage qwen4Pages(backend, governor.allocationAdmission(),
+                                   qwen4Kv, qwen4Extent, qwen4Extent);
+        require(static_cast<bool>(qwen4Pages.allocateExtent(0)),
+                "qwen4exp's KV extent was refused");
+        requireIndexedSpansTileExtent(qwen4Pages, 0);
+        metal::MetalBuffer qwen4KvTable =
+            test::sharedBuffer(backend, 4 * sizeof(RichKvPage));
+        metal::MetalBuffer qwen4IndexTable =
+            test::sharedBuffer(backend, 4 * sizeof(RichKvPage));
+        requireIndexEntries(qwen4Pages, qwen4KvTable, qwen4IndexTable,
+                            std::array<uint32_t, 3>{5, 200, 255});
     }
     std::cout << "KV page storage tests passed\n";
 }

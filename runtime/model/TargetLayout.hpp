@@ -188,9 +188,11 @@ struct TargetLayout final {
   // gate_proj the packed QKV row does not interleave, applied to the
   // attention output before the out-projection.
   bool attentionHeadGate = false;
-  // Gemma's expert slabs pad the logical expertIntermediateSize to the
-  // tiles' column granularity; the shared expert's dense GeGLU pads its
-  // intermediate to packedSharedWidth alike.
+  // Expert slabs pad the logical expertIntermediateSize to the packed
+  // format's tile granularity — Gemma's affine Q4 tiles, and Qwen4Exp's
+  // GGUF block segments whose 256-row planes and per-expert slab stride
+  // need a whole tile multiple (640 -> 768); the shared expert's dense
+  // GeGLU pads its intermediate to packedSharedWidth alike.
   uint32_t packedExpertWidth = 0;
   uint32_t sharedIntermediateSize = 0;
   uint32_t packedSharedWidth = 0;
@@ -243,6 +245,11 @@ struct TargetLayout final {
   // token it reads at an image's prompt positions (<|image_pad|>).
   uint32_t pleEosToken = 0;
   uint32_t pleImageToken = 0;
+  // The opt-in DuoAttention policy (kv::DuoPolicy, metal/abi/DuoAttention.h):
+  // the streaming KV heads' sink and trailing window in tokens, head_mask one
+  // bit per (attention ordinal, KV head) pair at bit 4*ordinal + head.
+  // kvLayout() forwards it; the all-zero default is dense attention.
+  kv::DuoPolicy duoAttention{};
 
   // The full-attention layer set: the LFM2 mask where set, else every
   // fullAttentionPeriod-th layer on the hybrids, else Gemma's globals,
@@ -317,6 +324,7 @@ struct TargetLayout final {
     // values, which its sparse gathers read contiguously.
     result.indexDimension = indexerHeads ? indexerHeadDimension : 0;
     result.valuesTokenMajor = indexerHeads != 0;
+    result.duo = duoAttention;
     return result;
   }
   [[nodiscard]] constexpr kv::Layout kvLayout(kv::Format format) const noexcept {

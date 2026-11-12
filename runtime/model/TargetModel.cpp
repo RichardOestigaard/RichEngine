@@ -73,6 +73,26 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.attentionHeadGate = layout.attentionHeadGate;
   result.attentionGateRows = layout.attentionGateRows;
   result.altRotaryRealPairs = layout.altRotaryRealPairs;
+  // The declared DuoAttention policy; RICHENGINE_DUO_OVERRIDE=sink,window,
+  // mask overrides it for experiments — the mask reads with strtoull's base
+  // detection, so "0xffffffffffffffff" bounds every head of every layer.
+  result.duoAttention = layout.duoAttention;
+  if (const char *duoOverride = std::getenv("RICHENGINE_DUO_OVERRIDE")) {
+    char *end = nullptr;
+    const uint64_t sink = std::strtoull(duoOverride, &end, 0);
+    kv::DuoPolicy parsed{};
+    if (end && *end == ',') {
+      const uint64_t window = std::strtoull(end + 1, &end, 0);
+      if (end && *end == ',') {
+        const uint64_t mask = std::strtoull(end + 1, &end, 0);
+        if (end && !*end)
+          parsed = {static_cast<uint32_t>(sink), static_cast<uint32_t>(window),
+                    mask};
+      }
+    }
+    result.duoAttention = parsed;
+  }
+  result.kvLayout.duo = result.duoAttention;
   return result;
 }
 
@@ -107,7 +127,12 @@ TargetModelGeometry geometryFor(const TargetLayout &layout) {
     result.logitSoftcap = layout.logitSoftcap;
   } else {
     result.denseIntermediateSize = layout.intermediateSize;
-    result.expertIntermediateSize = layout.expertIntermediateSize;
+    // Sparse MoE targets pad their expert intermediate to
+    // packedExpertWidth when the packed format's tiles require it
+    // (Qwen4Exp's GGUF expert slabs: 640 -> 768, TargetLayout.hpp).
+    result.expertIntermediateSize = layout.packedExpertWidth
+                                        ? layout.packedExpertWidth
+                                        : layout.expertIntermediateSize;
     // LFM3's mask-declared dual geometry: same KV sizes on both kinds, the
     // global (alt) layers differing only in their rope table — windowed
     // sliding layers stay primary, full-causal globals alt.
@@ -413,7 +438,8 @@ metal::MetalBuffer TargetModel::addPrefill(
                   geometry_.layerKvLayout(false))
             : operators_.prefillAttention(
                   sequence.rows, geometry_.attentionQueryHeads,
-                  geometry_.layerKvLayout(false)));
+                  geometry_.layerKvLayout(false),
+                  sequence.chunk.committed_tokens));
   }
   encoder_->beginPrefill(step);
   if (geometry_.ffnKind == FfnKind::SparseMoe)
@@ -504,7 +530,8 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
                                          sequence.chunk, geometry_.kvLayout);
     ops::PagedAttention::addPrefill(
         step.graph, step.kvLayers[layer], queries, attentionRows, b.attentionPartials, b.attentionStatistics,
-        sequence.pageTable, sequence.chunk, step.attention[index]);
+        sequence.pageTable, sequence.chunk, step.attention[index], {},
+        geometry_.layerDuoPolicy(layer));
     const metal::MetalBuffer hiddenRows =
         u16(b.attentionHidden, geometry_.attentionWidth);
     if (geometry_.attentionQueryGate) {
@@ -715,12 +742,14 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
                                    geometry_.attentionQueryGate
                                        ? b.fullPacked
                                        : metal::MetalBuffer{},
-                                   b.attentionHidden);
+                                   b.attentionHidden, {}, false,
+                                   geometry_.layerDuoPolicy(layer));
   } else {
     ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                    {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
                                     b.attentionStatistics, b.fullAttention, b.pageTables, b.treeMasks},
-                                   step.chunks, step.attention);
+                                   step.chunks, step.attention, {}, {}, {}, false,
+                                   geometry_.layerDuoPolicy(layer));
     hidden = ops::PagedAttention::addVerifyGate(
         step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
         geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input(),
@@ -965,15 +994,18 @@ void TargetModel::addVerifyInput(metal::CommandGraph &graph,
                                 uint32_t lanes, uint32_t verifyStride,
                                 uint32_t draftStride,
                                 std::span<const uint32_t> liveRows,
-                                metal::MetalBuffer plePriorTokens) const {
+                                metal::MetalBuffer plePriorTokens,
+                                std::span<const uint32_t> pleRowIds) const {
   const metal::MetalBuffer tokens = verifyInput;
   ops::Embedding::addVerifyInput(graph, std::move(draftInput),
                                  std::move(proposals), std::move(verifyInput),
                                  geometry_.vocabularySize, lanes, verifyStride,
                                  draftStride, liveRows);
-  // The arch encoder's input hook (qwen4exp's GPU PLE hash of the rows).
+  // The arch encoder's input hook (qwen4exp's GPU PLE hash of the rows,
+  // or the streamed table's staging of the host-computed ids).
   encoder_->onVerifyInput(graph, std::move(tokens),
-                          std::move(plePriorTokens), lanes, verifyStride);
+                          std::move(plePriorTokens), lanes, verifyStride,
+                          pleRowIds);
 }
 
 void TargetModel::addVerifyTreeInput(metal::CommandGraph &graph,

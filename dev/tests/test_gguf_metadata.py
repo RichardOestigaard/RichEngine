@@ -125,6 +125,32 @@ def gemma4_fixture():
     }
 
 
+def qwen4exp_fixture():
+    """The header fields unsloth/Qwen3.8-Flash-Next-GGUF states: a GDN layer
+    except every fourth (the QSA full-attention layers), the PLE layer's
+    n-gram embedding, and the metadata arrays the fields handler checks."""
+    tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
+    tokens += ["ab"]
+    tokens += [f"[unused{i}]" for i in range(248320 - len(tokens))]
+    return {
+        "general.architecture": "qwen4exp",
+        "qwen4exp.embedding_length": 2560,
+        "qwen4exp.block_count": 48,
+        "qwen4exp.context_length": 262144,
+        "qwen4exp.attention.head_count": 24,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.attention.key_length": 256,
+        "qwen4exp.full_attention_interval": 4,
+        "qwen4exp.expert_count": 512,
+        "qwen4exp.expert_used_count": 10,
+        "qwen4exp.attention.compress_ratios": [
+            4 if (layer + 1) % 4 == 0 else 0 for layer in range(48)
+        ],
+        "qwen4exp.ple.layers": [1],
+        "tokenizer.ggml.tokens": tokens,
+    }
+
+
 def vision_fixture():
     return {
         "general.architecture": "clip",
@@ -703,6 +729,111 @@ class GgufMetadataTests(unittest.TestCase):
         config = json.loads(files["tokenizer/tokenizer_config.json"])
         self.assertEqual(config["bos_token"], "<bos>")
         self.assertEqual(config["eos_token"], "<eos>")
+
+    def test_qwen4exp_config_states_its_experts_and_identifies_the_family(self):
+        config = gguf.model_config(self.metadata(qwen4exp_fixture()))
+        text = config["text_config"]
+        self.assertEqual(config["model_type"], "qwen4_exp")
+        self.assertEqual(text["model_type"], "qwen4_exp_text")
+        self.assertEqual(
+            (text["num_experts"], text["num_experts_per_tok"]), (512, 10)
+        )
+        self.assertEqual(text["num_hidden_layers"], 48)
+        self.assertEqual(text["hidden_size"], 2560)
+        self.assertEqual(text["head_dim"], 256)
+        self.assertEqual(families.family_for(config).name, "Qwen3.8-Flash-Next")
+
+    def test_qwen4exp_config_rejects_the_metadata_arrays_it_checks(self):
+        for key, value in (
+            ("qwen4exp.attention.compress_ratios", None),
+            ("qwen4exp.attention.compress_ratios", [0] * 48),
+            ("qwen4exp.ple.layers", None),
+            ("qwen4exp.ple.layers", [0]),
+        ):
+            values = qwen4exp_fixture()
+            if value is None:
+                del values[key]
+            else:
+                values[key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                models.ModelError, key.split(".", 1)[1]
+            ):
+                gguf.model_config(self.metadata(values))
+
+    def test_qwen4exp_screening_names_its_loadable_tensors(self):
+        values = qwen4exp_fixture()
+        header = gguf.Metadata(write_gguf(self.root / "q.gguf", values))
+        tensors = gguf.loaded_tensors(header)
+        # The model tensors: no output norm — the final hyper mix feeds the
+        # head — and the PLE's embedding table.
+        self.assertEqual(
+            {name for name in tensors if not name.startswith("blk.")},
+            {
+                "token_embd.weight",
+                "per_layer_token_embd.weight",
+                "output.weight",
+                "output_hc_norm.weight",
+                "output_hc_down.weight",
+                "output_hc_up.weight",
+            },
+        )
+        # Every layer reads the hyper mixes and the sparse MoE; layer 1 the
+        # PLE tensors; the full-attention layers the QSA indexer.
+        for name in (
+            "hc_attn_norm.weight",
+            "hc_ffn_inject.weight",
+            "ffn_gate_inp.weight",
+            "ffn_down_shexp.weight",
+        ):
+            self.assertIn(f"blk.0.{name}", tensors)
+        self.assertIn("blk.1.ple_key.weight", tensors)
+        self.assertNotIn("blk.0.ple_key.weight", tensors)
+        self.assertIn("blk.0.attn_qkv.weight", tensors)
+        self.assertIn("blk.0.ssm_alpha.weight", tensors)
+        self.assertNotIn("blk.0.attn_q.weight", tensors)
+        self.assertIn("blk.3.attn_q.weight", tensors)
+        self.assertIn("blk.3.indexer.q_proj.weight", tensors)
+        self.assertNotIn("blk.0.indexer.q_proj.weight", tensors)
+        # A file storing every tensor it reads loads; one missing or of a
+        # type the pack cannot read is refused by name.
+        loadable = loadable_tensors(values, self.root)
+        gguf.require_loadable(
+            gguf.Metadata(
+                write_gguf(self.root / "ok.gguf", values, loadable.items()),
+                tensors=True,
+            )
+        )
+        # The fused experts tensor is the alternative to the split pair.
+        fused = {
+            name: kind
+            for name, kind in loadable.items()
+            if not name.endswith(
+                ("ffn_gate_exps.weight", "ffn_up_exps.weight")
+            )
+        }
+        fused |= {
+            f"blk.{layer}.ffn_gate_up_exps.weight": GGML["Q4_K"]
+            for layer in range(48)
+        }
+        gguf.require_loadable(
+            gguf.Metadata(
+                write_gguf(self.root / "fused.gguf", values, fused.items()),
+                tensors=True,
+            )
+        )
+        missing = {
+            name: kind
+            for name, kind in loadable.items()
+            if name != "blk.7.attn_k.weight"
+        }
+        path = write_gguf(self.root / "bad.gguf", values, missing.items())
+        with self.assertRaisesRegex(models.ModelError, "attn_k.weight missing"):
+            gguf.require_loadable(gguf.Metadata(path, tensors=True))
+        wrong = dict(loadable)
+        wrong["blk.0.hc_attn_inject.weight"] = GGML["Q4_K"]
+        path = write_gguf(self.root / "wrong.gguf", values, wrong.items())
+        with self.assertRaisesRegex(models.ModelError, "hc_attn_inject.weight"):
+            gguf.require_loadable(gguf.Metadata(path, tensors=True))
 
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()

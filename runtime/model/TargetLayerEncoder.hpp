@@ -50,12 +50,15 @@ public:
   // after the token gather with the verify rows' tokens and the
   // pleNgram - 1 tokens before each lane's first row (`plePriorTokens`,
   // empty for targets without the qwen4exp PLE hash, which the GPU
-  // computes from them).
+  // computes from them). `pleRowIds` carries the rows' PLE table ids a
+  // streamed table stages (qwen4ExpVerifyPleIds); empty lets the encoder
+  // hash them on the GPU.
   virtual void onVerifyInput(metal::CommandGraph &,
                              metal::MetalBuffer /*verifyInput*/,
                              metal::MetalBuffer /*plePriorTokens*/,
                              uint32_t /*lanes*/,
-                             uint32_t /*verifyStride*/) const {}
+                             uint32_t /*verifyStride*/,
+                             std::span<const uint32_t> /*pleRowIds*/ = {}) const {}
   // The auxiliary-state commit at the end of TargetModel::addStateCommit:
   // the shared commit consumed the GDN cells; an arch whose state cells
   // reserve auxiliaryBytes (qwen4exp's PLE history and QSA pending keys)

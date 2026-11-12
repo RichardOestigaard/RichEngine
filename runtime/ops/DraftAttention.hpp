@@ -25,6 +25,7 @@ enum class DraftContextCore : uint8_t {
   Hidden5120,
   Hidden2048,
   Hidden4096,
+  Hidden2560,
   Plain5120,
   Plain4096,
   Plain2816,

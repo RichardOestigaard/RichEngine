@@ -155,6 +155,13 @@ using KernelLayout = DraftContextCore;
     if (shape.hiddenSize == 4096 && shape.dynamicSize == 1024)
       return KernelLayout::Hidden4096;
     break;
+  case KernelLayout::Hidden2560:
+    // Qwen3.8-Flash-Next's DFlash2 draft: draft_conv_h2560 covers every
+    // hidden-2560/dynamic-640 draft; headKernel() already dispatched the
+    // 32x8x128 attention geometry.
+    if (shape.hiddenSize == 2560 && shape.dynamicSize == 640)
+      return KernelLayout::Hidden2560;
+    break;
   case KernelLayout::Plain5120:
     if (shape.dynamicSize == 0 && shape.hiddenSize == 5120)
       return KernelLayout::Plain5120;
@@ -235,6 +242,9 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
     break;
   case KernelLayout::Hidden4096:
     name = kDraftConvH4096.data();
+    break;
+  case KernelLayout::Hidden2560:
+    name = kDraftConvH2560.data();
     break;
   default:
     throw std::invalid_argument("a plain draft has no dynamic convolutions");

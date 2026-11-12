@@ -186,6 +186,34 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 24,
               "MoE GGUF expert parameters are 24 bytes on both sides");
 
+// The streamed GGUF expert pass (moe_expert_gguf_streamed_*): the routed
+// experts' weights are not resident — the tile's expert resolves through
+// the arena's slot table (expert -> global slot, ~0u while unstaged) and
+// chunk address table (chunk -> the nine region GPU addresses, the staged
+// convention of runtime/qwen4/metal/abi/MoE.h: projection z's plane0,
+// plane1 and meta at z * 3 + p, a format without plane1 holding its meta
+// region's address in plane1's entry). A global slot below floor_slots
+// lies in chunk 0 at its own index; past it, chunk
+// 1 + (slot - floor_slots) / chunk_slots at the remainder. The shared
+// expert (id `experts`) keeps its resident segment, bound in the sw*
+// slots. projection is the pass's 0 gate, 1 up, 2 down.
+#define MOE_GGUF_STREAM_REGIONS 9u
+
+struct MoeGgufStreamParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t routed_format;
+  uint32_t shared_format;
+  uint32_t floor_slots;
+  uint32_t chunk_slots;
+  uint32_t projection;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(MoeGgufStreamParams) == 36,
+              "MoE GGUF streamed expert parameters are 36 bytes on both sides");
+
 // The fused gate+up pass (moe_expert_gguf_*_gu): one dispatch computes both
 // projections of a tile and stores silu(gate) * up — the split passes'
 // EpUpWithGate association without the intermediate store. Each segment

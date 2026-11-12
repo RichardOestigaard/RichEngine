@@ -2,6 +2,8 @@
 // kernels/decode/linear_gguf_sgmatrix.metal).
 #include "Linear.hpp"
 #include "Tuning.hpp"
+#include "Env.hpp"
+#include "model/ModelPolicy.hpp"
 #include "ops/DeviceTuning.hpp"
 #include "ops/KernelNames.hpp"
 
@@ -131,7 +133,15 @@ void requireSegments(const Projection &p, LinearMatrix matrix) {
   for (const QuantizedSegment &s : p.blocks().segments) {
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
-    if (!s.isFloat()) requireSegmentPlanes(s, "projection", p.planeInputs());
+    if (!s.isFloat()) {
+      // The image's meta unit is meta_groups quant groups of 32 inputs:
+      // inputs that do not fill whole units have no plane layout the
+      // kernels' group walk reads (a 320-input Q8_0 segment fills ten
+      // units; a Q4_K one needs whole 256-input superblocks).
+      if (s.inputSize % (32 * s.format().meta_groups))
+        throw std::invalid_argument("block segments do not fill whole meta units");
+      requireSegmentPlanes(s, "projection", p.planeInputs());
+    }
   }
 }
 
@@ -140,6 +150,14 @@ uint32_t segmentColumns(const Projection &p) {
   uint32_t columns = 0;
   for (const QuantizedSegment &s : p.blocks().segments) columns += s.outputSize;
   return columns;
+}
+
+// RICHENGINE_PREFILL_FAST_INT8's GGUF half: the flag and the
+// RICHENGINE_PREFILL_I8_SKIP epilogue mask Linear.cpp's affine path reads.
+bool ggufInt8Prefill(LinearEpilogue epilogue) {
+  static const bool on = model::modelPolicy().prefillFastInt8;
+  static const uint32_t skip = envUint("RICHENGINE_PREFILL_I8_SKIP", 0);
+  return on && !(skip & (1u << uint32_t(epilogue)));
 }
 
 // The kernel name suffix of an epilogue and the buffer it reads besides the
@@ -222,6 +240,20 @@ inline bool oneFormat(std::span<const Projection *const> projections) {
                                       &gate = projections[1]->blocks().segments;
   return up.size() == 1 && gate.size() == 1 && !up.front().isFloat() &&
          up.front().formatId == gate.front().formatId;
+}
+
+// The K splits a block plan's tile may take for `k` inputs, which the split
+// rule's multiple-of-256 assumption does not guarantee of narrow K:
+// requireBlockConfiguration has staged partitions cover whole 32-input
+// groups and the register tile whole 256-input units, so a wider pick is
+// halved until it fits (splits are powers of two).
+LinearConfig fitBlockSplits(LinearConfig config, uint32_t k) {
+  if (config.tile == LinearTile::GgufRegister) {
+    while (config.splits > 1 && k / 256 < config.splits) config.splits >>= 1;
+  } else {
+    while (config.splits > 1 && (k / 32) % config.splits) config.splits >>= 1;
+  }
+  return config;
 }
 
 // A single tensor's decode dispatches through `tensor(segment, epilogue
@@ -322,7 +354,8 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   const auto [n, k] = w.matrix;
   // The install's own kernel-pass measurement outranks every rule below.
-  if (const auto measured = measuredLinearPlan(policy_, w)) return *measured;
+  if (const auto measured = measuredLinearPlan(policy_, w))
+    return fitBlockSplits(*measured, k);
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
   // the same half stage and matmul rows, so its outputs equal the prefill
@@ -344,9 +377,10 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (w.phase == LinearPhase::Prefill) {
     const bool staged = w.rows <= 32 ||
                         (policy_.family == 10 && w.rows <= kMaximumStagedPrefillRows);
-    return staged ? LinearConfig{.tile = LinearTile::GgufStaged,
-                                 .splits = decodeSplits(policy_, n, k, stagedTiers(policy_))}
-                  : LinearConfig{.tile = LinearTile::GgufPrefill};
+    return fitBlockSplits(staged ? LinearConfig{.tile = LinearTile::GgufStaged,
+                                                .splits = decodeSplits(policy_, n, k, stagedTiers(policy_))}
+                                 : LinearConfig{.tile = LinearTile::GgufPrefill},
+                         k);
   }
   // A decode step wider than the staged decode tile runs the register
   // kernels, whose `_l` variants scale to the batch's rows; on Apple10
@@ -357,10 +391,11 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // staged pair at 64 rows, so decode beyond 32 rows keeps the pair.
   if (w.rows > 32 &&
       !(policy_.family == 10 && w.rows <= kMaximumStagedPrefillRows))
-    return registerDecode(policy_, n, k);
+    return fitBlockSplits(registerDecode(policy_, n, k), k);
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (policy_.isApple9() && !apple9Stages(w, projections)) return registerDecode(policy_, n, k);
+  if (policy_.isApple9() && !apple9Stages(w, projections))
+    return fitBlockSplits(registerDecode(policy_, n, k), k);
   const bool spreads = spreadsStagedDecode(policy_);
   const bool onePass =
       spreads && w.rows <= 32 && w.epilogue == LinearEpilogue::GateUp &&
@@ -373,7 +408,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
       apple10Registers(policy_, w.rows, onePass ? 2 * n : n,
                        shape.fourBits && everyQuantizedSegment(projections, fourBitsPerWeight)))
-    return registerDecode(policy_, n, k);
+    return fitBlockSplits(registerDecode(policy_, n, k), k);
   bool native = false;
   for (const Projection *p : projections) {
     if (!p) continue;
@@ -404,14 +439,14 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
       w.rows == RICHENGINE_TARGET_VERIFY_ROWS && config.splits == 1 &&
       policy_.family >= 10)
     config.sixteenRows = true;
-  return config;
+  return fitBlockSplits(config, k);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(policy_))
-    size.include(LinearPlan(w, oneGateUpPassDecode(policy_, n, k)).scratchSize());
+    size.include(LinearPlan(w, fitBlockSplits(oneGateUpPassDecode(policy_, n, k), k)).scratchSize());
   // A lane may run the 16-row tile (sixteenRows): its input table takes
   // twice the rows of the 8-row plan — reserve it either way.
   if (w.rows == RICHENGINE_TARGET_VERIFY_ROWS)
@@ -419,17 +454,17 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
                                             .sixteenRows = true})
                      .scratchSize());
   if (policy_.isApple9()) {
-    size.include(LinearPlan(w, stagedDecode(policy_, n, k)).scratchSize());
+    size.include(LinearPlan(w, fitBlockSplits(stagedDecode(policy_, n, k), k)).scratchSize());
     // Decode steps wider than the staged tile run the register kernels
     // (ggufBaseline): their split count comes from the register tiers,
     // which the baseline does not reach on Apple9.
-    size.include(LinearPlan(w, registerDecode(policy_, n, k)).scratchSize());
+    size.include(LinearPlan(w, fitBlockSplits(registerDecode(policy_, n, k), k)).scratchSize());
   }
   if (policy_.family >= 10) {
     // Apple10 picks the register tile on narrow grids (apple10Registers):
     // reserve its Table16 operand, which the projections here are not known
     // to exclude.
-    size.include(LinearPlan(w, registerDecode(policy_, n, k)).scratchSize());
+    size.include(LinearPlan(w, fitBlockSplits(registerDecode(policy_, n, k), k)).scratchSize());
   }
   if (policy_.nativeFormats() && w.phase == LinearPhase::Decode && w.weightLayout == WeightLayout::Block32) {
     // An MXFP4 segment decodes on the MXFP4 tiers' splits (ggufBaseline),
@@ -439,8 +474,9 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
     // takes the largest of all three (the segments are not known here).
     const uint32_t splits = std::max(decodeSplits(policy_, n, k, mxfp4Tiers()),
                                      measuredGgufSplitBound(policy_, n, k, stagedTileRows(w.rows)));
-    size.include(LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged,
-                                            .splits = splits})
+    size.include(LinearPlan(w, fitBlockSplits(LinearConfig{.tile = LinearTile::GgufStaged,
+                                                           .splits = splits},
+                                             k))
                      .scratchSize());
   }
   // A decode plan packs its activations when a projection is MXFP4
@@ -892,7 +928,43 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
                b.input, b.input, b.input, b.input, b.input},
               GgufDecodeParams{k, 1, n, 0, 0}, {uint64_t{rows} * k / 32, 1, 1}, {32, 1, 1});
   }
+  // RICHENGINE_PREFILL_FAST_INT8: the chunk's rows quantize once into the
+  // int8 operand buffers, then each AF segment runs its int8 tile while the
+  // rest keep the bf16 one (kernels/prefill/gguf_prefill_int8.metal). The
+  // buffers are the affine int8 path's, empty when the flag is off.
+  const bool int8 =
+      ggufInt8Prefill(w.epilogue) && k % GGUF_PREFILL_INT8_GROUP == 0 &&
+      std::any_of(segments.begin(), segments.end(),
+                  [](const QuantizedSegment &s) { return gguf_prefill_int8_format(s.formatId); });
+  const uint32_t i8Storage = plan.storageRows();
+  if (int8) {
+    requireBytes(b.scratch.i8codes, uint64_t{w.rows} * k, "i8 codes");
+    requireBytes(b.scratch.i8params, uint64_t{k / GGUF_PREFILL_INT8_GROUP} * i8Storage * 8,
+                 "i8 scales");
+    const uint32_t groups = k / GGUF_PREFILL_INT8_GROUP;
+    graph.add(std::string("gguf_prefill_int8_quantize"),
+              {b.input, b.scratch.i8codes, b.scratch.i8params},
+              GgufPrefillInt8QuantizeParams{k, w.rows, i8Storage},
+              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) /
+                   GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS,
+               w.rows, 1},
+              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+  }
   for (const QuantizedSegment &s : segments) {
+    if (int8 && gguf_prefill_int8_format(s.formatId)) {
+      const uint32_t columnTiles = s.outputSize / GGUF_TILE_COLUMNS;
+      const uint32_t rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
+      const uint32_t tiles = columnTiles * rowTiles;
+      graph.add(std::string("gguf_prefill_int8_") + s.name() + "_" + epilogue,
+                {b.scratch.i8codes, b.scratch.i8params, s.plane0, s.meta, b.output,
+                 epilogueInput(b, w.epilogue)},
+                GgufPrefillInt8Params{k, w.rows, i8Storage, n, s.columnOffset,
+                                     p.planeInputs() ? p.planeInputs() : k, columnTiles},
+                {GGUF_PREFILL_INT8_WALK,
+                 (tiles + GGUF_PREFILL_INT8_WALK - 1) / GGUF_PREFILL_INT8_WALK, 1},
+                {GGUF_PREFILL_INT8_THREADS, 1, 1});
+      continue;
+    }
     std::vector<metal::MetalBuffer> bindings;
     if (packs && s.formatId == GGUF_FMT_MXFP4) {
       bindings = {b.scratch.input, s.plane0, b.scratch.sums, s.meta, b.output};

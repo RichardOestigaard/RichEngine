@@ -407,6 +407,19 @@ struct MoeBuffers final {
   metal::MetalBuffer verifyRows;
 };
 
+// The streamed routed experts' device state a streamed GGUF expert pass
+// binds (model::ExpertArena's published tables): slotTable holds each
+// routed expert's global arena slot (~0u while it holds none — the pass
+// skips that expert's tiles), chunkAddresses the chunks' nine region GPU
+// addresses each (gate, up, down plane0/plane1/meta), and the chunk
+// geometry the kernels map a slot through.
+struct MoeStreamBinding final {
+  metal::MetalBuffer slotTable;
+  metal::MetalBuffer chunkAddresses;
+  uint32_t floorSlots = 0;
+  uint32_t chunkSlots = 0;
+};
+
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
@@ -420,6 +433,25 @@ struct MoE final {
                                           MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
+  // The route-first split of add() for streamed routed experts (a GGUF
+  // block, Block32 weights): addRouting encodes the router, select, cap
+  // and grouping dispatches; the host then learns the step's expert union,
+  // stages it into the arena and calls addGgufGather once and
+  // addGgufPasses once per staged batch — each pass skips the tiles of
+  // experts the binding's slot table leaves empty — and addCombine once
+  // after the last batch. The split methods encode the same dispatches
+  // add() would for a block plan; they throw for affine weights and for a
+  // streamed binding on a plan that is not the staged GGUF tile. add()
+  // itself is unchanged and remains the path of every other caller.
+  static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const MoeWeights &weights, const MoePlan &plan);
+  static void addGgufGather(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                            const MoeWeights &weights, const MoePlan &plan);
+  static void addGgufPasses(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                            const MoeWeights &weights, const MoePlan &plan,
+                            const MoeStreamBinding *streamed = nullptr);
+  static void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const MoeWeights &weights, const MoePlan &plan);
   // Gemma 4's block: moe_route_scores_gemma over `routerInput` (or `input`),
   // moe_route_select_gemma's softmax-top_k-renormalized routes scaled by
   // perExpertScale, the grouped GeGLU expert tiles and moe_combine into

@@ -61,7 +61,11 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
 }
 
 void validate(LinearWorkload w) {
-  if (!w.matrix.outputSize || w.matrix.outputSize % 256 ||
+  // GGUF block projections tile 64 output columns a threadgroup where
+  // affine Q4 tiles 256; both read whole 64-input quant groups.
+  const uint32_t columns =
+      w.weightLayout == WeightLayout::Block32 ? GGUF_TILE_COLUMNS : 256;
+  if (!w.matrix.outputSize || w.matrix.outputSize % columns ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
@@ -69,7 +73,11 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % kDecodeActivationRows ||
+    // Decode K partitions whole 256-input blocks of affine Q4; block
+    // projections split whole 32-input groups instead (320-input decode
+    // widths such as a hyper-connection rank included).
+    if ((w.weightLayout != WeightLayout::Block32 && w.matrix.inputSize % 256) ||
+        !w.rows || w.rows % kDecodeActivationRows ||
         w.rows > RICHENGINE_TARGET_VERIFY_ROWS * RICHENGINE_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");

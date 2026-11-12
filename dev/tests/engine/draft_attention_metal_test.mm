@@ -57,7 +57,11 @@ constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128, 0, kWindow,
                         DraftHeadCore::Q32K8D128, DraftContextCore::Hidden5120},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128, 0, kWindow,
-                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2048}};
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2048},
+    // Qwen3.8-Flash-Next's DFlash2 draft: hidden 2560 over the same
+    // 32x8x128 heads, its dynamic convolutions 640 wide.
+    DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128, 0, kWindow,
+                        DraftHeadCore::Q32K8D128, DraftContextCore::Hidden2560}};
 
 using richengine::test::require;
 

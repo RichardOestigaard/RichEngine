@@ -452,7 +452,13 @@ constexpr uint32_t kQsaVerifyLaneRecords =
       for (uint32_t lane = 0; lane < lanes; ++lane)
         staged[lane * stride] = *entries[lane]->pendingToken;
     }
-    if (deviceVerifyParams_) {
+    const auto *qwen4 =
+        std::get_if<Qwen4ExpWeights>(&package.target);
+    // A streamed PLE table needs the rows' ids on the host, so the device
+    // verify-params variant (which skips the encoder's input hook) cannot
+    // run: the staged variant's tokens are hashed by qwen4ExpVerifyPleIds.
+    const bool pleStream = qwen4 && qwen4->streamedTable;
+    if (deviceVerifyParams_ && !pleStream) {
       // The device variant binds the step pack: each lane takes its
       // anchor and live count from the pack when it proves to be that
       // lane's own predecessor's. The staged payload still carries the
@@ -478,8 +484,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     // first verify row (upstream Qwen4Steps::prepareVerifyLane's
     // plePriorTokens); underflow lanes get the none id.
     MetalBuffer plePriorTokens;
-    if (const auto *qwen4 =
-            std::get_if<Qwen4ExpWeights>(&package.target)) {
+    if (qwen4) {
       const uint32_t priors = qwen4->layout.pleNgram - 1;
       plePriorTokens =
           decodeArena->packed(DecodeTensor::PlePriorTokens, lanes);
@@ -496,10 +501,47 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                   : NGRAM_EMBEDDING_NONE;
       }
     }
+    // A streamed PLE table stages its rows on the host: the verify rows'
+    // tokens are the verify_input_tokens layout's (anchor, proposals,
+    // anchor past the live rows), hashed by qwen4ExpVerifyPleIds — the CPU
+    // twin of the GPU hash a resident table still runs.
+    std::vector<uint32_t> pleIds;
+    if (pleStream) {
+      const uint32_t verifyStride = geometry.draft.verifyRows();
+      const uint32_t priors = qwen4->layout.pleNgram - 1;
+      static const bool allLive = tuning().verifyAllLive;
+      const uint32_t *proposed =
+          contents<uint32_t>(proposals, "verify proposals");
+      const uint32_t *priorTokens =
+          contents<uint32_t>(plePriorTokens, "PLE prior tokens");
+      const uint32_t vocabulary = geometry.target.vocabularySize;
+      std::vector<uint32_t> tokens(uint64_t{lanes} * verifyStride);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t anchor = *entries[lane]->pendingToken;
+        const uint32_t live =
+            !allLive && lane < liveRows.size()
+                ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
+                : verifyStride;
+        for (uint32_t row = 0; row < verifyStride; ++row) {
+          const uint32_t token = row == 0 || row >= live
+                                     ? anchor
+                                     : proposed[lane *
+                                                    RICHENGINE_DRAFT_PROPOSAL_TOKENS +
+                                                row - 1];
+          tokens[uint64_t{lane} * verifyStride + row] =
+              std::min(token, vocabulary - 1);
+        }
+      }
+      const uint32_t heads = qwen4->layout.pleHeads();
+      pleIds.resize(uint64_t{lanes} * verifyStride * heads);
+      qwen4ExpVerifyPleIds(*qwen4, lanes, verifyStride, tokens,
+                           {priorTokens, uint64_t{lanes} * priors},
+                           pleIds.data());
+    }
     targetModel.addVerifyInput(
         graph, draftInput, proposals, verifyInput, lanes,
         geometry.draft.verifyRows(), geometry.draft.queryRows(), liveRows,
-        std::move(plePriorTokens));
+        std::move(plePriorTokens), pleIds);
   }
 
   void Runtime::Impl::encodeBatchStepPack(

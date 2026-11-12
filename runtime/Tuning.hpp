@@ -55,6 +55,12 @@ struct Tuning {
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
   // ops/Linear.cpp, model/RuntimeArenas.hpp
   bool prefillFastInt8 = false; // RICHENGINE_PREFILL_FAST_INT8 (presence)
+  // ops/PagedAttention.cpp: opt-in INT8-query (q8q) attention scoring on
+  // INT8 pages — RICHENGINE_Q8Q_ATTENTION (presence), and the
+  // pages-per-split at which a split's query quantization pays —
+  // RICHENGINE_Q8Q_ATTENTION_PAGES (0 keeps the measured default).
+  bool q8qAttention = false;      // RICHENGINE_Q8Q_ATTENTION (presence)
+  uint32_t q8qAttentionPages = 0; // RICHENGINE_Q8Q_ATTENTION_PAGES
   // ops/Linear.cpp
   bool prefillQ4M64 = false;  // RICHENGINE_PREFILL_Q4_M64 (presence)
   // Opt-in prefill experiments: >1 splits K across that many threadgroups of
@@ -276,6 +282,10 @@ struct Tuning {
       RICHENGINE_VERIFY_ATTENTION_MAXIMUM_SPLITS;  // RICHENGINE_VERIFY_SPLITS_MAX
   uint32_t prefillSplitsMax =
       RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS;  // RICHENGINE_PREFILL_SPLITS_MAX
+  // Pages of history one dense prefill split covers — 0 takes the
+  // generation's measured default (ExecutionPlans::prefillPagesPerSplit);
+  // RICHENGINE_PREFILL_PAGES_PER_SPLIT overrides on any tier.
+  uint32_t prefillPagesPerSplit = 0;  // RICHENGINE_PREFILL_PAGES_PER_SPLIT
   // The install's measured affine Linear plans, written into tuning.json by
   // the autotune's kernel pass (install/autotune.py) as
   // "{{output, input}, rows, LinearPhase::X, LinearEpilogue::Y}="
@@ -314,6 +324,8 @@ inline Tuning makeTuning() {
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
   t.prefillFastInt8 = envFlag("RICHENGINE_PREFILL_FAST_INT8");
+  t.q8qAttention = envFlag("RICHENGINE_Q8Q_ATTENTION");
+  t.q8qAttentionPages = envUint("RICHENGINE_Q8Q_ATTENTION_PAGES", 0);
   t.prefillQ4M64 = envFlag("RICHENGINE_PREFILL_Q4_M64");
   t.prefillQ4Ksplit = envUint("RICHENGINE_PREFILL_Q4_KSPLIT", 0);
   t.prefillQ4Persistent = envUint("RICHENGINE_PREFILL_Q4_PERSISTENT", 0);
@@ -447,6 +459,8 @@ inline Tuning makeTuning() {
       envUint("RICHENGINE_PREFILL_SPLITS_MAX",
               RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS),
       1u, RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS);
+  t.prefillPagesPerSplit =
+      envUint("RICHENGINE_PREFILL_PAGES_PER_SPLIT", 0);
   t.linearPlans = std::getenv("RICHENGINE_LINEAR_PLANS");
   return t;
 }

@@ -4,6 +4,7 @@
     "unsloth/Qwen3.8-Flash-Next-GGUF",
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
   ],
+  "note": "Packed-only target: the runtime loads MDFQ-packed files and no GGUF image plan or safetensors loader maps the qwen4exp tensor set (packedOnly), so pack.layout states qwen4ExpTargetLayout's geometry (pack_layouts.Qwen4ExpLayout). pack.draft_layout (kind dflash2, pack_layouts.DFlash2Layout) states the DFlash2 draft's packed geometry: install/pack.py emits its draft/*.bin files under MDFD0004 with the two dynamic projections per layer as F32 GGUF segments, and the manifest's draft object declares DFlash2DraftModel so runtime/model/families/Qwen4.mm's declared-draft binding applies.",
   "signature": {
     "model_type": "qwen4_exp_text",
     "max_position_embeddings": 262144,
@@ -41,6 +42,83 @@
         31,
         47
       ]
+    }
+  },
+  "defaults": {
+    "packed_format": "packed-qwen4exp",
+    "quant": "q4"
+  },
+  "pack": {
+    "layout": {
+      "maximum_context_tokens": 262144,
+      "layers": 48,
+      "hidden_size": 2560,
+      "vocabulary_size": 248320,
+      "packed_gdn_width": 16512,
+      "packed_full_width": 13312,
+      "convolution_dimension": 10240,
+      "convolution_taps": 4,
+      "gdn_key_heads": 16,
+      "gdn_value_heads": 48,
+      "gdn_head_dimension": 128,
+      "attention_width": 6144,
+      "attention_query_heads": 24,
+      "attention_kv_heads": 2,
+      "attention_head_dimension": 256,
+      "attention_query_stride": 2,
+      "attention_qk_norm": true,
+      "rotary_pairs": 32,
+      "rotary_theta": 10000000.0,
+      "full_attention_period": 4,
+      "mask_token": 248077,
+      "stop_tokens": [
+        248044,
+        248046
+      ],
+      "capture_layers": [
+        3,
+        17,
+        31,
+        47
+      ],
+      "experts": 512,
+      "experts_per_token": 10,
+      "expert_intermediate_size": 640,
+      "packed_expert_width": 768,
+      "moe_shared_expert": true,
+      "hyper_connections": 4,
+      "hyper_rank": 320,
+      "indexer_heads": 4,
+      "indexer_head_dimension": 128,
+      "indexer_top_blocks": 512,
+      "indexer_block_tokens": 4,
+      "ple_layer": 1,
+      "ple_ngram": 3,
+      "ple_heads_per_ngram": 8,
+      "ple_head_dimension": 160,
+      "ple_convolution_taps": 4,
+      "ple_eos_token": 248044,
+      "ple_image_token": 248056
+    },
+    "draft_layout": {
+      "kind": "dflash2",
+      "layers": 3,
+      "hidden": 2560,
+      "vocabulary": 248320,
+      "dynamic": 640,
+      "intermediate": 5120,
+      "selector_rank": 256,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "query_heads": 32,
+      "rotary_theta": 1000000.0,
+      "block_size": 8,
+      "target_hidden": 10240,
+      "sliding_window": 2048
+    },
+    "execution_geometry": {
+      "draft_proposal_tokens": 7,
+      "draft_query_rows": 8
     }
   },
   "serving": {

@@ -219,6 +219,10 @@ struct TargetModelGeometry final {
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   kv::Layout kvLayout{};
+  // The resolved DuoAttention policy (kv::DuoPolicy): head_mask holds one
+  // bit per (attention ordinal, KV head) pair; layerDuoPolicy derives each
+  // layer's kernel tail. All zero is dense attention.
+  kv::DuoPolicy duoAttention{};
   GdnStateLayout stateLayout{};
   // Gemma 4's second attention geometry: layers whose bit is set in
   // altAttentionMask are the global layers — altKvHeads KV heads of
@@ -327,6 +331,12 @@ struct TargetModelGeometry final {
       layout.windowTokens = slidingWindowTokens;
     }
     return layout;
+  }
+  // The layer's DuoAttention kernel tail: the model policy's head nibble for
+  // this attention ordinal, or the zero policy on a target without it.
+  [[nodiscard]] constexpr kv::DuoPolicy
+  layerDuoPolicy(uint32_t attentionOrdinal) const noexcept {
+    return kv::duoLayerPolicy(duoAttention, attentionOrdinal, attentionKvHeads);
   }
   [[nodiscard]] constexpr uint32_t layerHeadDimension(uint32_t layer) const noexcept {
     return isAltAttentionLayer(layer) ? altHeadDimension : attentionHeadDimension;
@@ -679,13 +689,17 @@ public:
   // holds, for a target whose verify rows hash their context (qwen4exp's
   // PLE), the tokens before each lane's first row — pleNgram - 1 per lane,
   // nearest first — that the layer encoder's onVerifyInput hook hashes with.
+  // pleRowIds holds the rows' PLE table ids instead, for a target whose
+  // table streams (qwen4exp's SparseRowStore stages them); empty keeps the
+  // GPU hash.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
                       metal::MetalBuffer verifyInput, uint32_t lanes,
                       uint32_t verifyStride = ExecutionLimits::targetVerifyRows,
                       uint32_t draftStride = ExecutionLimits::draftQueryRows,
                       std::span<const uint32_t> liveRows = {},
-                      metal::MetalBuffer plePriorTokens = {}) const;
+                      metal::MetalBuffer plePriorTokens = {},
+                      std::span<const uint32_t> pleRowIds = {}) const;
   // A tree batch's verify inputs: each lane's RICHENGINE_TREE_VERIFY_NODES nodes
   // supply the input tokens, rope positions and ancestor masks. `base` is
   // each lane's (t, h, w) rotary position at its committed length.

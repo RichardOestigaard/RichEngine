@@ -256,8 +256,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   void releasePrefillInputBank(uint32_t bank) noexcept {
     prefillInputBanksInFlight_ &= ~(1u << bank);
   }
-  // A bank is free while fewer than two prefills are unconsumed.
+  // A bank is free while fewer than two prefills are unconsumed. A
+  // streamed-expert qwen4exp prefill submits and waits mid-encode — the
+  // routed union is GPU data — so it keeps at most one command in flight:
+  // no submit-ahead overlap for it.
   bool prefillSubmitAheadAvailable() const noexcept {
+    if (const auto *qwen4 = std::get_if<Qwen4ExpWeights>(&package.target);
+        qwen4 && qwen4->expertStreaming.requested)
+      return false;
     return prefillInputBanksInFlight_ != 3;
   }
   std::unique_ptr<DecodeArena> decodeArena;
@@ -1465,6 +1471,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           policy.penalties.active())
         return false;
     }
+    // Qwen3.8-Flash-Next's QSA attention has no tree-verify kernels
+    // (verifyPlan refuses sparse + tree), and a streamed PLE table stages
+    // its rows from the chain verify's host ids — a tree batch never runs
+    // the encoder's input hook, so it cannot stage either. qwen4exp
+    // verifies the chain, streamed table or not.
+    if (std::holds_alternative<Qwen4ExpWeights>(package.target))
+      return false;
     // Adaptive admission: the batch trees only while every lane's
     // accepted-proposal EWMA sits inside the band — saturated lanes keep
     // the deeper chain (the comb's leaves never win once the top pick

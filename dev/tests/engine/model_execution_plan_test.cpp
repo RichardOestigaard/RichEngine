@@ -194,8 +194,11 @@ void checkDraftStorageLanes() {
   device.gpuCoreCount = 20;
   const ops::ExecutionPlans plans(device);
   model::RuntimeGeometry geometry;
-  require(model::DecodeArena::draftStorageLanes(geometry, plans, 3) == 3,
-          "a draftless model must keep the logical lane bound");
+  // The default draft layout's Block32 projections pad the three-lane
+  // step's 48 rows to the staged tile's 64-row height on Apple10, so the
+  // storage bound is four 16-row strides, not the logical three.
+  require(model::DecodeArena::draftStorageLanes(geometry, plans, 3) == 4,
+          "draft storage must cover the staged tile's padded rows");
   geometry.draft = model::denseDraftLayout();
   // The projection the shipped failure threw on (n=2560, k=2048).
   ops::ProjectionShape qkv{geometry.draft.qkvSize, geometry.draft.hiddenSize};
@@ -421,7 +424,7 @@ void moeCovers(const ops::MoeWorkspace &stride, const ops::MoeWorkspace &needed,
 void checkQwen4Exp() {
   const model::TargetLayout layout = model::qwen4ExpTargetLayout();
   const ops::MoeShape wide{layout.hiddenSize, layout.experts,
-                           layout.expertsPerToken, layout.expertIntermediateSize,
+                           layout.expertsPerToken, layout.packedExpertWidth,
                            ops::WeightLayout::Block32};
   require(wide.valid() && wide.wideExperts() && wide.routerWidth() == 512,
           "the 512-expert GGUF MoE shape stays refused");
@@ -433,6 +436,7 @@ void checkQwen4Exp() {
   wider.experts = wide.experts + 1;
   ops::MoeShape narrow = wide;
   narrow.experts = 256;
+  narrow.expertIntermediateSize = 384;
   require(!affine.valid() && !sigmoid.valid() && !wider.valid() &&
               !narrow.valid(),
           "the MoE shape gate widened past the wide family");
@@ -454,19 +458,18 @@ void checkQwen4Exp() {
     for (uint32_t rows = 1; rows <= 256; ++rows)
       moeCovers(bound, plans.moePrefill(geometry.target.moeShape(), rows).workspace(),
              1);
-    // Arena sizing gets past the MoE scratch and reaches the next,
-    // unrelated gate: a hyper-mix down or indexer key projection (320- or
-    // 128-wide output) misses Linear's 256-column bound — the same wall
-    // the packed projections would hit at encode.
-    try {
-      (void)model::prefillTensorBytes(geometry, plans);
-      (void)model::DecodeArena::linearScratchSize(geometry, plans);
-      require(false, "qwen4exp arena sizing passed a non-MoE gate unexpectedly");
-    } catch (const std::invalid_argument &error) {
-      require(std::string_view{error.what()}.find("linear matrix") !=
-                  std::string_view::npos,
-              "qwen4exp arena sizing hit an unexpected gate");
-    }
+    // Arena sizing gets past the MoE scratch and the narrow projections:
+    // the hyper-mix downs (320-wide output), ups (320 inputs) and indexer
+    // keys (128-wide output) plan on the GGUF tiles' 64-column grids.
+    const auto tensors = model::prefillTensorBytes(geometry, plans);
+    require(std::any_of(tensors.begin(), tensors.end(),
+                        [](uint64_t bytes) { return bytes; }),
+            "qwen4exp prefill arena sizing returned an empty arena");
+    const auto scratch =
+        model::DecodeArena::linearScratchSize(geometry, plans);
+    require(scratch.partials || scratch.counters || scratch.input ||
+                scratch.sums,
+            "qwen4exp decode scratch sizing returned nothing");
   }
 }
 

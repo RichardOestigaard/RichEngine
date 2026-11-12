@@ -431,10 +431,14 @@ inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint
                      std::vector<float> *Ws = nullptr) {
   const QuantFormat &fi = kQuantFormats[f];
   const uint32_t G = K / 32, rb = rowBytes(f, K), units = G / fi.meta_groups;
+  // The planes' rows pad to whole QUANT_TILE_ROWS tiles, as the image
+  // layout's quant_tile_index addressing requires of a row count that is
+  // not a tile multiple (the kernels read only rows below N).
+  const uint32_t rows = (N + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
   Packed p;
-  p.w0.assign((size_t)N * G * fi.plane0_bytes, 0);
-  p.w1.assign(fi.plane1_bytes ? (size_t)N * G * fi.plane1_bytes : 16, 0);
-  p.meta.assign((size_t)N * units * fi.meta_bytes, 0);
+  p.w0.assign((size_t)rows * G * fi.plane0_bytes, 0);
+  p.w1.assign(fi.plane1_bytes ? (size_t)rows * G * fi.plane1_bytes : 16, 0);
+  p.meta.assign((size_t)rows * units * fi.meta_bytes, 0);
   if (Wf) Wf->assign((size_t)N * K, 0.f);
   if (Ws) Ws->assign((size_t)N * K, 0.f);
   for (uint32_t n = 0; n < N; ++n) {

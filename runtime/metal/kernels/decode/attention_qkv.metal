@@ -57,6 +57,11 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4_f32, 16, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, float)
+// Qwen3.8-Flash-Next's QSA layers (kv::Core::Kv2Group12H256): 24 query
+// heads of 256 grouped twelve-to-one over 2 KV heads, the [q|gate] packed
+// rows and per-head QK norms the defaults already express.
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, bfloat)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, float)
 #undef VERIFY_ATTENTION_QKV
 
 // The head-dimension variants' decode phase: no query gate, a full rotary of
@@ -197,6 +202,17 @@ kernel void verify_attention_gate_kv2_g8(
       packed_qkv, attention, hidden, params, index, grid_size);
 }
 
+kernel void verify_attention_gate_kv2_g12(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullDecodeBatchParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_decode_phase<24, 2>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
 #define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout, HeadDim, Gate) \
   kernel void Name( \
       device const bfloat *packed [[buffer(0)]], \
@@ -218,9 +234,11 @@ kernel void verify_attention_gate_kv2_g8(
 ATTENTION_GATE_TABLE(verify_attention_gate_table64, 24, 4, q4sg::Table64, 256, true)
 ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv4_g4, 16, 4, q4sg::Table64, 256, true)
 ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g8, 16, 2, q4sg::Table64, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table64_kv2_g12, 24, 2, q4sg::Table64, 256, true)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16, 256, true)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv4_g4, 16, 4, gguf_sg::Table16, 256, true)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16, 256, true)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g12, 24, 2, gguf_sg::Table16, 256, true)
 // The no-gate gather variants of the dense and LFM2 targets, head
 // dimensions 128 and 64.
 ATTENTION_GATE_TABLE(verify_attention_gather_table64_hd128, 16, 2, q4sg::Table64, 128, false)
@@ -264,6 +282,7 @@ ATTENTION_GATE_TABLE(verify_attention_gather_table16_gemma_hd512, 16, 2, gguf_sg
 ATTENTION_GATE_PACKED(verify_attention_gate_packed, 24, 4, 256, true)
 ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv4_g4, 16, 4, 256, true)
 ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv2_g8, 16, 2, 256, true)
+ATTENTION_GATE_PACKED(verify_attention_gate_packed_kv2_g12, 24, 2, 256, true)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd128, 16, 2, 128, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd64, 32, 8, 64, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_k8q5d64, 40, 8, 64, false)

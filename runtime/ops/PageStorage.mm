@@ -38,13 +38,19 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     // geometry: a dual-geometry pool (Gemma 4's local h256 and global hd512
     // layers) prices each layer's region at that layer's shape, and the
     // extent size keeps every region 64 KiB-aligned by
-    // extentAlignmentPages()'s stride.
+    // extentAlignmentPages()'s stride. They fill the extent's K/V part; a
+    // block index's plane (Layout::indexDimension, qwen4exp's QSA pooled
+    // keys) takes the rest, where indexPlaneOffset() starts it and
+    // indexSpans() reaches it.
     uint64_t offset = 0;
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
         layers_.push_back({extentPages_, static_cast<uint32_t>(offset)});
         offset += extentPages_ * layout_.bytesPerLayerPageAt(layer);
     }
-    if (offset != extentBytes()) {
+    if (offset != indexPlaneOffset() ||
+        indexPlaneOffset() +
+                uint64_t{extentPages_} * layout_.indexBytesPerModelPage() !=
+            extentBytes()) {
         throw std::logic_error("KV layer regions do not fill the extent");
     }
     extents_.resize(pageCount_ / extentPages_);

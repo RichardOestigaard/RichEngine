@@ -52,6 +52,10 @@ class WeightImages final : public WeightMemory {
 public:
   explicit WeightImages(metal::MetalBackend &backend, std::string contentIdentity = {}) noexcept
       : backend_(&backend), contentIdentity_(std::move(contentIdentity)) {}
+  // What the sources the images were written from hold
+  // (ModelDescriptor::sourceIdentity); the records of files a loader reads
+  // without an image (a streamed table) report the same.
+  [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;
 

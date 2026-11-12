@@ -320,6 +320,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
   if (hiddenSize == 5120 && dynamicSize == 1280) return Core::Hidden5120;
   if (hiddenSize == 2048 && dynamicSize == 512) return Core::Hidden2048;
   if (hiddenSize == 4096 && dynamicSize == 1024) return Core::Hidden4096;
+  if (hiddenSize == 2560 && dynamicSize == 640) return Core::Hidden2560;
   if (dynamicSize == 0) {
     if (hiddenSize == 5120) return Core::Plain5120;
     if (hiddenSize == 4096) return Core::Plain4096;
@@ -523,6 +524,93 @@ void validateQwen36(NSDictionary *manifest,
   }
   validateCaptureLayers(draft, targetLayout);
   validateTokenizer(root, descriptor, "qwen3_5_moe_text");
+}
+
+// The packed qwen4exp manifest (install/pack.py's
+// richengine-packed-gguf-qwen4exp): the family's GGUF-block target
+// geometry and, when the package ships one, the DFlash2 draft's
+// declaration — applyManifestDraftKind already bound it to the family's
+// registered layout, so the fields are re-checked against the descriptor.
+void validateQwen4Exp(NSDictionary *manifest,
+                      const std::filesystem::path &root,
+                      const ModelDescriptor &descriptor) {
+  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
+               1, "schema_version");
+  NSDictionary *format =
+      requireObject(manifest, @"format", "model weight format");
+  requireNumbers(format, "format",
+                 {{"q4_bits", 4},
+                  {"q4_group_size", kQ4GroupElements},
+                  {"q4_storage_n", kQ4StorageN}});
+  validateCommonFormat(format, descriptor.target.layerMagic,
+                       draftLayerMagic(descriptor.draft));
+
+  const TargetLayout &targetLayout = descriptor.target;
+  NSDictionary *target =
+      requireObject(manifest, @"target", "target declaration");
+  requireEqual(requireString(target, @"architecture", "target architecture"),
+               "qwen4exp", "target architecture");
+  requireNumbers(target, "target",
+                 {{"layers", targetLayout.layers},
+                  {"hidden_size", targetLayout.hiddenSize},
+                  {"vocabulary_size", targetLayout.vocabularySize},
+                  {"gdn_key_heads", targetLayout.gdnKeyHeads},
+                  {"gdn_value_heads", targetLayout.gdnValueHeads},
+                  {"gdn_head_dimension", targetLayout.gdnHeadDimension},
+                  {"attention_width", targetLayout.attentionWidth},
+                  {"attention_query_heads",
+                   targetLayout.attentionQueryHeads},
+                  {"attention_kv_heads", targetLayout.attentionKvHeads},
+                  {"attention_head_dimension",
+                   targetLayout.attentionHeadDimension},
+                  {"attention_query_stride",
+                   targetLayout.attentionQueryStride},
+                  {"full_attention_period",
+                   targetLayout.fullAttentionPeriod},
+                  {"experts", targetLayout.experts},
+                  {"experts_per_token", targetLayout.expertsPerToken},
+                  {"expert_intermediate_size",
+                   targetLayout.expertIntermediateSize},
+                  {"hyper_connections", targetLayout.hyperConnections},
+                  {"hyper_rank", targetLayout.hyperRank},
+                  {"indexer_heads", targetLayout.indexerHeads},
+                  {"indexer_head_dimension",
+                   targetLayout.indexerHeadDimension},
+                  {"indexer_top_blocks", targetLayout.indexerTopBlocks},
+                  {"indexer_block_tokens", targetLayout.indexerBlockTokens},
+                  {"ple_layer", targetLayout.pleLayer},
+                  {"ple_ngram", targetLayout.pleNgram},
+                  {"ple_heads_per_ngram", targetLayout.pleHeadsPerNgram},
+                  {"ple_head_dimension", targetLayout.pleHeadDimension},
+                  {"ple_convolution_taps",
+                   targetLayout.pleConvolutionTaps}});
+  requireLayerTypes(requireArray(target, @"layer_types", "target layer_types"),
+                    targetLayout, @"attention", @"gdn",
+                    "target layer_types");
+  if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]]) {
+    const DFlashDraftLayout &draftLayout = descriptor.draft;
+    NSDictionary *draft =
+        requireObject(manifest, @"draft", "draft declaration");
+    requireEqual(requireString(draft, @"architecture", "draft architecture"),
+                 draftArchitecture(draftLayout), "draft architecture");
+    requireNumbers(draft, "draft",
+                   {{"layers", draftLayout.layers},
+                    {"hidden_size", draftLayout.hiddenSize},
+                    {"vocabulary_size", draftLayout.vocabularySize},
+                    {"intermediate_size", draftLayout.intermediateSize},
+                    {"num_attention_heads",
+                     draftLayout.attentionSize /
+                         draftLayout.attentionHeadDimension},
+                    {"num_key_value_heads", draftLayout.kvHeads},
+                    {"head_dim", draftLayout.attentionHeadDimension},
+                    {"rope_theta", draftLayout.rotaryTheta},
+                    {"block_size", draftLayout.blockSize},
+                    {"selector_rank", draftLayout.selectorRank},
+                    {"dynamic_size", draftLayout.dynamicSize},
+                    {"sliding_window", draftLayout.slidingWindow},
+                    {"target_hidden_size", draftLayout.targetHiddenSize}});
+  }
+  validateTokenizer(root, descriptor, "qwen4_exp_text");
 }
 
 // The dense and LFM2 packed formats' draft declaration: a plain transformer
@@ -1649,6 +1737,29 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
                            packedFamily->dflashV1Layout());
       }
       validateGemma4(manifest, root, descriptor);
+    } else if (canonicalFormat == "richengine-packed-gguf-qwen4exp") {
+      const std::string family =
+          requireString(manifest, @"family", "model family");
+      const ModelFamilyRegistration *entry = findModelFamily(family);
+      if (!entry)
+        throw std::invalid_argument("unsupported model family: " + family);
+      descriptor = entry->makeDescriptor(model);
+      descriptor.family = entry->name;
+      NSDictionary *weightFormat =
+          requireObject(manifest, @"format", "model weight format");
+      // A manifest-declared draft swaps the family's registered DFlash2
+      // layout in for the Null default; a package without one keeps it.
+      if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]]) {
+        const ModelFamilyRegistration *packedFamily =
+            findModelFamily(descriptor.family);
+        const DFlashDraftLayout dflash2Layout =
+            packedFamily->draftLayout ? packedFamily->draftLayout()
+                                      : DFlashDraftLayout{};
+        applyManifestDraftKind(
+            weightFormat, descriptor, nullptr,
+            packedFamily->draftLayout ? &dflash2Layout : nullptr);
+      }
+      validateQwen4Exp(manifest, root, descriptor);
     } else {
       // "richengine-packed-q4-diffusiongemma" is refused here while the
       // family is disabled; the branch and validateDiffusionGemma stay in

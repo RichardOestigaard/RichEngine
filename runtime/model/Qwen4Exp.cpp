@@ -4,13 +4,20 @@
 // section order and its layer bodies (Qwen4ExpTarget.cpp) are the
 // encoder's call order.
 #include "model/Qwen4Exp.hpp"
+#include "model/ExpertArena.hpp"
+#include "model/GgufImageLayout.hpp"
+#include "model/PackedExpertStore.hpp"
+#include "model/SparseRowStore.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/TargetLayerEncoder.hpp"
 #include "model/TargetLoader.hpp"
 #include "model/TargetModelGemmaHelpers.hpp"
 #include "model/WeightImages.hpp"
+#include "model/WeightSource.hpp"
 #include "model/WeightStore.hpp"
 #include "Tuning.hpp"
 #include "metal/abi/GDN.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/BlockIndexer.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"
@@ -19,6 +26,7 @@
 #include <algorithm>
 #include <any>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -69,6 +77,11 @@ void requireQwen4ExpLayout(const TargetLayout &layout) {
               layout.gdnHeadDimension ||
       layout.gdnValueHeads * layout.gdnHeadDimension !=
           layout.attentionWidth ||
+      // The packed GGUF image's expert slabs stride each expert's rows by
+      // the packed intermediate width, which its 256-row planes and the
+      // moe_gguf_segment offset math require a whole tile multiple of;
+      // the packer zero-pads the 640-wide intermediate to 768.
+      layout.packedExpertWidth != 768 ||
       layout.attentionWidth !=
           layout.attentionQueryHeads * layout.attentionHeadDimension ||
       layout.packedFullWidth !=
@@ -123,6 +136,9 @@ Qwen4IndexerWeights readIndexer(WeightFile &file,
 
 // The MoE block's sections, in the qwen3_6moe order: router, the routed
 // experts' gate, up and down, the shared expert's, and its scalar gate.
+// The routed experts stay resident for verify and decode; prefill chunks
+// stream them when RICHENGINE_QWEN4_EXPERT_STREAM is set (the note at
+// expertStreamingRequested).
 ops::MoeWeights readMoeBlock(WeightFile &file) {
   ops::BlockMoeWeights block;
   block.router = readQuantizedSegment(file, "router");
@@ -155,6 +171,35 @@ Qwen4PleWeights readPle(WeightFile &file, const BlockTargetFormat &format,
   return ple;
 }
 
+// The PLE hash header's checks and its record into the weights, shared by
+// the resident WeightFile parse (readPleHash) and the streaming loader's
+// host-side read of the same section.
+Qwen4PleHash pleHashFromHeader(const Qwen4PleHeader &header,
+                               const TargetLayout &layout,
+                               Qwen4ExpWeights &weights) {
+  const uint32_t heads = layout.pleHeads();
+  Qwen4PleHash hash;
+  if (header.headCount != heads || !header.tableRows)
+    throw WeightStoreError("the packed PLE hash does not match the layout");
+  std::copy(std::begin(header.multipliers), std::end(header.multipliers),
+            hash.multipliers.begin());
+  hash.tableRows = header.tableRows;
+  hash.headOffsets.assign(header.heads, header.heads + heads);
+  hash.headVocabularies.assign(header.heads + heads, header.heads + 2 * heads);
+  for (uint32_t head = 0; head < heads; ++head)
+    if (!hash.headVocabularies[head] ||
+        uint64_t{hash.headOffsets[head]} + hash.headVocabularies[head] >
+            hash.tableRows)
+      throw WeightStoreError(
+          "a PLE head's rows lie outside the packed table");
+  if (header.eosToken != layout.pleEosToken ||
+      (header.imageToken && header.imageToken != layout.pleImageToken))
+    throw WeightStoreError("the packed PLE hash does not match the layout");
+  weights.pleEosToken = header.eosToken;
+  weights.pleImageToken = header.imageToken;
+  return hash;
+}
+
 // The PLE hash the packed table's header states, checked against the
 // layout (upstream readPleHash checks the same of a GGUF's metadata).
 Qwen4PleHash readPleHash(WeightFile &file, const TargetLayout &layout,
@@ -164,37 +209,158 @@ Qwen4PleHash readPleHash(WeightFile &file, const TargetLayout &layout,
   const auto *header = static_cast<const Qwen4PleHeader *>(section.contents());
   if (!header)
     throw WeightStoreError("the packed PLE hash header is not CPU-visible");
-  const uint32_t heads = layout.pleHeads();
-  Qwen4PleHash hash;
-  if (header->headCount != heads || !header->tableRows)
-    throw WeightStoreError("the packed PLE hash does not match the layout");
-  std::copy(std::begin(header->multipliers), std::end(header->multipliers),
-            hash.multipliers.begin());
-  hash.tableRows = header->tableRows;
-  hash.headOffsets.assign(header->heads, header->heads + heads);
-  hash.headVocabularies.assign(header->heads + heads, header->heads + 2 * heads);
-  for (uint32_t head = 0; head < heads; ++head)
-    if (!hash.headVocabularies[head] ||
-        uint64_t{hash.headOffsets[head]} + hash.headVocabularies[head] >
-            hash.tableRows)
-      throw WeightStoreError(
-          "a PLE head's rows lie outside the packed table");
-  if (header->eosToken != layout.pleEosToken ||
-      (header->imageToken && header->imageToken != layout.pleImageToken))
-    throw WeightStoreError("the packed PLE hash does not match the layout");
-  weights.pleEosToken = header->eosToken;
-  weights.pleImageToken = header->imageToken;
-  return hash;
+  return pleHashFromHeader(*header, layout, weights);
+}
+
+// What the streaming PLE loader reads of ple-table.bin without mapping it:
+// the row table's place in the file, its native format, and the manifest
+// record either loading path reports.
+struct PleTableSource final {
+  SparseRowTable rows;
+  uint64_t planeBytes = 0;
+  uint32_t format = 0;
+  WeightFileRecord record;
+};
+
+// The resident bound of the PLE table: past it the table's rows stream
+// from the packed file instead of allocating an image (Qwen3.8-Flash-
+// Next's is ~100 GB). RICHENGINE_QWEN4_PLE_STREAM=0/1 overrides the rule.
+constexpr uint64_t kResidentPleTableBytes = uint64_t{2} << 30;
+[[nodiscard]] bool pleTableStreams(uint64_t planeBytes) {
+  if (const char *value = std::getenv("RICHENGINE_QWEN4_PLE_STREAM"))
+    return std::string_view(value) != "0";
+  return planeBytes > kResidentPleTableBytes;
+}
+
+// ple-table.bin's header, hash section and GGUF descriptor, read through
+// the open source: the same sections WeightFile would slice out of the
+// image, at the same 16 KiB-aligned offsets (WeightStore.cpp's section()).
+[[nodiscard]] PleTableSource
+readPleTableSource(WeightSource &source, const TargetLayout &layout,
+                   Qwen4ExpWeights &weights, std::string_view contentIdentity) {
+  const uint64_t fileBytes = source.bytes();
+  if (!fileBytes) throw WeightStoreError("packed file is empty: ple-table.bin");
+  const auto expected = weightFileHeader(kPleTableMagic, 0, 0);
+  const uint64_t headerBytes = expected.size();
+  std::array<uint8_t, 16> header{};
+  source.readData(0, header);
+  if (fileBytes % kWeightFileAlignment || fileBytes < headerBytes ||
+      std::memcmp(header.data(), expected.data(), expected.size()) != 0)
+    throw WeightStoreError("packed file header mismatch: ple-table.bin");
+  const auto read = [&](uint64_t offset, uint64_t bytes, auto &out) {
+    if (offset > fileBytes || bytes > fileBytes - offset)
+      throw WeightStoreError("packed file is truncated: ple-table.bin");
+    source.readData(offset, std::span<uint8_t>(
+                                 reinterpret_cast<uint8_t *>(&out), bytes));
+  };
+  uint64_t offset = headerBytes;
+  const uint64_t hashOffset = alignWeightOffset(offset);
+  Qwen4PleHeader pleHeader{};
+  read(hashOffset, sizeof(pleHeader), pleHeader);
+  offset = hashOffset + sizeof(pleHeader);
+  const uint64_t descriptorOffset = alignWeightOffset(offset);
+  GgufTensorDescriptor descriptor{};
+  read(descriptorOffset, sizeof(descriptor), descriptor);
+  const uint64_t planeOffset = alignWeightOffset(descriptorOffset + sizeof(descriptor));
+  // The checks readBlockEmbedding runs on the same descriptor.
+  if (!descriptor.outputSize || !descriptor.inputSize ||
+      descriptor.inputSize != layout.pleHeadDimension)
+    throw WeightStoreError("GGUF embedding does not match the layout: ple-table");
+  const uint32_t format = gguf_format_of(descriptor.type);
+  if (format == GGUF_FMT_COUNT)
+    throw WeightStoreError("unsupported GGUF tensor type " +
+                           std::to_string(descriptor.type));
+  const uint64_t rowBytes =
+      ggufRowBytes(kQuantFormats[format], descriptor.inputSize);
+  if (descriptor.plane0Bytes !=
+      uint64_t{descriptor.outputSize} * rowBytes)
+    throw WeightStoreError(
+        "GGUF embedding rows are not native GGUF blocks: ple-table");
+  weights.pleHash = pleHashFromHeader(pleHeader, layout, weights);
+  if (descriptor.outputSize != weights.pleHash.tableRows)
+    throw WeightStoreError("GGUF embedding does not match the layout: ple-table");
+  PleTableSource table;
+  table.rows = {"ple-table", descriptor.outputSize,
+                static_cast<uint32_t>(rowBytes), planeOffset};
+  table.planeBytes = descriptor.plane0Bytes;
+  table.format = format;
+  table.record = {"target/ple-table.bin", std::string(kPleTableMagic), 0, 0,
+                  fileBytes, std::string(contentIdentity)};
+  return table;
+}
+
+// The streamed table's store: its rows are the file's native row plane,
+// read through the same open source the metadata came from. The cache
+// holds RICHENGINE_QWEN4_PLE_CACHE_BYTES of rows (default 512 MiB) beside
+// the staging and prefetch working memory.
+[[nodiscard]] std::shared_ptr<SparseRowStore>
+openPleRowStore(std::shared_ptr<WeightSource> source,
+                const PleTableSource &table, const TargetLayout &layout) {
+  SparseRowStoreOptions options;
+  options.cacheBytes = [] {
+    if (const char *value = std::getenv("RICHENGINE_QWEN4_PLE_CACHE_BYTES")) {
+      const uint64_t bytes = std::strtoull(value, nullptr, 10);
+      if (bytes) return bytes;
+    }
+    return uint64_t{512} << 20;
+  }();
+  options.readers = std::make_shared<SsdReaders>(kSsdReaders);
+  // One prefill chunk's row ids of stage scratch, and a chunk of read-ahead.
+  const uint32_t stageRows =
+      ExecutionLimits::prefillTokenBudget * layout.pleHeads();
+  options.stageRows = stageRows;
+  options.prefetchRows = stageRows;
+  return std::make_shared<SparseRowStore>(table.rows,
+                                          openRowReader(std::move(source)),
+                                          std::move(options));
+}
+
+// The routed experts' streaming rule (Qwen4Exp.hpp). Off by default: the
+// forward pass's 512 routed experts per layer stay resident. Setting
+// RICHENGINE_QWEN4_EXPERT_STREAM builds the per-layer infrastructure anyway
+// — a PackedExpertStore and an ExpertArena each — validated against the
+// real packed files at load.
+//
+// What the flag changes today: a prefill chunk's MoE block runs the
+// streamed path (addStreamedMoeBlock) — the staged GGUF tiles resolve
+// routed experts through the arena's slot and chunk-address tables
+// (moe_gguf_stream_segment), the host reads the routed union off the
+// CPU-visible selectedExperts between flushed submissions, stages it in
+// arena-sized batches (each batch's passes submit before the next stage
+// can evict it), and the shared expert keeps its resident segment.
+// Verify and decode keep ops::MoE::add and the resident segments: their
+// submissions pass graph.dispatches(), which drops the event/host steps
+// a route-first split needs, and they have no host sync point for the
+// union yet (Runtime.mm, RuntimeImpl.hpp). The resident routed segments
+// therefore stay required while streaming is on; eliding them is the
+// follow-up once verify/decode take the split too. The resident path is
+// unchanged and stays the default.
+[[nodiscard]] bool expertStreamingRequested() {
+  if (const char *value = std::getenv("RICHENGINE_QWEN4_EXPERT_STREAM"))
+    return std::string_view(value) != "0" && !std::string_view(value).empty();
+  return false;
+}
+
+[[nodiscard]] uint64_t expertStreamBytes(const char *name, uint64_t fallback) {
+  if (const char *value = std::getenv(name)) {
+    const uint64_t bytes = std::strtoull(value, nullptr, 10);
+    if (bytes) return bytes;
+  }
+  return fallback;
 }
 
 // The PLE tensors of a step's rows (upstream Qwen4Scratch's PLE fields):
 // the gathered rows' table ids — CPU-computed for a prefill chunk
-// (qwen4ExpPleRows), GPU-hashed for a verify step (ngram_embedding_hash) —
-// the gathered rows themselves, their key and value projections and the
+// (qwen4ExpPleRows), GPU-hashed for a resident table's verify step
+// (ngram_embedding_hash) and host-computed for a streamed one's — the
+// gathered rows themselves, their key and value projections and the
 // gate's gated values and convolution inputs, whose tail the verify
-// commit's history writer reads.
+// commit's history writer reads. pleSlots/pleStaging are the streamed
+// table's: stage() fills them before the command that gathers them.
 struct Qwen4PleScratch final {
   metal::MetalBuffer pleIndices;
+  metal::MetalBuffer pleSlots;
+  metal::MetalBuffer pleStaging;
   metal::MetalBuffer pleRows;
   metal::MetalBuffer pleValue;
   metal::MetalBuffer pleGate;
@@ -335,13 +501,21 @@ struct Qwen4VerifyExtension final {
 };
 
 Qwen4PleScratch pleScratch(metal::MetalBackend &backend,
-                           const TargetLayout &layout, uint64_t rows) {
+                           const TargetLayout &layout, uint64_t rows,
+                           uint32_t rowBytes, bool streaming) {
   const auto buffer = [&](uint64_t bytes, const char *label) {
     return backend.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
   };
   Qwen4PleScratch scratch;
   scratch.pleIndices = buffer(
       rows * layout.pleHeads() * sizeof(uint32_t), "qwen4-ple-indices");
+  if (streaming) {
+    // The staged table's gather reads slots of pleStaging's rows: one
+    // staged row and one slot per row id the step can name.
+    const uint64_t ids = rows * layout.pleHeads();
+    scratch.pleSlots = buffer(ids * sizeof(uint32_t), "qwen4-ple-slots");
+    scratch.pleStaging = buffer(ids * rowBytes, "qwen4-ple-staging");
+  }
   scratch.pleRows = buffer(rows * layout.pleWidth() * sizeof(uint16_t),
                            "qwen4-ple-rows");
   scratch.pleValue = buffer(rows * layout.hiddenSize * sizeof(uint16_t),
@@ -357,6 +531,56 @@ Qwen4PleScratch pleScratch(metal::MetalBackend &backend,
 }
 
 } // namespace
+
+// The routed experts' per-layer streaming infrastructure (the note above):
+// for every layer a PackedExpertStore over its packed file's expert slices
+// and an ExpertArena of device slots, sharing the engine's one SSD reader
+// pool. The resident routed segments stay: the forward pass is unchanged.
+void openExpertStreaming(metal::MetalBackend &backend,
+                         const TargetLayout &layout,
+                         const PackedTargetFiles &packed,
+                         Qwen4ExpWeights &weights) {
+  Qwen4ExpExpertStreaming &stream = weights.expertStreaming;
+  stream.requested = true;
+  stream.hostCacheBytes = expertStreamBytes(
+      "RICHENGINE_QWEN4_EXPERT_CACHE_BYTES", uint64_t{128} << 20);
+  stream.arenaBytes =
+      expertStreamBytes("RICHENGINE_QWEN4_EXPERT_ARENA_BYTES",
+                        uint64_t{512} << 20);
+  auto readers = std::make_shared<SsdReaders>(kSsdReaders);
+  stream.stores.reserve(layout.layers);
+  stream.arenas.reserve(layout.layers);
+  for (uint32_t index = 0; index < layout.layers; ++index) {
+    const ops::MoeWeights &moe =
+        std::get<ops::MoeWeights>(weights.layers[index].ffn);
+    const ops::BlockMoeWeights &block = moe.blocks();
+    // The router's output rows are the expert count ([experts][hidden] F32).
+    const uint32_t experts = block.router.outputSize;
+    const PackedExpertTable table = packedExpertTable(
+        "layer-" + std::to_string(index) + "-experts", block.gate.routed,
+        block.up.routed, block.down.routed, experts);
+    PackedExpertStoreOptions storeOptions;
+    storeOptions.cacheBytes = stream.hostCacheBytes;
+    storeOptions.readers = readers;
+    // A decode step's read-ahead: its rows' experts' slices.
+    storeOptions.prefetchSlices = 4 * kPackedExpertRegions;
+    auto source = std::make_shared<WeightSource>(
+        packed.directory / ("layer-" + std::to_string(index) + ".bin"));
+    stream.stores.push_back(std::make_shared<PackedExpertStore>(
+        table, openRowReader(std::move(source)), std::move(storeOptions)));
+    ExpertSlotPlanes planes{};
+    for (uint32_t z = 0; z < kPackedExpertProjections; ++z)
+      for (uint32_t p = 0; p < kPackedExpertPlanes; ++p)
+        planes[z][p] =
+            table.regions[z * kPackedExpertPlanes + p].sliceBytes;
+    ExpertArenaOptions arenaOptions;
+    arenaOptions.bytes = stream.arenaBytes;
+    arenaOptions.largestBuffer = backend.capabilities().maxBufferLengthBytes;
+    arenaOptions.experts = experts;
+    stream.arenas.push_back(std::make_shared<ExpertArena>(
+        backend, planes, table, arenaOptions));
+  }
+}
 
 Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
                                     const TargetLayout &layout,
@@ -410,16 +634,32 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     result.files.push_back(file.record());
   }
   {
-    WeightFile file = packed->images.load(
-        packedImage(packed->directory / "ple-table.bin",
-                    "target/ple-table.bin", kPleTableMagic, 0, 0));
-    result.pleHash = readPleHash(file, layout, result);
-    result.pleTable = readBlockEmbedding(
-        file, static_cast<uint32_t>(result.pleHash.tableRows),
-        layout.pleHeadDimension, "ple-table");
-    file.finish();
-    result.files.push_back(file.record());
+    const std::filesystem::path path = packed->directory / "ple-table.bin";
+    // The table's metadata is read through an open source either way; past
+    // the resident bound its rows stream from the file (SparseRowStore)
+    // instead of allocating the whole table as an image.
+    auto source = std::make_shared<WeightSource>(path);
+    const PleTableSource table = readPleTableSource(
+        *source, layout, result, packed->images.contentIdentity());
+    if (pleTableStreams(table.planeBytes)) {
+      result.streamedTable = openPleRowStore(std::move(source), table, layout);
+      result.pleRowBytes = static_cast<uint32_t>(
+          ggufRowBytes(kQuantFormats[table.format], layout.pleHeadDimension));
+      result.pleFormat = table.format;
+      result.files.push_back(table.record);
+    } else {
+      WeightFile file = packed->images.load(
+          packedImage(path, "target/ple-table.bin", kPleTableMagic, 0, 0));
+      result.pleHash = readPleHash(file, layout, result);
+      result.pleTable = readBlockEmbedding(
+          file, static_cast<uint32_t>(result.pleHash.tableRows),
+          layout.pleHeadDimension, "ple-table");
+      file.finish();
+      result.files.push_back(file.record());
+    }
   }
+  if (expertStreamingRequested())
+    openExpertStreaming(backend, layout, *packed, result);
   result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
@@ -482,11 +722,14 @@ public:
                           uint64_t{ExecutionLimits::maximumBatchWidth} *
                               ExecutionLimits::targetVerifyRows,
                           true);
-    prefillPle_ =
-        pleScratch(model_.backend_, layout, ExecutionLimits::prefillTokenBudget);
+    const bool streamed = weights_.streamedTable != nullptr;
+    prefillPle_ = pleScratch(model_.backend_, layout,
+                           ExecutionLimits::prefillTokenBudget,
+                           weights_.pleRowBytes, streamed);
     verifyPle_ = pleScratch(model_.backend_, layout,
                             uint64_t{ExecutionLimits::maximumBatchWidth} *
-                                ExecutionLimits::targetVerifyRows);
+                                ExecutionLimits::targetVerifyRows,
+                            weights_.pleRowBytes, streamed);
     // The RoPE inverse frequencies the rope tables were made of
     // (PrefillArena fills its own the same way): the indexer's pool rotates
     // the pooled block keys with them.
@@ -522,6 +765,12 @@ public:
                   sequence.pleRowIds.data(),
                   sequence.pleRowIds.size() * sizeof(uint32_t));
     }
+    // A streamed table's rows are read now, before the command that
+    // gathers them is submitted (upstream stages in beginPrefill too).
+    if (weights_.streamedTable)
+      stagePleRows(prefillPle_,
+                   {indices, uint64_t{step.rows} * heads},
+                   SparseRowUse::Prefill, /*adoptPrefetch=*/true);
     // The streams start as the embedding's rows (upstream addPrefillBegin),
     // and the QSA block records the host computed into each sequence's
     // qsaBlocks land in the scratch (upstream preparePrefill's writeBlocks).
@@ -603,10 +852,21 @@ public:
   void onVerifyInput(metal::CommandGraph &graph,
                      metal::MetalBuffer verifyInput,
                      metal::MetalBuffer plePriorTokens, uint32_t lanes,
-                     uint32_t verifyStride) const override {
+                     uint32_t verifyStride,
+                     std::span<const uint32_t> pleRowIds = {}) const override {
     const TargetLayout &layout = weights_.layout;
-    const Qwen4PleHash &hash = weights_.pleHash;
     const uint32_t heads = layout.pleHeads();
+    if (weights_.streamedTable) {
+      // The host computed the rows' ids (qwen4ExpVerifyPleIds, the CPU
+      // twin of the hash below); stage them before the gather's command.
+      const uint64_t ids = uint64_t{lanes} * verifyStride * heads;
+      if (pleRowIds.size() != ids)
+        throw std::invalid_argument("invalid qwen4exp streamed PLE row ids");
+      stagePleRows(verifyPle_, pleRowIds, SparseRowUse::Decode);
+      verifyPleStaged_ = true;
+      return;
+    }
+    const Qwen4PleHash &hash = weights_.pleHash;
     if (heads > NGRAM_EMBEDDING_MAXIMUM_HEADS ||
         hash.headVocabularies.size() != heads ||
         hash.headOffsets.size() != heads)
@@ -705,7 +965,7 @@ public:
                                      prefill_.branch, prefill_.weights,
                                      hyperShape(), step.rows);
     addPrefillMix(step, extra.ffnHyper);
-    addMoeBlock(step, layer);
+    addMoeBlock(step, layer, index);
     ops::HyperConnection::addCombine(step.graph, prefill_.streams,
                                      prefill_.branch, prefill_.weights,
                                      hyperShape(), step.rows);
@@ -739,6 +999,8 @@ public:
                                      hyperShape(), step.rows);
     addVerifyMix(step, extra.ffnHyper, nullptr);
     addMoeBlock(step, layer);
+    // (verify keeps the resident MoE path: the streamed passes are
+    // prefill-only for now — see addStreamedMoeBlock)
     ops::HyperConnection::addCombine(step.graph, verify_.streams,
                                      verify_.branch, verify_.weights,
                                      hyperShape(), step.rows);
@@ -746,6 +1008,37 @@ public:
   }
 
 private:
+  // Stages a step's PLE row ids through the streamed table into the
+  // scratch's staging rows and slots; blocks until every row is in place,
+  // so the command that gathers them needs no read protocol.
+  void stagePleRows(const Qwen4PleScratch &scratch,
+                    std::span<const uint32_t> ids, SparseRowUse use,
+                    bool adoptPrefetch = false) const {
+    auto *staging = static_cast<uint8_t *>(scratch.pleStaging.contents());
+    auto *slots = static_cast<uint32_t *>(scratch.pleSlots.contents());
+    if (!staging || !slots)
+      throw std::logic_error("qwen4exp streamed PLE staging is not CPU-visible");
+    weights_.streamedTable->stage(
+        ids, {staging, scratch.pleStaging.sizeBytes()}, {slots, ids.size()},
+        use, adoptPrefetch);
+  }
+
+  // The table and indices a step's PLE gather binds: the resident image,
+  // or — streamed — the rows stage() copied into pleStaging, indexed by
+  // the staged slots.
+  [[nodiscard]] ops::EmbeddingWeights pleGatherWeights(
+      const Qwen4PleScratch &scratch) const {
+    if (!weights_.streamedTable) return weights_.pleTable;
+    return {static_cast<uint32_t>(scratch.pleSlots.sizeBytes() /
+                                  sizeof(uint32_t)),
+            weights_.layout.pleHeadDimension,
+            ops::NativeRows(scratch.pleStaging, weights_.pleFormat)};
+  }
+  [[nodiscard]] metal::MetalBuffer pleGatherIndices(
+      const Qwen4PleScratch &scratch) const {
+    return weights_.streamedTable ? scratch.pleSlots : scratch.pleIndices;
+  }
+
   // The shape of the PLE gate and convolution: hyperConnections streams of
   // hiddenSize, pleConvolutionTaps taps pleNgram rows apart.
   [[nodiscard]] ops::NgramShape ngramShape() const {
@@ -772,7 +1065,7 @@ private:
     const ops::Linear &linear = model_.operators_.linear();
     const TargetModelPrefillBuffers &b = step.buffers;
     const uint32_t rows = step.rows;
-    ops::Embedding::add(step.graph, h.pleIndices, weights_.pleTable,
+    ops::Embedding::add(step.graph, pleGatherIndices(h), pleGatherWeights(h),
                         h.pleRows, rows * weights_.layout.pleHeads());
     linear.addPrefill(step.graph, h.pleRows, ple.key, h.pleGate,
                       b.projectionSums, rows, b.linearScratch);
@@ -812,7 +1105,16 @@ private:
     const ops::Linear &linear = model_.operators_.linear();
     const TargetModelVerifyBuffers &b = step.buffers;
     const uint32_t rows = step.rows;
-    ops::Embedding::add(step.graph, h.pleIndices, weights_.pleTable,
+    if (weights_.streamedTable) {
+      // onVerifyInput staged this step's rows (a tree batch never calls
+      // the hook, so its gather would read stale rows); the flag is
+      // consumed so the next step must stage again.
+      if (!verifyPleStaged_)
+        throw std::logic_error(
+            "qwen4exp streamed PLE rows were not staged for this verify");
+      verifyPleStaged_ = false;
+    }
+    ops::Embedding::add(step.graph, pleGatherIndices(h), pleGatherWeights(h),
                         h.pleRows, rows * weights_.layout.pleHeads());
     const ops::LinearPlan keyPlan =
         linear.decodePlan(ple.key, step.planLanes, ops::LinearEpilogue::None,
@@ -1044,10 +1346,15 @@ private:
       ops::BlockIndexer::addPending(step.graph, keys, pending,
                                     qsaPending(sequence.auxiliaryOut, layer),
                                     firstPositions[at], sequence.rows);
-      if (shareBlocks ||
-          !ops::BlockIndexer::sparse(firstPositions[at], sequence.rows,
-                                     topBlocks))
+      if (shareBlocks)
         continue;
+      if (!ops::BlockIndexer::sparse(firstPositions[at], sequence.rows,
+                                     topBlocks)) {
+        // Inside the dense window every tile attends every block: the
+        // zero-stride lists the verify path uses (stride 0 reads none).
+        blocks[at] = {h.qsaLists, h.qsaListCounts, 0, 0};
+        continue;
+      }
       ops::BlockIndexer::addSelect(
           step.graph,
           u16(h.qsaQueries, sequence.rowBegin, sequence.rows, queryWidth),
@@ -1386,13 +1693,36 @@ private:
   // the routed tiles — adding the zero-residual route sum into the branch
   // the combine then injects. The verify step routes its lanes' verify
   // rows alone (MoeBuffers::verifyRows), as upstream's addVerify does.
+  //
+  // With RICHENGINE_QWEN4_EXPERT_STREAM a prefill chunk's block instead
+  // runs the streamed path (addStreamedMoeBlock): route and group, read
+  // the union off the GPU, stage it into the layer's arena and run the
+  // slot-aware expert passes. Everything else — verify, decode, affine or
+  // MXFP4-packed plans — keeps ops::MoE::add and the resident segments.
   void addMoeBlock(TargetModel::PrefillStep &step,
-                   const TargetLayerWeights &layer) const {
+                   const TargetLayerWeights &layer, uint32_t index) const {
     const TargetModelPrefillBuffers &b = step.buffers;
-    ops::MoE::add(step.graph,
-                  {b.normalized, prefill_.zeros, prefill_.branch, b.moe,
-                   {}, {}},
-                  std::get<ops::MoeWeights>(layer.ffn), *step.moe);
+    const ops::MoeWeights &weights =
+        std::get<ops::MoeWeights>(layer.ffn);
+    ops::MoeBuffers buffers{b.normalized, prefill_.zeros, prefill_.branch,
+                            b.moe, {}, {}};
+    if (!step.moe || !moeStreaming(weights, index) ||
+        step.moe->phase() != ops::MoePhase::Prefill ||
+        moeHasMxfp4(weights.blocks())) {
+      ops::MoE::add(step.graph, buffers, weights, *step.moe);
+      return;
+    }
+    // The streamed kernels are the staged tiles: a register plan is
+    // re-planned staged at the same 8-row tile — moeGgufPrefillTile's M32
+    // choice could outgrow the scratch the arena sized for the original
+    // plan, while staged M8's workspace never exceeds a register M8's.
+    if (step.moe->configuration().ggufTile == ops::MoeGgufTile::Register) {
+      ops::MoeConfig config = step.moe->configuration();
+      config.ggufTile = ops::MoeGgufTile::Staged;
+      config.expertTile = ops::MoeExpertTile::M8;
+      step.moe = ops::MoE::prefillPlan(step.moe->shape(), step.rows, config);
+    }
+    addStreamedMoeBlock(step, buffers, weights, *step.moe, index);
   }
   void addMoeBlock(TargetModel::VerifyStep &step,
                    const TargetLayerWeights &layer) const {
@@ -1436,6 +1766,102 @@ private:
         hyperShape(), step.rows);
   }
 
+  // Whether layer `index`'s MoE block streams its routed experts: the flag
+  // built the layer's store and arena at load (openExpertStreaming).
+  [[nodiscard]] bool moeStreaming(const ops::MoeWeights &weights,
+                                  uint32_t index) const {
+    if (weights.layout() != ops::WeightLayout::Block32) return false;
+    const Qwen4ExpExpertStreaming &stream = weights_.expertStreaming;
+    return stream.requested && index < stream.stores.size() &&
+           index < stream.arenas.size();
+  }
+  // The packed (`_p`) expert path has no streamed kernels: an MXFP4
+  // segment on an mxfp4Native plan keeps the resident path.
+  [[nodiscard]] static bool
+  moeHasMxfp4(const ops::BlockMoeWeights &block) {
+    const auto mxfp4 = [](const ops::QuantizedSegment &segment) {
+      return segment.formatId == GGUF_FMT_MXFP4;
+    };
+    return mxfp4(block.gate.routed) || mxfp4(block.gate.shared) ||
+           mxfp4(block.up.routed) || mxfp4(block.up.shared) ||
+           mxfp4(block.down.routed) || mxfp4(block.down.shared);
+  }
+  // The routed experts a completed routing pass selected, deduplicated:
+  // selectedExperts holds rows * routesPerToken expert ids — routed ids
+  // below `experts`, the shared expert's id `experts`, ~0u padding.
+  [[nodiscard]] static std::vector<uint32_t>
+  moeRoutedUnion(const metal::MetalBuffer &selectedExperts,
+                 const ops::MoePlan &plan) {
+    const uint32_t rows = plan.rows();
+    const uint32_t routes = plan.shape().routesPerToken();
+    const uint32_t experts = plan.shape().experts;
+    const auto *ids =
+        static_cast<const uint32_t *>(selectedExperts.contents());
+    if (!ids)
+      throw std::logic_error("qwen4exp MoE routes are not CPU-visible");
+    std::vector<uint32_t> unionExperts;
+    unionExperts.reserve(experts);
+    std::vector<uint8_t> seen(experts, 0);
+    for (uint64_t i = 0; i < uint64_t{rows} * routes; ++i) {
+      const uint32_t expert = ids[i];
+      if (expert < experts && !seen[expert]) {
+        seen[expert] = 1;
+        unionExperts.push_back(expert);
+      }
+    }
+    return unionExperts;
+  }
+  // The streamed MoE block of a prefill chunk (the note at
+  // expertStreamingRequested): the command so far is flushed and waited
+  // on, the routing dispatches run and are flushed again, the routed
+  // union comes off the CPU-visible selectedExperts, the gather runs
+  // once, then each arena-sized batch of the union is staged and its
+  // expert passes submitted before the next stage can evict it — the
+  // passes skip the tiles of experts the slot table leaves empty, so a
+  // batch's pass computes only its own experts' tiles (and recomputes
+  // any still resident, idempotently). The combine stays in the graph
+  // for the step's own submission. Union batches beyond the arena's
+  // slots are the prefill-chunk case the arena cannot hold at once;
+  // each round is correct but repeats the tile grid, so long chunks
+  // stream slowly until the passes take tile ranges.
+  void addStreamedMoeBlock(TargetModel::PrefillStep &step,
+                           const ops::MoeBuffers &buffers,
+                           const ops::MoeWeights &weights,
+                           const ops::MoePlan &plan,
+                           uint32_t index) const {
+    const Qwen4ExpExpertStreaming &stream = weights_.expertStreaming;
+    ExpertArena &arena = *stream.arenas[index];
+    PackedExpertStore &store = *stream.stores[index];
+    const auto flush = [&] {
+      // Move the graph's dispatches out and reset it, so the submission
+      // below covers exactly what was encoded so far and nothing is
+      // encoded twice when the step's own submission comes.
+      metal::CommandGraph pending = std::move(step.graph);
+      step.graph = metal::CommandGraph{};
+      (void)model_.backend_.submitCommandAsync(pending.command()).wait();
+    };
+    flush();
+    ops::MoE::addRouting(step.graph, buffers, weights, plan);
+    flush();
+    const std::vector<uint32_t> unionExperts =
+        moeRoutedUnion(buffers.scratch.selectedExperts, plan);
+    ops::MoE::addGgufGather(step.graph, buffers, weights, plan);
+    const ops::MoeStreamBinding binding{arena.slotTable(),
+                                        arena.chunkAddresses(),
+                                        arena.layout().floorSlots,
+                                        arena.layout().chunkSlots};
+    const uint32_t slots = arena.layout().slots;
+    const std::span<const uint32_t> all(unionExperts);
+    for (size_t begin = 0; begin < all.size(); begin += slots) {
+      const size_t end = std::min(begin + size_t{slots}, all.size());
+      arena.stage(store, all.subspan(begin, end - begin),
+                  ++expertStreamLoad_, PackedExpertUse::Prefill);
+      ops::MoE::addGgufPasses(step.graph, buffers, weights, plan, &binding);
+      flush();
+    }
+    ops::MoE::addCombine(step.graph, buffers, weights, plan);
+  }
+
   const TargetModel &model_;
   const Qwen4ExpWeights &weights_;
   // The auxiliary region's offset inside a state cell: after the GDN
@@ -1459,6 +1885,12 @@ private:
       verifyBlockCounts_{};
   mutable uint32_t verifyLanes_ = 0;
   mutable uint32_t verifyStride_ = 0;
+  // The streamed MoE arena's stage counter: each stage() call takes a fresh
+  // load number so its claims may evict the previous call's slots.
+  mutable uint64_t expertStreamLoad_ = 0;
+  // Whether onVerifyInput staged this verify's streamed PLE rows; the PLE
+  // gather consumes it, so a step that never staged (a tree batch) fails.
+  mutable bool verifyPleStaged_ = false;
   // RICHENGINE_QSA_INDEX_SHARE (IndexCache): the block lists the last
   // selecting full-attention layer wrote, which the share interval's
   // non-selecting layers reuse. The buffers stay valid because a shared
@@ -1503,6 +1935,49 @@ void qwen4ExpPleRows(const Qwen4ExpWeights &weights, uint64_t position,
       for (uint32_t g = 0; g < layout.pleHeadsPerNgram; ++g) {
         const uint32_t head =
             (gram - 2) * layout.pleHeadsPerNgram + g;
+        rowHeads[head] = static_cast<uint32_t>(
+            mixed % hash.headVocabularies[head] + hash.headOffsets[head]);
+      }
+    }
+  }
+}
+
+// The CPU twin of ngram_embedding_hash (kernels/decode/
+// ngram_embedding.metal), which the resident table's verify still runs on
+// the GPU: `before` holds each lane's pleNgram - 1 tokens before its first
+// row, nearest first, kQwen4PleNoToken where the request has none.
+void qwen4ExpVerifyPleIds(const Qwen4ExpWeights &weights, uint32_t lanes,
+                          uint32_t rowStride,
+                          std::span<const uint32_t> tokens,
+                          std::span<const uint32_t> priors, uint32_t *out) {
+  const TargetLayout &layout = weights.layout;
+  const Qwen4PleHash &hash = weights.pleHash;
+  const uint32_t eos = weights.pleEosToken;
+  const uint32_t heads = layout.pleHeads();
+  const uint32_t priorsPerLane = layout.pleNgram - 1;
+  if (!lanes || !rowStride ||
+      tokens.size() != uint64_t{lanes} * rowStride ||
+      priors.size() != uint64_t{lanes} * priorsPerLane)
+    throw std::invalid_argument("invalid qwen4exp verify PLE inputs");
+  for (uint32_t index = 0; index < lanes * rowStride; ++index) {
+    const uint32_t lane = index / rowStride;
+    const uint32_t r = index % rowStride;
+    std::array<uint64_t, kQwen4PleMaxNgram> context{tokens[index]};
+    bool cut = false;
+    for (uint32_t back = 1; back < layout.pleNgram; ++back) {
+      const uint32_t previous =
+          back <= r ? tokens[index - back]
+                    : priors[uint64_t{lane} * priorsPerLane + (back - r - 1)];
+      cut = cut || previous == kQwen4PleNoToken || previous == eos;
+      context[back] = cut ? eos : previous;
+    }
+    uint32_t *rowHeads = out + uint64_t{index} * heads;
+    for (uint32_t gram = 2; gram <= layout.pleNgram; ++gram) {
+      uint64_t mixed = context[0] * hash.multipliers[0];
+      for (uint32_t j = 1; j < gram; ++j)
+        mixed ^= context[j] * hash.multipliers[j];
+      for (uint32_t g = 0; g < layout.pleHeadsPerNgram; ++g) {
+        const uint32_t head = (gram - 2) * layout.pleHeadsPerNgram + g;
         rowHeads[head] = static_cast<uint32_t>(
             mixed % hash.headVocabularies[head] + hash.headOffsets[head]);
       }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/DuoAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
 #include "metal/MetalBackend.hpp"
@@ -11,6 +12,31 @@
 #include <string_view>
 
 namespace richengine::kv {
+
+// The DuoAttention policy shared with the _duo kernels' trailing constant
+// (metal/abi/DuoAttention.h). On a model declaration — TargetLayout's
+// duoAttention, kv::Layout::duo — head_mask holds one bit per
+// (attention ordinal, KV head) pair at bit 4*ordinal + head; on the
+// per-layer kernel tail it holds only that layer's head bits.
+using DuoPolicy = ::RichDuoAttentionPolicy;
+
+// Whether the policy bounds any head: a window of zero, or no streaming
+// head anywhere, leaves the attention dense.
+[[nodiscard]] constexpr bool duoEnabled(DuoPolicy policy) noexcept {
+  return policy.window_tokens != 0 && policy.head_mask != 0;
+}
+
+// The kernel tail for attention layer `ordinal` of a model-level policy:
+// that layer's four-bit head nibble of the model mask (heads past the
+// first four cannot be marked in this encoding). The zero policy on a
+// disabled model or an out-of-range ordinal.
+[[nodiscard]] constexpr DuoPolicy duoLayerPolicy(DuoPolicy policy,
+                                                 uint32_t ordinal,
+                                                 uint32_t kvHeads) noexcept {
+  const uint64_t heads = (uint64_t{1} << (kvHeads < 4 ? kvHeads : 4)) - 1;
+  return {policy.sink_tokens, policy.window_tokens,
+          ordinal < 16 ? (policy.head_mask >> (4 * ordinal)) & heads : 0};
+}
 
 // Selected once for a runtime and its entire page pool. Weight storage is
 // independent of the KV format; requests never change it while serving.
@@ -187,6 +213,12 @@ struct Layout final {
   // (ops::AttentionBlocks) gathers blocks of tokens, whose values are
   // contiguous only token-major. The `_tm` store variants write them.
   bool valuesTokenMajor = false;
+  // The model-level DuoAttention declaration (duoLayerPolicy derives each
+  // layer's kernel tail from it): the streaming heads' sink and trailing
+  // window in tokens, head_mask one bit per (attention ordinal, KV head).
+  // Storage geometry ignores it like windowTokens; all zero is dense
+  // attention — the _duo kernels only ever run when a plan selects them.
+  DuoPolicy duo{};
 
   [[nodiscard]] constexpr bool isAltLayer(uint32_t layer) const noexcept {
     return layer < 64 && ((altLayerMask >> layer) & 1);

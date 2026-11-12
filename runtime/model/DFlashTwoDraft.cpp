@@ -25,7 +25,12 @@ void requireLayout(const DFlashDraftLayout &layout) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
                            std::to_string(RICHENGINE_DRAFT_SELECTOR_RANK));
   }
-  validateQ4Layout(layout.dynamicSize, layout.hiddenSize);
+  // The conv kernels derive the dynamic width from the hidden size
+  // (Hidden/4): hidden 2560's 640 rows sit off the affine 256-row tile, so
+  // such a draft's packed files carry the dynamic projections unquantized
+  // and only the per-file readers enforce their format's alignment.
+  if (layout.dynamicSize * 4 != layout.hiddenSize)
+    throw WeightStoreError("draft dynamic width is not hiddenSize / 4");
   validateQ4Layout(layout.qkvSize, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, layout.attentionSize);
   validateQ4Layout(layout.intermediateSize, layout.hiddenSize);
@@ -354,7 +359,11 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
     layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
-    layer.attentionDynamic = readProjection(
+    // The dynamic width is hiddenSize / 4 — 640 at 2560, off the affine
+    // 256-row tile — so both paths carry these two as block projections:
+    // packed files as F32 GGUF segments (validateQ4Layout would reject
+    // 640 rows), checkpoints as AF4 segments.
+    layer.attentionDynamic = readBlockProjection(
         file, layout.dynamicSize, layout.hiddenSize,
         "attention-dynamic");
     layer.qkvProjection = readProjection(
@@ -367,7 +376,7 @@ DFlashDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
     layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
-    layer.mlpDynamic = readProjection(
+    layer.mlpDynamic = readBlockProjection(
         file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
     layer.gateProjection = readProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");

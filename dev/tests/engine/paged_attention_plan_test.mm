@@ -241,6 +241,9 @@ struct Case final {
   // Each lane's page ids, which its table holds as entries.
   std::array<std::vector<uint32_t>, 4> pages;
   std::array<kv::ChunkedPrefillParams, 4> stores{};
+  // The q8q run: the oracle quantizes each fused query row to int8 codes
+  // with the int8-activation rule (kernels/common/int8_activations.h).
+  bool int8Queries = false;
 
   uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                       uint32_t dimension) const {
@@ -523,16 +526,61 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
             data.layout.headDimension == 64    ? 0.125f
             : data.layout.headDimension == 128 ? 0.08838834764831845f
                                                : 0.0625f;
+        // A q8q fused row's INT8 codes and scale, by the int8-activation
+        // rule the kernel applies (kernels/common/int8_activations.h):
+        // q = clamp(rint(x * (127 / m)), -127, 127), the row standing for
+        // q * (m / 127). The quotients are correctly rounded on both sides,
+        // so the codes and scale match the kernel's bit for bit.
+        std::vector<int> queryCodes;
+        float queryScale = 1.0f;
+        if (data.int8Queries) {
+          queryCodes.resize(data.layout.headDimension);
+          float largest = 0.0f;
+          for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+               ++dimension) {
+            const float value = bf16ToFloat(static_cast<const uint16_t *>(
+                data.queries.contents())[data.queryIndex(lane, head, row,
+                                                         dimension)]);
+            require(std::isfinite(value), "q8q oracle query is nonfinite");
+            largest = std::max(largest, std::abs(value));
+          }
+          const bool coded = largest > 0x1p-100f;
+          const float inverse = coded ? 127.0f / largest : 0.0f;
+          queryScale = coded ? largest / 127.0f : 0.0f;
+          for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+               ++dimension) {
+            const float value = bf16ToFloat(static_cast<const uint16_t *>(
+                data.queries.contents())[data.queryIndex(lane, head, row,
+                                                         dimension)]);
+            queryCodes[dimension] = coded
+                ? int(std::clamp(std::rint(value * inverse), -127.0f, 127.0f))
+                : 0;
+          }
+        }
+        const float effectiveScale = scoreScale * queryScale;
         std::vector<float> scores(tokens);
         float maximum = -std::numeric_limits<float>::infinity();
         for (uint32_t token = 0; token < tokens; ++token) {
           float score = 0;
-          for (uint32_t dimension = 0; dimension < data.layout.headDimension;
-               ++dimension)
-            score += bf16ToFloat(static_cast<const uint16_t *>(data.queries.contents())[
-                              data.queryIndex(lane, head, row, dimension)]) *
+          if (data.int8Queries) {
+            // The kernel's int32 product is exact below 2^24; the double
+            // accumulation is exact well past it.
+            double dot = 0;
+            for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+                 ++dimension)
+              dot += double(queryCodes[dimension]) *
                      data.keyCode(lane, kvHead, token, dimension);
-          scores[token] = score * data.keyScale(lane, kvHead, token) * scoreScale;
+            score = float(dot);
+          } else {
+            for (uint32_t dimension = 0; dimension < data.layout.headDimension;
+                 ++dimension)
+              score += bf16ToFloat(static_cast<const uint16_t *>(
+                               data.queries.contents())[
+                               data.queryIndex(lane, head, row, dimension)]) *
+                       data.keyCode(lane, kvHead, token, dimension);
+          }
+          scores[token] = score * data.keyScale(lane, kvHead, token) *
+                          effectiveScale;
           maximum = std::max(maximum, scores[token]);
         }
         float denominator = 0;
@@ -794,17 +842,21 @@ void checkBf16StoreEdges(metal::MetalBackend &backend) {
 enum class Phase : uint8_t { Prefill, Verify };
 
 template <Phase phase>
-std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds) {
+std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
+                          uint32_t int8QueriesFromPages = 0) {
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
+      return ops::PagedAttention::prefillPlan(
+          data.rows, data.queryHeads, data.layout, false,
+          data.stores[0].committed_tokens, int8QueriesFromPages);
     else {
       std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
-                                            histories, false, 0, data.rows);
+                                            histories, false, 0, data.rows, false,
+                                            int8QueriesFromPages);
     }
   }();
   constexpr uint64_t guardBytes = 256;
@@ -1072,6 +1124,167 @@ void checkProjection(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layo
             << (float32 ? " f32" : " bf16") << " norms PASS\n";
 }
 
+// The q8q gate's plan names, without a dispatch: the pages-per-split
+// threshold and its committed-history and override terms, the format and
+// layout exclusions, and the default-off contract every caller keeps.
+void checkQ8qGate() {
+  const auto dense = testLayout(24, 4, 256, kv::Format::Int8);
+  const auto hasQ8q = [](const std::string &name) {
+    return name.find("q8q") != std::string::npos;
+  };
+  // Prefill: 2048 rows is a single split reading every page — over any
+  // sane threshold; 64 rows splits four ways and reads a page or two.
+  require(hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, dense, false, 0, 8)
+                    .splitPipeline),
+          "q8q prefill gate missed a long dense INT8 chunk");
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, dense).splitPipeline),
+          "q8q prefill ran without its pages-per-split threshold");
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(64, 24, dense, false, 0, 8)
+                     .splitPipeline),
+          "q8q prefill ran below its pages-per-split threshold");
+  require(hasQ8q(ops::PagedAttention::prefillPlan(64, 24, dense, false, 100000, 8)
+                    .splitPipeline),
+          "q8q prefill ignored the chunk's committed history");
+  require(hasQ8q(ops::PagedAttention::prefillPlan(64, 24, dense, false, 0, 1)
+                    .splitPipeline),
+          "q8q pages threshold override was ignored");
+  for (const auto format : {kv::Format::Int4, kv::Format::BFloat16})
+    require(!hasQ8q(ops::PagedAttention::prefillPlan(
+                        2048, 24, testLayout(24, 4, 256, format), false, 0, 8)
+                    .splitPipeline),
+            "q8q prefill ran on non-INT8 pages");
+  auto windowed = dense;
+  windowed.windowTokens = 512;
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, windowed, false, 0, 8)
+                     .splitPipeline),
+          "q8q prefill ran a windowed layer");
+  auto duo = dense;
+  duo.duo = {128, 512, 0xf};
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, duo, false, 0, 8)
+                     .splitPipeline),
+          "q8q prefill ran a DuoAttention layer");
+  auto sparseLayout = testLayout(24, 2, 256, kv::Format::Int8);
+  sparseLayout.attentionCore = kv::Core::Kv2Group12H256;
+  sparseLayout.valuesTokenMajor = true;
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, sparseLayout, true,
+                                                0, 8)
+                     .splitPipeline),
+          "q8q prefill ran a sparse layer");
+  auto gemma = testLayout(16, 8, 256, kv::Format::Int8);
+  gemma.attentionCore = kv::Core::GemmaKv8H256;
+  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 16, gemma, false, 0, 8)
+                     .splitPipeline),
+          "q8q prefill ran a Gemma core");
+  // Verify: the longest lane's busiest split decides; 16K tokens is far
+  // over the threshold, 1K is under it, and tree verify has no q8q kernels.
+  const std::array<uint32_t, 1> longHistory{16384};
+  const std::array<uint32_t, 1> shortHistory{1023};
+  require(hasQ8q(ops::PagedAttention::verifyPlan(1, 24, dense, longHistory, false,
+                                              0, 16, false, 8)
+                    .splitPipeline),
+          "q8q verify gate missed a long dense INT8 lane");
+  require(!hasQ8q(ops::PagedAttention::verifyPlan(1, 24, dense, longHistory)
+                     .splitPipeline),
+          "q8q verify ran without its pages-per-split threshold");
+  require(!hasQ8q(ops::PagedAttention::verifyPlan(1, 24, dense, shortHistory,
+                                               false, 0, 16, false, 8)
+                     .splitPipeline),
+          "q8q verify ran below its pages-per-split threshold");
+  require(!hasQ8q(ops::PagedAttention::verifyPlan(1, 24, dense, longHistory, true,
+                                               0, 16, false, 8)
+                     .splitPipeline),
+          "q8q verify ran a tree lane");
+  require(!hasQ8q(ops::PagedAttention::verifyPlan(1, 24, duo, longHistory, false,
+                                               0, 16, false, 8)
+                     .splitPipeline),
+          "q8q verify ran a DuoAttention layer");
+  std::cout << "q8q attention gate: PASS\n";
+}
+
+// The history term of the dense prefill splits: pages-per-split raises the
+// shared count with the committed history, bounded by the workspace's tile
+// product, and sparse, DuoAttention and windowed layouts keep the shared
+// splits their kernels were measured at.
+void checkPrefillSplitHistory() {
+  const auto dense = testLayout(24, 4, 256, kv::Format::Int8);
+  // 256 rows is 32 tiles: the shared policy splits once; the workspace
+  // holds eight splits of it (256 tile-products over 32 tiles).
+  require(ops::PagedAttention::prefillPlan(256, 24, dense).splits == 1,
+          "prefill shared splits changed");
+  require(ops::PagedAttention::prefillPlan(256, 24, dense, false, 131072, 0,
+                                         128)
+              .splits == 8,
+          "prefill history splits missed the workspace bound");
+  require(ops::PagedAttention::prefillPlan(256, 24, dense, false, 16384, 0,
+                                         128)
+              .splits == 4,
+          "prefill history splits did not scale with the pages");
+  require(ops::PagedAttention::prefillPlan(256, 24, dense, false, 131072, 0,
+                                         0)
+              .splits == 1,
+          "prefill pages-per-split 0 kept the history term");
+  auto sparseLayout = testLayout(24, 2, 256, kv::Format::Int8);
+  sparseLayout.attentionCore = kv::Core::Kv2Group12H256;
+  sparseLayout.valuesTokenMajor = true;
+  require(ops::PagedAttention::prefillPlan(256, 24, sparseLayout, true,
+                                         131072, 0, 128)
+              .splits == 1,
+          "prefill sparse splits took the history term");
+  auto windowed = dense;
+  windowed.windowTokens = 512;
+  require(ops::PagedAttention::prefillPlan(256, 24, windowed, false, 131072,
+                                         0, 128)
+              .splits == 1,
+          "prefill windowed splits took the history term");
+  auto duo = dense;
+  duo.duo = {128, 512, 0xf};
+  require(ops::PagedAttention::prefillPlan(256, 24, duo, false, 131072, 0,
+                                         128)
+              .splits == 1,
+          "prefill DuoAttention splits took the history term");
+  std::cout << "prefill split history: PASS\n";
+}
+
+// The q8q kernels end to end: the plans pick the _q8q splits and the scalar
+// oracle — quantizing each fused query row by the same int8-activation rule —
+// bounds the output. Prefill covers the plain splits; verify covers the
+// chain's _r2/_r4 pass splits and the block-8 draft's _m8 tile.
+void checkQ8q(metal::MetalBackend &backend, uint32_t queryHeads,
+              kv::Layout layout) {
+  constexpr uint32_t kPagesPerSplit = 8;
+  {
+    auto data = makeCase(backend, queryHeads, layout, 1, 2048, 4096, false);
+    data.int8Queries = true;
+    const auto plan = ops::PagedAttention::prefillPlan(
+        data.rows, queryHeads, layout, false, data.stores[0].committed_tokens,
+        kPagesPerSplit);
+    require(plan.splitPipeline.find("q8q") != std::string::npos,
+            "q8q prefill plan did not select the q8q split");
+    checkReference(data, run<Phase::Prefill>(backend, data, true, kPagesPerSplit));
+  }
+  for (const uint32_t rows : {kv::kVerifyRows, 8U}) {
+    auto data = makeCase(backend, queryHeads, layout, 2, rows, 16384, true);
+    data.int8Queries = true;
+    const auto plan = ops::PagedAttention::verifyPlan(
+        data.lanes, queryHeads, layout,
+        std::span<const uint32_t>(
+            std::array<uint32_t, 2>{data.stores[0].committed_tokens,
+                                    data.stores[1].committed_tokens}),
+        false, 0, rows, false, kPagesPerSplit);
+    require(plan.splitPipeline.find("q8q") != std::string::npos,
+            "q8q verify plan did not select the q8q split");
+    const auto output = run<Phase::Verify>(backend, data, true, kPagesPerSplit);
+    checkReference(data, output);
+    auto oneExtent = makeCase(backend, queryHeads, layout, 2, rows, 16384,
+                              true, true);
+    oneExtent.int8Queries = true;
+    require(run<Phase::Verify>(backend, oneExtent, false, kPagesPerSplit) ==
+                output,
+            "q8q verify over extents differs from one extent of the same pages");
+  }
+  std::cout << "q8q attention: q=" << queryHeads << " PASS\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1080,6 +1293,8 @@ int main(int argc, char **argv) {
     for (auto format : {kv::Format::Int8, kv::Format::Int4, kv::Format::BFloat16})
       for (const auto &[heads, kvHeads, headDim] : kGeometries)
         checkPlans(heads, testLayout(heads, kvHeads, headDim, format));
+    checkQ8qGate();
+    checkPrefillSplitHistory();
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
@@ -1133,6 +1348,7 @@ int main(int argc, char **argv) {
       }
       checkVerify(backend, heads, layout, 16384, 2);
       checkVerify(backend, heads, layout, 16384, 2, 8);
+      if (format == kv::Format::Int8) checkQ8q(backend, heads, layout);
     }
     std::cout << "paged attention plans: PASS\n";
   } catch (const std::exception &error) {

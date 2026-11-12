@@ -984,6 +984,157 @@ void af4pRepack(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   section("af4p->af4 repack: manifest planes repacked to af4 produce identical decode output");
 }
 
+// ---------------------------------------------------------------- narrow columns and inputs
+// The qwen4exp projections whose widths are multiples of the 64-column tile
+// but not of 256 — hyper-connection downs of 320 columns, indexer keys of
+// 128 — and the 320-input decode width of a hyper-connection up. The GGUF
+// tiles grid whole 64-column tiles and 32-input groups, so these run the
+// same kernels; the planes' rows pad to QUANT_TILE_ROWS as the image
+// layout's tile addressing requires. Every shape runs both decode tiles at
+// one and two lanes, the splits each tile's partition rule admits, plain and
+// residual; the policy's own decode and prefill plans — what the model's
+// encode path asks for — and a fused pair of narrow segments.
+void narrow(MetalBackend &backend, const Linear &linear) {
+  struct Shape { Fmt f; uint32_t n, k; };
+  const Shape shapes[] = {
+      {Q4K, 320, 1024},   // a hyper-connection down's columns
+      {Q80, 1024, 320},   // a hyper-connection up's 320 inputs
+      {Q4K, 128, 2048},   // an indexer key's columns
+      {Q80, 512, 320},    // an indexer query's columns at the narrow input
+      {AF4, 320, 320},    // a two-group meta unit filling whole units at K = 320
+      {MXFP4, 128, 1024},
+  };
+  for (const Shape &s : shapes) {
+    const Tensor w = tensor(backend, s.f, s.n, s.k);
+    const Projection p = projection({&w}, s.n);
+    const std::string what = std::string(fmtName(s.f)) + " " + std::to_string(s.n) + "x" +
+                             std::to_string(s.k);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, s.k);
+    const std::vector<float> residual = residuals(kMaximumRows, s.n);
+    const std::vector<Dot> dots = products({&w}, s.n, x, kMaximumRows);
+    // The policy's plans must build and run for the narrow shapes, as the
+    // model's encode path asks them.
+    for (const uint32_t lanes : {1u, 2u}) {
+      const LinearPlan plan = linear.decodePlan(p, lanes);
+      const LinearWorkload w = plan.workload();
+      const bool staged = plan.configuration().tile == LinearTile::GgufStaged;
+      const uint32_t rows = w.rows, storage = plan.storageRows();
+      const std::string label = what + " policy L=" + std::to_string(lanes);
+      const Outcome out =
+          run(backend, linear, plan, p, nullptr, storageRows(x, s.k, rows, storage), {},
+              kPoisonNaN, s.n, label);
+      checkValues(out, dots, {}, {}, w, rows, s.n, staged, label);
+    }
+    for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
+      // The register tile takes a format only in whole coefficient units
+      // (quant_register_tensor), as its policy gate requires.
+      if (tile == LinearTile::GgufRegister && !quant_register_tensor(s.f, s.k)) continue;
+      for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual})
+        for (const uint32_t lanes : {1u, 2u})
+          for (const uint32_t splits : {1u, 2u}) {
+            // Whole partition units: 256-input coefficient units of the
+            // register tile, 32-input groups of the staged tile.
+            if (splits > 1 &&
+                (tile == LinearTile::GgufRegister ? s.k / 256 < splits : (s.k / 32) % splits))
+              continue;
+            const LinearWorkload wl = decode({s.n, s.k}, lanes, epilogue);
+            const LinearPlan plan =
+                Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
+            const uint32_t rows = wl.rows, storage = plan.storageRows();
+            const std::vector<uint16_t> aux =
+                storageRows(residual, s.n, rows, storage);
+            const std::string label = what + " " + tileName(tile) + " " +
+                                      epilogueName(epilogue) + " L=" +
+                                      std::to_string(lanes) + " S=" +
+                                      std::to_string(splits);
+            const Outcome out = run(backend, linear, plan, p, nullptr,
+                                    storageRows(x, s.k, rows, storage), aux,
+                                    kPoisonFinite, s.n, label);
+            checkValues(out, dots, {}, aux, wl, rows, s.n,
+                        tile == LinearTile::GgufStaged, label);
+          }
+    }
+    // Prefill: the 128-row tile over an 80-row chunk and the staged tile's
+    // 64-row height over 48 rows, plain, residual and up-with-gate. The
+    // chunks run past the decode-sized x and dots, so they get their own
+    // 128-row input and reference.
+    const std::vector<float> px = activations(Inputs::Dense, 128, s.k);
+    const std::vector<Dot> pdots = products({&w}, s.n, px, 128);
+    for (const LinearEpilogue epilogue :
+         {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      const std::vector<float> auxValues =
+          epilogue == LinearEpilogue::Residual ? residuals(256, s.n)
+                                               : activations(Inputs::Dense, 256, s.n);
+      const std::vector<uint16_t> aux =
+          storageRows(auxValues, s.n, 256, 256);
+      for (const auto [rows, tile] :
+           {std::pair{80u, LinearTile::GgufPrefill}, {48u, LinearTile::GgufStaged}}) {
+        const LinearWorkload wl{{s.n, s.k}, rows, LinearPhase::Prefill, epilogue,
+                                WeightLayout::Block32};
+        const LinearPlan plan =
+            Linear::plan(wl, LinearConfig{.tile = tile}, FloatOutput::BFloat16);
+        const uint32_t storage = plan.storageRows();
+        const std::string label = what + " prefill " + std::to_string(rows) +
+                                  " rows " + epilogueName(epilogue);
+        const std::vector<uint16_t> chunkAux(
+            aux.begin(), aux.begin() + uint64_t{storage} * s.n);
+        const Outcome out = run(backend, linear, plan, p, nullptr,
+                                storageRows(px, s.k, rows, storage), chunkAux,
+                                kPoisonNaN, s.n, label);
+        checkValues(out, pdots, {}, chunkAux, wl, rows, s.n, true, label);
+      }
+    }
+    // The policy's prefill plan must build for the narrow shape too.
+    static_cast<void>(linear.prefillPlan(p, 256, LinearEpilogue::None));
+  }
+  // A fused projection of narrow segments in different formats: 128 columns
+  // of Q4_K and 192 of Q8_0 in one 320-column dispatch.
+  {
+    const Tensor a = tensor(backend, Q4K, 128, 1024), b = tensor(backend, Q80, 192, 1024);
+    const std::vector<const Tensor *> parts{&a, &b};
+    const Projection fused = projection(parts, 320);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, 1024);
+    const std::vector<Dot> dots = products(parts, 320, x, kMaximumRows);
+    for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
+      for (const uint32_t lanes : {1u, 2u}) {
+        const LinearWorkload wl = decode({320, 1024}, lanes, LinearEpilogue::None);
+        const LinearPlan plan = Linear::plan(wl, config(tile, wl, 1), FloatOutput::BFloat16);
+        const uint32_t rows = wl.rows, storage = plan.storageRows();
+        const std::string label = std::string("fused narrow ") + tileName(tile) +
+                                  " L=" + std::to_string(lanes);
+        const Outcome out = run(backend, linear, plan, fused, nullptr,
+                                storageRows(x, 1024, rows, storage), {}, kPoisonNaN,
+                                320, label);
+        checkValues(out, dots, {}, {}, wl, rows, 320,
+                    tile == LinearTile::GgufStaged, label);
+      }
+    }
+  }
+  // A K-quant's 256-input meta units have no layout at 320 inputs, where
+  // the one-group formats above fill whole units: the segment gate must
+  // refuse the dispatch the matrix-level plan admits.
+  {
+    const Tensor w = tensor(backend, Q4K, 128, 320);
+    const Projection p = projection({&w}, 128);
+    const LinearWorkload wl = decode({128, 320}, 1, LinearEpilogue::None);
+    const LinearPlan plan =
+        Linear::plan(wl, config(LinearTile::GgufStaged, wl, 1), FloatOutput::BFloat16);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, 320);
+    bool rejected = false;
+    try {
+      static_cast<void>(run(backend, linear, plan, p, nullptr,
+                            storageRows(x, 320, wl.rows, plan.storageRows()), {},
+                            kPoisonNaN, 128, "q4k 320-input gate"));
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    if (!rejected) fail("q4k at 320 inputs: the meta-unit gate did not fire");
+  }
+  section("narrow: " + std::to_string(std::size(shapes)) +
+          " shapes of 128-1024 columns at 320-2048 inputs on both decode tiles "
+          "(policy plans included), prefill chunks and a fused pair, within fp64");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- token gather
@@ -1109,6 +1260,7 @@ int main(int argc, char **argv) {
       }
       prefill(backend, linear);
       leadingInputs(backend, linear);
+      narrow(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

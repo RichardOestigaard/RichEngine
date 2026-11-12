@@ -36,6 +36,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -112,13 +113,21 @@ id<MTLComputePipelineState> MetalBackend::Impl::pipeline(std::string_view name) 
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result =
-            name.find_first_of("[|") == std::string_view::npos
-                ? newPipeline(name)
-                : newSpecializedPipeline(name);
-        pipelines.emplace(name, result);
-        sampleDeviceMemory();
-        return result;
+        // A lone lookup — gpu_encode's — creates through the same batch a
+        // command's missing set does, of one.
+        createPipelineBatch(pipelines, false,
+                            std::span<const std::string_view>(&name, 1));
+        return pipelines.find(name)->second;
+    }
+
+// pipeline()'s creation half, cache-free: a plain function name takes
+// newPipeline(), the extended grammar (stitch hooks, |options)
+// newSpecializedPipeline(). Runs on a createPipelineBatch worker.
+id<MTLComputePipelineState>
+MetalBackend::Impl::createDispatchPipeline(std::string_view name) {
+        return name.find_first_of("[|") == std::string_view::npos
+                   ? newPipeline(name)
+                   : newSpecializedPipeline(name);
     }
 
 namespace {
@@ -144,6 +153,12 @@ uint32_t cooperativeTensorThreads(std::string_view entry) noexcept {
         if (entry.ends_with("_gate_up")) return 32;
         return 64;
     }
+    // The int8 prefill tiles and their quantize run their own simdgroup
+    // counts — two per tile threadgroup, four per quantize
+    // (kernels/prefill/gguf_prefill_int8.metal) — not the bf16 tiles'
+    // cooperative 128.
+    if (entry.starts_with("gguf_prefill_int8_quantize")) return 128;
+    if (entry.starts_with("gguf_prefill_int8_")) return 64;
     if (entry.starts_with("gguf_prefill_") ||
         entry.starts_with("gguf_float_na_")) {
         return 128;
@@ -215,6 +230,12 @@ uint32_t readOnlyBufferMask(std::string_view entry) noexcept {
         if (entry.ends_with("_gate_up")) return 0b0001111111u;
         if (entry.ends_with("_amax")) return 0b00001111u;
         return 0b00001111u;
+    }
+    if (entry.starts_with("gguf_prefill_int8_quantize")) {
+        // buffers 1 and 2 are its outputs (the int8 codes and scales the
+        // int8 tiles read): only the input at 0 is read-only, so the
+        // dispatch-stage barrier orders the tiles after it.
+        return 0b001u;
     }
     if (entry.starts_with("gguf_prefill_")) {
         return 0b001111u;
@@ -461,7 +482,13 @@ struct PipelineOptionSpec {
                 throw MetalBackendError(
                     "unable to create stitched library for " +
                     std::string(name) + ": " + errorDescription(error));
-            stitchedLibraries.emplace(std::string(name), fnLibrary);
+            // The library outlives the pipeline that binds it; the table
+            // is shared with the batch's other workers, so the write
+            // takes pipelineCreateMutex.
+            {
+                std::lock_guard lock(pipelineCreateMutex);
+                stitchedLibraries.emplace(std::string(name), fnLibrary);
+            }
             // Each synthesized hook function is what the kernel's
             // [[stitchable]] call site binds by name.
             bound = [NSMutableArray new];
@@ -480,17 +507,7 @@ struct PipelineOptionSpec {
         // links in one descriptor.
         if (bound || spec.persistent || spec.reliefNone ||
             spec.forwardProgress) {
-            if (!compiler4) {
-                NSError *error = nil;
-                compiler4 =
-                    [device newCompilerWithDescriptor:
-                                [MTL4CompilerDescriptor new]
-                                                error:&error];
-                if (!compiler4)
-                    throw MetalBackendError(
-                        "unable to create a Metal 4 compiler: " +
-                        errorDescription(error));
-            }
+            id<MTL4Compiler> compiler = ensureCompiler4();
             MTL4LibraryFunctionDescriptor *entry =
                 [MTL4LibraryFunctionDescriptor new];
             entry.name = function.name;
@@ -535,9 +552,10 @@ struct PipelineOptionSpec {
             }
             NSError *error = nil;
             id<MTLComputePipelineState> result =
-                [compiler4 newComputePipelineStateWithDescriptor:descriptor
-                                             compilerTaskOptions:nil
-                                                           error:&error];
+                [compiler
+                    newComputePipelineStateWithDescriptor:descriptor
+                                      compilerTaskOptions:nil
+                                                    error:&error];
             if (!result)
                 throw MetalBackendError(
                     "unable to create Metal 4 pipeline " + std::string(name) +
@@ -575,13 +593,11 @@ struct PipelineOptionSpec {
         return result;
     }
 
-// The pipeline a baked indirect command binds: the same function as
-    // pipeline(), created with indirect command buffer support, which the
-    // default pipeline object does not carry.
-    id<MTLComputePipelineState> MetalBackend::Impl::indirectPipeline(std::string_view name) {
-        if (const auto cached = icbPipelines.find(name);
-            cached != icbPipelines.end())
-            return cached->second;
+// indirectPipeline()'s creation half, cache-free: the same function with
+// indirect command buffer support, which the default pipeline object does
+// not carry. Runs on a createPipelineBatch worker.
+    id<MTLComputePipelineState>
+    MetalBackend::Impl::createIndirectPipeline(std::string_view name) {
         NSString *key = checkedNSString(name, "pipeline name");
         id<MTLFunction> function =
             [library newFunctionWithName:key
@@ -614,16 +630,101 @@ struct PipelineOptionSpec {
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
         }
-        icbPipelines.emplace(std::string(name), result);
-#if RICHENGINE_MTL4_AVAILABLE
-        // Metal 4 resolves an indirect command's pipeline through residency
-        // sets, not the per-encoder usage declarations the Metal 3 replay
-        // makes.
-        if (mtl4Enabled()) residency->add(result);
-#endif
-        sampleDeviceMemory();
         return result;
     }
+
+// The pipeline a baked indirect command binds: the same function as
+    // pipeline(), created with indirect command buffer support, which the
+    // default pipeline object does not carry.
+    id<MTLComputePipelineState> MetalBackend::Impl::indirectPipeline(std::string_view name) {
+        if (const auto cached = icbPipelines.find(name);
+            cached != icbPipelines.end())
+            return cached->second;
+        // A lone lookup creates through the same batch a span's missing
+        // set does, of one.
+        createPipelineBatch(icbPipelines, true,
+                            std::span<const std::string_view>(&name, 1));
+        return icbPipelines.find(name)->second;
+    }
+
+namespace {
+
+// The most pipelines one batch creates at once. Metal compiles a pipeline
+// its shader cache lacks — as it lacks an updated kernel's — and runs
+// compilations side by side, each holding memory of its own until it
+// ends: four at once is where a cold start stops paying for the
+// parallelism in memory (the 27B's cold start 129 s → 49 s on the M5
+// Max, its compiler at 1.4 GB against 0.7 GB one at a time; 16 took 38 s
+// at 2.6 GB, more than the free memory a start keeps).
+constexpr size_t kPipelinesCreatedAtOnce = 4;
+
+} // namespace
+
+// Creates the pipelines of `names` the `cache` lacks — each once, in the
+// order given — kPipelinesCreatedAtOnce at a time, caches each creation
+// and throws the first failure in name order. `indirect` selects
+// indirectPipeline()'s pipelines over pipeline()'s. Only this thread
+// touches `cache`: a worker creates a pipeline state and nothing else —
+// the device, the library and the Metal 4 compiler take concurrent
+// pipeline requests, and the two writes a creation makes off this thread
+// (a stitched library's registration, the compiler's lazy create) take
+// pipelineCreateMutex.
+void MetalBackend::Impl::createPipelineBatch(
+    PipelineCache &cache, bool indirect,
+    std::span<const std::string_view> names) {
+    // What the cache lacks, each once, in the order given.
+    std::vector<std::string_view> missing;
+    for (const std::string_view name : names) {
+        if (cache.find(name) != cache.end() ||
+            std::ranges::any_of(missing, [&](std::string_view known) {
+                return known == name;
+            })) {
+            continue;
+        }
+        missing.push_back(name);
+    }
+    if (missing.empty()) return;
+    struct Creation {
+        __strong id<MTLComputePipelineState> pipeline = nil;
+        std::exception_ptr failure;
+    };
+    std::vector<Creation> creations(missing.size());
+    Creation *created = creations.data();
+    const std::string_view *requested = missing.data();
+    const size_t count = missing.size();
+    std::atomic<size_t> claimed{0};
+    std::atomic<size_t> *next = &claimed;
+    // Each worker creates the next pipeline no other has taken.
+    dispatch_apply(std::min(count, kPipelinesCreatedAtOnce),
+                   DISPATCH_APPLY_AUTO, ^(size_t) {
+        for (size_t index = next->fetch_add(1); index < count;
+             index = next->fetch_add(1)) {
+            @autoreleasepool {
+                try {
+                    created[index].pipeline = indirect
+                        ? createIndirectPipeline(requested[index])
+                        : createDispatchPipeline(requested[index]);
+                } catch (...) {
+                    created[index].failure = std::current_exception();
+                }
+            }
+        }
+    });
+    for (size_t index = 0; index < missing.size(); ++index) {
+        if (!creations[index].pipeline) continue;
+        cache.emplace(std::string(missing[index]), creations[index].pipeline);
+#if RICHENGINE_MTL4_AVAILABLE
+        // Metal 4 resolves an indirect command's pipeline through
+        // residency sets, not the per-encoder usage declarations the
+        // Metal 3 replay makes.
+        if (indirect && mtl4Enabled())
+            residency->add(creations[index].pipeline);
+#endif
+    }
+    sampleDeviceMemory();
+    for (const Creation &creation : creations)
+        if (creation.failure) std::rethrow_exception(creation.failure);
+}
 
 // The escape hatch: baked indirect dispatch is off entirely.
     bool MetalBackend::Impl::icbDisabled() noexcept {
@@ -881,6 +982,13 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
     // Metal 4 path; the Metal 3 encoder declares its usage.
     if (mtl4Enabled()) residency->add(icb);
 #endif
+    // The span's indirect pipelines the cache lacks are created together:
+    // a cold bake compiled every kernel's indirect variant one at a time.
+    std::vector<std::string_view> names;
+    names.reserve(span.dispatches.size());
+    for (const BakedSpan::DispatchSnapshot &snapshot : span.dispatches)
+        names.push_back(snapshot.pipelineName);
+    createPipelineBatch(icbPipelines, true, names);
     for (size_t i = 0; i < span.dispatches.size(); ++i) {
         const BakedSpan::DispatchSnapshot &snapshot = span.dispatches[i];
         id<MTLIndirectComputeCommand> command =
@@ -1135,6 +1243,13 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
         [argEncoder setArgumentBuffer:span.argsAllocation[bank]->buffer
                                offset:0];
         [argEncoder setIndirectCommandBuffer:span.icb[bank] atIndex:0];
+        // The table's indirect pipelines the cache lacks are created
+        // together, as a baked span's are.
+        std::vector<std::string_view> names;
+        names.reserve(span.pipelineTable.size());
+        for (const auto &[name, index] : span.pipelineTable)
+            names.push_back(name);
+        createPipelineBatch(icbPipelines, true, names);
         for (const auto &[name, index] : span.pipelineTable)
             [argEncoder setComputePipelineState:indirectPipeline(name)
                                         atIndex:1 + index];
@@ -1382,6 +1497,22 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             bindings += dispatch.buffers.size();
             command.ownedDispatches.push_back(item);
         }
+
+        // The command's pipelines the cache lacks are created together
+        // below: a cold shader cache compiles a dispatch's kernels one at
+        // a time for seconds each otherwise — the first start's longest
+        // stall. The names keep dispatch order so the batch's first
+        // failure is the one the per-dispatch lookup reported first.
+        std::vector<std::string_view> names;
+        names.reserve(command.ownedDispatches.size());
+        for (const PreparedDispatch &item : command.ownedDispatches) {
+            if (item.source->pipelineName.empty()) {
+                throw MetalBackendError(
+                    "Metal pipeline name must not be empty");
+            }
+            names.push_back(item.source->pipelineName);
+        }
+        createPipelineBatch(pipelines, false, names);
 
         for (PreparedDispatch &item : command.ownedDispatches) {
             item.pipeline = pipeline(item.source->pipelineName);

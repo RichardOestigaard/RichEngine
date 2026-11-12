@@ -574,6 +574,8 @@ void testSyntheticPackage(MetalBackend &backend,
         descriptor.sourceIdentity = "sources";
         auto package = loadModelPackage(backend, root, descriptor);
         const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
+        const auto &visionWeights =
+            std::get<richengine::model::QwenVisionWeights>(package.vision);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
         require(std::get<richengine::model::DFlashDraftWeights>(package.draft).layers.size() == draft.layers,
@@ -592,13 +594,13 @@ void testSyntheticPackage(MetalBackend &backend,
                 "target declared byte accounting is wrong");
         require(declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files) == expected.draftBytes,
                 "draft declared byte accounting is wrong");
-        require(package.vision.tensors.blocks.size() == vision.depth &&
-                    package.vision.files.size() == 1 &&
-                    declaredBytes(package.vision.files) == expected.visionBytes,
+        require(visionWeights.tensors.blocks.size() == vision.depth &&
+                    visionWeights.files.size() == 1 &&
+                    declaredBytes(visionWeights.files) == expected.visionBytes,
                 "vision role records are incomplete");
         require(loadedTarget.actualAllocatedBytes +
                     std::get<richengine::model::DFlashDraftWeights>(package.draft).actualAllocatedBytes +
-                    package.vision.actualAllocatedBytes ==
+                    visionWeights.actualAllocatedBytes ==
                     backend.memoryStats().allocatedBytes - baseline,
                 "actual package allocation accounting is wrong");
         require(package.manifestFingerprintSha256.size() == 64,
@@ -607,8 +609,8 @@ void testSyntheticPackage(MetalBackend &backend,
         std::vector<WeightFileRecord> records = loadedTarget.files;
         records.insert(records.end(), std::get<richengine::model::DFlashDraftWeights>(package.draft).files.begin(),
                        std::get<richengine::model::DFlashDraftWeights>(package.draft).files.end());
-        records.insert(records.end(), package.vision.files.begin(),
-                       package.vision.files.end());
+        records.insert(records.end(), visionWeights.files.begin(),
+                       visionWeights.files.end());
         require(weightManifestFingerprint(records) ==
                     package.manifestFingerprintSha256,
                 "combined manifest fingerprint is not reproducible");
@@ -650,7 +652,7 @@ void testSyntheticPackage(MetalBackend &backend,
         package.images->release();
         require(backend.memoryStats().allocatedBytes - baseline ==
                     actualTrackedBytes - declaredBytes(loadedTarget.files) -
-                        declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files) - declaredBytes(package.vision.files),
+                        declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files) - declaredBytes(visionWeights.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
         require(!package.images->restore() && !package.images->contents()[0].bytes.empty() &&
@@ -689,7 +691,7 @@ void validateRealPackage(MetalBackend &backend,
         auto package = loadModelPackage(backend, root, richengine::model::inspectModelPackage(root));
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(std::get<richengine::model::DFlashDraftWeights>(package.draft).files);
-        visionBytes = declaredBytes(package.vision.files);
+        visionBytes = declaredBytes(package.visionFiles());
         const uint32_t targetLayers = std::visit(
             [](const auto &weights) { return weights.layout.layers; },
             package.target);
@@ -697,7 +699,7 @@ void validateRealPackage(MetalBackend &backend,
                 "real target file set is incomplete");
         require(std::get<richengine::model::DFlashDraftWeights>(package.draft).files.size() == std::get<richengine::model::DFlashDraftWeights>(package.draft).layout.layers + 1,
                 "real draft file set is incomplete");
-        require(package.vision.files.size() == 1,
+        require(package.visionFiles().size() == 1,
                 "real vision file set is incomplete");
         require(targetBytes && draftBytes && visionBytes,
                 "real package has an empty role");
@@ -1052,6 +1054,90 @@ void testDSparkDescriptors(const std::filesystem::path &root) {
     }
 }
 
+// Qwen3.8-Flash-Next (qwen4exp): the family's real DFlash2 draft binds
+// through a declared draft/config.json — three sliding layers over hidden
+// 2560, dynamic convolutions 640 wide, selector rank 256, block size 8,
+// reading the target layers 3, 17, 31 and 47's stream-mean captures —
+// while an assembly without one keeps the Null layout and its n-gram
+// predraft.
+void testQwen4DraftDescriptors(const std::filesystem::path &root) {
+    using richengine::model::DraftKind;
+    const std::string targetConfig =
+        std::string("{\"model_type\":\"qwen4_exp\",\"text_config\":{")
+            .append("\"head_dim\":256,\"hidden_size\":2560,")
+            .append("\"max_position_embeddings\":262144,")
+            .append("\"model_type\":\"qwen4_exp_text\",")
+            .append("\"num_attention_heads\":24,\"num_experts\":512,")
+            .append("\"num_hidden_layers\":48,\"num_key_value_heads\":2,")
+            .append("\"vocab_size\":248320}}");
+    const std::string draftConfig =
+        R"({"architectures":["DFlash2DraftModel"],"attention_bias":false,)"
+        R"("attention_dropout":0.0,"bos_token_id":null,"is_causal":false,)"
+        R"("dflash_config":{"block_size":8,"conv_group_size":16,)"
+        R"("conv_kernel_size":2,"mask_token_id":248077,"selector_rank":256,)"
+        R"("selector_top_k":16,"target_hidden_reduction":"stream_mean",)"
+        R"("target_layer_ids":[3,17,31,47]},"dtype":"bfloat16",)"
+        R"("eos_token_id":248044,"head_dim":128,"hidden_act":"silu",)"
+        R"("hidden_size":2560,"initializer_range":0.02,)"
+        R"("intermediate_size":5120,"layer_types":["sliding_attention",)"
+        R"("sliding_attention","sliding_attention"],)"
+        R"("max_position_embeddings":262144,"max_window_layers":3,)"
+        R"("model_type":"qwen3","num_attention_heads":32,)"
+        R"("num_hidden_layers":3,"num_key_value_heads":8,)"
+        R"("num_target_layers":48,"pad_token_id":248044,)"
+        R"("rms_norm_eps":1e-06,"rope_parameters":{"rope_theta":1000000,)"
+        R"("rope_type":"default"},"sliding_window":2048,)"
+        R"("tie_word_embeddings":false,"use_cache":true,)"
+        R"("use_sliding_window":true,"vocab_size":248320})";
+    {
+        const std::filesystem::path package = root / "qwen4flash";
+        std::filesystem::create_directories(package / "draft");
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"Qwen3.8-Flash-Next","family":"Qwen3.8-Flash-Next","target_format":"gguf","vision_format":"none"})");
+        writeJson(package / "config.json", targetConfig);
+        writeJson(package / "draft" / "config.json", draftConfig);
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(descriptor.target.arch == "qwen4exp",
+                "Qwen3.8-Flash-Next target is not the qwen4exp layout");
+        require(descriptor.target.capturedHiddenSize() == 10240 &&
+                    descriptor.target.maskToken == 248077,
+                "Qwen3.8-Flash-Next capture geometry differs");
+        const auto &d = descriptor.draft;
+        require(d.kind == DraftKind::DFlashTwo && d.layers == 3 &&
+                    d.hiddenSize == 2560 && d.vocabularySize == 248320 &&
+                    d.dynamicSize == 640 && d.qkvSize == 6144 &&
+                    d.attentionSize == 4096 && d.intermediateSize == 5120 &&
+                    d.selectorRank == 256 && d.kvHeads == 8 &&
+                    d.attentionHeadDimension == 128 &&
+                    d.rotaryTheta == 1'000'000.0F && d.blockSize == 8 &&
+                    d.targetHiddenSize == 10240 &&
+                    d.headCore == richengine::ops::DraftHeadCore::Q32K8D128 &&
+                    d.contextCore ==
+                        richengine::ops::DraftContextCore::Hidden2560 &&
+                    d.queryRows() == 8 && d.proposalLimit() == 7,
+                "Qwen3.8-Flash-Next DFlash2 layout differs from the config");
+        require(descriptor.stateLayout.draft ==
+                    richengine::model::DraftStateLayout{3, 8, 128, 2048},
+                "Qwen3.8-Flash-Next draft state layout mismatch");
+        require(descriptor.valid(),
+                "Qwen3.8-Flash-Next descriptor is invalid");
+    }
+    {
+        // A draft-less assembly keeps the Null layout: the n-gram predraft
+        // still proposes.
+        const std::filesystem::path package = root / "qwen4flash-nodraft";
+        std::filesystem::create_directories(package);
+        writeJson(package / "model.json",
+                  R"({"version":1,"model":"Qwen3.8-Flash-Next","family":"Qwen3.8-Flash-Next","target_format":"gguf","vision_format":"none"})");
+        writeJson(package / "config.json", targetConfig);
+        const auto descriptor = richengine::model::inspectModelPackage(package);
+        require(descriptor.draft.kind == DraftKind::Null,
+                "draft-less Qwen3.8-Flash-Next draft is not the Null layout");
+        require(descriptor.valid(),
+                "draft-less Qwen3.8-Flash-Next descriptor is invalid");
+    }
+}
+
 }  // namespace
 
 int main(int argc, const char *argv[]) {
@@ -1066,6 +1152,7 @@ int main(int argc, const char *argv[]) {
         testWeightImages(backend, temporary.path());
         testGgufImageLayout(backend, temporary.path());
         testDSparkDescriptors(temporary.path() / "sources");
+        testQwen4DraftDescriptors(temporary.path() / "sources");
         testSyntheticPackage(backend, temporary.path() / "package");
         if (argc == 3) {
             testRealPackageMetadata(argv[2]);

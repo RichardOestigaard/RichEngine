@@ -24,15 +24,41 @@ def pack_spec(family):
     return family.pack
 
 
-def pack_layout(family) -> "Layout":
+def pack_layout(family):
     """The family's packed target geometry, per its file's pack.layout."""
-    return Layout(**pack_spec(family)["layout"])
+    spec = pack_spec(family)
+    # qwen4exp's pack.layout states Qwen4ExpLayout's fields; every other
+    # family's states Layout's.
+    layout_type = (
+        Qwen4ExpLayout
+        if dict(family.signature).get("model_type") == "qwen4_exp_text"
+        else Layout
+    )
+    return layout_type(**spec["layout"])
 
 
-def draft_layout(family) -> "DraftLayout | None":
-    """The family's packed draft geometry, or None for a draft-less pack."""
+def draft_layout(family) -> "DraftLayout | DFlash2Layout | None":
+    """The family's packed draft geometry, or None for a draft-less pack:
+    a DraftLayout for the plain DFlash draft, a DFlash2Layout for DFlash2
+    (the spec's "kind" names which)."""
     spec = pack_spec(family).get("draft_layout")
-    return DraftLayout(**spec) if spec else None
+    return draft_layout_from_spec(spec) if spec else None
+
+
+def draft_layout_from_spec(spec) -> "DraftLayout | DFlash2Layout | None":
+    """A pack section's draft_layout dict as its layout dataclass; the
+    spec's "kind" picks DFlash2Layout ("dflash2"), DraftLayout otherwise."""
+    from . import models
+
+    if not spec:
+        return None
+    spec = dict(spec)
+    kind = spec.pop("kind", "dflash")
+    if kind == "dflash2":
+        return DFlash2Layout(**spec)
+    if kind != "dflash":
+        raise models.ModelError(f"unknown packed draft kind: {kind}")
+    return DraftLayout(**spec)
 
 
 def diffusion_schedule(family):
@@ -104,7 +130,6 @@ class Layout:
         ]
 
 
-
 @dataclass(frozen=True)
 class DraftLayout:
     """The z-lab DFlash plain-transformer draft's geometry
@@ -131,6 +156,42 @@ class DraftLayout:
     @property
     def qkv(self) -> int:
         return (self.query_heads + 2 * self.kv_heads) * self.head_dim
+
+
+@dataclass(frozen=True)
+class DFlash2Layout:
+    """The DFlash2 draft's packed geometry (DFlashTwoDraft.cpp readDraft,
+    DraftKind::DFlashTwo): the dynamic-convolution draft whose two dynamic
+    projections per layer are hidden/4 rows — off the affine 256-row tile —
+    and pack as F32 GGUF segments instead. attention and qkv derive from the
+    head pattern as DraftLayout's do; dynamic is hidden // 4, which
+    requireLayout enforces."""
+
+    layers: int = 3
+    hidden: int = 2560
+    vocabulary: int = 248320
+    dynamic: int = 640
+    intermediate: int = 5120
+    selector_rank: int = 256
+    kv_heads: int = 8
+    head_dim: int = 128
+    query_heads: int = 32
+    rotary_theta: float = 1_000_000.0
+    block_size: int = 8
+    target_hidden: int = 10240
+    sliding_window: int = 2048
+
+    @property
+    def attention(self) -> int:
+        return self.query_heads * self.head_dim
+
+    @property
+    def qkv(self) -> int:
+        return (self.query_heads + 2 * self.kv_heads) * self.head_dim
+
+    @property
+    def context_kv(self) -> int:
+        return self.qkv - self.attention
 
 
 # The packed draft's files, in the order DFlashV1Draft.cpp reads them
@@ -181,3 +242,74 @@ LAYER_SECTIONS = (
     "post-ffn-norm",
     "layer-scalar",
 )
+
+
+@dataclass(frozen=True)
+class Qwen4ExpLayout:
+    """Qwen3.8-Flash-Next's packed target geometry, the fields of
+    qwen4ExpTargetLayout (runtime/model/Qwen4Exp.hpp) a pack declares: the
+    GDN/full-attention hybrid's widths, the sparse MoE, the
+    hyper-connected residual, the QSA indexer and the PLE layer. The file
+    magics (MDFQ0001 layer, MDFQ0002 head, MDFE0001 embedding, MDFQ0003
+    ple-table) and the compiled kernel cores are the format's and the
+    runtime's, not the family's data."""
+
+    maximum_context_tokens: int = 262144
+    layers: int = 48
+    hidden_size: int = 2560
+    vocabulary_size: int = 248320
+    packed_gdn_width: int = 16512
+    packed_full_width: int = 13312
+    convolution_dimension: int = 10240
+    convolution_taps: int = 4
+    gdn_key_heads: int = 16
+    gdn_value_heads: int = 48
+    gdn_head_dimension: int = 128
+    attention_width: int = 6144
+    attention_query_heads: int = 24
+    attention_kv_heads: int = 2
+    attention_head_dimension: int = 256
+    # The full-attention layers' packed QKV rows interleave a gate row per
+    # query head ([q|gate]).
+    attention_query_stride: int = 2
+    attention_qk_norm: bool = True
+    rotary_pairs: int = 32
+    rotary_theta: float = 10_000_000.0
+    full_attention_period: int = 4
+    mask_token: int = 248077
+    stop_tokens: tuple = (248044, 248046)
+    capture_layers: tuple = (3, 17, 31, 47)
+    experts: int = 512
+    experts_per_token: int = 10
+    expert_intermediate_size: int = 640
+    packed_expert_width: int = 768
+    moe_shared_expert: bool = True
+    hyper_connections: int = 4
+    hyper_rank: int = 320
+    indexer_heads: int = 4
+    indexer_head_dimension: int = 128
+    indexer_top_blocks: int = 512
+    indexer_block_tokens: int = 4
+    ple_layer: int = 1
+    ple_ngram: int = 3
+    ple_heads_per_ngram: int = 8
+    ple_head_dimension: int = 160
+    ple_convolution_taps: int = 4
+    ple_eos_token: int = 248044
+    ple_image_token: int = 248056
+
+    def is_full_attention(self, layer: int) -> bool:
+        return (layer + 1) % self.full_attention_period == 0
+
+    @property
+    def ple_heads(self) -> int:
+        """The PLE table's hashed heads: (ngram - 1) orders x heads each."""
+        return (self.ple_ngram - 1) * self.ple_heads_per_ngram
+
+    def layer_types(self):
+        # The packed manifest's names for the two mixers (the qwen3_5_moe
+        # convention of ModelDescriptor.mm's requireLayerTypes).
+        return [
+            "attention" if self.is_full_attention(layer) else "gdn"
+            for layer in range(self.layers)
+        ]

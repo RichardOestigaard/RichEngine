@@ -108,3 +108,48 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams
                               p.routed_format, p.shared_format, w0, w1, meta,
                               shared_w0, shared_w1, shared_meta);
 }
+
+// The streamed expert pass's weights for one tile (ops/MoE.cpp's
+// moe_expert_gguf_streamed_*): the routed experts live in the arena's
+// chunks, not resident planes. `slots` is the arena's expert -> global slot
+// table (~0u while the expert holds no slot — the tile's pass skips it),
+// `chunks` its chunk -> region GPU-address table (MOE_GGUF_STREAM_REGIONS
+// uint64s per chunk). A slot resolves to its chunk and local slot exactly
+// as moe_expert_chunk does in the staged reference
+// (runtime/qwen4/metal/kernels/common/moe_expert_chunk.h); the local slot
+// then indexes the chunk region's planes the way an expert indexes a
+// resident segment's, so the same tile math applies with `local` for
+// `expert`. The shared expert (id `experts`) keeps its resident segment.
+// `resident` reports whether the tile has weights to read.
+inline MoeGgufSegment moe_gguf_stream_segment(
+    uint expert, constant MoeGgufStreamParams &p, device const uint *slots,
+    device const ulong *chunks, device uchar *shared_w0, device uchar *shared_w1,
+    device uchar *shared_meta, bool &resident) {
+  if (expert == p.experts) {
+    resident = true;
+    return {shared_w0, shared_w1, shared_meta, p.shared_format};
+  }
+  const uint slot = slots[expert];
+  if (slot == 0xffffffffu) {
+    resident = false;
+    return {nullptr, nullptr, nullptr, p.routed_format};
+  }
+  resident = true;
+  uint chunk = 0, local = slot;
+  if (slot >= p.floor_slots) {
+    const uint elastic = slot - p.floor_slots;
+    chunk = 1 + elastic / p.chunk_slots;
+    local = elastic - (chunk - 1) * p.chunk_slots;
+  }
+  device const ulong *regions =
+      chunks + ulong(chunk) * MOE_GGUF_STREAM_REGIONS + ulong(p.projection) * 3;
+  device uchar *w0 = reinterpret_cast<device uchar *>(regions[0]);
+  device uchar *w1 = reinterpret_cast<device uchar *>(regions[1]);
+  device uchar *meta = reinterpret_cast<device uchar *>(regions[2]);
+  constant QuantFormat &f = kQuantFormats[p.routed_format];
+  const ulong rows = ulong(local) * p.output_size, groups = p.input_size / 32;
+  return {w0 + rows * groups * f.plane0_bytes,
+          w1 + rows * groups * f.plane1_bytes,
+          meta + rows * (groups / f.meta_groups) * f.meta_bytes,
+          p.routed_format};
+}

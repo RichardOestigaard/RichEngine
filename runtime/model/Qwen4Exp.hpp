@@ -32,6 +32,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -88,6 +89,16 @@ namespace richengine::model {
   layout.experts = 512;
   layout.expertsPerToken = 10;
   layout.expertIntermediateSize = 640;
+  // The packed GGUF image's expert slabs must keep every dimension a
+  // multiple of its 256-column/256-row tiles: moe_gguf_segment strides
+  // expert e's planes by e * packedExpertWidth rows, which the tile-major
+  // planes address exactly only at a whole tile multiple, and the shared
+  // expert's [packedExpertWidth, hidden] and [hidden, packedExpertWidth]
+  // segments face the same descriptor check. The packer zero-pads each
+  // expert's 640-wide intermediate to 768; the padding units stay zero
+  // through the SwiGLU, so they contribute nothing (TargetLayout::
+  // packedExpertWidth).
+  layout.packedExpertWidth = 768;
   // The Value48 kernel set matches the recurrent block's widths; the
   // layers' encodes pass its gate phase GDN_SIGMOID_GATE (the upstream
   // GDN kernels' flag), sigmoid(z) where the default is silu(z).
@@ -192,16 +203,44 @@ struct Qwen4ExpLayerExtras final {
   std::optional<Qwen4PleWeights> ple;
 };
 
+class SparseRowStore;
+class PackedExpertStore;
+class ExpertArena;
+
+// The routed experts' streaming configuration and, when
+// RICHENGINE_QWEN4_EXPERT_STREAM is set, the per-layer infrastructure built
+// for them: a PackedExpertStore (host cache of the packed file's expert
+// slices) and an ExpertArena (bounded device slots, slot table and chunk
+// address table) per layer, in layer order. The forward pass still routes
+// through the resident segments — the slot-aware expert kernels, the
+// route-first split of ops::MoE::add() and the per-step host sync the
+// decode/verify submission cannot carry yet are the remaining work (see
+// Qwen4Exp.cpp's expert-streaming note).
+struct Qwen4ExpExpertStreaming final {
+  bool requested = false;
+  uint64_t hostCacheBytes = 0;  // per layer
+  uint64_t arenaBytes = 0;      // per layer
+  std::vector<std::shared_ptr<PackedExpertStore>> stores;
+  std::vector<std::shared_ptr<ExpertArena>> arenas;
+};
+
 // The qwen4exp package's weights: the shared record's layers (each its
 // mixer and MoE block; a hyper-connected layer has no norms of its own, so
 // inputNorm/postAttentionNorm stay empty) plus, in extras, the same
 // layers' hyper mixes, indexers and PLE tensors in the same order.
 struct Qwen4ExpWeights final : TargetModelWeights {
   std::vector<Qwen4ExpLayerExtras> extras;
+  Qwen4ExpExpertStreaming expertStreaming;
   // The last mix, which feeds the head in place of a final norm.
   Qwen4HyperWeights finalHyper;
-  // The PLE table's native rows of pleHeadDimension values.
+  // The PLE table's native rows of pleHeadDimension values. When
+  // streamedTable is set the table stays in its packed file and the steps
+  // gather the rows a SparseRowStore stages; pleTable is then empty.
   ops::EmbeddingWeights pleTable;
+  std::shared_ptr<SparseRowStore> streamedTable;
+  // The table's native row width in bytes and format (GGUF format id,
+  // metal/abi/Gguf.h), as the packed file's descriptor states them.
+  uint32_t pleRowBytes = 0;
   Qwen4PleHash pleHash;
   // The table's native row format (the packed file's row type).
   uint32_t pleFormat = 0;
@@ -227,5 +266,18 @@ targetModelGeometry(const Qwen4ExpWeights &weights);
 void qwen4ExpPleRows(const Qwen4ExpWeights &weights, uint64_t position,
                      std::span<const uint32_t> tokens,
                      std::span<const uint32_t> history, uint32_t *out);
+
+// The PLE table ids of a chain-verify step's rows, the CPU twin of the
+// GPU's ngram_embedding_hash: `tokens` holds lanes * rowStride row tokens
+// in the verify_input_tokens layout (each lane's anchor, then its
+// proposals, the anchor again past its live rows), `priors` each lane's
+// pleNgram - 1 tokens before its first row, nearest first
+// (kQwen4PleNoToken where the request has none). Writes
+// lanes * rowStride * pleHeads() ids, the ids a streamed table's stage
+// reads; a resident table lets the GPU hash them instead.
+void qwen4ExpVerifyPleIds(const Qwen4ExpWeights &weights, uint32_t lanes,
+                          uint32_t rowStride,
+                          std::span<const uint32_t> tokens,
+                          std::span<const uint32_t> priors, uint32_t *out);
 
 } // namespace richengine::model

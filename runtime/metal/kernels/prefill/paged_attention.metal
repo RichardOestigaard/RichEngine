@@ -4,8 +4,11 @@
 // (richengine_paged_attention_tile) over eight query rows of one KV head.
 
 // Prefill split: KV heads vary first, then query tiles, then history splits.
+// Int8Queries selects the q8q product — INT8 query codes against the INT8
+// keys (paged_attention_tile.h); the dense INT8 layouts only.
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement,
-          uint HeadDim = RichKvHeadDimension, uint MPasses = 1>
+          uint HeadDim = RichKvHeadDimension, uint MPasses = 1,
+          bool Int8Queries = false>
 inline void richengine_prefill_attention_split_phase(
     device bfloat *queries, device bfloat *partials,
     device float *statistics, device const RichKvPage *page_table,
@@ -14,7 +17,7 @@ inline void richengine_prefill_attention_split_phase(
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale,
     threadgroup atomic<uint, thread_scope_threadgroup> *rescale,
-    uint3 group, uint thread_index) {
+    uint3 group, uint thread_index, RichDuoAttentionPolicy duo = {}) {
   constexpr uint D = HeadDim;
   uint kv_head = group.x;
   uint split = group.z;
@@ -30,12 +33,12 @@ inline void richengine_prefill_attention_split_phase(
   ulong slot = (ulong(tile) * KVHeads + kv_head) * params.split_count + split;
   richengine_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
                               RICHENGINE_PREFILL_ATTENTION_TILE_ROWS, CacheElement,
-                              HeadDim, MPasses>(
+                              HeadDim, MPasses, Int8Queries>(
       queries + tile_offset, page_table, params.kv, kv_head,
       params.committed_tokens + tile_start, active_rows, params.split_count, split,
       partials, statistics, slot, nullptr, params.score_scale, scores,
       probabilities, row_max, row_sum, previous_scale, rescale,
-      thread_index);
+      thread_index, 0, 0, MPasses, duo);
 }
 
 template <uint KVHeads, uint QueryHeadsPerKVHead,
@@ -45,7 +48,7 @@ inline void richengine_prefill_attention_reduce_phase(
     device bfloat *output,
     constant RichPrefillAttentionParams &params, uint3 group,
     uint thread_index, threadgroup float *weights,
-    threadgroup float *group_values) {
+    threadgroup float *group_values, RichDuoAttentionPolicy duo = {}) {
   constexpr ushort M = RICHENGINE_PREFILL_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
   constexpr ushort D = HeadDim;
   uint kv_head = group.x;
@@ -64,10 +67,13 @@ inline void richengine_prefill_attention_reduce_phase(
       partials, statistics, output + tile_offset,
       params.committed_tokens + tile_start, active_rows, params.split_count,
       (ulong(tile) * KVHeads + kv_head) * params.split_count, fused_row,
-      thread_index, weights, group_values);
+      thread_index, weights, group_values, 0, duo, kv_head);
 }
 
-#define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \
+// The trailing variadic forwards the phase template's HeadDim/MPasses/
+// Int8Queries: a q8q emission passes "RichKvHeadDimension, 1, true" (or the
+// head dimension's own), every existing call passes nothing.
+#define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement, ...)            \
   [[max_total_threads_per_threadgroup(256)]] kernel void Name(                 \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
@@ -84,7 +90,7 @@ inline void richengine_prefill_attention_reduce_phase(
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                           \
-    richengine_prefill_attention_split_phase<Heads, Group, CacheElement>(          \
+    richengine_prefill_attention_split_phase<Heads, Group, CacheElement, ##__VA_ARGS__>( \
         queries, partials, statistics, page_table, params, scores,             \
         probabilities, row_max, row_sum, previous_scale, &rescale,             \
         group, thread_index);                                                  \
@@ -101,6 +107,15 @@ PAGED_PREFILL_SPLIT(prefill_attention_int4_split_kv2_g8, 2, 8, RichKvPacked4)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g4, 4, 4, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+// The q8q (_q8q) splits: each fused query row quantizes to int8 codes and
+// the QK product lands as int32 (paged_attention_tile.h's Int8Queries),
+// scored by the same page softmax and reduce — the partials/statistics
+// contract is unchanged. Emitted for the dense INT8 layouts the planner's
+// RICHENGINE_Q8Q_ATTENTION gate reaches; windowed (_swa), DuoAttention,
+// sparse and the Gemma cores keep the bf16-query kernels.
+PAGED_PREFILL_SPLIT(prefill_attention_q8q_split, 4, 6, int8_t, RichKvHeadDimension, 1, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv4_g4, 4, 4, int8_t, RichKvHeadDimension, 1, true)
+PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv2_g8, 2, 8, int8_t, RichKvHeadDimension, 1, true)
 #undef PAGED_PREFILL_SPLIT
 
 kernel void prefill_attention_reduce(
@@ -147,8 +162,9 @@ kernel void prefill_attention_reduce_kv2_g8(
 
 // Head-dimension variants: the dense target's KV2/Group8 pages of 128
 // dimensions (_hd128) and LFM2's KV8/Group4 pages of 64 (_hd64). The reduce
-// threadgroup is the head dimension.
-#define PREFILL_ATTENTION_SPLIT_HD(Name, Heads, Group, CacheElement, HeadDim) \
+// threadgroup is the head dimension. The trailing variadic forwards the
+// phase template's MPasses/Int8Queries like PAGED_PREFILL_SPLIT's.
+#define PREFILL_ATTENTION_SPLIT_HD(Name, Heads, Group, CacheElement, HeadDim, ...) \
   [[max_total_threads_per_threadgroup(256)]] kernel void Name(              \
       device bfloat *queries [[buffer(0)]],                                 \
       device bfloat *partials [[buffer(1)]],                                 \
@@ -166,7 +182,7 @@ kernel void prefill_attention_reduce_kv2_g8(
     threadgroup float previous_scale[M];                                    \
     threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
     richengine_prefill_attention_split_phase<Heads, Group, CacheElement,        \
-                                         HeadDim>(                          \
+                                         HeadDim, ##__VA_ARGS__>(           \
         queries, partials, statistics, page_table, params, scores,          \
         probabilities, row_max, row_sum, previous_scale, &rescale,          \
         group, thread_index);                                               \
@@ -192,6 +208,12 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_hd512, 2, 8, bfloat, 512
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_k4q4d128, 4, 4, int8_t, 128)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k4q4d128, 4, 4, RichKvPacked4, 128)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k4q4d128, 4, 4, bfloat, 128)
+// The q8q head-dimension variants of the same gate.
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_hd128, 2, 8, int8_t, 128, 1, true)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_hd64, 8, 4, int8_t, 64, 1, true)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k8q5d64, 8, 5, int8_t, 64, 1, true)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k8q4d128, 8, 4, int8_t, 128, 1, true)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k4q4d128, 4, 4, int8_t, 128, 1, true)
 #undef PREFILL_ATTENTION_SPLIT_HD
 
 // The _m2 hd512 variants run the tile in two fused-row passes (MP = M/2 =
@@ -383,4 +405,53 @@ kernel void prefill_attention_reduce_gemma_hd512(
   richengine_prefill_attention_reduce_phase<2, 8, 512>(
       partials, statistics, output, params, group, thread_index, weights,
       group_values);
+}
+
+// The DuoAttention (_duo) prefill variants of the kv4/g6 core: a KV head
+// whose bit of the trailing policy's head_mask is set is a streaming head —
+// its splits partition the sink's leading pages plus the trailing window's
+// instead of the tile's whole history (metal/abi/DuoAttention.h), and the
+// reduce recomputes each head's written splits over the same range. INT8 and
+// packed-INT4 only.
+#define PREFILL_ATTENTION_SPLIT_DUO(Name, Heads, Group, CacheElement)        \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(              \
+      device bfloat *queries [[buffer(0)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
+      device float *statistics [[buffer(2)]],                               \
+      device const RichKvPage *page_table [[buffer(3)]],                  \
+      constant RichPrefillAttentionParams &params [[buffer(4)]],          \
+      constant RichDuoAttentionPolicy &duo [[buffer(5)]],                  \
+      uint3 group [[threadgroup_position_in_grid]],                         \
+      uint thread_index [[thread_index_in_threadgroup]]) {                  \
+    constexpr uint M = Group * RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;          \
+    constexpr uint N = RichKvPageTokens;                                  \
+    alignas(16) threadgroup float scores[M * N];                            \
+    alignas(16) threadgroup bfloat probabilities[2 * M * N];                \
+    threadgroup float row_max[M];                                           \
+    threadgroup float row_sum[M];                                           \
+    threadgroup float previous_scale[M];                                    \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
+    richengine_prefill_attention_split_phase<Heads, Group, CacheElement>(       \
+        queries, partials, statistics, page_table, params, scores,          \
+        probabilities, row_max, row_sum, previous_scale, &rescale,          \
+        group, thread_index, duo);                                          \
+  }
+
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8_split_duo, 4, 6, int8_t)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_int4_split_duo, 4, 6, RichKvPacked4)
+#undef PREFILL_ATTENTION_SPLIT_DUO
+
+kernel void prefill_attention_reduce_duo(
+    device const bfloat *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant RichPrefillAttentionParams &params [[buffer(3)]],
+    constant RichDuoAttentionPolicy &duo [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichPrefillMaximumSplits];
+  threadgroup float group_values[8];
+  richengine_prefill_attention_reduce_phase<4, 6>(
+      partials, statistics, output, params, group, thread_index, weights,
+      group_values, duo);
 }

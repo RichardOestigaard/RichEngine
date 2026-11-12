@@ -67,7 +67,8 @@ public:
                       geometry_.layerKvLayout(true))
                 : operators_.prefillAttention(
                       sequence.rows, geometry_.attentionQueryHeads,
-                      geometry_.layerKvLayout(true)));
+                      geometry_.layerKvLayout(true),
+                      sequence.chunk.committed_tokens));
     step.extension = std::move(extension);
   }
 

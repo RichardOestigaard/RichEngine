@@ -20,8 +20,11 @@ public:
                           std::string_view model = {});
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
+  // committedTokens is the chunk's history before its rows — the q8q
+  // gate's per-split page count needs it (0 plans conservatively).
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t queryHeads, kv::Layout layout) const;
+      uint32_t rows, uint32_t queryHeads, kv::Layout layout,
+      uint32_t committedTokens = 0) const;
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
       uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
       std::span<const uint32_t> historyTokens, bool tree = false,
@@ -59,6 +62,14 @@ private:
 
   // The device policy every operator's plans derive from (ops/DevicePolicy.hpp).
   DevicePolicy policy_{};
+  // The q8q gate's pages-per-split threshold: 0 keeps the bf16-query
+  // kernels. RICHENGINE_Q8Q_ATTENTION arms it; Apple9 measured slower
+  // upstream, so only the Apple10+ tier reaches the q8q kernels.
+  [[nodiscard]] uint32_t int8QueriesFromPages() const noexcept;
+  // The dense prefill splits' pages-per-split history term: the measured
+  // neural-accelerator value on Apple10+, 0 elsewhere unless
+  // RICHENGINE_PREFILL_PAGES_PER_SPLIT overrides.
+  [[nodiscard]] uint32_t prefillPagesPerSplit() const noexcept;
   Linear linear_;
   uint32_t moeUnionCap_;
   uint32_t moeRouteWideRows_;

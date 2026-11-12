@@ -99,6 +99,95 @@ template [[host_name("moe_expert_gguf_m8_g_n")]] kernel MoeExpertGgufKernel moe_
 template [[host_name("moe_expert_gguf_m32_a_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, true>;
 template [[host_name("moe_expert_gguf_m32_g_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate, true>;
 
+// The streamed variant of moe_gguf_expert_tile (ops/MoE.cpp's streamed
+// prefill passes): the routed experts' planes are not bound — moe_gguf_stream_segment resolves the tile's expert
+// through the arena's slot and chunk-address tables, and a tile whose expert
+// holds no slot this round writes nothing (its expert's earlier round's
+// output stands). Everything past the segment is the staged tile's own.
+template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
+inline void moe_gguf_expert_tile_streamed(
+    device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+    device const uint *slots, device const ulong *chunks, device uchar *sw0, device uchar *sw1,
+    device uchar *smeta, device bfloat *output, device bfloat *aux, constant MoeGgufStreamParams &p, uint2 group,
+    uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
+  if (group.y >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[group.y];
+  bool resident;
+  const MoeGgufSegment s =
+      moe_gguf_stream_segment(tile.expert, p, slots, chunks, sw0, sw1, smeta, resident);
+  if (!resident) return;
+  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
+  const ulong out = ulong(group.y) * Rows * p.output_size;
+  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  if (moe_column_tile(tiles, group.y)) {
+    float sums[MOE_GGUF_COLUMN_ROWS];
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
+                                         0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
+                                         sums);
+    for (uint row = 0; row < tile.rows; ++row) {
+      const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
+      output[o] = gguf_epilogue<Ep>(sums[row], aux, o);
+    }
+    return;
+  }
+  threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
+  const auto run = [&](auto rows) {
+    constexpr ushort R = decltype(rows)::value;
+#if defined(__HAVE_TENSOR_MULTIPLANE__) && defined(__HAVE_METAL_FP4_E2M1_FORMAT_TYPE__)
+    // MXFP4 experts take the multiplane tile (kernels/common/
+    // gguf_mxfp4_tile.h): 8 rows live, like the fused kernels; the tile
+    // never splits K, so its partials, counter and arrival go unused.
+    if constexpr (NativeMxfp4) {
+      if (R <= 8 && s.format == GGUF_FMT_MXFP4) {
+        gguf_decode_mxfp4_tile<R, Ep>(x, s.w0, s.meta, output + out, (device coherent(device) float *)nullptr,
+                                      nullptr, aux + out, p.input_size, 1, p.output_size, origin, origin, 0,
+                                      simd_lane, simd_group, stage, (threadgroup uchar *)tl, nullptr);
+        return;
+      }
+    }
+#endif
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    gguf_zero(acc);
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
+                                            simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
+    gguf_elements(acc, [&](uint row, uint column, float v) {
+      const ulong o = out + ulong(row) * p.output_size + origin + column;
+      output[o] = gguf_epilogue<Ep>(v, aux, o);
+    });
+  };
+  moe_live_rows<Rows>(tile.rows, run);
+}
+template <ushort Rows, GgufEpilogue Ep>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
+kernel void moe_expert_gguf_streamed(device bfloat *input [[buffer(0)]],
+                                     device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                     device const uint *tile_count [[buffer(2)]],
+                                     device const uint *slots [[buffer(3)]],
+                                     device const ulong *chunks [[buffer(4)]],
+                                     device uchar *sw0 [[buffer(5)]], device uchar *sw1 [[buffer(6)]],
+                                     device uchar *smeta [[buffer(7)]], device bfloat *output [[buffer(8)]],
+                                     device bfloat *aux [[buffer(9)]],
+                                     constant MoeGgufStreamParams &p [[buffer(10)]],
+                                     uint2 group [[threadgroup_position_in_grid]],
+                                     uint simd_lane [[thread_index_in_simdgroup]],
+                                     uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
+  moe_gguf_expert_tile_streamed<Rows, Ep, false>(input, tiles, tile_count, slots, chunks, sw0, sw1, smeta, output,
+                                     aux, p, group, simd_lane, simd_group, stage, tl);
+}
+using MoeExpertGgufStreamedKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
+                                         device const uint *, device const ulong *, device uchar *, device uchar *,
+                                         device uchar *, device bfloat *, device bfloat *,
+                                         constant MoeGgufStreamParams &, uint2, uint, uint);
+template [[host_name("moe_expert_gguf_streamed_m8_a")]] kernel MoeExpertGgufStreamedKernel
+    moe_expert_gguf_streamed<8, EpNone>;
+template [[host_name("moe_expert_gguf_streamed_m8_g")]] kernel MoeExpertGgufStreamedKernel
+    moe_expert_gguf_streamed<8, EpUpWithGate>;
+template [[host_name("moe_expert_gguf_streamed_m32_a")]] kernel MoeExpertGgufStreamedKernel
+    moe_expert_gguf_streamed<32, EpNone>;
+template [[host_name("moe_expert_gguf_streamed_m32_g")]] kernel MoeExpertGgufStreamedKernel
+    moe_expert_gguf_streamed<32, EpUpWithGate>;
+
 // The fused gate+up staged tile (ops::MoE's addGgufExperts, unpaced
 // non-register plans): each simdgroup accumulates the tile's gate columns
 // and up columns back to back on the same staged weights loop, and stores
