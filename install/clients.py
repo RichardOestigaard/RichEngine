@@ -355,7 +355,6 @@ export const RichEngineCorpus = async () => ({
       body: JSON.stringify({
         text,
         emit_variants: true,
-        session: input.sessionID || 0,
       }),
     }).catch(() => {});
   },

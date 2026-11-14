@@ -16,6 +16,7 @@
 #include <cstring>
 #include <deque>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace richengine::model::ngram {
@@ -211,6 +212,9 @@ struct Corpus {
     // requests extending the same conversation share it. Same-session docs
     // win lookup ties.
     uint64_t session = 0;
+    // Identity in the inverted indexes below: monotonically assigned at
+    // push, so a tag that outlives its doc resolves to nothing.
+    uint32_t seq = 0;
   };
   std::deque<Doc> docs;
   // In-flight requests' streams, appended as they commit: a concurrent
@@ -219,6 +223,15 @@ struct Corpus {
   // is bounded by the lane count, and each entry is dropped when its
   // request finishes or suspends (the finished stream is pushed normally).
   std::deque<Doc> liveDocs;
+  // Global 3-gram membership: a key maps to the seqs of the docs holding
+  // it, in push order — the same relative order the deques scan, so
+  // lookup's live-first-then-finished iteration and its tie-breaks are
+  // preserved exactly while misses skip the whole doc set. Evicted docs
+  // drop their tags and their bySeq entry together.
+  std::unordered_map<uint32_t, Doc *> bySeq;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> liveIndex;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> docsIndex;
+  uint32_t nextSeq = 1;
   size_t tokens = 0;
   uint64_t tick = 0;
   // Lifetime counters for /status observability. droppedStarts tracks
@@ -249,6 +262,40 @@ inline uint64_t sessionKey(std::span<const uint32_t> prompt) {
 // continues known text.
 constexpr uint32_t kCorpusArmMin = 8;
 
+// Registers a doc's 3-gram keys in the inverted index, only for starts
+// `from` onward — a live doc's appends index just their new positions.
+// A doc's seq enters a key's list once (the list holds members, not
+// occurrences; the per-doc starts table still resolves the starts).
+inline void indexDoc(std::unordered_map<uint64_t, std::vector<uint32_t>> &index,
+                     const Corpus::Doc &doc, uint32_t from = 0) {
+  const auto &history = doc.table.history;
+  if (history.size() < 3 + from)
+    return;
+  const uint32_t end = static_cast<uint32_t>(history.size()) - 3;
+  for (uint32_t i = from; i <= end; ++i) {
+    auto &seqs = index[key(history.data() + i)];
+    if (std::find(seqs.begin(), seqs.end(), doc.seq) == seqs.end())
+      seqs.push_back(doc.seq);
+  }
+}
+
+inline void unindexDoc(std::unordered_map<uint64_t, std::vector<uint32_t>> &index,
+                       const Corpus::Doc &doc) {
+  const auto &history = doc.table.history;
+  if (history.size() < 3)
+    return;
+  const uint32_t end = static_cast<uint32_t>(history.size()) - 3;
+  for (uint32_t i = 0; i <= end; ++i) {
+    const auto it = index.find(key(history.data() + i));
+    if (it == index.end())
+      continue;
+    auto &seqs = it->second;
+    seqs.erase(std::remove(seqs.begin(), seqs.end(), doc.seq), seqs.end());
+    if (seqs.empty())
+      index.erase(it);
+  }
+}
+
 inline void push(Corpus &corpus, std::span<const uint32_t> stream,
                  uint32_t maxDocs = 64, size_t maxTokens = 1u << 20,
                  uint64_t origin = 0, uint64_t session = 0) {
@@ -257,11 +304,14 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
   Corpus::Doc doc;
   doc.origin = origin;
   doc.session = session;
+  doc.seq = corpus.nextSeq++;
   uint32_t drops = 0;
   seed(doc.table, stream, &drops);
   corpus.droppedStarts += drops;
   doc.hitStamp = corpus.tick;
+  indexDoc(corpus.docsIndex, doc);
   corpus.docs.push_back(std::move(doc));
+  corpus.bySeq[corpus.docs.back().seq] = &corpus.docs.back();
   corpus.tokens += stream.size();
   ++corpus.pushes;
   while (corpus.docs.size() > maxDocs ||
@@ -273,6 +323,8 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
     for (auto it = corpus.docs.begin() + 1; it != corpus.docs.end(); ++it)
       if (it->hitStamp < oldest->hitStamp)
         oldest = it;
+    unindexDoc(corpus.docsIndex, *oldest);
+    corpus.bySeq.erase(oldest->seq);
     corpus.tokens -= oldest->table.history.size();
     corpus.docs.erase(oldest);
     ++corpus.evictions;
@@ -285,6 +337,8 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
 inline void liveEnd(Corpus &corpus, uint64_t origin) {
   for (auto it = corpus.liveDocs.begin(); it != corpus.liveDocs.end(); ++it)
     if (it->origin == origin) {
+      unindexDoc(corpus.liveIndex, *it);
+      corpus.bySeq.erase(it->seq);
       corpus.liveDocs.erase(it);
       return;
     }
@@ -300,9 +354,12 @@ inline void liveBegin(Corpus &corpus, uint64_t origin, uint64_t session,
   Corpus::Doc doc;
   doc.origin = origin;
   doc.session = session;
+  doc.seq = corpus.nextSeq++;
   seed(doc.table, stream);
   doc.hitStamp = corpus.tick;
+  indexDoc(corpus.liveIndex, doc);
   corpus.liveDocs.push_back(std::move(doc));
+  corpus.bySeq[corpus.liveDocs.back().seq] = &corpus.liveDocs.back();
 }
 
 // Appends newly committed tokens to a request's live doc. A request
@@ -311,7 +368,12 @@ inline void liveAppend(Corpus &corpus, uint64_t origin,
                        std::span<const uint32_t> tokens) {
   for (Corpus::Doc &doc : corpus.liveDocs)
     if (doc.origin == origin) {
+      // The append creates a start at each new size - 3, i.e. positions
+      // from the old size - 2 up; re-indexing them adds just the new keys.
+      const size_t before = doc.table.history.size();
       append(doc.table, tokens);
+      indexDoc(corpus.liveIndex, doc,
+               before >= 2 ? static_cast<uint32_t>(before - 2) : 0);
       return;
     }
 }
@@ -398,10 +460,35 @@ inline uint32_t lookupCorpus(Corpus &corpus,
       }
     }
   };
-  for (Corpus::Doc &doc : corpus.liveDocs)
-    consider(doc);
-  for (Corpus::Doc &doc : corpus.docs)
-    consider(doc);
+  // The inverted index turns the consult into O(occurrences). Hits are
+  // considered in seq order — a doc's creation order, which is its deque
+  // order — because a live doc that acquired this key through a later
+  // append sits at the list's tail regardless of its position. That keeps
+  // the live-first-then-finished scan's tie-breaks identical to a full
+  // doc scan.
+  std::vector<uint32_t> order;
+  const auto consult =
+      [&](const std::unordered_map<uint64_t, std::vector<uint32_t>> &index) {
+        const auto it = index.find(pattern);
+        if (it == index.end())
+          return;
+        // A single-member key is the common case — no ordering to fix.
+        if (it->second.size() == 1) {
+          const auto docIt = corpus.bySeq.find(it->second.front());
+          if (docIt != corpus.bySeq.end())
+            consider(*docIt->second);
+          return;
+        }
+        order.assign(it->second.begin(), it->second.end());
+        std::sort(order.begin(), order.end());
+        for (const uint32_t seq : order) {
+          const auto docIt = corpus.bySeq.find(seq);
+          if (docIt != corpus.bySeq.end())
+            consider(*docIt->second);
+        }
+      };
+  consult(corpus.liveIndex);
+  consult(corpus.docsIndex);
   if (best == kNone) {
     ++corpus.misses;
     return 0;
