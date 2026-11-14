@@ -19,14 +19,14 @@ inline float rms_inverse_of_sums(float sum, uint width, threadgroup float *reduc
   sum = simd_sum(sum);
   if (lane == 0)
     reductions[simd_group] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f;
     for (uint i = 0; i < Simdgroups; ++i)
       total += reductions[i];
     reductions[0] = rsqrt(total / width + eps);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   return reductions[0];
 }
 

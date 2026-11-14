@@ -35,7 +35,7 @@ inline bool split_arrive_last(device atomic_uint *counter, uint splits,
   if (thread_index == 0)
     *arrival = atomic_fetch_add_explicit(counter, 1u, memory_order_release,
                                          mem_flags::mem_device);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const uint order = *arrival;
   // The last arrival brings the counter to `splits` and wakes the parked
   // reducer. `order` is threadgroup-uniform, so whole simdgroups notify.

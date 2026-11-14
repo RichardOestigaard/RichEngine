@@ -104,6 +104,8 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->states.releaseLane(entry.stateLane, requestId);
   impl_->pageTableBindings[entry.stateLane] = {};
   impl_->releaseImages(entry);
+  // A suspended stream stops looking in-flight; resume re-opens the doc.
+  impl_->removeNgramLiveDoc(entry);
   entry.draftContextPlan.reset();
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
@@ -688,13 +690,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // proposals; there is no tree table, so it stays a chain. The n-gram
   // predraft does emit comb tables for a tree-eligible Null draft batch.
   impl_->ngram_.predraftedTree_ = false;
+  impl_->ngram_.mixMask_ = 0;
+  impl_->ngram_.mixCorpusMask_ = 0;
   const bool gpuPredrafted =
       (!constrained || nullDraft) &&
       impl_->adoptGpuPredraft(entries, items, width, !treeBatch);
   const bool predrafted =
       (!constrained || nullDraft) &&
       (gpuPredrafted || impl_->applyAnePredraft(entries, items, width) ||
-       impl_->applyNgramPredraft(entries, width, nullDraft && treeBatch));
+       impl_->applyNgramPredraft(
+           entries, width,
+           (nullDraft || impl_->ngram_.ngramTreeDrafted_) && treeBatch));
   // Adaptive draft bypass: when every lane's acceptance EWMA sits below the
   // draft's break-even cost, the batch decodes anchor-only — the draft
   // forward, its vocabulary head read and the selector all skip. A lane
@@ -798,6 +804,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeDraftBatchGraph(commandGraph, entries,
                                  {logicalPositions.data(), width});
   }
+  // N-gram per-lane mix (RICHENGINE_NGRAM_MIX): the draft produced
+  // proposals for every lane, so any lane whose n-gram scored higher
+  // verifies the better chain instead of the draft's — the draft pass is
+  // sunk either way. Chains only: a tree batch's proposals live in the
+  // comb tables. Bypassed and span-skipped batches keep their rows — the
+  // bypass's EWMA bookkeeping and the DFA's forced span both break under
+  // an overwrite.
+  if (!tree && !predrafted && !draftBypassed && !spanSkipDraft &&
+      impl_->ngram_.mixMask_)
+    impl_->applyNgramMix(commandGraph, entries, width);
   // Every chain batch chooses its verify rows: a MoE target's by expected
   // tokens per cost (model::VerifyBudget, the selector's confidences), every
   // other cycle's to its live rows (every_row), which keeps dead rows out of
@@ -1260,10 +1276,13 @@ void requireRunwayPages(const kv::PageStorage &storage,
 // so its revision stays 1.
 ModelBatchItem warmupItem(uint64_t id, uint64_t position, uint32_t tokens,
                           std::span<const uint32_t> pages) {
+  auto owner =
+      std::make_shared<const std::vector<uint32_t>>(pages.begin(), pages.end());
   return {.requestId = id,
           .logicalPosition = position,
           .tokenCount = tokens,
-          .pageTable = std::vector<uint32_t>(pages.begin(), pages.end()),
+          .pageTable = std::span<const uint32_t>(*owner),
+          .pageTableOwner = std::move(owner),
           .pageTableRevision = 1};
 }
 

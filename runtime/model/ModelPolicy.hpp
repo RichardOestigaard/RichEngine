@@ -69,7 +69,11 @@ struct ModelPolicy final {
   uint32_t ngramCorpus = 0;        // RICHENGINE_NGRAM_CORPUS
   bool ngramCorpusAll = false;     // RICHENGINE_NGRAM_CORPUS_ALL
   uint32_t ngramCorpusMargin = 5;  // RICHENGINE_NGRAM_CORPUS_MARGIN
-  bool ngramCorpusSessionGate = false; // RICHENGINE_NGRAM_CORPUS_SESSION_GATE
+  bool ngramCorpusSessionGate = true; // RICHENGINE_NGRAM_CORPUS_SESSION_GATE
+  bool ngramCorpusLive = true;     // RICHENGINE_NGRAM_CORPUS_LIVE
+  bool ngramMix = true;            // RICHENGINE_NGRAM_MIX
+  double ngramDraftCost = 0.1;     // RICHENGINE_NGRAM_DRAFT_COST
+  bool ngramTreeDrafted = false;   // RICHENGINE_NGRAM_TREE_DRAFTED
   double treeAcceptMin = 0.0;      // RICHENGINE_TREE_ACCEPT_MIN
   double treeAcceptMax = 6.0;      // RICHENGINE_TREE_ACCEPT_MAX
   // ops/Canvas.cpp + model/RuntimeImpl.hpp canvas policy. The profile bundles
@@ -157,6 +161,10 @@ namespace detail {
   p.ngramCorpusAll = env.ngramCorpusAll;
   p.ngramCorpusMargin = env.ngramCorpusMargin;
   p.ngramCorpusSessionGate = env.ngramCorpusSessionGate;
+  p.ngramCorpusLive = env.ngramCorpusLive;
+  p.ngramMix = env.ngramMix;
+  p.ngramDraftCost = env.ngramDraftCost;
+  p.ngramTreeDrafted = env.ngramTreeDrafted;
   p.treeAcceptMin =
       env.treeAcceptMinSet ? env.treeAcceptMin : maker.treeAcceptMin;
   p.treeAcceptMax =

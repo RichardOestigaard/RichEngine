@@ -1,0 +1,12 @@
+Fetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Fetching 13 files:  31%|███       | 4/13 [00:00<00:00, 15.11it/s]Fetching 13 files:  77%|███████▋  | 10/13 [00:00<00:00, 29.90it/s]Fetching 13 files: 100%|██████████| 13/13 [00:01<00:00,  7.66it/s]
+model mlx-community/Qwen3.8-27B-4bit: 64 layers, 16 full-attention [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63]
+tapped sdpa in 2 modules
+prompt 0: len=1024 depth=0.1 needle@98 gen='\n\n<think>' hit=False (2.8s)
+prompt 1: len=1024 depth=0.5 needle@490 gen='\n\n<think>' hit=False (2.2s)
+prompt 2: len=1024 depth=0.9 needle@883 gen='\n\n<think>' hit=False (2.3s)
+prompt 3: len=4096 depth=0.1 needle@405 gen='\n\n<think>' hit=False (8.9s)
+prompt 4: len=4096 depth=0.5 needle@2027 gen='\n\n<think>' hit=False (8.8s)
+prompt 5: len=4096 depth=0.9 needle@3648 gen='\n\n<think>' hit=False (9.2s)
+prompt 6: len=16384 depth=0.1 needle@1634 gen='\n\n<think>' hit=False (42.5s)
+prompt 7: len=16384 depth=0.5 needle@8171 gen='\n\n<think>' hit=False (38.4s)
+prompt 8: len=16384 depth=0.9 needle@14707 gen='\n\n<think>' hit=False (38.2s)

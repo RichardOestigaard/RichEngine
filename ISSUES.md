@@ -62,12 +62,18 @@ Q precision (fp16-Q staging verified no improvement — the error is in the
 stored codes). Tier stays opt-in (`--kv-format fp8`). Improving it needs a
 higher-precision K/V representation, not Q-side changes.
 
-### Chunked GDN prefill — implemented, abandoned
-`prefill/gdn_chunked.metal` (WY/UT form, flag-gated, unbound): correct to
-bf16 tolerance after two derivation fixes but at best ~1.0–1.15× of serial at
-T=2048 — the scan is latency-bound, and C≥128 hits the N>16 operand bug.
-Also inherently breaks `gdn_metal_test.mm`'s bitwise split-invariance contract.
-Left in-tree for reference; serial scan remains the production path.
+### Chunked GDN prefill — bound but not promoted
+`prefill/gdn_chunked.metal` (WY/UT form) is bound: `GDN::addPrefill`
+(`runtime/ops/GDN.cpp`) selects it when `buffers.chunkScratch` is
+allocated and `gdnChunkFactor()` returns nonzero — `RICHENGINE_GDN_CHUNKED`
+(32/64/128) via env or an autotune winner (`ModelPolicy::gdnChunked`,
+family tuning lists offer it). Correct to bf16 tolerance after two
+derivation fixes but at best ~1.0–1.15× of serial at T=2048 — the scan is
+latency-bound, and C≥128 hits the N>16 operand bug. Also inherently breaks
+`gdn_metal_test.mm`'s bitwise split-invariance contract. Serial scan
+remains the production default; `GDN_CHUNKED=128` measured 64.7 B1 on the
+sweep harness (vs ~51) but was rejected on its own regression rule
+(prefill 334 vs 408) — see the 27B decode notes below.
 
 ### Native MXFP4 prefill slower than staged
 `gguf_prefill_mxfp4p`/`gguf_decode_mxfp4p` p-path loses ~11–13% vs the staged

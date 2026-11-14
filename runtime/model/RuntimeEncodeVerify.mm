@@ -84,9 +84,12 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     const bool affine48 =
         headShape.layout() == ops::WeightLayout::Affine64 &&
         headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0;
-    // m64h is opt-in: its half-precision tile can flip argmax near-ties.
+    // m64h is opt-in: its half-precision tile can flip argmax near-ties. The
+    // K-split prototype covers the same 64 rows in fp32 partials but has no
+    // logits writeback, so a logits lane still vetoes the fused head below.
     static const bool headM64 = envFlag("RICHENGINE_HEAD_M64");
-    const uint32_t affineBound = headM64 ? 64 : 48;
+    const uint32_t affineBound =
+        headM64 || tuning().headKsplit ? 64 : 48;
     // RICHENGINE_HEAD_PER_LANE: a lane that is not clean-greedy keeps its
     // logits rows, which the fused head's *_logits variant writes beside the
     // argmax partials — sampled and penalized selection and masked argmax
@@ -120,6 +123,11 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     buffers.fusedHead = !headFusedOff && !tree && fusedShape &&
         uint64_t{lanes} * geometry.draft.verifyRows() <=
             (affine48 ? affineBound : 32);
+    // The K-split 64-row head cannot write logits for a lane that needs them;
+    // without m64h's *_logits tile that batch keeps the ordinary projection.
+    if (buffers.fusedHead && affine48 && !headM64 &&
+        uint64_t{lanes} * geometry.draft.verifyRows() > 48 && logitsLaneMask)
+      buffers.fusedHead = false;
     buffers.headArgs.output_size = geometry.target.vocabularySize;
     buffers.headArgs.output_stride = geometry.target.paddedVocabularySize;
     buffers.headArgs.input_size = geometry.target.hiddenSize;
@@ -306,8 +314,10 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         headShape.layout() == ops::WeightLayout::Affine64 &&
         headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0;
     static const bool headM64 = envFlag("RICHENGINE_HEAD_M64");
+    const uint32_t affineBound =
+        headM64 || tuning().headKsplit ? 64u : 48u;
     uint32_t fusedHead =
-        headFusedOff || headRows > (affineHead ? (headM64 ? 64u : 48u) : 32u)
+        headFusedOff || headRows > (affineHead ? affineBound : 32u)
             ? 0
             : affineHead
                   ? (headRows <= 16 && headShape.outputSize % 256 == 0 &&
@@ -353,6 +363,16 @@ constexpr uint32_t kQsaVerifyLaneRecords =
             ? (fusedHead == 2 ? logitsLaneMask : !fusedLaneMask)
             : logitsLaneMask)
       fusedHead = 0;
+    // fusedHead 4 is the affine K-split head: fp32 partial logits in two K
+    // halves, 64-column partials for the GGUF tile reducer. It has no logits
+    // writeback, so any logits lane keeps the ordinary projection unless
+    // m64h's half-precision *_logits tile was opted into.
+    if (headRows > 48 && fusedHead == 1) {
+      if (tuning().headKsplit && !logitsLaneMask)
+        fusedHead = 4;
+      else if (!headM64)
+        fusedHead = 0;
+    }
     if (fusedHead) {
       vBuffers.headArgmaxValues =
           decodeArena->packed(DecodeTensor::HeadArgmaxValues,

@@ -1,7 +1,8 @@
 # Security
 
-Please report vulnerabilities privately to <contact@inco.ai> rather than in a
-public issue. Include the RichEngine version (`richengine --version`), macOS version,
+Please report vulnerabilities privately using the repository's Security tab
+(<https://github.com/richardoestigaard/richengine/security/advisories/new>)
+rather than in a public issue. Include the RichEngine version (`richengine --version`), macOS version,
 and steps to reproduce. We will acknowledge your report and keep you informed
 until it is resolved.
 

@@ -28,7 +28,9 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            PQ20 = GGUF_FMT_PQ20, AF4 = GGUF_FMT_AF4,
            AF5 = GGUF_FMT_AF5, AF6 = GGUF_FMT_AF6, AF8 = GGUF_FMT_AF8,
            AF4G128 = GGUF_FMT_AF4G128, AF5G128 = GGUF_FMT_AF5G128, AF6G128 = GGUF_FMT_AF6G128,
-           AF8G128 = GGUF_FMT_AF8G128, AF4P = GGUF_FMT_AF4P, FMT_COUNT = GGUF_FMT_COUNT };
+           AF8G128 = GGUF_FMT_AF8G128, AF4P = GGUF_FMT_AF4P,
+           AF2 = GGUF_FMT_AF2, AF3 = GGUF_FMT_AF3, AF2G128 = GGUF_FMT_AF2G128, AF3G128 = GGUF_FMT_AF3G128,
+           FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The private AF formats (AF4 and the oQ family): native blocks of an
 // element-order code bitstream then a bf16 scale and bias.
@@ -106,6 +108,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
   switch (f) {
     case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
     case AF4: case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128: case AF4P:
+    case AF2: case AF3: case AF2G128: case AF3G128:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
     case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
     case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
@@ -320,7 +323,8 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
     // The oQ formats: a {codes, bf16 scale, bf16 bias} block per gs elements,
     // codes an element-order bitstream (element e at bits e*bits); plane0 the
     // same codes in slot order.
-    case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128: {
+    case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128:
+    case AF2: case AF3: case AF2G128: case AF3G128: {
       const uint32_t bits = afBits(f);
       uint16_t s16, m16; memcpy(&s16, blk + fi.block_bytes - 4, 2); memcpy(&m16, blk + fi.block_bytes - 2, 2);
       const float s = b2f(s16), m = b2f(m16);
@@ -412,6 +416,7 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
     case IQ1S: case Q40: case Q41: case MXFP4: case PQ20:
       memcpy(dst, blk, fi.meta_bytes); return;
     case AF4: case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128: case AF4P:
+    case AF2: case AF3: case AF2G128: case AF3G128:
       memcpy(dst, blk + fi.block_bytes - 4, fi.meta_bytes); return;
     case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;
     case Q3K: memcpy(dst, blk + kQ3KD, 2); dst[2] = dst[3] = 0; memcpy(dst + 4, blk + kQ3KScales, 12); return;
@@ -470,7 +475,8 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
     // The AF formats are the engine's private types; no upstream symbols exist.
     "dequantize_row_af4", "dequantize_row_af5", "dequantize_row_af6", "dequantize_row_af8",
     "dequantize_row_af4g128", "dequantize_row_af5g128", "dequantize_row_af6g128", "dequantize_row_af8g128",
-    "dequantize_row_af4p"};
+    "dequantize_row_af4p", "dequantize_row_af2", "dequantize_row_af3", "dequantize_row_af2g128",
+    "dequantize_row_af3g128"};
   static_assert(std::size(symbols) == FMT_COUNT, "a GGML dequantize_row_* symbol per format");
   using Dequantize = void (*)(const void *, float *, int64_t);
   auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbols[f]));

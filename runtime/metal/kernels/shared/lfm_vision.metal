@@ -128,7 +128,7 @@ kernel void lfm_vision_gemm_qkv(
         auto a_slice = a.template slice<BK, TileM>(chunk * BK, 0);
         auto b_slice = b.template slice<BK, TileN>(chunk * BK, 0);
         operation.run(a_slice, b_slice, accumulated);
-        threadgroup_barrier(mem_flags::mem_none);
+        threadgroup_barrier(mem_flags::mem_none, memory_order_relaxed);
     }
     auto converted = operation.template get_destination_cooperative_tensor<
         decltype(a0), decltype(b0), bfloat>();
@@ -196,7 +196,7 @@ kernel void lfm_vision_rmsnorm_embed(
     }
     squares = simd_sum(squares);
     if (simd_lane == 0) reductions[simd_group] = squares;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float total = 0.0f;
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) total += reductions[i];
@@ -229,7 +229,7 @@ kernel void lfm_vision_rmsnorm(
     }
     squares = simd_sum(squares);
     if (simd_lane == 0) reductions[simd_group] = squares;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float total = 0.0f;
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) total += reductions[i];
@@ -383,7 +383,7 @@ kernel void lfm_vision_attention(
             decltype(q0), decltype(k0), float>();
         qk.run(q0, k0, scores);
         scores.store(s0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
         float exponents[RowsPerSimdgroup][4];
         float scales[RowsPerSimdgroup];
@@ -412,7 +412,7 @@ kernel void lfm_vision_attention(
             running_sum[i] = running_sum[i] * scale + tile_sum;
             running_max[i] = next_max;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         for (ushort i = 0; i < RowsPerSimdgroup; ++i) {
             ushort row = simd_group * RowsPerSimdgroup + i;
             if (simd_lane == 0) {
@@ -424,7 +424,7 @@ kernel void lfm_vision_attention(
                 probabilities[row * N + column] = bfloat(exponents[i][j]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
         device bfloat *tile_v = v + ulong(tile) * N * D;
         auto vt = tensor(tile_v, dextents<int, 2>{D, N},
@@ -438,7 +438,7 @@ kernel void lfm_vision_attention(
             running[i] = running[i] * previous_scale[index[1]] +
                 partial_output[i];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
 
     auto ot = tensor(out, dextents<int, 2>{D, M}, array<int, 2>{1, D});
@@ -571,7 +571,7 @@ kernel void lfm_vision_gemm_m64n128_silu_up(
         auto a_slice = a.template slice<BK, TileM>(chunk * BK, 0);
         auto b_slice = b.template slice<BK, TileN>(chunk * BK, 0);
         operation.run(a_slice, b_slice, accumulated);
-        threadgroup_barrier(mem_flags::mem_none);
+        threadgroup_barrier(mem_flags::mem_none, memory_order_relaxed);
     }
     auto converted = operation.template get_destination_cooperative_tensor<
         decltype(a0), decltype(b0), bfloat>();

@@ -222,11 +222,17 @@ class RequestFlag(IntFlag):
     # cross-request n-gram corpus may draft for this lane when enabled in
     # hinted mode (RICHENGINE_NGRAM_CORPUS=2).
     NGRAM_CORPUS_HINT = 1 << 1
+    # The request never drafts from the cross-request n-gram corpus and
+    # its stream never joins it — for traffic that must not feed later
+    # requests.
+    NGRAM_CORPUS_OPT_OUT = 1 << 2
 
 
 # A request with any other bit set is a request error.
 _REQUEST_FLAG_BITS = int(
-    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.NGRAM_CORPUS_HINT
+    RequestFlag.IGNORE_END_OF_SEQUENCE
+    | RequestFlag.NGRAM_CORPUS_HINT
+    | RequestFlag.NGRAM_CORPUS_OPT_OUT
 )
 
 

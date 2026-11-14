@@ -183,7 +183,7 @@ struct RuntimeRequest final {
   // there were left out (ModelRequest::restoredTokens).
   uint32_t restoredTokens = 0;
   // Learning-free predraft state (RICHENGINE_NGRAM_PREDRAFT): the lane's
-  // token stream and each 3-gram key's last four starts, which the lookup
+  // token stream and each 3-gram key's last eight starts, which the lookup
   // walks. NgramIndex.hpp owns the logic.
   ngram::Table ngram;
   // Acceptance gating: EWMA of accepted tokens per n-gram round, set in

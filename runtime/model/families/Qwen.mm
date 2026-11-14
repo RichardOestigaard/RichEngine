@@ -133,7 +133,14 @@ ModelDescriptor qwen38Descriptor(std::string name) {
 }
 
 ModelDescriptor qwen36Descriptor(std::string name) {
-  const TargetLayout target = qwen36MoeTargetLayout();
+  TargetLayout target = qwen36MoeTargetLayout();
+  // The probe-calibrated DuoAttention policy (dev/tools/duoattention.md):
+  // sink 128 / window 1024 on int8/int4 KV; measured on
+  // mlx-community/Qwen3.6-35B-A3B-4bit — every head carries heavy
+  // old-context mass, so only the four lightest stream — bit
+  // 4*ordinal+head set. Ornith-1.5-35B-A3B shares the layout and carries
+  // the same mask from its own probe.
+  target.duoAttention = {128, 1024, 0x322ULL};
   return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
                              qwenVisionLayout(target.hiddenSize));
 }
@@ -145,7 +152,13 @@ ModelDescriptor qwen36Descriptor(std::string name) {
 // pays verify rows it never returns — and baked indirect dispatch
 // measures a few points behind direct encoding on this step graph.
 ModelDescriptor ornith36Descriptor(std::string name) {
-  const TargetLayout target = qwen36MoeTargetLayout();
+  TargetLayout target = qwen36MoeTargetLayout();
+  // The probe-calibrated DuoAttention policy (dev/tools/duoattention.md):
+  // sink 128 / window 1024 on int8/int4 KV; every head carries heavy
+  // old-context mass, so only the four lightest stream — bit
+  // 4*ordinal+head set. Qwen3.6-35B-A3B shares the layout and carries
+  // the same mask value from its own probe.
+  target.duoAttention = {128, 1024, 0x322ULL};
   ModelDescriptor descriptor =
       makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
                           qwenVisionLayout(target.hiddenSize));

@@ -1243,6 +1243,159 @@ void headArgmax(MetalBackend &backend, const Linear &linear) {
   section("fused head: q4_k/q6_k/mxfp4 over one and two lanes, every live row the fp64 argmax, dead rows sentinel");
 }
 
+// ---------------------------------------------------------------- packed decode
+// The family-10 packed-operand decode kernels (kernels/decode/
+// linear_gguf_*_sgmatrix.metal — the `<f>m` names ops::LinearGguf's
+// packedFormat returns under RICHENGINE_GGUF_PACKED_ON) over the same
+// repacked planes as the staged decode: q4km and q2km, the committed packed
+// paths, beside the new q5km and q6km. Their exact bf16 x code products sum
+// the same weights in another order, so each output is checked in the
+// packed path's own fp64 interval (projectionBound, staged = false), a
+// staged run beside each packed one bounds their difference by both errors
+// and the bf16 rounding of the value, and the fp32 epilogue's output rounds
+// to the bf16 one's bit for bit.
+void packedDecode(MetalBackend &backend) {
+  if (backend.capabilities().appleGpuFamily < 10) {
+    std::cout << "packed decode: skipped (Apple GPU family below 10)\n";
+    return;
+  }
+  constexpr uint32_t N = 256, K = 1024;
+  constexpr uint32_t kColumnTiles = N / GGUF_TILE_COLUMNS;
+  constexpr uint32_t kRows[] = {8, 16, 32};
+  constexpr uint32_t kSplits[] = {1, 2, 4, 8};
+  const struct {
+    Fmt f;
+    const char *name;
+  } formats[] = {{Q4K, "q4k"}, {Q5K, "q5k"}, {Q6K, "q6k"}, {Q2K, "q2k"}};
+  Guarded partials(backend, 8 * 32 * N * sizeof(float), 0);
+  Guarded counters(backend, kColumnTiles * sizeof(uint32_t), 0);
+  const auto poison = [&] {
+    std::fill_n(static_cast<uint32_t *>(partials.view.contents()), partials.bytes / 4, kPoisonFinite);
+  };
+  const auto countersClear = [&] {
+    const auto *count = static_cast<const uint32_t *>(counters.view.contents());
+    return std::all_of(count, count + counters.bytes / 4, [](uint32_t c) { return c == 0; });
+  };
+  // One decode dispatch of `kernel` over `splits` K partitions and `aux`
+  // as buffer 7 (the bf16 halves; empty binds the output, as the plain
+  // epilogues never read it).
+  const auto dispatch = [&](const std::string &kernel, const Tensor &w, const Guarded &input,
+                            const Guarded &aux, Guarded &output, uint32_t splits) {
+    CommandGraph graph;
+    graph.add(kernel, {input.view, w.segment.plane0, w.segment.plane1Slot(), w.segment.meta, output.view,
+                       partials.view, counters.view, aux.bytes ? aux.view : output.view},
+              GgufDecodeParams{K, splits, N, 0, 1}, {kColumnTiles, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    if (!countersClear()) fail(kernel + ": a split counter is not reset");
+  };
+  const auto kernelName = [](const char *format, bool packed, uint32_t rows, const char *ep) {
+    return std::string("gguf_decode_") + format + (packed ? "m" : "") + "_m" + std::to_string(rows) + "_" + ep;
+  };
+  for (const auto &format : formats) {
+    const Tensor w = tensor(backend, format.f, N, K);
+    const std::string what = std::string("packed ") + format.name;
+    uint64_t compared = 0;
+    for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse})
+      for (const uint32_t rows : kRows) {
+        const std::vector<float> x = activations(inputs, rows, K);
+        std::vector<uint16_t> xb(uint64_t{rows} * K);
+        for (uint64_t i = 0; i < xb.size(); ++i) xb[i] = floatToBf16(x[i]);
+        const Guarded input = bfloats(backend, xb);
+        const std::vector<Dot> dots = products({&w}, N, x, rows);
+        for (const uint32_t splits : kSplits) {
+          const std::string label = what + " " + std::string(inputs == Inputs::Dense ? "dense" : "sparse") +
+                                    " rows=" + std::to_string(rows) + " splits=" + std::to_string(splits);
+          // The plain epilogue: packed and staged, each within its fp64
+          // interval and within both errors of the other.
+          {
+            Guarded packedOut(backend, uint64_t{rows} * N * 2, 0xFF),
+                stagedOut(backend, uint64_t{rows} * N * 2, 0xFF);
+            poison();
+            dispatch(kernelName(format.name, true, rows, "a"), w, input, Guarded(backend, 0, 0), packedOut, splits);
+            poison();
+            dispatch(kernelName(format.name, false, rows, "a"), w, input, Guarded(backend, 0, 0), stagedOut, splits);
+            const std::vector<uint16_t> packed = packedOut.halves(), staged = stagedOut.halves();
+            uint64_t outside = 0;
+            std::string first;
+            for (uint32_t r = 0; r < rows; ++r)
+              for (uint32_t c = 0; c < N; ++c) {
+                const uint64_t i = uint64_t{r} * N + c;
+                const Dot &d = dots[i];
+                const Interval want = projected(d, false);
+                const double both = projectionBound(d, false) + projectionBound(d, true);
+                const double slack = 0.01 * (std::fabs(d.value) + projectionBound(d, true) + 1.0);
+                const float difference = std::fabs(bf16ToFloat(packed[i]) - bf16ToFloat(staged[i]));
+                if ((!inside(packed[i], want) || difference > both + slack) && !outside++)
+                  first = "row " + std::to_string(r) + " column " + std::to_string(c) + ": packed " +
+                          digits(bf16ToFloat(packed[i])) + " staged " + digits(bf16ToFloat(staged[i])) +
+                          " fp64 " + digits(d.value);
+              }
+            if (outside) fail(label + ": " + std::to_string(outside) + " outputs outside fp64 or the staged bound; " +
+                                 first);
+            compared += uint64_t{rows} * N;
+          }
+          // The other epilogues on the plain config's first split counts:
+          // residual and up-with-gate against their fp64 intervals, and the
+          // fp32 output rounding to the bf16 one's bit for bit.
+          if (rows == 8 && inputs == Inputs::Dense && (splits == 1 || splits == 4)) {
+            const std::vector<float> residual = residuals(rows, N), gate = activations(Inputs::Dense, rows, N);
+            std::vector<uint16_t> residualH(uint64_t{rows} * N), gateH(uint64_t{rows} * N);
+            for (uint64_t i = 0; i < residualH.size(); ++i) {
+              residualH[i] = floatToBf16(residual[i]);
+              gateH[i] = floatToBf16(gate[i]);
+            }
+            const Guarded residualAux = bfloats(backend, residualH), gateAux = bfloats(backend, gateH);
+            for (const char *ep : {"r", "g"}) {
+              Guarded out(backend, uint64_t{rows} * N * 2, 0xFF);
+              poison();
+              dispatch(kernelName(format.name, true, rows, ep), w, input,
+                       ep[0] == 'r' ? residualAux : gateAux, out, splits);
+              const std::vector<uint16_t> got = out.halves();
+              uint64_t outside = 0;
+              std::string first;
+              for (uint32_t r = 0; r < rows; ++r)
+                for (uint32_t c = 0; c < N; ++c) {
+                  const uint64_t i = uint64_t{r} * N + c;
+                  const Interval p = projected(dots[i], false);
+                  const Interval want =
+                      ep[0] == 'r' ? withResidual(p, bf16ToFloat(residualH[i])) : withGate(p, bf16ToFloat(gateH[i]));
+                  if (!inside(got[i], want) && !outside++)
+                    first = std::string(ep) + " row " + std::to_string(r) + " column " + std::to_string(c) +
+                            " is " + digits(bf16ToFloat(got[i])) + ", fp64 " + digits(dots[i].value);
+                }
+              if (outside)
+                fail(label + " " + ep + ": " + std::to_string(outside) + " outputs outside fp64; " + first);
+            }
+            // The fp32 epilogue: within fp64 before rounding, and its output
+            // rounds to the bf16 epilogue's bit for bit.
+            Guarded bf16Out(backend, uint64_t{rows} * N * 2, 0xFF),
+                f32Out(backend, uint64_t{rows} * N * sizeof(float), 0xFF);
+            poison();
+            dispatch(kernelName(format.name, true, rows, "a"), w, input, Guarded(backend, 0, 0), bf16Out, splits);
+            poison();
+            dispatch(kernelName(format.name, true, rows, "a_f32"), w, input, Guarded(backend, 0, 0), f32Out, splits);
+            const auto *values = static_cast<const float *>(f32Out.view.contents());
+            const std::vector<uint16_t> bf16 = bf16Out.halves();
+            uint64_t wrong = 0;
+            std::string first;
+            for (uint32_t r = 0; r < rows; ++r)
+              for (uint32_t c = 0; c < N; ++c) {
+                const uint64_t i = uint64_t{r} * N + c;
+                const float v = values[i];
+                if ((floatToBf16(v) != bf16[i] ||
+                     std::fabs(double(v) - dots[i].value) > projectionBound(dots[i], false)) &&
+                    !wrong++)
+                  first = "row " + std::to_string(r) + " column " + std::to_string(c) + " is " + digits(v) +
+                          ", fp64 " + digits(dots[i].value);
+              }
+            if (wrong) fail(label + " a_f32: " + std::to_string(wrong) + " outputs differ; " + first);
+          }
+        }
+      }
+    section(what + ": " + std::to_string(compared) + " packed outputs within fp64 and the staged runs' bound");
+  }
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -1275,6 +1428,7 @@ int main(int argc, char **argv) {
               "independent of poisoned partials and within fp64");
       packedInput(backend, linear);
       tokenGather(backend);
+      packedDecode(backend);
       headArgmax(backend, linear);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';

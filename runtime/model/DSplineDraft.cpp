@@ -356,9 +356,7 @@ void DSplineDraft::addDecode(
          buffers.persistentValues[layer], buffers.queryKeys,
          buffers.queryValues},
         cacheLengths, attentionPlan, causal, devicePack);
-    ops::DraftAttention::addReorder(graph, buffers.attention,
-                                    buffers.proposalQkv, attentionPlan);
-    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.residual,
+    linear.add(graph, {.input = buffers.attention, .output = buffers.residual,
                        .residual = buffers.hidden[current], .scratch = scratch},
                weights.outputProjection,
                linear.decodePlan(weights.outputProjection, lanes,

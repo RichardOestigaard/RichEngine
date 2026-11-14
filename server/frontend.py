@@ -511,6 +511,7 @@ class GenerationOptions:
     ignore_eos: bool
     seed: int
     priority: wire.RequestPriority
+    corpus_opt_out: bool = False
 
 
 class Frontend:
@@ -2169,6 +2170,9 @@ class Frontend:
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise APIError(400, "ignore_eos must be a boolean")
+        corpus_opt_out = body.get("corpus_opt_out", False)
+        if not isinstance(corpus_opt_out, bool):
+            raise APIError(400, "corpus_opt_out must be a boolean")
         seed = body.get("seed")
         if seed is None:
             seed = secrets.randbits(64)
@@ -2180,6 +2184,7 @@ class Frontend:
             ignore_eos,
             seed,
             self._priority(body),
+            corpus_opt_out,
         )
 
     def _output_budget(self, requested, prompt_tokens, field, clamp=False):
@@ -2217,9 +2222,16 @@ class Frontend:
             priority=options.priority,
             stop_sequences=options.stop_sequences,
             flags=(
-                wire.RequestFlag.IGNORE_END_OF_SEQUENCE
-                if options.ignore_eos
-                else wire.RequestFlag(0)
+                (
+                    wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+                    if options.ignore_eos
+                    else wire.RequestFlag(0)
+                )
+                | (
+                    wire.RequestFlag.NGRAM_CORPUS_OPT_OUT
+                    if options.corpus_opt_out
+                    else wire.RequestFlag(0)
+                )
             ),
             think_open=self.think_open,
             think_end=self.think_end,

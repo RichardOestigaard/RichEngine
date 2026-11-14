@@ -147,6 +147,32 @@ public:
                                  uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
                                  const GdnTapeLanes *tapeLanes = nullptr,
                                  uint32_t flags = 0);
+  // The z-split verify (RICHENGINE_GDN_ZSPLIT): the fused kernel's prologue
+  // and recurrent scan over the input projection's carved columns —
+  // `buffers.packed` is then the conv rows' ConvDim-strided view and `tail`
+  // the beta/decay rows' (PackedWidth - ConvDim - ValueHeads*HeadDim)-strided
+  // view — leaving the ungated rows in buffers.hidden. The caller dispatches
+  // the z GEMV next, then addDecodeGate, which gates the rows and writes the
+  // out-projection's `input` table; together they reproduce addDecode
+  // bitwise. Only the chain verify takes the split (tree keeps addDecodeTree).
+  static void addDecodeScan(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
+                            metal::MetalBuffer tail, GdnShape shape,
+                            uint32_t lanes, uint32_t layer,
+                            GdnStateStrides state, GdnHeadOrder order,
+                            std::span<const uint32_t> liveRows = {},
+                            uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+                            const GdnTapeLanes *tapeLanes = nullptr,
+                            uint32_t flags = 0);
+  // The split's gate half: `z` is the z GEMV's ValueHeads*HeadDim columns per
+  // row, `buffers.hidden` the scan's ungated rows in and the gated rows out,
+  // `buffers.mixerNorm` and `buffers.linearScratch` the gate's weights and
+  // table scratch. Returns what the scratch table describes, as addDecode.
+  static PreparedInput addDecodeGate(metal::CommandGraph &graph,
+                                     metal::MetalBuffer z,
+                                     GdnDecodeBuffers buffers, GdnShape shape,
+                                     uint32_t lanes, uint32_t verifyStride,
+                                     GdnHeadOrder order, LinearInput input,
+                                     uint32_t flags = 0);
   // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane, the
   // node descriptors and emitted counts steering the conv taps and the
   // leaf-on-copy scan. addCommitTree replays the retained path.
@@ -158,10 +184,14 @@ public:
                                      uint32_t layer, GdnStateStrides state,
                                      GdnHeadOrder order, LinearInput input,
                                      uint32_t flags = 0);
+  // convCarved marks the packed tensor the z-split verifies wrote: its conv
+  // columns sit ConvDim-strided inside each lane's flat carved row run, so
+  // the commit takes verify_gdn_commit_split instead of verify_gdn_commit.
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
                         GdnStateStrides state,
-                        uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS);
+                        uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS,
+                        bool convCarved = false);
   static void addCommitTree(metal::CommandGraph &graph,
                             GdnCommitBuffers buffers,
                             metal::MetalBuffer retainedPath,

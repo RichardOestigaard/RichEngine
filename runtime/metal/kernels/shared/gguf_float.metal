@@ -52,7 +52,7 @@ inline void project(device const bfloat *input, device const float *weights, dev
   }
 #pragma unroll
   for (uint f = 0; f < kFragments; ++f) parts[(sg * kFragments + f) * 32 + lane] = acc[f];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const uint f = sg, row = f * 8 + l.fm;
   if (f >= kFragments || row >= live) return;
   float2 total = float2(0);
@@ -157,7 +157,7 @@ inline void project(device bfloat *input, device const float *weights, device T 
 #pragma unroll
       for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = w[(step + 1) * (kStep / 4) + j];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (owns_rows) {
       auto slice = a.template slice<kStep, kRowsPerSimdgroup>(step * kStep, 0);
       if (step & 1) {

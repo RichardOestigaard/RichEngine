@@ -46,6 +46,10 @@ namespace richengine::model {
   layout.hiddenCaptureLayers = {1, 5, 9, 13, 17, 21, 25, 29};
   layout.captureLayerCount = 8;
   layout.attentionCore = kv::Core::Kv4Group4;
+  // The probe-calibrated DuoAttention policy (dev/tools/duoattention.md):
+  // sink 128 / window 1024, the eight lowest-old-mass KV heads of the
+  // eight full-attention layers stream — bit 4*ordinal+head set.
+  layout.duoAttention = {128, 1024, 0xE0002017ULL};
   layout.intermediateSize = 12288;
   // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp).
   layout.gdnCore = ops::GdnCore::Value32;

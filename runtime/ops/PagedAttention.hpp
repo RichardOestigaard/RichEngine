@@ -343,6 +343,11 @@ public:
              uint32_t liveNodes = 0, uint32_t rows = kv::kVerifyRows,
              bool sparse = false, uint32_t int8QueriesFromPages = 0);
 
+  // Whether RICHENGINE_ATTENTION_ACC16 selected the bfloat-accumulator
+  // (_a16) split kernels on this device: the environment flag and the
+  // Apple10+ gate the plans apply, before any per-layout eligibility.
+  [[nodiscard]] static bool attentionAcc16Enabled();
+
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
   // in a packed command reuse it serially. Verify storage covers all lanes at

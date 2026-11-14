@@ -215,6 +215,46 @@ struct Command {
   std::span<const EventStep> events;
 };
 
+// One operation of a blit command, encoded in submission order through an
+// MTLBlitCommandEncoder: a byte fill or a buffer-to-buffer copy. Offsets
+// and lengths are bytes relative to the named view; the whole range must
+// stay inside it. Fill writes `fillValue` to every byte of the range (the
+// KV-clear shape); Copy moves `length` bytes from `source` at
+// `sourceOffset` to `destination` at `destinationOffset`.
+struct BlitOperation {
+  enum class Kind : uint8_t { Fill, Copy };
+
+  MetalBuffer destination;
+  uint64_t destinationOffset = 0;
+  uint64_t length = 0;
+  // Copy's source view and offset; ignored by Fill.
+  MetalBuffer source;
+  uint64_t sourceOffset = 0;
+  // Fill's byte value; ignored by Copy.
+  uint8_t fillValue = 0;
+  Kind kind = Kind::Fill;
+};
+
+// What one blit submission encodes: its operations in order, and the event
+// steps between them — `before` counts operations exactly as Command's
+// counts dispatches.
+//
+// Blit commands always encode on the backend's Metal 3 command queue:
+// Metal 4 has no blit encoder. While the Metal 4 submission path is
+// active (the default), a blit therefore shares no implicit ordering with
+// compute submissions — hazard tracking cannot see the GPU-address
+// bindings the Metal 4 encoder uses. Order a blit against compute
+// explicitly: a compute command's EventStep::Signal raises a SharedEvent
+// the blit waits on, and the blit's own Signal holds a later compute
+// command's EventStep::Wait, or the caller waits the compute ticket first.
+// Interleaving blit operations inside a compute Command is the intended
+// next step (PreparedBlit/commitBlit in MetalBackendImpl.hpp are the
+// seam); until then a blit is its own submission.
+struct BlitCommand {
+  std::span<const BlitOperation> operations;
+  std::span<const EventStep> events;
+};
+
 struct CommandTiming {
   // From the GPU start of a command's first Metal command buffer to the end
   // of its last: a command split at event signals (EventStep) also counts the
@@ -356,6 +396,17 @@ public:
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
                  std::string_view label);
+  // RICHENGINE_HEAP_ARENA=1 opts allocateBuffer into placement-heap
+  // suballocation (HeapArena.hpp): eligible sizes come out of shared MTLHeaps
+  // whose freed ranges recycle, so disjoint transient allocations alias the
+  // same physical pages. Off by default — hazard semantics differ — and every
+  // heap-backed buffer still joins the residency set as an ordinary
+  // MTLBuffer. RICHENGINE_HEAP_ARENA_MIN_BYTES/_MAX_BYTES bound the eligible
+  // range (defaults 256 KiB and 1 GiB, 0 disables either bound),
+  // _GROW_MB sizes new heaps (default 512), _TRACKED=1 makes heaps
+  // hazard-tracked (default untracked — tracked heaps serialize all
+  // suballocated accesses), and _WC=1/_WC_MIN_BYTES put large Shared
+  // buffers on a write-combined heap.
   // A Shared buffer over whole pages of memory another agent also reads or
   // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
   // keeps `owner` until it lets the buffer go; the memory is the owner's, so
@@ -392,6 +443,19 @@ public:
   // the returned ticket. A second command is rejected until wait() consumes
   // the first ticket, preserving the one-in-flight runtime invariant.
   [[nodiscard]] CommandTicket submitAsync(const ComputeDispatch &dispatch);
+
+  // Encodes a blit command's operations through an MTLBlitCommandEncoder,
+  // commits it, waits for completion, and reports GPU and wall time like
+  // submit(). See BlitCommand for the ordering contract.
+  [[nodiscard]] CommandTiming submitBlit(const BlitCommand &command);
+
+  // Encodes and commits a blit command without waiting, under the same
+  // ticket contract as submitCommandAsync: the submit-ahead ring admits it
+  // beside one in-flight compute command, and its buffers order against
+  // other Metal 3 submissions but not implicitly against Metal 4 ones.
+  [[nodiscard]] CommandTicket
+  submitBlitAsync(const BlitCommand &command,
+                  CommandCompletion completion = {});
 
   // Encodes a command into Metal command buffers, one more than it has event
   // signals (EventStep), and commits them without waiting. The completion

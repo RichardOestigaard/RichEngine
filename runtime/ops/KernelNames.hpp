@@ -15,6 +15,8 @@ inline constexpr std::string_view kDecodeSamplePenalizeVerify = "decode_sample_p
 inline constexpr std::string_view kDecodeHeadArgmaxReduceTiles = "decode_head_argmax_reduce_tiles";
 inline constexpr std::string_view kDecodeHeadArgmaxReduceTilesGguf = "decode_head_argmax_reduce_tiles_gguf";
 inline constexpr std::string_view kDecodeHeadArgmaxReduceTilesT256 = "decode_head_argmax_reduce_tiles_t256";
+inline constexpr std::string_view kDecodeHeadArgmaxQ4KsplitWrite = "decode_head_argmax_q4_ksplit_write";
+inline constexpr std::string_view kDecodeHeadArgmaxQ4KsplitFinish = "decode_head_argmax_q4_ksplit_finish";
 inline constexpr std::string_view kDecodeSampleArgmaxSharded = "decode_sample_argmax_sharded";
 inline constexpr std::string_view kDecodeSampleArgmaxReduce = "decode_sample_argmax_reduce";
 inline constexpr std::string_view kDecodeSampleMassSharded = "decode_sample_mass_sharded";
@@ -64,10 +66,6 @@ inline constexpr std::string_view kDraftAttentionBf16Reduce = "draft_attention_b
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ16k2 = "draft_attention_bf16_reduce_q16k2";
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ32k8d64i = "draft_attention_bf16_reduce_q32k8d64i";
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ8k2d256 = "draft_attention_bf16_reduce_q8k2d256";
-inline constexpr std::string_view kDraftAttentionReorder = "draft_attention_reorder";
-inline constexpr std::string_view kDraftAttentionReorderQ16k2 = "draft_attention_reorder_q16k2";
-inline constexpr std::string_view kDraftAttentionReorderQ32k8d64i = "draft_attention_reorder_q32k8d64i";
-inline constexpr std::string_view kDraftAttentionReorderQ8k2d256 = "draft_attention_reorder_q8k2d256";
 inline constexpr std::string_view kDraftContextKvCommit = "draft_context_kv_commit";
 inline constexpr std::string_view kDraftContextKvCommitQ16k2 = "draft_context_kv_commit_q16k2";
 inline constexpr std::string_view kDraftContextKvCommitQ32k8d64i = "draft_context_kv_commit_q32k8d64i";
@@ -115,6 +113,13 @@ inline constexpr std::string_view kVerifyGdnFusedVh32 = "verify_gdn_fused_vh32";
 inline constexpr std::string_view kVerifyTreeGdnFused = "verify_tree_gdn_fused";
 inline constexpr std::string_view kVerifyGdnCommit = "verify_gdn_commit";
 inline constexpr std::string_view kVerifyGdnCommitVh32 = "verify_gdn_commit_vh32";
+// The RICHENGINE_GDN_ZSPLIT path: the fused kernel without its gate phase
+// (conv/z/tail projections carved apart), the standalone gate apply, and the
+// commit that reads the carved conv rows.
+inline constexpr std::string_view kVerifyGdnFusedSplit = "verify_gdn_fused_split";
+inline constexpr std::string_view kGdnGateApply = "gdn_gate_apply";
+inline constexpr std::string_view kVerifyGdnCommitSplit = "verify_gdn_commit_split";
+inline constexpr std::string_view kVerifyGdnCommitSplitVh32 = "verify_gdn_commit_split_vh32";
 inline constexpr std::string_view kVerifyGdnCommitTree = "verify_gdn_commit_tree";
 inline constexpr std::string_view kVerifyGdnCommitTreeVh32 = "verify_gdn_commit_tree_vh32";
 
@@ -382,6 +387,7 @@ inline constexpr std::string_view kMoeGroupRoutesE512 = "moe_group_routes_e512";
 inline constexpr std::string_view kMoeGroupRoutesVerifiedE512 = "moe_group_routes_verified_e512";
 inline constexpr std::string_view kMoeRouteSelectSigmoid = "moe_route_select_sigmoid";
 inline constexpr std::string_view kMoeRouteScoresQ8M8 = "moe_route_scores_q8_m8";
+inline constexpr std::string_view kMoeRouteScoresQ8M16 = "moe_route_scores_q8_m16";
 inline constexpr std::string_view kMoeRouteScoresQ8M32 = "moe_route_scores_q8_m32";
 inline constexpr std::string_view kMoeRouteSelectQ8 = "moe_route_select_q8";
 inline constexpr std::string_view kMoeRouteCap = "moe_route_cap";
@@ -391,6 +397,7 @@ inline constexpr std::string_view kMoeGroupRoutesVerified = "moe_group_routes_ve
 inline constexpr std::string_view kMoeGatherTable16 = "moe_gather_table16";
 inline constexpr std::string_view kMoeGatherPacked = "moe_gather_packed";
 inline constexpr std::string_view kMoeGatherRows = "moe_gather_rows";
+inline constexpr std::string_view kMoeGatherRowsSmall = "moe_gather_rows_small";
 inline constexpr std::string_view kMoeCombine = "moe_combine";
 // The dense shared-expert dispatches of a decode plan under
 // RICHENGINE_MOE_SHARED_DENSE (params.shared == 2 in the grouping).
@@ -468,6 +475,11 @@ inline constexpr std::string_view kTestAddHookU32 = "test_add_hook_u32";
 inline constexpr std::string_view kTestWriteGrid = "test_write_grid";
 inline constexpr std::string_view kTestWriteRange = "test_write_range";
 inline constexpr std::string_view kTestMarkGridU32 = "test_mark_grid_u32";
+// The stage_barrier.h self-test kernels (dev/tests/engine/
+// stage_barrier_test.metal).
+inline constexpr std::string_view kTestStageBarrierSync = "test_stage_barrier_sync";
+inline constexpr std::string_view kTestStageBarrierProduce = "test_stage_barrier_produce";
+inline constexpr std::string_view kTestStageBarrierConsume = "test_stage_barrier_consume";
 inline constexpr std::string_view kAddressedWriteU32 = "addressed_write_u32";
 inline constexpr std::string_view kAddressedCheckU32 = "addressed_check_u32";
 inline constexpr std::string_view kDoesNotExist = "does_not_exist";

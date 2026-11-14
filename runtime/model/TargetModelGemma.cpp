@@ -277,7 +277,7 @@ public:
     const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes);
     const ops::PreparedInput normalized = ops::Normalization::addRms(
         step.graph, input, layer.inputNorm, b.normalized, hidden, step.rows,
-        b.linearScratch, inputPlan.input());
+        b.linearScratch, inputPlan.input(), false);
     linear.add(step.graph,
                {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
                 .prepared = normalized},

@@ -415,10 +415,13 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
                            device const bfloat *aux, constant MoeGgufExpertParams &p, uint2 tg, uint tid, uint sg,
                            uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
-  if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
+  const bool tmaj = p.tile_major != 0;
+  const uint tile_row = tmaj ? tg.x : tg.y;
+  const uint colb = tmaj ? tg.y : tg.x;
+  if (tile_row >= *tile_count) return;
+  const MoeGgufSegment s = moe_gguf_segment(tiles[tile_row].expert, p, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
-  const ulong rows = ulong(tg.y) * 8;
+  const ulong rows = ulong(tile_row) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
   const auto pick = [&](auto body) {
     if constexpr (NativeMxfp4) quant_format_switch_native(s.format, body);
@@ -428,8 +431,8 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, 1, Ep>(
-        table + rows * K, sums + tg.y * table16_sums_per_tile(K), s.w0, s.w1, s.meta, out + rows * N, nullptr, nullptr,
-        aux + rows * N, q, uint2(tg.x, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
+        table + rows * K, sums + tile_row * table16_sums_per_tile(K), s.w0, s.w1, s.meta, out + rows * N, nullptr, nullptr,
+        aux + rows * N, q, uint2(colb, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
         arrival);
   });
 }

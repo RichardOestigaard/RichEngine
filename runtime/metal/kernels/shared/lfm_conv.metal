@@ -240,7 +240,7 @@ static inline void verify_v4_impl(
   staged[row * kLfmVerifyVecColumns + (tid % kLfmVerifyVecColumns)] = bx;
   *reinterpret_cast<device bfloat4 *>(
       mixed + (lane_base + row) * dimension + channel) = bx;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float4 conv = float4(0.0f);
   for (uint tap = 0; tap < taps; ++tap) {
     const float4 w =

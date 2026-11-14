@@ -103,7 +103,7 @@ kernel void draft_select_edges(
     if (lane < Candidates)
       predecessors[lane] = token;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
   // One task is one predecessor and eight of the sixteen candidates, so a
   // simdgroup issues all its codebook loads at once instead of one cold row

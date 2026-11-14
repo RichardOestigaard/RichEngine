@@ -1170,14 +1170,14 @@ inline void draft_top16_sharded_phase(
     // The 16th largest thread maximum: the minimum over the maxima that
     // fewer than sixteen others exceed.
     maxima[thread_index] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     uint above = 0;
     for (uint other = 0; other < 256; ++other)
       above += maxima[other] > best ? 1u : 0u;
     float candidate = simd_min(above < K ? best : INFINITY);
     if (lane == 0)
       thresholds[simd_group] = candidate;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float threshold = thresholds[0];
     for (uint other = 1; other < 8; ++other)
       threshold = min(threshold, thresholds[other]);
@@ -1209,7 +1209,7 @@ inline void draft_top16_sharded_phase(
       round_values[slot * 8 + simd_group] = simd_value;
       round_ids[slot * 8 + simd_group] = simd_id;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float best = round_values[slot * 8];
     uint best_id = round_ids[slot * 8];
     for (uint other = 1; other < 8; ++other) {
@@ -1836,6 +1836,110 @@ HEAD_ARGMAX_Q4_T(decode_head_argmax_q4_m64h_logits, 64, kHeadArgmaxCols,
 #undef HEAD_ARGMAX_Q4
 #undef HEAD_ARGMAX_Q4_L
 #undef HEAD_ARGMAX_Q4_T
+
+// The K-split affine head for the 64-row verify batch: two dispatches cover
+// the input's quant groups, so the threadgroup tile stays float (16 KB at
+// 64 x 64) and the weight stream splits across two grids instead of paying
+// the half-precision m64h tile's rounding. The first split stores fp32
+// partial logits to the logits buffer; the second adds them, argmaxes and
+// writes 64-column partials for decode_head_argmax_reduce_tiles_gguf.
+constant constexpr ushort kHeadKsplitRows = 64;
+constant constexpr ushort kHeadKsplitCols = 64;
+
+kernel void decode_head_argmax_q4_ksplit_write(
+    device bfloat *input [[buffer(0)]],
+    device uchar *weights [[buffer(1)]],
+    device bfloat *scales [[buffer(2)]],
+    device bfloat *biases [[buffer(3)]],
+    device float *logits [[buffer(4)]],
+    constant HeadArgmaxSplitParams &params [[buffer(5)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr ushort M = kHeadKsplitRows;
+  constexpr ushort TN = kHeadKsplitCols;
+  threadgroup float input_sums[8 * M];
+  const uint col0 = tile * TN;
+  q4_mpp_tile_sums<M, TN, false, 8, false>(
+      input, weights, scales, biases, weights, scales, biases,
+      params.head.input_size, input_sums, col0, params.first_group,
+      params.end_group, simd_lane, simd_group,
+      [&](thread auto &sums_0, thread auto &sums_1 [[maybe_unused]],
+          Q4Traversal traversal) __attribute__((always_inline)) {
+        q4_visit(sums_0, traversal, [&](ushort i)
+                 __attribute__((always_inline)) {
+          auto index = sums_0.get_multidimensional_index(i);
+          const uint s = index[1];
+          const uint lane = s / params.head.rows;
+          const uint live = params.head.live_rows[lane];
+          if (live && s % params.head.rows < live)
+            logits[ulong(s) * params.head.output_stride + col0 + index[0]] =
+                float(sums_0[i]);
+        });
+      });
+}
+
+kernel void decode_head_argmax_q4_ksplit_finish(
+    device bfloat *input [[buffer(0)]],
+    device uchar *weights [[buffer(1)]],
+    device bfloat *scales [[buffer(2)]],
+    device bfloat *biases [[buffer(3)]],
+    device float *logits [[buffer(4)]],
+    device float *partial_values [[buffer(5)]],
+    device uint *partial_indices [[buffer(6)]],
+    constant HeadArgmaxSplitParams &params [[buffer(7)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr ushort M = kHeadKsplitRows;
+  constexpr ushort TN = kHeadKsplitCols;
+  threadgroup float tg_tile[M * TN];
+  threadgroup float input_sums[8 * M];
+  const uint col0 = tile * TN;
+  q4_mpp_tile_sums<M, TN, false, 8, false>(
+      input, weights, scales, biases, weights, scales, biases,
+      params.head.input_size, input_sums, col0, params.first_group,
+      params.end_group, simd_lane, simd_group,
+      [&](thread auto &sums_0, thread auto &sums_1 [[maybe_unused]],
+          Q4Traversal traversal) __attribute__((always_inline)) {
+        q4_visit(sums_0, traversal, [&](ushort i)
+                 __attribute__((always_inline)) {
+          auto index = sums_0.get_multidimensional_index(i);
+          tg_tile[index[1] * TN + index[0]] = float(sums_0[i]);
+        });
+      });
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index >= M)
+    return;
+  const uint s = thread_index;
+  const uint tiles = params.head.output_stride / TN;
+  float best = -INFINITY;
+  uint best_index = 0xffffffffu;
+  const uint live = params.head.live_rows[s / params.head.rows];
+  if (live && s % params.head.rows < live) {
+    const uint lane = s / params.head.rows;
+    const bool exclude_stop =
+        (params.head.exclude_stop_mask & (1u << lane)) != 0;
+    for (uint col = 0; col < TN; ++col) {
+      const uint token = col0 + col;
+      if (token >= params.head.output_size ||
+          (exclude_stop &&
+           (token == params.head.stop_token_0 ||
+            token == params.head.stop_token_1)))
+        continue;
+      const float value =
+          tg_tile[s * TN + col] +
+          logits[ulong(s) * params.head.output_stride + col0 + col];
+      if (value > best || (value == best && token < best_index)) {
+        best = value;
+        best_index = token;
+      }
+    }
+  }
+  partial_values[s * tiles + tile] = best;
+  partial_indices[s * tiles + tile] = best_index;
+}
 
 // Reduces the fused head's per-(row, column tile) partials to each selected
 // greedy row's token, lowest id on ties.

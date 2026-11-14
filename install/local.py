@@ -26,7 +26,7 @@ OMLX_DIR = Path.home() / ".omlx"
 
 # The affine quantization the runtime loads (MLX uniform Q4/64 and the
 # oMLX oQ matrix), shared with upstream._mlx_target.
-OQ_BITS = (4, 5, 6, 8)
+OQ_BITS = (2, 3, 4, 5, 6, 8)
 OQ_GROUPS = (64, 128)
 
 
@@ -140,7 +140,7 @@ def _quantization(config):
 
 def affine_supported(entry, defaults) -> bool:
     """Whether a quantization dict entry is in the oQ matrix: affine mode at
-    4-8 bits over groups of 64 or 128, fields defaulting to the global's."""
+    2-8 bits over groups of 64 or 128, fields defaulting to the global's."""
     return (
         entry.get("mode", defaults.get("mode", "affine")) == "affine"
         and entry.get("bits", defaults.get("bits")) in OQ_BITS

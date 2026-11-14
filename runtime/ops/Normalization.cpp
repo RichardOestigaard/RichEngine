@@ -4,6 +4,7 @@
 #include "ops/KernelNames.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
+#include <cstdlib>
 #include <utility>
 #include <stdexcept>
 
@@ -23,13 +24,20 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     const NormWeights &weight,
                                     metal::MetalBuffer output, uint32_t width,
                                     uint32_t rows, LinearScratch scratch,
-                                    LinearInput layout) {
+                                    LinearInput layout, bool writeRows) {
   if (layout != LinearInput::Plain) {
     requireTableScratch(scratch, layout, width, rows);
     // Packed takes the same two scratch slots as a table: the fp16 plane and
     // the per-(row, 32) exponent bytes the mxfp4p decode kernels read.
-    graph.add(normKernel(std::string(kNormRms) + tableSuffix(layout) + "_decode", weight, width),
-              {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
+    // writeRows=false selects the _nr variants, which skip the bf16 row
+    // stores a table-only consumer never reads.
+    std::string kernel = normKernel(std::string(kNormRms) + tableSuffix(layout) + "_decode",
+                                    weight, width);
+    // Opt-in while the DFlash2 draft-collapse correlation is unresolved:
+    // RICHENGINE_NORM_NR=1 enables the row-store elision.
+    if (!writeRows && std::getenv("RICHENGINE_NORM_NR")) kernel += "_nr";
+    graph.add(std::move(kernel), {input, weight.buffer, output, scratch.input, scratch.sums},
+              width, {rows, 1, 1});
     return {std::move(output), layout};
   }
   if (rows <= RICHENGINE_STAGED_NORM_ROWS && width <= RICHENGINE_STAGED_NORM_WIDTH && width % 4 == 0)

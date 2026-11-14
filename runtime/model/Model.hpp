@@ -48,10 +48,15 @@ enum RequestFlag : uint32_t {
   // when the global n-gram corpus is enabled in hinted mode the lane may
   // draft from it. Without the corpus the bit changes nothing.
   RequestNgramCorpusHint = 1U << 1,
+  // The request never drafts from the cross-request n-gram corpus and its
+  // stream never joins it — for traffic that must not feed later requests.
+  // Without the corpus the bit changes nothing.
+  RequestNgramCorpusOptOut = 1U << 2,
 };
 
 inline constexpr uint32_t kRequestFlagBits =
-    RequestIgnoreEndOfSequence | RequestNgramCorpusHint;
+    RequestIgnoreEndOfSequence | RequestNgramCorpusHint |
+    RequestNgramCorpusOptOut;
 
 // A request's token selection, its fields in the native request frame's
 // order. The defaults are greedy selection with nothing changing the logits.
@@ -362,9 +367,11 @@ struct ModelBatchItem final {
   uint64_t requestId = 0;
   uint64_t logicalPosition = 0;
   uint32_t tokenCount = 0;
-  // Owned: the cache's pages vector may reallocate between a batch item's
-  // assembly and its encode; a captured span would dangle.
-  std::vector<uint32_t> pageTable;
+  // A view of the cache's page list, kept alive by pageTableOwner: the
+  // engine hands out a shared snapshot so a decode step does not copy the
+  // whole list per lane. Empty span means no pages.
+  std::span<const uint32_t> pageTable{};
+  std::shared_ptr<const std::vector<uint32_t>> pageTableOwner;
   // pageTableRevision names the page list and is nonzero; the list equals
   // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;

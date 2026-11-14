@@ -251,7 +251,17 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * rows,
           cacheLengths[lane], rows, reference, causal);
       for (uint64_t index = 0; index < reference.size(); ++index) {
-        const float actual = tuning::bf16ToFloat(output[queryOffset + index]);
+        // The reduce writes row-major: the grouped reference index
+        // (query head in the KV group, proposal row, dim) maps to
+        // [row][head][dim] of the lane's attention rows.
+        const uint32_t queryHead = uint32_t(index) / (rows * kHeadDim);
+        const uint32_t remainder = uint32_t(index) % (rows * kHeadDim);
+        const uint64_t rowMajor =
+            uint64_t{lane} * rows * kAttention +
+            uint64_t{remainder / kHeadDim} * kAttention +
+            (uint64_t{head} * kQueryHeadsPerKv + queryHead) * kHeadDim +
+            remainder % kHeadDim;
+        const float actual = tuning::bf16ToFloat(output[rowMajor]);
         const float expected = reference[index];
         if (!std::isfinite(actual) ||
             std::fabs(actual - expected) >
@@ -378,7 +388,14 @@ void runCaseGeneric(MetalBackend &backend, uint32_t lanes,
               static_cast<float>(accumulated[d] / sum);
       }
       for (uint64_t index = 0; index < reference.size(); ++index) {
-        const float actual = tuning::bf16ToFloat(output[queryOffset + index]);
+        const uint32_t queryHead = uint32_t(index) / (kRows * headDim);
+        const uint32_t remainder = uint32_t(index) % (kRows * headDim);
+        const uint64_t rowMajor =
+            uint64_t{lane} * kRows * attention +
+            uint64_t{remainder / headDim} * attention +
+            (uint64_t{head} * qPerKv + queryHead) * headDim +
+            remainder % headDim;
+        const float actual = tuning::bf16ToFloat(output[rowMajor]);
         const float expected = reference[index];
         if (!std::isfinite(actual) ||
             std::fabs(actual - expected) > 0.02F + 0.02F * std::fabs(expected)) {
@@ -454,7 +471,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const auto queries = allocate(workspace.groupedQueriesBytes);
   const auto queryKeys = allocate(workspace.queryKeysBytes);
   const auto queryValues = allocate(workspace.queryValuesBytes);
-  const auto packed = allocate(workspace.groupedQueriesBytes);
   const auto queryNorm = allocate(kHeadDim * 2);
   const auto keyNorm = allocate(kHeadDim * 2);
   std::fill_n(static_cast<uint16_t *>(queryNorm.contents()), kHeadDim,
@@ -479,7 +495,8 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
     const bool finish = stage == DraftConvolutionStage::Residual;
     uint32_t params = 0;
     std::memcpy(&params, graph.dispatches()[0].bytes[0].data, sizeof(params));
-    require(graph.dispatches()[0].threadgroups.x == (kRows * shape.hiddenSize + 255) / 256 &&
+    require(graph.dispatches()[0].threadgroups.x ==
+                    ((uint64_t{kRows} * (shape.hiddenSize / 4) + 255) / 256) &&
                 params == (finish ? 1U : 0U),
             "convolution dispatch does not cover each element once");
     static_cast<void>(backend.submitCommand(graph.dispatches()));
@@ -510,7 +527,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   DraftAttention::addPrepare(graph,
       {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
        queryValues}, plan);
-  DraftAttention::addReorder(graph, queries, packed, plan);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
   require(std::equal(originalQkv.begin(), originalQkv.end(),
                      static_cast<const uint16_t *>(qkv.contents())),
@@ -557,22 +573,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                     "draft prepare value copy differs");
       }
     }
-  const auto *grouped = static_cast<const uint16_t *>(queries.contents());
-  const auto *reordered = static_cast<const uint16_t *>(packed.contents());
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
-    for (uint32_t row = 0; row < kRows; ++row) {
-      for (uint32_t head = 0; head < shape.queryHeads; ++head) {
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-          require(reordered[laneOffset + row * kAttention + head * kHeadDim +
-                             dim] ==
-                      grouped[laneOffset + (head * kRows + row) * kHeadDim +
-                              dim],
-                  "draft reorder differed from CPU layout reference");
-      }
-    }
-  }
-
   CommandGraph invalid;
   const auto shortBuffer = backend.view(output, 0, output.sizeBytes() - 2);
   rejects([&] {
@@ -584,9 +584,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
     DraftAttention::addPrepare(invalid,
         {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, {}, queryValues},
         plan);
-  });
-  rejects([&] {
-    DraftAttention::addReorder(invalid, queries, {}, plan);
   });
   const std::array<MetalBuffer, kLanes> emptyRings{};
   const std::array<uint32_t, kLanes> lengths{};

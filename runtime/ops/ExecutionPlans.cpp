@@ -97,6 +97,7 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   if (!prefill && !canvas) {
     config.unionCap = moeUnionCap_;
     config.m8Simdgroups = moeDecodeSimdgroups_;
+    config.routeM16 = tuning().moeRouteM16;
   }
   // Canvas plans take M16 tiles: a canvas step's union leaves experts well
   // under 32 rows each, and the doubled tile count buys parallelism the

@@ -20,6 +20,11 @@ struct DeviceCapabilities {
     // Highest supported MTLGPUFamilyAppleN.
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
     uint32_t appleGpuFamily = 0;
+    // The chip generation the device name reports ("Apple M5 Pro" -> 5), or
+    // zero when the name carries none. MTLGPUFamilyAppleN does not separate
+    // M4 from M5 — both report family 10 — so generation-scoped dispatch
+    // reads this instead.
+    uint32_t chipGeneration = 0;
     // IORegistry gpu-core-count; zero means unavailable. ops::plannedGpuCores
     // substitutes kAssumedGpuCores for kernel policy. Keep the missing
     // value here (status reports it).
@@ -53,6 +58,22 @@ struct DeviceCapabilities {
 // This is a fallback, not a calibrated optimum. Reported counts always win
 // (ops::plannedGpuCores performs the substitution for kernel policy).
 inline constexpr uint32_t kAssumedGpuCores = 32;
+
+// The chip generation a device name reports: the digits after "Apple M"
+// ("Apple M5 Pro" -> 5), or zero when the name carries none.
+[[nodiscard]] constexpr uint32_t
+parseChipGeneration(std::string_view name) noexcept {
+    const std::string_view marker = "Apple M";
+    const size_t at = name.find(marker);
+    if (at == std::string_view::npos) return 0;
+    size_t i = at + marker.size();
+    uint32_t generation = 0;
+    while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+        generation = generation * 10 + uint32_t(name[i] - '0');
+        ++i;
+    }
+    return generation;
+}
 
 // The first chip of an Apple GPU family, for messages: people know their
 // chip, not its GPU family number. A family without a public name here yet

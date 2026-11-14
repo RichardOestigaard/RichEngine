@@ -70,6 +70,14 @@ inline MoeQ4Slab moe_q4_slab(device uchar *packed, device uchar *shared,
                                             parameter_bytes)};
 }
 
+// The expert pass's (column block, tile) pair from the dispatch's group:
+// column-major grids arrive as (group.x, group.y); tile-major dispatches
+// (RICHENGINE_MOE_TILE_MAJOR) swap the axes so threadgroups sweep an
+// expert's row-tiles at one column block, and arrive as (group.y, group.x).
+inline uint2 moe_expert_group(constant MoeExpertParams &params, uint2 group) {
+  return params.tile_major ? uint2(group.y, group.x) : group;
+}
+
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):
 // every routed expert of the projection is one image segment of experts *
 // output_size rows, so expert e's planes start at tile e * output_size /

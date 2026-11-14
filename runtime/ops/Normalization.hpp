@@ -39,7 +39,8 @@ public:
                               const NormWeights &weight, metal::MetalBuffer output,
                               uint32_t width, uint32_t rows,
                               LinearScratch scratch = {},
-                              LinearInput layout = LinearInput::Plain);
+                              LinearInput layout = LinearInput::Plain,
+                              bool writeRows = true);
 
   // Fused RMS normalization plus Q4 input-group sums for an affine prefill
   // projection, of whole 64-input groups. Its norm weights are bf16: F32

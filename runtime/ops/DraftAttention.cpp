@@ -222,8 +222,9 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   }
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
-  const uint32_t groups =
-      phaseGroups(uint64_t{plan.rows()} * shape.hiddenSize);
+  // Each thread convolves one row's four-channel vector.
+  const uint32_t groups = phaseGroups(
+      uint64_t{plan.rows()} * (shape.hiddenSize / 4));
   const uint32_t lanes = plan.lanes();
   requireBuffer(buffers.input, workspace.convolutionBytes);
   requireBuffer(buffers.output, workspace.convolutionBytes);
@@ -349,21 +350,6 @@ void DraftAttention::addResidual(metal::CommandGraph &graph,
   graph.add(std::string(kDraftResidualAdd), {std::move(input), std::move(residual), std::move(output)},
             static_cast<uint32_t>(elements),
             {phaseGroups(elements), plan.lanes(), 1});
-}
-
-void DraftAttention::addReorder(metal::CommandGraph &graph,
-                                metal::MetalBuffer grouped,
-                                metal::MetalBuffer packed,
-                                const DraftAttentionPlan &plan) {
-  const auto shape = plan.shape();
-  const uint32_t groups =
-      phaseGroups(uint64_t{plan.rows()} * shape.queryHeads * shape.headDimension);
-  const uint32_t lanes = plan.lanes();
-  requireBuffer(grouped, queryRowsBytes(plan));
-  requireBuffer(packed, queryRowsBytes(plan));
-  graph.add(headKernelName(headKernel(shape), kDraftAttentionReorder),
-            {std::move(grouped), std::move(packed)}, plan.rows(),
-            {groups, lanes, 1});
 }
 
 void DraftAttention::addContextPrefill(

@@ -34,13 +34,20 @@ struct DevicePolicy final {
   // count matches only a reported one: an assumed count is a plan, not a
   // measurement the row was fitted to.
   bool coresReported = false;
+  // The chip generation the device name reports
+  // (DeviceCapabilities::chipGeneration): MTLGPUFamilyAppleN does not
+  // separate M4 from M5, so a measurement that only holds on the Neural
+  // Accelerator's second generation scopes here. Zero is every generation,
+  // including an unparsed name.
+  uint32_t chipGeneration = 0;
   // The model family the plans serve (the descriptor's family name), for
   // the measured rows scoped to one model. Empty is the bare-device policy
   // tests and offline tools use: model-scoped rows do not match it.
   std::string_view model = {};
 
   [[nodiscard]] static constexpr DevicePolicy of(const DeviceCapabilities &device) noexcept {
-    return {device.appleGpuFamily, plannedGpuCores(device), device.gpuCoreCount != 0};
+    return {device.appleGpuFamily, plannedGpuCores(device), device.gpuCoreCount != 0,
+            device.chipGeneration, {}};
   }
 
   [[nodiscard]] constexpr Tier tier() const noexcept {
@@ -52,6 +59,11 @@ struct DevicePolicy final {
   // In the Apple10 tuning generation: family 10 and every newer family the
   // tuning tables have not been re-measured for.
   [[nodiscard]] constexpr bool apple10Plus() const noexcept { return tier() == Tier::Apple10; }
+  // The M5 generation and newer (GPU architecture 17, the Neural
+  // Accelerator's second generation): MTLGPUFamilyAppleN cannot tell M4
+  // from M5, so this reads the parsed chip name. An unparsed name (0) is
+  // not M5.
+  [[nodiscard]] constexpr bool m5Plus() const noexcept { return chipGeneration >= 5; }
   // The Metal 4.1 packed-FP4 kernels the `_n`/`mxfp4n` formats decode on,
   // family 10 and up. Earlier families never create their pipelines, whose
   // AIR would not lower there.

@@ -135,6 +135,9 @@ struct TokenAdmission final {
 
 struct PageTableView final {
   std::span<const uint32_t> pages;
+  // Keeps pages alive past the request's next mutation; null only when the
+  // caller must not hold the view (never produced by pageTable()).
+  std::shared_ptr<const std::vector<uint32_t>> owner;
   uint64_t revision = 0;
   uint32_t firstChanged = 0;
 };
@@ -444,6 +447,10 @@ private:
 
   struct Request final {
     std::vector<uint32_t> pages;
+    // pageTable()'s last handed-out copy; pagesChanged() drops it so the
+    // next view re-copies only when the list actually moved. Mutable: the
+    // view is a const method's cache of the copy.
+    mutable std::shared_ptr<const std::vector<uint32_t>> pagesSnapshot;
     std::vector<uint64_t> cachedBlocks;
     uint64_t pageTableRevision = 0;
     uint32_t firstChangedPage = 0;

@@ -245,9 +245,7 @@ void DFlashDraft::addDecode(
          buffers.persistentValues[layer], buffers.queryKeys,
          buffers.queryValues},
         cacheLengths, attentionPlan, /*causal=*/false, devicePack);
-    ops::DraftAttention::addReorder(graph, buffers.attention,
-                                    buffers.proposalQkv, attentionPlan);
-    linear.add(graph, {.input = buffers.proposalQkv, .output = buffers.projected, .scratch = scratch},
+    linear.add(graph, {.input = buffers.attention, .output = buffers.projected, .scratch = scratch},
                weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows()));
     ops::DraftAttention::addConvolution(
         graph,
@@ -285,16 +283,21 @@ void DFlashDraft::addDecode(
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
   const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
+  const ops::LinearPlan selectorPlan = linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
+  // The selector reuses the head's table only when the layouts match; a
+  // mismatch makes it re-prepare from the bf16 rows, which must then exist.
+  const bool sharedTable = headPlan.input() != ops::LinearInput::Plain &&
+                           headPlan.input() == selectorPlan.input();
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
-      buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
+      buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input(), !sharedTable);
   const ops::PreparedInput afterHead = linear.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
-             weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows()));
+             weights_.selectorProjection, selectorPlan);
   graph.endBakedSpan();
 }
 
@@ -314,19 +317,31 @@ void DFlashDraft::addContextCommit(
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
              weights_.contextProjection, linear.decodePlan(weights_.contextProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows()));
   // Every layer's key and value projection reads the same normalized rows,
-  // prepared for the first layer's plan.
-  ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
+  // prepared for the first layer's plan. The bf16 rows are dead only when
+  // every layer's plan takes the same table layout — a mismatch makes a
+  // later layer re-prepare from them.
+  std::vector<ops::LinearPlan> kvPlans;
+  kvPlans.reserve(layout.layers);
+  ops::LinearInput kvInput = ops::LinearInput::Plain;
+  bool kvUniform = true;
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    ops::LinearPlan plan = linear.decodePlan(contextKvProjections_[layer], lanes,
+                                             ops::LinearEpilogue::None, nullptr, layout.verifyRows());
+    if (layer == 0) kvInput = plan.input();
+    else if (plan.input() != kvInput) kvUniform = false;
+    kvPlans.push_back(std::move(plan));
+  }
+  const bool kvRowsDead = kvUniform && kvInput != ops::LinearInput::Plain;
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
-      scratch, kvPlan.input());
+      scratch, kvInput, !kvRowsDead);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];
-    if (layer) kvPlan = linear.decodePlan(projection, lanes, ops::LinearEpilogue::None, nullptr, layout.verifyRows());
     hidden = linear.add(graph,
                         {.input = buffers.hidden, .output = buffers.contextKv, .scratch = scratch,
                          .prepared = hidden},
-                        projection, kvPlan);
+                        projection, kvPlans[layer]);
     ops::DraftAttention::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],

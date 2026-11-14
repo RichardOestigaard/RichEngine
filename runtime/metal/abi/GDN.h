@@ -41,6 +41,11 @@ static_assert(sizeof(GDNChunkedParams) == 16,
 // the normalized output by sigmoid(z) (qwen4exp) instead of silu(z).
 #define GDN_TILED_HEADS 1u
 #define GDN_SIGMOID_GATE 2u
+// GDN_TAPE_FOLD marks a decode whose tape binding is live: only then may the
+// kernel read the pending prefix and write this step's rows for the next
+// fold. The argument table is shared and never cleared, so an unbound tape
+// slot keeps a stale address — the kernel must not dereference it.
+#define GDN_TAPE_FOLD 4u
 struct GDNGatePrefillParams {
   uint32_t flags;
 };
@@ -88,3 +93,16 @@ struct GDNBatchCommitParams {
 
 static_assert(sizeof(GDNBatchCommitParams) == 32,
               "GDN commit parameters are 32 bytes on both sides");
+
+// The z-split gate apply (decode/gdn.metal's gdn_gate_apply*): the recurrent
+// scan's ungated rows and the z GEMV's columns meet here after both
+// dispatches. flags carries the same GDN_TILED_HEADS/GDN_SIGMOID_GATE bits
+// as GDNDecodeBatchParams.
+struct GDNGateParams {
+  uint32_t flags;
+  // The lanes' packed row stride, as in GDNDecodeBatchParams.
+  uint32_t verify_stride;
+};
+
+static_assert(sizeof(GDNGateParams) == 8,
+              "GDN gate parameters are 8 bytes on both sides");

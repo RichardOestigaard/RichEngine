@@ -28,16 +28,23 @@ struct MeasuredScope final {
   // another family's token stream does not survive, say. Empty shares the
   // row across models; the shape key already decides most rows agree.
   std::string_view model = {};
+  // The lowest chip generation the row was measured on (DevicePolicy::
+  // chipGeneration): family cannot separate M4 from M5, so a winner that
+  // only holds on the Neural Accelerator's second generation names 5 here.
+  // Zero matches every generation, an unparsed name included.
+  uint32_t minChip = 0;
   [[nodiscard]] constexpr bool matches(const DevicePolicy &device) const noexcept {
     return device.family >= minFamily && (!maxFamily || device.family <= maxFamily) &&
            (!cores || (device.coresReported && cores == device.cores)) &&
+           (!minChip || device.chipGeneration >= minChip) &&
            (model.empty() || model == device.model);
   }
   // Ordering among matching rows: more constrained fields win (a
-  // core-scoped row beats an unscoped one), then the higher minFamily — the
-  // family's own measurement beats a carried-forward one.
+  // chip-scoped row beats a family-only one, which beats an unscoped one),
+  // then the higher minFamily — the family's own measurement beats a
+  // carried-forward one.
   [[nodiscard]] constexpr unsigned specificity() const noexcept {
-    return (!model.empty() ? 8u : 0u) + (minFamily ? 4u : 0u) +
+    return (minChip ? 16u : 0u) + (!model.empty() ? 8u : 0u) + (minFamily ? 4u : 0u) +
            (maxFamily ? 2u : 0u) + (cores ? 1u : 0u);
   }
 };
@@ -47,6 +54,10 @@ struct MeasuredScope final {
 // names an exact core count.
 constexpr MeasuredScope kApple10Plus{10, 0, 0};
 constexpr MeasuredScope kApple10Plus20Cores{10, 0, 20};
+// The same generation restricted to the M5 chip and newer: family 10
+// cannot tell M4 from M5, so rows fitted on the Neural Accelerator's
+// second generation name the chip floor instead.
+[[maybe_unused]] constexpr MeasuredScope kApple10M5Plus{10, 0, 0, {}, 5};
 // A measured row only valid on one model: draft-path tile changes
 // reassociate reductions and flip emitted tokens on families they were
 // never measured for, so rows a shape share cannot carry stay model-scoped.

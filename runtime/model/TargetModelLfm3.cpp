@@ -294,7 +294,7 @@ public:
       step.graph.beginBakedSpan();
       const ops::PreparedInput normalized = ops::Normalization::addRms(
           step.graph, input, layer.inputNorm, b.normalized, hidden,
-          step.rows, b.linearScratch, inputPlan.input());
+          step.rows, b.linearScratch, inputPlan.input(), false);
       linear.add(step.graph,
                  {.input = b.normalized, .output = b.gdnPacked[convLayer],
                   .scratch = b.linearScratch, .prepared = normalized},
@@ -344,7 +344,7 @@ public:
                             step.rowCapacity);
       const ops::PreparedInput normalized = ops::Normalization::addRms(
           step.graph, input, layer.inputNorm, b.normalized, hidden,
-          step.rows, b.linearScratch, inputPlan.input());
+          step.rows, b.linearScratch, inputPlan.input(), false);
       linear.add(step.graph,
                  {.input = b.normalized, .output = b.fullPacked,
                   .scratch = b.linearScratch, .prepared = normalized},
@@ -454,7 +454,7 @@ public:
         gateUpPlan.usesSimdgroup() && downPlan.usesSimdgroup();
     const ops::PreparedInput normalized = ops::Normalization::addRms(
         step.graph, residual, layer.postAttentionNorm, b.normalized, hidden,
-        step.rows, b.linearScratch, gateUpPlan.input());
+        step.rows, b.linearScratch, gateUpPlan.input(), false);
     linear.add(step.graph,
                {.input = b.normalized, .output = b.denseIntermediate,
                 .gateScratch = b.denseGateScratch,

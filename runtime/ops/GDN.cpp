@@ -160,7 +160,8 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   }
   GDNDecodeBatchParams params{flags | (order == GdnHeadOrder::Tiled
                                            ? GDN_TILED_HEADS
-                                           : 0u),
+                                           : 0u) |
+                                  (folded ? GDN_TAPE_FOLD : 0u),
                               layer,
                               state.convolutionLayerBytes,
                               state.recurrentLayerBytes,
@@ -193,6 +194,104 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   else
     graph.add(kernel_name, std::move(bindings), params,
               {shape.valueHeads, lanes, 1});
+  if (!prepare) return {};
+  return {buffers.hidden, input};
+}
+
+void GDN::addDecodeScan(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
+                        metal::MetalBuffer tail, GdnShape shape,
+                        uint32_t lanes, uint32_t layer, GdnStateStrides state,
+                        GdnHeadOrder order, std::span<const uint32_t> liveRows,
+                        uint32_t verifyStride, const GdnTapeLanes *tapeLanes,
+                        uint32_t flags) {
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+      !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS ||
+      (!liveRows.empty() && liveRows.size() != lanes) || !tail)
+    throw std::invalid_argument("invalid GDN decode geometry");
+  const KernelLayout kernel = kernelShape(shape);
+  const bool folded = tapeLanes && buffers.tape && tapeLanes->layerBytes;
+  // conv rows at buffer 0, the a/b tail at 1, then the fused kernel's state
+  // and operand bindings; the params sit at 17 and an unfolded dispatch
+  // leaves the tape at 18 unbound — the shared argument table's stale
+  // address there is harmless only because the kernel gates tape access on
+  // GDN_TAPE_FOLD.
+  std::vector<metal::MetalBuffer> bindings{buffers.packed, std::move(tail),
+                                           buffers.convolutionWeights};
+  bindings.reserve(18);
+  appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  bindings.insert(bindings.end(),
+                  {buffers.mixed, buffers.decayWeights, buffers.timeBias,
+                   buffers.decay, buffers.beta, buffers.hidden});
+  if (folded)
+    bindings.push_back(buffers.tape);
+  GDNDecodeBatchParams params{flags | (order == GdnHeadOrder::Tiled
+                                           ? GDN_TILED_HEADS
+                                           : 0u) |
+                                  (folded ? GDN_TAPE_FOLD : 0u),
+                              layer,
+                              state.convolutionLayerBytes,
+                              state.recurrentLayerBytes,
+                              state.convolutionStateBytes,
+                              {},
+                              verifyStride,
+                              {},
+                              {},
+                              {}};
+  for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
+    params.live_rows[lane] =
+        lane < liveRows.size()
+            ? std::clamp(liveRows[lane], uint32_t{1}, verifyStride)
+            : verifyStride;
+  if (folded) {
+    for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane) {
+      params.pending_tape[lane] =
+          tapeLanes->pending[lane] + uint64_t{layer} * tapeLanes->layerBytes;
+      params.step_tape[lane] =
+          tapeLanes->step[lane] + uint64_t{layer} * tapeLanes->layerBytes;
+      params.pending_rows[lane] =
+          lane < lanes ? tapeLanes->rows[lane] : 0;
+    }
+  }
+  graph.addParamsAt(std::string(kVerifyGdnFusedSplit) +
+                        kernelName(kernel, "", "_vh32"),
+                    std::move(bindings), params, 17u,
+                    {shape.valueHeads, lanes, 1});
+}
+
+PreparedInput GDN::addDecodeGate(metal::CommandGraph &graph,
+                                 metal::MetalBuffer z,
+                                 GdnDecodeBuffers buffers, GdnShape shape,
+                                 uint32_t lanes, uint32_t verifyStride,
+                                 GdnHeadOrder order, LinearInput input,
+                                 uint32_t flags) {
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
+      !verifyStride || verifyStride > RICHENGINE_TARGET_VERIFY_ROWS || !z)
+    throw std::invalid_argument("invalid GDN gate geometry");
+  const KernelLayout kernel = kernelShape(shape);
+  const bool prepare = input != LinearInput::Plain;
+  if (prepare)
+    requireTableScratch(buffers.linearScratch, input,
+                        shape.valueHeads * shape.headDimension,
+                        lanes * verifyStride);
+  const GDNGateParams params{flags | (order == GdnHeadOrder::Tiled
+                                        ? GDN_TILED_HEADS
+                                        : 0u),
+                            verifyStride};
+  const std::string name =
+      std::string(kGdnGateApply) + tableSuffix(input) +
+      kernelName(kernel, "", "_vh32");
+  const std::string kernel_name =
+      normKernel(name, buffers.mixerNorm, shape.headDimension);
+  if (prepare) {
+    graph.add(kernel_name,
+              {std::move(z), buffers.hidden, buffers.mixerNorm.buffer,
+               buffers.linearScratch.input, buffers.linearScratch.sums},
+              params, {shape.valueHeads, lanes, 1});
+  } else {
+    graph.add(kernel_name,
+              {std::move(z), buffers.hidden, buffers.mixerNorm.buffer},
+              params, {shape.valueHeads, lanes, 1});
+  }
   if (!prepare) return {};
   return {buffers.hidden, input};
 }
@@ -245,7 +344,8 @@ PreparedInput GDN::addDecodeTree(metal::CommandGraph &graph,
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                     GdnShape shape, uint32_t layers, uint32_t lanes,
-                    GdnStateStrides state, uint32_t verifyStride) {
+                    GdnStateStrides state, uint32_t verifyStride,
+                    bool convCarved) {
   if (!layers || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
       !state.valid() || !verifyStride)
     throw std::invalid_argument("invalid GDN commit geometry");
@@ -262,8 +362,11 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
   // Static parameters and arena/state buffers: replayable. The current/next
   // state swap alternates between the span cache's two slots.
   graph.beginBakedSpan();
-  graph.add(kernelName(kernel, kVerifyGdnCommit.data(),
-                       kVerifyGdnCommitVh32.data()),
+  graph.add(kernelName(kernel,
+                       convCarved ? kVerifyGdnCommitSplit.data()
+                                  : kVerifyGdnCommit.data(),
+                       convCarved ? kVerifyGdnCommitSplitVh32.data()
+                                  : kVerifyGdnCommitVh32.data()),
             std::move(bindings), params,
             {shape.valueHeads, layers, lanes});
   graph.endBakedSpan();

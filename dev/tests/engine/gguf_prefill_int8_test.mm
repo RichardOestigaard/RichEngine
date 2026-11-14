@@ -302,7 +302,8 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
       int before = failures;
-      for (const Fmt f : {AF4, AF5, AF6, AF8, AF4G128, AF5G128, AF6G128, AF8G128}) {
+      for (const Fmt f :
+           {AF4, AF5, AF6, AF8, AF4G128, AF5G128, AF6G128, AF8G128, AF2, AF3, AF2G128, AF3G128}) {
         // 320 columns (five 64-column tiles, an odd tile count for the
         // kernel's tile walk), 512 inputs; and 256 x 384 at 80 rows for a
         // second meta-unit count and a partial row tile.
@@ -314,7 +315,7 @@ int main(int argc, char **argv) {
             check(backend, linear, w, rows, e);
         }
       }
-      section("int8 prefill: all eight AF formats, plain/residual/up-with-gate, two shapes each, "
+      section("int8 prefill: all twelve AF formats, plain/residual/up-with-gate, two shapes each, "
               "fp64-simulated outputs");
       std::cout << "gguf-prefill-int8: " << (failures - before ? "FAIL" : "PASS") << '\n';
       return failures - before ? 1 : 0;

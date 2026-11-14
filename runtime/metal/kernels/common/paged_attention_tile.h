@@ -195,14 +195,15 @@ inline void richengine_attention_page_softmax(
     }
   }
   float local_max = -INFINITY;
+  bool admitted[TokensPerLane];
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint t = token + j;
-    const bool admitted = (t < duo_sink || t >= window_begin) &&
+    admitted[j] = (t < duo_sink || t >= window_begin) &&
         (!row_masks ? t < limit
         : (t < committed_tokens) ||
               (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
-    score[j] = admitted ? score[j] : -INFINITY;
+    score[j] = admitted[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   // The butterfly spans a row's lanes only: with sixteen tokens per lane
@@ -217,12 +218,7 @@ inline void richengine_attention_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    const uint t = token + j;
-    const bool admitted = (t < duo_sink || t >= window_begin) &&
-        (!row_masks ? t < limit
-        : (t < committed_tokens) ||
-              (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
-    probability[j] = admitted ? fast::exp(score[j] - next_max) : 0.0f;
+    probability[j] = admitted[j] ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
 #pragma unroll
@@ -338,10 +334,13 @@ inline float richengine_attention_query_codes(device const bfloat *queries,
 // only after the pass's last page) and the QK product lands as int32 scores,
 // exact for |sum| < 2^24. The per-row scale then joins the softmax's score
 // scale. Only INT8 pages admit it — see the static_assert.
+// Accumulator is the PV running tensor's element: float keeps the fp32
+// accumulation, bfloat lets matmul2d accumulate in bf16 (the _a16 kernels,
+// dispatched by RICHENGINE_ATTENTION_ACC16 on Apple10+).
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           typename CacheElement,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint MPasses = 1,
-          bool Int8Queries = false>
+          bool Int8Queries = false, typename Accumulator = float>
 inline void richengine_paged_attention_tile(
     device bfloat *tile_queries, device const RichKvPage *page_table,
     RichKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -364,6 +363,9 @@ inline void richengine_paged_attention_tile(
   using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
   static_assert(!Int8Queries || is_same<CacheElement, int8_t>::value,
                 "INT8 queries take INT8 keys");
+  static_assert(is_same<Accumulator, float>::value ||
+                    is_same<Accumulator, bfloat>::value,
+                "the PV accumulator is float or bfloat");
   constexpr ushort N = RichKvPageTokens;
   constexpr ushort D = HeadDim;
   uint visible_tokens = committed_tokens + active_rows;
@@ -447,14 +449,14 @@ inline void richengine_paged_attention_tile(
             decltype(Packed4Tensor(static_cast<device uchar *>(nullptr),
                                    dextents<int, 2>{D, N}, array<int, 2>{1, D})
                          .template slice<D, N>(0, 0)),
-            float>();
+            Accumulator>();
       else
         return pv.template get_destination_cooperative_tensor<
             PSliced,
             decltype(tensor(static_cast<device CacheElement *>(nullptr),
                             dextents<int, 2>{N, D}, array<int, 2>{1, N})
                          .template slice<N, D>(0, 0)),
-            float>();
+            Accumulator>();
     }();
     // Uniform capacity partitions the logical tile across eight 32-lane
     // groups. Equality proves no padding; otherwise only valid entries may
@@ -464,7 +466,7 @@ inline void richengine_paged_attention_tile(
 #pragma unroll
     for (ushort index = 0; index < running.get_capacity(); ++index) {
       if (running_full || running.is_valid_element(index))
-        running[index] = 0.0f;
+        running[index] = Accumulator(0.0f);
     }
 
     for (uint vpage = page_begin; vpage < page_end; ++vpage) {
@@ -505,7 +507,13 @@ inline void richengine_paged_attention_tile(
             if (!running_full && !running.is_valid_element(index))
               continue;
             auto coordinates = running.get_multidimensional_index(index);
-            running[index] *= previous_scale[coordinates[1]];
+            // bfloat has no *= float: the rescale widens through fp32 and
+            // rounds back, the same value the fp32 accumulator rescales to.
+            if constexpr (is_same<Accumulator, bfloat>::value)
+              running[index] = Accumulator(
+                  float(running[index]) * previous_scale[coordinates[1]]);
+            else
+              running[index] *= previous_scale[coordinates[1]];
           }
         }
         pv.run(p0, vs, running);
@@ -528,7 +536,8 @@ inline void richengine_paged_attention_tile(
       }
     }
     // bf16 on the bus: half the partial round-trip at ~0.2% per element —
-    // inside the merge's fp64 gate; the accumulator stays fp32.
+    // inside the merge's fp64 gate; the accumulator's precision is the
+    // caller's Accumulator (float, or bfloat on the _a16 kernels).
 #pragma unroll
     for (ushort index = 0; index < running.get_capacity(); ++index) {
       if (!running_full && !running.is_valid_element(index))
@@ -597,16 +606,24 @@ inline bfloat richengine_attention_reduce_value(
     weights[split] = fast::exp(
         statistics[((head_slot + split) * M + fused_row) * 2] - row_maximum);
   threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
-  float numerator = 0.0f, denominator = 0.0f;
-  // Keep both accumulations in the original split order. A parallel sum of
-  // the denominator changes speculative acceptance on real model prompts.
-  for (uint split = 0; split < written; ++split) {
-    const float weight = weights[split];
-    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
-    numerator += weight *
-        float(partials[((head_slot + split) * M + fused_row) * D + thread_index]);
-    denominator += weight * statistics[stat + 1];
+  // The denominator is row-invariant: one thread accumulates it in the
+  // original split order — a parallel or reassociated sum changes
+  // speculative acceptance on real model prompts — and the row's threads
+  // read the broadcast. group_values' maxima were consumed before the
+  // barrier, so slot 0 is free.
+  if (thread_index == 0) {
+    float sum = 0.0f;
+    for (uint split = 0; split < written; ++split)
+      sum += weights[split] *
+          statistics[((head_slot + split) * M + fused_row) * 2 + 1];
+    group_values[0] = sum;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  const float denominator = group_values[0];
+  float numerator = 0.0f;
+  for (uint split = 0; split < written; ++split)
+    numerator += weights[split] *
+        float(partials[((head_slot + split) * M + fused_row) * D + thread_index]);
   return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 

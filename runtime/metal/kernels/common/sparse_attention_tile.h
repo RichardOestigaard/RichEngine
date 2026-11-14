@@ -225,8 +225,11 @@ inline void richengine_sparse_softmax_lane(
 // softmax, and QK's reads of the keys before the values replace them; the
 // probabilities and values before PV; and PV's reads before the next step's
 // entries and stage.
+// The accumulator is the PV running tensor's element, as the page loop's:
+// float, or bfloat on the _a16 kernels (RICHENGINE_ATTENTION_ACC16).
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          typename CacheElement, uint D = RichKvHeadDimension>
+          typename CacheElement, uint D = RichKvHeadDimension,
+          typename Accumulator = float>
 inline void richengine_sparse_attention_tile(
     device bfloat *tile_queries, device const RichKvPage *page_table,
     RichKvLayer kv, uint kv_head, uint first_position, uint active_rows,
@@ -240,6 +243,9 @@ inline void richengine_sparse_attention_tile(
   constexpr uint Blocks = RichSparseStep<CacheElement>::Blocks;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint AllRows = (1u << RowsPerTile) - 1u;
+  static_assert(is_same<Accumulator, float>::value ||
+                    is_same<Accumulator, bfloat>::value,
+                "the PV accumulator is float or bfloat");
   static_assert(RowsPerTile <= RICHENGINE_ATTENTION_BLOCK_ROW_BITS, "an entry has a bit per row");
   const uint per_split = richengine_sparse_split_entries(count, splits);
   const uint begin = split * per_split;
@@ -271,13 +277,13 @@ inline void richengine_sparse_attention_tile(
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
   auto running = pv.template get_destination_cooperative_tensor<
-      decltype(p0), decltype(stage0), float>();
+      decltype(p0), decltype(stage0), Accumulator>();
   const bool running_full =
       uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
 #pragma unroll
   for (ushort index = 0; index < running.get_capacity(); ++index) {
     if (running_full || running.is_valid_element(index))
-      running[index] = 0.0f;
+      running[index] = Accumulator(0.0f);
   }
 
   for (uint step = begin; step < end; step += Blocks) {
@@ -296,7 +302,7 @@ inline void richengine_sparse_attention_tile(
     }
     if (thread_index == 0)
       atomic_store_explicit(&scratch.rescale, 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     richengine_sparse_gather<KVHeads, CacheElement, N, D>(scratch.stage, scratch.entries,
                                                           scratch.pages, addressing, false,
                                                           thread_index);
@@ -317,13 +323,13 @@ inline void richengine_sparse_attention_tile(
         scratch.value_scales[thread_index] = value_scale;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto step_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(stage0), float>();
     qk.run(q0, stage0, step_scores);
     step_scores.store(st.template slice<N, M>(0, 0));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     // The values replace the keys in the stage while the softmax reads only
     // the scores and scales.
@@ -336,18 +342,22 @@ inline void richengine_sparse_attention_tile(
           scratch.previous_scale, &scratch.rescale, scratch.key_scales,
           scratch.value_scales, scratch.entries, first_position, active_rows, lane,
           qk_scale);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (atomic_load_explicit(&scratch.rescale, memory_order_relaxed)) {
 #pragma unroll
       for (ushort index = 0; index < running.get_capacity(); ++index) {
         if (!running_full && !running.is_valid_element(index))
           continue;
         auto coordinates = running.get_multidimensional_index(index);
-        running[index] *= scratch.previous_scale[coordinates[1]];
+        if constexpr (is_same<Accumulator, bfloat>::value)
+          running[index] = Accumulator(
+              float(running[index]) * scratch.previous_scale[coordinates[1]]);
+        else
+          running[index] *= scratch.previous_scale[coordinates[1]];
       }
     }
     pv.run(p0, stage0, running);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   // bf16 on the bus, as the page loop writes them: half the partial
   // round-trip with the accumulator still fp32.
@@ -391,22 +401,30 @@ inline void richengine_sparse_combine_splits(
   const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
   const float group_maximum = simd_max(maximum);
   if (lane == 0) group_values[sg] = group_maximum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float row_maximum =
       simd_max(lane < Groups ? group_values[lane] : -INFINITY);
   if (thread_index < written)
     weights[thread_index] = fast::exp(maximum - row_maximum);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float numerator = 0.0f, denominator = 0.0f;
-  // Keep both accumulations in the original split order. A parallel sum of
-  // the denominator changes speculative acceptance on real model prompts.
-  for (uint split = 0; split < written; ++split) {
-    const float weight = weights[split];
-    const ulong stat2 = ((head_slot + split) * M + fused_row) * 2;
-    numerator += weight *
-        float(partials[((head_slot + split) * M + fused_row) * D + thread_index]);
-    denominator += weight * statistics[stat2 + 1];
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  // The denominator is row-invariant: one thread accumulates it in the
+  // original split order — a parallel or reassociated sum changes
+  // speculative acceptance on real model prompts — and the row's threads
+  // read the broadcast. group_values' maxima were consumed before the
+  // barrier, so slot 0 is free.
+  if (thread_index == 0) {
+    float sum = 0.0f;
+    for (uint split = 0; split < written; ++split)
+      sum += weights[split] *
+          statistics[((head_slot + split) * M + fused_row) * 2 + 1];
+    group_values[0] = sum;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  const float denominator = group_values[0];
+  float numerator = 0.0f;
+  for (uint split = 0; split < written; ++split)
+    numerator += weights[split] *
+        float(partials[((head_slot + split) * M + fused_row) * D + thread_index]);
   tile_output[fused_row * D + thread_index] =
       bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }

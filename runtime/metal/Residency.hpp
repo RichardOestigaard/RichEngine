@@ -14,8 +14,12 @@
 namespace richengine::metal {
 
 // Holds every buffer of a backend in one residency set, wired between the
-// commands of its command queue. Metal wires them while a command runs and
-// lets them go a few seconds later, and one request holds them only about two
+// commands of its command queue. Heap-arena scratch buffers
+// (RICHENGINE_HEAP_ARENA, HeapArena.hpp) are no exception: each
+// suballocated MTLBuffer joins as an ordinary member, so the heartbeat
+// sees them and aliasing reuse never bypasses the set. Metal wires them
+// while a command runs and lets them go a few seconds later, and one
+// request holds them only about two
 // seconds, so a heartbeat requests residency every 500 ms. After keepAlive
 // without a command, never when it is infinite, it ends residency, which Metal
 // applies at its next GPU operation on any queue: one dispatch of the kick

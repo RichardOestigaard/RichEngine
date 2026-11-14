@@ -161,7 +161,7 @@ kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w
           besti[row] = token;
         }
       });
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 #pragma unroll
   for (ushort r = 0; r < Rows; ++r) {
     float v = best[r];
@@ -180,7 +180,7 @@ kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w
       amax_i[simd_group * Rows + r] = ix;
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (tid < Rows) {
     float v = -INFINITY;
     uint ix = 0xffffffffu;

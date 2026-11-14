@@ -28,13 +28,18 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  device uchar *smeta, device bfloat *output, device bfloat *aux,
                                  constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
                                  threadgroup half *stage, threadgroup half2 *tl) {
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+  // Tile-major dispatches (RICHENGINE_MOE_TILE_MAJOR) swap the grid axes:
+  // the row index arrives on group.x, the column block on group.y.
+  const bool tmaj = p.tile_major != 0;
+  const uint tile_row = tmaj ? group.x : group.y;
+  const uint colb = tmaj ? group.y : group.x;
+  if (tile_row >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[tile_row];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
-  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
-  if (moe_column_tile(tiles, group.y)) {
+  device bfloat *x = input + ulong(tile_row) * Rows * p.input_size;
+  const ulong out = ulong(tile_row) * Rows * p.output_size;
+  const uint origin = colb * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  if (moe_column_tile(tiles, tile_row)) {
     float sums[MOE_GGUF_COLUMN_ROWS];
     column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
                                          0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
@@ -110,16 +115,19 @@ inline void moe_gguf_expert_tile_streamed(
     device const uint *slots, device const ulong *chunks, device uchar *sw0, device uchar *sw1,
     device uchar *smeta, device bfloat *output, device bfloat *aux, constant MoeGgufStreamParams &p, uint2 group,
     uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+  const bool tmaj = p.reserved != 0;
+  const uint tile_row = tmaj ? group.x : group.y;
+  const uint colb = tmaj ? group.y : group.x;
+  if (tile_row >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[tile_row];
   bool resident;
   const MoeGgufSegment s =
       moe_gguf_stream_segment(tile.expert, p, slots, chunks, sw0, sw1, smeta, resident);
   if (!resident) return;
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
-  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
-  if (moe_column_tile(tiles, group.y)) {
+  device bfloat *x = input + ulong(tile_row) * Rows * p.input_size;
+  const ulong out = ulong(tile_row) * Rows * p.output_size;
+  const uint origin = colb * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  if (moe_column_tile(tiles, tile_row)) {
     float sums[MOE_GGUF_COLUMN_ROWS];
     column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
                                          0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
@@ -203,19 +211,22 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
                                 device uchar *umeta, device uchar *usw0, device uchar *usw1, device uchar *usmeta,
                                 device bfloat *output, constant MoeGgufFusedParams &p, uint2 group, uint simd_lane,
                                 uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+  const bool tmaj = p.reserved != 0;
+  const uint tile_row = tmaj ? group.x : group.y;
+  const uint colb = tmaj ? group.y : group.x;
+  if (tile_row >= *tile_count) return;
+  const MoeTileDescriptor tile = tiles[tile_row];
   const MoeGgufSegment gate = moe_gguf_segment_fmt(tile.expert, p.experts, p.input_size, p.output_size,
                                                  p.gate_routed_format, p.gate_shared_format, gw0, gw1, gmeta,
                                                  gsw0, gsw1, gsmeta);
   const MoeGgufSegment up = moe_gguf_segment_fmt(tile.expert, p.experts, p.input_size, p.output_size,
                                                p.up_routed_format, p.up_shared_format, uw0, uw1, umeta,
                                                usw0, usw1, usmeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
-  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  device bfloat *x = input + ulong(tile_row) * Rows * p.input_size;
+  const ulong out = ulong(tile_row) * Rows * p.output_size;
+  const uint origin = colb * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  if (moe_column_tile(tiles, group.y)) {
+  if (moe_column_tile(tiles, tile_row)) {
     float gs[MOE_GGUF_COLUMN_ROWS], us[MOE_GGUF_COLUMN_ROWS];
     column_dot_any<MOE_GGUF_COLUMN_ROWS>(gate.format, x, tile.rows, p.input_size, gate.w0, gate.w1, gate.meta,
                                          origin + simd_lane, 0, p.input_size / 32, tl,
@@ -239,7 +250,7 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
     staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(gate.format, x, gate.w0, gate.w1, gate.meta,
                                             p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
                                             p.input_size / GGUF_STAGED_STEP, 0, acc_g);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(up.format, x, up.w0, up.w1, up.meta,
                                             p.input_size, origin, my, tl, simd_group * 32 + simd_lane, simd_lane, 0,
                                             p.input_size / GGUF_STAGED_STEP, 0, acc_u);
@@ -299,7 +310,10 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
                                  device float *partials, device atomic_uint *counters,
                                  constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
                                  threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
-  const uint tile_index = group.y / p.splits, split = group.y % p.splits;
+  const bool tmaj = p.tile_major != 0;
+  const uint tile_row = tmaj ? group.x : group.y;
+  const uint colb = tmaj ? group.y : group.x;
+  const uint tile_index = tile_row / p.splits, split = tile_row % p.splits;
   if (tile_index >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[tile_index];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
@@ -307,7 +321,7 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
   device half *xp = packed + ulong(tile_index) * Rows * p.input_size;
   device uchar *xe = exponents + ulong(tile_index) * Rows * (p.input_size / 32);
   const ulong out = ulong(tile_index) * Rows * p.output_size;
-  const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  const uint origin = colb * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
@@ -320,7 +334,7 @@ inline void moe_gguf_packed_tile(device bfloat *input, device half *packed, devi
     if (s.format == GGUF_FMT_MXFP4) {
       gguf_decode_mxfp4p_tile<R, Ep>(xp, xe, s.w0, s.meta, output + out,
                                      (device coherent(device) float *)(partials + ulong(tile_index) * p.splits * Rows * p.output_size),
-                                     counters + tile_index * (p.output_size / GGUF_TILE_COLUMNS) + group.x,
+                                     counters + tile_index * (p.output_size / GGUF_TILE_COLUMNS) + colb,
                                      aux + out, p.input_size,
                                      p.splits, p.output_size, origin, origin, split, simd_lane, simd_group, arrival);
       return;

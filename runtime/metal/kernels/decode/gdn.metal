@@ -691,8 +691,14 @@ inline void gdn_decode_batch_phase(
   const uint pending = params.pending_rows[batch];
   // The previous step's retained rows sit on the lane's tape: per token the
   // conv inputs, then the kv row (key then value columns), then decay
-  // (fp32) and beta (bf16) runs.
-  device const uchar *tape = tape_out + params.pending_tape[batch];
+  // (fp32) and beta (bf16) runs. GDN_TAPE_FOLD gates every tape access: an
+  // unfolded dispatch leaves the slot unbound and the shared argument
+  // table's stale address there must never be dereferenced.
+  const bool taped =
+      tape_out != nullptr && (params.flags & GDN_TAPE_FOLD) != 0;
+  device const uchar *tape =
+      taped ? tape_out + params.pending_tape[batch]
+            : (device const uchar *)nullptr;
   device const bfloat *tape_conv =
       reinterpret_cast<device const bfloat *>(tape);
   if (pending) {
@@ -720,19 +726,20 @@ inline void gdn_decode_batch_phase(
       shared.pending_values[t] =
           tkv[token * KvWidth + KeyHeads * HeadDim + group.x * HeadDim + dim];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
       dt_bias, decay, beta, tape_conv, pending,
-      tape_out + params.step_tape[batch], shared, group.x, lane,
-      simd_group, tokens);
-  const bool tape_step = tape_out != nullptr;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+      taped ? tape_out + params.step_tape[batch]
+            : (device uchar *)nullptr,
+      shared, group.x, lane, simd_group, tokens);
+  const bool tape_step = taped;
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
                                          lane, simd_group, tokens, pending,
                                          tape_step);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
   const bool sigmoid = (params.flags & GDN_SIGMOID_GATE) != 0;
   const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
@@ -1058,11 +1065,11 @@ inline void gdn_decode_tree_batch_phase(
                                         mixed, a_scale, dt_bias, decay, beta,
                                         shared, nodes, count, group.x, lane,
                                         simd_group);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   gdn_decode_tree_scan<HeadDim, RowsInFlight>(state_in, state_out, shared,
                                               count, group.x, lane,
                                               simd_group);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
   const bool sigmoid = (params.flags & GDN_SIGMOID_GATE) != 0;
   for (uint token = simd_group; token < Rows; token += kDecodeSimdgroups) {
@@ -1151,3 +1158,571 @@ GDN_TREE_DECODE_PACKED_ENTRY(verify_tree_gdn_fused_packed_vh32, 16, 32, 128, 819
 #undef GDN_TREE_DECODE_BODY
 #undef GDN_TREE_DECODE_THREADS
 #undef GDN_TREE_DECODE_BUFFERS
+
+// ---------------------------------------------------------------------------
+// Z-split decode (RICHENGINE_GDN_ZSPLIT): the input projection's packed columns
+// carve into three contiguous runs — the ConvDim conv/qkv inputs, the
+// ValueHeads*HeadDim z-gate columns (contiguous: the gate reads
+// packed[ConvDim + head*HeadDim + dim], the beta/decay tail after them) — so
+// the z GEMV overlaps the ALU-bound scan. verify_gdn_fused_split runs the
+// prologue and scan and leaves the ungated rows in `hidden`; gdn_gate_apply
+// gates them once the z GEMV has landed; verify_gdn_commit_split reads the
+// carved conv rows for the state commit.
+// ---------------------------------------------------------------------------
+
+// The split prologue: gdn_decode_prologue with the conv inputs at ConvDim row
+// stride and the a/b gates in their own TailWidth-strided buffer (beta first,
+// then the decay columns — packed's [ConvDim + ValueWidth, PackedWidth)
+// tail).
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth>
+inline void gdn_decode_split_prologue(
+    device const bfloat *conv, device const bfloat *tail,
+    device const bfloat *conv_weights,
+    device const bfloat *conv_state_in, device bfloat *conv_state_out,
+    device bfloat *mixed_qkv, device const float *a_scale,
+    device const bfloat *dt_bias, device float *decay, device bfloat *beta,
+    device const bfloat *tape_conv, uint pending, device uchar *step_tape,
+    threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
+    uint simd_group, uint tokens) {
+  constexpr uint TailWidth = PackedWidth - ConvDim - ValueHeads * HeadDim;
+  const uint Tokens = tokens;
+  static_assert(!(RICHENGINE_TARGET_VERIFY_ROWS % kDecodeSimdgroups) &&
+                    HeadDim == 128,
+                "rows stride over the simdgroups, four channels per lane");
+  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+  constexpr uint ValueWidth = ValueHeads * HeadDim;
+  constexpr uint Groups = HeadDim / 32;
+  const uint key_head = value_head / HeadsPerKey;
+  const bool shared_writer = value_head % HeadsPerKey == 0;
+  const bool carrier = simd_group < 3;
+  const uint q_channel = key_head * HeadDim + lane;
+  const uint k_channel = KeyWidth + q_channel;
+  const uint v_channel = 2 * KeyWidth + value_head * HeadDim + lane;
+  constexpr uint KvWidth = KeyWidth + ValueWidth;
+  const uint k_column = key_head * HeadDim + lane;
+  const uint v_column = KeyWidth + value_head * HeadDim + lane;
+  for (uint token = simd_group; token < Tokens; token += kDecodeSimdgroups) {
+    float q[Groups], k[Groups];
+    bfloat v[Groups];
+    for (uint g = 0; g < Groups; ++g) {
+      q[g] = float(gdn_conv_silu_pending(conv, conv_state_in, tape_conv, pending,
+                                 conv_weights,
+                                 ConvDim, ConvDim, token,
+                                 q_channel + 32 * g));
+      k[g] = float(gdn_conv_silu_pending(conv, conv_state_in, tape_conv, pending,
+                                 conv_weights,
+                                 ConvDim, ConvDim, token,
+                                 k_channel + 32 * g));
+      v[g] = gdn_conv_silu_pending(conv, conv_state_in, tape_conv, pending,
+                           conv_weights, ConvDim,
+                           ConvDim, token, v_channel + 32 * g);
+    }
+    GdnGates gates{};
+    if (lane == 0)
+      gates = gdn_gates(tail + token * TailWidth, dt_bias, a_scale,
+                        0, ValueHeads, value_head);
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint g = 0; g < Groups; ++g) {
+      q_sum += simd_sum(q[g] * q[g]);
+      k_sum += simd_sum(k[g] * k[g]);
+    }
+    const float q_scale = rsqrt(q_sum / HeadDim + kRmsEpsilon);
+    const float k_scale = rsqrt(k_sum / HeadDim + kRmsEpsilon);
+    for (uint g = 0; g < Groups; ++g) {
+      const uint dim = 32 * g + lane;
+      const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
+      const bfloat key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
+      shared.queries[token * HeadDim + dim] = query;
+      shared.keys[token * HeadDim + dim] = key;
+      shared.values[token * HeadDim + dim] = v[g];
+      if (shared_writer)
+        mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
+      mixed_qkv[token * ConvDim + v_channel + 32 * g] = v[g];
+    }
+    if (lane == 0) {
+      const uint gate_index = token * ValueHeads + value_head;
+      beta[gate_index] = gates.beta;
+      decay[gate_index] = gates.decay;
+      shared.beta[token] = gates.beta;
+      shared.decay[token] = gates.decay;
+    }
+    if (step_tape) {
+      constexpr uint VRows = RICHENGINE_TARGET_VERIFY_ROWS;
+      device bfloat *conv_row =
+          reinterpret_cast<device bfloat *>(step_tape) + ulong(token) * ConvDim;
+      device bfloat *kv_row =
+          reinterpret_cast<device bfloat *>(step_tape) +
+          ulong(VRows) * ConvDim + ulong(token) * KvWidth;
+      for (uint g = 0; g < Groups; ++g) {
+        conv_row[v_channel + 32 * g] =
+            conv[token * ConvDim + v_channel + 32 * g];
+        kv_row[v_column + 32 * g] =
+            shared.values[token * HeadDim + 32 * g + lane];
+        if (shared_writer) {
+          conv_row[q_channel + 32 * g] =
+              conv[token * ConvDim + q_channel + 32 * g];
+          conv_row[k_channel + 32 * g] =
+              conv[token * ConvDim + k_channel + 32 * g];
+          kv_row[k_column + 32 * g] =
+              shared.keys[token * HeadDim + 32 * g + lane];
+        }
+      }
+      if (lane == 0) {
+        reinterpret_cast<device float *>(
+            step_tape + ulong(VRows) * (ConvDim + KvWidth) * 2)
+            [token * ValueHeads + value_head] = gates.decay;
+        reinterpret_cast<device bfloat *>(
+            step_tape + ulong(VRows) * (ConvDim + KvWidth) * 2 +
+            ulong(VRows) * ValueHeads * 4)
+            [token * ValueHeads + value_head] = gates.beta;
+      }
+    }
+  }
+  if (carrier) {
+    const uint row = simd_group;
+    const uint consumed = step_tape ? pending : Tokens;
+    for (uint g = 0; g < Groups; ++g) {
+      conv_state_out[row * ConvDim + v_channel + 32 * g] =
+          gdn_conv_carry_pending(conv, conv_state_in, tape_conv, pending,
+                                ConvDim, ConvDim, consumed,
+                         row, v_channel + 32 * g);
+      if (shared_writer) {
+        conv_state_out[row * ConvDim + q_channel + 32 * g] =
+            gdn_conv_carry_pending(conv, conv_state_in, tape_conv, pending,
+                                ConvDim, ConvDim, consumed,
+                           row, q_channel + 32 * g);
+        conv_state_out[row * ConvDim + k_channel + 32 * g] =
+            gdn_conv_carry_pending(conv, conv_state_in, tape_conv, pending,
+                                ConvDim, ConvDim, consumed,
+                           row, k_channel + 32 * g);
+      }
+    }
+  }
+}
+
+// Grid {value heads, lanes}: the fused kernel minus its gate phase and table
+// writes. The ungated recurrent rows land in `hidden` at their output-head
+// positions for gdn_gate_apply.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth, uint RowsInFlight>
+inline void gdn_decode_split_phase(
+    device const bfloat *conv, device const bfloat *tail,
+    device const bfloat *conv_weights,
+    device const uchar *current0, device const uchar *current1,
+    device const uchar *current2, device const uchar *current3,
+    device uchar *next0, device uchar *next1, device uchar *next2,
+    device uchar *next3, device bfloat *mixed, device const float *a_scale,
+    device const bfloat *dt_bias, device float *decay, device bfloat *beta,
+    device bfloat *gdn_hidden,
+    constant GDNDecodeBatchParams &params,
+    uint2 group, uint lane, uint simd_group,
+    threadgroup GdnDecodeShared<HeadDim> &shared,
+    device uchar *tape_out) {
+  constexpr uint ValueWidth = ValueHeads * HeadDim;
+  constexpr uint TailWidth = PackedWidth - ConvDim - ValueWidth;
+  uint batch = group.y;
+  device const uchar *current = batch == 0
+      ? current0
+      : (batch == 1 ? current1 : (batch == 2 ? current2 : current3));
+  device uchar *next = batch == 0
+      ? next0
+      : (batch == 1 ? next1 : (batch == 2 ? next2 : next3));
+  const uint stride = params.verify_stride;
+  conv += ulong(batch) * stride * ConvDim;
+  tail += ulong(batch) * stride * TailWidth;
+  mixed += ulong(batch) * stride * ConvDim;
+  decay += ulong(batch) * stride * ValueHeads;
+  beta += ulong(batch) * stride * ValueHeads;
+  device const bfloat *conv_state_in =
+      reinterpret_cast<device const bfloat *>(
+          current + ulong(params.layer) * params.conv_layer_bytes);
+  device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
+      next + ulong(params.layer) * params.conv_layer_bytes);
+  device const float *state_in = reinterpret_cast<device const float *>(
+      current + params.convolution_state_bytes +
+      ulong(params.layer) * params.recurrent_layer_bytes);
+  device float *state_out = reinterpret_cast<device float *>(
+      next + params.convolution_state_bytes +
+      ulong(params.layer) * params.recurrent_layer_bytes);
+
+  device bfloat *lane_hidden = gdn_hidden + ulong(batch) * stride * ValueWidth;
+  const uint live = params.live_rows[batch];
+  const uint tokens =
+      live && live < stride ? live : stride;
+  const uint pending = params.pending_rows[batch];
+  // As the fused phase: GDN_TAPE_FOLD gates every tape access — an unfolded
+  // dispatch's unbound slot holds a stale argument-table address.
+  const bool taped =
+      tape_out != nullptr && (params.flags & GDN_TAPE_FOLD) != 0;
+  device const uchar *tape =
+      taped ? tape_out + params.pending_tape[batch]
+            : (device const uchar *)nullptr;
+  device const bfloat *tape_conv =
+      reinterpret_cast<device const bfloat *>(tape);
+  if (pending) {
+    constexpr uint KvWidth = KeyHeads * HeadDim + ValueWidth;
+    constexpr ulong TapeRows = RICHENGINE_TARGET_VERIFY_ROWS;
+    device const bfloat *tkv =
+        reinterpret_cast<device const bfloat *>(tape + TapeRows * ConvDim * 2);
+    device const float *td = reinterpret_cast<device const float *>(
+        tape + TapeRows * ConvDim * 2 + TapeRows * KvWidth * 2);
+    device const bfloat *tb = reinterpret_cast<device const bfloat *>(
+        tape + TapeRows * ConvDim * 2 + TapeRows * KvWidth * 2 +
+        TapeRows * ValueHeads * 4);
+    const uint key_head = group.x / (ValueHeads / KeyHeads);
+    for (uint t = simd_group * 32 + lane; t < pending;
+         t += kDecodeSimdgroups * 32) {
+      shared.pending_decay[t] = td[t * ValueHeads + group.x];
+      shared.pending_beta[t] = tb[t * ValueHeads + group.x];
+    }
+    for (uint t = simd_group * 32 + lane; t < pending * HeadDim;
+         t += kDecodeSimdgroups * 32) {
+      const uint token = t / HeadDim, dim = t % HeadDim;
+      shared.pending_keys[t] = tkv[token * KvWidth + key_head * HeadDim + dim];
+      shared.pending_values[t] =
+          tkv[token * KvWidth + KeyHeads * HeadDim + group.x * HeadDim + dim];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  }
+  gdn_decode_split_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim,
+                             PackedWidth>(
+      conv, tail, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
+      dt_bias, decay, beta, tape_conv, pending,
+      taped ? tape_out + params.step_tape[batch]
+            : (device uchar *)nullptr,
+      shared, group.x, lane, simd_group, tokens);
+  const bool tape_step = taped;
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  gdn_decode_scan<HeadDim, RowsInFlight>(state_in, state_out, shared, group.x,
+                                         lane, simd_group, tokens, pending,
+                                         tape_step);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
+  const uint head = gdn_output_head<KeyHeads, ValueHeads>(group.x, tiled);
+  for (uint token = simd_group; token < stride; token += kDecodeSimdgroups) {
+    device bfloat *out =
+        lane_hidden + (ulong(token) * ValueHeads + head) * HeadDim;
+    for (uint g = 0; g < HeadDim / 32; ++g)
+      out[32 * g + lane] = shared.rows[token * HeadDim + 32 * g + lane];
+  }
+}
+
+// The gate apply's row staging: the gated dims each simdgroup produced,
+// read back across lanes for the out-projection table exactly as the fused
+// kernel's shared.rows did.
+struct GDNGateShared {
+  bfloat rows[RICHENGINE_TARGET_VERIFY_ROWS * 128];
+};
+
+// Grid {value heads, lanes}: gdn_decode_gate's gated RMSNorm, reading the
+// ungated rows and the z columns from device memory, writing the gated rows
+// back in place and the out-projection's table beside them. TP/SP are the
+// table and sums pointer types as in gdn_decode_batch_phase.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth, class Table, class W, class TP, class SP>
+inline void gdn_gate_apply_phase(
+    device const bfloat *z, device bfloat *hidden,
+    device const W *norm_weight, constant GDNGateParams &params,
+    uint2 group, uint lane, uint simd_group,
+    threadgroup GDNGateShared &gate_shared, TP *table, SP *sums) {
+#pragma clang fp reassociate(off)
+  constexpr uint ValueWidth = ValueHeads * HeadDim;
+  const uint stride = params.verify_stride;
+  const bool tiled = (params.flags & GDN_TILED_HEADS) != 0;
+  const bool sigmoid = (params.flags & GDN_SIGMOID_GATE) != 0;
+  const uint batch = group.y;
+  const uint head = group.x;
+  const uint out_head = gdn_output_head<KeyHeads, ValueHeads>(head, tiled);
+  z += ulong(batch) * stride * ValueWidth;
+  device bfloat *lane_hidden = hidden + ulong(batch) * stride * ValueWidth;
+  for (uint token = simd_group; token < stride; token += kDecodeSimdgroups) {
+    constexpr uint Groups = HeadDim / 32;
+    const ulong base = (ulong(token) * ValueHeads + out_head) * HeadDim;
+    bfloat gate[Groups];
+    W weight[Groups];
+    float value[Groups];
+    for (uint g = 0; g < Groups; ++g) {
+      const uint dim = 32 * g + lane;
+      gate[g] = z[token * ValueWidth + head * HeadDim + dim];
+      weight[g] = norm_weight[dim];
+      value[g] = float(lane_hidden[base + dim]);
+    }
+    float total = 0.0f;
+    for (uint g = 0; g < Groups; ++g)
+      total += simd_sum(value[g] * value[g]);
+    const float inverse = rsqrt(total / HeadDim + kRmsEpsilon);
+    for (uint g = 0; g < Groups; ++g) {
+      const uint dim = 32 * g + lane;
+      const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));
+      const float zz = float(gate[g]);
+      const bfloat gated =
+          sigmoid ? bfloat(float(normalized) * richengine_sigmoid(zz))
+                  : bfloat((float(normalized) * zz) /
+                           (1.0f + fast::exp2(-1.44269504089f * zz)));
+      lane_hidden[base + dim] = gated;
+      gate_shared.rows[token * HeadDim + dim] = gated;
+    }
+    if (table) {
+      // As the fused kernel: each simdgroup tables only the rows it gated
+      // itself, so the lane-to-lane publish pairs at simdgroup scope.
+      simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                        thread_scope_simdgroup);
+      for (uint g = 0; g < HeadDim / 64; ++g) {
+        const uint column = out_head * HeadDim + g * 64 + 2 * lane;
+        const uint local = token * HeadDim + g * 64 + 2 * lane;
+        Table::write_row(table + ulong(batch) * ValueWidth * stride,
+                     sums + ulong(batch) * (stride / q4sg::kRows) * Table::sums_per_tile(ValueWidth), ValueWidth,
+                     column / 64, token, lane, gate_shared.rows[local],
+                     gate_shared.rows[local + 1]);
+      }
+    }
+  }
+}
+
+// The commit over the carved packed tensor: the conv carry reads the lane's
+// ConvDim-strided conv block inside the layer's flat row run.
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth>
+inline void gdn_commit_split_phase(
+    device const bfloat *conv, device const bfloat *mixed_qkv,
+    device const float *decay, device const bfloat *beta,
+    device const bfloat *conv_state_in,
+    device bfloat *conv_state_out, device const float *state_in,
+    device float *state_out, uint retained, uint group,
+    uint thread_index, uint lane, uint simd_group) {
+  constexpr uint KeyDim = HeadDim, ValueDim = HeadDim;
+  constexpr uint ValueBatches = ValueDim / 8;
+  constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+
+  uint count = retained;
+  if (count == RICHENGINE_TARGET_VERIFY_ROWS)
+    return;
+  for (uint element = group * 256 + thread_index; element < 3 * ConvDim;
+       element += ValueHeads * 256) {
+    uint row = element / ConvDim;
+    uint channel = element % ConvDim;
+    conv_state_out[element] = gdn_conv_carry(
+        conv, conv_state_in, ConvDim, ConvDim, count, row, channel);
+  }
+
+  for (uint task = group; task < ValueHeads * ValueBatches;
+       task += ValueHeads) {
+    uint value_head = task / ValueBatches;
+    uint value_dim = (task % ValueBatches) * 8 + simd_group;
+    uint key_head = value_head / HeadsPerKey;
+    ulong state_base = (ulong(value_head) * ValueDim + value_dim) * KeyDim;
+    float local_state[4];
+    for (uint i = 0; i < 4; ++i) {
+      local_state[i] = state_in[state_base + lane * 4 + i];
+    }
+    for (uint token = 0; token < count; ++token) {
+      ulong key_base = ulong(token) * ConvDim + key_head * KeyDim;
+      float memory = 0.0f;
+      float d = decay[token * ValueHeads + value_head];
+      for (uint i = 0; i < 4; ++i) {
+        uint dim = lane * 4 + i;
+        local_state[i] *= d;
+        memory +=
+            local_state[i] * float(mixed_qkv[key_base + dim + KeyWidth]);
+      }
+      memory = simd_sum(memory);
+      ulong value_index =
+          ulong(token) * ConvDim + value_head * ValueDim + value_dim +
+          2 * KeyWidth;
+      float delta = (float(mixed_qkv[value_index]) - memory) *
+                    float(beta[token * ValueHeads + value_head]);
+      for (uint i = 0; i < 4; ++i) {
+        uint dim = lane * 4 + i;
+        local_state[i] += float(mixed_qkv[key_base + dim + KeyWidth]) * delta;
+      }
+    }
+    for (uint i = 0; i < 4; ++i) {
+      state_out[state_base + lane * 4 + i] = local_state[i];
+    }
+  }
+}
+
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          uint PackedWidth>
+inline void gdn_commit_split_batch_phase(
+    device const bfloat *packed, device const bfloat *mixed_qkv,
+    device const float *decay, device const bfloat *beta,
+    device const uchar *current_0, device const uchar *current_1,
+    device const uchar *current_2, device const uchar *current_3,
+    device uchar *next_0, device uchar *next_1, device uchar *next_2,
+    device uchar *next_3, device const uint *retained,
+    constant GDNBatchCommitParams &params, uint3 group, uint thread_index,
+    uint simd_lane, uint simd_group) {
+  uint batch = group.z;
+  uint layer = group.y;
+  device const uchar *current = batch == 0   ? current_0
+                                : batch == 1 ? current_1
+                                : batch == 2 ? current_2
+                                             : current_3;
+  device uchar *next = batch == 0   ? next_0
+                       : batch == 1 ? next_1
+                       : batch == 2 ? next_2
+                                    : next_3;
+  const ulong rows = (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH + batch) * params.verify_stride;
+  // The layer's packed region is a flat run of lanes * verify_stride rows
+  // carved [conv | z | tail]: the lane's conv columns of flat row
+  // batch * verify_stride + r sit ConvDim elements apart inside it.
+  packed += ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH *
+                RICHENGINE_TARGET_VERIFY_ROWS * PackedWidth +
+            ulong(batch) * params.verify_stride * ConvDim;
+  mixed_qkv += rows * ConvDim;
+  decay += rows * ValueHeads;
+  beta += rows * ValueHeads;
+  device const bfloat *conv_state_in = reinterpret_cast<device const bfloat *>(
+      current + ulong(layer) * params.conv_layer_bytes);
+  device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
+      next + ulong(layer) * params.conv_layer_bytes);
+  device const float *state_in = reinterpret_cast<device const float *>(
+      current + params.convolution_state_bytes +
+      ulong(layer) * params.recurrent_layer_bytes);
+  device float *state_out = reinterpret_cast<device float *>(
+      next + params.convolution_state_bytes +
+      ulong(layer) * params.recurrent_layer_bytes);
+  gdn_commit_split_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+      packed, mixed_qkv, decay, beta, conv_state_in, conv_state_out, state_in,
+      state_out, retained[batch], group.x, thread_index, simd_lane,
+      simd_group);
+}
+
+// ---------------------------------------------------------------------------
+// Entries.
+// ---------------------------------------------------------------------------
+
+#define GDN_SPLIT_DECODE_BUFFERS \
+    device const bfloat *conv [[buffer(0)]], \
+    device const bfloat *tail [[buffer(1)]], \
+    device const bfloat *conv_weights [[buffer(2)]], \
+    device const uchar *current0 [[buffer(3)]], device const uchar *current1 [[buffer(4)]], \
+    device const uchar *current2 [[buffer(5)]], device const uchar *current3 [[buffer(6)]], \
+    device uchar *next0 [[buffer(7)]], device uchar *next1 [[buffer(8)]], \
+    device uchar *next2 [[buffer(9)]], device uchar *next3 [[buffer(10)]], \
+    device bfloat *mixed [[buffer(11)]], device const float *a_scale [[buffer(12)]], \
+    device const bfloat *dt_bias [[buffer(13)]], device float *decay [[buffer(14)]], \
+    device bfloat *beta [[buffer(15)]], device bfloat *gdn_hidden [[buffer(16)]]
+#define GDN_SPLIT_THREADS \
+    uint2 group [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
+#define GDN_SPLIT_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth) \
+    threadgroup GdnDecodeShared<HeadDim> shared; \
+    gdn_decode_split_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2>( \
+        conv, tail, conv_weights, current0, current1, current2, current3, \
+        next0, next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, \
+        gdn_hidden, params, group, lane, simd_group, shared, tape);
+#define GDN_SPLIT_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth) \
+  [[max_total_threads_per_threadgroup(256)]] \
+  kernel void Name(GDN_SPLIT_DECODE_BUFFERS, \
+      constant GDNDecodeBatchParams &params [[buffer(17)]], \
+      device uchar *tape [[buffer(18)]], GDN_SPLIT_THREADS) { \
+    GDN_SPLIT_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth) \
+  }
+
+GDN_SPLIT_DECODE_ENTRY(verify_gdn_fused_split, 16, 48, 128, 10240, 16640)
+GDN_SPLIT_DECODE_ENTRY(verify_gdn_fused_split_vh32, 16, 32, 128, 8192, 12544)
+#undef GDN_SPLIT_DECODE_ENTRY
+#undef GDN_SPLIT_DECODE_BODY
+#undef GDN_SPLIT_THREADS
+#undef GDN_SPLIT_DECODE_BUFFERS
+
+// The gate apply: `z` holds the z GEMV's ValueWidth columns per row,
+// `hidden` the scan's ungated rows in and the gated rows out. W is the norm
+// weights' stored type (float: a GGUF's F32 norms, _f32), Layout the
+// out-projection's table type as in the fused entries.
+#define GDN_GATE_APPLY_PLAIN_BUFFERS(W) \
+    device const bfloat *z [[buffer(0)]], \
+    device bfloat *hidden [[buffer(1)]], \
+    device const W *norm_weight [[buffer(2)]]
+#define GDN_GATE_APPLY_TABLE_BUFFERS(W) \
+    device const bfloat *z [[buffer(0)]], \
+    device bfloat *hidden [[buffer(1)]], \
+    device const W *norm_weight [[buffer(2)]], \
+    device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]]
+#define GDN_GATE_APPLY_THREADS \
+    uint2 group [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
+#define GDN_GATE_APPLY_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, table, sums, Layout) \
+    threadgroup GDNGateShared gate_shared; \
+    gdn_gate_apply_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W>( \
+        z, hidden, norm_weight, params, group, lane, simd_group, gate_shared, \
+        table, sums);
+#define GDN_GATE_APPLY_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
+  kernel void Name(GDN_GATE_APPLY_PLAIN_BUFFERS(W), \
+      constant GDNGateParams &params [[buffer(3)]], GDN_GATE_APPLY_THREADS) { \
+    GDN_GATE_APPLY_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, \
+                        (device bfloat *)nullptr, (device float *)nullptr, q4sg::Table64) \
+  }
+#define GDN_GATE_APPLY_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
+  kernel void Name(GDN_GATE_APPLY_TABLE_BUFFERS(W), \
+      constant GDNGateParams &params [[buffer(5)]], GDN_GATE_APPLY_THREADS) { \
+    GDN_GATE_APPLY_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, table, sums, Layout) \
+  }
+#define GDN_GATE_APPLY_PACKED_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+  [[max_total_threads_per_threadgroup(256)]] \
+  kernel void Name(device const bfloat *z [[buffer(0)]], \
+      device bfloat *hidden [[buffer(1)]], device const W *norm_weight [[buffer(2)]], \
+      device half *plane [[buffer(3)]], device uchar *exponents [[buffer(4)]], \
+      constant GDNGateParams &params [[buffer(5)]], GDN_GATE_APPLY_THREADS) { \
+    GDN_GATE_APPLY_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, plane, exponents, gguf_sg::Packed) \
+  }
+
+GDN_GATE_APPLY_ENTRY(gdn_gate_apply, 16, 48, 128, 10240, 16640, bfloat)
+GDN_GATE_APPLY_ENTRY(gdn_gate_apply_vh32, 16, 32, 128, 8192, 12544, bfloat)
+GDN_GATE_APPLY_ENTRY(gdn_gate_apply_f32, 16, 48, 128, 10240, 16640, float)
+GDN_GATE_APPLY_ENTRY(gdn_gate_apply_vh32_f32, 16, 32, 128, 8192, 12544, float)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table64, 16, 48, 128, 10240, 16640, q4sg::Table64, bfloat)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table64_vh32, 16, 32, 128, 8192, 12544, q4sg::Table64, bfloat)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table16, 16, 48, 128, 10240, 16640, gguf_sg::Table16, bfloat)
+GDN_GATE_APPLY_TABLE_ENTRY(gdn_gate_apply_table16_vh32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, bfloat)
+GDN_GATE_APPLY_PACKED_ENTRY(gdn_gate_apply_packed_f32, 16, 48, 128, 10240, 16640, float)
+GDN_GATE_APPLY_PACKED_ENTRY(gdn_gate_apply_packed_vh32_f32, 16, 32, 128, 8192, 12544, float)
+GDN_GATE_APPLY_PACKED_ENTRY(gdn_gate_apply_packed, 16, 48, 128, 10240, 16640, bfloat)
+GDN_GATE_APPLY_PACKED_ENTRY(gdn_gate_apply_packed_vh32, 16, 32, 128, 8192, 12544, bfloat)
+#undef GDN_GATE_APPLY_PACKED_ENTRY
+#undef GDN_GATE_APPLY_TABLE_ENTRY
+#undef GDN_GATE_APPLY_ENTRY
+#undef GDN_GATE_APPLY_BODY
+#undef GDN_GATE_APPLY_THREADS
+#undef GDN_GATE_APPLY_TABLE_BUFFERS
+#undef GDN_GATE_APPLY_PLAIN_BUFFERS
+
+#define GDN_COMMIT_SPLIT_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, \
+                                PackedWidth)                                \
+  kernel void Name(                                                           \
+      device const bfloat *packed [[buffer(0)]],                              \
+      device const bfloat *mixed_qkv [[buffer(1)]],                           \
+      device const float *decay [[buffer(2)]],                                \
+      device const bfloat *beta [[buffer(3)]],                                \
+      device const uchar *current_0 [[buffer(4)]],                            \
+      device const uchar *current_1 [[buffer(5)]],                            \
+      device const uchar *current_2 [[buffer(6)]],                            \
+      device const uchar *current_3 [[buffer(7)]],                            \
+      device uchar *next_0 [[buffer(8)]], device uchar *next_1 [[buffer(9)]], \
+      device uchar *next_2 [[buffer(10)]],                                    \
+      device uchar *next_3 [[buffer(11)]],                                    \
+      device const uint *retained [[buffer(12)]],                             \
+      constant GDNBatchCommitParams &params [[buffer(13)]],                   \
+      uint3 group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint simd_lane [[thread_index_in_simdgroup]],                           \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    gdn_commit_split_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim,      \
+                                  PackedWidth>(                               \
+        packed, mixed_qkv, decay, beta, current_0, current_1, current_2,      \
+        current_3, next_0, next_1, next_2, next_3, retained, params, group,    \
+        thread_index, simd_lane, simd_group);                                 \
+  }
+
+GDN_COMMIT_SPLIT_ENTRY(verify_gdn_commit_split, 16, 48, 128, 10240, 16640)
+GDN_COMMIT_SPLIT_ENTRY(verify_gdn_commit_split_vh32, 16, 32, 128, 8192, 12544)
+#undef GDN_COMMIT_SPLIT_ENTRY

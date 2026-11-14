@@ -10,6 +10,7 @@
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Env.hpp"
+#include "HeapArena.hpp"
 #include "Residency.hpp"
 #include "TestConfig.hpp"
 // DispatchTiming is part of Impl's layout, so the struct is included
@@ -120,6 +121,7 @@ namespace {
 [[maybe_unused]] void readDeviceCapabilities(id<MTLDevice> device,
                             DeviceCapabilities &capabilities) {
     capabilities.deviceName = stringFromNSString(device.name);
+    capabilities.chipGeneration = parseChipGeneration(capabilities.deviceName);
     capabilities.gpuCoreCount = gpuCoreCountForDevice(device.registryID);
     // Apple GPU families nest, so the device's is the last one supported
     // counting up from Apple7.
@@ -291,6 +293,16 @@ struct MetalAllocation {
     // may outlive the backend. The set retains the buffer, and with it its
     // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
+    // Heap-arena placement (RICHENGINE_HEAP_ARENA, HeapArena.hpp): the
+    // range this buffer occupies inside `heap`, returned to the arena's
+    // free list when the allocation detaches so a later transient
+    // allocation may alias the same pages. All four stay empty for
+    // direct device allocations, which is every allocation while the
+    // flag is off.
+    std::shared_ptr<HeapArena> heapArena;
+    __strong id<MTLHeap> heap = nil;
+    uint64_t heapOffset = 0;
+    uint64_t heapSize = 0;
     // Submitting-thread dedupe stamps, one per prepared-command pass:
     // submitEpoch marks the retained set, matchEpoch marks an allocation
     // whose identity a command or span snapshot already proved this pass.
@@ -307,13 +319,21 @@ struct MetalAllocation {
                   accounting->allocatedBytes.fetch_add(
                       bytes, std::memory_order_relaxed) + bytes);
     }
-    // Lets the buffer go: it leaves the residency set and the accounting.
+    // Lets the buffer go: it leaves the residency set and the accounting,
+    // and its heap range — when it has one — goes back to the arena's
+    // free list for aliasing reuse.
     void detach() noexcept {
         if (!buffer) return;
         if (auto kept = residency.lock()) kept->remove(buffer);
         accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
         buffer = nil;
         bytes = 0;
+        if (heapArena) {
+            heapArena->freeRange(heap, heapOffset, heapSize);
+            heapArena.reset();
+            heap = nil;
+            heapOffset = heapSize = 0;
+        }
     }
 
     ~MetalAllocation() { detach(); }
@@ -1201,6 +1221,31 @@ struct MetalBackend::Impl {
     id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
                             NSString *label);
 
+    // allocateBuffer/restoreMemory's allocation path: identical to
+    // newBuffer() while RICHENGINE_HEAP_ARENA is off; with it on, buffers
+    // in the eligible size range are suballocated from a placement heap
+    // (HeapArena.hpp) so transient scratch aliases physical pages, and
+    // `placement` reports the range for MetalAllocation's free-list
+    // return. Always writes `placement` — empty when the buffer is a
+    // direct device allocation. newBuffer() itself stays heap-free: the
+    // span arenas and staging buffers MetalEncode.mm allocates through it
+    // are long-lived and report no placement.
+    id<MTLBuffer> newBufferPlaced(uint64_t bytes, BufferStorage storage,
+                                  NSString *label,
+                                  HeapArena::Placement *placement);
+
+    // The lazily created heap arena for a buffer's class — heapArenas[0]
+    // Private, [1] Shared, [2] Shared write-combined for large
+    // read-mostly buffers (RICHENGINE_HEAP_ARENA_WC). Defined in
+    // MetalArena.mm.
+    std::shared_ptr<HeapArena> heapArenaFor(BufferStorage storage,
+                                            uint64_t bytes);
+
+    // Heap arenas by class, created on first use. Arena construction
+    // cannot fail — heaps are created lazily inside allocate() — so a
+    // non-null entry always serves or falls back per allocation.
+    std::shared_ptr<HeapArena> heapArenas[3];
+
 
     // The base allocation of a buffer, which must be a whole buffer of this
     // backend.
@@ -1398,6 +1443,52 @@ struct MetalBackend::Impl {
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion,
                          const PreparedCommand *origin = nullptr);
+
+    // --- Blit command groundwork (MetalArena.mm) ---------------------
+    // One validated BlitOperation resolved to absolute offsets inside its
+    // base MTLBuffer — what a blit encoder binds. `destination` is set for
+    // both kinds; `source` only for Copy.
+    struct PreparedBlit {
+        BlitOperation::Kind kind = BlitOperation::Kind::Fill;
+        std::shared_ptr<MetalAllocation> destination;
+        uint64_t destinationOffset = 0;
+        uint64_t length = 0;
+        std::shared_ptr<MetalAllocation> source;
+        uint64_t sourceOffset = 0;
+        uint8_t fillValue = 0;
+    };
+
+    // A blit command as submission encodes it: its operations and every
+    // allocation they touch, which its ticket retains.
+    struct PreparedBlitCommand {
+        std::vector<PreparedBlit> operations;
+        std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
+    };
+
+    // Resolves one blit view to its base allocation and the absolute
+    // offset of `offset` inside it, checking the range stays inside the
+    // view. Throws MetalBackendError on an empty, foreign, released or
+    // out-of-range buffer.
+    void blitRange(const MetalBuffer &view, uint64_t offset, uint64_t length,
+                   const char *role,
+                   std::shared_ptr<MetalAllocation> *allocation,
+                   uint64_t *absoluteOffset);
+
+    // Validates a blit command's operations the way prepare() validates
+    // dispatches.
+    PreparedBlitCommand prepareBlit(std::span<const BlitOperation> operations);
+
+    // Encodes and commits prepared blit operations and the event steps
+    // between them; the ticket retains `retained` until it is consumed.
+    // Always the Metal 3 queue — MTL4 has no blit encoder — so while the
+    // Metal 4 submission path is active a blit orders against compute
+    // only through explicit EventStep shared events or host-side ticket
+    // waits, never implicitly.
+    CommandTicket commitBlit(std::span<const PreparedBlit> operations,
+                             std::span<const EventStep> events,
+                             std::vector<std::shared_ptr<MetalAllocation>>
+                                 retained,
+                             CommandCompletion completion);
 
     // What encodeSubmission needs beyond the dispatch list itself: the
     // queue, the ticket whose sequence the commit lands under, the encode

@@ -27,14 +27,14 @@ inline void reduce_streams(thread float (&values)[kStreams], uint streams,
     if (lane == 0)
       scratch[sg * kStreams + s] = sum;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint s = 0; s < streams; ++s) {
     float total = 0.0f;
     for (uint g = 0; g < kSimdgroups; ++g)
       total += scratch[g * kStreams + s];
     values[s] = total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // Writes the lane's two values of span `span` of absolute row `row` into the
@@ -146,14 +146,14 @@ inline void hyper_norm_quarter_row(device const float *streams,
   sum = simd_sum(sum);
   if (lane == 0)
     scratch[simdgroup] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (tid == 0) {
     float total = 0.0f;
     for (uint g = 0; g < kSimdgroups; ++g)
       total += scratch[q * kSimdgroups + g];
     scales[q] = rsqrt(total / kNormHidden + kRmsEpsilon);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   device bfloat *out = normalized + ulong(row) * width;
   float dot = 0.0f;
   if (!p.inject) {
@@ -184,10 +184,10 @@ inline void hyper_norm_quarter_row(device const float *streams,
   if (!p.inject)
     return;
   dot = simd_sum(dot);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (lane == 0)
     scratch[simdgroup] = dot;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (tid != 0)
     return;
   float total = 0.0f;
@@ -305,7 +305,7 @@ kernel void hyper_connection_mix_table16(
   const bfloat value = bfloat(sum / p.streams);
   mixed[ulong(row) * p.hidden + d] = value;
   values[tid] = value;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (sg >= kRowThreads / 64)
     return;
   const uint k = sg * 64 + 2 * lane;

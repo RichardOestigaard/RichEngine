@@ -192,7 +192,7 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(RichKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
   result.params = {committed, activeRows, kStride, pages,
-                   result.pool->layer(kLayer), splits, 0};
+                   result.pool->layer(kLayer), splits, 0, 0, 0};
   uint64_t queryElements =
       uint64_t{shape.queryHeads()} * kQueryStride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
@@ -364,20 +364,29 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
   const auto [rSuffix, rGroups] = productionSplit(shape);
+  // RICHENGINE_ATTENTION_ACC16's _a16 twins: the dense q8 splits take the
+  // bfloat-accumulator variant wherever the plan emits one — every _rP/_m8
+  // verify form and every prefill split; the R2-off base name keeps fp32.
+  const bool acc16 = richengine::ops::PagedAttention::attentionAcc16Enabled();
   result.splitName = std::string(richengine::ops::kVerifyAttentionQ8Split) +
-                     shape.suffix + rSuffix;
+                     shape.suffix + rSuffix +
+                     (acc16 && !rSuffix.empty() ? "_a16" : "");
   result.splitGridX = shape.kvHeads * rGroups;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
       device, library,
       std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix +
           (kVerifyRows == 8 ? "_m8" : ""));
-  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionQ8Split) + shape.suffix;
+  result.prefillSplitName = std::string(richengine::ops::kPrefillAttentionQ8Split) + shape.suffix +
+                            (acc16 ? "_a16" : "");
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
       device, library, std::string(richengine::ops::kPrefillAttentionReduce) + shape.suffix);
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
+  const uint64_t prefillScratch =
+      result.prefillSplit.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
+            << " prefill_threadgroup_bytes=" << prefillScratch
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
   // The verify tile runs sixteen fused rows to the prefill tile's eight,
@@ -424,7 +433,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, kRows, kRows, 0});
+               data.params.kv, splits, splits, kRows, kRows, 0, 0, 0});
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -567,13 +576,19 @@ void checkOutput(const Case &data, uint32_t width,
             << " bf16_cosine=" << qualityCosine
             << " bf16_max_absolute=" << qualityMaximumAbsolute
             << " bf16_top1=" << top1Agreement << '\n';
-  require(cosine > 0.9995,
+  // RICHENGINE_ATTENTION_ACC16's _a16 splits round the PV running sum to
+  // bfloat on every page iteration, so long histories sit further from the
+  // fp32-accumulated references; these bounds reject only catastrophic
+  // error — the sweep benchmark prices the real quality cost.
+  const bool acc16 = richengine::ops::PagedAttention::attentionAcc16Enabled();
+  require(cosine > (acc16 ? 0.98 : 0.9995),
           "production batch attention differs from its Q8 reference");
-  require(maximumAbsolute < 0.02f,
+  require(maximumAbsolute < (acc16 ? 0.1f : 0.02f),
           "production batch attention exceeds its Q8 error bound");
   require(!qualityGate ||
-              (qualityCosine > 0.9999 && qualityMaximumAbsolute < 0.01f &&
-               top1Agreement >= 0.98),
+              (qualityCosine > (acc16 ? 0.97 : 0.9999) &&
+               qualityMaximumAbsolute < (acc16 ? 0.05f : 0.01f) &&
+               top1Agreement >= (acc16 ? 0.9 : 0.98)),
           "Q8 production attention failed its BF16 quality gate");
 }
 
@@ -793,7 +808,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {
-    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, kRows, kRows, 0};
+    const VerifyAttentionParams params{committed, splits, {1, 0}, splits, splits, kRows, kRows, 0, 0, 0};
     verify = reduce(std::string(richengine::ops::kVerifyAttentionReduce), params,
                     partials, stats);
     check(verify, "verify");
@@ -850,7 +865,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
             "fused reduce/gate differs from reduce plus verify_attention_gate");
   }
   if (splits <= RICHENGINE_PREFILL_ATTENTION_MAXIMUM_SPLITS) {
-    const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits, 0};
+    const PrefillAttentionParams params{committed, activeRows, kStride, splits, {1, 0}, splits, 0, 0, 0};
     const uint32_t coveredTiles =
         (activeRows + RICHENGINE_PREFILL_ATTENTION_TILE_ROWS - 1) /
         RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;
@@ -886,7 +901,7 @@ void benchSplit(id<MTLDevice> device, id<MTLCommandQueue> queue,
                 data.queries.contents, laneBytes);
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
-               data.params.kv, splits, splits, kRows, kRows, 0});
+               data.params.kv, splits, splits, kRows, kRows, 0, 0, 0});
   id<MTLComputePipelineState> reduce = makePipeline(
       device, library,
       std::string(richengine::ops::kVerifyAttentionReduce) + shape.suffix +

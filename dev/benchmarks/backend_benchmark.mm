@@ -56,6 +56,7 @@ struct Observation final {
   std::vector<uint32_t> outputTokens;
   std::optional<Clock::time_point> firstToken;
   bool completed = false;
+  EngineFinishReason finishReason = EngineFinishReason::Length;
   std::string failure;
 };
 
@@ -98,10 +99,12 @@ public:
     throw std::logic_error("unconstrained benchmark requested a token mask");
   }
 
-  void completed(uint64_t requestId, EngineFinishReason, uint32_t,
+  void completed(uint64_t requestId, EngineFinishReason reason, uint32_t,
                  uint32_t, uint32_t, uint32_t,
                  std::span<const float>) override {
-    observations_[requestId].completed = true;
+    Observation &value = observations_[requestId];
+    value.completed = true;
+    value.finishReason = reason;
   }
 
   void failed(uint64_t requestId, LaneOutcome outcome,
@@ -588,8 +591,16 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
     const Observation &observed = events.get(id);
     if (!observed.completed || !observed.failure.empty() ||
         observed.outputTokens.size() != 64) {
+      std::string tokens;
+      for (uint32_t t : observed.outputTokens)
+        tokens += " " + std::to_string(t);
       throw std::runtime_error(
-          "decode throughput request did not produce exactly 64 tokens");
+          "decode throughput request did not produce exactly 64 tokens "
+          "(id=" + std::to_string(id) + " completed=" +
+          std::to_string(observed.completed ? 1 : 0) +
+          " finish=" + std::to_string(static_cast<int>(observed.finishReason)) +
+          " tokens=" + std::to_string(observed.outputTokens.size()) +
+          " failure=[" + observed.failure + "] all=" + tokens + ")");
     }
     if (reference && reference->outputTokens != observed.outputTokens) {
       fprintf(stderr, "width=%u lane-id=%llu tokens differ\n", width,
@@ -1174,10 +1185,14 @@ int main(int argc, char **argv) {
         }
         for (uint32_t sample = 0; sample < samples; ++sample) {
           evictAllCache(resources->cache());
-          const std::vector<uint32_t> longPrompt =
-              prompt(length,
-                     (uint64_t{length} << 32 | sample) ^ 0x4c4f4e474458ULL,
-                     promptVocabulary);
+          // End with the chat-formatted decode prompt: a bare synthetic
+          // prompt can drive the model to EOS inside the 64-token window.
+          std::vector<uint32_t> longPrompt = prompt(
+              length - static_cast<uint32_t>(decodePrompt.size()),
+              (uint64_t{length} << 32 | sample) ^ 0x4c4f4e474458ULL,
+              promptVocabulary);
+          longPrompt.insert(longPrompt.end(), decodePrompt.begin(),
+                            decodePrompt.end());
           const model::ModelTelemetry prefillBefore = executor->telemetry();
           DecodeThroughputMeasurement result = runDecodeThroughput(
               engine, driver, *executor, events, progress.get(), requestId,

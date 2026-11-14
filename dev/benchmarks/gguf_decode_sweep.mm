@@ -165,6 +165,15 @@ void run(const std::string &metallibPath) {
       {"g8_up", 12'800, 4'096, GGUF_FMT_Q4K},
       {"g8_down", 4'096, 12'800, GGUF_FMT_Q6K},
       {"g8_head", 100'352, 4'096, GGUF_FMT_Q6K},
+      // The packed-operand q5km/q6km tiles (RICHENGINE_GGUF_PACKED_ON
+      // formats) beside their staged twins.
+      {"g8_v_q6k_packed", 1'024, 4'096, GGUF_FMT_Q6K, "q6km"},
+      {"g8_down_q6k_packed", 4'096, 12'800, GGUF_FMT_Q6K, "q6km"},
+      {"g8_head_q6k_packed", 100'352, 4'096, GGUF_FMT_Q6K, "q6km"},
+      {"g8_q5k", 4'096, 4'096, GGUF_FMT_Q5K},
+      {"g8_q5k_packed", 4'096, 4'096, GGUF_FMT_Q5K, "q5km"},
+      {"g8_down_q5k", 4'096, 12'800, GGUF_FMT_Q5K},
+      {"g8_down_q5k_packed", 4'096, 12'800, GGUF_FMT_Q5K, "q5km"},
       // MLX Q4 dense targets under --weight-layout block (the 27B shapes):
       // the AF4 repack rides the staged tile; these rows read its decode
       // beside the same shapes' affine kernels.

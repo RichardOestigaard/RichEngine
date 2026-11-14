@@ -31,14 +31,14 @@ inline void ngram_reduce_streams(thread float (&values)[kNgramStreams],
     const float sum = simd_sum(values[s]);
     if (lane == 0) scratch[sg * kNgramStreams + s] = sum;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint s = 0; s < streams; ++s) {
     float total = 0.0f;
     for (uint g = 0; g < kNgramSimdgroups; ++g)
       total += scratch[g * kNgramStreams + s];
     values[s] = total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // The gate of a row: per stream the scaled dot product of the normalized

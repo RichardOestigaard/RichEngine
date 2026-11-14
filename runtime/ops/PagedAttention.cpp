@@ -3,6 +3,7 @@
 #include "Env.hpp"
 
 #include "ops/BufferExtent.hpp"
+#include "ops/DevicePolicy.hpp"
 #include "ops/KernelNames.hpp"
 #include "ops/Linear.hpp"
 
@@ -58,6 +59,26 @@ namespace {
 [[nodiscard]] constexpr AttentionWorkspace attentionWorkspace(uint64_t rows,
                                                               uint32_t headDimension) {
   return {rows * headDimension * 2, rows * 2 * sizeof(float)};
+}
+
+// RICHENGINE_ATTENTION_ACC16 opts the paged-attention PV accumulation into
+// bfloat: the split kernels named with a trailing _a16 accumulate the
+// probability-times-values product in a bfloat matmul2d destination instead
+// of fp32 (paged_attention_tile.h's Accumulator). Like the q8q gate it runs
+// on the Apple10+ generation only — the bfloat destination's AIR lowers
+// there — and only where a compiled _a16 twin exists: the dense chain
+// splits' _rP/_m8 forms and the sparse splits. The Gemma, DuoAttention,
+// tree, windowed, q8q, fp8 and canvas paths keep the fp32 accumulator.
+[[nodiscard]] bool attentionAcc16() {
+  if (!envFlag("RICHENGINE_ATTENTION_ACC16")) return false;
+  static const bool apple10Plus = [] {
+    try {
+      return DevicePolicy::of(metal::probeDeviceCapabilities()).apple10Plus();
+    } catch (...) {
+      return false;
+    }
+  }();
+  return apple10Plus;
 }
 
 // The kernel family's attention geometry (kv::Core, ops/PagedKv.hpp):
@@ -292,10 +313,10 @@ using KernelLayout = kv::Core;
       (kernel == KernelLayout::Kv2Group8 ||
        kernel == KernelLayout::Kv2Group8D128))
     name += "_m2";
-  // The DuoAttention _duo splits (kv4/g6, int8/int4): a streaming KV head's
-  // splits partition its sink-plus-window page range instead of the full
-  // history. The tag sits between the layout/variant suffixes and the _rP
-  // and _m8 tags the caller appends.
+  // The DuoAttention _duo splits (kv cores, int8/int4): a streaming KV
+  // head's splits partition its sink-plus-window page range instead of
+  // the full history. The tag sits between the layout/variant suffixes
+  // and the _rP and _m8 tags the caller appends.
   if (duo) name += "_duo";
   // The chain tile's fused M rows at 16 verify rows cap residency at one
   // threadgroup per core; the _rP splits run the tile's P fused-row passes
@@ -384,14 +405,15 @@ void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
          (duo ? "_duo" : "");
 }
 
-// Whether the layout's core compiles DuoAttention kernels: the kv4/g6 set
-// only, on int8 or packed-int4 pages, without a sliding window or block
+// Whether the layout's core compiles DuoAttention kernels: the kv cores,
+// on int8 or packed-int4 pages, without a sliding window or block
 // lists of its own.
 void requireDuoLayout(const kv::Layout &layout, KernelLayout kernel,
                       bool tree) {
   if (tree)
     throw std::invalid_argument("tree verify has no duo attention kernels");
-  if (kernel != KernelLayout::Kv4Group6)
+  if (kernel != KernelLayout::Kv4Group6 && kernel != KernelLayout::Kv4Group4 &&
+      kernel != KernelLayout::Kv2Group8)
     throw std::invalid_argument("no duo attention kernel for layout");
   if (layout.format != kv::Format::Int8 && layout.format != kv::Format::Int4)
     throw std::invalid_argument("duo attention requires int8 or int4 pages");
@@ -450,6 +472,8 @@ void requireDuoLayout(const kv::Layout &layout, KernelLayout kernel,
 
 } // namespace
 
+bool PagedAttention::attentionAcc16Enabled() { return attentionAcc16(); }
+
 AttentionWorkspace PagedAttention::prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
                                                       kv::Layout layout) {
   const KernelLayout kernelLayout = attentionKernelLayout(layout, queryHeads);
@@ -496,12 +520,13 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
   const uint64_t pages = (uint64_t{committedTokens} + rows +
                           kv::kPageTokens - 1) /
                          kv::kPageTokens;
-  // The history term of the splits: dense layouts only — sparse keeps the
-  // shared splits (its block lists read a few thousand tokens whatever the
-  // history), and DuoAttention and windowed layers keep them until their
-  // kernels are measured against it.
+  // The history term of the splits: sparse and windowed layouts keep the
+  // shared splits (sparse's block lists read a few thousand tokens whatever
+  // the history; windowed kernels were measured only at the shared count).
+  // DuoAttention's _duo splits partition each head's own virtual page
+  // range, so the history-scaled count is safe for them.
   const uint32_t splits =
-      sparse || duo || layout.windowTokens
+      sparse || layout.windowTokens
           ? sharedPrefillSplits(tiles)
           : prefillSplits(tiles, pages, prefillPagesPerSplit);
   const uint32_t fusedRows =
@@ -509,22 +534,35 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
   // The q8q gate: the pages one split of the chunk's longest tile reads —
   // verify applies the same per-split rule to its longest lane, and a
   // short context never pays the query quantization. Only the dense INT8
-  // page loop qualifies: sparse, DuoAttention, windowed and the Gemma
-  // cores compile no q8q kernels and keep the bf16-query path.
+  // page loop and the DuoAttention splits qualify: sparse, windowed and
+  // the Gemma cores compile no q8q kernels and keep the bf16-query path.
   const uint64_t splitReads = (pages + splits - 1) / splits;
   const bool int8Queries =
       int8QueriesFromPages != 0 && layout.format == kv::Format::Int8 &&
-      !sparse && !duo && !layout.windowTokens &&
+      !sparse && !layout.windowTokens &&
       kernelLayout != KernelLayout::GemmaKv8H256 &&
       kernelLayout != KernelLayout::GemmaKv2H512 &&
       splitReads >= int8QueriesFromPages;
+  // The _a16 twin exists for every dense and sparse split this plan can
+  // name, DuoAttention's included; the Gemma, windowed, q8q and fp8
+  // variants keep fp32.
+  const bool acc16 = attentionAcc16() && !int8Queries &&
+                     layout.format != kv::Format::Float8E4M3 &&
+                     (sparse ||
+                      (!layout.windowTokens &&
+                       kernelLayout != KernelLayout::GemmaKv8H256 &&
+                       kernelLayout != KernelLayout::GemmaKv2H512));
+  const std::string split =
+      (sparse ? sparseSplitKernel(kPrefillAttention, layout.format,
+                                  kernelLayout)
+              : splitPipeline(kPrefillAttention, layout, kernelLayout, false,
+                              duo, int8Queries)) +
+      (acc16 ? "_a16" : "");
   return {rows,
           splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              kernelLayoutHeadDim(kernelLayout)),
-          sparse ? sparseSplitKernel(kPrefillAttention, layout.format, kernelLayout)
-                 : splitPipeline(kPrefillAttention, layout, kernelLayout, false,
-                                 duo, int8Queries),
+          split,
           sparse ? sparseReduceKernel(kPrefillAttention, kernelLayout)
                  : reduceKernel(kPrefillAttentionReduce, kernelLayout, duo),
           {layout.kvHeads, tiles, splits},
@@ -603,10 +641,9 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     // A sparse lane's splits follow the most its tiles' lists can hold: the
     // written splits of a list of every history block, capped like the page
     // loop's. The kernels' partition reads each list's device count, so the
-    // bound only needs to cover it. A duo lane's split count sizes to the
-    // streaming heads' bound — the sink plus the window plus two pages of
-    // edge slack covers every masked head's effective range, while an
-    // unmasked head still splits correctly, just coarser.
+    // bound only needs to cover it. A duo lane sizes to its full history:
+    // the streaming heads' splits mostly early-return on their short page
+    // range, while the unmasked heads keep the dense path's parallelism.
     laneSplits[lane] =
         sparse
             ? std::min(
@@ -614,13 +651,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                       kv::sparseHistoryBlocks(historyTokens[lane], liveRows),
                       kv::kVerifyMaximumSplits),
                   kv::verifyAttentionSplits(historyTokens[lane], liveRows))
-            : kv::verifyAttentionSplits(
-                  duo ? std::min(historyTokens[lane],
-                                 layout.duo.sink_tokens +
-                                     layout.duo.window_tokens +
-                                     2 * kv::kPageTokens)
-                      : historyTokens[lane],
-                  liveRows);
+            : kv::verifyAttentionSplits(historyTokens[lane], liveRows);
     splits = std::max(splits, laneSplits[lane]);
     if (int8QueriesFromPages) {
       const uint64_t pages =
@@ -644,12 +675,12 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                       !envFlag("RICHENGINE_VERIFY_M8_OFF");
   const bool chainR2 = !tree && !narrow && !sparse &&
                        !tuning().verifySplitR2Off;
-  // The q8q gate: INT8 pages, a dense full-attention layout, and a split
-  // read count at the calibrated threshold — sparse, DuoAttention, tree,
-  // windowed and the Gemma cores compile no q8q kernels.
+  // The q8q gate: INT8 pages, a dense full-attention or DuoAttention
+  // layout, and a split read count at the calibrated threshold — sparse,
+  // tree, windowed and the Gemma cores compile no q8q kernels.
   const bool int8Queries =
       int8QueriesFromPages != 0 && layout.format == kv::Format::Int8 &&
-      !sparse && !duo && !tree && !layout.windowTokens &&
+      !sparse && !tree && !layout.windowTokens &&
       kernelLayout != KernelLayout::GemmaKv8H256 &&
       kernelLayout != KernelLayout::GemmaKv2H512 &&
       splitReads >= int8QueriesFromPages;
@@ -664,6 +695,19 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     splitGroupX *= split.back() - '0';
   if (narrow && !sparse)
     split += "_m8";
+  // The _a16 twins exist only for the names this plan can reach: the sparse
+  // splits, and the dense or DuoAttention chain splits' _rP/_m8 forms — a
+  // base name (the RICHENGINE_VERIFY_SPLIT_R2_OFF escape hatch) has none
+  // and stays fp32.
+  const bool acc16 = attentionAcc16() && !int8Queries &&
+                     layout.format != kv::Format::Float8E4M3 &&
+                     (sparse ||
+                      (!tree && !layout.windowTokens &&
+                       (narrow || chainR2) &&
+                       kernelLayout != KernelLayout::GemmaKv8H256 &&
+                       kernelLayout != KernelLayout::GemmaKv2H512));
+  if (acc16)
+    split += "_a16";
   const uint32_t rowTiles =
       (rows + kv::kSparseTileRows - 1) / kv::kSparseTileRows;
   const uint32_t group = queryHeads / layout.kvHeads;

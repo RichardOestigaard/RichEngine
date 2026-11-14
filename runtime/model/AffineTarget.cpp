@@ -331,13 +331,14 @@ std::vector<Image> gdnImages(const TargetLayout &layout, const QuantResolver &re
 
 // The oQ resolver of a checkpoint: the spec the configuration declares for
 // a module the tensors mark quantized, nullopt for a plain float weight;
-// the oQ formats are the affine-mode ones of 4..8 bits over groups of 64 or
-// 128.
+// the oQ formats are the affine-mode ones of 2..8 bits (except 7) over
+// groups of 64 or 128.
 QuantResolver oqResolver(const SafetensorsCheckpoint &source) {
   return [&source](std::string_view module) -> std::optional<QuantSpec> {
     const std::optional<QuantSpec> spec = source.quantization(module);
     if (!spec) return std::nullopt;
-    if ((spec->bits != 4 && spec->bits != 5 && spec->bits != 6 && spec->bits != 8) ||
+    if ((spec->bits != 2 && spec->bits != 3 && spec->bits != 4 && spec->bits != 5 && spec->bits != 6 &&
+         spec->bits != 8) ||
         (spec->groupSize != 64 && spec->groupSize != 128) ||
         (!spec->mode.empty() && spec->mode != "affine"))
       throw WeightStoreError("unsupported oQ quantization for " + std::string(module) + ": " +

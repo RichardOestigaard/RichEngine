@@ -465,6 +465,37 @@ inline void q4_mpp_tile(
   threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
+// q4_mpp_tile for a tile whose first `live_rows` of Rows are real: the MPP
+// matmul still runs the full Rows (its M is a multiple of 8), but the store
+// pass skips the padding rows, whose grouped inputs and outputs combine
+// never reads. Live rows keep the sequential tile's arithmetic.
+template <ushort Rows, ushort TileN, bool GateUp, bool AddResidual,
+          bool MultiplySiluGate = false, ushort Simdgroups = 8,
+          bool Pipelined = false, class Out>
+inline void q4_mpp_tile_live(
+    device bfloat *input, device uchar *weights_0, device bfloat *scales_0,
+    device bfloat *biases_0, device Out *output_0, device uchar *weights_1,
+    device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
+    uint output_size, uint input_size, threadgroup float *input_sums,
+    uint live_rows, uint output_origin, uint simd_lane, uint simd_group) {
+  q4_mpp_tile_sums<Rows, TileN, GateUp, Simdgroups, Pipelined>(
+      input, weights_0, scales_0, biases_0, weights_1, scales_1, biases_1,
+      input_size, input_sums, output_origin, 0, input_size / 64, simd_lane,
+      simd_group,
+      [&](thread auto &accumulated_0, thread auto &accumulated_1,
+          Q4Traversal traversal) __attribute__((always_inline)) {
+    q4_visit(accumulated_0, traversal, [&](ushort i) {
+      auto index = accumulated_0.get_multidimensional_index(i);
+      if (uint(index[1]) >= live_rows)
+        return;
+      uint output_index = index[1] * output_size + output_origin + index[0];
+      q4_store_output<GateUp, AddResidual, MultiplySiluGate>(
+          accumulated_0, accumulated_1, i, residual, output_0, output_index);
+    });
+  });
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+}
+
 // Split-K form of q4_mpp_tile across the grid, one weight stream: threadgroup
 // `group` computes column tile group.x over K partition group.y of `splits`,
 // whole 256-input blocks whose counts differ by at most one between

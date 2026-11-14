@@ -84,7 +84,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
   };
   if constexpr (StagedSums) {
     load_sums(0);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
@@ -114,9 +114,9 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
     }
     if (StagedSums && quant_group % SumBatch == SumBatch - 1 &&
         quant_group + 1 < quant_groups) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       load_sums(quant_group + 1);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
   }
 
@@ -384,7 +384,7 @@ inline void q4_mpp_prefill_tile_split(
   };
   if constexpr (StagedSums) {
     load_sums(first_group);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   for (uint quant_group = first_group; quant_group < end_group;
@@ -415,9 +415,9 @@ inline void q4_mpp_prefill_tile_split(
     }
     if (StagedSums && (quant_group - first_group) % SumBatch == SumBatch - 1 &&
         quant_group + 1 < end_group) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       load_sums(quant_group + 1);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
   }
 
@@ -581,7 +581,7 @@ PREFILL_Q4_SPLIT_M(prefill_linear_q4_n256_up_silu_sums_m64_ksplit, 64, 256, 8, U
           input, weights, scales, biases, PREFILL_Q4_ARGUMENTS_##Epilogue,     \
           params.output_size, params.input_size, uint2(group.x, tile),         \
           simd_lane, simd_group, input_sums);                                  \
-      threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);                         \
     }                                                                          \
   }
 #define PREFILL_Q4_PERSISTENT_PARAMS_Plain 6

@@ -21,12 +21,16 @@ namespace {
 // has one (metal/abi/QuantFormat.h).
 uint32_t formatOf(uint32_t bits, uint32_t groupSize) {
   if (groupSize == 64) {
+    if (bits == 2) return GGUF_FMT_AF2;
+    if (bits == 3) return GGUF_FMT_AF3;
     if (bits == 4) return GGUF_FMT_AF4;
     if (bits == 5) return GGUF_FMT_AF5;
     if (bits == 6) return GGUF_FMT_AF6;
     if (bits == 8) return GGUF_FMT_AF8;
   }
   if (groupSize == 128) {
+    if (bits == 2) return GGUF_FMT_AF2G128;
+    if (bits == 3) return GGUF_FMT_AF3G128;
     if (bits == 4) return GGUF_FMT_AF4G128;
     if (bits == 5) return GGUF_FMT_AF5G128;
     if (bits == 6) return GGUF_FMT_AF6G128;

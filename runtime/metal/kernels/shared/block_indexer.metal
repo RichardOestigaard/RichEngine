@@ -48,10 +48,10 @@ inline device bfloat *indexer_index_keys(RichKvPage entry, constant BlockIndexer
 inline float indexer_rms_scale(float value, threadgroup float *scratch, uint lane, uint sg) {
   const float sum = simd_sum(value * value);
   if (lane == 0) scratch[sg] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float total = 0.0f;
   for (uint g = 0; g < kDimension / 32; ++g) total += scratch[g];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   return rsqrt(total / kDimension + kRmsEpsilon);
 }
 
@@ -61,12 +61,12 @@ template <class Table>
 inline void indexer_rotate_store(float value, threadgroup float *rotated, Table cosine,
                                  Table sine, device bfloat *out, uint tid) {
   rotated[tid] = value;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float result = value;
   if (tid < kPairs) result = value * cosine[tid] - rotated[tid + kPairs] * sine[tid];
   else if (tid < 2 * kPairs) result = value * cosine[tid - kPairs] + rotated[tid - kPairs] * sine[tid - kPairs];
   out[tid] = bfloat(result);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // Threadgroup (row, head, lane) of 128 threads: query heads are normalized,
@@ -136,7 +136,7 @@ kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0
     cosine[tid] = rope.x;
     sine[tid] = rope.y;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const uint first = p.first_position[batch];
   device const bfloat *lane_keys = keys + ulong(batch) * p.rows * kDimension;
   float sum = 0.0f;
@@ -251,7 +251,7 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
                                                     (block % kPageBlocks) * D)[chunk % Chunks];
     reinterpret_cast<threadgroup uint4 *>(k)[chunk] = data;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   auto qt = tensor(q, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto kt = tensor(k, dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto pt = tensor(products, dextents<int, 2>{N, M}, array<int, 2>{1, N});
@@ -263,7 +263,7 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   auto dots = product.template get_destination_cooperative_tensor<decltype(q0), decltype(k0), float>();
   product.run(q0, k0, dots);
   dots.store(pt.template slice<N, M>(0, 0));
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint index = tid; index < kScoreRows * N; index += kScoreThreads) {
     const uint r = index / N, b = index % N;
     if (row0 + r >= p.rows || block0 + b >= complete) continue;
@@ -314,7 +314,7 @@ inline void indexer_threshold(threadgroup atomic_uint *histogram, uint bins, uin
   }
   const uint inclusive = simd_prefix_inclusive_sum(local);
   if (lane == 31) simd_counts[sg] = inclusive;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   uint above = inclusive - local;
   for (uint g = 0; g < sg; ++g) above += simd_counts[g];
   if (above < wanted && above + local >= wanted)
@@ -327,7 +327,7 @@ inline void indexer_threshold(threadgroup atomic_uint *histogram, uint bins, uin
       }
       above += run[j];
     }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 kernel void block_indexer_select(device const float *scores [[buffer(0)]],
@@ -365,7 +365,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
     const uint width = min(kSelectBits, uint(high) + 1), shift = uint(high) + 1 - width;
     const uint bins = 1u << width;
     for (uint i = tid; i < kBins; i += kSelectThreads) atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (gathered) {
       const uint count = atomic_load_explicit(&candidate_count, memory_order_relaxed);
       for (uint i = tid; i < count; i += kSelectThreads) {
@@ -380,7 +380,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
           atomic_fetch_add_explicit(&histogram[(v >> shift) & (bins - 1)], 1u, memory_order_relaxed);
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     indexer_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
     prefix |= threshold[0] << shift;
     prefix_mask |= (bins - 1) << shift;
@@ -390,7 +390,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
     // the passes after it.
     if (high == 30 && !all && atomic_load_explicit(&histogram[threshold[0]], memory_order_relaxed) <= kCandidates) {
       if (tid == 0) atomic_store_explicit(&candidate_count, 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       for (uint b = tid; b < complete; b += kSelectThreads) {
         const uint v = as_type<uint>(s[b]);
         if ((v & prefix_mask) == prefix)
@@ -398,7 +398,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
       }
       gathered = true;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   // Each simdgroup writes a run of whole words, a ballot of 32 consecutive
   // scores each. Unless every score equal to the threshold is taken, a pass
@@ -415,7 +415,7 @@ kernel void block_indexer_select(device const float *scores [[buffer(0)]],
     }
     equal = simd_sum(equal);
     if (lane == 0) simd_counts[sg] = equal;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint g = 0; g < sg; ++g) before += simd_counts[g];
   }
   for (uint w = w0; w < w1; ++w) {
@@ -514,7 +514,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
   threadgroup atomic_uint pageAllow[(kLocal * kThreads / kPageBlocks + 31) / 32];
   for (uint i = tid; i < (kLocal * kThreads / kPageBlocks + 31) / 32; i += kThreads)
     atomic_store_explicit(&pageAllow[i], 0u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   device const RichKvPage *index_table =
       RICHENGINE_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
   device float *s = scores + (ulong(batch) * p.rows + row) * p.score_stride;
@@ -539,15 +539,15 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
       }
       probes[page] = score;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint i = tid; i < kBins; i += kThreads)
       atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint page = tid; page < pages; page += kThreads) {
       const uint v = as_type<uint>(probes[page]);
       atomic_fetch_add_explicit(&histogram[v >> 21], 1u, memory_order_relaxed);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     const uint wantedPages =
         min(pages, (2 * p.top_blocks + kPageBlocks - 1) / kPageBlocks + 1);
     indexer_threshold(histogram, kBins, wantedPages, simd_counts, threshold,
@@ -559,7 +559,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
         atomic_fetch_or_explicit(&pageAllow[page / 32], 1u << (page % 32),
                                  memory_order_relaxed);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   const auto allowed = [&](uint block) -> bool {
     return !p.prefilter ||
@@ -594,7 +594,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
     const uint bins = 1u << width;
     for (uint i = tid; i < kBins; i += kThreads)
       atomic_store_explicit(&histogram[i], 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (gathered) {
       const uint count = atomic_load_explicit(&candidate_count, memory_order_relaxed);
       for (uint i = tid; i < count; i += kThreads) {
@@ -612,7 +612,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
                                     memory_order_relaxed);
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     indexer_threshold(histogram, bins, wanted, simd_counts, threshold, tid, lane, sg);
     prefix |= threshold[0] << shift;
     prefix_mask |= (bins - 1) << shift;
@@ -620,7 +620,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
     all = threshold[2];
     if (high == 30 && !all && atomic_load_explicit(&histogram[threshold[0]], memory_order_relaxed) <= kCandidates) {
       if (tid == 0) atomic_store_explicit(&candidate_count, 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       for (uint b = tid; b < complete; b += kThreads) {
         if (!allowed(b)) continue;
         const uint v = as_type<uint>(s[b]);
@@ -629,7 +629,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
       }
       gathered = true;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   constexpr uint kSimdgroups = kThreads / 32;
   const uint per = (words + kSimdgroups - 1) / kSimdgroups;
@@ -654,7 +654,7 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
     }
     equal = simd_sum(equal);
     if (lane == 0) simd_counts[sg] = equal;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint g = 0; g < sg; ++g) before += simd_counts[g];
   }
   for (uint w = w0; w < w1; ++w) {

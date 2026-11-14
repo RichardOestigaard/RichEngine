@@ -274,6 +274,38 @@ void testCorpusLookupScale() {
   require(microsPerLookup < 500, "corpus miss should stay sub-0.5ms");
 }
 
+// The hit path's cost: one doc carries the key deep, so the backward
+// extension walk runs ~200 tokens before the lane history runs out —
+// the loop the pairwise compare halves. Not an assertion — prints the
+// measured microseconds.
+void testCorpusLookupHitScale() {
+  // The doc's run: 500 tokens the lane's tail verbatim extends — the
+  // key sits at its end, so the extension walks back 200 into the lane.
+  std::vector<uint32_t> run(500);
+  for (uint32_t i = 0; i < run.size(); ++i)
+    run[i] = (i * 7 + 13) & 0xFFFFu;
+  ngram::Corpus hitCorpus;
+  {
+    std::vector<uint32_t> carrier(16 * 1024);
+    for (uint32_t i = 0; i < carrier.size(); ++i)
+      carrier[i] = (32 * 2654435761u + i) & 0xFFFFu;
+    std::copy(run.begin(), run.end(), carrier.begin() + 1000);
+    ngram::push(hitCorpus, carrier);
+  }
+  std::vector<uint32_t> lane(run.end() - 200, run.end());
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (uint32_t i = 0; i < 1000; ++i)
+    ngram::lookupCorpus(hitCorpus, lane, out.data(), extension);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  const double microsPerLookup =
+      std::chrono::duration<double, std::micro>(elapsed).count() / 1000.0;
+  std::cout << "corpus lookup hit ~200-deep extension: " << microsPerLookup
+            << "us (extension " << extension << ")\n";
+  require(extension >= 190, "the hit should extend deep into the lane");
+}
+
 // A lane's own committed stream never serves it — its self table already
 // covers that history; the corpus doc is dead weight for that lane.
 void testCorpusLookupSkipsSelfOrigin() {
@@ -317,6 +349,70 @@ void testAppendIndexesNewGrams() {
           "appended tokens should feed the index");
 }
 
+// The extension limit bounds the backward scan: followers are unaffected
+// and the reported extension saturates at the cap.
+void testCorpusLookupHonoursExtensionLimit() {
+  ngram::Corpus corpus;
+  const uint32_t doc[] = {10, 11, 12, 13, 14, 1, 2, 3, 40, 41};
+  ngram::push(corpus, doc);
+  const uint32_t lane[] = {10, 11, 12, 13, 14, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const uint32_t found = ngram::lookupCorpus(
+      corpus, lane, out.data(), extension, 0, 0, false,
+      /*extensionLimit=*/2);
+  require(found == 2 && out[0] == 40 && out[1] == 41,
+          "a capped scan must still emit the occurrence's followers");
+  require(extension == 2, "the reported extension should stop at the cap");
+  extension = 0;
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension, 0, 0,
+                              false, /*extensionLimit=*/5) == 2 &&
+              extension == 5,
+          "an occurrence below the cap reports its full extension");
+}
+
+// A live doc is searchable mid-flight, invisible to its own request, and
+// gone after liveEnd.
+void testCorpusLiveDocLifecycle() {
+  ngram::Corpus corpus;
+  const uint32_t prefix[] = {7, 8, 9};
+  ngram::liveBegin(corpus, /*origin=*/7, /*session=*/0, prefix);
+  const uint32_t emitted[] = {1, 2, 3, 40, 50};
+  ngram::liveAppend(corpus, 7, emitted);
+  const uint32_t lane[] = {9, 1, 2, 3};
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension) == 2 &&
+              out[0] == 40 && out[1] == 50,
+          "another lane should draft from the live doc's committed tail");
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension,
+                              /*selfOrigin=*/7) == 0,
+          "a lane must not draft from its own live doc");
+  ngram::liveEnd(corpus, 7);
+  require(ngram::lookupCorpus(corpus, lane, out.data(), extension) == 0,
+          "the doc leaves the searchable set when the request finishes");
+}
+
+// The four-start window: a key's fifth-oldest occurrence is dropped —
+// only the last four starts are ranked. Measured on identical-lane
+// traffic: a wider window picks older follower-rich occurrences whose
+// continuations diverge, costing ~4% decode throughput.
+void testLookupStartWindowIsFour() {
+  // Key {1,2,3} occurs at starts 5, 9, 13, 17, 25 (the tail). Only the
+  // oldest shares the tail's five-token context, but the window dropped it
+  // — the most recent four starts are all context-shallow, so the best of
+  // them wins on followers.
+  ngram::Table t = table({10, 11, 12, 13, 14, 1, 2, 3, 20, 1, 2, 3, 21,
+                          1, 2, 3, 22, 1, 2, 3, 10, 11, 12, 13, 14, 1, 2, 3});
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 0;
+  const uint32_t found = ngram::lookup(t, out.data(), &extension);
+  require(extension == 0,
+          "the dropped occurrence's deep extension must not reach lookup");
+  require(found == RICHENGINE_DRAFT_PROPOSAL_TOKENS && out[0] == 21,
+          "the window's follower-richest start supplies the followers");
+}
+
 } // namespace
 
 int main() {
@@ -339,8 +435,12 @@ int main() {
     testCorpusPushHonoursTokenCap();
     testCorpusPushDropsShortStreams();
     testCorpusLookupScale();
+    testCorpusLookupHitScale();
     testCorpusLookupSkipsSelfOrigin();
     testCorpusLookupPrefersSameSession();
+    testCorpusLookupHonoursExtensionLimit();
+    testCorpusLiveDocLifecycle();
+    testLookupStartWindowIsFour();
     std::cout << "ngram index tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

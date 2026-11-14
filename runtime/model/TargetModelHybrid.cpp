@@ -6,14 +6,142 @@
 // TargetModelGemmaHelpers.hpp.
 #include "model/TargetModelGemmaHelpers.hpp"
 #include "model/TargetLayerEncoder.hpp"
+#include "Tuning.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
 
+#include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace richengine::model {
+
+namespace {
+
+// RICHENGINE_GDN_ZSPLIT: the packed GDN input projection's columns carve into
+// three contiguous runs — the ConvDim conv/qkv inputs, the
+// ValueHeads*HeadDim z-gate columns (contiguous: gdn.metal's gate reads
+// packed[ConvDim + head*HeadDim + dim]) and the beta/decay tail — each a
+// whole run of QUANT_TILE_ROWS plane tiles, so Projection::rowRange views
+// them and three decode plans reproduce the fused projection's columns
+// bitwise (same tile, splits and simdgroups; K order unchanged).
+struct GdnZSplitDims final {
+  uint32_t conv = 0;
+  uint32_t z = 0;
+  uint32_t tail = 0;
+};
+
+[[nodiscard]] std::optional<GdnZSplitDims> gdnZSplitDims(
+    const TargetModelGeometry &geometry, const ops::Projection &packed) {
+  // Affine Q4 planes only: a GGUF's segmented projections and its gpu-span
+  // decode ordering stay on the fused path, as does any non-bf16 destination.
+  if (packed.layout() != ops::WeightLayout::Affine64 ||
+      !packed.takesPlaneViews() ||
+      packed.destination != ops::FloatOutput::BFloat16 ||
+      packed.outputSize != geometry.packedGdnWidth)
+    return std::nullopt;
+  const ops::GdnShape shape = geometry.gdnShape();
+  const uint32_t conv = shape.convolutionDimension;
+  const uint32_t z = shape.valueHeads * shape.headDimension;
+  const uint32_t tail = shape.packedWidth - conv - z;
+  if (!tail || conv % QUANT_TILE_ROWS || z % QUANT_TILE_ROWS ||
+      tail % QUANT_TILE_ROWS)
+    return std::nullopt;
+  return GdnZSplitDims{conv, z, tail};
+}
+
+// The column tiles of the affine decode tiles a split plan can inherit from
+// the full projection's configuration (the GGUF tiles never reach here).
+[[nodiscard]] constexpr uint32_t gdnZSplitTileColumns(ops::LinearTile tile) noexcept {
+  switch (tile) {
+  case ops::LinearTile::Simdgroup: return 64;
+  case ops::LinearTile::N256:
+  case ops::LinearTile::Paired256: return 256;
+  default: return 128;
+  }
+}
+
+struct GdnZSplit final {
+  GdnZSplitDims dims;
+  ops::Projection conv, z, tail;
+  ops::LinearPlan convPlan, zPlan, tailPlan;
+};
+
+// The carved projections and their plans on the full projection's decode
+// configuration — identical tile, splits and simdgroups keep every output
+// column's accumulation order, hence bitwise — or nullopt when the
+// projection or plan cannot take the split. splits must be one: the carved
+// GEMVs share LinearScratch's split partials and counters otherwise.
+[[nodiscard]] std::optional<GdnZSplit> gdnZSplitPlans(
+    const metal::MetalBackend &backend,
+    const TargetModelGeometry &geometry, const ops::Projection &packed,
+    const ops::LinearPlan &inputPlan) {
+  if (!tuning().gdnZSplit)
+    return std::nullopt;
+  const std::optional<GdnZSplitDims> dims = gdnZSplitDims(geometry, packed);
+  if (!dims || inputPlan.configuration().splits != 1)
+    return std::nullopt;
+  try {
+    const ops::LinearConfig config = inputPlan.configuration();
+    const ops::LinearWorkload full = inputPlan.workload();
+    const auto plan = [&](const ops::Projection &p) {
+      ops::LinearConfig c = config;
+      // Persistent grids size to the full projection's tiles; clamp to the
+      // carved projection's (a scheduling bound only, not the math).
+      c.groups = std::min(c.groups, p.outputSize / gdnZSplitTileColumns(c.tile));
+      return ops::Linear::plan(
+          {{p.outputSize, p.inputSize}, full.rows, ops::LinearPhase::Decode,
+           ops::LinearEpilogue::None, ops::WeightLayout::Affine64, false,
+           full.lanes},
+          c, inputPlan.destination());
+    };
+    const ops::Projection conv = packed.rowRange(backend, 0, dims->conv);
+    const ops::Projection z = packed.rowRange(backend, dims->conv, dims->z);
+    const ops::Projection tail =
+        packed.rowRange(backend, dims->conv + dims->z, dims->tail);
+    auto convPlan = plan(conv);
+    auto zPlan = plan(z);
+    auto tailPlan = plan(tail);
+    return GdnZSplit{*dims, std::move(conv), std::move(z), std::move(tail),
+                     std::move(convPlan), std::move(zPlan),
+                     std::move(tailPlan)};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+// Whether a chain commit of `lanes` lanes at `verifyStride` follows
+// z-split verifies: every GDN layer's input projection must take the split
+// (they share one shape, so the first layer's plans speak for all) — the
+// commit then reads the carved conv rows through verify_gdn_commit_split.
+[[nodiscard]] bool gdnZSplitCommitted(
+    const TargetModelWeights &weights, const TargetModelGeometry &geometry,
+    const ops::Linear &linear, const metal::MetalBackend &backend,
+    uint32_t lanes, uint32_t verifyStride) {
+  if (!tuning().gdnZSplit || !geometry.gdnLayers)
+    return false;
+  const ops::Projection *first = nullptr;
+  for (const TargetLayerWeights &layer : weights.layers) {
+    const auto *gdn = std::get_if<GdnMixerWeights>(&layer.mixer);
+    if (!gdn)
+      continue;
+    if (!gdnZSplitDims(geometry, gdn->inputProjection))
+      return false;
+    first = first ? first : &gdn->inputProjection;
+  }
+  if (!first)
+    return false;
+  const ops::LinearPlan inputPlan = linear.decodePlan(
+      *first, lanes, ops::LinearEpilogue::None, nullptr, verifyStride);
+  return gdnZSplitPlans(backend, geometry, *first, inputPlan)
+      .has_value();
+}
+
+} // namespace
+
 
 metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const GdnMixerWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
@@ -92,41 +220,86 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const GdnMixerW
   // pair's current/next swap alternates between the span cache's two slots).
   step.graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
-      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
+      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input(), false);
+  const ops::LinearPlan outputPlan =
+      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
+  const ops::GdnStateStrides state{
+      geometry_.stateLayout.convolutionLayerBytes(),
+      geometry_.stateLayout.recurrentLayerBytes(),
+      geometry_.stateLayout.convolutionBytes()};
+  ops::GdnDecodeBuffers gdn{b.gdnPacked[layer], mixer.convolutionWeights,
+                            b.currentGdnStates, b.nextGdnStates,
+                            b.gdnMixed[layer], mixer.decay, mixer.timeBias,
+                            b.gdnDecay[layer], b.gdnBeta[layer],
+                            mixer.mixerNorm, b.gdnHidden, b.linearScratch,
+                            b.gdnTape};
+  // RICHENGINE_GDN_ZSPLIT (chain verifies only): the input projection's
+  // columns carve into conv, z and tail GEMVs — the z dispatch sits between
+  // the recurrent scan and the gate apply so it overlaps the scan where
+  // RICHENGINE_SPAN_BARRIERS lets siblings run un-barriered. The packed
+  // buffer's carved regions are disjoint byte ranges of the layer's rows.
+  if (!step.tree) {
+    if (std::optional<GdnZSplit> split =
+            gdnZSplitPlans(backend_, geometry_,
+                           mixer.inputProjection, inputPlan)) {
+      const uint64_t rows = inputPlan.workload().rows;
+      const auto carve = [&](uint64_t first, uint64_t count) {
+        return backend_.view(b.gdnPacked[layer], first * 2, count * 2);
+      };
+      const metal::MetalBuffer convView =
+          carve(0, rows * split->dims.conv);
+      const metal::MetalBuffer zView =
+          carve(rows * split->dims.conv, rows * split->dims.z);
+      const metal::MetalBuffer tailView =
+          carve(rows * (split->dims.conv + split->dims.z),
+                rows * split->dims.tail);
+      gdn.packed = convView;
+      ops::PreparedInput prepared = normalized;
+      prepared = linear.add(
+          step.graph,
+          {.input = b.normalized, .output = convView,
+           .scratch = b.linearScratch, .prepared = prepared},
+          split->conv, split->convPlan);
+      prepared = linear.add(
+          step.graph,
+          {.input = b.normalized, .output = tailView,
+           .scratch = b.linearScratch, .prepared = prepared},
+          split->tail, split->tailPlan);
+      ops::GDN::addDecodeScan(
+          step.graph, gdn, tailView, geometry_.gdnShape(), step.lanes, layer,
+          state, mixer.outputHeadOrder, step.liveRows, step.rowCapacity,
+          step.tapeLanes);
+      prepared = linear.add(
+          step.graph,
+          {.input = b.normalized, .output = zView,
+           .scratch = b.linearScratch, .prepared = prepared},
+          split->z, split->zPlan);
+      const ops::PreparedInput hidden = ops::GDN::addDecodeGate(
+          step.graph, zView, gdn, geometry_.gdnShape(), step.lanes,
+          step.rowCapacity, mixer.outputHeadOrder, outputPlan.input());
+      linear.add(step.graph,
+                 {.input = b.gdnHidden, .output = b.gdnOutput,
+                  .residual = input, .scratch = b.linearScratch,
+                  .prepared = hidden},
+                 mixer.outputProjection, outputPlan);
+      step.graph.endBakedSpan();
+      return b.gdnOutput;
+    }
+  }
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked[layer], .scratch = b.linearScratch,
               .prepared = normalized},
              mixer.inputProjection, inputPlan);
-  const ops::LinearPlan outputPlan =
-      linear.decodePlan(mixer.outputProjection, step.planLanes, ops::LinearEpilogue::Residual, nullptr, step.rowCapacity);
   const ops::PreparedInput hidden =
       step.tree
           ? ops::GDN::addDecodeTree(
-                step.graph,
-                {b.gdnPacked[layer], mixer.convolutionWeights,
-                 b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
-                 mixer.decay, mixer.timeBias, b.gdnDecay[layer],
-                 b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
-                 b.linearScratch, b.gdnTape},
-                b.treeNodes, b.treeCounts, geometry_.gdnShape(), step.lanes,
-                layer,
-                {geometry_.stateLayout.convolutionLayerBytes(),
-                 geometry_.stateLayout.recurrentLayerBytes(),
-                 geometry_.stateLayout.convolutionBytes()},
+                step.graph, gdn, b.treeNodes, b.treeCounts,
+                geometry_.gdnShape(), step.lanes, layer, state,
                 mixer.outputHeadOrder, outputPlan.input())
           : ops::GDN::addDecode(
-                step.graph,
-                {b.gdnPacked[layer], mixer.convolutionWeights,
-                 b.currentGdnStates, b.nextGdnStates, b.gdnMixed[layer],
-                 mixer.decay, mixer.timeBias, b.gdnDecay[layer],
-                 b.gdnBeta[layer], mixer.mixerNorm, b.gdnHidden,
-                 b.linearScratch, b.gdnTape},
-                geometry_.gdnShape(), step.lanes, layer,
-                {geometry_.stateLayout.convolutionLayerBytes(),
-                 geometry_.stateLayout.recurrentLayerBytes(),
-                 geometry_.stateLayout.convolutionBytes()},
-                mixer.outputHeadOrder, outputPlan.input(), step.liveRows,
-                step.rowCapacity, step.tapeLanes);
+                step.graph, gdn, geometry_.gdnShape(), step.lanes, layer,
+                state, mixer.outputHeadOrder, outputPlan.input(),
+                step.liveRows, step.rowCapacity, step.tapeLanes);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,
               .prepared = hidden},
@@ -146,7 +319,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const LfmConvWe
   const ops::LinearPlan inputPlan = linear.decodePlan(mixer.inputProjection, step.planLanes, ops::LinearEpilogue::None, nullptr, step.rowCapacity);
   step.graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
-      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
+      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input(), false);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked[layer], .scratch = b.linearScratch,
               .prepared = normalized},
@@ -222,7 +395,9 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
       {geometry_.stateLayout.convolutionLayerBytes(),
        geometry_.stateLayout.recurrentLayerBytes(),
        geometry_.stateLayout.convolutionBytes()},
-      verifyStride);
+      verifyStride,
+      gdnZSplitCommitted(*weights_, geometry_, operators_.linear(), backend_,
+                         lanes, verifyStride));
   encoder_->commitState(graph, commit, lanes, verifyStride);
 }
 

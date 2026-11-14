@@ -21,10 +21,15 @@ struct MoeRouteParams {
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  // The affine shared-expert scalar gate: 0 when the shape has none, 1 when
+  // the scores tile folds it in as a 257th column parked at
+  // scores + rows * 256 for the select to read, 2 when the select re-dots
+  // the input against the gate planes (RICHENGINE_MOE_FOLDED_GATE_OFF).
+  uint32_t shared;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the shared expert, whose
 // id is `experts` and whose routing weight is the sigmoid of its scalar gate.
@@ -113,8 +118,8 @@ struct MoeRouteGroupParams {
   MoeGroupParams group;
 };
 
-static_assert(sizeof(MoeRouteGroupParams) == 44,
-              "MoE route-group parameters are 44 bytes on both sides");
+static_assert(sizeof(MoeRouteGroupParams) == 48,
+              "MoE route-group parameters are 48 bytes on both sides");
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp): the decode union cap keeps the
 // `budget` routed experts with the largest summed routing weight across the
@@ -159,12 +164,16 @@ struct MoeExpertParams {
   uint32_t output_size;
   uint32_t experts;
   uint32_t reserved0;
+  // Nonzero when the host swapped the dispatch grid's axes
+  // (RICHENGINE_MOE_TILE_MAJOR): group arrives as (tile, column block)
+  // instead of (column block, tile). Decode expert tiles only.
+  uint32_t tile_major;
   uint64_t expert_stride_bytes_0;
   uint64_t expert_stride_bytes_1;
 };
 
-static_assert(sizeof(MoeExpertParams) == 32,
-              "MoE expert parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeExpertParams) == 40,
+              "MoE expert parameters are 40 bytes on both sides");
 
 // A GGUF expert pass (ops/MoE.cpp): every routed expert of the projection
 // is one image segment of experts * output_size rows, expert e's planes
@@ -181,10 +190,14 @@ struct MoeGgufExpertParams {
   // dense decode tile's contiguous split. 1 when unpacked or when the
   // segments do not all take the packed path.
   uint32_t splits;
+  // Nonzero when the host swapped the dispatch grid's axes
+  // (RICHENGINE_MOE_TILE_MAJOR): the row index (tile * splits + split)
+  // arrives on group.x and the column block on group.y.
+  uint32_t tile_major;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 24,
-              "MoE GGUF expert parameters are 24 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 28,
+              "MoE GGUF expert parameters are 28 bytes on both sides");
 
 // The streamed GGUF expert pass (moe_expert_gguf_streamed_*): the routed
 // experts' weights are not resident — the tile's expert resolves through

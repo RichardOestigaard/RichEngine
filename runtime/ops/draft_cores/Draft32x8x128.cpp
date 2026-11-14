@@ -15,8 +15,6 @@ const char *draftCore32x8x128(std::string_view base) {
     return kDraftAttentionBf16Split.data();
   if (base == kDraftAttentionBf16Reduce)
     return kDraftAttentionBf16Reduce.data();
-  if (base == kDraftAttentionReorder)
-    return kDraftAttentionReorder.data();
   if (base == kDraftContextKvCommit)
     return kDraftContextKvCommit.data();
   if (base == kPrefillDraftContextKv)

@@ -283,12 +283,18 @@ void Cache::recordLookup(const CacheLookup &result) {
 
 PageTableView Cache::pageTable(uint64_t requestId) const {
   const Request &active = request(requestId);
-  return {active.pages, active.pageTableRevision, active.firstChangedPage};
+  if (!active.pagesSnapshot)
+    active.pagesSnapshot =
+        std::make_shared<const std::vector<uint32_t>>(active.pages);
+  return {std::span<const uint32_t>(*active.pagesSnapshot),
+          active.pagesSnapshot, active.pageTableRevision,
+          active.firstChangedPage};
 }
 
 void Cache::pagesChanged(Request &active, uint32_t first) noexcept {
   ++active.pageTableRevision;
   active.firstChangedPage = first;
+  active.pagesSnapshot.reset();
 }
 
 void Cache::publishCommittedBlocks(uint64_t requestId,

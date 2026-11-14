@@ -18,28 +18,35 @@ inline void draft_conv_phase(device const bfloat *input,
                              uint thread_index, uint rows) {
   constexpr uint ConvGroups = Hidden / 16;
   constexpr uint Dynamic = 4 * ConvGroups;
-  const uint element = group * 256 + thread_index;
-  if (element >= rows * Hidden)
+  constexpr uint ChannelVecs = Hidden / 4;
+  // Each thread owns one row's 4-channel vector: every tensor operand moves
+  // in 16-byte vectors, and a row's tap-1 input is the previous row's tap-0
+  // read, which adjacent threads' loads leave in L1.
+  const uint unit = group * 256 + thread_index;
+  const uint row = unit / ChannelVecs;
+  const uint cv = unit % ChannelVecs;
+  if (row >= rows)
     return;
-  uint row = element / Hidden;
-  uint channel = element % Hidden;
-  uint conv_group = channel / 16;
-  uint kind = finish ? 1 : 0;
-  float value =
-      float(input[element]) *
-      (float(base[(kind * 2) * Hidden + channel]) +
-       float(dynamic[row * Dynamic + (kind * 2) * ConvGroups + conv_group]));
-  if (row > 0) {
-    value +=
-        float(input[(row - 1) * Hidden + channel]) *
-        (float(base[(kind * 2 + 1) * Hidden + channel]) +
-         float(
-             dynamic[row * Dynamic + (kind * 2 + 1) * ConvGroups +
-                     conv_group]));
-  }
+  const uint conv_group = cv / 4;
+  const uint kind = finish ? 1 : 0;
+  device const bfloat4 *input4 =
+      reinterpret_cast<device const bfloat4 *>(input);
+  device const bfloat4 *base4 =
+      reinterpret_cast<device const bfloat4 *>(base);
+  device const bfloat4 *residual4 =
+      reinterpret_cast<device const bfloat4 *>(residual);
+  device bfloat4 *output4 = reinterpret_cast<device bfloat4 *>(output);
+  device const bfloat *dyn = dynamic + row * Dynamic + kind * 2 * ConvGroups;
+  float4 value = float4(input4[row * ChannelVecs + cv]) *
+                 (float4(base4[(kind * 2) * ChannelVecs + cv]) +
+                  float4(float(dyn[conv_group])));
+  if (row > 0)
+    value += float4(input4[(row - 1) * ChannelVecs + cv]) *
+             (float4(base4[(kind * 2 + 1) * ChannelVecs + cv]) +
+              float4(float(dyn[ConvGroups + conv_group])));
   if (finish)
-    value += float(residual[element]);
-  output[element] = bfloat(value);
+    value += float4(residual4[row * ChannelVecs + cv]);
+  output4[row * ChannelVecs + cv] = bfloat4(value);
 }
 
 template <uint QHeads, uint KVHeads, uint HeadDim, bool Interleaved, bool E5>
@@ -88,7 +95,7 @@ inline void draft_qkv_prepare_phase(
                             lane, simd_group, E5 ? 1e-5f : kRmsEpsilon);
     if (thread_index < HeadDim)
       head[thread_index] = bfloat(value * inverse * float(weight[thread_index]));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if constexpr (Interleaved) {
       if (thread_index < HeadDim / 2) {
         float first = float(head[2 * thread_index]);
@@ -108,7 +115,7 @@ inline void draft_qkv_prepare_phase(
       destination[thread_index + HeadDim / 2] =
           bfloat(second * cosine + first * sine);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 
@@ -244,7 +251,7 @@ inline void draft_attention_split_phase(
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
   for (uint tile = split; tile < live_tiles; tile += Splits) {
     uint slot = (tile < wrapped ? tile : resume + tile - wrapped) * N;
@@ -267,7 +274,7 @@ inline void draft_attention_split_phase(
       }
     }
     scores.store(pt.slice<N, M>(0, 0));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     for (ushort batch = 0; batch < M; batch += 8) {
       ushort matrix_row = batch + simd_group;
@@ -311,7 +318,7 @@ inline void draft_attention_split_phase(
         score_storage[matrix_row * N + column] = local_scores[i];
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto vt = tensor(values + slot, dextents<int, 2>{N, D},
                      array<int, 2>{1, int(value_stride)});
@@ -336,7 +343,7 @@ inline void draft_attention_split_phase(
       auto index = running.get_multidimensional_index(i);
       running[i] = running[i] * previous_scale[index[1]] + partial_output[i];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   if (split + 1 == Splits) {
@@ -376,7 +383,7 @@ inline void draft_attention_split_phase(
       }
     }
     current.store(current_scores.slice<CurrentN, M>(0, 0));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     for (ushort batch = 0; batch < M; batch += 8) {
       ushort matrix_row = batch + simd_group;
@@ -403,7 +410,7 @@ inline void draft_attention_split_phase(
             lane < CurrentN ? probability : 0.0f;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto current_probabilities =
         tensor(score_storage, dextents<int, 2>{CurrentValueTile, M},
@@ -417,7 +424,7 @@ inline void draft_attention_split_phase(
                                   ? query_values[dimension * rows + token]
                                   : bfloat(0.0f);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     auto current_vt =
         tensor(current_values, dextents<int, 2>{CurrentValueTile, D},
                array<int, 2>{1, int(CurrentValueTile)});
@@ -433,7 +440,7 @@ inline void draft_attention_split_phase(
       auto index = running.get_multidimensional_index(i);
       running[i] = running[i] * previous_scale[index[1]] + current_output[i];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   auto accumulator =
@@ -447,14 +454,19 @@ inline void draft_attention_split_phase(
 
 // Fixed-order combine of one (lane, head) pair's split partials into the
 // normalized bf16 rows, so the result does not depend on which split
-// finished first or on how many lanes ran.
-template <uint M, uint D>
+// finished first or on how many lanes ran. The write lands in the
+// [row][head][dim] layout the output projection reads — the reorder pass
+// this output used to feed is folded into the same address math, since a
+// row's Chunk elements are contiguous in either layout.
+template <uint M, uint D, uint QHeads>
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
+                                         uint group, uint rows,
                                          uint thread_index) {
   constexpr uint Stride = M * D + 2 * M;
   const uint Splits = kDraftAttentionSplits;
   constexpr uint Chunk = D / 8;
+  constexpr uint Attention = QHeads * D;
   for (uint row = thread_index / 8; row < M; row += 32) {
     uint dim = (thread_index % 8) * Chunk;
     float maximum = -INFINITY;
@@ -476,24 +488,17 @@ inline void draft_attention_reduce_phase(device const float *partials,
       for (uint i = 0; i < Chunk; ++i)
         accumulated[i] += scale * partial[row * D + dim + i];
     }
+    // The tile's grouped rows are consecutive (head, query) pairs of the
+    // prepare's [head][row][dim] layout; the group's base is a whole number
+    // of query heads.
+    const uint grouped = group * M + row;
+    const uint head = grouped / rows;
+    const uint query_row = grouped - head * rows;
+    device bfloat *destination =
+        output + query_row * Attention + head * D + dim;
     for (uint i = 0; i < Chunk; ++i)
-      output[row * D + dim + i] = bfloat(accumulated[i] / total);
+      destination[i] = bfloat(accumulated[i] / total);
   }
-}
-
-template <uint QHeads, uint HeadDim>
-inline void draft_attention_reorder_phase(device const bfloat *grouped,
-                                          device bfloat *row_major, uint group,
-                                          uint thread_index, uint rows) {
-  const uint element = group * 256 + thread_index;
-  if (element >= rows * QHeads * HeadDim)
-    return;
-  uint row = element / (QHeads * HeadDim);
-  uint remainder = element % (QHeads * HeadDim);
-  uint query_head = remainder / HeadDim;
-  uint dim = remainder % HeadDim;
-  uint grouped_index = (query_head * rows + row) * HeadDim + dim;
-  row_major[element] = grouped[grouped_index];
 }
 
 template <uint Hidden>
@@ -778,10 +783,9 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
                                              params.lanes * Rows * Attention) +
       (batch * KVHeads * RowTiles + group.x) * kDraftAttentionSplits *
           PartialFloats;
-  draft_attention_reduce_phase<M, HeadDim>(
-      partials,
-      queries + batch * Rows * Attention + group.x * M * HeadDim,
-      thread_index);
+  draft_attention_reduce_phase<M, HeadDim, M / 8 * KVHeads>(
+      partials, queries + batch * Rows * Attention, group.x,
+      params.query_rows, thread_index);
 }
 
 #define DRAFT_REDUCE_KERNEL(NAME, M, KV, HD)                                 \
@@ -798,59 +802,6 @@ DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce, 32, 8, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q16k2, 64, 2, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q32k8d64i, 32, 8, 64)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q8k2d256, 32, 2, 256)
-
-template <uint QHeads, uint HeadDim>
-inline void draft_attention_reorder_impl(device const bfloat *grouped,
-                                         device bfloat *row_major,
-                                         uint query_rows, uint2 group,
-                                         uint thread_index) {
-  const ulong Rows = query_rows;
-  constexpr ulong Attention = ulong(QHeads) * HeadDim;
-  uint batch = group.y;
-  draft_attention_reorder_phase<QHeads, HeadDim>(
-      grouped + batch * Rows * Attention, row_major + batch * Rows * Attention,
-      group.x, thread_index, query_rows);
-}
-
-kernel void draft_attention_reorder(
-    device const bfloat *grouped [[buffer(0)]],
-    device bfloat *row_major [[buffer(1)]],
-    constant uint &query_rows [[buffer(2)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<32, 128>(grouped, row_major, query_rows, group,
-                                        thread_index);
-}
-
-kernel void draft_attention_reorder_q16k2(
-    device const bfloat *grouped [[buffer(0)]],
-    device bfloat *row_major [[buffer(1)]],
-    constant uint &query_rows [[buffer(2)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<16, 128>(grouped, row_major, query_rows, group,
-                                        thread_index);
-}
-
-kernel void draft_attention_reorder_q32k8d64i(
-    device const bfloat *grouped [[buffer(0)]],
-    device bfloat *row_major [[buffer(1)]],
-    constant uint &query_rows [[buffer(2)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<32, 64>(grouped, row_major, query_rows, group,
-                                       thread_index);
-}
-
-kernel void draft_attention_reorder_q8k2d256(
-    device const bfloat *grouped [[buffer(0)]],
-    device bfloat *row_major [[buffer(1)]],
-    constant uint &query_rows [[buffer(2)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  draft_attention_reorder_impl<8, 256>(grouped, row_major, query_rows, group,
-                                       thread_index);
-}
 
 // The plain transformer draft's residual adds, which the DFlash2 path folds
 // into its convolutions: output = input + residual over one lane's rows.

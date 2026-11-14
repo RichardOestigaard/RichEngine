@@ -257,7 +257,8 @@ void Sampling::addSelection(metal::CommandGraph &graph,
       // The fused head wrote per-(row, column tile) argmax partials and
       // skipped the logits entirely; reduce them directly. The tile width is
       // the affine head's 128 (fusedHead 1) or the GGUF tile's 64 (2).
-      graph.add(std::string(fusedHead == 2   ? kDecodeHeadArgmaxReduceTilesGguf
+      graph.add(std::string(fusedHead == 2 || fusedHead == 4
+                                ? kDecodeHeadArgmaxReduceTilesGguf
                               : fusedHead == 3 ? kDecodeHeadArgmaxReduceTilesT256
                                                : kDecodeHeadArgmaxReduceTiles),
                 {buffers.headArgmaxValues, buffers.headArgmaxIndices,

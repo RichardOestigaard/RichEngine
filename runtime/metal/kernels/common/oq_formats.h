@@ -1,7 +1,8 @@
 #pragma once
 
 // The oQ (oMLX) affine formats, the private types of metal/abi/QuantFormat.h
-// from GGUF_FMT_AF5 on: QuantLinear, value = s * code + bias, meta one bf16
+// GGUF_FMT_AF2 through GGUF_FMT_AF8G128 and GGUF_FMT_AF2..AF3G128:
+// QuantLinear, value = s * code + bias, meta one bf16
 // scale and bias per unit covering MetaGroupsN groups of 32, as AF4's. Their
 // plane0 packs a group differently from AF4's pair-interleaved words: the
 // slots' codes as one contiguous little-endian bitstream, slot s at bits
@@ -51,3 +52,7 @@ typedef FmtOq<4, 4, GGUF_FMT_AF4G128> FmtAF4G128;
 typedef FmtOq<5, 4, GGUF_FMT_AF5G128> FmtAF5G128;
 typedef FmtOq<6, 4, GGUF_FMT_AF6G128> FmtAF6G128;
 typedef FmtOq<8, 4, GGUF_FMT_AF8G128> FmtAF8G128;
+typedef FmtOq<2, 2, GGUF_FMT_AF2> FmtAF2;
+typedef FmtOq<3, 2, GGUF_FMT_AF3> FmtAF3;
+typedef FmtOq<2, 4, GGUF_FMT_AF2G128> FmtAF2G128;
+typedef FmtOq<3, 4, GGUF_FMT_AF3G128> FmtAF3G128;

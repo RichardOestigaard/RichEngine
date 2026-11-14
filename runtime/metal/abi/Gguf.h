@@ -109,10 +109,11 @@ struct GgufPrefillInt8Params {
   uint32_t column_tiles;      // the segment's tiles of GGUF_TILE_COLUMNS columns
 };
 static_assert(sizeof(GgufPrefillInt8Params) == 28, "int8 prefill parameters are 28 bytes on both sides");
-// The formats whose segments run the int8 prefill kernels: the whole private
-// AF id range but AF4P, whose packed-manifest plane order differs.
+// The formats whose segments run the int8 prefill kernels: the private AF
+// id ranges but AF4P, whose packed-manifest plane order differs.
 inline constexpr bool gguf_prefill_int8_format(uint32_t format) {
-  return format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128;
+  return (format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128) ||
+         (format >= GGUF_FMT_AF2 && format <= GGUF_FMT_AF3G128);
 }
 
 // Decode tiles of both families (the register tile on Apple9, the staged
@@ -180,9 +181,11 @@ inline constexpr bool gguf_embedding_format(uint32_t format) {
          format == GGUF_FMT_IQ4XS || format == GGUF_FMT_IQ4NL || format == GGUF_FMT_IQ3S || format == GGUF_FMT_PQ20;
 }
 // The oQ (oMLX) formats whose native token rows the gathers read
-// (gguf_embed_af*): the whole private AF id range.
+// (gguf_embed_af*): the whole private AF id range but AF4P's packed
+// manifest, which is not a token-table layout.
 inline constexpr bool oq_embedding_format(uint32_t format) {
-  return format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128;
+  return (format >= GGUF_FMT_AF4 && format <= GGUF_FMT_AF8G128) || format == GGUF_FMT_AF2 ||
+         format == GGUF_FMT_AF3 || format == GGUF_FMT_AF2G128 || format == GGUF_FMT_AF3G128;
 }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights

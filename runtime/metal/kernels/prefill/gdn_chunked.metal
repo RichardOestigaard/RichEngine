@@ -125,7 +125,7 @@ void gdn_chunked_prep_body(
     }
     psuf[C] = exp(acc); // D
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
   auto k_view =
       tensor(k + ulong(base) * kstride + key_head * GdnChunkHeadDim,
@@ -373,7 +373,7 @@ void gdn_chunked_scan_body(
         running[index] = v0 * decay_all;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto k0 = kt_view(base).template slice<GdnChunkHeadDim, C>(0, 0);
     auto q0 = qt_view(base).template slice<GdnChunkHeadDim, C>(0, 0);
@@ -395,7 +395,7 @@ void gdn_chunked_scan_body(
                          array<int, 2>{1, Rows})
                         .template slice<Rows, C>(0, 0);
     fct.store(fslice);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     // R = V - diag(Lam) F, transposed [v-row][token], padding rows zeroed.
     for (uint e = tid; e < C * Rows; e += GdnChunkThreads) {
       const uint r = e / C, i = e % C;
@@ -407,7 +407,7 @@ void gdn_chunked_scan_body(
                        lam[i] * fmat[i * Rows + r])
               : bfloat(0.0f);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     // O = diag(Lam) (Q S_0) + W R.
     fmul.run(q0, shi, oct);
@@ -427,7 +427,7 @@ void gdn_chunked_scan_body(
                            array<int, 2>{1, Rows})
                           .template slice<Rows, C>(0, 0);
       oct.store(oslice);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       for (uint e = tid; e < count * Rows; e += GdnChunkThreads) {
         const uint i = e / Rows, vr = e % Rows;
         output[(ulong(base + i) * params.value_heads + head) *
@@ -452,7 +452,7 @@ void gdn_chunked_scan_body(
 
     // S += R' . X.
     sacc.run(rbfc, x0c, running);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   running.store(sout_view.template slice<GdnChunkHeadDim, Rows>(0, 0));

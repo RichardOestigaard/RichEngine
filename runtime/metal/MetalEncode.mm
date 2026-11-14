@@ -177,6 +177,11 @@ uint32_t cooperativeTensorThreads(std::string_view entry) noexcept {
 }
 
 bool usesSimdMultipleThreads(std::string_view entry) noexcept {
+    static const bool all = [] {
+        const char *value = std::getenv("RICHENGINE_TG_SIMD_ALL");
+        return value && value[0] == '1';
+    }();
+    if (all) return true;
     if (cooperativeTensorThreads(entry) != 0) return true;
     return entry.starts_with("decode_linear_q4_") ||
            entry.starts_with("prefill_linear_q4_") ||
@@ -1039,11 +1044,14 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
         }
     }
 
-// The escape hatch: GPU-encoded spans stay opt-in and internal
-// (RICHENGINE_GPU_SPANS only — never a tuning-table default) until the
-// MTL_SHADER_VALIDATION anomaly in ISSUES.md is resolved.
+// GPU-encoded spans cover the opt-in RICHENGINE_GPU_SPANS runs and, by
+// default, GGUF decode projections (tuning().ggufDecodeGpuSpans); both stay
+// disabled under MTL_SHADER_VALIDATION — gpuSpan dispatches then encode
+// directly, as a suspension would have left them.
     bool MetalBackend::Impl::gpuSpansEnabled() noexcept {
-        if (tuning().gpuSpans && getenv("MTL_SHADER_VALIDATION")) {
+        const bool enabled =
+            tuning().gpuSpans || tuning().ggufDecodeGpuSpans;
+        if (enabled && getenv("MTL_SHADER_VALIDATION")) {
             static bool warned = false;
             if (!warned) {
                 warned = true;
@@ -1055,7 +1063,7 @@ void MetalBackend::Impl::encodeBank(const BakedSpan &span, uint32_t bank,
             }
             return false;
         }
-        return tuning().gpuSpans;
+        return enabled;
     }
 
 // Identity of a run against a gpu span's snapshot; identical to

@@ -24,11 +24,13 @@ the installer's selection link). Scenarios:
   10K cache hit; reports TTFT.
 - `short`: cold prefills of 481–2,017 tokens.
 - `context` / `exact`: long-context and cache-exactness checks.
-- `longdecode`: warms 32K/64K/128K synthetic prompts into the cache, then
-  decodes 64 tokens at each depth on one lane; reports per-length cold
-  prefill tok/s, decode wall/GPU tok/s and draft acceptance under
-  `long_decode` in the report. Lengths the context budget cannot hold are
-  skipped.
+- `longdecode`: warms 32K/64K/128K prompts into the cache, then decodes
+  64 tokens at each depth on one lane; reports per-length cold prefill
+  tok/s, decode wall/GPU tok/s and draft acceptance under `long_decode`
+  in the report. Lengths the context budget cannot hold are skipped.
+  Prompts are synthetic filler ending in the chat-formatted decode
+  prompt — a bare synthetic prompt can drive a model to EOS inside the
+  64-token window (observed on Qwen3.8-27B at 64K).
 
 Options: `--samples N` (default 1), `--progress FILE` (JSONL progress),
 `--max-context TOKENS` (as serve's), `--kv-format FORMAT` and

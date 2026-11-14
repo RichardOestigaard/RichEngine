@@ -86,10 +86,12 @@ inline void richengine_attention_page_softmax_fp8(
     score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
   }
   float local_max = -INFINITY;
+  bool admitted[TokensPerLane];
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint t = token + j;
-    score[j] = t >= window_begin && t < limit ? score[j] : -INFINITY;
+    admitted[j] = t >= window_begin && t < limit;
+    score[j] = admitted[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -100,9 +102,8 @@ inline void richengine_attention_page_softmax_fp8(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    const uint t = token + j;
     probability[j] =
-        t >= window_begin && t < limit ? fast::exp(score[j] - next_max) : 0.0f;
+        admitted[j] ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -120,14 +121,14 @@ inline void richengine_attention_page_softmax_fp8(
   // Masked tokens stay exactly zero whatever their stored value scale holds.
   const float4 low_scales = value_scales[vector];
   const float4 high_scales = value_scales[vector + 1];
-  const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                   token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                   token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                   token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-  const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                    token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                    token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                    token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+  const float4 low(score[0] > -INFINITY ? probability[0] * low_scales.x : 0.0f,
+                   score[1] > -INFINITY ? probability[1] * low_scales.y : 0.0f,
+                   score[2] > -INFINITY ? probability[2] * low_scales.z : 0.0f,
+                   score[3] > -INFINITY ? probability[3] * low_scales.w : 0.0f);
+  const float4 high(score[4] > -INFINITY ? probability[4] * high_scales.x : 0.0f,
+                    score[5] > -INFINITY ? probability[5] * high_scales.y : 0.0f,
+                    score[6] > -INFINITY ? probability[6] * high_scales.z : 0.0f,
+                    score[7] > -INFINITY ? probability[7] * high_scales.w : 0.0f);
   threadgroup half4 *probabilities4 = reinterpret_cast<threadgroup half4 *>(
       probabilities + fused_row * N + column);
   probabilities4[0] = half4(low);

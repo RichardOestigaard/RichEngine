@@ -121,7 +121,7 @@ class LocalTest(unittest.TestCase):
         # lists with its reason instead of being skipped silently.
         mlx_dir(
             self.lmstudio / "a" / "too-low",
-            moe_config({"bits": 3, "group_size": 64}),
+            moe_config({"bits": 7, "group_size": 64}),
         )
         mlx_dir(
             self.lmstudio / "a" / "bad-override",
@@ -133,7 +133,7 @@ class LocalTest(unittest.TestCase):
             {"text_config": unknown, "quantization": AFFINE},
         )
         found = self.candidates()
-        self.assertIn("3 bits/group-64", found["a/too-low"].reason)
+        self.assertIn("7 bits/group-64", found["a/too-low"].reason)
         self.assertIn("model.x", found["a/bad-override"].reason)
         self.assertIn("architecture", found["a/alien"].reason)
 

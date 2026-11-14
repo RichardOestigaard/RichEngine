@@ -48,6 +48,13 @@ namespace richengine::model {
   layout.hiddenCaptureLayers = {5, 19, 33, 47, 61};
   layout.captureLayerCount = 5;
   layout.attentionCore = kv::Core::Kv4Group6;
+  // DuoAttention on by default (dev/tools/duoattention.md): the probe's
+  // calibrated mask streams the 16 lowest-old-mass KV heads of the 16
+  // full-attention layers to sink 128 + window 1024 — measured +7-12%
+  // prefill at 32-131K context with NIAH retrieval intact. int8/int4 KV
+  // only; other formats run dense. RICHENGINE_DUO_OVERRIDE replaces the
+  // policy and "0,0,0" restores dense attention.
+  layout.duoAttention = {128, 1024, 0x4000000000bfa317ULL};
   layout.intermediateSize = 17408;
   // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp).
   layout.gdnCore = ops::GdnCore::Value48;

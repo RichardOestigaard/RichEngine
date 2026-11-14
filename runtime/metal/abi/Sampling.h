@@ -60,6 +60,19 @@ struct HeadArgmaxParams {
 static_assert(sizeof(HeadArgmaxParams) == 48,
               "Head argmax parameters are 48 bytes on both sides");
 
+// The K-split affine head's parameters: the ordinary head fields plus the
+// quant-group range this dispatch covers. The first split writes fp32
+// partial logits to the logits buffer; the second adds them, argmaxes and
+// writes the 64-column partials the GGUF reducer consumes.
+struct HeadArgmaxSplitParams {
+  HeadArgmaxParams head;
+  uint32_t first_group;
+  uint32_t end_group;
+};
+
+static_assert(sizeof(HeadArgmaxSplitParams) == 56,
+              "Head argmax split parameters are 56 bytes on both sides");
+
 struct TargetSamplingParams {
   uint32_t vocabulary;
   uint32_t mask_words;

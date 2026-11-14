@@ -20,7 +20,7 @@ inline void rotation_butterflies(float4 v, threadgroup float *values, uint tid) 
     v = (tid & stride) ? peer - v : v + peer;
   }
   for (uint i = 0; i < 4; ++i) values[tid + i * GGUF_ROTATION_THREADS] = v[i];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint stride = 32; stride < GGUF_ROTATION_BLOCK; stride *= 2) {
     for (uint pair = tid; pair < GGUF_ROTATION_BLOCK / 2; pair += GGUF_ROTATION_THREADS) {
       const uint a = (pair / stride) * (2 * stride) + pair % stride;
@@ -28,7 +28,7 @@ inline void rotation_butterflies(float4 v, threadgroup float *values, uint tid) 
       values[a] = x + y;
       values[a + stride] = x - y;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 

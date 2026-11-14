@@ -487,6 +487,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::unique_ptr<AnePredictor> aneMedusa_;
   std::unique_ptr<AnePredictor> anePredraft_;
   MetalBuffer aneLeafTokens_;  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS]
+  MetalBuffer ngramMixTokens_; // staged chains for the per-lane mix
   MetalBuffer aneFlag_;        // one u32: the medusa serial last published
   // Three u32s the mask-grid kernel fills under RICHENGINE_GPU_DECODE_GRID:
   // the DFA mask pass's MTLDispatchThreadgroupsIndirectArguments.
@@ -593,6 +594,25 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     const uint32_t ngramCorpusMargin_ = modelPolicy().ngramCorpusMargin;
     const bool ngramCorpusSessionGate_ =
         modelPolicy().ngramCorpusSessionGate;
+    // In-flight requests append their committed stream to a live corpus doc
+    // concurrent lanes can see (RICHENGINE_NGRAM_CORPUS_LIVE).
+    const bool ngramCorpusLive_ = modelPolicy().ngramCorpusLive;
+    // Per-lane mixing behind the batch gate (RICHENGINE_NGRAM_MIX) and the
+    // draft forward's share of a drafted step (RICHENGINE_NGRAM_DRAFT_COST,
+    // ρ): displacement clears the mixed total discounted by ρ because the
+    // skipped draft pass refunds its cost.
+    const bool ngramMix_ = modelPolicy().ngramMix;
+    const double ngramDraftCost_ = modelPolicy().ngramDraftCost;
+    // Whether a displaced drafted batch may emit the n-gram comb tree
+    // (RICHENGINE_NGRAM_TREE_DRAFTED).
+    const bool ngramTreeDrafted_ = modelPolicy().ngramTreeDrafted;
+    // Armed by applyNgramPredraft: lanes whose n-gram score beat the
+    // draft's EWMA while the batch stayed drafted. applyNgramMix consumes
+    // and the per-cycle reset in the decode path clears.
+    uint32_t mixMask_ = 0;
+    // The mixMask_ lanes whose chain came from the corpus — finalizeDecode
+    // credits their acceptance to corpusAcceptedAvg.
+    uint32_t mixCorpusMask_ = 0;
     ngram::Corpus ngramCorpusDocs_;
     // Whether a lane may consult the corpus this step. Arming happens at
     // admission (seedNgramHistory) and through the starvation probe in
@@ -2117,6 +2137,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // table logic.
   void seedNgramHistory(Request &entry, std::span<const uint32_t> prompt);
   void appendNgramTokens(Request &entry, std::span<const uint32_t> tokens);
+  // Drops the request's in-flight corpus doc (suspend).
+  void removeNgramLiveDoc(const Request &entry);
   // A finishing request's committed stream joins the cross-request corpus:
   // the emitted span, or the whole stream under RICHENGINE_NGRAM_CORPUS_ALL.
   void noteNgramCorpus(const Request &entry);
@@ -2127,7 +2149,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after
   // that its observed EWMA speaks.
-  double ngramLaneScore(const Request &entry, bool found) const;
+  double ngramLaneScore(const Request &entry, bool found,
+                        bool drafted) const;
   // The learning-free predraft: each lane's chain comes from the followers
   // of its closing 3-gram's last earlier occurrence; a lane without a match
   // repeats its anchor (a wrong guess only wastes its verify rows). The
@@ -2139,6 +2162,24 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // and ngram_.predraftedTree_ reports whether the batch left as a tree.
   bool applyNgramPredraft(std::span<Request *const> entries,
                           uint32_t width, bool emitTree);
+  // Per-lane mix behind applyNgramPredraft (RICHENGINE_NGRAM_MIX): when the
+  // batch stayed drafted, lanes whose n-gram score beat the draft EWMA get
+  // their ProposedTokens rows overwritten with the staged n-gram chain —
+  // the draft forward already ran, so the better proposal set is free and
+  // verify stays authoritative over whichever rows lose. mixMask_ is armed
+  // only on steps applyNgramPredraft evaluated.
+  void applyNgramMix(CommandGraph &graph, std::span<Request *const> entries,
+                     uint32_t width);
+  // The lazily-allocated staged n-gram chains mix lanes copy from:
+  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS] tokens, host-filled in
+  // applyNgramPredraft the same step it is consumed.
+  [[nodiscard]] const MetalBuffer &ngramMixTokens() {
+    if (!ngramMixTokens_)
+      ngramMixTokens_ = backend.allocateBuffer(
+          kLaneCount * RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
+          BufferStorage::Shared, "ngram-mix");
+    return ngramMixTokens_;
+  }
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,

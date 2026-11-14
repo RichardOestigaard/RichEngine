@@ -125,7 +125,8 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       break;
     }
     case GGUF_FMT_AF5: case GGUF_FMT_AF6: case GGUF_FMT_AF8:
-    case GGUF_FMT_AF4G128: case GGUF_FMT_AF5G128: case GGUF_FMT_AF6G128: case GGUF_FMT_AF8G128: {
+    case GGUF_FMT_AF4G128: case GGUF_FMT_AF5G128: case GGUF_FMT_AF6G128: case GGUF_FMT_AF8G128:
+    case GGUF_FMT_AF2: case GGUF_FMT_AF3: case GGUF_FMT_AF2G128: case GGUF_FMT_AF3G128: {
       // oQ affine: the block's element-order bitstream of block_elements*bits/8 bytes, then the meta unit.
       const uint obits = f.plane0_bytes * 8 / 32;
       device const uchar *qs = blk + j * 4 * obits;

@@ -356,6 +356,9 @@ struct MoeConfig final {
   // Decode plans only: the union cap moe_route_cap applies (serve-native's
   // --moe-union); 0 keeps every selected route.
   uint32_t unionCap = 0;
+  // Decode plans only: route through the 16x64 score tile instead of the
+  // 8x32 tile when the 32-row tile would not already be selected.
+  bool routeM16 = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

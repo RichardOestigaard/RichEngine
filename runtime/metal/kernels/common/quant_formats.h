@@ -60,7 +60,7 @@ template <class F, class T>
 inline void quant_pair_table(threadgroup T *table, uint thread_index, uint threads) {
   if constexpr (F::Kind == QuantCodebook && !F::Native) {
     for (uint i = thread_index; i < kQuantPairTableEntries; i += threads) table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 
@@ -538,7 +538,7 @@ struct FmtPQ20 {
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
 
-// The oQ (oMLX) formats AF5..AF8G128: one FmtOq template, defined here while
+// The oQ (oMLX) formats AF2..AF8G128: one FmtOq template, defined here while
 // the QUANT_FORMAT macro stands.
 #include "metal/kernels/common/oq_formats.h"
 
@@ -551,6 +551,7 @@ struct FmtPQ20 {
   X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
   X(FmtAF4, af4) X(FmtAF5, af5) X(FmtAF6, af6) X(FmtAF8, af8)                                                     \
   X(FmtAF4G128, af4g128) X(FmtAF5G128, af5g128) X(FmtAF6G128, af6g128) X(FmtAF8G128, af8g128)      \
+  X(FmtAF2, af2) X(FmtAF3, af3) X(FmtAF2G128, af2g128) X(FmtAF3G128, af3g128)                    \
   X(FmtAF4P, af4p)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick

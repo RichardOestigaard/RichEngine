@@ -74,7 +74,7 @@ inline void full_qkv_storage_phase(
   } else {
     // Keep the callers' barrier count identical either way: no reduction
     // runs without norms, so no barrier is needed before the rope read.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   normalized[thread_index] = bfloat(element * inverse * scale);
   if (!query) {
@@ -101,7 +101,7 @@ inline void full_qkv_storage_phase(
       chunk_values[value_offset] = source[KWidth + thread_index];
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   constexpr uint partner =
       ProportionalRope ? HeadDim / 2 : RotaryPairs;
   if (thread_index < RotaryPairs) {

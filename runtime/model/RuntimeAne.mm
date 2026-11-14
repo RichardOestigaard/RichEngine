@@ -1,18 +1,43 @@
 #include "model/RuntimeImpl.hpp"
 #include "AwakeClock.hpp"
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define RICHENGINE_NEON 1
+#endif
+
 namespace richengine::model {
 
   // bf16 rows (the arena's hidden storage) to the fp16 the predictor
   // contracts name: a bf16 is the top half of a float's bits.
   void Runtime::Impl::bf16ToFp16Row(const uint16_t *source, _Float16 *target,
                             uint32_t count) {
+#ifdef RICHENGINE_NEON
+    uint32_t index = 0;
+    for (; index + 8 <= count; index += 8) {
+      const uint16x8_t packed = vld1q_u16(source + index);
+      const uint32x4_t lo =
+          vshlq_n_u32(vmovl_u16(vget_low_u16(packed)), 16);
+      const uint32x4_t hi =
+          vshlq_n_u32(vmovl_u16(vget_high_u16(packed)), 16);
+      const float16x4_t flo = vcvt_f16_f32(vreinterpretq_f32_u32(lo));
+      const float16x4_t fhi = vcvt_f16_f32(vreinterpretq_f32_u32(hi));
+      vst1q_f16(reinterpret_cast<float16_t *>(target + index), vcombine_f16(flo, fhi));
+    }
+    for (; index < count; ++index) {
+      const uint32_t bits = uint32_t{source[index]} << 16;
+      float value;
+      std::memcpy(&value, &bits, sizeof(value));
+      target[index] = static_cast<_Float16>(value);
+    }
+#else
     for (uint32_t index = 0; index < count; ++index) {
       const uint32_t bits = uint32_t{source[index]} << 16;
       float value;
       std::memcpy(&value, &bits, sizeof(value));
       target[index] = static_cast<_Float16>(value);
     }
+#endif
   }
 
   // Feeds the predictors the state this batch just committed: the medusa

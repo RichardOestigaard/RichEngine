@@ -1364,7 +1364,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     item.logicalPosition = position;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
-    item.pageTable.assign(pageTable.pages.begin(), pageTable.pages.end());
+    item.pageTable = pageTable.pages;
+    item.pageTableOwner = pageTable.owner;
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
     item.requestTokens = active.exactTokens;
@@ -1585,7 +1586,8 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
     item.logicalPosition = position;
     item.tokenCount = scheduled.tokenCount;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
-    item.pageTable.assign(pageTable.pages.begin(), pageTable.pages.end());
+    item.pageTable = pageTable.pages;
+    item.pageTableOwner = pageTable.owner;
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
     items.push_back(std::move(item));

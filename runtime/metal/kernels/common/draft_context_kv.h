@@ -38,7 +38,7 @@ inline void draft_context_kv_phase(
         bfloat(element * inverse * float(k_norm[thread_index]));
     value[ulong(thread_index) * Window] = source[KWidth + thread_index];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if constexpr (Interleaved) {
     if (thread_index < HeadDim / 2) {
       float first = float(normalized[2 * thread_index]);

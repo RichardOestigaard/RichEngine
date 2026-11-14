@@ -60,8 +60,10 @@ M5_CXXFLAGS := $(if $(findstring Apple M5,$(HOST_CPU_BRAND)),-mcpu=apple-m5 -flt
 PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 # gguf_prefill_int8.metal's int8 cooperative tensors compile under metal4.0
-# only: metal4.1's cooperative_tensor rules reject the int32 destination
-# layout MPP generates for them (upstream 1.6.1 built them at metal4.0).
+# only: metal4.1 rejects get_destination_cooperative_tensor for ANY
+# cooperative-tensor operands (retested on the macOS 27.2 SDK / Xcode 27.2;
+# tensor-operand int8 matmuls still compile). The kernel hand-fills its
+# fragments, so it cannot take the tensor-operand route without a rewrite.
 METAL40_FLAGS := $(subst metal4.1,metal4.0,$(PROD_METALFLAGS))
 ENGINE_CXXFLAGS := -std=c++20 -O3 $(M5_CXXFLAGS) -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)

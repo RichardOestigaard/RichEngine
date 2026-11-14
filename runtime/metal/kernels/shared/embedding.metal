@@ -273,6 +273,10 @@ using GgufEmbedAF4G128 = GgufEmbedOq<4, 128>;
 using GgufEmbedAF5G128 = GgufEmbedOq<5, 128>;
 using GgufEmbedAF6G128 = GgufEmbedOq<6, 128>;
 using GgufEmbedAF8G128 = GgufEmbedOq<8, 128>;
+using GgufEmbedAF2 = GgufEmbedOq<2, 64>;
+using GgufEmbedAF3 = GgufEmbedOq<3, 64>;
+using GgufEmbedAF2G128 = GgufEmbedOq<2, 128>;
+using GgufEmbedAF3G128 = GgufEmbedOq<3, 128>;
 // Inlined, with each format's value, so every gather stays one function (the
 // compiler otherwise keeps Q6_K's as a call).
 template <class F>
@@ -314,6 +318,10 @@ GGUF_EMBEDDING_ENTRY(gguf_embed_af4g128, GgufEmbedAF4G128)
 GGUF_EMBEDDING_ENTRY(gguf_embed_af5g128, GgufEmbedAF5G128)
 GGUF_EMBEDDING_ENTRY(gguf_embed_af6g128, GgufEmbedAF6G128)
 GGUF_EMBEDDING_ENTRY(gguf_embed_af8g128, GgufEmbedAF8G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af2, GgufEmbedAF2)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af3, GgufEmbedAF3)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af2g128, GgufEmbedAF2G128)
+GGUF_EMBEDDING_ENTRY(gguf_embed_af3g128, GgufEmbedAF3G128)
 GGUF_EMBEDDING_ENTRY(gguf_embed_f32, GgufEmbedF32)
 #undef GGUF_EMBEDDING_ENTRY
 

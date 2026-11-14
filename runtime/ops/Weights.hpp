@@ -188,6 +188,12 @@ public:
   // of its rows, whole quant groups and meta units, which reads its planes as
   // they are (planeInputs()).
   [[nodiscard]] Projection leadingRows(const metal::MetalBackend &backend, uint32_t rows) const;
+  // The same view starting at row `firstRow` instead of row 0: whole
+  // QUANT_TILE_ROWS tiles of the planes, which stay contiguous because the
+  // planes store their tiles in order (Linear.cpp). The GDN z-split carves
+  // its packed projection's columns this way.
+  [[nodiscard]] Projection rowRange(const metal::MetalBackend &backend, uint32_t firstRow,
+                                    uint32_t rows) const;
   [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
   // Whether those views take it: its own planes, not a view, of affine Q4
   // weights or of one unrotated quantized GGUF tensor.

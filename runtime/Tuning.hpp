@@ -48,8 +48,37 @@ struct Tuning {
   // ops/ExecutionPlans.cpp: forces the four-simdgroup affine expert tiles
   // (moe_expert_*_sg4) on families that default to eight, for A/Bs.
   bool moeSg4 = false;            // RICHENGINE_MOE_SG4 (presence)
+  // ops/MoE.cpp, metal/kernels/shared/moe.metal: affine decode gathers and
+  // expert tiles size to a partial expert tile's live rows (1/2/4/8) instead
+  // of always staging eight. Affine-layout MoE only — GGUF decode already
+  // live-row-specializes. A/B candidate; Ornith 35B (Block32) never takes it.
+  bool moeSmallRows = false;      // RICHENGINE_MOE_SMALL_ROWS (presence)
+  // ops/ExecutionPlans.cpp, metal/kernels/shared/moe.metal: wide decode
+  // batches route through the 16x64 score tile, halving router weight
+  // re-reads versus the 8x32 tile. Affine-layout MoE only — GGUF decode
+  // routes through gguf_float_f32 instead. A/B candidate.
+  bool moeRouteM16 = false;       // RICHENGINE_MOE_ROUTE_M16 (presence)
+  // ops/MoE.cpp, metal/kernels/{shared,decode}/*moe*.metal: decode expert
+  // passes launch tile-major — threadgroups sweep an expert tile's column
+  // blocks for every grouped tile at one column, so same-expert row-tiles
+  // read identical weight slices back-to-back (L2 reuse) instead of each
+  // tile streaming its whole slab before the next. A/B candidate.
+  bool moeTileMajor = false;      // RICHENGINE_MOE_TILE_MAJOR (presence)
+  // ops/MoE.cpp, metal/kernels/shared/moe.metal: decode expert gate/up
+  // reads each grouped row's input through grouped_routes (the prefill
+  // indirect tile's staging) instead of a gather materializing
+  // groupedInput. A/B candidate.
+  bool moeIndirectGather = false; // RICHENGINE_MOE_INDIRECT (presence)
+  // The affine scores tiles fold the shared-expert scalar gate in as a 257th
+  // column; OFF makes the select re-dot the input instead. A/B candidate.
+  bool moeFoldedGate = true;    // RICHENGINE_MOE_FOLDED_GATE_OFF (presence)
   // ops/GDN.cpp, model/RuntimeArenas.hpp
   uint32_t gdnChunked = 0;    // RICHENGINE_GDN_CHUNKED
+  // model/TargetModelHybrid.cpp, ops/GDN.cpp: split the GDN input
+  // projection's z-gate columns into their own GEMV, dispatched un-barriered
+  // beside the ALU-bound recurrent scan (the lithos-metal overlap). Opt-in;
+  // RICHENGINE_SPAN_BARRIERS is what lets the sibling dispatches overlap.
+  bool gdnZSplit = false;     // RICHENGINE_GDN_ZSPLIT (presence)
   // ops/Linear.cpp, ops/LinearGguf.cpp
   bool ggufPackedOn = false;  // RICHENGINE_GGUF_PACKED_ON (presence)
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
@@ -88,6 +117,14 @@ struct Tuning {
   bool preparedCacheOff = false; // RICHENGINE_PREPARED_CACHE_OFF (presence)
   bool opTimings = false;       // RICHENGINE_OP_TIMINGS=1
   bool gpuSpans = false;        // RICHENGINE_GPU_SPANS (presence)
+  // GGUF decode projections (ops/Linear.cpp's Block32 decode plans) ride
+  // GPU-encoded spans by default: the host-baked ICB replay produces no
+  // output for these kernels on this driver (ISSUES.md), while the commands
+  // gpu_encode writes on device replay correctly (verified bitwise on the
+  // gguf-moe suite). GGUF prefill chunks keep the suspension; RICHENGINE_GPU_SPANS
+  // still covers them, and *_OFF is the A/B escape hatch. Still suppressed
+  // under MTL_SHADER_VALIDATION (MetalEncode.mm::gpuSpansEnabled).
+  bool ggufDecodeGpuSpans = true; // RICHENGINE_GGUF_DECODE_GPU_SPANS_OFF disables (default on)
   // ops/PagedAttention.cpp: the kv4/g6 16-row chain verify splits its two
   // fused-row passes across two threadgroups (the _r2 kernels), halving the
   // tile's threadgroup footprint so two groups share a core. Measured 1.40x
@@ -131,6 +168,13 @@ struct Tuning {
   // fused head for the whole packed batch. Opt-in A/B: absent keeps the
   // whole batch unfused whenever any lane needs logits.
   bool headPerLane = false;     // RICHENGINE_HEAD_PER_LANE (presence)
+  // model/RuntimeEncodeVerify.mm, model/TargetModel.cpp,
+  // metal/kernels/decode/sampling.metal: the 64-row affine fused head splits
+  // the vocabulary projection's K in two and reuses the logits buffer as the
+  // first split's fp32 partials, avoiding the half-precision m64h tile.
+  // Measured on Ornith 35B B4 (the only width it engages): 53.23 ms vs
+  // 52.93 ms baseline — no win, tokens bitwise identical. Kept off.
+  bool headKsplit = false;      // RICHENGINE_HEAD_KSPLIT (presence)
   // metal/CommandGraph.hpp
   bool patchableOff = false;    // RICHENGINE_PATCHABLE_OFF (presence)
   // model/TargetModelGemma.cpp
@@ -193,7 +237,20 @@ struct Tuning {
   uint32_t ngramCorpus = 0;         // RICHENGINE_NGRAM_CORPUS
   bool ngramCorpusAll = false;      // RICHENGINE_NGRAM_CORPUS_ALL (presence)
   uint32_t ngramCorpusMargin = 5;   // RICHENGINE_NGRAM_CORPUS_MARGIN
-  bool ngramCorpusSessionGate = false; // RICHENGINE_NGRAM_CORPUS_SESSION_GATE
+  bool ngramCorpusSessionGate = true; // RICHENGINE_NGRAM_CORPUS_SESSION_GATE
+  bool ngramCorpusLive = true;      // RICHENGINE_NGRAM_CORPUS_LIVE
+  // Per-lane n-gram/draft mixing: when the batch stays drafted, a lane
+  // whose n-gram score beats the draft EWMA still gets the n-gram chain —
+  // the draft forward ran anyway, so the better proposal set is free.
+  bool ngramMix = true;             // RICHENGINE_NGRAM_MIX
+  // The draft forward's share of a drafted step (ρ): all-ngram
+  // displacement clears the mixed total discounted by it — a proposer
+  // slightly under the draft's score can still win because skipping the
+  // draft pass refunds its cost.
+  double ngramDraftCost = 0.1;      // RICHENGINE_NGRAM_DRAFT_COST
+  // Let a displaced drafted batch emit the n-gram comb tree — off by
+  // default: the tree verify path is exercised only on Null drafts.
+  bool ngramTreeDrafted = false;    // RICHENGINE_NGRAM_TREE_DRAFTED
   double treeAcceptMin = 0.0;       // RICHENGINE_TREE_ACCEPT_MIN
   double treeAcceptMax = 6.0;       // RICHENGINE_TREE_ACCEPT_MAX
   // Presence flags for the threshold knobs above: a family's ModelTuning
@@ -320,6 +377,11 @@ inline Tuning makeTuning() {
   t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
   t.moeDecodeM32 = envFlag("RICHENGINE_MOE_DECODE_M32");
   t.moeSg4 = envFlag("RICHENGINE_MOE_SG4");
+  t.moeSmallRows = envFlag("RICHENGINE_MOE_SMALL_ROWS");
+  t.moeRouteM16 = envFlag("RICHENGINE_MOE_ROUTE_M16");
+  t.moeTileMajor = envFlag("RICHENGINE_MOE_TILE_MAJOR");
+  t.moeIndirectGather = envFlag("RICHENGINE_MOE_INDIRECT");
+  t.moeFoldedGate = !envFlag("RICHENGINE_MOE_FOLDED_GATE_OFF");
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
@@ -339,6 +401,7 @@ inline Tuning makeTuning() {
   t.verifySplitR2Off = envFlag("RICHENGINE_VERIFY_SPLIT_R2_OFF");
   t.opTimings = envFlagOn("RICHENGINE_OP_TIMINGS");
   t.gpuSpans = envFlag("RICHENGINE_GPU_SPANS");
+  t.ggufDecodeGpuSpans = !envFlag("RICHENGINE_GGUF_DECODE_GPU_SPANS_OFF");
   t.gpuDecodeGrid = !envFlag("RICHENGINE_GPU_DECODE_GRID_OFF");
   t.deviceVerifyParams = !envFlag("RICHENGINE_DEVICE_VERIFY_PARAMS_OFF");
   t.dfaMerge = !envFlag("RICHENGINE_DFA_MERGE_OFF");
@@ -346,6 +409,7 @@ inline Tuning makeTuning() {
   t.dfaSpanSkipDraft = !envFlag("RICHENGINE_DFA_SPAN_SKIP_DRAFT_OFF");
   t.verifyAllLive = envFlag("RICHENGINE_VERIFY_ALL_LIVE");
   t.headPerLane = !envFlag("RICHENGINE_HEAD_PER_LANE_OFF");
+  t.headKsplit = envFlag("RICHENGINE_HEAD_KSPLIT");
   t.patchableOff = envFlag("RICHENGINE_PATCHABLE_OFF");
   t.gemmaSkipAttn = envFlag("RICHENGINE_GEMMA_SKIP_ATTN");
   t.gemmaSkipMoe = envFlag("RICHENGINE_GEMMA_SKIP_MOE");
@@ -409,9 +473,17 @@ inline Tuning makeTuning() {
   t.ngramCorpus = envUint("RICHENGINE_NGRAM_CORPUS", 2);
   t.ngramCorpusAll = envUint("RICHENGINE_NGRAM_CORPUS_ALL", 1) != 0;
   t.ngramCorpusMargin = envUint("RICHENGINE_NGRAM_CORPUS_MARGIN", 5);
-  // Hard session isolation: cross-session docs are invisible, not just
-  // outranked — kills the "a match existed" timing leak entirely.
-  t.ngramCorpusSessionGate = envFlag("RICHENGINE_NGRAM_CORPUS_SESSION_GATE");
+  // Hard session isolation is the default: cross-session docs are
+  // invisible, not just outranked — kills the "a match existed" timing
+  // leak entirely. =0 restores the ranking-only mode.
+  t.ngramCorpusSessionGate =
+      envUint("RICHENGINE_NGRAM_CORPUS_SESSION_GATE", 1) != 0;
+  // In-flight requests publish their committed stream to the corpus so
+  // concurrent lanes can draft from it; =0 pushes only at request end.
+  t.ngramCorpusLive = envUint("RICHENGINE_NGRAM_CORPUS_LIVE", 1) != 0;
+  t.ngramMix = envUint("RICHENGINE_NGRAM_MIX", 1) != 0;
+  t.ngramDraftCost = envDouble("RICHENGINE_NGRAM_DRAFT_COST", 0.1);
+  t.ngramTreeDrafted = envFlag("RICHENGINE_NGRAM_TREE_DRAFTED");
   t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");
   t.treeAcceptMin = envDouble("RICHENGINE_TREE_ACCEPT_MIN", 0.0);
   t.treeAcceptMaxSet = envFlag("RICHENGINE_TREE_ACCEPT_MAX");
@@ -462,6 +534,7 @@ inline Tuning makeTuning() {
   t.prefillPagesPerSplit =
       envUint("RICHENGINE_PREFILL_PAGES_PER_SPLIT", 0);
   t.linearPlans = std::getenv("RICHENGINE_LINEAR_PLANS");
+  t.gdnZSplit = envFlag("RICHENGINE_GDN_ZSPLIT");
   return t;
 }
 

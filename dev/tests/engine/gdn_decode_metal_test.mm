@@ -649,6 +649,236 @@ void runFold(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
   }
 }
 
+// The z-split verify's carved packed regions (RICHENGINE_GDN_ZSPLIT): the
+// fused packed rows cut into lane-major ConvDim, ValueHeads*HeadDim and tail
+// columns — the conv rows also gathered per layer for the carved commit,
+// whose kernel strides each layer's region by the full packed width.
+struct CarvedGdn final {
+  std::vector<MetalBuffer> conv, z, tail;
+  MetalBuffer commit;
+};
+
+CarvedGdn carveGdn(MetalBackend &backend, const Fixture &fixture) {
+  const GdnShape &shape = fixture.shape;
+  const uint32_t convDim = shape.convolutionDimension;
+  const uint32_t valueWidth = shape.valueHeads * kHeadDim;
+  const uint32_t tailWidth = shape.packedWidth - convDim - valueWidth;
+  const uint64_t rows = uint64_t{kMaxLanes} * kRows;
+  auto allocate = [&](uint64_t elements) {
+    return backend.allocateBuffer(elements * 2, BufferStorage::Shared,
+                                  "gdn carved packed");
+  };
+  CarvedGdn carved;
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    MetalBuffer conv = allocate(rows * convDim);
+    MetalBuffer z = allocate(rows * valueWidth);
+    MetalBuffer tail = allocate(rows * tailWidth);
+    auto *convOut = static_cast<uint16_t *>(conv.contents());
+    auto *zOut = static_cast<uint16_t *>(z.contents());
+    auto *tailOut = static_cast<uint16_t *>(tail.contents());
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+      for (uint32_t token = 0; token < kRows; ++token) {
+        const uint16_t *src = fixture.packedRow(layer, lane, token);
+        const uint64_t row = uint64_t{lane} * kRows + token;
+        std::memcpy(convOut + row * convDim, src, convDim * 2);
+        std::memcpy(zOut + row * valueWidth, src + convDim, valueWidth * 2);
+        std::memcpy(tailOut + row * tailWidth, src + convDim + valueWidth,
+                    tailWidth * 2);
+      }
+    carved.conv.push_back(conv);
+    carved.z.push_back(z);
+    carved.tail.push_back(tail);
+  }
+  carved.commit =
+      allocate(uint64_t{kLayers} * kMaxLanes * kRows * shape.packedWidth);
+  auto *packed = static_cast<uint16_t *>(carved.commit.contents());
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+      for (uint32_t token = 0; token < kRows; ++token) {
+        // Each layer's region strides by the full packed width; its conv
+        // rows lead it ConvDim elements apart.
+        const uint64_t offset =
+            uint64_t{layer} * kMaxLanes * kRows * shape.packedWidth +
+            (uint64_t{lane} * kRows + token) * convDim;
+        std::memcpy(packed + offset, fixture.packedRow(layer, lane, token),
+                    convDim * 2);
+      }
+  return carved;
+}
+
+PreparedInput addSplitDecode(CommandGraph &graph, const CarvedGdn &carved,
+                             const Fixture &fixture, const GdnShape &shape,
+                             uint32_t lanes, const GdnTapeLanes *tape,
+                             LinearInput input = LinearInput::Plain,
+                             LinearScratch scratch = {}) {
+  PreparedInput prepared;
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    const GdnDecodeBuffers buffers{carved.conv[layer], fixture.convWeights,
+                                   fixture.current, fixture.next,
+                                   fixture.mixedLayer[layer],
+                                   fixture.decayWeights, fixture.timeBias,
+                                   fixture.decayLayer[layer],
+                                   fixture.betaLayer[layer], fixture.mixerNorm,
+                                   fixture.hidden, scratch, fixture.tape};
+    GDN::addDecodeScan(graph, buffers, carved.tail[layer], shape, lanes,
+                       layer, fixture.cell.strides(), GdnHeadOrder::Grouped, {},
+                       kRows, tape);
+    prepared = GDN::addDecodeGate(graph, carved.z[layer], buffers, shape,
+                                  lanes, kRows, GdnHeadOrder::Grouped, input);
+  }
+  return prepared;
+}
+
+// The split decode's hidden rows, emitted gates and cells are the fused
+// decode's, byte for byte, and so are the carved commit's retained replays.
+void runSplit(MetalBackend &backend, const GdnShape &shape, uint32_t lanes) {
+  const std::string where = "zsplit lanes " + std::to_string(lanes);
+  Fixture fixture(backend, shape, lanes, false);
+  const CarvedGdn carved = carveGdn(backend, fixture);
+  CommandGraph fused;
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    static_cast<void>(GDN::addDecode(
+        fused, fixture.decodeBuffers(layer), shape, lanes, layer,
+        fixture.cell.strides(), GdnHeadOrder::Grouped, LinearInput::Plain));
+  static_cast<void>(backend.submitCommand(fused.dispatches()));
+  const uint64_t hiddenBytes = fixture.hidden.sizeBytes();
+  std::vector<uint8_t> expectedHidden(hiddenBytes);
+  std::memcpy(expectedHidden.data(), fixture.hidden.contents(), hiddenBytes);
+  std::vector<std::vector<uint8_t>> expectedMixed(kLayers),
+      expectedDecay(kLayers), expectedBeta(kLayers), expectedCells;
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    const auto copy = [](const MetalBuffer &buffer) {
+      return std::vector<uint8_t>(
+          static_cast<const uint8_t *>(buffer.contents()),
+          static_cast<const uint8_t *>(buffer.contents()) + buffer.sizeBytes());
+    };
+    expectedMixed[layer] = copy(fixture.mixedLayer[layer]);
+    expectedDecay[layer] = copy(fixture.decayLayer[layer]);
+    expectedBeta[layer] = copy(fixture.betaLayer[layer]);
+  }
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    expectedCells.emplace_back(fixture.cellBytes(fixture.next[lane]),
+                               fixture.cellBytes(fixture.next[lane]) +
+                                   fixture.cell.bytes);
+  fixture.clear();
+  CommandGraph split;
+  addSplitDecode(split, carved, fixture, shape, lanes, nullptr);
+  static_cast<void>(backend.submitCommand(split.dispatches()));
+  require(!std::memcmp(expectedHidden.data(), fixture.hidden.contents(),
+                       hiddenBytes),
+          where + ": hidden mismatch");
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    const auto check = [&](const MetalBuffer &actual,
+                           const std::vector<uint8_t> &expected,
+                           const char *what) {
+      require(!std::memcmp(actual.contents(), expected.data(),
+                           expected.size()),
+              where + ": layer " + std::to_string(layer) + " " + what +
+                  " mismatch");
+    };
+    check(fixture.mixedLayer[layer], expectedMixed[layer], "mixed");
+    check(fixture.decayLayer[layer], expectedDecay[layer], "decay");
+    check(fixture.betaLayer[layer], expectedBeta[layer], "beta");
+  }
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    if (lane >= lanes) {
+      requireUntouched(fixture, lane, where);
+      continue;
+    }
+    require(!std::memcmp(fixture.next[lane].contents(),
+                         expectedCells[lane].data(), fixture.cell.bytes),
+            where + ": lane " + std::to_string(lane) + " cell mismatch");
+  }
+  // The carved commit replays the retained rows over the split's emitted
+  // mixed rows and gates, byte for byte the fused commit's.
+  auto *retained = static_cast<uint32_t *>(fixture.retained.contents());
+  for (uint32_t count : {1u, kRows / 2, kRows}) {
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+      retained[lane] = count;
+    CommandGraph fusedCommit;
+    GDN::addCommit(fusedCommit, fixture.commitBuffers(), shape, kLayers,
+                   lanes, fixture.cell.strides(), kRows);
+    CommandGraph splitCommit;
+    GDN::addCommit(splitCommit,
+                   {carved.commit, fixture.mixed, fixture.decay,
+                    fixture.beta, fixture.current, fixture.next,
+                    fixture.retained},
+                   shape, kLayers, lanes, fixture.cell.strides(), kRows,
+                   /*convCarved=*/true);
+    std::vector<std::vector<uint8_t>> fusedCells(lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      std::memcpy(fixture.next[lane].contents(), expectedCells[lane].data(),
+                  fixture.cell.bytes);
+    static_cast<void>(backend.submitCommand(fusedCommit.dispatches()));
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      fusedCells[lane].assign(fixture.cellBytes(fixture.next[lane]),
+                              fixture.cellBytes(fixture.next[lane]) +
+                                  fixture.cell.bytes);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      std::memcpy(fixture.next[lane].contents(), expectedCells[lane].data(),
+                  fixture.cell.bytes);
+    static_cast<void>(backend.submitCommand(splitCommit.dispatches()));
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      require(!std::memcmp(fixture.next[lane].contents(),
+                           fusedCells[lane].data(), fixture.cell.bytes),
+              where + " commit retained " + std::to_string(count) +
+                  " lane " + std::to_string(lane) + " cell mismatch");
+  }
+}
+
+// The folded commit under the split: step one's carved rows land on the
+// lane's tape; step two's scan folds the retained ones in — the committed
+// cell equals the standalone commit's, as runFold checks for the fused path.
+void runSplitFold(MetalBackend &backend, const GdnShape &shape,
+                  uint32_t lanes) {
+  Fixture fixture(backend, shape, lanes, false);
+  const CarvedGdn carved = carveGdn(backend, fixture);
+  const std::string where = "zsplit fold lanes " + std::to_string(lanes);
+  const uint64_t slotBytes = uint64_t{kLayers} * fixture.tapeLayerBytes();
+  CommandGraph step1;
+  GdnTapeLanes tape1;
+  tape1.layerBytes = fixture.tapeLayerBytes();
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    tape1.step[lane] = uint64_t{lane} * 2 * slotBytes;
+    tape1.pending[lane] = tape1.step[lane] + slotBytes;
+    tape1.rows[lane] = 0;
+  }
+  addSplitDecode(step1, carved, fixture, shape, lanes, &tape1);
+  static_cast<void>(backend.submitCommand(step1.dispatches()));
+  std::array<uint32_t, kMaxLanes> retained{};
+  auto *counts = static_cast<uint32_t *>(fixture.retained.contents());
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane)
+    counts[lane] = retained[lane] = 1 + lane % (kRows - 1);
+  CommandGraph step2;
+  GdnTapeLanes tape2;
+  tape2.layerBytes = fixture.tapeLayerBytes();
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    tape2.pending[lane] = uint64_t{lane} * 2 * slotBytes;
+    tape2.step[lane] = tape2.pending[lane] + slotBytes;
+    tape2.rows[lane] = retained[lane];
+  }
+  std::vector<std::vector<std::vector<double>>> expected(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t head : {0u, shape.valueHeads / 2, shape.valueHeads - 1})
+        expected[lane].push_back(
+            recurrence(fixture, layer, lane, head, retained[lane], nullptr));
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    std::memset(fixture.next[lane].contents(), 0, fixture.cell.bytes);
+  addSplitDecode(step2, carved, fixture, shape, lanes, &tape2);
+  static_cast<void>(backend.submitCommand(step2.dispatches()));
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const std::string laneWhere =
+        where + " retained " + std::to_string(retained[lane]) + " lane " +
+        std::to_string(lane);
+    size_t index = 0;
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t head : {0u, shape.valueHeads / 2, shape.valueHeads - 1})
+        checkState(fixture, layer, lane, head, expected[lane][index++],
+                   laneWhere);
+  }
+}
+
 // The out-projection table a fused decode writes into its scratch and the one
 // the projection's own preparation writes from the decoded hidden rows.
 struct PreparedTables final {
@@ -682,6 +912,62 @@ struct PreparedTables final {
             what + " sums mismatch");
   }
 };
+
+std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes,
+                     LinearInput layout);
+
+// The production decode tile feeds the out-projection a Table64: the split's
+// gate apply must write the same table and sums bytes the fused kernel's
+// in-scan gate writes.
+void runSplitTable(MetalBackend &backend, const GdnShape &shape,
+                   uint32_t lanes) {
+  const std::string what =
+      caseName("zsplit Table64", shape, lanes, LinearInput::Table64);
+  Fixture fixture(backend, shape, lanes, false);
+  const CarvedGdn carved = carveGdn(backend, fixture);
+  const PreparedTables tables(backend, LinearInput::Table64,
+                              shape.valueHeads * kHeadDim, lanes);
+  CommandGraph fused;
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    auto buffers = fixture.decodeBuffers(layer);
+    buffers.linearScratch = tables.scratch();
+    static_cast<void>(GDN::addDecode(
+        fused, buffers, shape, lanes, layer, fixture.cell.strides(),
+        GdnHeadOrder::Grouped, LinearInput::Table64));
+  }
+  static_cast<void>(backend.submitCommand(fused.dispatches()));
+  const uint64_t hiddenBytes =
+      uint64_t{lanes} * kRows * shape.valueHeads * kHeadDim * 2;
+  std::vector<uint8_t> expectedHidden(hiddenBytes), expectedTable,
+      expectedSums;
+  std::memcpy(expectedHidden.data(), fixture.hidden.contents(), hiddenBytes);
+  expectedTable.assign(
+      static_cast<const uint8_t *>(tables.table.contents()),
+      static_cast<const uint8_t *>(tables.table.contents()) +
+          tables.tableSize);
+  expectedSums.assign(
+      static_cast<const uint8_t *>(tables.sums.contents()),
+      static_cast<const uint8_t *>(tables.sums.contents()) + tables.sumsSize);
+  fixture.clear();
+  std::memset(tables.table.contents(), 0, tables.tableSize);
+  std::memset(tables.sums.contents(), 0, tables.sumsSize);
+  CommandGraph split;
+  const PreparedInput prepared =
+      addSplitDecode(split, carved, fixture, shape, lanes, nullptr,
+                     LinearInput::Table64, tables.scratch());
+  tables.addReference(split, fixture.hidden);
+  static_cast<void>(backend.submitCommand(split.dispatches()));
+  tables.requireWritten(prepared, fixture.hidden, what);
+  require(!std::memcmp(expectedHidden.data(), fixture.hidden.contents(),
+                       hiddenBytes),
+          what + ": hidden mismatch");
+  require(!std::memcmp(tables.table.contents(), expectedTable.data(),
+                       expectedTable.size()),
+          what + ": table mismatch");
+  require(!std::memcmp(tables.sums.contents(), expectedSums.data(),
+                       expectedSums.size()),
+          what + ": sums mismatch");
+}
 
 std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, LinearInput layout) {
   return std::string(test) + " vh" + std::to_string(shape.valueHeads) + " lanes " +
@@ -847,6 +1133,12 @@ int main(int argc, char **argv) {
       for (const GdnShape &shape : kShapes)
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
           runDecode(backend, shape, lanes, float32);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
+        runSplit(backend, shape, lanes);
+        runSplitFold(backend, shape, lanes);
+        runSplitTable(backend, shape, lanes);
+      }
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         runFold(backend, shape, lanes);

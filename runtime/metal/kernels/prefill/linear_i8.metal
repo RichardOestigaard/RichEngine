@@ -145,7 +145,7 @@ __attribute__((always_inline)) inline void i8_prefill(
         sum += (wb[byte] & 0xFu) + (wb[byte] >> 4);
       tg_c[col] = float(sum);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto b_ten =
         tensor<device uint4b_format, dextents<int, 2>, tensor_inline>(
@@ -171,7 +171,7 @@ __attribute__((always_inline)) inline void i8_prefill(
                 pa.offSum * sw * tg_c[col] +
                 input_sums[row * quant_groups + quant_group] * bw;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 
   auto converted = op.template get_destination_cooperative_tensor<
@@ -206,7 +206,7 @@ __attribute__((always_inline)) inline void i8_prefill(
       }
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 }
 
 // Bindings: codes_hi/codes_lo (0-1), params_hi (2), weights, scales, biases

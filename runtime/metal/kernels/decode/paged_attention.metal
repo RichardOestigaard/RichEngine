@@ -158,6 +158,29 @@ PAGED_VERIFY_SPLIT_BOTH(verify_attention_q8q_split_hd64, verify_attention_q8q_sp
 PAGED_VERIFY_SPLIT_BOTH(verify_attention_q8q_split_k8q5d64, verify_attention_q8q_split_k8q5d64_m8, 8, 5, int8_t, 64, 1, true)
 PAGED_VERIFY_SPLIT_BOTH(verify_attention_q8q_split_k8q4d128, verify_attention_q8q_split_k8q4d128_m8, 8, 4, int8_t, 128, 1, true)
 PAGED_VERIFY_SPLIT_BOTH(verify_attention_q8q_split_k4q4d128, verify_attention_q8q_split_k4q4d128_m8, 4, 4, int8_t, 128, 1, true)
+// The _a16 verify splits: the same tiles with a bfloat PV accumulator
+// (paged_attention_tile.h's Accumulator, the last template argument — the
+// variadic forwards MPasses/Int8Queries/Accumulator). RICHENGINE_ATTENTION_ACC16
+// dispatches them on Apple10+; the Gemma, DuoAttention, tree, windowed, q8q,
+// sparse and fp8 paths keep the fp32 accumulator.
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_m8_a16, 4, 6, int8_t, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_m8_a16, 4, 6, RichKvPacked4, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_m8_a16, 4, 6, bfloat, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g4_m8_a16, 4, 4, int8_t, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_kv4_g4_m8_a16, 4, 4, RichKvPacked4, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g4_m8_a16, 4, 4, bfloat, 256, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_hd64_m8_a16, 8, 4, int8_t, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_hd64_m8_a16, 8, 4, RichKvPacked4, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_hd64_m8_a16, 8, 4, bfloat, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_k8q5d64_m8_a16, 8, 5, int8_t, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_k8q5d64_m8_a16, 8, 5, RichKvPacked4, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k8q5d64_m8_a16, 8, 5, bfloat, 64, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_k8q4d128_m8_a16, 8, 4, int8_t, 128, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_k8q4d128_m8_a16, 8, 4, RichKvPacked4, 128, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k8q4d128_m8_a16, 8, 4, bfloat, 128, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_k4q4d128_m8_a16, 4, 4, int8_t, 128, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_int4_split_k4q4d128_m8_a16, 4, 4, RichKvPacked4, 128, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k4q4d128_m8_a16, 4, 4, bfloat, 128, 8, 1, false, bfloat)
 #undef PAGED_VERIFY_SPLIT
 
 // The _m2 hd512 verify variants run the tile in two fused-row passes
@@ -212,6 +235,13 @@ PAGED_VERIFY_SPLIT_M2_BOTH(verify_attention_bf16_split_kv2_g8, verify_attention_
 // The q8q forms of the two M=128 layouts.
 PAGED_VERIFY_SPLIT_M2_BOTH(verify_attention_q8q_split_kv2_g8, verify_attention_q8q_split_kv2_g8_m8, 2, 8, int8_t, 256, true)
 PAGED_VERIFY_SPLIT_M2_BOTH(verify_attention_q8q_split_hd128, verify_attention_q8q_split_hd128_m8, 2, 8, int8_t, 128, true)
+// The _a16 forms of the two M=128 layouts' narrow _m8 tiles.
+PAGED_VERIFY_SPLIT_M2(verify_attention_q8_split_kv2_g8_m8_a16, 2, 8, int8_t, 256, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_kv2_g8_m8_a16, 2, 8, RichKvPacked4, 256, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_kv2_g8_m8_a16, 2, 8, bfloat, 256, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_M2(verify_attention_q8_split_hd128_m8_a16, 2, 8, int8_t, 128, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_M2(verify_attention_int4_split_hd128_m8_a16, 2, 8, RichKvPacked4, 128, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_hd128_m8_a16, 2, 8, bfloat, 128, 8, false, bfloat)
 #undef PAGED_VERIFY_SPLIT_M2
 
 // At 16 verify rows the kv4/g6 chain tile's M = 96 fused rows halve core
@@ -343,6 +373,34 @@ PAGED_VERIFY_SPLIT_RP(verify_attention_q8q_split_k8q5d64_r2, 8, 5, int8_t, 64, 2
 PAGED_VERIFY_SPLIT_RP(verify_attention_q8q_split_k8q4d128_r2, 8, 4, int8_t, 128, 2, true)
 PAGED_VERIFY_SPLIT_RP(verify_attention_q8q_split_k4q4d128_r2, 4, 4, int8_t, 128, 2, true)
 PAGED_VERIFY_SPLIT_RP(verify_attention_q8q_split_hd128_r4, 2, 8, int8_t, 128, 4, true)
+// The _a16 chain splits: the same _rP pass split with a bfloat PV
+// accumulator — _r2 for the fused-M <= 96 layouts, _r4 for the M=128 pair.
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_r2_a16, 4, 6, int8_t, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_r2_a16, 4, 6, RichKvPacked4, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_r2_a16, 4, 6, bfloat, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_kv4_g4_r2_a16, 4, 4, int8_t, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_kv4_g4_r2_a16, 4, 4, RichKvPacked4, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_kv4_g4_r2_a16, 4, 4, bfloat, 256, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_kv2_g8_r4_a16, 2, 8, int8_t, 256, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_kv2_g8_r4_a16, 2, 8, RichKvPacked4, 256, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_kv2_g8_r4_a16, 2, 8, bfloat, 256, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_hd128_r4_a16, 2, 8, int8_t, 128, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_hd128_r4_a16, 2, 8, RichKvPacked4, 128, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_hd128_r4_a16, 2, 8, bfloat, 128, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_hd64_r2_a16, 8, 4, int8_t, 64, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_hd64_r2_a16, 8, 4, RichKvPacked4, 64, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_hd64_r2_a16, 8, 4, bfloat, 64, 2, false, bfloat)
+#if (5 * RICHENGINE_TARGET_VERIFY_ROWS / 2) % 8 == 0
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_k8q5d64_r2_a16, 8, 5, int8_t, 64, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_k8q5d64_r2_a16, 8, 5, RichKvPacked4, 64, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_k8q5d64_r2_a16, 8, 5, bfloat, 64, 2, false, bfloat)
+#endif
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_k8q4d128_r2_a16, 8, 4, int8_t, 128, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_k8q4d128_r2_a16, 8, 4, RichKvPacked4, 128, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_k8q4d128_r2_a16, 8, 4, bfloat, 128, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_q8_split_k4q4d128_r2_a16, 4, 4, int8_t, 128, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_int4_split_k4q4d128_r2_a16, 4, 4, RichKvPacked4, 128, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_RP(verify_attention_bf16_split_k4q4d128_r2_a16, 4, 4, bfloat, 128, 2, false, bfloat)
 #undef PAGED_VERIFY_SPLIT_RP
 #undef PAGED_VERIFY_SCRATCH_RP
 
@@ -468,7 +526,7 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
 #undef PAGED_VERIFY_SPLIT_SWA_M2
 #undef PAGED_VERIFY_SCRATCH_M2
 
-// The DuoAttention (_duo) verify splits of the kv4/g6 core: a KV head whose
+// The DuoAttention (_duo) verify splits of the kv4 cores: a KV head whose
 // bit of the per-dispatch policy's head_mask is set is a streaming head —
 // its split partitions the sink's leading pages plus the trailing window's
 // instead of the whole history (metal/abi/DuoAttention.h); the policy rides
@@ -488,7 +546,7 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
   threadgroup atomic<uint, thread_scope_threadgroup> rescale;
 
 #define PAGED_VERIFY_SPLIT_DUO(Name, Heads, Group, CacheElement, VRows,      \
-                               Passes)                                       \
+                               Passes, Int8Queries, Accumulator)             \
   kernel void Name(                                                          \
       device bfloat *queries [[buffer(0)]],                                  \
       device bfloat *partials [[buffer(1)]],                                  \
@@ -510,7 +568,8 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
       return;                                                                \
     const uint pass = group.x % Passes;                                      \
     richengine_paged_attention_tile<Heads, Group, VRows,                     \
-        CacheElement, RICHENGINE_KV_HEAD_DIMENSION, Passes>(                 \
+        CacheElement, RICHENGINE_KV_HEAD_DIMENSION, Passes,                  \
+        Int8Queries, Accumulator>(                                           \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,     \
         tile.committed_tokens, tile.active_rows, tile.splits,                \
         tile.split, partials, statistics, tile.slot, nullptr,                \
@@ -519,20 +578,140 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
         thread_index, 0, pass, pass + 1, duo);                               \
   }
 
-PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 1)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_m8, 4, 6, int8_t, 8, 1)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_r2, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 1)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_m8, 4, 6, RichKvPacked4, 8, 1)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_r2, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 2)
+#define PAGED_VERIFY_SPLIT_DUO_FP(Name, Heads, Group, CacheElement, VRows,   \
+                                  Passes)                                    \
+  PAGED_VERIFY_SPLIT_DUO(Name, Heads, Group, CacheElement, VRows, Passes,    \
+                        false, float)
+
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_duo, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_duo_m8, 4, 6, int8_t, 8, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_duo_r2, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_duo, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_duo_m8, 4, 6, RichKvPacked4, 8, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_duo_r2, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 2)
+// The _duo_q8q splits: INT8 queries against the INT8 pages, same page
+// partitioning as the plain _duo splits.
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_duo, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 1, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_duo_m8, 4, 6, int8_t, 8, 1, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_duo_r2, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2, true, float)
+// The _duo_a16 splits: the bfloat PV accumulator of the _a16 twins.
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_m8_a16, 4, 6, int8_t, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_r2_a16, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_m8_a16, 4, 6, RichKvPacked4, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_r2_a16, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 2, false, bfloat)
 // The _r4 pass split keeps the PV matmul's multiple-of-8 MP only where the
 // plain _r4 variant compiles.
 #if (6 * RICHENGINE_TARGET_VERIFY_ROWS / 4) % 8 == 0
-PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_r4, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4)
-PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_r4, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_duo_r4, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_duo_r4, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_duo_r4, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_duo_r4_a16, 4, 6, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_duo_r4_a16, 4, 6, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
 #endif
+
+// The kv4/g4 core's (_kv4_g4_duo) set: Ornith 1.5's full-attention layers.
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_kv4_g4_duo, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_kv4_g4_duo_m8, 4, 4, int8_t, 8, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_kv4_g4_duo_r2, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_kv4_g4_duo, 4, 4, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_kv4_g4_duo_m8, 4, 4, RichKvPacked4, 8, 1)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_kv4_g4_duo_r2, 4, 4, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 2)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_kv4_g4_duo, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 1, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_kv4_g4_duo_m8, 4, 4, int8_t, 8, 1, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_kv4_g4_duo_r2, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_kv4_g4_duo_m8_a16, 4, 4, int8_t, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_kv4_g4_duo_r2_a16, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 2, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_kv4_g4_duo_m8_a16, 4, 4, RichKvPacked4, 8, 1, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_kv4_g4_duo_r2_a16, 4, 4, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 2, false, bfloat)
+#if (4 * RICHENGINE_TARGET_VERIFY_ROWS / 4) % 8 == 0
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_kv4_g4_duo_r4, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_kv4_g4_duo_r4, 4, 4, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_kv4_g4_duo_r4, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_kv4_g4_duo_r4_a16, 4, 4, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_kv4_g4_duo_r4_a16, 4, 4, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
+#endif
+
+// The kv2/g8 core's (_kv2_g8_duo) set: the qwen3_6moe family's
+// full-attention layers (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B). Its fused
+// tile is M = 8 x VERIFY_ROWS = 128 rows, so the plain and _m8 splits run
+// the same internal two-pass halving the dense _m2 kernels do — scratch
+// and PV accumulator registers stay at MP = M/2 — with the DuoAttention
+// policy trailing like the _rP splits. The chain's _r4 splits keep the
+// grid pass split instead (MP = 32), matching the dense _r4 contract.
+#define PAGED_VERIFY_DUO_SCRATCH_M2(Group, VRows)                            \
+  constexpr uint M = Group * VRows;                                            \
+  constexpr uint MP = M / 2;                                                   \
+  constexpr uint N = RichKvPageTokens;                                       \
+  alignas(16) threadgroup float scores[MP * N];                              \
+  alignas(16) threadgroup bfloat probabilities[2 * MP * N];                  \
+  threadgroup float row_max[MP];                                             \
+  threadgroup float row_sum[MP];                                             \
+  threadgroup float previous_scale[MP];                                      \
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
+
+#define PAGED_VERIFY_SPLIT_DUO_M2(Name, Heads, Group, CacheElement, VRows,   \
+                                   Int8Queries, Accumulator)                 \
+  kernel void Name(                                                          \
+      device bfloat *queries [[buffer(0)]],                                  \
+      device bfloat *partials [[buffer(1)]],                                  \
+      device float *statistics [[buffer(2)]],                                \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      constant RichDuoAttentionPolicy &duo [[buffer(8)]],                    \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    PAGED_VERIFY_DUO_SCRATCH_M2(Group, VRows)                                  \
+    const RichVerifyTile tile =                                              \
+        richengine_verify_attention_tile_at<Heads, Group>(                   \
+            queries, page_table0, page_table1, page_table2, page_table3,     \
+            params, group);                                                  \
+    if (!tile.active)                                                        \
+      return;                                                                \
+    richengine_paged_attention_tile<Heads, Group, VRows,                     \
+        CacheElement, RICHENGINE_KV_HEAD_DIMENSION, 2,                       \
+        Int8Queries, Accumulator>(                                           \
+        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,     \
+        tile.committed_tokens, tile.active_rows, tile.splits,                \
+        tile.split, partials, statistics, tile.slot, nullptr,                \
+        params[group.z].score_scale, scores,                                 \
+        probabilities, row_max, row_sum, previous_scale, &rescale,           \
+        thread_index, 0, 0, 2, duo);                                         \
+  }
+
+#define PAGED_VERIFY_SPLIT_DUO_M2_FP(Name, Heads, Group, CacheElement,       \
+                                     VRows)                                  \
+  PAGED_VERIFY_SPLIT_DUO_M2(Name, Heads, Group, CacheElement, VRows, false,  \
+                           float)
+
+PAGED_VERIFY_SPLIT_DUO_M2_FP(verify_attention_q8_split_kv2_g8_duo, 2, 8, int8_t, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_SPLIT_DUO_M2_FP(verify_attention_q8_split_kv2_g8_duo_m8, 2, 8, int8_t, 8)
+PAGED_VERIFY_SPLIT_DUO_M2_FP(verify_attention_int4_split_kv2_g8_duo, 2, 8, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_SPLIT_DUO_M2_FP(verify_attention_int4_split_kv2_g8_duo_m8, 2, 8, RichKvPacked4, 8)
+// The _duo_q8q splits: INT8 queries against the INT8 pages.
+PAGED_VERIFY_SPLIT_DUO_M2(verify_attention_q8q_split_kv2_g8_duo, 2, 8, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, true, float)
+PAGED_VERIFY_SPLIT_DUO_M2(verify_attention_q8q_split_kv2_g8_duo_m8, 2, 8, int8_t, 8, true, float)
+// The _duo_a16 splits: the bfloat PV accumulator of the _a16 twins — the
+// _m8 form only, like the dense _a16 entries (the chain takes _r4).
+PAGED_VERIFY_SPLIT_DUO_M2(verify_attention_q8_split_kv2_g8_duo_m8_a16, 2, 8, int8_t, 8, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO_M2(verify_attention_int4_split_kv2_g8_duo_m8_a16, 2, 8, RichKvPacked4, 8, false, bfloat)
+// The chain's _r4 pass splits, under the same multiple-of-8 MP guard as
+// the kv4 cores' _r4 entries.
+#if (8 * RICHENGINE_TARGET_VERIFY_ROWS / 4) % 8 == 0
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_q8_split_kv2_g8_duo_r4, 2, 8, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO_FP(verify_attention_int4_split_kv2_g8_duo_r4, 2, 8, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8q_split_kv2_g8_duo_r4, 2, 8, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, true, float)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_q8_split_kv2_g8_duo_r4_a16, 2, 8, int8_t, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
+PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_kv2_g8_duo_r4_a16, 2, 8, RichKvPacked4, RICHENGINE_TARGET_VERIFY_ROWS, 4, false, bfloat)
+#endif
+#undef PAGED_VERIFY_SPLIT_DUO_FP
 #undef PAGED_VERIFY_SPLIT_DUO
 #undef PAGED_VERIFY_DUO_SCRATCH
+#undef PAGED_VERIFY_SPLIT_DUO_M2_FP
+#undef PAGED_VERIFY_SPLIT_DUO_M2
+#undef PAGED_VERIFY_DUO_SCRATCH_M2
 
 // The tree verify splits: RICHENGINE_TREE_VERIFY_NODES rows of a lane's comb.
 // The emitted nodes occupy scratch slots committed..committed+rows-1 in row
@@ -1195,8 +1374,8 @@ PAGED_VERIFY_TREE_REDUCE_HEADGATE(verify_tree_attention_reduce_headgate_k4q4d128
 // The DuoAttention (_duo) reduces: the chain's per-row split reduce with
 // each KV head's written split count recomputed over its sink-plus-window
 // page range, which the _duo splits partition. The policy constant trails
-// the parameters. kv4/g6 only, matching the _duo split entries.
-#define PAGED_VERIFY_REDUCE_DUO(Name, Group, VRows)                          \
+// the parameters. The kv cores only, matching the _duo split entries.
+#define PAGED_VERIFY_REDUCE_DUO(Name, KVHeads, Group, VRows)                \
   kernel void Name(                                                          \
       device const bfloat *partials [[buffer(0)]],                            \
       device const float *statistics [[buffer(1)]],                          \
@@ -1207,19 +1386,25 @@ PAGED_VERIFY_TREE_REDUCE_HEADGATE(verify_tree_attention_reduce_headgate_k4q4d128
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
     threadgroup float weights[RichVerifyMaximumSplits];                      \
     threadgroup float group_values[8];                                       \
-    richengine_verify_attention_reduce_phase<4, Group,                       \
+    richengine_verify_attention_reduce_phase<KVHeads, Group,                \
         RICHENGINE_KV_HEAD_DIMENSION, VRows>(                                \
         partials, statistics, output, params, group, thread_index,           \
         weights, group_values, duo);                                         \
   }
 
-PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_duo, 6, RICHENGINE_TARGET_VERIFY_ROWS)
-PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_duo_m8, 6, 8)
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_duo, 4, 6, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_duo_m8, 4, 6, 8)
+// The kv4/g4 core's (_kv4_g4_duo) reduces: same recompute at Group 4.
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_kv4_g4_duo, 4, 4, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_kv4_g4_duo_m8, 4, 4, 8)
+// The kv2/g8 core's (_kv2_g8_duo) reduces at Group 8.
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_kv2_g8_duo, 2, 8, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_kv2_g8_duo_m8, 2, 8, 8)
 #undef PAGED_VERIFY_REDUCE_DUO
 
 // The fused reduce/gate twin: the same per-head written-split recompute, the
 // query-gate epilogue unchanged.
-#define PAGED_VERIFY_REDUCE_GATE_DUO(Name, Group, VRows)                     \
+#define PAGED_VERIFY_REDUCE_GATE_DUO(Name, KVHeads, Group, VRows)           \
   kernel void Name(                                                          \
       device const bfloat *partials [[buffer(0)]],                            \
       device const float *statistics [[buffer(1)]],                          \
@@ -1232,11 +1417,15 @@ PAGED_VERIFY_REDUCE_DUO(verify_attention_reduce_duo_m8, 6, 8)
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
     threadgroup float weights[RichVerifyMaximumSplits];                      \
     threadgroup float group_values[8];                                       \
-    richengine_verify_attention_reduce_gate_phase<4, Group, VRows>(          \
+    richengine_verify_attention_reduce_gate_phase<KVHeads, Group, VRows>(    \
         partials, statistics, output, packed_qkv, hidden, params, group,     \
         thread_index, weights, group_values, duo);                           \
   }
 
-PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_duo, 6, RICHENGINE_TARGET_VERIFY_ROWS)
-PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_duo_m8, 6, 8)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_duo, 4, 6, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_duo_m8, 4, 6, 8)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_kv4_g4_duo, 4, 4, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_kv4_g4_duo_m8, 4, 4, 8)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_kv2_g8_duo, 2, 8, RICHENGINE_TARGET_VERIFY_ROWS)
+PAGED_VERIFY_REDUCE_GATE_DUO(verify_attention_reduce_gate_kv2_g8_duo_m8, 2, 8, 8)
 #undef PAGED_VERIFY_REDUCE_GATE_DUO

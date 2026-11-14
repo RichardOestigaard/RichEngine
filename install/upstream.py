@@ -298,7 +298,7 @@ def _mlx_target(repo, language_only):
     # MLX states its quantization under "quantization"; a transformers
     # quantization_config alone describes another method (GPTQ, AWQ, ...).
     # What the runtime loads is the affine matrix — uniform Q4/64 and the
-    # oMLX oQ matrix of 4-8 bits over groups of 64 or 128, per module or
+    # oMLX oQ matrix of 2-8 bits over groups of 64 or 128, per module or
     # globally (local.quantization_support); a module with no entry keeps
     # its float weight.
     if reason := local.quantization_support(config):
@@ -313,7 +313,7 @@ def _mlx_target(repo, language_only):
             else ""
         )
         raise models.ModelError(
-            "this model requires an MLX affine checkpoint (4-8 bit, "
+            "this model requires an MLX affine checkpoint (2-8 bit, "
             f"group 64/128) or a supported GGUF{hint}: {reason}"
         )
     # A family the runtime serves text-only takes no tower, whether or not

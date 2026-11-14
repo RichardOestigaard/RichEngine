@@ -92,11 +92,12 @@ inline void richengine_canvas_page_softmax(
     }
   }
   float local_max = -INFINITY;
+  bool admitted[TokensPerLane];
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint t = token + j;
-    const bool admitted = t >= window_begin && t < limit;
-    score[j] = admitted ? score[j] : -INFINITY;
+    admitted[j] = t >= window_begin && t < limit;
+    score[j] = admitted[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
 #pragma unroll
@@ -108,9 +109,7 @@ inline void richengine_canvas_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    const uint t = token + j;
-    const bool admitted = t >= window_begin && t < limit;
-    probability[j] = admitted ? fast::exp(score[j] - next_max) : 0.0f;
+    probability[j] = admitted[j] ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
 #pragma unroll
@@ -200,7 +199,7 @@ inline void richengine_canvas_attention_tile(
       row_max[thread_index] = -INFINITY;
       row_sum[thread_index] = 0.0f;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     auto qt = tensor(tile_queries + row_offset * D, dextents<int, 2>{D, MP},
                      array<int, 2>{1, D});
@@ -245,7 +244,7 @@ inline void richengine_canvas_attention_tile(
         page_scores.store(st.template slice<N, MP>(0, 0));
         if (thread_index == 0)
           atomic_store_explicit(rescale, 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         richengine_canvas_page_softmax<QueryHeadsPerKVHead,
             RowsPerTile / MPasses, Quantized, HeadDim, (MP > 64 ? 16 : 8)>(
             scores, pbuf, row_max, row_sum, previous_scale, rescale,
@@ -253,7 +252,7 @@ inline void richengine_canvas_attention_tile(
             reinterpret_cast<device const float4 *>(value_scales), token_start,
             visible_tokens, committed_tokens, thread_index, qk_scale,
             window_tokens);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
           for (ushort index = 0; index < running.get_capacity(); ++index) {
@@ -264,7 +263,7 @@ inline void richengine_canvas_attention_tile(
           }
         }
         pv.run(p0, vs, running);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       };
 
       if constexpr (Packed) {
@@ -297,7 +296,7 @@ inline void richengine_canvas_attention_tile(
       statistics[(slot * M + row_offset + thread_index) * 2 + 1] =
           row_sum[thread_index];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
 }
 

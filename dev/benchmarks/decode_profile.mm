@@ -167,8 +167,11 @@ void prefill(model::Runtime &executor, Lane &lane,
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{lane.id, count, offset}},
                    .decodeStage = DecodeStage::Regular};
-    ModelBatchItem item{lane.id, offset, count, lane.pages,
-                        lane.pageTableRevision};
+    ModelBatchItem item{.requestId = lane.id,
+                        .logicalPosition = offset,
+                        .tokenCount = count,
+                        .pageTable = lane.pages,
+                        .pageTableRevision = lane.pageTableRevision};
     item.inputTokens = prompt.subspan(offset, count);
     auto results =
         executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
@@ -199,8 +202,11 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   std::vector<ModelBatchItem> items;
   for (Lane &lane : lanes) {
     plan.items.push_back({lane.id, 0, 0});
-    items.push_back({lane.id, lane.position, 0, lane.pages,
-                     lane.pageTableRevision});
+    items.push_back(ModelBatchItem{.requestId = lane.id,
+                                   .logicalPosition = lane.position,
+                                   .tokenCount = 0,
+                                   .pageTable = lane.pages,
+                                   .pageTableRevision = lane.pageTableRevision});
   }
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())

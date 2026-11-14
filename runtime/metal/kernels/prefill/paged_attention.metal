@@ -5,10 +5,12 @@
 
 // Prefill split: KV heads vary first, then query tiles, then history splits.
 // Int8Queries selects the q8q product — INT8 query codes against the INT8
-// keys (paged_attention_tile.h); the dense INT8 layouts only.
+// keys (paged_attention_tile.h); the dense INT8 layouts only. Accumulator is
+// the PV running tensor's element — float, or bfloat on the _a16 splits
+// (RICHENGINE_ATTENTION_ACC16).
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement,
           uint HeadDim = RichKvHeadDimension, uint MPasses = 1,
-          bool Int8Queries = false>
+          bool Int8Queries = false, typename Accumulator = float>
 inline void richengine_prefill_attention_split_phase(
     device bfloat *queries, device bfloat *partials,
     device float *statistics, device const RichKvPage *page_table,
@@ -33,7 +35,7 @@ inline void richengine_prefill_attention_split_phase(
   ulong slot = (ulong(tile) * KVHeads + kv_head) * params.split_count + split;
   richengine_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
                               RICHENGINE_PREFILL_ATTENTION_TILE_ROWS, CacheElement,
-                              HeadDim, MPasses, Int8Queries>(
+                              HeadDim, MPasses, Int8Queries, Accumulator>(
       queries + tile_offset, page_table, params.kv, kv_head,
       params.committed_tokens + tile_start, active_rows, params.split_count, split,
       partials, statistics, slot, nullptr, params.score_scale, scores,
@@ -111,11 +113,23 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
 // the QK product lands as int32 (paged_attention_tile.h's Int8Queries),
 // scored by the same page softmax and reduce — the partials/statistics
 // contract is unchanged. Emitted for the dense INT8 layouts the planner's
-// RICHENGINE_Q8Q_ATTENTION gate reaches; windowed (_swa), DuoAttention,
-// sparse and the Gemma cores keep the bf16-query kernels.
+// RICHENGINE_Q8Q_ATTENTION gate reaches, DuoAttention's _duo splits
+// included; windowed (_swa), sparse and the Gemma cores keep the
+// bf16-query kernels.
 PAGED_PREFILL_SPLIT(prefill_attention_q8q_split, 4, 6, int8_t, RichKvHeadDimension, 1, true)
 PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv4_g4, 4, 4, int8_t, RichKvHeadDimension, 1, true)
 PAGED_PREFILL_SPLIT(prefill_attention_q8q_split_kv2_g8, 2, 8, int8_t, RichKvHeadDimension, 1, true)
+// The _a16 prefill splits: the same tiles with a bfloat PV accumulator
+// (RICHENGINE_ATTENTION_ACC16 on Apple10+).
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_a16, 4, 6, int8_t, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_int4_split_a16, 4, 6, RichKvPacked4, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_a16, 4, 6, bfloat, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv4_g4_a16, 4, 4, int8_t, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_int4_split_kv4_g4_a16, 4, 4, RichKvPacked4, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g4_a16, 4, 4, bfloat, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8_a16, 2, 8, int8_t, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_int4_split_kv2_g8_a16, 2, 8, RichKvPacked4, RichKvHeadDimension, 1, false, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8_a16, 2, 8, bfloat, RichKvHeadDimension, 1, false, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
 kernel void prefill_attention_reduce(
@@ -214,6 +228,22 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_hd64, 8, 4, int8_t, 64, 1
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k8q5d64, 8, 5, int8_t, 64, 1, true)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k8q4d128, 8, 4, int8_t, 128, 1, true)
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8q_split_k4q4d128, 4, 4, int8_t, 128, 1, true)
+// The _a16 head-dimension splits.
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_hd128_a16, 2, 8, int8_t, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_hd128_a16, 2, 8, RichKvPacked4, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_hd128_a16, 2, 8, bfloat, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_hd64_a16, 8, 4, int8_t, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_hd64_a16, 8, 4, RichKvPacked4, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_hd64_a16, 8, 4, bfloat, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_k8q5d64_a16, 8, 5, int8_t, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k8q5d64_a16, 8, 5, RichKvPacked4, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k8q5d64_a16, 8, 5, bfloat, 64, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_k8q4d128_a16, 8, 4, int8_t, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k8q4d128_a16, 8, 4, RichKvPacked4, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k8q4d128_a16, 8, 4, bfloat, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_q8_split_k4q4d128_a16, 4, 4, int8_t, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k4q4d128_a16, 4, 4, RichKvPacked4, 128, 1, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k4q4d128_a16, 4, 4, bfloat, 128, 1, false, bfloat)
 #undef PREFILL_ATTENTION_SPLIT_HD
 
 // The _m2 hd512 variants run the tile in two fused-row passes (MP = M/2 =
@@ -407,13 +437,14 @@ kernel void prefill_attention_reduce_gemma_hd512(
       group_values);
 }
 
-// The DuoAttention (_duo) prefill variants of the kv4/g6 core: a KV head
+// The DuoAttention (_duo) prefill variants of the kv cores: a KV head
 // whose bit of the trailing policy's head_mask is set is a streaming head —
 // its splits partition the sink's leading pages plus the trailing window's
 // instead of the tile's whole history (metal/abi/DuoAttention.h), and the
 // reduce recomputes each head's written splits over the same range. INT8 and
 // packed-INT4 only.
-#define PREFILL_ATTENTION_SPLIT_DUO(Name, Heads, Group, CacheElement)        \
+#define PREFILL_ATTENTION_SPLIT_DUO(Name, Heads, Group, CacheElement,       \
+                                     Int8Queries, Accumulator)              \
   [[max_total_threads_per_threadgroup(256)]] kernel void Name(              \
       device bfloat *queries [[buffer(0)]],                                 \
       device bfloat *partials [[buffer(1)]],                                 \
@@ -431,27 +462,57 @@ kernel void prefill_attention_reduce_gemma_hd512(
     threadgroup float row_sum[M];                                           \
     threadgroup float previous_scale[M];                                    \
     threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
-    richengine_prefill_attention_split_phase<Heads, Group, CacheElement>(       \
+    richengine_prefill_attention_split_phase<Heads, Group, CacheElement,    \
+        RichKvHeadDimension, 1, Int8Queries, Accumulator>(                  \
         queries, partials, statistics, page_table, params, scores,          \
         probabilities, row_max, row_sum, previous_scale, &rescale,          \
         group, thread_index, duo);                                          \
   }
 
-PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8_split_duo, 4, 6, int8_t)
-PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_int4_split_duo, 4, 6, RichKvPacked4)
+#define PREFILL_ATTENTION_SPLIT_DUO_FP(Name, Heads, Group, CacheElement)     \
+  PREFILL_ATTENTION_SPLIT_DUO(Name, Heads, Group, CacheElement, false, float)
+
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_q8_split_duo, 4, 6, int8_t)
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_int4_split_duo, 4, 6, RichKvPacked4)
+// The _duo_q8q split: INT8 queries against the INT8 pages.
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8q_split_duo, 4, 6, int8_t, true, float)
+// The _duo_a16 splits: the bfloat PV accumulator of the _a16 twins.
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8_split_duo_a16, 4, 6, int8_t, false, bfloat)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_int4_split_duo_a16, 4, 6, RichKvPacked4, false, bfloat)
+// The kv4/g4 core's (_kv4_g4_duo) set: Ornith 1.5's full-attention layers.
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_q8_split_kv4_g4_duo, 4, 4, int8_t)
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_int4_split_kv4_g4_duo, 4, 4, RichKvPacked4)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8q_split_kv4_g4_duo, 4, 4, int8_t, true, float)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8_split_kv4_g4_duo_a16, 4, 4, int8_t, false, bfloat)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_int4_split_kv4_g4_duo_a16, 4, 4, RichKvPacked4, false, bfloat)
+// The kv2/g8 core's (_kv2_g8_duo) set: the qwen3_6moe family's
+// full-attention layers. The prefill tile is M = 8 x 8 = 64 fused rows —
+// no pass split needed.
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_q8_split_kv2_g8_duo, 2, 8, int8_t)
+PREFILL_ATTENTION_SPLIT_DUO_FP(prefill_attention_int4_split_kv2_g8_duo, 2, 8, RichKvPacked4)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8q_split_kv2_g8_duo, 2, 8, int8_t, true, float)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_q8_split_kv2_g8_duo_a16, 2, 8, int8_t, false, bfloat)
+PREFILL_ATTENTION_SPLIT_DUO(prefill_attention_int4_split_kv2_g8_duo_a16, 2, 8, RichKvPacked4, false, bfloat)
+#undef PREFILL_ATTENTION_SPLIT_DUO_FP
 #undef PREFILL_ATTENTION_SPLIT_DUO
 
-kernel void prefill_attention_reduce_duo(
-    device const bfloat *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant RichPrefillAttentionParams &params [[buffer(3)]],
-    constant RichDuoAttentionPolicy &duo [[buffer(4)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  threadgroup float weights[RichPrefillMaximumSplits];
-  threadgroup float group_values[8];
-  richengine_prefill_attention_reduce_phase<4, 6>(
-      partials, statistics, output, params, group, thread_index, weights,
-      group_values, duo);
-}
+#define PREFILL_ATTENTION_REDUCE_DUO(Name, KVHeads, Group)                  \
+  kernel void Name(                                                          \
+      device const bfloat *partials [[buffer(0)]],                            \
+      device const float *statistics [[buffer(1)]],                          \
+      device bfloat *output [[buffer(2)]],                                   \
+      constant RichPrefillAttentionParams &params [[buffer(3)]],             \
+      constant RichDuoAttentionPolicy &duo [[buffer(4)]],                    \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    threadgroup float weights[RichPrefillMaximumSplits];                     \
+    threadgroup float group_values[8];                                       \
+    richengine_prefill_attention_reduce_phase<KVHeads, Group>(               \
+        partials, statistics, output, params, group, thread_index, weights,  \
+        group_values, duo);                                                  \
+  }
+
+PREFILL_ATTENTION_REDUCE_DUO(prefill_attention_reduce_duo, 4, 6)
+PREFILL_ATTENTION_REDUCE_DUO(prefill_attention_reduce_kv4_g4_duo, 4, 4)
+PREFILL_ATTENTION_REDUCE_DUO(prefill_attention_reduce_kv2_g8_duo, 2, 8)
+#undef PREFILL_ATTENTION_REDUCE_DUO

@@ -11,23 +11,95 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace richengine::model::ngram {
+
+constexpr uint32_t kNone = ~0u;
+
+// A lane's 3-gram starts in an open-addressed table: lookups run once per
+// decode step per lane (and once per corpus doc per step), where
+// unordered_map's per-node indirection costs more than the probe. Keys
+// pack three <2^18 tokens, so ~0ull can never collide with a real key.
+// Nothing deletes — seed() and clear() drop the table whole.
+struct Starts {
+  struct Slot {
+    uint64_t key = ~0ull;
+    std::array<uint32_t, 4> starts{};
+  };
+  std::vector<Slot> slots;
+  size_t count = 0;
+
+  static uint64_t mix(uint64_t x) noexcept {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+
+  void rehash(size_t capacity) {
+    std::vector<Slot> next(capacity);
+    for (const Slot &slot : slots) {
+      if (slot.key == ~0ull)
+        continue;
+      size_t i = mix(slot.key) & (capacity - 1);
+      while (next[i].key != ~0ull)
+        i = (i + 1) & (capacity - 1);
+      next[i] = slot;
+    }
+    slots = std::move(next);
+  }
+
+  const std::array<uint32_t, 4> *find(uint64_t k) const {
+    if (slots.empty())
+      return nullptr;
+    const size_t mask = slots.size() - 1;
+    size_t i = mix(k) & mask;
+    while (slots[i].key != ~0ull) {
+      if (slots[i].key == k)
+        return &slots[i].starts;
+      i = (i + 1) & mask;
+    }
+    return nullptr;
+  }
+
+  std::array<uint32_t, 4> *entry(uint64_t k) {
+    if (slots.empty())
+      rehash(1024);
+    if ((count + 1) * 10 >= slots.size() * 7)
+      rehash(slots.size() * 2);
+    const size_t mask = slots.size() - 1;
+    size_t i = mix(k) & mask;
+    while (slots[i].key != ~0ull) {
+      if (slots[i].key == k)
+        return &slots[i].starts;
+      i = (i + 1) & mask;
+    }
+    slots[i].key = k;
+    slots[i].starts = {kNone, kNone, kNone, kNone};
+    ++count;
+    return &slots[i].starts;
+  }
+
+  void clear() {
+    slots.clear();
+    count = 0;
+  }
+};
 
 // A lane's token stream and, per 3-gram key, its last four starts — a
 // key's newest start is the stream's own tail, so lookups skip it to the
 // earlier occurrences.
 struct Table {
   std::vector<uint32_t> history;
-  std::unordered_map<uint64_t, std::array<uint32_t, 4>> starts;
+  Starts starts;
 };
-
-constexpr uint32_t kNone = ~0u;
 
 // The vocabulary is under 2^18, so three tokens pack into one key.
 inline uint64_t key(const uint32_t *tokens) {
@@ -36,16 +108,12 @@ inline uint64_t key(const uint32_t *tokens) {
 }
 
 inline void noteAt(Table &table, uint32_t start, uint32_t *drops = nullptr) {
-  auto &seen =
-      table.starts
-          .try_emplace(key(table.history.data() + start),
-                       std::array{kNone, kNone, kNone, kNone})
-          .first->second;
+  auto *seen = table.starts.entry(key(table.history.data() + start));
   // A fifth+ start evicts the oldest recorded one — the occurrence a
   // variable-order matcher would still have found. `drops` counts them.
-  if (drops && seen[3] != kNone)
+  if (drops && (*seen)[3] != kNone)
     ++*drops;
-  seen = {start, seen[0], seen[1], seen[2]};
+  *seen = {start, (*seen)[0], (*seen)[1], (*seen)[2]};
 }
 
 // (Re)seeds a table from its lane's prompt; emitted tokens then append.
@@ -77,15 +145,29 @@ inline uint32_t lookup(const Table &table, uint32_t *out,
   const uint32_t size = static_cast<uint32_t>(history.size());
   if (size < 4)
     return 0;
-  const auto found = table.starts.find(key(history.data() + size - 3));
-  if (found == table.starts.end())
+  const auto *found = table.starts.find(key(history.data() + size - 3));
+  if (!found)
     return 0;
   bool have = false;
   uint32_t best = 0, bestExtension = 0, bestFollowers = 0;
-  for (const uint32_t start : found->second) {
+  for (const uint32_t start : *found) {
     if (start == kNone || start + 3 >= size)
       continue;
+    // An occurrence's extension is bounded by `start` — one under the best
+    // found already can neither beat it nor tie, so its scan is dead work.
+    if (start < bestExtension)
+      continue;
+    // Two tokens per compare while a whole pair fits, the scalar loop
+    // handling the odd remainder — identical extension values.
     uint32_t extension = 0;
+    while (extension + 2 <= start) {
+      uint64_t a, b;
+      std::memcpy(&a, history.data() + (start - 2 - extension), 8);
+      std::memcpy(&b, history.data() + (size - 5 - extension), 8);
+      if (a != b)
+        break;
+      extension += 2;
+    }
     while (extension < start &&
            history[start - 1 - extension] == history[size - 4 - extension])
       ++extension;
@@ -131,6 +213,12 @@ struct Corpus {
     uint64_t session = 0;
   };
   std::deque<Doc> docs;
+  // In-flight requests' streams, appended as they commit: a concurrent
+  // lane drafting the same content sees it without waiting for the
+  // request's end. Never evicted and not counted in `tokens` — the set
+  // is bounded by the lane count, and each entry is dropped when its
+  // request finishes or suspends (the finished stream is pushed normally).
+  std::deque<Doc> liveDocs;
   size_t tokens = 0;
   uint64_t tick = 0;
   // Lifetime counters for /status observability. droppedStarts tracks
@@ -191,16 +279,59 @@ inline void push(Corpus &corpus, std::span<const uint32_t> stream,
   }
 }
 
-// The lane's closing 3-gram looked up across every corpus doc; the winning
-// occurrence's continuation fills `out`. Returns the follower count and the
-// winning backward extension measured against the lane's own history —
-// that is the corpus match's effective pattern length, minus the fixed 3.
+// Drops an in-flight request's live doc — at end (its stream joins docs
+// through the normal push) and at suspend (its stale prefix leaves the
+// searchable set).
+inline void liveEnd(Corpus &corpus, uint64_t origin) {
+  for (auto it = corpus.liveDocs.begin(); it != corpus.liveDocs.end(); ++it)
+    if (it->origin == origin) {
+      corpus.liveDocs.erase(it);
+      return;
+    }
+}
+
+// Opens an in-flight request's live doc: seeded with the stream the
+// request will eventually push — its whole prompt+output stream under
+// CORPUS_ALL, otherwise an empty table only committed tokens join. A
+// resume re-seeds wholesale: the stale doc is dropped first.
+inline void liveBegin(Corpus &corpus, uint64_t origin, uint64_t session,
+                      std::span<const uint32_t> stream) {
+  liveEnd(corpus, origin);
+  Corpus::Doc doc;
+  doc.origin = origin;
+  doc.session = session;
+  seed(doc.table, stream);
+  doc.hitStamp = corpus.tick;
+  corpus.liveDocs.push_back(std::move(doc));
+}
+
+// Appends newly committed tokens to a request's live doc. A request
+// without one (opted out, or live docs off) is skipped by the scan.
+inline void liveAppend(Corpus &corpus, uint64_t origin,
+                       std::span<const uint32_t> tokens) {
+  for (Corpus::Doc &doc : corpus.liveDocs)
+    if (doc.origin == origin) {
+      append(doc.table, tokens);
+      return;
+    }
+}
+
+// The lane's closing 3-gram looked up across every corpus doc — live
+// in-flight docs first (the freshest wins a full tie), then the finished
+// FIFO; the winning occurrence's continuation fills `out`. Returns the
+// follower count and the winning backward extension measured against the
+// lane's own history — that is the corpus match's effective pattern
+// length, minus the fixed 3. `extensionLimit` bounds the per-occurrence
+// backward scan: the reported extension never exceeds it, so pass the
+// smallest extension the caller's decision still needs (an extension
+// past it can never change the outcome).
 inline uint32_t lookupCorpus(Corpus &corpus,
                              std::span<const uint32_t> laneHistory,
                              uint32_t *out, uint32_t &extensionOut,
                              uint64_t selfOrigin = 0,
                              uint64_t selfSession = 0,
-                             bool sessionGate = false) {
+                             bool sessionGate = false,
+                             uint32_t extensionLimit = kNone) {
   const uint32_t laneSize = static_cast<uint32_t>(laneHistory.size());
   if (laneSize < 3)
     return 0;
@@ -209,24 +340,41 @@ inline uint32_t lookupCorpus(Corpus &corpus,
   Corpus::Doc *bestDoc = nullptr;
   uint32_t best = kNone, bestExtension = 0, bestFollowers = 0;
   bool bestSession = false;
-  for (Corpus::Doc &doc : corpus.docs) {
+  const auto consider = [&](Corpus::Doc &doc) {
     if (selfOrigin && doc.origin == selfOrigin)
-      continue;
+      return;
     // Hard gate: another conversation's docs are invisible, not just
     // outranked. Global docs (session 0) stay open to everyone.
     if (sessionGate && selfSession && doc.session &&
         doc.session != selfSession)
-      continue;
-    const auto found = doc.table.starts.find(pattern);
-    if (found == doc.table.starts.end())
-      continue;
+      return;
+    const auto *found = doc.table.starts.find(pattern);
+    if (!found)
+      return;
     const auto &dhistory = doc.table.history;
     const uint32_t dsize = static_cast<uint32_t>(dhistory.size());
-    for (const uint32_t start : found->second) {
+    for (const uint32_t start : *found) {
       if (start == kNone || start + 3 >= dsize)
         continue;
+      // An occurrence's extension is bounded by `start` — one under the
+      // best found already can neither beat it nor tie, so its scan is
+      // dead work.
+      if (start < bestExtension)
+        continue;
+      const uint32_t bound =
+          std::min({extensionLimit, start, laneSize - 3});
+      // Two tokens per compare while a whole pair fits, the scalar loop
+      // handling the odd remainder — identical extension values.
       uint32_t extension = 0;
-      while (extension < start && extension < laneSize - 3 &&
+      while (extension + 2 <= bound) {
+        uint64_t a, b;
+        std::memcpy(&a, dhistory.data() + (start - 2 - extension), 8);
+        std::memcpy(&b, laneHistory.data() + (laneSize - 5 - extension), 8);
+        if (a != b)
+          break;
+        extension += 2;
+      }
+      while (extension < bound &&
              dhistory[start - 1 - extension] ==
                  laneHistory[laneSize - 4 - extension])
         ++extension;
@@ -249,7 +397,11 @@ inline uint32_t lookupCorpus(Corpus &corpus,
         bestSession = sameSession;
       }
     }
-  }
+  };
+  for (Corpus::Doc &doc : corpus.liveDocs)
+    consider(doc);
+  for (Corpus::Doc &doc : corpus.docs)
+    consider(doc);
   if (best == kNone) {
     ++corpus.misses;
     return 0;
@@ -281,14 +433,19 @@ inline uint32_t alternate(const Table &table, const uint32_t *keyTail,
   const std::vector<uint32_t> &history = table.history;
   const uint32_t size = static_cast<uint32_t>(history.size());
   const uint32_t ctxLen = size + chainLen;
-  const auto found = table.starts.find(key(keyTail));
-  if (found == table.starts.end() || ctxLen < 3)
+  const auto *found = table.starts.find(key(keyTail));
+  if (!found || ctxLen < 3)
     return kNone;
   bool have = false;
   uint32_t best = 0, bestExtension = 0, bestFollowers = 0;
-  for (const uint32_t start : found->second) {
+  for (const uint32_t start : *found) {
     if (start == kNone || start + 3 >= size ||
         history[start + 3] == chainToken)
+      continue;
+    // An occurrence's extension is bounded by `start` — one under the
+    // best found already can neither beat it nor tie, so its scan is
+    // dead work.
+    if (start < bestExtension)
       continue;
     uint32_t extension = 0;
     while (extension < start && extension < ctxLen - 3) {

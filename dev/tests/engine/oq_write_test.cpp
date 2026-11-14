@@ -157,6 +157,8 @@ struct Fixture {
   Quant four = makeQuant(256, kColumns, 4, 64, false, 13);   // the global 4/64
   Quant eight = makeQuant(256, kColumns, 8, 128, false, 17); // 8/128
   Quant six = makeQuant(256, kColumns, 6, 64, true, 19);     // 6/64, F16 meta
+  Quant two = makeQuant(256, kColumns, 2, 64, false, 37);    // 2/64, the oQ2e experts
+  Quant three = makeQuant(256, kColumns, 3, 128, false, 41); // 3/128, the oQ2.5e/oQ3e experts
   Quant smallA = makeQuant(64, kColumns, 4, 64, false, 23);  // an unaligned run
   Quant smallB = makeQuant(192, kColumns, 6, 64, false, 29);
   Quant tok = makeQuant(512, kColumns, 4, 64, false, 31);    // the token table
@@ -179,6 +181,8 @@ struct Fixture {
         R"("five":{"bits":5,"group_size":64},)"
         R"("eight":{"bits":8,"group_size":128},)"
         R"("six":{"bits":6,"group_size":64},)"
+        R"("two":{"bits":2,"group_size":64},)"
+        R"("three":{"bits":3,"group_size":128},)"
         R"("small_b":{"bits":6,"group_size":64}}})");
     Shard shard;
     const auto quantized = [&](const Quant &q, const std::string &name, const char *metaType) {
@@ -190,6 +194,8 @@ struct Fixture {
     quantized(four, "four", "BF16");
     quantized(eight, "eight", "BF16");
     quantized(six, "six", "F16");
+    quantized(two, "two", "BF16");
+    quantized(three, "three", "BF16");
     quantized(smallA, "small_a", "BF16");
     quantized(smallB, "small_b", "BF16");
     quantized(tok, "tok", "BF16");
@@ -229,6 +235,9 @@ struct Fixture {
     expect("four", 4, 64);
     expect("eight", 8, 128);
     section(3 * 256, {part(five, "five"), part(four, "four"), part(eight, "eight")});
+    expect("two", 2, 64);
+    expect("three", 3, 128);
+    section(2 * 256, {part(two, "two"), part(three, "three")});
     expect("small_a", 4, 64);
     expect("small_b", 6, 64);
     section(256, {part(smallA, "small_a"), part(smallB, "small_b")});
@@ -347,7 +356,7 @@ int main() {
     std::vector<uint8_t> bytes(image.bytes);
     affine::writeAffineImage(bytes, image);
 
-    require(image.sections.size() == 6 && image.sections[0].kind == affine::SectionKind::Copy,
+    require(image.sections.size() == 7 && image.sections[0].kind == affine::SectionKind::Copy,
             "the oQ image's sections changed shape");
 
     // The mixed-spec section: one segment per aligned part at its format.
@@ -365,9 +374,23 @@ int main() {
                     "the emitted segment's weights differ from the source's");
     }
 
-    // The unaligned run merged into one segment at its finest spec, 6/64.
+    // The 2- and 3-bit section: the oQ2e/oQ2.5e/oQ3e formats' segments.
     {
       const std::vector<Segment> segs = segments(bytes, image.sections[2]);
+      require(segs.size() == 2, "the low-bit parts did not emit one segment each");
+      requireDescriptor(segs[0], GGUF_FMT_AF2, 256, "the AF2 descriptor is inconsistent");
+      requireDescriptor(segs[1], GGUF_FMT_AF3G128, 256, "the AF3G128 descriptor is inconsistent");
+      const Quant *expected[2] = {&fixture.two, &fixture.three};
+      for (uint32_t s = 0; s < 2; ++s)
+        for (uint32_t row = 0; row < 256; ++row)
+          for (uint32_t col = 0; col < kColumns; ++col)
+            require(emittedValue(bytes, segs[s], row, col) == quantValue(*expected[s], row, col),
+                    "the low-bit segment's weights differ from the source's");
+    }
+
+    // The unaligned run merged into one segment at its finest spec, 6/64.
+    {
+      const std::vector<Segment> segs = segments(bytes, image.sections[3]);
       require(segs.size() == 1, "the unaligned run did not merge");
       requireDescriptor(segs[0], GGUF_FMT_AF6, 256, "the merged descriptor is inconsistent");
       for (uint32_t row = 0; row < 256; ++row)
@@ -380,7 +403,7 @@ int main() {
 
     // The F16 meta narrowed to BF16.
     {
-      const std::vector<Segment> segs = segments(bytes, image.sections[3]);
+      const std::vector<Segment> segs = segments(bytes, image.sections[4]);
       require(segs.size() == 1, "the F16-meta part did not emit one segment");
       requireDescriptor(segs[0], GGUF_FMT_AF6, 256, "the AF6 descriptor is inconsistent");
       for (uint32_t row = 0; row < 256; ++row)
@@ -393,7 +416,7 @@ int main() {
     // block MoE's router and scalar gate read their segments by the part's
     // count, not the section's padded one.
     {
-      const std::vector<Segment> segs = segments(bytes, image.sections[4]);
+      const std::vector<Segment> segs = segments(bytes, image.sections[5]);
       require(segs.size() == 1 && segs[0].descriptor.type == ggml::kF32 &&
                   segs[0].descriptor.outputSize == 128 && segs[0].descriptor.inputSize == kColumns &&
                   segs[0].descriptor.plane0Bytes == uint64_t(128) * kColumns * sizeof(float),
@@ -409,7 +432,7 @@ int main() {
     // The token table's native rows: one AF4 block {codes, scale, bias} per
     // group of 64.
     {
-      const affine::Section &section = image.sections[5];
+      const affine::Section &section = image.sections[6];
       GgufTensorDescriptor descriptor;
       std::memcpy(&descriptor, bytes.data() + section.offset, sizeof descriptor);
       require(descriptor.type == GGUF_PRIVATE_TYPE_AF4 && descriptor.outputSize == fixture.tok.rows &&

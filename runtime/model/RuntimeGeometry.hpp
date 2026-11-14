@@ -50,6 +50,16 @@ struct RuntimeGeometry final {
         [](const auto &weights) { return targetModelGeometry(weights); },
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
+    // The descriptor's layout carries the declared DuoAttention policy
+    // only; the resolved one (declared or RICHENGINE_DUO_OVERRIDE) lives on
+    // duoAttention — the per-layer plans read it through kvLayout.duo.
+    result.target.kvLayout.duo = result.target.duoAttention;
+    // DuoAttention's kernels exist for int8/int4 pages only; on any other
+    // KV format the policy drops to dense rather than fail the run.
+    if (format != kv::Format::Int8 && format != kv::Format::Int4) {
+      result.target.duoAttention = {};
+      result.target.kvLayout.duo = {};
+    }
     result.draft = std::visit(
         [](const auto &weights) { return weights.layout; }, package.draft);
     result.tuning = package.descriptor.tuning;

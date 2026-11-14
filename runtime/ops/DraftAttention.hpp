@@ -148,10 +148,9 @@ public:
                           metal::MetalBuffer residual,
                           metal::MetalBuffer output,
                           const DraftAttentionPlan &plan);
-  static void addReorder(metal::CommandGraph &graph,
-                         metal::MetalBuffer grouped,
-                         metal::MetalBuffer packed,
-                         const DraftAttentionPlan &plan);
+  // The split/reduce core writes the normalized rows in the output
+  // projection's [row][head][dim] order; no reorder pass follows it.
+
   // The context writers. A row of contextKv holds its keys, then its values
   // (kvHeads * headDimension each); its normalized, rotated keys and its
   // values go to its position's slot of the ring.

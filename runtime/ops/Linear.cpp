@@ -201,6 +201,38 @@ Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t 
                                                                 groups / format.meta_groups * format.meta_bytes))}});
 }
 
+Projection Projection::rowRange(const metal::MetalBackend &backend, uint32_t firstRow,
+                                uint32_t rows) const {
+  requirePlaneViews(*this);
+  if (!rows || rows % QUANT_TILE_ROWS || firstRow % QUANT_TILE_ROWS ||
+      uint64_t{firstRow} + rows > outputSize)
+    throw std::invalid_argument(
+        "a view of plane rows takes whole plane tiles inside the projection's rows");
+  // Rows [firstRow, firstRow + rows) of a plane of `rowBytes` bytes per row:
+  // whole tiles, so a contiguous byte range `rows * rowBytes` long.
+  const auto view = [&](const metal::MetalBuffer &plane, uint64_t rowBytes) {
+    return rowBytes ? backend.view(plane, firstRow * rowBytes, rows * rowBytes)
+                    : metal::MetalBuffer{};
+  };
+  if (layout() == WeightLayout::Affine64) {
+    const uint64_t groups = inputSize / kQuantGroup;
+    const AffineWeights &planes = affine();
+    return Projection(rows, inputSize,
+                      AffineWeights{view(planes.weights, groups * kQuantGroup / 2),
+                                    view(planes.scales, groups * 2),
+                                    view(planes.biases, groups * 2)});
+  }
+  const QuantizedSegment &segment = blocks().segments.front();
+  const QuantFormat &format = segment.format();
+  const uint64_t groups = inputSize / 32;
+  return Projection(rows, inputSize,
+                    BlockWeights{{QuantizedSegment::planes(segment.formatId, rows, inputSize,
+                                                           view(segment.plane0, groups * format.plane0_bytes),
+                                                           view(segment.plane1, groups * format.plane1_bytes),
+                                                           view(segment.meta,
+                                                                groups / format.meta_groups * format.meta_bytes))}});
+}
+
 Projection Projection::leadingInputs(uint32_t inputs) const {
   requirePlaneViews(*this);
   const bool affineWeights = layout() == WeightLayout::Affine64;
@@ -865,6 +897,16 @@ uint32_t fastInt8Skip() noexcept {
   static const uint32_t mask = envUint("RICHENGINE_PREFILL_I8_SKIP", 0);
   return mask;
 }
+// RICHENGINE_PREFILL_I8_AFFINE: the affine (MLX) half of the int8 prefill
+// flag needs its own opt-in — measured ~2.4x slower end-to-end than the
+// bf16 tensor-op path on Qwen3.8-27B-4bit MLX (M5 Pro, 32K prompt), because
+// the weights stay bf16-packed and the extra quantize pass costs more than
+// the narrower activation math saves. The GGUF af*g128 int8 tiles keep the
+// main flag; they run true int8xint8 fragments.
+bool fastInt8AffinePrefill() {
+  static const bool on = envFlag("RICHENGINE_PREFILL_I8_AFFINE");
+  return on;
+}
 
 bool packsPrefill(const DevicePolicy &device, LinearWorkload w) noexcept {
   return packedPrefillEnabled() && !packedTilesDisabled() &&
@@ -1011,11 +1053,15 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "rotated input");
     // The GGUF decode kernels produce no output when they replay from an
     // indirect command buffer on this driver (the gguf MoE expert and
-    // embedding kernels fail the same way): a suspension keeps them out of
-    // every enclosing baked span. RICHENGINE_GPU_SPANS marks them a
-    // GPU-encoded span instead — the same replay the suspension avoids,
-    // written on device where it produces correct output.
-    const bool gpu = tuning().gpuSpans;
+    // embedding kernels fail the same way): they must stay out of every
+    // enclosing baked span. Decode plans ride a GPU-encoded span instead —
+    // gpu_encode writes the same indirect commands on device, where they
+    // produce correct output (tuning().ggufDecodeGpuSpans, on by default;
+    // RICHENGINE_GPU_SPANS opts prefill chunks in too). When neither marks
+    // them, the suspension keeps them out of every span as before.
+    const bool gpu = tuning().gpuSpans ||
+                     (w.phase == LinearPhase::Decode &&
+                      tuning().ggufDecodeGpuSpans);
     gpu ? graph.beginGpuSpan() : graph.suspendBakedSpan();
     addGguf(graph, b, p, selected, gate);
     gpu ? graph.endGpuSpan() : graph.resumeBakedSpan();
@@ -1034,7 +1080,7 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireAffineProjection(p, w.matrix);
   if (gate) requireAffineProjection(*gate, w.matrix);
   const AffineWeights &weights = p.affine();
-  if (fastInt8Prefill() && w.phase == LinearPhase::Prefill &&
+  if (fastInt8Prefill() && fastInt8AffinePrefill() && w.phase == LinearPhase::Prefill &&
       w.epilogue != LinearEpilogue::GateUp && k % 64 == 0 && n % 256 == 0 &&
       !(fastInt8Skip() & (1u << static_cast<uint32_t>(w.epilogue)))) {
     // Integer NA path: quantize the chunk's input into the two-term uint8

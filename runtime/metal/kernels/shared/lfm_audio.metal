@@ -300,7 +300,7 @@ kernel void lfm_audio_gemm_qkv(
         auto a_slice = a.template slice<BK, TileM>(chunk * BK, 0);
         auto b_slice = b.template slice<BK, TileN>(chunk * BK, 0);
         operation.run(a_slice, b_slice, accumulated);
-        threadgroup_barrier(mem_flags::mem_none);
+        threadgroup_barrier(mem_flags::mem_none, memory_order_relaxed);
     }
     auto converted = operation.template get_destination_cooperative_tensor<
         decltype(a0), decltype(b0), bfloat>();
@@ -350,7 +350,7 @@ kernel void lfm_audio_gemm_lin_out(
         auto a_slice = a.template slice<BK, TileM>(chunk * BK, 0);
         auto b_slice = b.template slice<BK, TileN>(chunk * BK, 0);
         operation.run(a_slice, b_slice, accumulated);
-        threadgroup_barrier(mem_flags::mem_none);
+        threadgroup_barrier(mem_flags::mem_none, memory_order_relaxed);
     }
     auto converted = operation.template get_destination_cooperative_tensor<
         decltype(a0), decltype(b0), float>();
@@ -437,14 +437,14 @@ kernel void lfm_audio_qkv_prepare(
     float squares = q_val * q_val;
     squares = simd_sum(squares);
     if (simd_lane == 0) reductions[simd_group] = squares;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     const float q_total = reductions[0] + reductions[1] + reductions[2];
     const float q_inv = rsqrt(q_total / float(kAudioHeadDim) + kAudioNormEps);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     squares = k_val * k_val;
     squares = simd_sum(squares);
     if (simd_lane == 0) reductions[simd_group] = squares;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     const float k_total = reductions[0] + reductions[1] + reductions[2];
     const float k_inv = rsqrt(k_total / float(kAudioHeadDim) + kAudioNormEps);
 
@@ -601,12 +601,12 @@ kernel void lfm_audio_layer_norm(
         sum += float(row[column]);
     sum = simd_sum(sum);
     if (simd_lane == 0) reductions[simd_group] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float total = 0.0f;
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) total += reductions[i];
     const float mean = total / float(params.count);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
     float squares = 0.0f;
     for (uint column = thread_index; column < params.count; column += 256) {
@@ -615,7 +615,7 @@ kernel void lfm_audio_layer_norm(
     }
     squares = simd_sum(squares);
     if (simd_lane == 0) reductions[simd_group] = squares;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     float variance = 0.0f;
     #pragma unroll
     for (ushort i = 0; i < 8; ++i) variance += reductions[i];

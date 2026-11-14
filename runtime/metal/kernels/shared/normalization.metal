@@ -134,7 +134,7 @@ inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *we
   const uint vectors = width / 4;
   for (uint column = tid; column < vectors; column += RICHENGINE_STAGED_NORM_THREADS)
     stage[column] = input[row * vectors + column];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // The first 256 threads reduce the row as rms_inverse does; the other
   // simdgroups' partials are zero and unread.
   const float sum = tid < 256 ? row_squares((threadgroup const bfloat *)stage, width, tid) : 0.0f;
@@ -164,7 +164,9 @@ NORM_RMS_STAGED(norm_rms_staged_e5_f32, packed_float4, 1e-5f)
 // the same rounded bfloat values. No additional dispatch is needed. The table
 // takes a simdgroup per 64-column span, so the first chunk's span pairs are
 // loaded (L2-hot input, weights) alongside the reduction's columns.
-template <class Table, class W>
+// WriteRows=false (_nr variants) skips the bf16 row stores: the consumer
+// reads only the table and sums, so the row write is dead bandwidth.
+template <class Table, class W, bool WriteRows = true>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            device bfloat *output, device bfloat *table, device float *sums,
                            uint width, uint row, uint tid, uint lane, uint sg,
@@ -178,8 +180,10 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
       const uint k = g * 64 + lane * 2;
       const bfloat a = bfloat((float(row_input[k]) * inverse) * float(weight[k]));
       const bfloat b = bfloat((float(row_input[k + 1]) * inverse) * float(weight[k + 1]));
-      output[row * width + k] = a;
-      output[row * width + k + 1] = b;
+      if constexpr (WriteRows) {
+        output[row * width + k] = a;
+        output[row * width + k + 1] = b;
+      }
       Table::write(table + ulong(row / 8) * width * 8,
                    sums + ulong(row / 8) * Table::sums_per_tile(width),
                    width, g, row % 8, lane, a, b);
@@ -210,8 +214,10 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
         break;
       const bfloat a = bfloat((float(in[j].x) * inverse) * float(w[j].x));
       const bfloat b = bfloat((float(in[j].y) * inverse) * float(w[j].y));
-      output[row * width + k] = a;
-      output[row * width + k + 1] = b;
+      if constexpr (WriteRows) {
+        output[row * width + k] = a;
+        output[row * width + k + 1] = b;
+      }
       Table::write(table + ulong(row / 8) * width * 8,
                    sums + ulong(row / 8) * Table::sums_per_tile(width), width, k / 64, row % 8, lane,
                    a, b);
@@ -226,7 +232,17 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float reductions[8]; \
-    norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions, Eps); \
+    norm_rms_table<Table, W>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions, Eps); \
+  }
+#define NORM_RMS_TABLE_NR(Name, Table, W, Eps) \
+  kernel void Name(device const bfloat *input [[buffer(0)]], \
+      device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
+      device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
+      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+      uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    norm_rms_table<Table, W, false>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions, Eps); \
   }
 // The reachable pairs: Table64 feeds affine projections, from the affine targets' and the draft's bf16 norms.
 // Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
@@ -238,6 +254,13 @@ NORM_RMS_TABLE(norm_rms_table64_decode_e5, q4sg::Table64, bfloat, 1e-5f)
 NORM_RMS_TABLE(norm_rms_table16_decode_e5, gguf_sg::Table16, bfloat, 1e-5f)
 NORM_RMS_TABLE(norm_rms_table16_decode_e5_f32, gguf_sg::Table16, float, 1e-5f)
 #undef NORM_RMS_TABLE
+NORM_RMS_TABLE_NR(norm_rms_table64_decode_nr, q4sg::Table64, bfloat, kRmsEpsilon)
+NORM_RMS_TABLE_NR(norm_rms_table16_decode_nr, gguf_sg::Table16, bfloat, kRmsEpsilon)
+NORM_RMS_TABLE_NR(norm_rms_table16_decode_f32_nr, gguf_sg::Table16, float, kRmsEpsilon)
+NORM_RMS_TABLE_NR(norm_rms_table64_decode_e5_nr, q4sg::Table64, bfloat, 1e-5f)
+NORM_RMS_TABLE_NR(norm_rms_table16_decode_e5_nr, gguf_sg::Table16, bfloat, 1e-5f)
+NORM_RMS_TABLE_NR(norm_rms_table16_decode_e5_f32_nr, gguf_sg::Table16, float, 1e-5f)
+#undef NORM_RMS_TABLE_NR
 
 // The same fused-output pattern for the mxfp4p operand (LinearInput::Packed):
 // norm_rms_packed_decode writes the ordinary bf16 row plus the slot-permuted
@@ -248,7 +271,7 @@ NORM_RMS_TABLE(norm_rms_table16_decode_e5_f32, gguf_sg::Table16, float, 1e-5f)
 // the row per iteration and lane on element lane of it, so simd_max is the
 // group's max. The packed value is the rounded bf16 output element scaled by
 // 2^-e, as gguf_pack_half computes it.
-template <class W>
+template <class W, bool WriteRows = true>
 inline void norm_rms_packed_row(device const bfloat *input, device const W *weight,
                                 device bfloat *output, device half *packed, device uchar *exponents,
                                 uint width, uint row, uint tid, uint lane, uint sg,
@@ -260,7 +283,7 @@ inline void norm_rms_packed_row(device const bfloat *input, device const W *weig
   device half *row_packed = packed + ulong(row) * width;
   device uchar *row_exponents = exponents + ulong(row) * (width / 32);
   const auto store = [&](uint column, bfloat v) {
-    output[row * width + column] = v;
+    if constexpr (WriteRows) output[row * width + column] = v;
     const float a = column < width ? float(v) : 0.0f;
     const float m = simd_max(fabs(a));
     const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
@@ -306,11 +329,26 @@ inline void norm_rms_packed_row(device const bfloat *input, device const W *weig
     threadgroup float reductions[8]; \
     norm_rms_packed_row<W>(input, weight, output, packed, exponents, width, row, tid, lane, sg, reductions, Eps); \
   }
+#define NORM_RMS_PACKED_NR(Name, W, Eps) \
+  kernel void Name(device const bfloat *input [[buffer(0)]], \
+      device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
+      device half *packed [[buffer(3)]], device uchar *exponents [[buffer(4)]], \
+      constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
+      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+      uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[8]; \
+    norm_rms_packed_row<W, false>(input, weight, output, packed, exponents, width, row, tid, lane, sg, reductions, Eps); \
+  }
 NORM_RMS_PACKED(norm_rms_packed_decode, bfloat, kRmsEpsilon)
 NORM_RMS_PACKED(norm_rms_packed_decode_f32, float, kRmsEpsilon)
 NORM_RMS_PACKED(norm_rms_packed_decode_e5, bfloat, 1e-5f)
 NORM_RMS_PACKED(norm_rms_packed_decode_e5_f32, float, 1e-5f)
+NORM_RMS_PACKED_NR(norm_rms_packed_decode_nr, bfloat, kRmsEpsilon)
+NORM_RMS_PACKED_NR(norm_rms_packed_decode_f32_nr, float, kRmsEpsilon)
+NORM_RMS_PACKED_NR(norm_rms_packed_decode_e5_nr, bfloat, 1e-5f)
+NORM_RMS_PACKED_NR(norm_rms_packed_decode_e5_f32_nr, float, 1e-5f)
 #undef NORM_RMS_PACKED
+#undef NORM_RMS_PACKED_NR
 
 // Scaleless RMS norm (Gemma 4's router input and any weight-free norm): the
 // row times its inverse RMS only. `width` doubles as the column count; eps is

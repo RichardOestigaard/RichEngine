@@ -11,6 +11,7 @@
 #include "../../../runtime/model/WeightStore.hpp"
 #include "../../../runtime/ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "../../../runtime/Tuning.hpp"
 #include "metal/abi/MoE.h"
 
 #import <Foundation/Foundation.h>
@@ -382,7 +383,8 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   const auto *groupedInput = static_cast<const uint8_t *>(
       fixture.buffers.scratch.groupedInput.contents());
   const uint64_t inputRowBytes = uint64_t{kHidden} * kBFloat16Bytes;
-  const uint64_t scoresBytes = uint64_t{rows} * kStorageColumns * sizeof(float);
+  const uint64_t scoresBytes =
+      uint64_t{rows} * (kStorageColumns + 1) * sizeof(float);
   for (uint32_t tile = 0; tile < *tileCount; ++tile) {
     const uint32_t liveRows = tiles[tile * 2 + 1];
     require(liveRows > 0 && liveRows <= tileRows,
@@ -567,17 +569,20 @@ void planBounds() {
               "prefill plans run the split 32-row expert passes over their actual rows");
       checkPlan(plan);
     }
+    MoeConfig decodeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)};
+    decodeConfig.routeM16 = richengine::tuning().moeRouteM16;
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = shipped.moeDecode(shape, lanes, 8);
-      require(plan.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)} &&
+      require(plan.configuration() == decodeConfig &&
                   !plan.splitExperts() && plan.rows() == lanes * 8,
               "decode plans run the fused 8-row expert tile over the DFlash rows");
       checkPlan(plan);
       // The Apple9 four-simdgroup tiles change only the down pass's column
       // grid: same rows, tiles and scratch as the shipped plan.
+      MoeConfig narrowConfig = decodeConfig;
+      narrowConfig.m8Simdgroups = MoeExpertSimdgroups::Four;
       const MoePlan narrow = plans(9).moeDecode(shape, lanes, 8);
-      require(narrow.configuration() == MoeConfig{MoeExpertTile::M8, moeRouteWideRows(kGpuCores),
-                                                  MoeExpertSimdgroups::Four} &&
+      require(narrow.configuration() == narrowConfig &&
                   narrow.rows() == plan.rows() && narrow.tileRows() == plan.tileRows() &&
                   narrow.maximumTiles() == plan.maximumTiles() && !narrow.splitExperts() &&
                   narrow.workspace() == plan.workspace(),
@@ -610,22 +615,39 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
   const auto dispatches = graph.dispatches();
   const bool split = plan.splitExperts();
   const size_t expertPasses = split ? 3 : 2;
+  // RICHENGINE_MOE_INDIRECT: the fused decode gate/up reads the rows'
+  // inputs through grouped_routes and no gather runs.
+  const bool indirect =
+      !split && richengine::tuning().moeIndirectGather &&
+      plan.tileRows() == 8 && plan.shape().hiddenSize % 256 == 0;
   // Two router dispatches, grouping, the gather the fused decode tile reads,
   // the expert passes and combine. The split passes read the rows through
   // grouped_routes and gather nothing.
-  const size_t gather = split ? 0 : 1;
+  const size_t gather = split || indirect ? 0 : 1;
   require(dispatches.size() == 4 + gather + expertPasses,
           "MoE plan must encode the entire operator");
-  const auto route =
+  auto route =
       richengine::ops::moeRouteTile(plan.rows(), plan.configuration().routeWideRows);
-  const std::string scores = route.rows == 8 ? "moe_route_scores_q8_m8"
-                                             : "moe_route_scores_q8_m32";
+  if (plan.configuration().routeM16 && route.rows == 8)
+    route = richengine::ops::MoeRouteTile{16, 64};
+  const std::string scores = route.rows == 8   ? "moe_route_scores_q8_m8"
+                             : route.rows == 16 ? "moe_route_scores_q8_m16"
+                                                : "moe_route_scores_q8_m32";
+  const std::string gatherName =
+      !split && plan.tileRows() == 8 && richengine::tuning().moeSmallRows
+          ? "moe_gather_rows_small"
+          : "moe_gather_rows";
   const size_t experts = 3 + gather;
   const size_t combine = experts + expertPasses;
+  // RICHENGINE_MOE_TILE_MAJOR swaps the fused decode expert grids' axes
+  // (the split prefill passes keep theirs); the kernels remap group through
+  // params.tile_major.
+  const bool tileMajor = !split && richengine::tuning().moeTileMajor &&
+                         plan.phase() == MoePhase::Decode;
   require(dispatches[0].pipelineName == scores &&
               dispatches[1].pipelineName == "moe_route_select_q8" &&
               dispatches[2].pipelineName == "moe_group_routes" &&
-              (split || dispatches[3].pipelineName == "moe_gather_rows") &&
+              (split || indirect || dispatches[3].pipelineName == gatherName) &&
               dispatches[combine].pipelineName == "moe_combine",
           "MoE plan chose inconsistent pipelines");
   if (split) {
@@ -648,23 +670,39 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
     const bool four = plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Four;
-    const std::string gateUp = four ? "moe_expert_gate_up_q4_m8_n128_sg4"
-                                    : "moe_expert_gate_up_q4_m8";
+    const std::string gateUp =
+        indirect ? (four ? "moe_expert_gate_up_q4_m8_n128_sg4_indirect"
+                         : "moe_expert_gate_up_q4_m8_indirect")
+                 : (four ? "moe_expert_gate_up_q4_m8_n128_sg4"
+                         : "moe_expert_gate_up_q4_m8");
     const std::string down = four ? "moe_expert_down_q4_m8_n256_sg4"
                                   : "moe_expert_down_q4_m8";
     require(dispatches[experts].pipelineName == gateUp &&
                 dispatches[experts + 1].pipelineName == down,
             "fused MoE plan chose inconsistent expert pipelines");
     const uint32_t threads = four ? 128 : 256;
-    require(dispatches[experts].threadgroups.x == kIntermediate / 128 &&
-                dispatches[experts + 1].threadgroups.x == kHidden / (four ? 256 : 128) &&
+    const auto axis = [&](uint32_t columns, uint32_t tiles_,
+                          uint32_t observed) {
+      return observed == (tileMajor ? tiles_ : columns);
+    };
+    const uint32_t gateColumns = kIntermediate / 128;
+    const uint32_t downColumns = kHidden / (four ? 256 : 128);
+    require(axis(gateColumns, plan.maximumTiles(),
+                 dispatches[experts].threadgroups.x) &&
+                axis(downColumns, plan.maximumTiles(),
+                     dispatches[experts + 1].threadgroups.x) &&
+                axis(plan.maximumTiles(), gateColumns,
+                     dispatches[experts].threadgroups.y) &&
+                axis(plan.maximumTiles(), downColumns,
+                     dispatches[experts + 1].threadgroups.y) &&
                 dispatches[experts].threadsPerThreadgroup.x == threads &&
                 dispatches[experts + 1].threadsPerThreadgroup.x == threads,
             "fused MoE plan chose inconsistent column tiles or threadgroup width");
   }
   bool tileGrids = true;
   for (size_t pass = experts; pass < combine; ++pass)
-    tileGrids &= dispatches[pass].threadgroups.y == plan.maximumTiles();
+    tileGrids &= tileMajor ? dispatches[pass].threadgroups.x == plan.maximumTiles()
+                           : dispatches[pass].threadgroups.y == plan.maximumTiles();
   for (size_t pass = 0; pass <= combine; ++pass) {
     const bool expertPass = pass >= experts && pass < combine;
     require((expertPass ||
@@ -679,7 +717,7 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
               dispatches[0].threadgroups.y ==
                   (plan.shape().experts + route.experts - 1) / route.experts &&
               dispatches[1].threadgroups.x == plan.rows() &&
-              (split || dispatches[3].threadgroups.x == plan.maximumTiles()) &&
+              (split || indirect || dispatches[3].threadgroups.x == plan.maximumTiles()) &&
               tileGrids &&
               dispatches[combine].threadgroups.x == plan.rows(),
           "MoE plan chose inconsistent dispatch bounds");
@@ -800,22 +838,32 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   const uint64_t scoreBytes = uint64_t{kMaximumRows} * kStorageColumns * 4;
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
+  MetalBuffer middle = shared(backend, scoreBytes, "scores-m16");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
-    const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
+    const MoeRouteParams params{rows, kHidden, kExperts, kTopK, 0};
     CommandGraph graph;
     graph.add("moe_route_scores_q8_m8",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
-               router.planes.biases, narrow},
+               router.planes.biases, narrow, router.planes.weights,
+               router.planes.scales, router.planes.biases},
               params, {(rows + 7) / 8, kStorageColumns / 32, 1});
+    graph.add("moe_route_scores_q8_m16",
+              {fixture.buffers.input, router.planes.weights, router.planes.scales,
+               router.planes.biases, middle, router.planes.weights,
+               router.planes.scales, router.planes.biases},
+              params, {(rows + 15) / 16, kStorageColumns / 64, 1});
     graph.add("moe_route_scores_q8_m32",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,
-               router.planes.biases, wide},
+               router.planes.biases, wide, router.planes.weights,
+               router.planes.scales, router.planes.biases},
               params, {(rows + 31) / 32, kStorageColumns / 128, 1});
     (void)backend.submitCommand(graph.dispatches());
     const std::string label = "router tiles rows=" + std::to_string(rows);
     require(std::memcmp(narrow.contents(), wide.contents(),
-                        uint64_t{rows} * kStorageColumns * 4) == 0,
-            label + ": 8-row and 32-row tiles disagree");
+                        uint64_t{rows} * kStorageColumns * 4) == 0 &&
+                std::memcmp(narrow.contents(), middle.contents(),
+                            uint64_t{rows} * kStorageColumns * 4) == 0,
+            label + ": 8-row, 16-row and 32-row tiles disagree");
     const auto *values = static_cast<const float *>(narrow.contents());
     for (uint32_t row = 0; row < rows; ++row) {
       for (uint32_t expert = 0; expert < kStorageColumns; ++expert) {

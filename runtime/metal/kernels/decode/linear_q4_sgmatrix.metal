@@ -142,7 +142,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
       // must match it or the consumer's offset correction drifts.
       pbuf[(sg * 8 + fn) * 8 + fm] = float(bfloat(value.x));
       pbuf[(sg * 8 + fn + 1) * 8 + fm] = float(bfloat(value.y));
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       // Row r's partial is the sum of pbuf[sg][r][fm] over all 32 lanes.
       if (lane < 8) {
         float s = 0;

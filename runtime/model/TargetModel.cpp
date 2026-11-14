@@ -711,7 +711,7 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
   // blocks carry each lane's committed history, which changes every step.
   step.graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
-      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input());
+      step.graph, input, norm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch, inputPlan.input(), false);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch, .prepared = normalized},
              mixer.inputProjection, inputPlan);
@@ -782,7 +782,7 @@ void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &no
   const bool emitTable = gateUpPlan.usesSimdgroup() && downPlan.usesSimdgroup();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
-      b.linearScratch, gateUpPlan.input());
+      b.linearScratch, gateUpPlan.input(), false);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
               .scratch = b.linearScratch, .prepared = normalized, .emitTable64 = emitTable},
@@ -886,6 +886,25 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
       // the logits_lane_mask lanes' rows to the logits buffer; the plain
       // ones bind it and never touch it.
       const bool emitLogits = fused->headArgs.logits_lane_mask != 0;
+      const uint32_t groups = head.inputSize / 64;
+      const uint32_t split = groups / 2;
+      if (tuning().headKsplit && !emitLogits && liveRows > 48 &&
+          liveRows <= 64 && groups >= 2 && split && split < groups &&
+          head.outputSize % 64 == 0 &&
+          fused->headArgs.output_stride % 64 == 0) {
+        HeadArgmaxSplitParams params{fused->headArgs, 0, split};
+        graph.add(std::string("decode_head_argmax_q4_ksplit_write"),
+                  {finalHidden, w.weights, w.scales, w.biases, logits},
+                  params, {head.outputSize / 64, 1, 1}, {256, 1, 1});
+        params.first_group = split;
+        params.end_group = groups;
+        graph.add(std::string("decode_head_argmax_q4_ksplit_finish"),
+                  {finalHidden, w.weights, w.scales, w.biases, logits,
+                   fused->headArgmaxValues, fused->headArgmaxIndices},
+                  params, {head.outputSize / 64, 1, 1}, {256, 1, 1});
+        graph.endBakedSpan();
+        return;
+      }
       const std::string kernel =
           std::string(
               t256             ? "decode_head_argmax_q4_m16_t256"
@@ -912,7 +931,7 @@ void TargetModel::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hi
   graph.beginBakedSpan();
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       graph, std::move(hidden), weightsBase_.finalNorm, finalHidden, geometry_.hiddenSize,
-      lanes * verifyStride, scratch, logitsPlan.input());
+      lanes * verifyStride, scratch, logitsPlan.input(), false);
   linear.add(graph,
              {.input = std::move(finalHidden), .output = logits, .scratch = scratch,
               .prepared = normalized},
@@ -947,7 +966,7 @@ bool TargetModel::addScoreHeadColumns(
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       graph, std::move(hidden), weightsBase_.finalNorm, finalHidden,
       geometry_.hiddenSize, lanes * ExecutionLimits::targetVerifyRows,
-      scratch, logitsPlan.input());
+      scratch, logitsPlan.input(), false);
   const bool done = linear.addGgufHeadColumns(
       graph, backend_,
       {.input = finalHidden,

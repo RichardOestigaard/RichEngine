@@ -1,5 +1,5 @@
-// The oQ (oMLX) formats' kernels (metal/abi/QuantFormat.h, ids
-// GGUF_FMT_AF5..GGUF_FMT_AF8G128): the staged tile's dequantization of the
+// The oQ (oMLX) formats' kernels (metal/abi/QuantFormat.h, the stream-packed
+// ids GGUF_FMT_AF2..GGUF_FMT_AF8G128): the staged tile's dequantization of the
 // slot-order code bitstream (gguf_test_dequant_*, kernels/common/oq_formats.h)
 // against the CPU reference of GgufFormatReference.hpp, and the native-row
 // token gathers (ops::Embedding, kernels/shared/embedding.metal) of every AF
@@ -43,12 +43,18 @@ MetalBuffer upload(MetalBackend &backend, const std::vector<float> &values) {
   return buffer;
 }
 
+// The stream-packed oQ formats: AF4's pair words and AF4P's manifest order
+// are not this bitstream, so the dequant check names them.
+constexpr uint32_t kStreamFormats[] = {GGUF_FMT_AF2,  GGUF_FMT_AF3,  GGUF_FMT_AF5,  GGUF_FMT_AF6,
+                                       GGUF_FMT_AF8,  GGUF_FMT_AF2G128, GGUF_FMT_AF3G128, GGUF_FMT_AF4G128,
+                                       GGUF_FMT_AF5G128, GGUF_FMT_AF6G128, GGUF_FMT_AF8G128};
+
 // Every weight of every oQ format is the half rounding of its fp32 value
 // s * code + bias (gguf-dequant's check for the GGML formats).
 int dequant(MetalBackend &backend, std::mt19937 &rng) {
   constexpr uint32_t N = 256, K = 1024, kGroup = 32, kThreads = 32;
   int failures = 0;
-  for (uint32_t fi = GGUF_FMT_AF5; fi <= GGUF_FMT_AF8G128; ++fi) {
+  for (const uint32_t fi : kStreamFormats) {
     const Fmt f = Fmt(fi);
     std::vector<float> values;
     const Packed planes = repack(f, makeNative(f, N, K, rng), N, K, &values);
@@ -56,7 +62,7 @@ int dequant(MetalBackend &backend, std::mt19937 &rng) {
     const MetalBuffer output = sharedBuffer(backend, uint64_t{N} * K * 2);
     CommandGraph graph;
     graph.add(std::string(richengine::ops::kGgufTestDequant) + fmtName(f), {w0, meta, meta, output},
-              GgufDecodeParams{K, 1, N, 0}, {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
+              GgufDecodeParams{K, 1, N, 0, false}, {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
     static_cast<void>(backend.submitCommand(graph.dispatches()));
     const auto *got = static_cast<const uint16_t *>(output.contents());
     size_t differ = 0;
@@ -74,8 +80,12 @@ int dequant(MetalBackend &backend, std::mt19937 &rng) {
 int tokenGather(MetalBackend &backend, std::mt19937 &rng) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024;
   const std::vector<uint32_t> tokens{kVocabulary - 1, 0, 17, 17, 42, 3, kVocabulary - 1, 29, 8};
+  // Every AF format but AF4P's packed manifest: ids 19..26 and 28..31.
+  constexpr uint32_t kGatherFormats[] = {GGUF_FMT_AF4,  GGUF_FMT_AF5,  GGUF_FMT_AF6,  GGUF_FMT_AF8,
+                                         GGUF_FMT_AF4G128, GGUF_FMT_AF5G128, GGUF_FMT_AF6G128, GGUF_FMT_AF8G128,
+                                         GGUF_FMT_AF2, GGUF_FMT_AF3, GGUF_FMT_AF2G128, GGUF_FMT_AF3G128};
   int failures = 0;
-  for (uint32_t fi = GGUF_FMT_AF4; fi <= GGUF_FMT_AF8G128; ++fi) {
+  for (const uint32_t fi : kGatherFormats) {
     const Fmt f = Fmt(fi);
     const std::vector<uint8_t> native = makeNative(f, kVocabulary, kHidden, rng);
     const richengine::ops::EmbeddingWeights table(kVocabulary, kHidden,

@@ -129,13 +129,13 @@ kernel void canvas_row_stats(
   threadgroup float maxima[8];
   if (thread_index % 32 == 0)
     maxima[thread_index / 32] = row_max_v;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float m = simd_max(thread_index < 8 ? maxima[thread_index] : -INFINITY);
   // Broadcast via a second scratch write so every thread agrees.
   threadgroup float row_maximum[1];
   if (thread_index == 0)
     row_maximum[0] = m;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float mx = row_maximum[0];
 
   float sum = 0.0f, weighted = 0.0f;
@@ -165,7 +165,7 @@ kernel void canvas_row_stats(
     best_values[sg] = s_best;
     best_indices[sg] = best_index;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f, wtotal = 0.0f, bv = -INFINITY;
     for (uint i = 0; i < 8; ++i) {
@@ -178,16 +178,16 @@ kernel void canvas_row_stats(
     best_values[0] = bv;
     entropy[row] = fast::log(total) + mx - wtotal / total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // Argmax: the lowest index holding the row max, via an atomic min.
   threadgroup atomic_uint argmax_out[1];
   if (thread_index == 0)
     atomic_store_explicit(&argmax_out[0], vocabulary, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (best == best_values[0])
     atomic_fetch_min_explicit(&argmax_out[0], best_index,
                               memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
   // Multinomial draw: u in [0, Z). Each thread's slice mass; an exclusive
   // scan (thread order) finds the owning thread.
@@ -196,7 +196,7 @@ kernel void canvas_row_stats(
       richengine_canvas_uniform(params.seed, row) * Z;
   threadgroup float mass[256];
   mass[thread_index] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float running = 0.0f;
     for (uint i = 0; i < 256; ++i) {
@@ -205,7 +205,7 @@ kernel void canvas_row_stats(
       running += m_i;
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float prefix = mass[thread_index];
   const bool owner = u >= prefix && u < prefix + sum;
   if (owner) {
@@ -277,7 +277,7 @@ kernel void canvas_entropy_accept(
   const uint i = thread_index;
   keys[i] = i < params.rows ? entropy[i] : INFINITY;
   order[i] = i;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // Bitonic sort, ascending by entropy; the original index travels along.
   for (uint k = 2; k <= CanvasRows; k <<= 1) {
     for (uint j = k >> 1; j > 0; j >>= 1) {
@@ -295,7 +295,7 @@ kernel void canvas_entropy_accept(
           order[ixj] = to;
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
   }
   // Exclusive prefix sum over the sorted entropies (256 additions, thread 0;
@@ -312,7 +312,7 @@ kernel void canvas_entropy_accept(
     }
     stats[0] = live_total / float(params.rows);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // Rank i's row: accept iff the cheaper positions' mass fits the bound.
   const uint position = order[i];
   const bool live = position < params.rows;
@@ -330,13 +330,13 @@ kernel void canvas_entropy_accept(
       live && argmax_cur[position] != argmax_in[position];
   threadgroup atomic_uint *mismatches =
       (threadgroup atomic_uint *)&keys[0];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (i == 0)
     atomic_store_explicit(mismatches, 0u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (mismatch)
     atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (i == 0)
     stats[1] = atomic_load_explicit(mismatches, memory_order_relaxed) == 0
                    ? 1.0f
@@ -407,11 +407,11 @@ inline float2 richengine_canvas_softmax_stats(
   float sg_max = simd_max(local_max);
   if (thread_index % 32 == 0)
     reduce8[thread_index / 32] = sg_max;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0)
     broadcast[0] =
         simd_max(thread_index < 8 ? reduce8[thread_index] : -INFINITY);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float mx = broadcast[0];
   float sum = 0.0f;
   for (uint i = begin; i < end; ++i)
@@ -419,14 +419,14 @@ inline float2 richengine_canvas_softmax_stats(
   const float sg_sum = simd_sum(sum);
   if (thread_index % 32 == 0)
     reduce8[thread_index / 32] = sg_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f;
     for (uint i = 0; i < 8; ++i)
       total += reduce8[i];
     broadcast[0] = total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   return float2(mx, broadcast[0]);
 }
 
@@ -471,18 +471,18 @@ kernel void canvas_soft_embed_exact(
       acc[dim] = 0.0f;
   }
   threadgroup float prob[256];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint v0 = 0; v0 < vocabulary; v0 += 256) {
     const uint v = v0 + thread_index;
     float p = 0.0f;
     if (v < vocabulary)
       p = fast::exp(r[v] - mx) / z;
     prob[thread_index] = p;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint k = 0; k < 256 && v0 + k < vocabulary; ++k)
       richengine_canvas_embed_add(weights, scales, biases, v0 + k, prob[k],
                                   acc, thread_index);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   device bfloat *o = output + ulong(row) * CanvasHidden;
   for (uint dim = thread_index; dim < CanvasHidden; dim += 256)
@@ -520,14 +520,14 @@ kernel void canvas_soft_embed_topk(
     const uint sg_count = simd_sum(count);
     if (thread_index % 32 == 0)
       counts[thread_index / 32] = sg_count;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     uint total = counts[0] + counts[1] + counts[2] + counts[3] + counts[4] +
                  counts[5] + counts[6] + counts[7];
     if (total > top_k)
       lo = mid;
     else
       hi = mid;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   const float tau = hi;
   // Mass and accumulation over qualifying rows. prob[] stages this block's
@@ -540,7 +540,7 @@ kernel void canvas_soft_embed_topk(
       acc[dim] = 0.0f;
   }
   threadgroup float prob[256];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float kept_mass = 0.0f;
   for (uint v0 = 0; v0 < vocabulary; v0 += 256) {
     const uint v = v0 + thread_index;
@@ -549,7 +549,7 @@ kernel void canvas_soft_embed_topk(
       p = fast::exp(r[v] - mx) / z;
     p = p >= tau ? p : 0.0f;
     prob[thread_index] = p;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     for (uint k = 0; k < 256 && v0 + k < vocabulary; ++k) {
       const float pk = prob[k];
       if (pk > 0.0f) {
@@ -558,7 +558,7 @@ kernel void canvas_soft_embed_topk(
                                     thread_index);
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   }
   // kept_mass is per-thread replicated (every thread ran the same inner
   // adds); all agree, so no reduce.
@@ -640,12 +640,12 @@ kernel void canvas_row_stats_fused(
   threadgroup float maxima[8];
   if (thread_index % 32 == 0)
     maxima[thread_index / 32] = simd_max(local_max);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   threadgroup float shared[2];
   if (thread_index == 0)
     shared[0] =
         simd_max(thread_index < 8 ? maxima[thread_index] : -INFINITY);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float mx = shared[0];
   // Rescale the slice partials onto the row max; the per-slice mass feeds
   // the draw's prefix sum below.
@@ -668,7 +668,7 @@ kernel void canvas_row_stats_fused(
     best_values[sg] = s_best;
     best_indices[sg] = best_index;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f, wtotal = 0.0f, bv = -INFINITY;
     for (uint i = 0; i < 8; ++i) {
@@ -681,19 +681,19 @@ kernel void canvas_row_stats_fused(
     shared[1] = total;
     entropy[row] = fast::log(total) + mx - wtotal / total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   threadgroup atomic_uint argmax_out[1];
   if (thread_index == 0)
     atomic_store_explicit(&argmax_out[0], vocabulary, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (best == best_values[0])
     atomic_fetch_min_explicit(&argmax_out[0], best_index,
                               memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
 
   const float Z = shared[1];
   const float u = richengine_canvas_uniform(params.seed, row) * Z;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float running = 0.0f;
     for (uint i = 0; i < 256; ++i) {
@@ -702,7 +702,7 @@ kernel void canvas_row_stats_fused(
       running += m_i;
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float prefix = mass[thread_index];
   const bool owner = u >= prefix && u < prefix + partial;
   if (owner) {
@@ -788,14 +788,14 @@ kernel void canvas_soft_embed_histogram(
     reduce8[thread_index / 32] = simd_max(local_max);
     minima[thread_index / 32] = sg_min;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     shared[0] =
         simd_max(thread_index < 8 ? reduce8[thread_index] : -INFINITY);
     shared[1] =
         simd_min(thread_index < 8 ? minima[thread_index] : INFINITY);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float mx = shared[0];
   const float mn = shared[1];
   const float partial =
@@ -803,7 +803,7 @@ kernel void canvas_soft_embed_histogram(
   const float sg_sum = simd_sum(partial);
   if (thread_index % 32 == 0)
     reduce8[thread_index / 32] = sg_sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f;
     for (uint i = 0; i < 8; ++i)
@@ -819,7 +819,7 @@ kernel void canvas_soft_embed_histogram(
   if (thread_index == 0)
     shared[0] = 0.0f; // reused below for tau_l; Z already consumed
   atomic_store_explicit(&bins[thread_index], 0u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float z = shared[1];
   const float range = mx - mn;
   const float inv_width = range > 0.0f ? 256.0f / range : 0.0f;
@@ -828,7 +828,7 @@ kernel void canvas_soft_embed_histogram(
     const uint b = min(uint((l - mn) * inv_width), 255u);
     atomic_fetch_add_explicit(&bins[b], 1u, memory_order_relaxed);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   // l_tau = mn + b* * w where b* is the lowest grid point whose tail count
   // is at most top_k; b* == 256 (top bin already overfull, or degenerate)
   // maps to +inf so nothing qualifies, like the bisection's empty set.
@@ -845,7 +845,7 @@ kernel void canvas_soft_embed_histogram(
     shared[0] = bracket == 256 ? INFINITY
                              : mn + float(bracket) * (range / 256.0f);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const float tau_l = shared[0];
 
   // Pass 3: compact qualifying indices and their probabilities; the kept
@@ -862,7 +862,7 @@ kernel void canvas_soft_embed_histogram(
     if (dim < CanvasHidden)
       acc[dim] = 0.0f;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   float kept_mass_local = 0.0f;
   for (uint i = begin; i < end; ++i) {
     const float l = canvas_logit_transform(r[i], xf);
@@ -877,21 +877,21 @@ kernel void canvas_soft_embed_histogram(
       }
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const uint kept =
       min(atomic_load_explicit(&kept_count[0], memory_order_relaxed),
           CanvasHistListCapacity);
   float kept_mass = simd_sum(kept_mass_local);
   if (thread_index % 32 == 0)
     reduce8[thread_index / 32] = kept_mass;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     float total = 0.0f;
     for (uint i = 0; i < 8; ++i)
       total += reduce8[i];
     shared[1] = total;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   kept_mass = shared[1];
   // One accumulation pass: only the kept rows' Q4 weights are read.
   for (uint k = 0; k < kept; ++k)

@@ -152,6 +152,7 @@ TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DFA_BENCHMARK := $(ENGINE_TEST_BUILD)/dfa-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
+TEST_GDN_CHUNKED_BENCH := $(ENGINE_TEST_BUILD)/gdn-chunked-bench
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_ANE_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-moe-benchmark
@@ -171,6 +172,15 @@ TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 TEST_MPP_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention
 TEST_MPP_ATTENTION_AIR := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention.air
 TEST_MPP_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/mpp-simdgroup-attention.metallib
+# The accumulator-precision probe: bfloat vs float MPP PV destinations.
+TEST_ACC16_PROBE_TEST := $(ENGINE_TEST_BUILD)/acc16-probe
+TEST_ACC16_PROBE_AIR := $(ENGINE_TEST_BUILD)/acc16-probe.air
+TEST_ACC16_PROBE_LIB := $(ENGINE_TEST_BUILD)/acc16-probe.metallib
+# The stage-barrier self-test: mutual and producer/consumer dispatches of
+# kernels/common/stage_barrier.h, plus the bounded-failure case.
+TEST_STAGE_BARRIER_TEST := $(ENGINE_TEST_BUILD)/stage-barrier-test
+TEST_STAGE_BARRIER_AIR := $(ENGINE_TEST_BUILD)/stage-barrier-test.air
+TEST_STAGE_BARRIER_LIB := $(ENGINE_TEST_BUILD)/stage-barrier-test.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
 TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/prefill/paged_attention.metal \
@@ -285,6 +295,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GELU_SATURATION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
+	$(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_LIB) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
 	$(TEST_FP8_LIB) $(TEST_FP8_ATTENTION_LIB) \
 	$(TEST_GGUF_DEQUANT_LIB) \
@@ -294,7 +305,8 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
-	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GGUF_DECODE_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GDN_CHUNKED_BENCH) \
+	$(TEST_GGUF_DECODE_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_ANE_MOE_BENCHMARK) $(TEST_ANE_FORWARD_BENCHMARK) \
 	$(TEST_ANE_PREDRAFT_BENCHMARK) \
@@ -302,6 +314,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_FP8_AIR) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) \
 	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB) \
+	$(TEST_ACC16_PROBE_TEST) $(TEST_ACC16_PROBE_AIR) $(TEST_ACC16_PROBE_LIB) \
+	$(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_AIR) $(TEST_STAGE_BARRIER_LIB) \
 	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
@@ -583,10 +597,42 @@ $(TEST_MOE_PREFILL_BENCH): dev/tests/engine/moe_prefill_bench_metal_test.mm \
 test-moe-prefill-bench: $(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_LIB) $(LIB)
 	$(TEST_MOE_PREFILL_BENCH) $(LIB) $(TEST_MOE_PREFILL_LIB)
 
+$(TEST_ACC16_PROBE_AIR): dev/tests/engine/acc16_probe.metal \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
+
+$(TEST_ACC16_PROBE_LIB): $(TEST_ACC16_PROBE_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_ACC16_PROBE_TEST): dev/tests/engine/acc16_probe.mm \
+		$(TEST_ACC16_PROBE_LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+$(TEST_STAGE_BARRIER_AIR): dev/tests/engine/stage_barrier_test.metal \
+		runtime/metal/kernels/common/stage_barrier.h | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
+
+$(TEST_STAGE_BARRIER_LIB): $(TEST_STAGE_BARRIER_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_STAGE_BARRIER_TEST): dev/tests/engine/stage_barrier_test.mm \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+.PHONY: test-stage-barrier
+test-stage-barrier: $(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_LIB)
+	$(METAL_TEST_ENV) $(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_LIB)
+
 # The prototype check runs on demand only; it is not part of test-engine-metal.
 .PHONY: test-mpp-attention
 test-mpp-attention: $(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_LIB) $(MPP_ATTENTION_ARGS)
+
+.PHONY: test-acc16-probe
+test-acc16-probe: $(TEST_ACC16_PROBE_TEST) $(TEST_ACC16_PROBE_LIB)
+	$(METAL_TEST_ENV) $(TEST_ACC16_PROBE_TEST) $(TEST_ACC16_PROBE_LIB)
 
 .PHONY: test-q8-attention
 test-q8-attention: $(TEST_Q8_ATTENTION_TEST) $(TEST_Q8_ATTENTION_LIB)
@@ -866,6 +912,14 @@ $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
+# The chunked GDN scan's parity-and-time sweep against the serial prefill
+# scan (dev/benchmarks/gdn_chunked_bench.mm).
+$(TEST_GDN_CHUNKED_BENCH): dev/benchmarks/gdn_chunked_bench.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
 # The GGUF benchmarks call the operators directly; test-engine-cpu builds them
 # so they cannot fall behind unnoticed.
 $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
@@ -1051,6 +1105,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_CANVAS_KERNELS_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
+	$(METAL_TEST_ENV) $(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_LIB)
 
 # The hd512 m2 parity and timing test alone (also part of test-engine-metal).
 .PHONY: test-hd512
@@ -1080,7 +1135,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend benchmark-dfa \
 	benchmark-decode-profile benchmark-attention-sweep \
-	benchmark-gguf-projection benchmark-gguf-moe
+	benchmark-gguf-projection benchmark-gguf-moe benchmark-gdn-chunked
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
 	$(TEST_Q4_PREFILL_PROFILE) $(LIB)
 
@@ -1111,6 +1166,13 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 # [gate/up format] [down format] (q4k q5k by default).
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
+
+# Chunked GDN scan against the serial prefill scan at both compiled head
+# layouts, each RICHENGINE_GDN_CHUNKED factor, with a parity gate;
+# GDN_CHUNKED_ARGS passes [tokens] [reps] (2048, 5).
+GDN_CHUNKED_ARGS ?=
+benchmark-gdn-chunked: $(TEST_GDN_CHUNKED_BENCH) $(LIB)
+	$(TEST_GDN_CHUNKED_BENCH) $(LIB) $(GDN_CHUNKED_ARGS)
 
 # ANE expert-eval A/B at the 35B shape; ANE_MOE_ARGS passes [rounds].
 .PHONY: benchmark-ane-moe

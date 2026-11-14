@@ -71,6 +71,8 @@ const char *packedFormat(uint32_t formatId) noexcept {
   case GGUF_FMT_Q80: return "q80m";
   case GGUF_FMT_PQ20: return "pq20m";
   case GGUF_FMT_Q2K: return "q2km";
+  case GGUF_FMT_Q5K: return "q5km";
+  case GGUF_FMT_Q6K: return "q6km";
   default: return nullptr;
   }
 }

@@ -112,7 +112,7 @@ inline void gdn_scan_prefill_phase(
 
   fetch(0);
   stage();
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint start = 0; start < tokens; start += Block) {
     const bool more = start + Block < tokens;
     if (more)
@@ -148,9 +148,9 @@ inline void gdn_scan_prefill_phase(
       }
     }
     if (more) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
       stage();
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     }
   }
   for (uint c = 0; c < Columns / 4; ++c) {
@@ -224,7 +224,7 @@ inline void gdn_prepare_prefill_phase(
     reductions[simd_group] = query_sum;
     reductions[4 + simd_group] = key_sum;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   if (thread_index == 0) {
     reductions[0] =
         rsqrt((reductions[0] + reductions[1] + reductions[2] + reductions[3]) /
@@ -235,7 +235,7 @@ inline void gdn_prepare_prefill_phase(
                   HeadDim +
               kRmsEpsilon);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   const ulong key_row = ulong(token) * KeyWidth;
   q[key_row + query_channel] =
       bfloat(float(bfloat(query * reductions[0])) * 0.0078125f);

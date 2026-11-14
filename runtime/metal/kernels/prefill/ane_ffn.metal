@@ -84,7 +84,7 @@ kernel void ane_ffn_rotate(device const bfloat *input [[buffer(0)]],
   }
   peak = simd_max(peak);
   if (lane == 0) peaks[simd_group] = peak;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   peak = 0.0f;
   for (uint group = 0; group < simd_groups; ++group) peak = max(peak, peaks[group]);
   const float scale = max(peak, ANE_FFN_PEAK_FLOOR) / ANE_FFN_INT8_PEAK, inverse = 1.0f / scale;
@@ -106,7 +106,7 @@ kernel void ane_ffn_pack(device const half *rotated [[buffer(0)]],
   const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     staged[j][position.x] = rotated[(row + j) * params.hidden + params.channel + channel + position.x];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
     packed[(channel + j) * params.stride + row + position.x] =
         char(clamp(rint(float(staged[position.x][j])), -ANE_FFN_INT8_PEAK, ANE_FFN_INT8_PEAK));
@@ -388,7 +388,7 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     scale[position.x] = float(intermediate) * float(input);
   }
   if (!finite) atomic_store_explicit(status, 1u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
   for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
     if (row + j >= params.rows) continue;
     const uint index = (row + j) * params.hidden + channel + position.x;

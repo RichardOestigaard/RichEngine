@@ -125,11 +125,16 @@ std::string geometrySuffix(uint32_t queryHeads, kv::Layout layout) {
 void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const std::string geometrySuffix = ::geometrySuffix(queryHeads, layout);
   const std::array<uint32_t, 1> zeroHistory{};
+  // RICHENGINE_ATTENTION_ACC16's _a16 twins: every geometry here is a dense,
+  // windowless, non-Gemma layout, so the plans take the tag wherever a twin
+  // was emitted — every prefill split, and the verify _rP/_m8 forms (the
+  // R2-off base name keeps fp32).
+  const bool acc16 = ops::PagedAttention::attentionAcc16Enabled();
   const std::string prefillSplit = std::string(
       layout.format == kv::Format::Int8      ? ops::kPrefillAttentionQ8Split
       : layout.format == kv::Format::Int4    ? ops::kPrefillAttentionInt4Split
                                              : ops::kPrefillAttentionBf16Split) +
-      geometrySuffix;
+      geometrySuffix + (acc16 ? "_a16" : "");
   const std::string prefillReduce = std::string(ops::kPrefillAttentionReduce) + geometrySuffix;
   checkPrefillSlotOrientation(queryHeads, layout);
   for (uint32_t rows = 1; rows <= 2048; ++rows) {
@@ -160,6 +165,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   // M=128 tile still caps residency halved. An eight-row chain is the
   // narrow _m8 tile.
   const bool narrow = kv::kVerifyRows == 8;
+  const bool chainR2 = !narrow && !richengine::tuning().verifySplitR2Off;
   const uint32_t splitPasses =
       narrow ? 0
       : (layout.attentionCore == kv::Core::Kv2Group8 ||
@@ -171,7 +177,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
       : layout.format == kv::Format::Int4    ? ops::kVerifyAttentionInt4Split
                                              : ops::kVerifyAttentionBf16Split) +
       geometrySuffix +
-      (narrow ? "_m8" : "_r" + std::to_string(splitPasses));
+      (narrow ? "_m8" : "_r" + std::to_string(splitPasses)) +
+      (acc16 && (narrow || chainR2) ? "_a16" : "");
   const std::string verifyReduce = std::string(ops::kVerifyAttentionReduce) +
                                    geometrySuffix + (narrow ? "_m8" : "");
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -615,7 +622,25 @@ void checkReference(const Case &data, const std::vector<uint16_t> &actual) {
   // the same decoded magnitudes, so its oracle cosine is inherently lower;
   // errors stay unbiased and near zero (meanSigned ~0).
   const double bound = data.layout.format == kv::Format::Int4 ? 0.998 : 0.9995;
-  if (!(maximumError < 0.02f && cosine > bound)) {
+  // RICHENGINE_ATTENTION_ACC16's _a16 splits accumulate the PV product in
+  // bfloat: every page iteration rounds the running sum, so long histories
+  // drift further from the fp64 oracle than the fp32 accumulator's. The
+  // bounds below only reject catastrophic error; the sweep benchmark
+  // quantifies the real quality cost.
+  // q8q keeps the fp32 accumulator even with the flag on, so its oracle
+  // keeps the tight bounds.
+  const bool acc16 =
+      ops::PagedAttention::attentionAcc16Enabled() && !data.int8Queries;
+  const float errorBound = acc16 ? 0.15f : 0.02f;
+  const double cosineBound =
+      acc16 ? (data.layout.format == kv::Format::Int4 ? 0.95 : 0.97) : bound;
+  if (acc16)
+    std::cerr << "acc16 oracle: history=" << data.stores[0].committed_tokens
+              << " rows=" << data.rows << " format="
+              << kv::formatName(data.layout.format)
+              << " maxErr=" << maximumError << " cosine=" << cosine
+              << " meanSigned=" << signedError / count << '\n';
+  if (!(maximumError < errorBound && cosine > cosineBound)) {
     std::cerr << "oracle debug: history=" << data.stores[0].committed_tokens
               << " rows=" << data.rows << " maxErr=" << maximumError
               << " cosine=" << cosine << " meanSigned=" << signedError / count
@@ -1160,9 +1185,10 @@ void checkQ8qGate() {
           "q8q prefill ran a windowed layer");
   auto duo = dense;
   duo.duo = {128, 512, 0xf};
-  require(!hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, duo, false, 0, 8)
+  require(hasQ8q(ops::PagedAttention::prefillPlan(2048, 24, duo, false, 65536,
+                                               8)
                      .splitPipeline),
-          "q8q prefill ran a DuoAttention layer");
+          "q8q prefill skipped a DuoAttention layer");
   auto sparseLayout = testLayout(24, 2, 256, kv::Format::Int8);
   sparseLayout.attentionCore = kv::Core::Kv2Group12H256;
   sparseLayout.valuesTokenMajor = true;
@@ -1194,17 +1220,18 @@ void checkQ8qGate() {
                                                0, 16, false, 8)
                      .splitPipeline),
           "q8q verify ran a tree lane");
-  require(!hasQ8q(ops::PagedAttention::verifyPlan(1, 24, duo, longHistory, false,
-                                               0, 16, false, 8)
-                     .splitPipeline),
-          "q8q verify ran a DuoAttention layer");
+  require(hasQ8q(ops::PagedAttention::verifyPlan(1, 24, duo, longHistory, false,
+                                              0, 16, false, 8)
+                    .splitPipeline),
+          "q8q verify skipped a DuoAttention layer");
   std::cout << "q8q attention gate: PASS\n";
 }
 
 // The history term of the dense prefill splits: pages-per-split raises the
 // shared count with the committed history, bounded by the workspace's tile
-// product, and sparse, DuoAttention and windowed layouts keep the shared
-// splits their kernels were measured at.
+// product, and sparse and windowed layouts keep the shared splits their
+// kernels were measured at. DuoAttention's _duo splits partition each
+// head's own page range, so they take the history-scaled count too.
 void checkPrefillSplitHistory() {
   const auto dense = testLayout(24, 4, 256, kv::Format::Int8);
   // 256 rows is 32 tiles: the shared policy splits once; the workspace
@@ -1240,8 +1267,37 @@ void checkPrefillSplitHistory() {
   duo.duo = {128, 512, 0xf};
   require(ops::PagedAttention::prefillPlan(256, 24, duo, false, 131072, 0,
                                          128)
-              .splits == 1,
-          "prefill DuoAttention splits took the history term");
+              .splits == 8,
+          "prefill DuoAttention splits skipped the history term");
+  // The kv4/g4 core (Ornith's full-attention layers) compiles the same
+  // _duo family: the plan must select its kernels, not throw.
+  auto duoG4 = testLayout(16, 4, 256, kv::Format::Int8);
+  duoG4.duo = {128, 512, 0xf};
+  const auto g4Plan = ops::PagedAttention::prefillPlan(
+      256, 16, duoG4, false, 131072, 0, 128);
+  require(g4Plan.splitPipeline.find("_kv4_g4_duo") != std::string::npos &&
+              g4Plan.splits == 8,
+          "prefill Kv4Group4 DuoAttention plan missed its _duo splits");
+  require(ops::PagedAttention::verifyPlan(1, 16, duoG4,
+                                        std::array<uint32_t, 1>{16384},
+                                        false, 0, 16, false, 8)
+              .splitPipeline.find("_kv4_g4_duo") != std::string::npos,
+          "verify Kv4Group4 DuoAttention plan missed its _duo splits");
+  // The kv2/g8 core (the qwen3_6moe family's full-attention layers): the
+  // chain's fused-128 tile takes the _r4 pass splits like the dense
+  // layout, and the M2-halved plain splits cover the non-chain path.
+  auto duoG8 = testLayout(16, 2, 256, kv::Format::Int8);
+  duoG8.duo = {128, 512, 0x3};
+  const auto g8Plan = ops::PagedAttention::prefillPlan(
+      256, 16, duoG8, false, 131072, 0, 128);
+  require(g8Plan.splitPipeline.find("_kv2_g8_duo") != std::string::npos &&
+              g8Plan.splits == 8,
+          "prefill Kv2Group8 DuoAttention plan missed its _duo splits");
+  require(ops::PagedAttention::verifyPlan(1, 16, duoG8,
+                                        std::array<uint32_t, 1>{16384},
+                                        false, 0, 16, false, 8)
+              .splitPipeline.find("_kv2_g8_duo_r4") != std::string::npos,
+          "verify Kv2Group8 DuoAttention plan missed its _duo_r4 splits");
   std::cout << "prefill split history: PASS\n";
 }
 

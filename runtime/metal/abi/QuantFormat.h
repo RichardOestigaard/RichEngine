@@ -77,7 +77,13 @@
 // dequant over 64-group codes and separate bf16 scale and bias planes,
 // bound as plane0, plane1 and meta.
 #define GGUF_FMT_AF4P 27u
-#define GGUF_FMT_COUNT 28u
+// The oQ 2- and 3-bit formats (oQ2e/oQ2.5e/oQ3e checkpoints carry them):
+// same layout as the oQ family above.
+#define GGUF_FMT_AF2 28u
+#define GGUF_FMT_AF3 29u
+#define GGUF_FMT_AF2G128 30u
+#define GGUF_FMT_AF3G128 31u
+#define GGUF_FMT_COUNT 32u
 
 // The tensor type AF4 sections carry in a GgufTensorDescriptor (and
 // kQuantFormats' ggml_type column): a private id no GGUF file may use, not
@@ -94,6 +100,10 @@
 #define GGUF_PRIVATE_TYPE_AF5G128 0x80001af5u
 #define GGUF_PRIVATE_TYPE_AF6G128 0x80001af6u
 #define GGUF_PRIVATE_TYPE_AF8G128 0x80001af8u
+#define GGUF_PRIVATE_TYPE_AF2 0x80000af2u
+#define GGUF_PRIVATE_TYPE_AF3 0x80000af3u
+#define GGUF_PRIVATE_TYPE_AF2G128 0x80001af2u
+#define GGUF_PRIVATE_TYPE_AF3G128 0x80001af3u
 #define GGUF_PRIVATE_TYPE_AF4P 0x80020af4u
 
 struct QuantFormat {
@@ -147,6 +157,13 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     // AF4P: AF4 over the packed manifest's planes — 64-group codes as
     // plane0, the bias plane as plane1, the scale plane as meta.
     {GGUF_PRIVATE_TYPE_AF4P, 64, 36, 16, 1, 2, 2, "af4p"},
+    // The oQ 2- and 3-bit formats (oQ2e/oQ2.5e/oQ3e checkpoints carry
+    // them): the same {codes, bf16 scale, bf16 bias} block per group as the
+    // oQ family above, codes an element-order bitstream.
+    {GGUF_PRIVATE_TYPE_AF2, 64, 20, 8, 0, 4, 2, "af2"},
+    {GGUF_PRIVATE_TYPE_AF3, 64, 28, 12, 0, 4, 2, "af3"},
+    {GGUF_PRIVATE_TYPE_AF2G128, 128, 36, 8, 0, 4, 4, "af2g128"},
+    {GGUF_PRIVATE_TYPE_AF3G128, 128, 52, 12, 0, 4, 4, "af3g128"},
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.
