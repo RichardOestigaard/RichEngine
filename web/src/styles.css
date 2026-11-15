@@ -207,6 +207,7 @@ svg { display: block }
 }
 @media (max-width: 900px) {
   .palette-trigger .kbd { display: none }
+  .palette-trigger .palette-ico { display: block }
   .top-mem { display: none }
 }
 @media (max-width: 720px) {

@@ -80,9 +80,10 @@ interface StreamState {
 }
 
 const ALLOWED_EFFORTS = new Set(["", "xhigh", "medium", "low", "none"]);
-/* A model still calling after this many rounds is stuck; the last streamed
-   answer ends the turn without honoring further calls. */
-const MAX_TOOL_ROUNDS = 8;
+/* A model still calling after this many distinct tool requests is stuck;
+   a round repeating only calls already made is a loop and ends the turn at
+   once, so the bound only ever meets fresh requests. */
+const MAX_UNIQUE_TOOL_CALLS = 32;
 // ~33% base64 inflation keeps 100 MB of file under the 128M request limit.
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 
@@ -92,6 +93,26 @@ function draftKey(id: string | null): string {
 
 function isAbort(error: unknown): boolean {
   return (error as { name?: string }).name === "AbortError";
+}
+
+/* One call's dedupe key: name plus its arguments with object keys sorted,
+   so a respelled repeat counts as the same request. */
+function callKey(call: ToolCallDraft): string {
+  const canonical = (value: unknown): unknown =>
+    Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === "object"
+        ? Object.fromEntries(
+            Object.entries(value as Record<string, unknown>)
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([key, item]) => [key, canonical(item)])
+          )
+        : value;
+  try {
+    return `${call.name}\u0000${JSON.stringify(canonical(JSON.parse(call.arguments || "null")))}`;
+  } catch {
+    return `${call.name}\u0000${call.arguments}`;
+  }
 }
 
 export default function Chat() {
@@ -893,6 +914,7 @@ export default function Chat() {
         else wire.unshift({ role: "system", content: note });
       }
       let round = 0;
+      const seenCalls = new Set<string>();
       while (true) {
         state.calls = [];
         state.finish = null;
@@ -950,16 +972,26 @@ export default function Chat() {
         const calls = state.calls.filter(
           (call): call is ToolCallDraft => Boolean(call?.name)
         );
-        if (
-          state.finish !== "tool_calls" ||
-          !calls.length ||
-          round >= MAX_TOOL_ROUNDS
-        ) {
-          // The round cap leaves unanswered calls; say so instead of
-          // dropping them silently.
-          if (calls.length && round >= MAX_TOOL_ROUNDS) {
+        let fresh = 0;
+        for (const call of calls) {
+          const key = callKey(call);
+          if (!seenCalls.has(key)) {
+            seenCalls.add(key);
+            fresh += 1;
+          }
+        }
+        const stuck =
+          calls.length > 0 &&
+          (fresh === 0 || seenCalls.size >= MAX_UNIQUE_TOOL_CALLS);
+        if (state.finish !== "tool_calls" || !calls.length || stuck) {
+          // A cap leaves unanswered calls; say so instead of dropping them
+          // silently.
+          if (stuck) {
             (assistant.tool_runs ??= []).push({
-              name: `stopped after ${MAX_TOOL_ROUNDS} tool rounds`,
+              name:
+                fresh === 0
+                  ? "stopped: the model repeated its earlier tool calls"
+                  : `stopped after ${MAX_UNIQUE_TOOL_CALLS} unique tool calls`,
               detail: "",
               status: "error",
               result:
@@ -1278,7 +1310,9 @@ export default function Chat() {
       if (box) continueMessage(box);
       return;
     }
-    const zoom = target.closest<HTMLImageElement>(".user-images img");
+    const zoom = target.closest<HTMLImageElement>(
+      ".user-images img, .content img.md-img"
+    );
     if (zoom?.src) setLightbox({ kind: "img", src: zoom.src });
   }
 
@@ -1378,6 +1412,34 @@ export default function Chat() {
         inputEl?.focus();
         // An empty box takes the "/" itself so the command menu opens.
         if (!input()) setInput("/");
+        return;
+      }
+      /* Type-anywhere: a printable key pressed while nothing editable has
+         focus lands in the composer instead of dying on the page. Modifiers,
+         "?" (shortcuts dialog) and IME keys stay with their owners; open
+         overlays keep their keystrokes. */
+      if (
+        event.key.length === 1 &&
+        event.key !== "?" &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.isComposing &&
+        !isEditableTarget(event.target) &&
+        /* Space/Enter activate a focused button or link — leave those
+           keys to the control. */
+        !(
+          event.key === " " &&
+          event.target instanceof HTMLElement &&
+          event.target.closest("button, a, summary, [role='button']")
+        ) &&
+        !document.querySelector(".palette-overlay, .confirm-overlay, .lightbox")
+      ) {
+        /* preventDefault: without it the keypress still lands in the
+           just-focused textarea and the character doubles. */
+        event.preventDefault();
+        inputEl?.focus();
+        onDraftInput(input() + event.key);
         return;
       }
       if (event.key !== "Escape") return;

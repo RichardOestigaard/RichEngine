@@ -87,12 +87,10 @@ CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 # Browsers, and other clients, ask for a site's icon at /favicon.ico.
 FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
 WEBUI_DIR = Path(__file__).with_name("webui")
-# The single-page app `make webui` builds; without it "/" falls back to the
-# classic chat page.
-try:
-    WEBUI_INDEX = (WEBUI_DIR / "index.html").read_bytes()
-except OSError:
-    WEBUI_INDEX = None
+# The single-page app `make webui` builds into server/webui/; without it "/"
+# falls back to the classic chat page. index.html is read per request — a
+# rebuild swaps the hashed asset names it references, and a cached copy
+# would pin the previous bundle until the server restarts.
 # The suffixes the bundle emits and the content type each is served as.
 WEBUI_ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
@@ -516,10 +514,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._safe_error(APIError(404, "not found", "not_found"))
             elif path == "/favicon.ico":
                 self._send(200, FAVICON_SVG, "image/svg+xml")
-            elif path == "/classic" or WEBUI_INDEX is None:
+            elif path == "/classic":
                 self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             else:
-                self._send(200, WEBUI_INDEX, "text/html; charset=utf-8")
+                try:
+                    index = (WEBUI_DIR / "index.html").read_bytes()
+                except OSError:
+                    index = CHAT_HTML
+                self._send(200, index, "text/html; charset=utf-8")
             return
         if path.startswith("/assets/"):
             self._webui_asset(path)

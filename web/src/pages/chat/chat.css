@@ -232,6 +232,8 @@
 .chat-shell .content li.task input { margin-right: 2px; accent-color: var(--accent); vertical-align: -1px }
 .chat-shell .content a { color: var(--accent); text-decoration: none }
 .chat-shell .content a:hover { text-decoration: underline }
+.chat-shell .content hr { margin: 16px 0; border: 0; border-top: 1px solid var(--border) }
+.chat-shell .content img.md-img { display: block; max-width: min(480px, 100%); margin: 0 0 12px; border-radius: 10px; cursor: zoom-in }
 .chat-shell .content code { padding: 2px 5px; border-radius: 6px; background: var(--bubble); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace }
 .chat-shell .content pre { margin: 0 0 12px; overflow-x: auto; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bubble) }
 .chat-shell .content pre code { padding: 0; border-radius: 0; background: none; white-space: pre }

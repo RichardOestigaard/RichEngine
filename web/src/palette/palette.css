@@ -152,6 +152,10 @@
   color: var(--muted);
 }
 
+.palette-trigger .palette-ico {
+  display: none;
+}
+
 .palette-trigger:hover {
   background: var(--hover);
   color: var(--text);

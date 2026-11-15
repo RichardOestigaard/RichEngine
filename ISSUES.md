@@ -1406,14 +1406,18 @@ program shape/coverage for Ornith is a separate issue.
 
 ## DFA constraint compiler
 
-### Compiled DFA over-admits vs llguidance (latent, flaky repro)
+### Compiled DFA over-admits vs llguidance — resolved
 `dev/tests/test_dfa_parity.py` random token walks assert the compiled DFA's
 allowed-token set equals LLMatcher's at every step. With
 `seed=(...)__hash__() & 0xFFFF` (PYTHONHASHSEED-random per process), roughly a
 third of `test_qwen3_tool_calls` runs failed: at a deep step the DFA's mask
 listed a regular byte token (e.g. 'P') llguidance's mask denied — the compiled
-automaton is *more permissive* than the grammar path, not less. Unresolved:
-could be a real compiler edge case (an engine lane would accept a token the
-grammar would reject) or a mask-semantics asymmetry the walk doesn't model.
-The test's seeds are now pinned, so CI is stable but the divergent paths are
-no longer exercised — needs a reduced repro before shipping `DFA_MODE=full`.
+automaton is *more permissive* than the grammar path, not less. Root cause
+(reduced: `json_grammar({"type": "string"})` + `"\` / `"\u` prefixes):
+`_JSON_STRING` admitted the JSON-spec escape set `["\\/bfnrt]` and any
+`\uXXXX`, while llguidance's canonical string admits `["\\bfnrt]` only, and
+`\u` only for codepoints the literal class excludes — `\u00[01][0-9a-fA-F]`
+(\x00-\x1f) and `\u007[fF]` (DEL). Surfaced live as `constraint_error` under
+`dfa_mode=full`: the engine's DFA lane emits a token the delegate's
+commit()/finish() rejects. Fixed in `server/dfa.py` `_JSON_STRING`; a seed
+sweep over the qwen3 tool grammars walks clean.

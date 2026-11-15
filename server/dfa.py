@@ -49,7 +49,13 @@ _MAX_SUBSETS = 65536
 _MAX_CP = 0x10FFFF
 _WS_BYTES = frozenset(b" \t\n\r")
 
-_JSON_STRING = r'"([^"\\\x00-\x1f\x7f]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*"'
+# llguidance's canonical JSON string admits only the escapes a character
+# needs: ["\\bfnrt] — not the legal-but-optional \/ — and \u only for
+# codepoints the literal class excludes (\x00-\x1f and \x7f). A wider class
+# lists tokens the delegate grammar denies, which desyncs commit()/finish().
+_JSON_STRING = (
+    r'"([^"\\\x00-\x1f\x7f]|\\["\\bfnrt]|\\u00[01][0-9a-fA-F]|\\u007[fF])*"'
+)
 _JSON_INT = r"-?(0|[1-9][0-9]*)"
 _JSON_NUM = r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?"
 _PYTHON_STRING = r"'([^'\\\n\r]|\\[\\'nr])*'"

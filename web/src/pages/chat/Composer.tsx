@@ -233,7 +233,10 @@ export default function Composer(props: {
     onCleanup(() =>
       window.removeEventListener("richengine:model-changed", onModelChanged)
     );
+    /* Two chances: the microtask lands before first paint, the frame after
+       catches anything that stole focus during mount. */
     queueMicrotask(() => inputEl?.focus());
+    requestAnimationFrame(() => inputEl?.focus());
   });
 
   const acceptedFiles = () =>

@@ -32,9 +32,12 @@ STEERED_MAX_TOKENS = 2048
 # tools. Still repeating after them, the turn ends with the stop text.
 STEER_ATTEMPTS = 3
 
-# The tool calls one reply may make. Locals' default; enough for a turn's
-# work, small enough to catch a call loop early.
-MAX_CALLS = 6
+# The tool calls one reply may make. Every call reaching this bound is
+# unique — an identical call ends the reply as a duplicate long before —
+# so the limit can sit far above a turn's usual work. It is the backstop
+# for a model inventing fresh arguments forever (a semantic loop no exact
+# check can see), not the ceiling a working turn should feel.
+MAX_CALLS = 32
 
 
 def looping(tokens, reps=3, max_period=256, min_span=24, short_span=128):

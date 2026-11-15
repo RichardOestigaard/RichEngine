@@ -13,6 +13,9 @@ export function inlineMd(text: string): string {
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
     .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+    // Images before links: the link pattern would otherwise eat the
+    // "[alt](url)" half of "![alt](url)" and leave a stray "!".
+    .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, '<img class="md-img" src="$2" alt="$1" loading="lazy">')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
 
@@ -68,6 +71,11 @@ export function renderMarkdown(text: string): string {
       flushAll();
       const level = Math.min(heading[1].length + 2, 6);
       out.push(`<h${level}>${inlineMd(heading[2])}</h${level}>`);
+    }
+    // --- / *** / ___ (spaces allowed between marks) on their own line.
+    else if (/^\s{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) {
+      flushAll();
+      out.push("<hr>");
     }
     // A table row is a header line of | cells followed by a --- separator;
     // body rows follow until the first line without a pipe.

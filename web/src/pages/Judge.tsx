@@ -47,6 +47,14 @@ interface SystemOneResponse {
   total_seconds?: number;
 }
 
+/* /v1/models entry: a served name. Entries with `root` alias another
+   resident — the datalist lists primaries only. */
+interface ServedModel {
+  id?: string;
+  decision?: boolean;
+  root?: string;
+}
+
 /* A systemone 422 lists every bad field, FastAPI-style. */
 interface DetailItem {
   loc?: (string | number)[];
@@ -187,7 +195,8 @@ single — POST /v1/judgments: { id: string (auto, only set if asked),
   state: string (the evidence — JSON text or plain text),
   options: [{id, description}] — 2 to 16 entries, unique short ids }
 
-batch — POST /v1/systemone: { model: string (required served model id),
+batch — POST /v1/systemone: { model: string (optional served model id; blank
+  routes to the decision resident),
   state: string (shared evidence), questions: object keyed by question id;
   each value is one of:
     {"type":"noul","instructions":"..."}        — scores P(true)
@@ -225,9 +234,22 @@ interface OptionRow {
 }
 
 export default function Judge() {
-  /* Shared: served-model ids for prefills; which form last copied. */
-  const [modelIds, setModelIds] = createSignal<string[]>([]);
+  /* Shared: served models for prefills and the datalist; which form last
+     copied. */
+  const [models, setModels] = createSignal<ServedModel[]>([]);
   const { copied, copy } = useCopied();
+
+  /* Aliases (root set) repeat their resident under another name. */
+  const primaries = () => models().filter((m) => m.id && !m.root);
+  /* The decision resident is the purpose-built judge; chat models score
+     through the SemIf pathway only as a fallback. */
+  const decisionIds = () =>
+    primaries().filter((m) => m.decision).map((m) => m.id!);
+  const judgeDefault = () => decisionIds()[0] ?? primaries()[0]?.id ?? "";
+  /* The creator guide needs a generative model — decision residents
+     cannot produce chat completions. */
+  const guideModel = () =>
+    primaries().find((m) => !m.decision)?.id ?? judgeDefault();
 
   /* The active tab lives in the hash — #/judge?tab=batch survives reloads. */
   const [params, setParams] = useSearchParams();
@@ -278,15 +300,19 @@ export default function Judge() {
   const [guideError, setGuideError] = createSignal<string | null>(null);
 
   onMount(() => {
-    api<{ data?: { id?: string }[] }>("/v1/models")
+    api<{ data?: ServedModel[] }>("/v1/models")
       .then((res) => {
-        const ids = (res?.data ?? [])
-          .map((entry) => entry.id)
-          .filter((id): id is string => !!id);
-        setModelIds(ids);
-        if (ids[0]) {
-          if (!sModel()) setSModel(ids[0]);
-          if (!jModel()) setJModel(ids[0]);
+        const list = (res?.data ?? []).filter(
+          (m): m is ServedModel & { id: string } =>
+            typeof m.id === "string" && !!m.id
+        );
+        setModels(list);
+        const fallback =
+          list.find((m) => m.decision && !m.root)?.id ??
+          list.find((m) => !m.root)?.id;
+        if (fallback) {
+          if (!sModel()) setSModel(fallback);
+          if (!jModel()) setJModel(fallback);
         }
       })
       .catch(() => {
@@ -416,7 +442,6 @@ export default function Judge() {
   } {
     const model = sModel().trim();
     const body: Record<string, unknown> = {
-      model,
       state: parseState(sState()),
     };
     const errors: Record<string, string> = {};
@@ -428,7 +453,8 @@ export default function Judge() {
       return { body, errors };
     }
     body.questions = questions;
-    if (!model) errors.model = "model is required — the served model id";
+    /* Blank omits the key: the server routes to the decision resident. */
+    if (model) body.model = model;
     if (body.state === undefined)
       errors.state = "state must be nonempty — JSON value or plain text";
     if (!questions || typeof questions !== "object" || Array.isArray(questions))
@@ -528,7 +554,7 @@ export default function Judge() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: sModel() || jModel() || modelIds()[0],
+          model: guideModel() || sModel() || jModel(),
           stream: false,
           messages: [
             { role: "system", content: GUIDE_SYSTEM },
@@ -658,7 +684,7 @@ export default function Judge() {
                 </label>
                 <label>
                   <span class="field-label">
-                    Model <span class="hint">— optional, defaults to the served model</span>
+                    Model <span class="hint">— optional; blank uses the decision resident</span>
                   </span>
                   <input
                     class="judge-input mono"
@@ -909,7 +935,10 @@ export default function Judge() {
             <fieldset disabled={sBusy()}>
               <label class="field">
                 <span class="field-label">
-                  Model <span class="hint">— the served model id, required</span>
+                  Model{" "}
+                  <span class="hint">
+                    — optional; blank uses the decision resident
+                  </span>
                 </span>
                 <input
                   class="judge-input mono"
@@ -1108,7 +1137,14 @@ export default function Judge() {
       </TabGroup>
 
       <datalist id="judge-models">
-        <For each={modelIds()}>{(id) => <option value={id} />}</For>
+        <For each={primaries()}>
+          {(m) => (
+            <option value={m.id}>
+              {m.id}
+              {m.decision ? " — decision" : ""}
+            </option>
+          )}
+        </For>
       </datalist>
     </main>
   );

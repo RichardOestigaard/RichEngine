@@ -1,4 +1,4 @@
-import { createSignal, createEffect, onCleanup, onMount, For, Index, Show, untrack } from "solid-js";
+import { createSignal, createEffect, createMemo, onCleanup, onMount, For, Index, Show, untrack } from "solid-js";
 import type { JSX } from "solid-js";
 import { A, useSearchParams } from "@solidjs/router";
 import { api, apiPost, authorization, curlExample, errorText, storageGet, storageSet } from "../api";
@@ -403,6 +403,26 @@ export default function Models() {
       .then(setModels)
       .catch((e) => setModelsError(e instanceof Error ? e.message : String(e)));
   }
+
+  /* Optioned installs of one model id share the row's name; count them so
+     each duplicate can carry its selection hash. */
+  const modelCounts = createMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of available() ?? [])
+      if (entry.model)
+        counts.set(entry.model, (counts.get(entry.model) ?? 0) + 1);
+    return counts;
+  });
+
+  /* Rows sharing a model id differ by selection link: the plain link is
+     the default install, ".selections/<hash>" an optioned one. */
+  const selLabel = (entry: AvailableModel) => {
+    const sel = entry.selection ?? "";
+    if (!sel || sel === entry.model) return "default";
+    if (sel.startsWith(".selections/"))
+      return `sel ${(sel.split("/").pop() ?? sel).slice(0, 8)}`;
+    return sel;
+  };
 
   async function copyCurl() {
     await copy("curl", curlExample(model()?.id ?? "MODEL_ID"));
@@ -960,6 +980,18 @@ export default function Models() {
                         {copied() === entry.model ? "copied ✓" : entry.model}
                       </button>
                     </span>
+                    {/* Same model id installed under different source
+                        options (.selections links): tell the rows apart. */}
+                    <Show
+                      when={
+                        (modelCounts().get(entry.model ?? "") ?? 0) > 1 &&
+                        entry.selection
+                      }
+                    >
+                      <span class="badge" title={`Selection ${entry.selection}`}>
+                        {selLabel(entry)}
+                      </span>
+                    </Show>
                     <Show when={entry.family}>
                       <span class="badge">{entry.family}</span>
                     </Show>

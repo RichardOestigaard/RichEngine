@@ -420,14 +420,47 @@ export default function TopBar() {
   return (
     <>
     <header class="topbar">
-      <A href="/" class="brand" title="RichEngine — Chat">
+      <A
+        href="/"
+        class="brand"
+        title="RichEngine — Chat"
+        onClick={() => {
+          if (location.pathname === "/")
+            setTimeout(
+              () =>
+                window.dispatchEvent(
+                  new CustomEvent("richengine:focus-input")
+                ),
+              0
+            );
+        }}
+      >
         <img src="/favicon.ico" alt="" width="18" height="18" />
         RichEngine
       </A>
       <nav class="topnav" aria-label="Pages" ref={(el) => (navEl = el)}>
         <span class="nav-ind" aria-hidden="true" />
         <Show when={!decisionModel()}>
-          <A href="/" class="navlink" classList={{ active: active("/") }} title="Chat (⌘1)">Chat</A>
+          <A
+            href="/"
+            class="navlink"
+            classList={{ active: active("/") }}
+            title="Chat (⌘1)"
+            onClick={() => {
+              /* Already on Chat: no remount, so no autofocus — pull the
+                 caret back to the composer explicitly. */
+              if (location.pathname === "/")
+                setTimeout(
+                  () =>
+                    window.dispatchEvent(
+                      new CustomEvent("richengine:focus-input")
+                    ),
+                  0
+                );
+            }}
+          >
+            Chat
+          </A>
         </Show>
         <A href="/models" class="navlink" classList={{ active: active("/models") }} title="Models (⌘2)">Models</A>
         <A href="/disk" class="navlink" classList={{ active: active("/disk") }} title="Disk (⌘3)">Disk</A>
@@ -445,6 +478,21 @@ export default function TopBar() {
         aria-label="Open command palette"
         onClick={() => togglePalette()}
       >
+        {/* Icon stands in for the kbd once it hides under 900px. */}
+        <svg
+          class="palette-ico"
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          aria-hidden="true"
+        >
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
+        </svg>
         <kbd class="kbd">⌘K</kbd>
       </button>
       <button
