@@ -1675,14 +1675,17 @@ def _argument_grammar(schema, dialect=None):
 
 
 def json_grammar(schema, thinking, *, think_end_id=None, think_end_text=THINK_END):
-    start = "start: " + ("think " if thinking else "") + "WS %json "
+    start = "start: " + ("think " if thinking else "") + "%json "
     grammar = [
         "%llguidance {}",
         start + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
     if thinking:
         think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
-        grammar.append(f"think: TEXT <[{think_end}]>")
+        # Whitespace setting the answer apart from the reasoning is the
+        # think rule's, so an answer no reasoning precedes starts at its
+        # first token rather than spending the output budget on it.
+        grammar.append(f"think: TEXT <[{think_end}]> WS")
         grammar.append(
             r"TEXT: /(?s:.*)/ & ~/(?s:.*)" + _regex_text(think_end_text) + r"(?s:.*)/"
         )
@@ -1902,8 +1905,8 @@ def tool_grammar(
         # tool_choice "none": neither the text nor a formatted answer starts a call.
         body = "answer" if answer else "TEXT"
     elif policy.required or answer:
-        # A call comes first, set apart from the reasoning by whitespace.
-        body = f"WS {call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
+        # A call comes first.
+        body = f"{call} " + (f"(TEXT {call})* TEXT" if policy.parallel else "WS")
         if not policy.required:
             body = f"(({body}) | answer)"
     else:
@@ -1912,7 +1915,7 @@ def tool_grammar(
     if not policy.required:
         if response_schema is not None:
             main.append(
-                "answer: WS %json "
+                "answer: %json "
                 + json.dumps(
                     _grammar_compatible_schema(response_schema),
                     separators=(",", ":"),
@@ -1920,10 +1923,10 @@ def tool_grammar(
                 + " WS"
             )
         elif response_regex is not None:
-            main.append("answer: WS " + _lark_pattern(response_regex) + " WS")
+            main.append("answer: " + _lark_pattern(response_regex) + " WS")
     if thinking:
         think_end = THINK_END_TOKEN_ID if think_end_id is None else think_end_id
-        main.append(f"think: TEXT <[{think_end}]>")
+        main.append(f"think: TEXT <[{think_end}]> WS")
     main.extend(
         [
             *calls,

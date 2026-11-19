@@ -381,6 +381,11 @@ struct ModelBatchItem final {
   // prefill item's full prefix for the n-gram tails its chunk rows need —
   // inputTokens is chunk-only — and a verify lane's priors.
   std::span<const uint32_t> requestTokens{};
+  // A page boundary inside the step's committed span
+  // (logicalPosition, logicalPosition + retained] whose composite state the
+  // step's commit captures for the cache (SuffixReplay: a follow-up turn
+  // resumes there instead of re-prefilling the reply). Zero for none.
+  uint64_t stateCapture = 0;
 };
 
 struct ModelStepResult final {
@@ -412,6 +417,11 @@ struct ModelStepResult final {
   // rest of the batch stands. Broken invariants and GPU faults stay
   // exceptions and remain engine-fatal.
   std::string failure{};
+  // The composite state the step captured at capturedBoundary, when a
+  // decode item asked for one and the retained rows reached it — the
+  // engine publishes it to the cache block the boundary names.
+  std::shared_ptr<const CompositeState> capturedState{};
+  uint64_t capturedBoundary = 0;
 
   bool operator==(const ModelStepResult &) const = default;
 };

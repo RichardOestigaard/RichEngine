@@ -393,6 +393,32 @@ CompositeStateStorage::snapshot(uint32_t index, LogicalLengths lengths) {
       pool_, std::move(cached), layout_, lengths, file_, staging_));
 }
 
+std::optional<CachedStateBuffers> CompositeStateStorage::acquireCapture() {
+  Buffers buffers;
+  if (!acquire(1, "state-cache", buffers))
+    return std::nullopt;
+  return CachedStateBuffers{std::move(buffers.gdn[0]), std::move(buffers.draft)};
+}
+
+void CompositeStateStorage::captureDraftRing(uint32_t index,
+                                             CachedStateBuffers &buffers) {
+  const std::vector<DFlashDraftRingLayer> &ring = draft(index);
+  for (uint32_t layer = 0; layer < ring.size(); ++layer) {
+    copyExact(buffers.draft->layers()[layer].keys, ring[layer].keys,
+              "captured draft keys");
+    copyExact(buffers.draft->layers()[layer].values, ring[layer].values,
+              "captured draft values");
+  }
+}
+
+std::shared_ptr<const CompositeState>
+CompositeStateStorage::makeCaptured(CachedStateBuffers buffers,
+                                    LogicalLengths lengths) {
+  validateLengths(lengths, false);
+  return std::shared_ptr<const CompositeStateImpl>(new CompositeStateImpl(
+      pool_, std::move(buffers), layout_, lengths, file_, staging_));
+}
+
 std::unique_ptr<StateOffload>
 CompositeStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completion) {
   const Lane &source = lane(index);

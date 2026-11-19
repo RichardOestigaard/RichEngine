@@ -6,6 +6,7 @@
 // Runtime::Impl (RuntimeImpl.hpp), which aliases the types under their
 // nested names.
 
+#include "model/LookupProposals.hpp"
 #include "model/NgramIndex.hpp"
 #include "model/Runtime.hpp"
 #include "model/CompositeStateStorage.hpp"
@@ -186,10 +187,37 @@ struct RuntimeRequest final {
   // token stream and each 3-gram key's last eight starts, which the lookup
   // walks. NgramIndex.hpp owns the logic.
   ngram::Table ngram;
+  // Prompt lookup (Splash 1.7.0 LookupProposals port): a suffix automaton
+  // over the same stream, matching up to 64 tokens where the 3-gram keys
+  // match three. applyNgramPredraft emits its continuation when the fitted
+  // acceptance says it yields more than the lane's other proposal sources.
+  LookupIndex lookup;
   // Acceptance gating: EWMA of accepted tokens per n-gram round, set in
   // finalizeDecode for steps where this lane's proposals were used.
   uint32_t ngramRounds = 0;
   double ngramAcceptedAvg = 0;
+  // The lookup chain's own acceptance record, kept separate so lookup-sourced
+  // rounds do not train the 3-gram's EWMA — the displacement comparison of
+  // the two needs each scored on what it emitted.
+  uint32_t lookupRounds = 0;
+  double lookupAcceptedAvg = 0;
+  // Set in applyNgramPredraft when the lookup chain won the lane's proposal
+  // rows; lookupInFlight marks a verify round to credit.
+  bool lookupInFlight = false;
+  bool lookupSourced = false;
+  // The emitted chain and its match, kept for the finalizeDecode observe.
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> lookupChain{};
+  uint32_t lookupMatchLength = 0;
+  uint32_t lookupChainLength = 0;
+  // Mid-decode boundary capture (SuffixReplay): the engine's page boundary
+  // for this step, the pooled buffers the commit's capture dispatch writes,
+  // and the retained-row count reaching the boundary. Set in
+  // prepareDecodeLane, armed and consumed in encodeBatchGdnCommit and
+  // finalizeDecode.
+  uint64_t stateCapture = 0;
+  std::optional<CachedStateBuffers> captureBuffers;
+  uint64_t captureBoundary = 0;
+  uint32_t captureRowCount = 0;
   // Next generatedTokens count at which a gated-off lane may probe again.
   uint32_t ngramProbeAt = 0;
   bool ngramInFlight = false;

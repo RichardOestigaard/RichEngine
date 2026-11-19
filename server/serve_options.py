@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import images, origins
+from . import images, origins, unix_socket
 from .http_security import validate_api_key
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -215,6 +215,22 @@ def parse_reasoning_effort(value):
     return value
 
 
+def parse_host(value):
+    """An address to bind, which the bind checks, or unix:PATH with the path
+    of a UNIX socket."""
+    if unix_socket.path(value) == "":
+        raise argparse.ArgumentTypeError(
+            "unix: needs the socket's path, such as unix:/tmp/richengine.sock"
+        )
+    return value
+
+
+def parse_chat_template_file(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a Jinja chat template file")
+    return Path(value).expanduser().absolute()
+
+
 @dataclass(frozen=True)
 class ServeOption:
     """An option of both commands, and how the launcher passes it on."""
@@ -244,10 +260,11 @@ SERVE_OPTIONS = (
     ServeOption(
         "--host",
         dict(
+            type=parse_host,
             default="127.0.0.1",
             help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 "
-            "interfaces); clients use an IP address, localhost or a name given "
-            "with --allowed-host",
+            "interfaces; unix:PATH for a UNIX socket); clients use an IP "
+            "address, localhost or a name given with --allowed-host",
         ),
     ),
     ServeOption(
@@ -288,6 +305,29 @@ SERVE_OPTIONS = (
             default=False,
             help="report the first --served-model-name in API responses and list "
             "it first in /v1/models; /status keeps the loaded model ID",
+        ),
+    ),
+    ServeOption(
+        "--reasoning-effort",
+        dict(
+            type=parse_reasoning_effort,
+            metavar="EFFORT",
+            help="effort of every Chat, Responses and Messages request, whatever "
+            "the request asks: "
+            + ", ".join(REASONING_EFFORTS[:-1])
+            + f" or {REASONING_EFFORTS[-1]}; none turns thinking off (default: "
+            "RICHENGINE_REASONING_EFFORT, else each request's own)",
+        ),
+        environment="RICHENGINE_REASONING_EFFORT",
+    ),
+    ServeOption(
+        "--chat-template-file",
+        dict(
+            type=parse_chat_template_file,
+            default=None,
+            metavar="FILE",
+            help="a Jinja chat template to render every request with, in place "
+            "of the model's own; read once at startup (default: the model's)",
         ),
     ),
     ServeOption(
@@ -550,6 +590,12 @@ def check_serve_arguments(parser, args):
         parser.error("--persistent-cache needs --max-cache-disk")
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
+        parser.error(
+            "--default-reasoning-effort (RICHENGINE_DEFAULT_REASONING_EFFORT) "
+            "sets the effort of requests that set none, and --reasoning-effort "
+            "(RICHENGINE_REASONING_EFFORT) leaves none: it sets every request's"
+        )
 
 
 def serve_argv(args):

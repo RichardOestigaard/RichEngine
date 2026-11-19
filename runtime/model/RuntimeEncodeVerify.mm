@@ -1082,13 +1082,74 @@ constexpr uint32_t kQsaVerifyLaneRecords =
       targetModel.addStateCommitTree(
           graph, std::move(buffers),
           decodeArena->packed(DecodeTensor::RetainedPath, width), width);
-      return;
-    }
-    // The folded path folds retained rows into the next step's scan — the
-    // standalone commit only runs when the tape is off or tree-verify did.
-    if (!gdnTape_)
+    } else if (!gdnTape_) {
+      // The folded path folds retained rows into the next step's scan — the
+      // standalone commit only runs when the tape is off or tree-verify did.
       targetModel.addStateCommit(graph, std::move(buffers), width,
                                  geometry.draft.verifyRows());
+    }
+    // Mid-decode boundary capture (SuffixReplay): when a lane's retained
+    // span can reach a page boundary, a second commit replaying only the
+    // rows up to it writes a pooled cell — read-only against the step's own
+    // tensors, independent of the fold/commit advancing the lane. The
+    // replay's start state is the cell at the step's base: `current` for a
+    // standalone-commit lane (tree or tape off), `next` for a folded lane
+    // whose verify scan advanced that cell over the pending rows only.
+    {
+      std::array<uint32_t, kLaneCount> counts{};
+      std::array<MetalBuffer, kLaneCount> captured;
+      bool any = false;
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        Request &entry = *lanes[lane];
+        entry.captureBuffers.reset();
+        entry.captureRowCount = 0;
+        if (!entry.stateCapture)
+          continue;
+        const uint64_t boundary = entry.stateCapture;
+        entry.stateCapture = 0;
+        const uint64_t base =
+            states.metadata(entry.stateLane).lengths.targetTokens;
+        if (boundary <= base)
+          continue;
+        const uint64_t count = boundary - base;
+        const uint64_t rowsMax = tree ? RICHENGINE_TARGET_VERIFY_ROWS
+                                      : geometry.draft.verifyRows();
+        if (count > rowsMax)
+          continue;
+        std::optional<CachedStateBuffers> cell = states.acquireCapture();
+        if (!cell)
+          continue;
+        entry.captureBuffers = std::move(*cell);
+        entry.captureRowCount = static_cast<uint32_t>(count);
+        entry.captureBoundary = boundary;
+        counts[lane] = entry.captureRowCount;
+        captured[lane] = entry.captureBuffers->gdn->buffers().stateBase;
+        any = true;
+      }
+      if (any) {
+        for (MetalBuffer &cell : captured)
+          if (!cell)
+            cell = captureScratch();
+        std::memcpy(captureCounts().contents(), counts.data(),
+                    sizeof(counts));
+        const std::array<MetalBuffer, kLaneCount> &replayFrom =
+            (!tree && gdnTape_) ? nextStates : currentStates;
+        TargetModelCommitBuffers capture{
+            decodeArena->gdnStorage(DecodeTensor::VerifyPackedBase),
+            decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
+            decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
+            decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase),
+            replayFrom, captured, captureCounts()};
+        if (tree) {
+          targetModel.addStateCommitTree(
+              graph, std::move(capture),
+              decodeArena->packed(DecodeTensor::RetainedPath, width), width);
+        } else {
+          targetModel.addStateCommit(graph, std::move(capture), width,
+                                     geometry.draft.verifyRows());
+        }
+      }
+    }
   }
 
 } // namespace richengine::model

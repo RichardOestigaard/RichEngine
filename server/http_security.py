@@ -94,3 +94,13 @@ def validate_headers(headers, allowed_hosts, allowed_origins):
         # other sites out.
         raise OriginRefused(origins[0])
     return origins[0]
+
+
+def socket_hosts(name):
+    """The Host names a socket's own name gives a server, of the address it
+    binds and of the one each connection arrives at: an IP socket's address,
+    which a client that connects by address sends as its Host. A UNIX
+    socket's name is its path, which no Host header carries, and gives none:
+    its clients name the server by a loopback name or an --allowed-host one,
+    as a relay that forwards a TCP port to the socket passes them on."""
+    return {name[0].lower()} if isinstance(name, tuple) else set()

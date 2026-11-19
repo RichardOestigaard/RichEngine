@@ -17,6 +17,24 @@ VISION_UNAVAILABLE = (
     "this model is serving without vision (started with --language-only)"
 )
 
+# The fields every generation API takes under Chat's names, as Chat takes
+# them: how a request samples (the frame's sampling fields, logit_bias, which
+# RichEngine refuses unless empty, ignore_eos and seed), and how it is
+# scheduled, bounded and keeps out of the corpus. A dialect hands Chat each
+# one a request sends, whether its own API defines it or not, so that Chat's
+# validation refuses a bad value with the same 400 on every route and no
+# route drops one: Anthropic defines 3 of the 7 sampling fields, and
+# Messages dropped the other 4, penalties some clients can set nowhere else.
+CHAT_GENERATION_FIELDS = (
+    *wire.SAMPLING_FIELDS,
+    "logit_bias",
+    "ignore_eos",
+    "seed",
+    "priority",
+    "timeout",
+    "corpus_opt_out",
+)
+
 
 def _text_content(content):
     if content is None:
@@ -666,13 +684,11 @@ def responses_to_chat_body(body, items):
     # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
-        *wire.SAMPLING_FIELDS,
-        "logit_bias",
-        "seed",
-        "timeout",
-        "priority",
+        *CHAT_GENERATION_FIELDS,
         "stop",
         "max_output_tokens",
+        "chat_template_kwargs",
+        "preserve_thinking",
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
@@ -760,15 +776,12 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
             "a final assistant message (prefill) is not supported; "
             "end messages with a user turn",
         )
+    # Every API's sampling and scheduling fields, of which Anthropic defines
+    # temperature, top_p and top_k, as Chat takes them (CHAT_GENERATION_FIELDS).
     chat.update(
         max_completion_tokens=max_tokens,
         stop=body.get("stop_sequences"),
-        temperature=body.get("temperature"),
-        top_p=body.get("top_p"),
-        top_k=body.get("top_k"),
-        seed=body.get("seed"),
-        timeout=body.get("timeout"),
-        priority=body.get("priority"),
+        **{name: body.get(name) for name in CHAT_GENERATION_FIELDS},
     )
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, thinking_display

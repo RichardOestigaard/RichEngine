@@ -626,6 +626,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // time because the host wrote the table — the verify plan and its KV
     // stores size for it instead of the scratch's full capacity.
     uint32_t predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
+    // Prompt-lookup acceptance (Splash 1.7.0 port): the fitted prior plus
+    // decayed counts of this engine's own lookup rounds, shared across
+    // requests — one model, like upstream's.
+    LookupAcceptance lookupAcceptance_{};
   };
   NgramPredraft ngram_{};
   // The env switch AND the family's default (ModelDescriptor.tuning).
@@ -2180,6 +2184,25 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           BufferStorage::Shared, "ngram-mix");
     return ngramMixTokens_;
   }
+  // Mid-decode boundary capture (SuffixReplay): the host-written per-lane
+  // retained counts reaching each lane's page boundary, and a dummy cell
+  // the capture dispatch writes for lanes that capture nothing.
+  [[nodiscard]] const MetalBuffer &captureCounts() {
+    if (!captureCounts_)
+      captureCounts_ = backend.allocateBuffer(
+          sizeof(uint32_t) * kLaneCount, BufferStorage::Shared,
+          "gdn-capture-counts");
+    return captureCounts_;
+  }
+  [[nodiscard]] const MetalBuffer &captureScratch() {
+    if (!captureScratch_)
+      captureScratch_ = backend.allocateBuffer(
+          states.layout().target.cellBytes(), BufferStorage::Private,
+          "gdn-capture-scratch");
+    return captureScratch_;
+  }
+  MetalBuffer captureCounts_;
+  MetalBuffer captureScratch_;
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
@@ -3475,6 +3498,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         entry.maskWords.clear();
         entry.ngramInFlight = false;
         entry.corpusInFlight = false;
+        entry.lookupInFlight = false;
+        entry.lookupSourced = false;
+        entry.stateCapture = 0;
+        entry.captureRowCount = 0;
+        entry.captureBuffers.reset();
         entry.verifyMaskInFlight = false;
         entry.verifyMaskRows = 0;
         entry.gpuMaskInFlight = false;
@@ -3620,11 +3648,31 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         entry.ngramInFlight = false;
         const double observed =
             std::min(laneResult.accepted, laneResult.retained - 1);
-        entry.ngramAcceptedAvg = entry.ngramRounds
-                                     ? 0.75 * entry.ngramAcceptedAvg +
-                                           0.25 * observed
-                                     : observed;
-        ++entry.ngramRounds;
+        if (entry.lookupInFlight) {
+          // A lookup-sourced round trains its own EWMA and the shared
+          // acceptance model — the 3-gram's stays untouched, so a source
+          // displacement never mis-credits the proposer it replaced.
+          entry.lookupInFlight = false;
+          entry.lookupAcceptedAvg =
+              entry.lookupRounds ? 0.75 * entry.lookupAcceptedAvg +
+                                       0.25 * observed
+                                 : observed;
+          ++entry.lookupRounds;
+          if (entry.lookupMatchLength >= LookupIndex::kMinimumMatch) {
+            const LookupOutcome outcome = lookupOutcome(
+                {entry.lookupChain.data(), entry.lookupChainLength},
+                {targetTokens, laneResult.retained}, {});
+            ngram_.lookupAcceptance_.observe(
+                samplingEnabled(entry), entry.lookupMatchLength,
+                outcome.verified, outcome.accepted);
+          }
+        } else {
+          entry.ngramAcceptedAvg = entry.ngramRounds
+                                       ? 0.75 * entry.ngramAcceptedAvg +
+                                             0.25 * observed
+                                       : observed;
+          ++entry.ngramRounds;
+        }
         entry.ngramProbeAt =
             entry.generatedTokens + NgramPredraft::kNgramProbeTokens;
         // The corpus's own EWMA — the round's proposals were corpus-sourced
@@ -3677,6 +3725,34 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                            laneResult.verifyRows - 1),
            std::min(laneResult.accepted, laneResult.retained - 1)});
       ModelStepResult &result = results.back();
+      // Boundary capture armed in encodeBatchGdnCommit: report it only
+      // when the retained rows actually reached the boundary — a shorter
+      // accept leaves the checkpoint cell unwritten, and its buffers go
+      // back to the pool through the discarded state.
+      if (entry.captureRowCount) {
+        if (laneResult.retained >= entry.captureRowCount) {
+          states.captureDraftRing(entry.stateLane, *entry.captureBuffers);
+          // The window the restored lane's draft reads ends at the
+          // boundary; the copied ring's position-indexed slots hold exactly
+          // those tokens (capacity exceeds the window by far more than a
+          // step's retained rows).
+          const uint32_t window = static_cast<uint32_t>(std::min(
+              entry.captureBoundary, uint64_t{geometry.draft.draftWindow()}));
+          result.capturedState = states.makeCaptured(
+              std::move(*entry.captureBuffers),
+              {entry.captureBoundary, entry.captureBoundary - window,
+               window});
+          result.capturedBoundary = entry.captureBoundary;
+        } else {
+          // The state is dropped as soon as it is made: its destructor
+          // returns the capture buffers to the pool.
+          static_cast<void>(states.makeCaptured(
+              std::move(*entry.captureBuffers),
+              {entry.captureBoundary, entry.captureBoundary, 0}));
+        }
+        entry.captureBuffers.reset();
+        entry.captureRowCount = 0;
+      }
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
     }

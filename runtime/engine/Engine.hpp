@@ -395,6 +395,11 @@ private:
   // admission, and after the scheduler has taken a command's progress.
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
+  // The first whole KV page a decode step starting at `position` can
+  // complete, or zero when none is reachable or a media span straddles it.
+  // Arming it lets the step's state commit leave a resumable state there.
+  [[nodiscard]] uint64_t decodeCaptureBoundary(const Request &request,
+                                               uint64_t position) const;
   [[nodiscard]] bool retireCheckpoint(Request &request);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed, double nowMilliseconds);

@@ -1181,6 +1181,20 @@ void Engine::discardPendingStateBoundaries(Request &active) noexcept {
   active.stateBoundaryCursor = 0;
 }
 
+uint64_t Engine::decodeCaptureBoundary(const Request &active,
+                                       uint64_t position) const {
+  const uint64_t boundary =
+      (position / KvCache::pageTokens + 1) * KvCache::pageTokens;
+  if (boundary > position + model_.decodeAdmissionTokens())
+    return 0;
+  // A captured state cannot hold the image rows a straddled span needs; the
+  // finish-time snapshot's hold is the only path that keeps them.
+  for (const ImageSpan &span : active.mediaSpans)
+    if (span.offset < boundary && boundary < span.end())
+      return 0;
+  return boundary;
+}
+
 bool Engine::retireCheckpoint(Request &active) {
   // Shared progress points remain disposable under memory pressure, but a
   // lane's normal rolling replacement must not retire its peer's recovery point.
@@ -1373,6 +1387,8 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       item.inputTokens =
           std::span<const uint32_t>(active.exactTokens)
               .subspan(scheduled.promptOffset, scheduled.tokenCount);
+    } else if (tuning().suffixReplay && !active.skipCache) {
+      item.stateCapture = decodeCaptureBoundary(active, position);
     }
     items.push_back(std::move(item));
   }
@@ -1590,6 +1606,8 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
     item.pageTableOwner = pageTable.owner;
     item.pageTableRevision = pageTable.revision;
     item.pageTableFirstChanged = pageTable.firstChanged;
+    if (tuning().suffixReplay && !active.skipCache)
+      item.stateCapture = decodeCaptureBoundary(active, position);
     items.push_back(std::move(item));
   }
   if (admitted.empty())
@@ -2021,6 +2039,23 @@ void Engine::apply(const BatchPlan &plan,
           result.outputTokensWithoutKv;
       cache_.publishCommittedBlocks(active.request.id, active.exactTokens,
                                     storedTokens, active.mediaSpans);
+      // SuffixReplay during decode: the step that crossed a whole page left
+      // the state at that boundary in a pooled cell. Publishing it lets a
+      // follow-up turn resume there instead of replaying the reply.
+      if (result.capturedState) {
+        const uint64_t block = cache_.blockAt(
+            active.request.id, static_cast<uint32_t>(result.capturedBoundary));
+        if (!block)
+          throw std::logic_error("captured state lost its block");
+        if (cache_.reuseCompositeState(block, false)) {
+          ++counters_.deduplicatedStatePublications;
+        } else {
+          cache_.publishCompositeState(block, result.capturedState, false);
+          ++counters_.replayStatePublications;
+        }
+        writeBehind_.published(
+            block, static_cast<uint32_t>(result.capturedBoundary), now);
+      }
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
@@ -2169,9 +2204,9 @@ void Engine::finish(Request &active, EngineFinishReason reason,
       try {
         const uint64_t block = cache_.blockAt(active.request.id, boundary);
         // snapshot() requires the lane's committed length to be
-        // page-aligned, so only an end on the boundary can publish — the
-        // deep win needs decode-time boundary snapshots (the prefill-only
-        // publication loop, SCOPED_BUT_NOT_WIRED.md).
+        // page-aligned, so only an end on the boundary can publish here;
+        // mid-reply boundaries are covered by the decode-time capture
+        // (ModelBatchItem::stateCapture, published in apply()).
         if (block && boundary == active.exactTokens.size() &&
             !cache_.reuseCompositeState(block, false)) {
           std::shared_ptr<const CompositeState> state =

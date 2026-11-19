@@ -32,6 +32,7 @@ from . import (
     reply_guards,
     serve_options,
     tuner,
+    unix_socket,
 )
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -54,7 +55,12 @@ from .backend import CacheInfo, NativeResult, remaining_request_time
 from .chat_templates import ChatTemplateError
 from .diagnostics import accent, dim, log_unexpected, print_status
 from .errors import APIError, ContextLengthError
-from .http_security import OriginRefused, authenticate, validate_headers
+from .http_security import (
+    OriginRefused,
+    authenticate,
+    socket_hosts,
+    validate_headers,
+)
 from .latency import LatencyMetrics, RequestLatency
 from .metrics import prometheus_metrics, timings_dict, usage_dict
 from .model_host import HostPool, ModelHost
@@ -249,9 +255,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             min(self._unread_body, self.server.max_request_bytes)
         )
         try:
-            allowed_hosts = self.server.allowed_hosts | {
-                self.connection.getsockname()[0].lower()
-            }
+            allowed_hosts = self.server.allowed_hosts | socket_hosts(
+                self.connection.getsockname()
+            )
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
@@ -2879,9 +2885,21 @@ class FrontendServer(ThreadingHTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        path = unix_socket.path(address[0])
+        if path is not None:
+            self.address_family = socket.AF_UNIX
+            address = path
+        # A UNIX socket's hold on its path, from its bind until it closes.
+        self._claim = None
         self.allowed_hosts = {
             host.lower().rstrip(".")
-            for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
+            for host in (
+                *allowed_hosts,
+                *socket_hosts(address),
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
             if host not in ("0.0.0.0", "::")
         }
         # As serve_options.parse_allowed_origin returns them.
@@ -2947,8 +2965,8 @@ class FrontendServer(ThreadingHTTPServer):
                 if self.host is not None and self.host.assembly_dir is not None
                 else None
             ),
-            "host": self.server_address[0],
-            "port": self.server_address[1],
+            "host": self.listen_address,
+            "port": self.server_port,
             "started_at": self.started_at,
             "thermal_state": thermal_state(),
         }
@@ -2966,6 +2984,22 @@ class FrontendServer(ThreadingHTTPServer):
             "connections": self.connections.stats(),
         }
         return status
+
+    @property
+    def listen_address(self):
+        """Where it listens, as --host names it: the address it bound, or a
+        UNIX socket's unix:PATH."""
+        if self.address_family == socket.AF_UNIX:
+            return unix_socket.PREFIX + self.server_address
+        return self.server_address[0]
+
+    def server_bind(self):
+        if self.address_family != socket.AF_UNIX:
+            return super().server_bind()
+        self._claim = unix_socket.Claim(self.server_address)
+        self._claim.bind(self.socket)
+        # A UNIX socket has no port, which /status reports as none.
+        self.server_port = None
 
     def process_request(self, request, client_address):
         if not self.connections.admit(request):
@@ -2986,6 +3020,8 @@ class FrontendServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        if self._claim is not None:
+            self._claim.close()
         self.refused.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
         self.workers.stop()
@@ -3109,7 +3145,11 @@ def main():
         server.host = host
         host.load_initial()
         server.server_activate()
-        address = f"http://{args.host}:{server.server_port}"
+        address = (
+            server.listen_address
+            if server.address_family == socket.AF_UNIX
+            else f"http://{args.host}:{server.server_port}"
+        )
         app = host.app
         if app is None:
             print_status(

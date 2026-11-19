@@ -217,6 +217,17 @@ public:
   // for retry.
   [[nodiscard]] std::shared_ptr<const CompositeStateImpl>
   snapshot(uint32_t lane);
+  // A pooled cell + ring a decode step's capture dispatch writes its
+  // boundary state into; null when the pool has none free and the governor
+  // denies new ones. makeCaptured wraps them once the step commits (or to
+  // return them to the pool when the step's rows fell short).
+  [[nodiscard]] std::optional<CachedStateBuffers> acquireCapture();
+  // Copies the lane's live draft ring into a capture's ring. The ring is
+  // indexed by absolute position, so the copy holds every slot a window
+  // ending at the capture boundary reads.
+  void captureDraftRing(uint32_t lane, CachedStateBuffers &buffers);
+  [[nodiscard]] std::shared_ptr<const CompositeState>
+  makeCaptured(CachedStateBuffers buffers, LogicalLengths lengths);
   [[nodiscard]] bool canSnapshotToDisk() const noexcept {
     return file_ && file_->writable();
   }

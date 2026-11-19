@@ -22,7 +22,7 @@ from . import images as image_input
 from . import runtime as engine_runtime
 from . import serve_options, serving
 from .backend import NativeBackend
-from .chat_templates import ChatTemplates
+from .chat_templates import ChatTemplates, read_template_file
 from .constraints import ConstraintFactory, validate_tokenizer
 from .diagnostics import accent, dim, print_request, print_status
 from .errors import APIError
@@ -238,6 +238,13 @@ class ModelHost:
         assembly, validated against the engine's Ready. On any failure the
         runtime is stopped; nothing is published."""
         print_status(f"Loading · {accent(model_id)}")
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if getattr(self.args, "chat_template_file", None) is not None:
+            custom = read_template_file(self.args.chat_template_file)
+            print_status(f"Chat template file · {self.args.chat_template_file}")
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, local_files_only=True, trust_remote_code=False
         )
@@ -251,6 +258,7 @@ class ModelHost:
             allow_missing=bool(
                 serving_contract.decision or serving_contract.encoder
             ),
+            override=custom,
         )
         print_status(f"Chat template · {chat_templates.describe()}")
         # Special tokens the output parser needs as text: the dialect's call
@@ -381,7 +389,10 @@ class ModelHost:
                 thinking_codec=self.thinking_codec.scoped(model_id),
                 served_model_names=self.args.served_model_name,
                 announce_served_name=self.args.announce_served_name,
-                default_reasoning_effort=self.args.default_reasoning_effort,
+                reasoning_effort=getattr(self.args, "reasoning_effort", None),
+                default_reasoning_effort=getattr(
+                    self.args, "default_reasoning_effort", None
+                ),
                 vision=readiness.vision,
                 audio=readiness.audio,
                 speech=readiness.speech,

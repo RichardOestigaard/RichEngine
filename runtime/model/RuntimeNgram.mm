@@ -18,6 +18,16 @@ namespace richengine::model {
     entry.ngramAcceptedAvg = 0;
     entry.ngramProbeAt = 0;
     entry.ngramInFlight = false;
+    // The suffix-automaton lookup indexes the same stream (Splash 1.7.0
+    // port); a reseed rebuilds it wholesale like the 3-gram table.
+    entry.lookup = LookupIndex();
+    entry.lookup.append(prompt);
+    entry.lookupRounds = 0;
+    entry.lookupAcceptedAvg = 0;
+    entry.lookupInFlight = false;
+    entry.lookupSourced = false;
+    entry.lookupMatchLength = 0;
+    entry.lookupChainLength = 0;
     if (!ngram_.ngramCorpus_)
       return;
     // Opted-out traffic neither drafts from the corpus nor feeds it.
@@ -59,6 +69,7 @@ namespace richengine::model {
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
     ngram::append(entry.ngram, tokens);
+    entry.lookup.append(tokens);
     if (ngram_.ngramCorpus_ && ngram_.ngramCorpusLive_)
       ngram::liveAppend(ngram_.ngramCorpusDocs_, entry.id, tokens);
   }
@@ -222,6 +233,49 @@ namespace richengine::model {
                     lane, corpusFound, corpusExtension);
         }
       }
+      // Prompt lookup (Splash 1.7.0 LookupIndex port): the suffix
+      // automaton's longest earlier occurrence offers its own continuation
+      // beside the 3-gram chain — up to 64 tokens of match context where
+      // the 3-gram keys on three. The fitted acceptance prior scores it
+      // until the chain's own EWMA proves it; the better chain takes the
+      // lane's proposal rows and the same verify forward checks it, so a
+      // losing displacement wastes nothing but the rows it replaced. A
+      // corpus displacement already won on measured pattern length and is
+      // left alone.
+      entry.lookupSourced = false;
+      entry.lookupMatchLength = 0;
+      entry.lookupChainLength = 0;
+      double lookupLaneScore = 0;
+      const LookupIndex::Match lookupMatch = entry.lookup.match();
+      if (lookupMatch.length && !corpusLanes[lane]) {
+        const std::span<const uint32_t> lookupTokens =
+            entry.lookup.proposals(RICHENGINE_DRAFT_PROPOSAL_TOKENS);
+        if (!lookupTokens.empty()) {
+          if (entry.lookupRounds >= ngram_.ngramWarmup_) {
+            lookupLaneScore = entry.lookupAcceptedAvg;
+          } else {
+            for (uint32_t d = 0; d < lookupTokens.size(); ++d)
+              lookupLaneScore += ngram_.lookupAcceptance_.rate(
+                  samplingEnabled(entry), lookupMatch.length, d,
+                  LookupAgreement::Unknown);
+          }
+          if (lookupLaneScore >
+              ngramLaneScore(entry, found != 0, !nullDraft)) {
+            found = static_cast<uint32_t>(lookupTokens.size());
+            std::copy(lookupTokens.begin(), lookupTokens.end(),
+                      proposals[lane].begin());
+            entry.lookupSourced = true;
+            entry.lookupMatchLength = lookupMatch.length;
+            entry.lookupChainLength = found;
+            std::copy(lookupTokens.begin(), lookupTokens.end(),
+                      entry.lookupChain.begin());
+            if (ngramDebug_)
+              fprintf(stderr,
+                      "  lookup-displaced lane=%u match=%u len=%u score=%.2f\n",
+                      lane, lookupMatch.length, found, lookupLaneScore);
+          }
+        }
+      }
       foundCounts[lane] = found;
       if (found) {
         // Repeat the last real candidate: a duplicate only loses its row.
@@ -231,7 +285,9 @@ namespace richengine::model {
         std::fill_n(proposals[lane].data(), RICHENGINE_DRAFT_PROPOSAL_TOKENS,
                     *entry.pendingToken);
       }
-      double nScore = ngramLaneScore(entry, found != 0, !nullDraft);
+      double nScore = entry.lookupSourced
+                          ? lookupLaneScore
+                          : ngramLaneScore(entry, found != 0, !nullDraft);
       // A corpus-displaced chain carries its own evidence — the pattern
       // length that won the margin is a direct measurement, not an EWMA
       // estimate — so it scores itself instead of waiting on a prior the
@@ -295,6 +351,7 @@ namespace richengine::model {
                   RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
       entries[lane]->ngramInFlight = true;
       entries[lane]->corpusInFlight = corpusLanes[lane];
+      entries[lane]->lookupInFlight = entries[lane]->lookupSourced;
     }
     if (!emitTree)
       return true;
@@ -346,6 +403,7 @@ namespace richengine::model {
       entries[lane]->ngramInFlight = true;
       entries[lane]->corpusInFlight =
           (ngram_.mixCorpusMask_ & (uint32_t{1} << lane)) != 0;
+      entries[lane]->lookupInFlight = entries[lane]->lookupSourced;
       if (ngramDebug_)
         fprintf(stderr, "ngram-mix lane=%u\n", lane);
     }

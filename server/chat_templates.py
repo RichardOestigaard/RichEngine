@@ -33,6 +33,12 @@ state before it. No chat format's markers are assumed.
 Requests and the probe share the reasoning efforts, template options and
 alias retry defined here, so the probe renders exactly as requests do.
 Tokenizer files and the tokenizer object are never modified.
+
+A custom template, the source of the file --chat-template-file names,
+replaces every template the tokenizer defines, named ones included, and is
+probed as they are. The probe must find its generation prompt, without which
+it would serve no request: RichEngine never falls back from it to the
+tokenizer's.
 """
 
 import json
@@ -40,6 +46,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 
 from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
@@ -85,7 +92,29 @@ LATER_SYSTEM_UNSUPPORTED = (
 
 
 class ChatTemplateError(ValueError):
-    """The tokenizer has no chat template RichEngine can serve."""
+    """No chat template RichEngine can serve: the tokenizer has none, or a
+    custom one cannot be read or would serve no request."""
+
+
+def read_template_file(path):
+    """The custom chat template in the file at path: its UTF-8 text as
+    written. Whether it serves requests is checked by ChatTemplates, which
+    renders it as requests do."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as error:
+        raise ChatTemplateError(
+            f"cannot read the chat template {path}: {error.strerror or error}"
+        ) from None
+    try:
+        source = data.decode()
+    except UnicodeDecodeError as error:
+        raise ChatTemplateError(
+            f"the chat template {path} is not UTF-8: {error}"
+        ) from None
+    if not source.strip():
+        raise ChatTemplateError(f"the chat template {path} is empty")
+    return source
 
 
 # What a template that rejects one of the REASONING_EFFORTS renders instead;
@@ -183,28 +212,40 @@ class ChatTemplate:
 
 
 class ChatTemplates:
-    """The tokenizer's templates, probed and chosen once at startup."""
+    """The tokenizer's templates, or a custom one in their place, probed and
+    chosen once at startup."""
 
-    def __init__(self, tokenizer, *, allow_missing=False):
+    def __init__(self, tokenizer, *, allow_missing=False, override=None):
+        """override, a custom template's source (read_template_file), is the
+        one template every request renders with, in place of all the
+        tokenizer defines."""
         defined = tokenizer.chat_template
         # A decision model ships no chat template — its generation paths
-        # are refused, so an empty registry is a valid startup state.
-        if defined is None and allow_missing:
+        # are refused, so an empty registry is a valid startup state. A
+        # custom template serves its requests whatever the tokenizer has.
+        if defined is None and allow_missing and override is None:
             self.templates = {}
             return
-        named = dict(defined) if isinstance(defined, dict) else {None: defined}
-        if isinstance(defined, dict) and "default" not in named:
-            raise ChatTemplateError(
-                "the tokenizer's named chat templates have no default"
-            )
-        if not all(isinstance(source, str) and source for source in named.values()):
-            raise ChatTemplateError("the tokenizer defines no chat template")
+        if override is not None:
+            named = {None: override}
+        else:
+            named = dict(defined) if isinstance(defined, dict) else {None: defined}
+            if isinstance(defined, dict) and "default" not in named:
+                raise ChatTemplateError(
+                    "the tokenizer's named chat templates have no default"
+                )
+            if not all(
+                isinstance(source, str) and source for source in named.values()
+            ):
+                raise ChatTemplateError("the tokenizer defines no chat template")
         render, encode = _renderer(tokenizer), _encoder(tokenizer)
         prepared = {}
         for source in named.values():
             if source not in prepared:
                 prepared[source] = _prepare(render, encode, source)
         self.templates = {name: prepared[source] for name, source in named.items()}
+        if override is not None:
+            _require_generation_prompt(render, self.templates[None])
 
     def select(self, tools):
         """The template the tokenizer itself would choose for this request."""
@@ -278,6 +319,40 @@ def _encoder(tokenizer):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
     return encode
+
+
+def _require_generation_prompt(render, template):
+    """Raise unless the probe found a custom template's generation prompt
+    for a request that sets no template option. Every prompt must end with
+    the one the probe found (the frontend's 400 otherwise), so a template
+    without one, or one that cannot render one of the probe's conversations,
+    would start a server that refuses every chat request. The refusal names
+    the first of them the template cannot render, with the template's own
+    error."""
+    options = template_options(
+        reasoning_effort=None,
+        preserve_thinking=None,
+        tools=None,
+        add_generation_prompt=True,
+    )
+    if _generation_key(options) in template.generation_prompts:
+        return
+    prompts = [f"of {name}" for name in _FOLLOWED]
+    reason = (
+        f"it must end the prompt {', '.join(prompts[:-1])} and {prompts[-1]} "
+        "with the same generation prompt"
+    )
+    for name, messages in _FOLLOWED.items():
+        try:
+            render(template.source, messages, options)
+        except TemplateSyntaxError as error:
+            reason = f"line {error.lineno}: {error.message}"
+        except Exception as error:  # templates raise what they like
+            reason = f"it cannot render {name}: {error}"
+        else:
+            continue
+        break
+    raise ChatTemplateError(f"the custom chat template serves no request: {reason}")
 
 
 def _prepare(render, encode, source):
@@ -395,9 +470,14 @@ _OPTIONS = (
 )
 
 
-# Conversations the generation prompt must be the same for: a question, a
-# follow-up after a reasoned answer, and a tool result.
-_FOLLOWED = ([_ASK], [_SYSTEM, _ASK, _THOUGHT, _NEXT], [_SYSTEM, _ASK, _CALL, _RESULT])
+# Conversations the generation prompt must be the same for, each by what a
+# refusal calls it: a question, a follow-up after a reasoned answer, and a
+# tool result.
+_FOLLOWED = {
+    "a question": [_ASK],
+    "a follow-up": [_SYSTEM, _ASK, _THOUGHT, _NEXT],
+    "a tool result": [_SYSTEM, _ASK, _CALL, _RESULT],
+}
 
 
 def _generation_key(options):
@@ -435,7 +515,7 @@ def _generation_prompt(render, encode, source, options):
     different text (the prompt is context-dependent); None where a render
     is no prefix or the shared text is empty."""
     texts = set()
-    for messages in _FOLLOWED:
+    for messages in _FOLLOWED.values():
         prompt = _outcome(render, source, messages, options)
         history = _outcome(
             render, source, messages, {**options, "add_generation_prompt": False}

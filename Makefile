@@ -395,6 +395,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/TargetModelHybrid.cpp \
 	runtime/model/TargetModelLfm3.cpp \
 	runtime/model/TargetLoader.cpp \
+	runtime/model/LookupProposals.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DFlashTwoDraft.cpp \
 	runtime/model/DFlashTwo8width.cpp \

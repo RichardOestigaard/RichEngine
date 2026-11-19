@@ -13,6 +13,7 @@ namespace richengine::model {
         !metadata.lengths.hasCompleteDraftWindow(geometry.draft.draftWindow())) {
       throw std::logic_error("decode state length is not exact");
     }
+    entry.stateCapture = item.stateCapture;
     static_cast<void>(synchronizedPageTable(entry, item));
     // The draft input packs at the draft's query stride, so its embedding
     // gathers draft.queryRows() rows per lane; the anchor occupies row 0.
