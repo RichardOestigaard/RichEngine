@@ -341,6 +341,16 @@ SERVE_OPTIONS = (
         environment="RICHENGINE_DEFAULT_REASONING_EFFORT",
     ),
     ServeOption(
+        "--cached-states",
+        dict(
+            choices=("int8", "exact"),
+            default="int8",
+            help="how cached recurrent states store: int8 codes and bf16 "
+            "scales (default: int8, a third the bytes), or the running "
+            "layout exactly",
+        ),
+    ),
+    ServeOption(
         "--kv-format",
         dict(
             choices=("int8", "int4", "bf16", "fp8", "fp8e4m3"),

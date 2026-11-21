@@ -67,10 +67,12 @@ void StateUse::reset() noexcept {
 }
 
 std::optional<CompositeStateLease>
-StateCache::acquireDeepest(std::span<const uint64_t> kvChain) {
+StateCache::acquireDeepest(std::span<const uint64_t> kvChain, bool *lostState) {
   for (auto block = kvChain.rbegin(); block != kvChain.rend(); ++block) {
     if (auto lease = acquireBlock(*block))
       return lease;
+    if (lostState && kv_.hadState(*block))
+      *lostState = true;
   }
   return std::nullopt;
 }

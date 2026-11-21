@@ -1,11 +1,17 @@
-"""Bounded token reuse at literal chat-message boundaries."""
+"""Prompt tokenization: a rendered prompt's tokens, in which only the text
+the chat template wrote reads as a token the tokenizer adds, and bounded token
+reuse at literal chat-message boundaries."""
 
 import json
 import os
+import re
+import secrets
 import sys
 import threading
 from array import array
 from collections import OrderedDict
+
+from tokenizers import Tokenizer
 
 # Emitted-id reply memory (RICHENGINE_NO_REPLY_ID_MEMORY=1 disables): a reply
 # the model emitted re-encodes differently when a client resends it as
@@ -22,8 +28,141 @@ def _reply_memory_disabled():
 # most that many suffix slices per turn boundary.
 _REPLY_SUFFIX = 24
 
+# A surrogate code point. Request text keeps a lone one that JSON spells, such
+# as "\ud800"; it encodes no token, so each reads as U+FFFD first.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+def tokenizable(text):
+    """`text` with each lone surrogate as U+FFFD, which it encodes as."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
+# The mark PromptTokenizer.quote sets after the first character of an added
+# token that begins in what a client sent: a text no request can hold, as its
+# 128 random bits are drawn when the server starts, and of characters that a
+# template's JSON or trimming of the text leaves as they are.
+QUOTE = f"__richengine_quoted_{secrets.token_hex(16)}__"
+
+
+def unquoted(text):
+    """`text` without its quote marks: the text the model reads."""
+    return text.replace(QUOTE, "")
+
+
+def added_tokens(tokenizer):
+    """The tokens `tokenizer` adds beside its model's vocabulary, by their
+    text: a chat template's turn and role tokens, its tags, an image's pad.
+    It splits its input at each before anything else reads the text, and
+    PromptTokenizer keeps that split from the text a client sent. A
+    ValueError names what it cannot keep it from: a tokenizer without a fast
+    backend, an added token that takes the spaces beside it or stands only
+    as a word, which its literal text does not find, or that QUOTE cannot
+    go inside, and a pipeline where the text between two added tokens does
+    not encode on its own. A normalized one, as add_tokens adds them, is
+    found in the normalized text, its literal text among others
+    (PromptTokenizer.literal). A tokenizer that adds none splits nothing."""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError("tokenizer must be a fast tokenizer")
+    tokens = {}
+    for token_id, token in backend.get_added_tokens_decoder().items():
+        text = token.content
+        if token.lstrip or token.rstrip or token.single_word:
+            raise ValueError(
+                f"tokenizer must find the added token {text!r} as its literal text"
+            )
+        # The mark follows the token's first character, and its own text
+        # must not complete a token with the characters around it.
+        if (
+            len(text) < 2
+            or text in QUOTE
+            or any(
+                QUOTE.startswith(text[-length:]) or QUOTE.endswith(text[:length])
+                for length in range(1, len(text))
+            )
+        ):
+            raise ValueError(f"tokenizer adds a token that cannot be quoted: {text!r}")
+        tokens[text] = token_id
+    if tokens and not _encodes_segments_alone(backend):
+        raise ValueError(
+            "tokenizer must encode the text between two added tokens on its own"
+        )
+    return tokens
+
+
+def _encodes_segments_alone(backend):
+    """Whether the text between two literal added tokens encodes as it does
+    alone: byte-level BPE after regex splits, Qwen's one or Flint's three,
+    each of which reads a segment on its own, and no normalizer or NFC.
+    Another pipeline may not: for example, Metaspace's prepend_scheme="first"
+    depends on whether a segment starts the complete input, not just a
+    split. A post-processor has no part in it: prompts encode without the
+    tokenizer's own special tokens, and it adds no other."""
+    if type(backend.model).__name__ != "BPE" or backend.model.dropout:
+        return False
+    if backend.pre_tokenizer is None:
+        return False
+    pre = json.loads(backend.pre_tokenizer.__getstate__())
+    parts = pre["pretokenizers"] if pre.get("type") == "Sequence" else [pre]
+    if [part.get("type") for part in parts] != ["Split"] * (len(parts) - 1) + [
+        "ByteLevel"
+    ] or parts[-1].get("add_prefix_space"):
+        return False
+    return (
+        backend.normalizer is None
+        or json.loads(backend.normalizer.__getstate__()).get("type") == "NFC"
+    )
+
+
+def _rest_pattern(rests):
+    """A pattern for what follows an added token's first character where the
+    token begins in a text: the rest of one, each of `rests`, or as much of
+    a rest as the text holds where it ends first, which what follows the
+    text in a prompt could complete. It reads the characters that rests
+    share once: 1 MB of markup takes 1.7 ms with Flint's 144 tokens, where
+    trying each rest in turn took 23 ms."""
+    shared = {}
+    for rest in rests:
+        node = shared
+        for character in rest:
+            node = node.setdefault(character, {})
+        # A token ends here: nothing more to read.
+        node[""] = {}
+
+    def pattern(node):
+        if "" in node:
+            return ""
+        following = "|".join(
+            re.escape(character) + pattern(after) for character, after in node.items()
+        )
+        return rf"(?:\Z|{following})"
+
+    return pattern(shared)
+
 
 class PromptTokenizer:
+    """Encodes rendered prompts so that only the chat template's own text
+    reads as a token the tokenizer adds (added_tokens). A tokenizer finds an
+    added token wherever the text spells it, so one that a message only
+    quotes, as a tool result showing a parser's `tool_call_start =
+    "<tool_call>"` does, would reach the model as the control token, and a
+    `<|im_end|>` in a document as the end of its turn. `quote` marks each
+    where it begins in what a client sent, before the template renders it;
+    `encode` reads the template's text between two of the tokens the template
+    wrote as ordinary text, a marked token as its characters.
+
+    It reuses a cached prompt's tokens up to its last `marker`, the chat
+    turn's end token, where the tokenizer splits its input, and splices the
+    remembered ids of replies the prompt resends."""
+
+    MIN_PREFIX_CHARS = 4096
+    BUDGET_BYTES = 8 * 1024 * 1024
+    # One entry per live conversation prefix; BUDGET_BYTES is the real
+    # memory bound, so this only needs to outnumber concurrent sessions.
+    CAPACITY = 32
+    REPLY_CAPACITY = 256
+
     def __init__(self, tokenizer, marker=None):
         self.tokenizer = tokenizer
         # The token that ends a chat turn; the tokenizer's EOS by default, the
@@ -39,6 +178,51 @@ class PromptTokenizer:
             if self.enabled
             else None
         )
+        # The quote machinery. A tokenizer added_tokens cannot serve keeps
+        # every text literal: validate_tokenizer refuses it before serving,
+        # so an empty map here only stands where there is no contract to
+        # hold (tests, probes).
+        try:
+            self.added = added_tokens(tokenizer)
+        except ValueError:
+            self.added = {}
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        # Whether the tokenizer finds its added tokens as their literal text
+        # alone. A normalized one, as add_tokens adds them, it finds in the
+        # normalized text, where NFC makes another spelling of it the token
+        # too, as U+212A for a K, which no mark breaks: such a tokenizer's
+        # prompts all encode as the text between the template's tokens.
+        self.literal = backend is not None and (
+            backend.normalizer is None
+            or not any(
+                token.normalized
+                for token in backend.get_added_tokens_decoder().values()
+            )
+        )
+        # Where an added token begins in a text, to mark it there: for each
+        # first character of one, that character before the rest of any, or
+        # before the text's end where that comes first (_rest_pattern).
+        rests = {}
+        for text in self.added:
+            rests.setdefault(text[0], []).append(text[1:])
+        self._begins = [
+            (first, re.compile(f"{re.escape(first)}(?={_rest_pattern(rest)})"))
+            for first, rest in rests.items()
+        ]
+        if self.added:
+            # Each whole one, the longest first as the tokenizer finds them.
+            self._tokens = re.compile(
+                "("
+                + "|".join(map(re.escape, sorted(self.added, key=len, reverse=True)))
+                + ")"
+            )
+            # The tokenizer's own normalizer, pre-tokenizer and model, which
+            # it shares, without its added tokens: how it encodes ordinary
+            # text.
+            self._plain = Tokenizer(backend.model)
+            if backend.normalizer is not None:
+                self._plain.normalizer = backend.normalizer
+            self._plain.pre_tokenizer = backend.pre_tokenizer
         self.entries = OrderedDict()
         self.bytes = self.hits = self.reused_tokens = 0
         # Reply text -> the ids the model emitted for it, a small LRU.
@@ -48,13 +232,6 @@ class PromptTokenizer:
         self.reply_buckets = {}
         self.reply_hits = 0
         self.lock = threading.Lock()
-
-    MIN_PREFIX_CHARS = 4096
-    BUDGET_BYTES = 8 * 1024 * 1024
-    # One entry per live conversation prefix; BUDGET_BYTES is the real
-    # memory bound, so this only needs to outnumber concurrent sessions.
-    CAPACITY = 32
-    REPLY_CAPACITY = 256
 
     def _supports_boundaries(self, tokenizer):
         backend = getattr(tokenizer, "backend_tokenizer", None)
@@ -100,14 +277,68 @@ class PromptTokenizer:
             )
         )
 
-    def _encode(self, text):
-        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+    @staticmethod
+    def _marked(begun):
+        """The first character of a token that begins, with the mark after
+        it. A function, as `sub` looks a replacement text up by a hash of
+        its whole pattern at every call: 2 to 4 microseconds for these."""
+        return begun[0] + QUOTE
+
+    def quote(self, value):
+        """`value`, what a request gives its chat template (messages, tool
+        definitions, template variables), with QUOTE inside every added
+        token that a string or a key of it begins: one it spells whole, and
+        one its end cuts off, which what the template writes next could
+        complete, as the `>` Qwen's templates write after a call's name
+        would, or the next of a message's text parts. A U+0000 is U+FFFD
+        first: a text that holds one inside a token spells no token to mark,
+        and a template that deletes the character, as Flint's does, would
+        write the token whole. The template renders the marked text as it
+        renders any other, and no longer finds a tag there itself."""
+        if isinstance(value, str):
+            if "\x00" in value:
+                value = value.replace("\x00", "\ufffd")
+            for first, begins in self._begins:
+                # Few strings hold the character at all: looking for it
+                # first quotes a 66K-token conversation of 2,600 strings in
+                # 0.24 ms, where searching each took 0.40 ms.
+                if first in value:
+                    value = begins.sub(self._marked, value)
+            return value
+        if isinstance(value, dict):
+            return {self.quote(key): self.quote(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.quote(item) for item in value]
+        return value
+
+    def tokens(self, text):
+        """The tokens of `text`, a rendered prompt or a part of one that
+        encodes on its own. Without a mark it encodes as the tokenizer
+        encodes it, where that finds its added tokens as their literal text
+        alone (literal). Otherwise each added token it still spells whole is
+        the template's, and the text between two of them, its marks taken
+        out, encodes as ordinary text: what the tokenizer does with a text
+        it splits at those tokens alone."""
+        text = tokenizable(text)
+        if not self.added or (QUOTE not in text and self.literal):
+            return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        parts = self._tokens.split(text)
+        plain = self._plain.encode_batch(
+            [unquoted(part) for part in parts[::2]], add_special_tokens=False
+        )
+        tokens = list(plain[0].ids)
+        for token, following in zip(parts[1::2], plain[1:]):
+            tokens.append(self.added[token])
+            tokens.extend(following.ids)
+        return tokens
 
     def record_reply(self, text, token_ids):
         """Remember `token_ids` as the ids the model emitted for the reply
         text `text`, which a later conversation resends inside an assistant
-        turn. The turn-end token the emission ended on is not part of the
-        reply, so one trailing marker id is dropped."""
+        turn. The stored text is marked as `quote` marks the resent one, so
+        the match lands on the rendered prompt's quoted spelling. The
+        turn-end token the emission ended on is not part of the reply, so
+        one trailing marker id is dropped."""
         if (
             not self.enabled
             or _reply_memory_disabled()
@@ -121,6 +352,7 @@ class PromptTokenizer:
             ids.pop()
         if not ids:
             return
+        text = self.quote(text)
         with self.lock:
             self._unindex_reply(text)
             self.replies.pop(text, None)
@@ -188,9 +420,9 @@ class PromptTokenizer:
         while pos:
             boundary = text.rfind(self.marker, 0, pos)
             if boundary < 0:
-                pieces.append(self._encode(text[:pos]))
+                pieces.append(self.tokens(text[:pos]))
                 break
-            tail = self._encode(text[boundary:pos])
+            tail = self.tokens(text[boundary:pos])
             # As in encode, another added token can consume part of the
             # marker; this literal occurrence is then no boundary.
             if not tail or tail[0] != self.marker_id:
@@ -207,11 +439,13 @@ class PromptTokenizer:
         return tokens
 
     def encode(self, text):
+        """The tokens of the rendered prompt `text` (tokens), reusing a
+        cached prompt's and a remembered reply's."""
         if not self.enabled:
-            return self._encode(text)
+            return self.tokens(text)
         boundary = text.rfind(self.marker)
         if boundary < 0:
-            return self._encode(text)
+            return self.tokens(text)
         boundary += len(self.marker)
         prefix = text[:boundary]
         remembered = self._replies_active()
@@ -219,8 +453,8 @@ class PromptTokenizer:
             if remembered:
                 middle = self._encode_middle(prefix)
                 if middle is not None:
-                    return middle + self._encode(text[boundary:])
-            return self._encode(text)
+                    return middle + self.tokens(text[boundary:])
+            return self.tokens(text)
         with self.lock:
             key = max(
                 (key for key in self.entries if prefix.startswith(key)),
@@ -236,11 +470,11 @@ class PromptTokenizer:
         if key != prefix:
             span = prefix[len(key) :]
             middle = self._encode_middle(span) if remembered else None
-            tokens.extend(middle if middle is not None else self._encode(span))
+            tokens.extend(middle if middle is not None else self.tokens(span))
             # A different added token can consume part of the marker. In that
             # case this literal occurrence is not a tokenizer boundary.
             if not tokens or tokens[-1] != self.marker_id:
-                return self._encode(text)
+                return self.tokens(text)
             packed = array("I", tokens).tobytes()
             size = sys.getsizeof(prefix) + sys.getsizeof(packed)
             if size <= self.BUDGET_BYTES:
@@ -259,16 +493,17 @@ class PromptTokenizer:
                     ):
                         old, previous = self.entries.popitem(last=False)
                         self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
-        return tokens + self._encode(text[boundary:])
+        return tokens + self.tokens(text[boundary:])
 
     def split(self, text):
         """`text` cut just past its last marker where the tokenizer splits it
         there: the tokens before the cut, and the text after it, which
-        encodes on its own. No tokens and all of `text` where it does not."""
+        encodes on its own (tokens). No tokens and all of `text` where it
+        does not."""
         boundary = text.rfind(self.marker) if self.marker is not None else -1
         if self.enabled and boundary >= 0:
             boundary += len(self.marker)
-            head = self._encode(text[:boundary])
+            head = self.tokens(text[:boundary])
             # As in encode, another added token may consume part of the
             # marker, which is then no boundary.
             if head and head[-1] == self.marker_id:

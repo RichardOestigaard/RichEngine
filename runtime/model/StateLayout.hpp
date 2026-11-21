@@ -63,6 +63,36 @@ struct GdnStateLayout final {
     return convolutionBytes() + recurrentBytes() + auxiliaryBytes;
   }
 
+  // A cached state's recurrent matrix stores int8 codes with one bf16 scale
+  // per block of this many values, the block's largest magnitude over 127
+  // (StateCodec); the convolution FIFO and auxiliary bytes stay exact.
+  static constexpr uint32_t codecBlock = 32;
+  // Whether the recurrent matrix codes evenly into codecBlock blocks;
+  // otherwise a cached state keeps the running layout (cachedCellBytes ==
+  // cellBytes).
+  [[nodiscard]] constexpr bool codable() const noexcept {
+    return recurrentColumns % codecBlock == 0;
+  }
+  // Every value row of one layer: each group's recurrentRows of
+  // recurrentColumns values.
+  [[nodiscard]] constexpr uint64_t recurrentRowCount() const noexcept {
+    return uint64_t{recurrentGroups} * recurrentRows;
+  }
+  // One layer's codes and scales, aligned like the running layer.
+  [[nodiscard]] constexpr uint64_t codecLayerBytes() const noexcept {
+    if (!recurrentColumns || !codable())
+      return recurrentLayerBytes();
+    const uint64_t rows = recurrentRowCount();
+    return alignUp(rows * recurrentColumns +
+                   rows * (recurrentColumns / codecBlock) * bfloat16Bytes);
+  }
+  // A cached state's cell: the convolution FIFO and auxiliary bytes, the
+  // recurrent matrix as codes.
+  [[nodiscard]] constexpr uint64_t cachedCellBytes() const noexcept {
+    return convolutionBytes() + uint64_t{layers} * codecLayerBytes() +
+           auxiliaryBytes;
+  }
+
   bool operator==(const GdnStateLayout &) const = default;
 };
 
@@ -106,6 +136,11 @@ struct CompositeStateLayout final {
     return kLaneGdnCells * target.cellBytes() + draft.ringBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
+    return target.cachedCellBytes() + draft.ringBytes();
+  }
+  // A cached state stored as it runs, not coded
+  // (RICHENGINE_CACHED_STATES=exact): the running cell's bytes.
+  [[nodiscard]] constexpr uint64_t exactBytes() const noexcept {
     return target.cellBytes() + draft.ringBytes();
   }
 

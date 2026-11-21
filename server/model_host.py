@@ -319,6 +319,11 @@ class ModelHost:
                 "RICHENGINE_CANVAS_PROFILE", canvas_profile
             )
             tuned_env = env
+        cached_states = getattr(self.args, "cached_states", "int8")
+        if cached_states != "int8":
+            env = tuned_env if tuned_env is not None else dict(os.environ)
+            env["RICHENGINE_CACHED_STATES"] = cached_states
+            tuned_env = env
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(native_args),
             startup_timeout=NATIVE_START_TIMEOUT,

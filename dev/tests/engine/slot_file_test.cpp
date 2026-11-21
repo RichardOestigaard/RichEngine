@@ -3,6 +3,7 @@
 #include "model/SlotFile.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <future>
 #include <csignal>
 #include <fcntl.h>
@@ -235,6 +236,42 @@ static void testCancelledDirectWrite() {
   require(hold->wait() && !cancelled->wait(), "a cancelled write of aligned runs succeeded");
   require(file.writable() && !file.read(slot, {output}, {})->wait(),
           "a cancelled write of aligned runs left its slot readable or closed the file");
+}
+
+// A queued read goes ahead of writes queued for other slots: restores are
+// latency-bound while offloads are not. It still cannot pass a write to its
+// own slot, which is the write whose landing makes it readable.
+static void testReadPassesUnrelatedWritesOnly() {
+  constexpr size_t size = kHostPageBytes;
+  SlotFile file(size, std::make_shared<DiskBudget>(2 * size));
+  auto ahead = file.acquire();
+  auto own = file.acquire();
+  std::vector<std::byte> before(size, std::byte{1}), after(size, std::byte{2});
+  require(file.write(ahead, {before}, {})->wait() &&
+              file.write(own, {before}, {})->wait(),
+          "priming writes failed");
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  std::vector<std::byte> restored(size);
+  auto hold = file.read(ahead, {restored},
+                        [&] { reached.set_value(); released.wait(); });
+  reached.get_future().wait();
+  auto write = file.write(ahead, {after}, {});
+  std::atomic<bool> first{false};
+  auto jump = file.read(own, {restored}, [&] { first = !write->ready(); });
+  release.set_value();
+  require(hold->wait() && jump->wait() && write->wait() && first.load(),
+          "a queued read did not pass an unrelated write");
+  // The same read cannot pass a write queued for its own slot.
+  std::promise<void> reached2, release2;
+  auto released2 = release2.get_future().share();
+  hold = file.read(own, {restored}, [&] { reached2.set_value(); released2.wait(); });
+  reached2.get_future().wait();
+  auto overwrite = file.write(own, {after}, {});
+  auto behind = file.read(own, {restored}, {});
+  release2.set_value();
+  require(hold->wait() && overwrite->wait() && behind->wait() && restored == after,
+          "a read passed the write queued for its own slot");
 }
 
 // A freed slot gives its blocks back: two files filling one quota in turn
@@ -503,6 +540,7 @@ int main() {
     testScatteredSpans();
     testAlignedRunsMoveDirectly();
     testCancelledDirectWrite();
+    testReadPassesUnrelatedWritesOnly();
     testFreedSlotsReturnTheirBlocks();
     testPunchedSlotIsReusable();
     testPersistentSlotsComeBack();

@@ -22,6 +22,7 @@
 #include <string>
 #include <system_error>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace richengine::model {
@@ -601,7 +602,8 @@ void SlotFile::seal() noexcept {
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
-                                                     std::function<void()> completion) {
+                                                     std::function<void()> completion,
+                                                     uint32_t slot, bool read) {
   auto operation = std::make_shared<Operation>();
   {
     std::lock_guard lock(backing_->mutex);
@@ -609,7 +611,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
       throw std::logic_error("slot file is shutting down");
     if (backing_->adopting)
       throw std::logic_error("a persistent slot file takes operations only after adoption");
-    backing_->work.push_back({operation, std::move(run), std::move(completion)});
+    backing_->work.push_back(
+        {operation, std::move(run), std::move(completion), slot, read});
   }
   backing_->wake.notify_one();
   return operation;
@@ -635,8 +638,24 @@ void SlotFile::run() {
         continue;
       }
       if (backing.work.empty()) return;
-      work = std::move(backing.work.front());
-      backing.work.pop_front();
+      // Reads are on the latency path and writes are not, so the first read
+      // goes ahead of the writes queued for other slots. Order still holds
+      // within a slot: a read never passes a write to its own slot.
+      auto next = backing.work.begin();
+      {
+        std::unordered_set<uint32_t> writes;
+        for (auto it = next; it != backing.work.end(); ++it) {
+          if (it->read) {
+            if (!writes.count(it->slot)) {
+              next = it;
+              break;
+            }
+          } else if (it->slot != noSlot)
+            writes.insert(it->slot);
+        }
+      }
+      work = std::move(*next);
+      backing.work.erase(next);
     }
     bool success = false;
     try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
@@ -744,7 +763,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     slot->checksum_ = checksum;
     slot->written_ = true;
     return true;
-  }, std::move(completion));
+  }, std::move(completion), slot->index_, false);
 }
 
 std::shared_ptr<SlotFile::Operation> SlotFile::read(
@@ -799,7 +818,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
       slot->verify_ = false;
     }
     return true;
-  }, std::move(completion));
+  }, std::move(completion), slot->index_, true);
 }
 
 } // namespace richengine::model

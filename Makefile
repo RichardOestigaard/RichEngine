@@ -412,7 +412,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ExpertArena.cpp \
 	runtime/model/ExpertSlotRecycler.cpp \
 	runtime/model/VerifyBudget.cpp \
-	runtime/model/CompositeStateStorage.cpp
+	runtime/model/CompositeStateStorage.cpp \
+	runtime/model/StateCodec.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/AnePredictor.mm \
 	runtime/ane/Handoff.mm \

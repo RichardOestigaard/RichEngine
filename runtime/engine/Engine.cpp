@@ -75,6 +75,12 @@ std::string pageShortfall(const TokenAdmission &admission) {
          ", free_pages=" + std::to_string(admission.availablePages);
 }
 
+// Debug denial logging: read once, not per request per step.
+bool denyDebug() noexcept {
+  static const bool value = std::getenv("RICHENGINE_DENY_DEBUG") != nullptr;
+  return value;
+}
+
 } // namespace
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
@@ -389,7 +395,7 @@ bool Engine::tick(double now) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
-  while (auto plan = scheduler_.next(excluded)) {
+  while (auto plan = scheduler_.next(excluded, now)) {
     std::vector<ModelBatchItem> items;
     switch (prepare(*plan, items, now)) {
     case Prepared::Runnable: {
@@ -486,6 +492,11 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   if (const std::optional<double> persist = writeBehind_.nextWakeup();
       persist && (!result || *persist < *result))
     result = persist;
+  // A prefill unit waiting for a decoder's memory to land ends its wait
+  // here (Scheduler::waitsForDecoders), whether the memory has or not.
+  if (const std::optional<double> until = scheduler_.waitsUntil();
+      until && (!result || *until < *result))
+    result = until;
   return result;
 }
 
@@ -597,8 +608,14 @@ bool Engine::admitQueued(double now) {
   const auto waitForLane = [&](uint64_t id, Request &active) {
     if (!laneSought && !pendingSharedPrefill(active, cachedTokens(active))) {
       laneSought = true;
-      if (preemptBelow(active.request.priority, now))
+      if (preemptBelow(active.request.priority, now)) {
+        // The suspension is this pass's progress, whatever the next admits:
+        // run the pass again at once so the tick's command is the start's,
+        // where leaving it to the next tick cost a Foreground prompt beside
+        // Background decodes one more command of the lanes left.
+        static_cast<void>(admitQueued(now));
         return true;
+      }
     }
     scheduler_.waitForResources(id);
     deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
@@ -1360,7 +1377,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     const auto kv = allocate(
         [&] { return cache_.ensureTokens(active.request.id, workEnd); }, true, upTo);
     if (!kv.admission.granted()) {
-      if (getenv("RICHENGINE_DENY_DEBUG"))
+      if (denyDebug())
         fprintf(stderr,
                 "deny id=%llu pos=%llu workEnd=%llu addPages=%u avail=%u af=%d pend=%d\n",
                 (unsigned long long)active.request.id,
@@ -1460,7 +1477,7 @@ bool Engine::trySubmitAhead(double now) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
-  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
+  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded, now);
   if (!plan || plan->kind != WorkKind::Prefill || plan->empty())
     return false;
   std::vector<ModelBatchItem> items;
@@ -1558,7 +1575,7 @@ bool Engine::trySubmitAheadDecode(const Pending &retired,
   // The retiring lanes still decode and still carry their old stage, so the
   // plan and the scheduler's commit both read the pre-completion state
   // correctly; complete() then records the same phases the plan assumed.
-  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded);
+  std::optional<BatchPlan> plan = scheduler_.nextAhead(excluded, now);
   if (!plan || plan->kind != WorkKind::Decode || anyConstrained(*plan) ||
       plan->decodeStage != DecodeStage::Regular || plan->empty()) {
     return false;
@@ -2095,13 +2112,13 @@ void Engine::apply(const BatchPlan &plan,
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
-                      representativePrefillTiming);
+                      representativePrefillTiming, now);
   // A GPU-DFA lane's first mask came from the walk kernels in this command:
   // release its mask wait without the host round trip.
   for (uint64_t id : gpuMaskReady)
     if (scheduler_.phase(id) == Phase::WaitingMask)
       scheduler_.maskReady(id);
-  if (getenv("RICHENGINE_DENY_DEBUG") && plan.kind == WorkKind::Decode) {
+  if (denyDebug() && plan.kind == WorkKind::Decode) {
     std::string ids;
     for (const BatchItem &item : plan.items)
       ids += std::to_string(item.requestId) + " ";

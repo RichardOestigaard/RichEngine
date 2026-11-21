@@ -432,6 +432,43 @@ void keepsTheSourceIdentity(const std::filesystem::path &directory) {
   openRowReader(unchanged)->checkUnchanged();
 }
 
+// The buffer-backed reader copies from the resident bytes while they hold,
+// and reads the source once they do not: resident bytes differing from the
+// file's on purpose tell the two paths apart, and rows cached from the
+// buffer keep their bytes after the buffer lets go.
+void readsTheResidentBuffer(const std::filesystem::path &directory) {
+  const auto path = directory / "resident.bin";
+  const uint64_t rows = 64;
+  const std::vector<uint8_t> disk = randomBytes(kOffset + rows * rowBytes, 7);
+  richengine::test::writeFile(path, disk);
+  const std::vector<uint8_t> resident = randomBytes(kOffset + rows * rowBytes, 8);
+  std::atomic<size_t> held{resident.size()};
+  const auto bytes = [&]() -> std::span<const uint8_t> {
+    return {resident.data(), held.load()};
+  };
+  SparseRowStore store(
+      tableOf(rows),
+      openBufferRowReader(std::make_shared<WeightSource>(path), bytes),
+      optionsOf(bytesFor(1024, 64), 2, 64));
+  const auto check = [&](const std::vector<uint32_t> &ids, const std::vector<uint8_t> &against) {
+    std::vector<uint8_t> staged(ids.size() * rowBytes);
+    std::vector<uint32_t> slots(ids.size());
+    store.stage(ids, staged, slots, SparseRowUse::Decode);
+    for (size_t i = 0; i < ids.size(); ++i)
+      require(std::memcmp(staged.data() + uint64_t{slots[i]} * rowBytes,
+                          against.data() + kOffset + uint64_t{ids[i]} * rowBytes, rowBytes) == 0,
+              "a resident-buffer row was staged wrong");
+  };
+  check({0, 63, 17}, resident);
+  // A range the resident bytes do not cover reads the file.
+  held = kOffset + 4 * rowBytes;
+  check({10, 11}, disk);
+  held = 0;
+  check({1, 62}, disk);
+  // Rows cached from the buffer keep its bytes once it is gone.
+  check({17}, resident);
+}
+
 // The production reader reads the file it was given open, uncached: a write
 // to it poisons, a new file at its path changes nothing, a truncation fails.
 void readsAnOpenFile(const std::filesystem::path &directory) {
@@ -507,6 +544,7 @@ int main() {
       dropsAFailedPrefetch();
       concurrentUse();
       readsAnOpenFile(directory.path());
+      readsTheResidentBuffer(directory.path());
       keepsTheSourceIdentity(directory.path());
     }
   } catch (const std::exception &error) {

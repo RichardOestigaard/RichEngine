@@ -40,7 +40,7 @@ from .errors import APIError, ContextLengthError
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
-from .tokenization import PromptTokenizer
+from .tokenization import PromptTokenizer, unquoted
 from .tool_schema import (
     QWEN3_XML,
     THINK_END,
@@ -976,8 +976,9 @@ class Frontend:
             {**template, "tokenize": False, "chat_template": marked},
         )
         # Marker positions in the final string, pad tokens spliced in: each
-        # recorded span is where the pad token lands once markers leave.
-        image_offsets, audio_offsets, video_offsets = set(), set(), set()
+        # recorded kind is where its pad token lands once markers leave.
+        seen = set()
+        offsets = (set(), set(), set())
         parts, clean_len, cursor = [], 0, 0
         while True:
             at = {
@@ -997,36 +998,61 @@ class Frontend:
             # for its marker (which a template could only emit anyway when
             # that media kind was marked).
             if marker == IMAGE_RENDER_MARKER:
-                pad, which = self.image_pad_token, image_offsets
+                pad, kind = self.image_pad_token, 0
             elif marker == AUDIO_RENDER_MARKER:
-                pad, which = self.audio_pad_token, audio_offsets
+                pad, kind = self.audio_pad_token, 1
             else:
-                pad, which = self.video_pad_token, video_offsets
+                pad, kind = self.video_pad_token, 2
+            seen.add(kind)
             parts.append(rendered[cursor:at_])
             clean_len += at_ - cursor
-            which.add((clean_len, clean_len + len(pad)))
+            offsets[kind].add((clean_len, clean_len + len(pad)))
             parts.append(pad)
             clean_len += len(pad)
             cursor = at_ + len(marker)
         parts.append(rendered[cursor:])
         clean = "".join(parts)
-        encoded = self._tokenize(
-            clean,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        offsets = [
-            (index, tuple(span))
-            for index, span in enumerate(encoded["offset_mapping"])
-        ]
-        image_positions = [i for i, span in offsets if span in image_offsets]
-        audio_positions = [i for i, span in offsets if span in audio_offsets]
-        video_positions = [i for i, span in offsets if span in video_offsets]
+        prompt_tokenizer = getattr(self, "prompt_tokenizer", None)
+        if prompt_tokenizer is not None:
+            # The spliced pad texts are the template's own, unmarked, so each
+            # encodes as its token; text a client sent encodes as no added
+            # token, so every pad token in the encoding is a splice's.
+            tokens = prompt_tokenizer.tokens(clean)
+            positions = []
+            for kind, attribute in enumerate(
+                ("image_pad_token", "audio_pad_token", "video_pad_token")
+            ):
+                pad = getattr(self, attribute, None) if kind in seen else None
+                pad_id = (
+                    self.tokenizer.convert_tokens_to_ids(pad)
+                    if pad is not None
+                    else None
+                )
+                positions.append(
+                    [i for i, token in enumerate(tokens) if token == pad_id]
+                    if pad_id is not None
+                    else []
+                )
+        else:
+            encoded = self._tokenize(
+                clean,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            spans = [
+                (index, tuple(span))
+                for index, span in enumerate(encoded["offset_mapping"])
+            ]
+            tokens = list(encoded["input_ids"])
+            positions = [
+                [i for i, span in spans if span in offsets[kind]]
+                for kind in range(3)
+            ]
         return (
-            list(encoded["input_ids"]),
-            image_positions,
-            audio_positions,
-            video_positions,
+            tokens,
+            positions[0],
+            positions[1],
+            positions[2],
             clean,
         )
 
@@ -1646,8 +1672,24 @@ class Frontend:
         return {"pushed": pushed}
 
     def _apply_chat_template(self, messages, template):
+        """The prompt the template renders from the request's messages and
+        template options, each quoted (PromptTokenizer.quote) as text a
+        client sent: what a message, a tool definition or a variable spells
+        is never the template's own tag. The template's source, named by
+        "chat_template", is the template's own text and stays unmarked."""
         with self.latencies.measure("template"):
-            return render_chat_template(self.tokenizer, messages, template)
+            quote = getattr(
+                getattr(self, "prompt_tokenizer", None), "quote",
+                lambda value: value,
+            )
+            return render_chat_template(
+                self.tokenizer,
+                quote(messages),
+                {
+                    name: value if name == "chat_template" else quote(value)
+                    for name, value in template.items()
+                },
+            )
 
     def _render_shared_prefix_probe(self, key):
         """The tokens of a request's leading system message and template
@@ -1658,7 +1700,7 @@ class Frontend:
             text = self._apply_chat_template([*head, SHARED_PREFIX_PROBE], template)
         except Exception:
             return ()
-        return tuple(self._tokenize(text, add_special_tokens=False)["input_ids"])
+        return tuple(self.prompt_tokenizer.tokens(text))
 
     def _shared_prefix_probe_tokens(self, messages, template):
         """The tokens of the prompt's leading system message, tools and
@@ -1798,6 +1840,8 @@ class Frontend:
         first_media = min(positions + audio_positions + video_positions, default=None)
         if first_media is not None and first_media < shared_prefix_tokens:
             shared_prefix_tokens = 0
+        # The text the model reads; the marks said how it encodes.
+        rendered = unquoted(rendered)
         return RenderedPrompt(
             rendered,
             tokens,

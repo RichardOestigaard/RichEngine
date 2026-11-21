@@ -33,15 +33,21 @@ public:
     return buffers_;
   }
 
+  // A lane's cell when `cached` is false; a cached state's smaller cell,
+  // whose recurrent regions hold codec bytes rather than the running
+  // matrix, when true.
+  [[nodiscard]] bool cached() const noexcept { return cached_; }
+
 private:
   GdnCell(metal::MetalBackend &backend,
               std::shared_ptr<StateAllocationTracker> tracker,
               GdnStateLayout layout,
-              std::string_view label);
+              std::string_view label, bool cached = false);
 
   std::shared_ptr<StateAllocationTracker> tracker_;
   GdnParityBuffers buffers_;
   uint64_t actualAllocatedBytes_ = 0;
+  bool cached_ = false;
 
   friend class CompositeStateStorage;
 };
@@ -84,6 +90,9 @@ struct CachedStateBuffers final {
 // only by reclaim.
 struct StateBufferPool final {
   std::vector<std::shared_ptr<GdnCell>> cells;
+  // Cached-state cells (codec layout) pool apart from the lanes': a lane
+  // never reuses one, a cached state never a lane's.
+  std::vector<std::shared_ptr<GdnCell>> cachedCells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
   // Cleared when the storage goes away; late returns then just free.
   bool open = true;
@@ -170,6 +179,17 @@ public:
   ~CompositeStateStorage();
   CompositeStateStorage(const CompositeStateStorage &) = delete;
   CompositeStateStorage &operator=(const CompositeStateStorage &) = delete;
+
+  // Whether cached states of this layout code the recurrent matrix as
+  // int8: the default, unless RICHENGINE_CACHED_STATES=exact or the layout
+  // does not code evenly. Whoever sizes a stored state from the layout
+  // (the slot file, a record check) picks the same mode.
+  [[nodiscard]] static bool cachesInt8(const CompositeStateLayout &layout) noexcept;
+  // What one stored state of the layout occupies in that mode
+  // (CompositeStateLayout::cachedBytes or exactBytes).
+  [[nodiscard]] static uint64_t storedBytes(const CompositeStateLayout &layout) noexcept {
+    return cachesInt8(layout) ? layout.cachedBytes() : layout.exactBytes();
+  }
 
   [[nodiscard]] const LaneMetadata &metadata(uint32_t lane) const;
   // An assigned lane's buffers, read through the cells and the ring it
@@ -280,9 +300,10 @@ private:
   // refusal allocates nothing and takes nothing from the pool.
   [[nodiscard]] metal::AllocationResult
   acquire(uint32_t cells, std::string_view label, Buffers &buffers,
-          uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
+          uint64_t extraBytes = 0,
+          const std::function<void()> &allocateExtra = {}, bool cached = false);
   // The bytes of the cells and the ring the pool lacks of that.
-  [[nodiscard]] uint64_t missingBytes(uint32_t cells) const noexcept;
+  [[nodiscard]] uint64_t missingBytes(uint32_t cells, bool cached = false) const noexcept;
   void restore(uint32_t lane, const CompositeStateImpl &state,
                bool restoreDraftState);
   void restoreLengths(uint32_t lane, LogicalLengths lengths, bool restoreDraft);
@@ -297,6 +318,10 @@ private:
   std::array<Lane, ExecutionLimits::maximumBatchWidth> lanes_;
   std::shared_ptr<SlotFile> file_;
   std::shared_ptr<StateStaging> staging_;
+  // Cached states hold the recurrent matrix as int8 codes (RICHENGINE_
+  // CACHED_STATES; "exact" keeps the running layout, as does a layout that
+  // does not code evenly).
+  bool cachedInt8_ = false;
 };
 
 } // namespace richengine::model

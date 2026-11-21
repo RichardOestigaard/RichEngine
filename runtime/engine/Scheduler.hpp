@@ -108,17 +108,27 @@ public:
   // prefill lanes and candidates, and is dropped when a higher tier decodes.
   [[nodiscard]] std::optional<RequestPriority> highestRunnablePriority() const noexcept;
   // The next command, planned without the excluded lanes: those that wait
-  // for memory on its way back and cannot run before it lands.
-  [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
+  // for memory on its way back and cannot run before it lands. None while
+  // the next prefill unit waits for a decoder among them whose gap the
+  // unit would hold a second unit of (waitsForDecoders).
+  [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded,
+                                              double now = 0.0);
   // The command behind a committed one (the submit-ahead ring): plans
   // against promptPlanned, so a continuation chunk starts where the
   // in-flight one ends.
-  [[nodiscard]] std::optional<BatchPlan> nextAhead(std::span<const uint64_t> excluded) const;
+  [[nodiscard]] std::optional<BatchPlan> nextAhead(std::span<const uint64_t> excluded,
+                                                   double now = 0.0);
+  // When the next prefill unit's wait for decoders whose memory lands ends
+  // (waitsForDecoders); none where no unit waits.
+  [[nodiscard]] std::optional<double> waitsUntil() const noexcept;
   // The excluded lanes are those the plan was made without: blocked, not
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
+  // A prefill unit, ended at `now`, bounds the next unit's wait for
+  // decoders whose memory lands (waitsForDecoders).
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds, bool representativePrefillTiming);
+                double wallMilliseconds, bool representativePrefillTiming,
+                double now = 0.0);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // Suspended by suspendForResources and not resumed since; a terminal
@@ -175,6 +185,13 @@ private:
   nextDecode(std::span<const uint64_t> excluded) const;
   [[nodiscard]] std::optional<BatchPlan>
   planPrefill(std::vector<PrefillRequestView> ready) const;
+  // Whether `prefill`, which runs as no decode can, holds for a decoder
+  // among the excluded whose memory lands: one of its priority or a higher
+  // that has not decoded since the last prefill unit began, owed decode
+  // time the wait stands in for.
+  [[nodiscard]] bool waitsForDecoders(const BatchPlan &prefill,
+                                      std::span<const uint64_t> excluded,
+                                      double now);
   // The rows the lane can take in one command: up to its prompt's end or its
   // next state boundary.
   [[nodiscard]] static uint32_t dispatchRemaining(const PrefillRequestView &view) noexcept;
@@ -193,8 +210,20 @@ private:
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
-  // commands' wall time has worked it off.
+  // commands' wall time, and the time a prefill unit waited for decoders
+  // whose memory lands (waitsForDecoders), have worked it off.
   double decodeDebtMilliseconds_ = 0.0;
+  // When the next prefill unit's wait for decoders whose memory lands ends
+  // at the latest: the end of the last prefill unit and the time it took,
+  // capped (complete). A time, set as that unit ends, so the wait ends by
+  // itself, and once for a unit.
+  double waitEndMilliseconds_ = 0.0;
+  // When the wait in force began, negative while none is: what it took of
+  // the debt comes off as the wait ends.
+  double waitBeginMilliseconds_ = -1.0;
+  // The decode dispatch order when the last prefill unit committed: a lane
+  // whose last decode dispatch is no later has not decoded since.
+  uint64_t prefillDispatchOrder_ = 0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

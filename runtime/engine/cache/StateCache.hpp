@@ -157,8 +157,11 @@ public:
     completion_ = std::move(notifier);
   }
 
+  // Deepest state's lease, or none; lostState reports a block deeper than
+  // it that once held a reusable state gone from both tiers. One walk gives
+  // both, as a block is lost only above the state a lookup would take.
   [[nodiscard]] std::optional<CompositeStateLease>
-  acquireDeepest(std::span<const uint64_t> kvChain);
+  acquireDeepest(std::span<const uint64_t> kvChain, bool *lostState = nullptr);
 
   // Reuses a RAM copy without a restore pin. A normal boundary upgrades a
   // checkpoint; a checkpoint cannot downgrade an ordinary state. False for a

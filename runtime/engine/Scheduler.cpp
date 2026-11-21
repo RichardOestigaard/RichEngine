@@ -15,6 +15,9 @@ constexpr uint32_t kMaximumOvertakes =
     model::ExecutionLimits::maximumBatchWidth - 1;
 
 constexpr double kContendedPrefillMilliseconds = 500.0;
+// The most a prefill unit's wait for a decoder whose memory lands can be:
+// the decode gap target.
+constexpr double kDecodeWaitCapMilliseconds = 500.0;
 constexpr uint32_t kMinimumPrefillRows = 64;
 
 // A command excludes at most the lanes of a full batch: a linear search.
@@ -243,19 +246,22 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
   return result;
 }
 
-std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
+std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded, double now) {
   if (!active_.empty())
     return std::nullopt;
-  return nextAhead(excluded);
+  return nextAhead(excluded, now);
 }
 
-std::optional<BatchPlan> Scheduler::nextAhead(std::span<const uint64_t> excluded) const {
+std::optional<BatchPlan> Scheduler::nextAhead(std::span<const uint64_t> excluded,
+                                                double now) {
   if (active_.size() >= 2)
     return std::nullopt;
   auto decode = nextDecode(excluded);
   auto prefill = nextPrefill(excluded);
   if (!decode)
-    return prefill;
+    return prefill && waitsForDecoders(*prefill, excluded, now)
+               ? std::nullopt
+               : prefill;
   if (!prefill)
     return decode;
 
@@ -276,6 +282,46 @@ std::optional<BatchPlan> Scheduler::nextAhead(std::span<const uint64_t> excluded
     return decode;
   return lastCommittedKind_ == WorkKind::Decode ? std::move(prefill)
                                                  : std::move(decode);
+}
+
+std::optional<double> Scheduler::waitsUntil() const noexcept {
+  return waitBeginMilliseconds_ >= 0.0
+             ? std::optional<double>(waitEndMilliseconds_)
+             : std::nullopt;
+}
+
+bool Scheduler::waitsForDecoders(const BatchPlan &prefill,
+                                 std::span<const uint64_t> excluded,
+                                 double now) {
+  // A decoder whose memory is on its way back is a decoder still: the
+  // decode share protects its gap as it does a ready one's. The wait ends
+  // at a time the last prefill unit set as it ended (complete): it lasts
+  // once for that unit, whatever commits meanwhile, and what it waited
+  // works the debt off as the decoder's decode would have.
+  if (!(decodeDebtMilliseconds_ > 0.0) || !(now < waitEndMilliseconds_)) {
+    if (waitBeginMilliseconds_ >= 0.0) {
+      decodeDebtMilliseconds_ =
+          std::max(0.0, decodeDebtMilliseconds_ -
+                            (waitEndMilliseconds_ - waitBeginMilliseconds_));
+      waitBeginMilliseconds_ = -1.0;
+    }
+    return false;
+  }
+  const RequestPriority priority =
+      get(prefill.items.front().requestId).spec.priority;
+  const bool owed = std::ranges::any_of(excluded, [&](uint64_t id) {
+    const auto found = requests_.find(id);
+    return found != requests_.end() && found->second.phase == Phase::Decode &&
+           found->second.spec.priority <= priority &&
+           found->second.lastDecodeDispatch <= prefillDispatchOrder_;
+  });
+  if (!owed) {
+    waitBeginMilliseconds_ = -1.0;
+    return false;
+  }
+  if (waitBeginMilliseconds_ < 0.0)
+    waitBeginMilliseconds_ = now;
+  return true;
 }
 
 std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> excluded) const {
@@ -389,11 +435,12 @@ uint32_t Scheduler::prefillBudget(
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
+  static const bool denyDebug = getenv("RICHENGINE_DENY_DEBUG") != nullptr;
   std::vector<const Request *> ready;
   for (const auto &[id, request] : requests_) {
     if (request.phase == Phase::Decode && !listed(excluded, id))
       ready.push_back(&request);
-    else if (getenv("RICHENGINE_DENY_DEBUG") &&
+    else if (denyDebug &&
              !terminal(request.phase) && request.phase != Phase::Prefill &&
              (request.phase != Phase::Decode || listed(excluded, id)))
       fprintf(stderr, "not-ready id=%llu phase=%d excl=%d\n",
@@ -432,7 +479,7 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
         request->decodeStage != decodeStage ||
         (mixedPack ? hostMaskLane(request) != leaderHostMask
                    : request->spec.constraint != constraint)) {
-      if (getenv("RICHENGINE_DENY_DEBUG"))
+      if (denyDebug)
         fprintf(stderr, "stage-split id=%llu stage=%d want=%d constr=%d want=%d\n",
                 (unsigned long long)request->spec.id,
                 (int)request->decodeStage, (int)decodeStage,
@@ -470,6 +517,7 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
   active_.push_back({plan, {excluded.begin(), excluded.end()}});
   lastCommittedKind_ = plan.kind;
   if (plan.kind == WorkKind::Prefill) {
+    prefillDispatchOrder_ = decodeDispatchOrder_;
     ++counters_.prefillBatches;
     for (const BatchItem &item : plan.items)
       counters_.prefillRows += item.tokenCount;
@@ -501,7 +549,7 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
 void Scheduler::complete(const BatchPlan &plan,
                          std::span<const StepResult> results,
                          double wallMilliseconds,
-                         bool representativePrefillTiming) {
+                         bool representativePrefillTiming, double now) {
   if (active_.empty() || active_.front().plan.kind != plan.kind ||
       active_.front().plan.items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
@@ -578,6 +626,14 @@ void Scheduler::complete(const BatchPlan &plan,
         decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
+  // The next prefill unit waits for decoders whose memory lands
+  // (waitsForDecoders) until this one has ended for as long as it took, at
+  // most the decode gap target. An untimed one leaves no wait.
+  if (plan.kind == WorkKind::Prefill)
+    waitEndMilliseconds_ =
+        now + (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0
+                   ? std::min(wallMilliseconds, kDecodeWaitCapMilliseconds)
+                   : 0.0);
   dropStaleDecodeDebt();
   active_.pop_front();
 }

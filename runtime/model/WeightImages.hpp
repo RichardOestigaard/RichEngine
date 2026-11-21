@@ -4,6 +4,7 @@
 #include "model/WeightMemory.hpp"
 #include "model/WeightStore.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -72,6 +73,10 @@ public:
   // Each image's component and bytes in load order, its bytes empty while
   // released, valid until the next load().
   [[nodiscard]] std::vector<Contents> contents() const;
+  // The bytes of the image loaded with `component` (an ImagePlan's), empty
+  // while the image is released and not yet restored — restore() rewrites
+  // an image before restored_ passes it — or when no image has it.
+  [[nodiscard]] std::span<const uint8_t> imageBytes(std::string_view component) const noexcept;
 
 private:
   struct Image final {
@@ -82,9 +87,9 @@ private:
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
   std::vector<Image> images_;
-  bool released_ = false;
+  std::atomic<bool> released_{false};
   // The images restore() has written back since release().
-  size_t restored_ = 0;
+  std::atomic<size_t> restored_{0};
 };
 
 // The image of a RichEngine package's packed file at path, read as it is.

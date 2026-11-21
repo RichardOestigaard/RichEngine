@@ -566,8 +566,19 @@ void openExpertStreaming(metal::MetalBackend &backend,
     storeOptions.prefetchSlices = 4 * kPackedExpertRegions;
     auto source = std::make_shared<WeightSource>(
         packed.directory / ("layer-" + std::to_string(index) + ".bin"));
+    // The layer's image already holds the file's every byte; the store's
+    // reads copy from it while it is resident and touch storage while it
+    // is released (WeightImages::release/restore, or a component the
+    // images do not name).
+    const WeightImages &images = packed.images;
+    const std::string component =
+        "target/layer-" + std::to_string(index) + ".bin";
     stream.stores.push_back(std::make_shared<PackedExpertStore>(
-        table, openRowReader(std::move(source)), std::move(storeOptions)));
+        table,
+        openBufferRowReader(std::move(source), [&images, component] {
+          return images.imageBytes(component);
+        }),
+        std::move(storeOptions)));
     ExpertSlotPlanes planes{};
     for (uint32_t z = 0; z < kPackedExpertProjections; ++z)
       for (uint32_t p = 0; p < kPackedExpertPlanes; ++p)

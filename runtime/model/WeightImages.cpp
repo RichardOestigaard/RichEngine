@@ -51,6 +51,21 @@ std::vector<WeightImages::Contents> WeightImages::contents() const {
   return result;
 }
 
+std::span<const uint8_t> WeightImages::imageBytes(std::string_view component) const noexcept {
+  const size_t restored = restored_.load(std::memory_order_acquire);
+  for (size_t index = 0; index < images_.size(); ++index) {
+    const Image &image = images_[index];
+    if (image.component != component) continue;
+    // A released buffer's contents are null; one restore() is rewriting may
+    // already have a buffer whose bytes are not the file's yet.
+    if (released_.load(std::memory_order_acquire) && index >= restored) return {};
+    const auto *bytes = static_cast<const uint8_t *>(image.buffer.contents());
+    return bytes ? std::span<const uint8_t>{bytes, image.buffer.sizeBytes()}
+                 : std::span<const uint8_t>{};
+  }
+  return {};
+}
+
 ImagePlan packedImage(const std::filesystem::path &path, std::string component, std::string_view magic,
                       uint32_t layer, uint32_t type) {
   auto source = std::make_shared<WeightSource>(path);

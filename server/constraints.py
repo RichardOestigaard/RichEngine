@@ -21,6 +21,7 @@ from llguidance.numpy import (
 from . import dfa as dfa_compiler
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
+from .tokenization import added_tokens
 from .tool_schema import (
     THINK_END,
     THINK_OPEN,
@@ -618,6 +619,13 @@ def validate_tokenizer(tokenizer, config, serving=None):
     config.json. serving is the model's ServingContract: its think framing
     and tool dialect name the spellings to bind; without one (an old
     assembly) the spellings are probed, as they always were."""
+    # A tokenizer whose added tokens the server cannot keep out of the text
+    # a client sent (tokenization.added_tokens) would serve a prompt that
+    # quotes a tag with the tag as its control token.
+    try:
+        added_tokens(tokenizer)
+    except ValueError as error:
+        raise engine_runtime.EngineUnhealthy(str(error)) from None
     generation_config = None
     if not isinstance(config, dict):
         config_dir = config

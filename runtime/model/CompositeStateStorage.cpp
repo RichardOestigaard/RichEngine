@@ -1,9 +1,13 @@
 #include "model/CompositeStateStorage.hpp"
 
+#include "model/StateCodec.hpp"
+
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace richengine::model {
@@ -50,6 +54,53 @@ std::vector<std::span<std::byte>> stateSpans(
     append(layer.values);
   }
   return spans;
+}
+
+// `source`, a lane's cell, coded into `cached`, a cached cell: the
+// convolution FIFO and the auxiliary bytes as they are, every layer's
+// recurrent matrix as codes (statecodec).
+void quantizeCell(GdnCell &cached, const GdnParityBuffers &source,
+                  const GdnStateLayout &layout) {
+  auto *to = static_cast<std::byte *>(
+      writableContents(cached.buffers().stateBase, "cached GDN state"));
+  const auto *from = static_cast<const std::byte *>(
+      writableContents(source.stateBase, "cached GDN state"));
+  const uint64_t convolution = layout.convolutionBytes();
+  std::memcpy(to, from, convolution);
+  const uint64_t rows = layout.recurrentRowCount();
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    statecodec::quantize(
+        reinterpret_cast<const float *>(
+            from + convolution + uint64_t{layer} * layout.recurrentLayerBytes()),
+        to + convolution + uint64_t{layer} * layout.codecLayerBytes(), rows,
+        layout.recurrentColumns);
+  }
+  std::memcpy(to + convolution + uint64_t{layout.layers} * layout.codecLayerBytes(),
+              from + convolution +
+                  uint64_t{layout.layers} * layout.recurrentLayerBytes(),
+              layout.auxiliaryBytes);
+}
+
+void dequantizeCell(const GdnParityBuffers &lane, const GdnParityBuffers &cached,
+                    const GdnStateLayout &layout) {
+  auto *to = static_cast<std::byte *>(
+      writableContents(lane.stateBase, "restored GDN state"));
+  const auto *from = static_cast<const std::byte *>(
+      writableContents(cached.stateBase, "restored GDN state"));
+  const uint64_t convolution = layout.convolutionBytes();
+  std::memcpy(to, from, convolution);
+  const uint64_t rows = layout.recurrentRowCount();
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    statecodec::dequantize(
+        from + convolution + uint64_t{layer} * layout.codecLayerBytes(),
+        reinterpret_cast<float *>(
+            to + convolution + uint64_t{layer} * layout.recurrentLayerBytes()),
+        rows, layout.recurrentColumns);
+  }
+  std::memcpy(to + convolution + uint64_t{layout.layers} * layout.recurrentLayerBytes(),
+              from + convolution +
+                  uint64_t{layout.layers} * layout.codecLayerBytes(),
+              layout.auxiliaryBytes);
 }
 
 class FileOffload final : public StateOffload {
@@ -102,20 +153,24 @@ private:
 
 GdnCell::GdnCell(metal::MetalBackend &backend,
                          std::shared_ptr<StateAllocationTracker> tracker,
-                         GdnStateLayout layout, std::string_view label)
-    : tracker_(std::move(tracker)) {
+                         GdnStateLayout layout, std::string_view label,
+                         bool cached)
+    : tracker_(std::move(tracker)), cached_(cached) {
   if (!tracker_)
     throw std::invalid_argument("state allocation tracker is empty");
   if (!layout.valid())
     throw std::invalid_argument("GDN state layout is invalid");
+  const uint64_t cellBytes = cached ? layout.cachedCellBytes() : layout.cellBytes();
+  const uint64_t recurrentBytes =
+      cached ? layout.codecLayerBytes() : layout.recurrentLayerBytes();
   const uint64_t before = backend.memoryStats().allocatedBytes;
   // A stateless target's cell is empty: no layers, no allocation.
   buffers_.stateBase =
-      layout.cellBytes()
-          ? backend.allocateBuffer(layout.cellBytes(), metal::BufferStorage::Shared, label)
+      cellBytes
+          ? backend.allocateBuffer(cellBytes, metal::BufferStorage::Shared, label)
           : metal::MetalBuffer{};
   // The cell holds every layer's convolution state, then every layer's
-  // recurrent state.
+  // recurrent state — a cached cell's as codec bytes.
   buffers_.convolutionLayers.resize(layout.layers);
   buffers_.recurrentLayers.resize(layout.layers);
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
@@ -123,16 +178,16 @@ GdnCell::GdnCell(metal::MetalBackend &backend,
         backend.view(buffers_.stateBase,
                      uint64_t{layer} * layout.convolutionLayerBytes(),
                      layout.convolutionLayerBytes());
-    if (layout.recurrentLayerBytes())
+    if (recurrentBytes)
       buffers_.recurrentLayers[layer] = backend.view(
           buffers_.stateBase,
           layout.convolutionBytes() +
-              uint64_t{layer} * layout.recurrentLayerBytes(),
-          layout.recurrentLayerBytes());
+              uint64_t{layer} * recurrentBytes,
+          recurrentBytes);
   }
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
-  if (actualAllocatedBytes_ < layout.cellBytes()) {
+  if (actualAllocatedBytes_ < cellBytes) {
     throw std::logic_error("GDN allocation is below declared bytes");
   }
   tracker_->bytes.fetch_add(actualAllocatedBytes_, std::memory_order_relaxed);
@@ -223,7 +278,10 @@ void CompositeStateImpl::label(std::vector<std::byte> label) const {
 CompositeStateImpl::~CompositeStateImpl() {
   if (!pool_ || !pool_->open)
     return;
-  pool_->cells.push_back(std::move(buffers_.gdn));
+  if (buffers_.gdn->cached())
+    pool_->cachedCells.push_back(std::move(buffers_.gdn));
+  else
+    pool_->cells.push_back(std::move(buffers_.gdn));
   pool_->rings.push_back(std::move(buffers_.draft));
 }
 
@@ -239,12 +297,19 @@ CompositeStateStorage::CompositeStateStorage(metal::MetalBackend &backend,
     throw std::invalid_argument("state allocation admission is required");
   if (!layout_.valid())
     throw std::invalid_argument("composite state layout is invalid");
+  cachedInt8_ = cachesInt8(layout_);
   if (file) {
     file_ = std::move(file);
     staging_ = std::make_shared<StateStaging>();
     staging_->buffer = backend_.allocateBuffer(
-        layout_.cachedBytes(), metal::BufferStorage::Shared, "state-staging");
+        storedBytes(layout_), metal::BufferStorage::Shared, "state-staging");
   }
+}
+
+bool CompositeStateStorage::cachesInt8(const CompositeStateLayout &layout) noexcept {
+  const char *format = std::getenv("RICHENGINE_CACHED_STATES");
+  return layout.target.recurrentColumns && layout.target.codable() &&
+         (!format || std::string_view(format) != "exact");
 }
 
 CompositeStateStorage::~CompositeStateStorage() {
@@ -324,6 +389,8 @@ uint64_t CompositeStateStorage::releaseOneIdle(bool keepLane) noexcept {
   const uint64_t before = backend_.memoryStats().allocatedBytes;
   if (idleCells() > (keepLane ? CompositeStateLayout::kLaneGdnCells : 0))
     pool_->cells.pop_back();
+  else if (!pool_->cachedCells.empty())
+    pool_->cachedCells.pop_back();
   else if (idleRings() > (keepLane ? 1U : 0U))
     pool_->rings.pop_back();
   else
@@ -340,9 +407,13 @@ uint32_t CompositeStateStorage::idleRings() const noexcept {
   return static_cast<uint32_t>(pool_->rings.size());
 }
 
-uint64_t CompositeStateStorage::missingBytes(uint32_t cells) const noexcept {
-  const uint64_t missing = cells - std::min<uint64_t>(pool_->cells.size(), cells);
-  return missing * layout_.target.cellBytes() +
+uint64_t CompositeStateStorage::missingBytes(uint32_t cells,
+                                             bool cached) const noexcept {
+  const auto &pool =
+      cached ? pool_->cachedCells : pool_->cells;
+  const uint64_t missing = cells - std::min<uint64_t>(pool.size(), cells);
+  return missing * (cached ? layout_.target.cachedCellBytes()
+                           : layout_.target.cellBytes()) +
          (pool_->rings.empty() ? layout_.draft.ringBytes() : 0);
 }
 
@@ -378,11 +449,14 @@ CompositeStateStorage::snapshot(uint32_t index, LogicalLengths lengths) {
   const std::vector<DFlashDraftRingLayer> &ring = draft(index);
   validateLengths(lengths, true);
   Buffers buffers;
-  if (!acquire(1, "state-cache", buffers))
+  if (auto admission = acquire(1, "state-cache", buffers, 0, {}, cachedInt8_))
     return nullptr;
   CachedStateBuffers cached{std::move(buffers.gdn[0]), std::move(buffers.draft)};
-  copyExact(cached.gdn->buffers().stateBase, gdn.stateBase,
-            "cached GDN state");
+  if (cachedInt8_)
+    quantizeCell(*cached.gdn, gdn, layout_.target);
+  else
+    copyExact(cached.gdn->buffers().stateBase, gdn.stateBase,
+              "cached GDN state");
   for (uint32_t layer = 0; layer < ring.size(); ++layer) {
     copyExact(cached.draft->layers()[layer].keys, ring[layer].keys,
               "cached draft keys");
@@ -415,6 +489,21 @@ std::shared_ptr<const CompositeState>
 CompositeStateStorage::makeCaptured(CachedStateBuffers buffers,
                                     LogicalLengths lengths) {
   validateLengths(lengths, false);
+  if (cachedInt8_) {
+    // The capture cell is lane-sized — the commit dispatch wrote a running
+    // cell. Code it into a cached cell and return the capture cell to the
+    // lane pool.
+    Buffers cached;
+    if (!acquire(1, "state-cache", cached, 0, {}, true))
+      return nullptr;
+    quantizeCell(*cached.gdn[0], buffers.gdn->buffers(), layout_.target);
+    cached.draft = std::move(buffers.draft);
+    pool_->cells.push_back(std::move(buffers.gdn));
+    return std::shared_ptr<const CompositeStateImpl>(new CompositeStateImpl(
+        pool_,
+        CachedStateBuffers{std::move(cached.gdn[0]), std::move(cached.draft)},
+        layout_, lengths, file_, staging_));
+  }
   return std::shared_ptr<const CompositeStateImpl>(new CompositeStateImpl(
       pool_, std::move(buffers), layout_, lengths, file_, staging_));
 }
@@ -426,27 +515,31 @@ CompositeStateStorage::snapshotToDisk(uint32_t index, std::function<void()> comp
   validateLengths(source.metadata.lengths, true);
   if (!canSnapshotToDisk())
     return {};
-  return CompositeStateImpl::write(file_, staging_,
-                                   stateSpans(current(index), draft(index)),
-                                   layout_, source.metadata.lengths,
-                                   std::move(completion));
+  // The write takes the cached layout's bytes, so snapshot first: its impl
+  // codes the lane's cell, whose buffers the write's staging copy frees.
+  auto state = snapshot(index, source.metadata.lengths);
+  if (!state)
+    return {};
+  return state->offload(std::move(completion));
 }
 
 metal::AllocationResult
 CompositeStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &buffers,
-                          uint64_t extraBytes, const std::function<void()> &allocateExtra) {
+                          uint64_t extraBytes, const std::function<void()> &allocateExtra,
+                          bool cached) {
+  auto &cellPool = cached ? pool_->cachedCells : pool_->cells;
   const uint32_t pooledCells =
-      std::min(cells, static_cast<uint32_t>(pool_->cells.size()));
+      std::min(cells, static_cast<uint32_t>(cellPool.size()));
   const bool pooledRing = !pool_->rings.empty();
   Buffers fresh;
-  if (const uint64_t bytes = missingBytes(cells) + extraBytes) {
+  if (const uint64_t bytes = missingBytes(cells, cached) + extraBytes) {
     const auto admission = admitAllocation_(bytes, [&] {
       if (allocateExtra)
         allocateExtra();
       for (uint32_t cell = pooledCells; cell < cells; ++cell) {
         fresh.gdn[cell] = std::shared_ptr<GdnCell>(new GdnCell(
             backend_, allocations_, layout_.target,
-            std::string(label) + "-gdn-" + std::to_string(cell)));
+            std::string(label) + "-gdn-" + std::to_string(cell), cached));
       }
       if (!pooledRing) {
         fresh.draft = std::shared_ptr<DFlashDraftRing>(new DFlashDraftRing(
@@ -459,8 +552,8 @@ CompositeStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &
       return admission;
   }
   for (uint32_t cell = 0; cell < pooledCells; ++cell) {
-    buffers.gdn[cell] = std::move(pool_->cells.back());
-    pool_->cells.pop_back();
+    buffers.gdn[cell] = std::move(cellPool.back());
+    cellPool.pop_back();
   }
   for (uint32_t cell = pooledCells; cell < cells; ++cell)
     buffers.gdn[cell] = std::move(fresh.gdn[cell]);
@@ -470,7 +563,7 @@ CompositeStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &
     if (!buffers.gdn[cell])
       buffers.gdn[cell] = std::shared_ptr<GdnCell>(new GdnCell(
           backend_, allocations_, layout_.target,
-          std::string(label) + "-gdn-" + std::to_string(cell)));
+          std::string(label) + "-gdn-" + std::to_string(cell), cached));
   if (pooledRing) {
     buffers.draft = std::move(pool_->rings.back());
     pool_->rings.pop_back();
@@ -486,8 +579,12 @@ CompositeStateStorage::acquire(uint32_t cells, std::string_view label, Buffers &
 
 void CompositeStateStorage::restore(uint32_t index, const CompositeStateImpl &state,
                                bool restoreDraftState) {
-  copyExact(current(index).stateBase, state.buffers_.gdn->buffers().stateBase,
-            "restored GDN state");
+  if (state.buffers_.gdn->cached())
+    dequantizeCell(current(index), state.buffers_.gdn->buffers(),
+                   layout_.target);
+  else
+    copyExact(current(index).stateBase, state.buffers_.gdn->buffers().stateBase,
+              "restored GDN state");
   if (restoreDraftState) {
     const std::vector<DFlashDraftRingLayer> &ring = draft(index);
     for (uint32_t layer = 0; layer < ring.size(); ++layer) {
@@ -523,10 +620,23 @@ std::unique_ptr<StateRestore> CompositeStateStorage::beginRestore(
     committed();
     return {};
   }
-  auto spans = stateSpans(current(index), draft(index));
-  auto commit = [this, index, lengths = typed->lengths_, restoreDraftState,
+  // The slot holds the cached layout: read it into pooled cached buffers,
+  // which restore() decodes into the lane once the read lands.
+  Buffers staged;
+  if (auto admission =
+          acquire(1, "state-restore", staged, 0, {}, cachedInt8_);
+      admission)
+    throw std::runtime_error("no buffers to restore a cached state");
+  auto stagedState =
+      std::shared_ptr<const CompositeStateImpl>(new CompositeStateImpl(
+          pool_,
+          CachedStateBuffers{std::move(staged.gdn[0]), std::move(staged.draft)},
+          layout_, typed->lengths_, file_, staging_));
+  auto spans = stateSpans(stagedState->buffers_.gdn->buffers(),
+                          stagedState->buffers_.draft->layers());
+  auto commit = [this, index, stagedState, restoreDraftState,
                  committed = std::move(committed)] {
-    restoreLengths(index, lengths, restoreDraftState);
+    restore(index, *stagedState, restoreDraftState);
     committed();
   };
   auto operation = typed->file_->read(typed->disk_, std::move(spans), std::move(completion));
@@ -546,7 +656,7 @@ std::shared_ptr<const CompositeState> CompositeStateStorage::adopt(const SlotRec
   const uint32_t window = std::min(tokens, layout_.draft.window);
   const LogicalLengths lengths{tokens, tokens - window, window};
   validateLengths(lengths, true);
-  if (record.payloadBytes != layout_.cachedBytes())
+  if (record.payloadBytes != storedBytes(layout_))
     throw std::invalid_argument("a recorded state does not match the state layout");
   return std::shared_ptr<const CompositeState>(
       new CompositeStateImpl(layout_, lengths, file_, file_->adopt(record)));

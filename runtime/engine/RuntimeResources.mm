@@ -350,7 +350,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // no state's write needs the staging buffer the plan would set aside.
   std::shared_ptr<model::DiskBudget> diskBudget;
   std::shared_ptr<model::SlotFile> stateFile;
-  const uint64_t stateBytes = config.model.stateLayout.cachedBytes();
+  // The state file's slots hold a stored state of whichever form the
+  // storage codes (RICHENGINE_CACHED_STATES): int8, or the running layout.
+  const uint64_t stateBytes =
+      model::CompositeStateStorage::storedBytes(config.model.stateLayout);
   if (config.maximumCacheDiskBytes) {
     diskBudget = std::make_shared<model::DiskBudget>(config.maximumCacheDiskBytes);
     try {

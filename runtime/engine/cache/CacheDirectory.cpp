@@ -1,5 +1,6 @@
 #include "engine/cache/CacheDirectory.hpp"
 #include "AwakeClock.hpp"
+#include "InterruptedCall.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -64,9 +65,10 @@ bool owned(int directory) noexcept {
 }
 
 Descriptor openDirectory(const std::filesystem::path &path, const char *what) {
-  if (::mkdir(path.c_str(), 0700) < 0 && errno != EEXIST)
+  if (retryInterrupted([&] { return ::mkdir(path.c_str(), 0700); }) < 0 && errno != EEXIST)
     fail(what);
-  Descriptor directory(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  Descriptor directory(retryInterrupted(
+      [&] { return ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }));
   if (directory.get() < 0)
     fail(what);
   if (!owned(directory.get()))
@@ -127,8 +129,14 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
                      const std::function<bool()> &cancelled) {
   if (!plainName(cacheNamespace))
     throw std::invalid_argument("a cache namespace is a name of lowercase hex digits");
-  if (root.has_parent_path())
-    std::filesystem::create_directories(root.parent_path());
+  // A signal can interrupt the mkdir of a parent as it can the root's.
+  std::error_code made;
+  if (root.has_parent_path() && retryInterrupted([&] {
+        std::filesystem::create_directories(root.parent_path(), made);
+        errno = made.value();
+        return made ? -1 : 0;
+      }) < 0)
+    throw std::filesystem::filesystem_error("create_directories", root.parent_path(), made);
   static_cast<void>(openDirectory(root, "open cache root"));
   const std::filesystem::path path = root / cacheNamespace;
   // A restarting server's new engine can race the end of the old one.
@@ -139,8 +147,10 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
   std::unique_ptr<CacheDirectory> result;
   for (;;) {
     Descriptor directory = openDirectory(path, "open cache directory");
-    Descriptor lock(
-        ::openat(directory.get(), kLock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600));
+    Descriptor lock(retryInterrupted([&] {
+      return ::openat(directory.get(), kLock,
+                      O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }));
     if (lock.get() < 0)
       fail("open cache directory lock");
     result.reset(new CacheDirectory(path, directory.release(), lock.release()));
@@ -205,15 +215,20 @@ void CacheDirectory::close() {
   unmark(kServing);
 }
 
+// A signal can interrupt the open and each fsync as it can the directories'.
 void CacheDirectory::mark(const char *name) {
-  Descriptor file(::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                           0600));
-  if (file.get() < 0 || ::fsync(file.get()) < 0 || ::fsync(directory_) < 0)
+  Descriptor file(retryInterrupted([&] {
+    return ::openat(directory_, name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                    0600);
+  }));
+  if (file.get() < 0 || retryInterrupted([&] { return ::fsync(file.get()); }) < 0 ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("mark cache directory");
 }
 
 void CacheDirectory::unmark(const char *name) {
-  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) || ::fsync(directory_) < 0)
+  if ((::unlinkat(directory_, name, 0) < 0 && errno != ENOENT) ||
+      retryInterrupted([&] { return ::fsync(directory_); }) < 0)
     fail("unmark cache directory");
 }
 

@@ -158,17 +158,19 @@ void Cache::endRequest(uint64_t requestId) {
   if (!active.cachedBlocks.empty())
     kv_.releaseActive(active.cachedBlocks.back());
   if (active.pendingRestores) {
-    for (auto &[_, restore] : restores_)
-      std::erase(restore.waiters, requestId);
-    // Unsubmitted reads have no IO to drain. Return their pages leaf first;
-    // shared restores and already submitted transfers retain their ownership.
-    // So does a block another request published a state in RAM on meanwhile:
-    // a state in RAM sits on resident KV, so its read goes on.
+    // A request waits only on blocks of its own chain (restoreRequest), so
+    // erasing there covers every waiter list it could be on.
     for (auto block = active.cachedBlocks.rbegin(); block != active.cachedBlocks.rend(); ++block) {
       const auto restore = restores_.find(*block);
-      if (restore != restores_.end() && !restore->second.transfer &&
-          restore->second.waiters.empty() && !states_.stateResident(*block) &&
-          kv_.abandonRestore(*block))
+      if (restore == restores_.end()) continue;
+      std::erase(restore->second.waiters, requestId);
+      // Unsubmitted reads have no IO to drain. Return their pages leaf
+      // first; shared restores and already submitted transfers retain their
+      // ownership. So does a block another request published a state in RAM
+      // on meanwhile: a state in RAM sits on resident KV, so its read goes
+      // on.
+      if (!restore->second.transfer && restore->second.waiters.empty() &&
+          !states_.stateResident(*block) && kv_.abandonRestore(*block))
         restores_.erase(restore);
     }
   }
@@ -256,17 +258,9 @@ CacheLookup Cache::lookup(std::span<const uint32_t> prompt,
     if (resident != blocks.rbegin() && resident != blocks.rend())
       kv_.touch(*resident);
     result.kvBoundary = static_cast<uint32_t>(blocks.size() * KvCache::pageTokens);
-    result.state = states_.acquireDeepest(blocks);
+    result.state = states_.acquireDeepest(blocks, &result.lostState);
     if (result.kvBoundary > result.resumeBoundary() && kv_.stateBelow(blocks.back()))
       result.junctionBoundary = result.kvBoundary;
-  }
-  const uint64_t stateBlock = result.state ? result.state->kvBlock() : 0;
-  for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
-    if (*block == stateBlock) break;
-    if (kv_.hadState(*block) && !states_.contains(*block)) {
-      result.lostState = true;
-      break;
-    }
   }
   return result;
 }

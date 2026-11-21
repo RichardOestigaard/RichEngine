@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -226,12 +227,19 @@ private:
     std::shared_ptr<Operation> operation;
     Run run;
     std::function<void()> completion;
+    // For a slot read/write, the slot it touches; restorations jump queued
+    // writes to other slots, never an earlier write to their own.
+    uint32_t slot = noSlot;
+    bool read = false;
   };
+  static constexpr uint32_t noSlot = std::numeric_limits<uint32_t>::max();
   struct Free {
     void operator()(std::byte *memory) const noexcept;
   };
   [[nodiscard]] std::shared_ptr<Operation> submit(Run run,
-                                                  std::function<void()> completion);
+                                                  std::function<void()> completion,
+                                                  uint32_t slot = noSlot,
+                                                  bool read = false);
   // The checks and the setup both constructors share before the file opens;
   // each starts the worker last.
   void prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget);

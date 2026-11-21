@@ -51,6 +51,31 @@ private:
   std::shared_ptr<const WeightSource> source_;
 };
 
+// A reader of a file a resident image holds verbatim (packedImage copies
+// the whole file, so image offsets are file offsets): a memcpy while the
+// image's bytes() reports them resident, a read of the source while it is
+// released or a range lies outside it.
+class BufferRowReader final : public RowReader {
+public:
+  BufferRowReader(std::shared_ptr<const WeightSource> source,
+                  std::function<std::span<const uint8_t>()> bytes)
+      : source_(std::move(source)), bytes_(std::move(bytes)) {}
+  void read(uint64_t offset, std::span<uint8_t> bytes) override {
+    const std::span<const uint8_t> image = bytes_();
+    if (offset <= image.size() && bytes.size() <= image.size() - offset) {
+      std::memcpy(bytes.data(), image.data() + offset, bytes.size());
+      return;
+    }
+    readWeightBytes(source_->descriptor(), offset, bytes);
+  }
+  void checkUnchanged() override { source_->checkUnchanged(); }
+  [[nodiscard]] uint64_t size() const override { return source_->bytes(); }
+
+private:
+  std::shared_ptr<const WeightSource> source_;
+  std::function<std::span<const uint8_t>()> bytes_;
+};
+
 uint64_t nanosecondsSince(Clock::time_point start) {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
@@ -516,6 +541,12 @@ SparseRowStats SparseRowStore::stats() const {
 
 std::unique_ptr<RowReader> openRowReader(std::shared_ptr<const WeightSource> source) {
   return std::make_unique<SourceRowReader>(std::move(source));
+}
+
+std::unique_ptr<RowReader>
+openBufferRowReader(std::shared_ptr<const WeightSource> source,
+                    std::function<std::span<const uint8_t>()> bytes) {
+  return std::make_unique<BufferRowReader>(std::move(source), std::move(bytes));
 }
 
 } // namespace richengine::model

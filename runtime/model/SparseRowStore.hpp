@@ -30,6 +30,7 @@
 #include "model/SsdReaders.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -76,6 +77,13 @@ public:
 // it was opened: a new file at its path changes nothing, and a write to the
 // open file since it was opened is a change. It holds the source.
 [[nodiscard]] std::unique_ptr<RowReader> openRowReader(std::shared_ptr<const WeightSource> source);
+// A reader of a file whose bytes a resident weight image already holds
+// (WeightImages::imageBytes): it copies from `bytes()` while the image is
+// resident and reads `source` while its bytes() is empty, so streamed
+// weights the load already read are not read from storage again to stage.
+[[nodiscard]] std::unique_ptr<RowReader>
+openBufferRowReader(std::shared_ptr<const WeightSource> source,
+                    std::function<std::span<const uint8_t>()> bytes);
 
 struct SparseRowStoreOptions final {
   // The cache and working-memory reservation (committedBytes): workingBytes

@@ -49,6 +49,9 @@ public:
   // Prefill chunks each request received, to prove a failure was isolated to
   // the last one rather than to a prefill that never chunked.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  // Rows in each request's final prompt chunk: the blocks that chunk alone
+  // publishes — the delta a failed final step leaves unpublished.
+  std::unordered_map<uint64_t, uint32_t> lastChunkTokens;
   uint32_t widestBatch = 0;
   void checkHealth() override {
     if (onHealthCheck)
@@ -97,6 +100,8 @@ public:
       const bool last =
           found != requests_.end() &&
           item.logicalPosition + item.tokenCount == found->second.promptTokens;
+      if (last)
+        lastChunkTokens[item.requestId] = item.tokenCount;
       const bool scoring =
           found != requests_.end() && !found->second.scoreTokens.empty();
       std::vector<float> logits;
@@ -115,10 +120,14 @@ public:
       // A constrained prompt's end asks for the first token's mask.
       const bool awaitsMask =
           found != requests_.end() && found->second.constrained && last;
-      results.push_back({item.requestId, item.tokenCount, {}, scoring && last,
-                         awaitsMask ? DecodeStage::ApplyInitialMask
-                                    : DecodeStage::Regular,
-                         0, 0, 0, std::move(logits), std::move(failure)});
+      results.push_back({.requestId = item.requestId,
+                         .consumedPromptTokens = item.tokenCount,
+                         .finished = scoring && last,
+                         .nextDecodeStage = awaitsMask
+                                                ? DecodeStage::ApplyInitialMask
+                                                : DecodeStage::Regular,
+                         .scoreLogits = std::move(logits),
+                         .failure = std::move(failure)});
     }
     return results;
   }
@@ -1117,6 +1126,7 @@ struct ScoreBesideChat final {
   uint32_t completions = 0;
   uint32_t tokens = 0;
   uint32_t scoreChunks = 0;
+  uint32_t scoreLastChunkPages = 0;
   uint32_t widestBatch = 0;
   uint64_t failedRequest = 0;
   std::string failureCode;
@@ -1140,9 +1150,9 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
     executor.invalidScores.insert(21);
   loop.announceReady();
 
-  // Whole KV pages, so the last prompt chunk is the one that publishes the
-  // final block. The chat lane deliberately does not share this prefix.
-  auto scored = scoreRequest(21, 4 * KvCache::pageTokens);
+  // One budgeted chunk plus one page: the last prompt chunk is its own
+  // step and covers exactly one KV block, whatever slice contention gives.
+  auto scored = scoreRequest(21, 2048 + KvCache::pageTokens);
   for (uint32_t index = 0; index < scored.promptTokens.size(); ++index)
     scored.promptTokens[index] = 1000 + index;
   require(loop.receive(protocol::peer::serialize(scored)),
@@ -1156,6 +1166,8 @@ ScoreBesideChat runScoreBesideChat(bool invalidScore) {
   result.healthy = loop.engineHealthy() && !loop.connectionMustClose();
   result.slotsReleased = !executor.holdsSlot(21) && !executor.holdsSlot(22);
   result.scoreChunks = executor.prefillChunks[21];
+  result.scoreLastChunkPages =
+      executor.lastChunkTokens.at(21) / KvCache::pageTokens;
   result.widestBatch = executor.widestBatch;
 
   require(loop.receive(protocol::peer::serialize(request(23))),
@@ -1205,7 +1217,10 @@ void testInvalidScoreFailsOneRequestAndKeepsTheBatch() {
   require(failed.slotsReleased, "the failed score kept its model slot");
   // Chunks before the failing one keep their blocks, exactly as they do for a
   // cancelled request. Only the failed step must publish nothing.
-  require(failed.publishedBlocks + 1 == healthy.publishedBlocks,
+  // Contended budgets split the last chunk wherever the batch's rows run
+  // out; the failed step's pages are its own chunk's, not one.
+  require(failed.publishedBlocks + failed.scoreLastChunkPages ==
+              healthy.publishedBlocks,
           "the failed step published its KV block");
 }
 
@@ -1270,7 +1285,8 @@ void testConstrainedMaskExchange() {
       runUntilIdle(loop);
     }
     if (reply == Reply::AfterTimeout) {
-      now += 5000.0;
+      // The first mask row may wait much longer than a steady-state one.
+      now += 121'000.0;
       runUntilIdle(loop);
     }
     if (reply == Reply::Malformed) {
