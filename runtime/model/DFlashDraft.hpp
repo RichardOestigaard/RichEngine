@@ -111,6 +111,15 @@ struct DFlashDraftLayout final {
   uint32_t targetHiddenSize = 25600;
   uint32_t selectorRank = 256;
   uint32_t kvHeads = 8;
+  // YaRN RoPE scaling (rope_parameters.rope_type "yarn" — NVIDIA's
+  // Nemotron DFlash v1 draft): the declared factor the inverse
+  // frequencies interpolate over (model/YarnRope.hpp), the window it
+  // stretches (original_max_position_embeddings) and the draft's own
+  // max_position_embeddings the attention factor's scale derives from.
+  // ropeFactor <= 1 or ropeOriginalMax 0 is the unscaled "default" rope.
+  float ropeFactor = 1.0F;
+  uint32_t ropeOriginalMax = 0;
+  uint32_t ropeMaxPosition = 0;
   // DSpark only: the Markov head's inner rank (markov_w1/markov_w2 rows of
   // vocabularySize x markovRank), the config's declared block_size (the
   // runtime dispatches the draft's verifyRows query rows — the trained

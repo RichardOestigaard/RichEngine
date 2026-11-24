@@ -1,4 +1,5 @@
 #include "model/RuntimeImpl.hpp"
+#include "model/YarnRope.hpp"
 
 namespace richengine::model {
 
@@ -15,6 +16,12 @@ namespace richengine::model {
         prefillArena->get(geometry.draftRotaryPairs()
                               ? PrefillTensor::DraftInverseFrequencies
                               : PrefillTensor::TargetInverseFrequencies);
+    // YaRN's attention factor on the draft's tables: 1 for every draft
+    // that declares no yarn rope_parameters.
+    const float draftScale =
+        yarnAttentionFactor(geometry.draft.ropeFactor,
+                            geometry.draft.ropeOriginalMax,
+                            geometry.draft.ropeMaxPosition);
     // The dual-geometry target's second target table: the same positions at
     // the alternate pairs and theta; its draft side stays unwritten. A
     // draft-only call (the tree path builds the target's tables later)
@@ -27,7 +34,7 @@ namespace richengine::model {
           std::move(targetCosAlt), std::move(targetSinAlt), draftCos,
           draftSin,
           {targetRows, 0, geometry.target.altRotaryPairs,
-           geometry.target.ropeAxes, geometry.draftRotaryPairs()},
+           geometry.target.ropeAxes, geometry.draftRotaryPairs(), draftScale},
           maximumRows);
     }
     // A NoPE target (nemotron) leaves its rope tables unallocated: with a
@@ -42,7 +49,7 @@ namespace richengine::model {
           draftIf, draftIf, draftCos, draftSin, std::move(draftCos),
           std::move(draftSin),
           {targetRows, draftRows, 0, geometry.target.ropeAxes,
-           geometry.draftRotaryPairs()},
+           geometry.draftRotaryPairs(), draftScale},
           maximumRows);
       return;
     }
@@ -53,7 +60,7 @@ namespace richengine::model {
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
         {targetRows, draftRows, geometry.target.rotaryPairs,
-         geometry.target.ropeAxes, geometry.draftRotaryPairs()},
+         geometry.target.ropeAxes, geometry.draftRotaryPairs(), draftScale},
         maximumRows);
   }
 
@@ -79,6 +86,9 @@ namespace richengine::model {
     if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel);
         dspark && dspark->weights().tokenEmbedding.outputSize)
       own = &dspark->weights().tokenEmbedding;
+    if (const auto *dflash = std::get_if<DFlashV1Draft>(&draftModel);
+        dflash && dflash->weights().tokenEmbedding.outputSize)
+      own = &dflash->weights().tokenEmbedding;
     if (!own) {
       encodeBatchEmbedding(graph, tokens, output, lanes, rowFactor, rowStride);
       return;

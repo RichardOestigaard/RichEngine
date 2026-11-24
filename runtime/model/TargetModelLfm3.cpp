@@ -93,6 +93,7 @@ public:
         std::any_cast<const Lfm3PrefillExtension &>(step.extension);
     const ops::Linear &linear = operators_.linear();
     const uint32_t hidden = geometry_.hiddenSize;
+    static const bool noAltLayers = envFlag("RICHENGINE_NO_ALT_LAYERS");
     const TargetLayerWeights &layer = weights_.layers[index];
     metal::MetalBuffer residual = b.attentionOutput;
 
@@ -137,7 +138,7 @@ public:
           std::get<AttentionMixerWeights>(layer.mixer);
       const uint32_t attentionLayer = step.attentionLayer++;
       const bool global = geometry_.isAltAttentionLayer(index) &&
-                          !envFlag("RICHENGINE_NO_ALT_LAYERS");
+                          !noAltLayers;
       const kv::Layout layerKv = geometry_.layerKvLayout(global);
       const uint32_t pairs = weights_.layout.rotaryPairsAt(index);
       const metal::MetalBuffer ropeCos = global ? b.ropeCosAlt : b.ropeCos;
@@ -282,6 +283,9 @@ public:
         std::any_cast<const Lfm3VerifyExtension &>(step.extension);
     const ops::Linear &linear = operators_.linear();
     const uint32_t hidden = geometry_.hiddenSize;
+    static const bool noAltLayers = envFlag("RICHENGINE_NO_ALT_LAYERS");
+    static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+    static const bool noFusedReduce = envFlag("RICHENGINE_NO_FUSED_REDUCE");
     const TargetLayerWeights &layer = weights_.layers[index];
     metal::MetalBuffer residual = b.gemmaResidual;
 
@@ -333,7 +337,7 @@ public:
           std::get<AttentionMixerWeights>(layer.mixer);
       const uint32_t attentionLayer = step.attentionLayer++;
       const bool global = geometry_.isAltAttentionLayer(index) &&
-                          !envFlag("RICHENGINE_NO_ALT_LAYERS");
+                          !noAltLayers;
       const kv::Layout layerKv = geometry_.layerKvLayout(global);
       const metal::MetalBuffer ropeCos = global ? b.ropeCosAlt : b.ropeCos;
       const metal::MetalBuffer ropeSin = global ? b.ropeSinAlt : b.ropeSin;
@@ -353,7 +357,7 @@ public:
           linear.decodePlan(mixer.gateProjection, step.planLanes,
                             ops::LinearEpilogue::None, nullptr,
                             step.rowCapacity);
-      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+      if (verifyDump2) {
         const auto iw = inputPlan.workload(), gw = gatePlan.workload();
         fprintf(stderr,
                 "dump2 lfm3-verify L=%u planLanes=%u rowCap=%u "
@@ -404,7 +408,7 @@ public:
           global ? *ext.altAttention : step.attention;
       const bool fusedReduce =
           !step.tree && outputPlan.input() == ops::LinearInput::Plain &&
-          !envFlag("RICHENGINE_NO_FUSED_REDUCE");
+          !noFusedReduce;
       if (fusedReduce) {
         // verify_attention_reduce_headgate_*: the hidden layout directly.
         ops::PagedAttention::addVerify(

@@ -203,98 +203,68 @@ kernel void dspark_select_top16_sharded(
                             simd_group, query_rows);
 }
 
-// One group per DSpark proposal row scores every predecessor/candidate edge
-// of the merged shard pool: all 128 partial slots the top-16 shards emitted,
-// not just their best sixteen. The reference applies the Markov bias over
-// the whole vocabulary; the pool covers every token any shard ranked, so a
-// low-logit token the bias favors can still win the walk. Position zero's
-// only predecessor is the anchor, every other row's predecessors are the
-// previous row's pool. Each entry accumulates W2[candidate] . W1[predecessor]
-// over the rank in order in one thread, so it rounds exactly as the serial
-// walk's per-lane dot did. The table follows the shard partials in
-// partial-values scratch.
-kernel void dspark_select_edges(
-    device const uint *partial_ids [[buffer(0)]],
-    device float *partial_values [[buffer(1)]],
-    device const bfloat *markov_w1 [[buffer(2)]],
-    device const bfloat *markov_w2 [[buffer(3)]],
-    device const uint *draft_input [[buffer(4)]],
-    constant SelectorBatchParams &params [[buffer(5)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  constexpr uint Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
-  constexpr uint Pool = Shards * Candidates;
-  // The head's declared markov_rank, no longer compiled: Nemotron's 512
-  // rides the same kernel as the 256 drafts'.
+// The Markov edges under the walk's chosen predecessor for one lane's
+// Pool/32 pool slots, accumulated over the dims in order so each edge
+// rounds exactly as the retired edge-table pass's per-edge dot did. That
+// pass scored every predecessor/candidate pair of the pool in advance;
+// the walk only ever reads the row of the predecessor it picked, so the
+// fused selectors score their own slots inline instead — a Pool-times
+// smaller dot count and no table round-trip through scratch.
+inline void dspark_markov_edges(
+    device const uint *partial_ids, device const bfloat *markov_w1,
+    device const bfloat *markov_w2, device const uint *draft_input,
+    constant SelectorBatchParams &params, uint row, uint batch,
+    uint position, uint predecessor_index, uint lane,
+    thread float (&edges)[RICHENGINE_DSPARK_POOL / 32]) {
+  constexpr uint Pool = RICHENGINE_DSPARK_POOL;
+  constexpr uint Owned = Pool / 32;
+  const uint previous =
+      position ? partial_ids[(row - 1) * Pool + predecessor_index]
+               : draft_input[batch * params.query_rows];
+  // Ids come from the shard top-k and are always in range; the clamp
+  // only keeps a corrupted id inside the Markov tables.
+  device const bfloat *feature =
+      markov_w1 + ulong(min(previous, params.vocabulary - 1u)) * params.rank;
+  device const bfloat *bias_rows[Owned];
+  for (uint k = 0; k < Owned; ++k) {
+    const uint candidate =
+        min(partial_ids[row * Pool + lane + 32 * k],
+            params.vocabulary - 1u);
+    bias_rows[k] = markov_w2 + ulong(candidate) * params.rank;
+    edges[k] = 0.0f;
+  }
   const uint Rank = params.rank;
-  const uint batch = row / Positions;
-  const uint position = row % Positions;
-  device float *table =
-      partial_values + ulong(params.lanes) * Positions * Pool +
-      ulong(row) * Pool * Pool;
-  const uint edges = position ? Pool * Pool : Pool;
-  // Four edges in flight per thread with independent accumulators: the dim
-  // loop's loads are the bottleneck, so the interleave hides their latency.
-  // Each edge still adds its dims 0..Rank-1 in order, so it rounds exactly
-  // as the serial walk's per-lane dot did.
-  constexpr uint Ilp = 4;
-  for (uint e = thread_index; e < edges; e += 256 * Ilp) {
-    uint predecessors[Ilp];
-    uint candidates[Ilp];
-    device const bfloat *feature_rows[Ilp];
-    device const bfloat *bias_rows[Ilp];
-    uint live = 0;
-    for (uint j = 0; j < Ilp && e + 256 * j < edges; ++j) {
-      const uint edge = e + 256 * j;
-      const uint predecessor = edge / Pool;
-      const uint candidate = edge % Pool;
-      // Ids come from the shard top-k and are always in range; the clamp
-      // only keeps a corrupted id inside the Markov tables.
-      const uint prev_token = position
-          ? partial_ids[(row - 1) * Pool + predecessor]
-          : draft_input[batch * params.query_rows];
-      const uint safe_predecessor = min(prev_token, params.vocabulary - 1u);
-      const uint safe_candidate =
-          min(partial_ids[row * Pool + candidate], params.vocabulary - 1u);
-      feature_rows[j] = markov_w1 + ulong(safe_predecessor) * Rank;
-      bias_rows[j] = markov_w2 + ulong(safe_candidate) * Rank;
-      predecessors[j] = predecessor;
-      candidates[j] = candidate;
-      live = j + 1;
-    }
-    float bias[Ilp] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if ((Rank & 3u) == 0) {
-      // Rank % 4 == 0 keeps every row 8-byte aligned for the vector loads.
-      for (uint d4 = 0; d4 < Rank / 4; ++d4) {
-        for (uint j = 0; j < live; ++j) {
-          const bfloat4 b =
-              reinterpret_cast<device const bfloat4 *>(bias_rows[j])[d4];
-          const bfloat4 f =
-              reinterpret_cast<device const bfloat4 *>(feature_rows[j])[d4];
-          bias[j] += float(b.x) * float(f.x);
-          bias[j] += float(b.y) * float(f.y);
-          bias[j] += float(b.z) * float(f.z);
-          bias[j] += float(b.w) * float(f.w);
-        }
+  if ((Rank & 3u) == 0) {
+    // Rank % 4 == 0 keeps every row 8-byte aligned for the vector loads.
+    for (uint d4 = 0; d4 < Rank / 4; ++d4) {
+      const bfloat4 f =
+          reinterpret_cast<device const bfloat4 *>(feature)[d4];
+      for (uint k = 0; k < Owned; ++k) {
+        const bfloat4 b =
+            reinterpret_cast<device const bfloat4 *>(bias_rows[k])[d4];
+        edges[k] += float(b.x) * float(f.x);
+        edges[k] += float(b.y) * float(f.y);
+        edges[k] += float(b.z) * float(f.z);
+        edges[k] += float(b.w) * float(f.w);
       }
-    } else {
-      for (uint dim = 0; dim < Rank; ++dim)
-        for (uint j = 0; j < live; ++j)
-          bias[j] += float(bias_rows[j][dim]) * float(feature_rows[j][dim]);
     }
-    for (uint j = 0; j < live; ++j)
-      table[predecessors[j] * Pool + candidates[j]] = bias[j];
+  } else {
+    for (uint dim = 0; dim < Rank; ++dim) {
+      const float f = float(feature[dim]);
+      for (uint k = 0; k < Owned; ++k)
+        edges[k] += float(bias_rows[k][dim]) * f;
+    }
   }
 }
 
 // One simdgroup per lane walks a DSpark draft's proposal positions in order:
 // each position's score is its pool slot's shard score plus the edge the
-// parallel dspark_select_edges pass scored for the previously chosen slot —
-// the anchor's row for position zero — then the greedy or drawn pick feeds
-// the next position, exactly as the serial Markov walk did. Each lane owns
-// four of the pool's 128 slots.
+// parallel edge-table pass scored for the previously chosen slot — the
+// anchor's row for position zero — then the greedy or drawn pick feeds the
+// next position, exactly as the serial Markov walk did. Each lane owns
+// four of the pool's 128 slots. The Markov draft's own path fuses the edge
+// score instead (draft_select_dspark_markov); this table walk remains for
+// the DFlash pool selectors, whose edges are hidden-conditioned.
 kernel void draft_select_dspark(
     device const uint *partial_ids [[buffer(0)]],
     device const float *partial_values [[buffer(1)]],
@@ -350,14 +320,122 @@ kernel void draft_select_dspark(
 
     // The largest of the position's candidate probabilities at temperature
     // 1, before the lane chooses among them (VerifyRowsParams): the top
-    // biased score's share of its softmax.
-    const float top_score = simd_max(local_best);
-    float confidence_mass = 0.0f;
-    for (uint k = 0; k < Owned; ++k)
-      confidence_mass += fast::exp(biased[k] - top_score);
+    // biased score's share of its softmax. A greedy row's temperature is 1,
+    // where biased/1 == biased and total is already the t1 mass.
+    float confidence_mass = total;
+    if (sampling) {
+      const float top_score = simd_max(local_best);
+      float t1 = 0.0f;
+      for (uint k = 0; k < Owned; ++k)
+        t1 += fast::exp(biased[k] - top_score);
+      confidence_mass = simd_sum(t1);
+    }
     if (lane == 0)
       confidence[batch * Positions + position] =
-          1.0f / simd_sum(confidence_mass);
+          1.0f / confidence_mass;
+
+    uint selected;
+    if (sampling) {
+      const float uniform =
+          uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                   RICHENGINE_UNIFORM_PROPOSALS + position] * total;
+      // The crossing must be found by draw position (lane * Owned + k), not
+      // slot: simd_min over slots would steal the draw for any later lane's
+      // first slot, which is always below 32.
+      uint pick = 0xffffffffu;
+      for (uint k = 0; k < Owned; ++k) {
+        run += weights[k];
+        if (pick == 0xffffffffu && run > uniform)
+          pick = lane * Owned + k;
+      }
+      selected = simd_min(pick);
+      selected = selected == 0xffffffffu
+                     ? Pool - 1
+                     : selected / Owned + 32 * (selected % Owned);
+    } else {
+      const float top = simd_max(local_best);
+      selected = simd_min(local_best == top ? local_slot : 0xffffffffu);
+      if (selected == 0xffffffffu)
+        selected = 0;
+    }
+    if (lane == 0)
+      tokens[row] = partial_ids[row * Pool + selected];
+    predecessor_index = selected;
+  }
+}
+
+// draft_select_dspark with the Markov edge fused into the walk: each lane
+// scores its own pool slots against the chosen predecessor instead of
+// reading a precomputed table, so one dispatch replaces the edge pass and
+// its Pool-squared scratch traffic. Same order, same picks, same outputs.
+kernel void draft_select_dspark_markov(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device float *probabilities [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device float *confidence [[buffer(5)]],
+    device const bfloat *markov_w1 [[buffer(6)]],
+    device const bfloat *markov_w2 [[buffer(7)]],
+    device const uint *draft_input [[buffer(8)]],
+    constant SelectorBatchParams &params [[buffer(9)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Pool = RICHENGINE_DSPARK_POOL;
+  constexpr uint Owned = Pool / 32;
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  uint predecessor_index = 0;
+  for (uint position = 0; position < Positions; ++position) {
+    const uint row = batch * Positions + position;
+    float edges[Owned];
+    dspark_markov_edges(partial_ids, markov_w1, markov_w2, draft_input,
+                        params, row, batch, position, predecessor_index,
+                        lane, edges);
+    float biased[Owned];
+    float local_best = -INFINITY;
+    uint local_slot = 0;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      biased[k] = partial_values[row * Pool + slot] + edges[k];
+      if (biased[k] > local_best) {
+        local_best = biased[k];
+        local_slot = slot;
+      }
+    }
+
+    // Sampled softmax over the pool; the CDF order is lane-major, which is a
+    // valid draw order for the same distribution.
+    float weights[Owned];
+    float weight_sum = 0.0f;
+    const float maximum = simd_max(local_best / temperature);
+    for (uint k = 0; k < Owned; ++k)
+      weight_sum += weights[k] =
+          fast::exp((biased[k] / temperature) - maximum);
+    const float lane_prefix =
+        simd_prefix_inclusive_sum(weight_sum) - weight_sum;
+    const float total = simd_sum(weight_sum);
+    float run = lane_prefix;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      probabilities[row * Pool + slot] = weights[k] / total;
+    }
+
+    // The largest of the position's candidate probabilities at temperature
+    // 1, before the lane chooses among them (VerifyRowsParams): the top
+    // biased score's share of its softmax. A greedy row's temperature is 1,
+    // where biased/1 == biased and total is already the t1 mass.
+    float confidence_mass = total;
+    if (sampling) {
+      const float top_score = simd_max(local_best);
+      float t1 = 0.0f;
+      for (uint k = 0; k < Owned; ++k)
+        t1 += fast::exp(biased[k] - top_score);
+      confidence_mass = simd_sum(t1);
+    }
+    if (lane == 0)
+      confidence[batch * Positions + position] =
+          1.0f / confidence_mass;
 
     uint selected;
     if (sampling) {
@@ -482,6 +560,151 @@ kernel void draft_select_dspark_tree(
     for (uint k = 0; k < Owned; ++k) {
       const uint slot = lane + 32 * k;
       biased[k] = partial_values[row * Pool + slot] + edge[slot];
+      if (biased[k] > local_best) {
+        local_best = biased[k];
+        local_slot = slot;
+      }
+    }
+
+    float weights[Owned];
+    float weight_sum = 0.0f;
+    const float maximum = simd_max(local_best / temperature);
+    for (uint k = 0; k < Owned; ++k)
+      weight_sum += weights[k] =
+          fast::exp((biased[k] / temperature) - maximum);
+    const float lane_prefix =
+        simd_prefix_inclusive_sum(weight_sum) - weight_sum;
+    const float total = simd_sum(weight_sum);
+    float run = lane_prefix;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      probabilities[row * Pool + slot] = weights[k] / total;
+    }
+
+    uint selected;
+    uint runner = Pool;
+    if (sampling) {
+      const float uniform =
+          uniforms[batch * RICHENGINE_SAMPLING_UNIFORMS +
+                   RICHENGINE_UNIFORM_PROPOSALS + position] * total;
+      uint pick = 0xffffffffu;
+      for (uint k = 0; k < Owned; ++k) {
+        run += weights[k];
+        if (pick == 0xffffffffu && run > uniform)
+          pick = lane * Owned + k;
+      }
+      selected = simd_min(pick);
+      selected = selected == 0xffffffffu
+                     ? Pool - 1
+                     : selected / Owned + 32 * (selected % Owned);
+    } else {
+      const float top = simd_max(local_best);
+      selected = simd_min(local_best == top ? local_slot : 0xffffffffu);
+      if (selected == 0xffffffffu)
+        selected = 0;
+      if (tree) {
+        // The runner-up under the chain's predecessor becomes the leaf at
+        // this position's fixed row; a dead or sentinel pool slot leaves a
+        // NONE node the accept walk skips.
+        float local_second = -INFINITY;
+        uint second_slot = 0;
+        for (uint k = 0; k < Owned; ++k) {
+          const uint slot = lane + 32 * k;
+          if (slot != selected && biased[k] > local_second) {
+            local_second = biased[k];
+            second_slot = slot;
+          }
+        }
+        const float second = simd_max(local_second);
+        runner = simd_min(local_second == second ? second_slot : Pool);
+      }
+    }
+    if (lane == 0) {
+      const uint chain_row = position + 1;
+      const uint token = partial_ids[row * Pool + selected];
+      if (!tree || chain_row < ChainRows) {
+        tree_tokens[chain_row] = token;
+        tree_nodes[chain_row] =
+            (chain_row - 1) | (chain_row << 8) | (position << 16);
+      }
+      tokens[row] = token;
+      const uint leaf_row = ChainRows + position;
+      const uint leaf_token =
+          runner < Pool ? partial_ids[row * Pool + runner] : 0xffffffffu;
+      if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES &&
+          leaf_token < params.vocabulary) {
+        // The leaf's parent is the chain row that was this position's
+        // predecessor (row 0 for position 0, row p for position p).
+        tree_tokens[leaf_row] = leaf_token;
+        tree_nodes[leaf_row] = position | (chain_row << 8) | (position << 16);
+      } else if (tree && leaf_row < RICHENGINE_TREE_VERIFY_NODES) {
+        tree_tokens[leaf_row] = 0;
+        tree_nodes[leaf_row] = RICHENGINE_TREE_NODE_NONE |
+                               (RICHENGINE_TREE_NODE_NONE << 8) |
+                               (RICHENGINE_TREE_NODE_NONE << 16);
+      }
+    }
+    predecessor_index = selected;
+  }
+  if (lane == 0) {
+    if (1 + Positions < RICHENGINE_TREE_VERIFY_NODES) {
+      tree_tokens[RICHENGINE_TREE_VERIFY_NODES - 1] = 0;
+      tree_nodes[RICHENGINE_TREE_VERIFY_NODES - 1] =
+          RICHENGINE_TREE_NODE_NONE | (RICHENGINE_TREE_NODE_NONE << 8) |
+          (RICHENGINE_TREE_NODE_NONE << 16);
+    }
+    tree_counts[batch] = min(ulong(1) + Positions,
+                             ulong(RICHENGINE_TREE_VERIFY_NODES));
+  }
+}
+
+// draft_select_dspark_tree with the Markov edge fused into the walk: same
+// chain, same comb leaves, one dispatch instead of the edge-table pass —
+// the tree variant for DSpark Markov drafts (the DFlash pool tree still
+// rides the table kernel above).
+kernel void draft_select_dspark_markov_tree(
+    device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device const float *uniforms [[buffer(2)]],
+    device float *probabilities [[buffer(3)]],
+    device uint *tokens [[buffer(4)]], device uint *tree_tokens [[buffer(5)]],
+    device uint *tree_nodes [[buffer(6)]],
+    device uint *tree_counts [[buffer(7)]],
+    device const uint *draft_input [[buffer(8)]],
+    device const bfloat *markov_w1 [[buffer(9)]],
+    device const bfloat *markov_w2 [[buffer(10)]],
+    constant SelectorBatchParams &params [[buffer(11)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ulong Positions = RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Pool = RICHENGINE_DSPARK_POOL;
+  constexpr uint Owned = Pool / 32;
+  // The comb splits the node stride in halves: chain nodes lead it, one leaf
+  // per leading position follows.
+  constexpr uint ChainRows = RICHENGINE_TREE_VERIFY_NODES / 2;
+  tree_tokens += batch * RICHENGINE_TREE_VERIFY_NODES;
+  tree_nodes += batch * RICHENGINE_TREE_VERIFY_NODES;
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
+  const bool tree = (params.tree_mask & (1u << batch)) != 0 && !sampling;
+  const float temperature = sampling ? params.temperature[batch] : 1.0f;
+  if (lane == 0) {
+    tree_tokens[0] = draft_input[batch * params.query_rows];
+    tree_nodes[0] = RICHENGINE_TREE_NODE_NONE |
+                    (RICHENGINE_TREE_NODE_NONE << 16);
+  }
+  uint predecessor_index = 0;
+  for (uint position = 0; position < Positions; ++position) {
+    const uint row = batch * Positions + position;
+    float edges[Owned];
+    dspark_markov_edges(partial_ids, markov_w1, markov_w2, draft_input,
+                        params, row, batch, position, predecessor_index,
+                        lane, edges);
+    float biased[Owned];
+    float local_best = -INFINITY;
+    uint local_slot = 0;
+    for (uint k = 0; k < Owned; ++k) {
+      const uint slot = lane + 32 * k;
+      biased[k] = partial_values[row * Pool + slot] + edges[k];
       if (biased[k] > local_best) {
         local_best = biased[k];
         local_slot = slot;

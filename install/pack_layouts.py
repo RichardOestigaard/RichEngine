@@ -147,6 +147,14 @@ class DraftLayout:
     query_heads: int = 32
     intermediate: int = 5632
     rotary_theta: int = 1000000
+    # A YaRN draft's scaling (rope_parameters "yarn"): the declared
+    # factor and the window it stretches, then the draft's own
+    # max_position_embeddings the attention factor's scale derives from;
+    # the defaults leave the rope unscaled (DFlashDraftLayout's
+    # ropeFactor/ropeOriginalMax/ropeMaxPosition).
+    rope_factor: float = 1.0
+    rope_original_max: int = 0
+    rope_max_position: int = 0
     block_size: int = 16
     sliding_window: int = 2048
     target_hidden: int = 6 * 2816

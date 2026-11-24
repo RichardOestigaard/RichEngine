@@ -4,6 +4,7 @@
 #include "qwen4/model/GgufImage.hpp"
 #include "qwen4/model/WeightSource.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -35,5 +36,20 @@ struct StoredRows final {
   uint64_t offset = 0;
 };
 [[nodiscard]] std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
+
+// A plane of a repack's rows as its file stores them: where its row 0 is,
+// from the file's start, and its bytes a row; none (rowBytes 0) for a
+// format without that plane.
+struct PlaneRows final {
+  const WeightSource *file = nullptr;
+  uint64_t offset = 0;
+  uint64_t rowBytes = 0;
+};
+// The planes of a repack whose one source is an MLX affine or mxfp4 tensor
+// of all its rows in order, from which the GPU builds the native blocks it
+// repacks (moe_expert_load): an affine tensor's codes, scales and biases, an
+// mxfp4 tensor's codes and scales. None for any other repack, whose native
+// rows readRepackRows builds.
+[[nodiscard]] std::optional<std::array<PlaneRows, 3>> storedPlanes(const gguf::Repack &repack);
 
 } // namespace splash::model

@@ -16,8 +16,6 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from transformers import AutoTokenizer
-
 from . import images as image_input
 from . import runtime as engine_runtime
 from . import serve_options, serving
@@ -247,41 +245,10 @@ class ModelHost:
         if getattr(self.args, "chat_template_file", None) is not None:
             custom = read_template_file(self.args.chat_template_file)
             print_status(f"Chat template file · {self.args.chat_template_file}")
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path, local_files_only=True, trust_remote_code=False
-        )
         # The assembly's serving contract: the spellings and defaults this
         # model's record declares (or its family file does), per model, not
         # per server.
         serving_contract = serving.load(assembly_dir)
-        contract = validate_tokenizer(tokenizer, str(tokenizer_path), serving_contract)
-        chat_templates = ChatTemplates(
-            tokenizer,
-            allow_missing=bool(
-                serving_contract.decision or serving_contract.encoder
-            ),
-            override=custom,
-        )
-        print_status(f"Chat template · {chat_templates.describe()}")
-        # Special tokens the output parser needs as text: the dialect's call
-        # markup, and the think-close token where it is a special token.
-        visible_token_ids = {contract.think_end_id, contract.think_open_id}
-        dialects = {
-            template.dialect
-            for template in chat_templates.templates.values()
-            if template.dialect is not None
-        }
-        # The contract's dialect counts too: the probe may render a template
-        # whose call markup it cannot classify while the family file names it.
-        declared = dialect_named(serving_contract.tool_dialect)
-        if declared is not None:
-            dialects.add(declared)
-        for dialect in dialects:
-            for marker in dialect.structural:
-                ids = tokenizer.encode(marker, add_special_tokens=False)
-                if len(ids) == 1:
-                    visible_token_ids.add(ids[0])
-        visible_token_ids.discard(None)
         native_fields = vars(self.args).copy()
         native_fields["assembly_dir"] = str(assembly_dir)
         native_args = argparse.Namespace(**native_fields)
@@ -333,32 +300,86 @@ class ModelHost:
             eager_start=False,
             env=tuned_env,
         )
-        # The packed manifest names diffusion targets (packed-only families
-        # install as packages; an assembly has no manifest); their canvas
-        # bursts need burst-aware throughput in the request metrics.
-        from install import layout
-        from install import models as model_artifacts
+        # The engine starts now and reads its weights while this process
+        # imports the tokenizer's library and loads the tokenizer, the
+        # chat templates and the grammars' table, which it needs none of.
+        # A failure here closes the engine (except, below); one of the
+        # engine's is raised by wait_ready.
+        runtime.start()
+        backend = None
+        try:
+            # Imported here, while the engine loads: transformers takes
+            # 0.35-0.75 s.
+            from transformers import AutoTokenizer
 
-        try:
-            manifest = (
-                model_artifacts.read_json(assembly_dir / layout.PACKAGE_MANIFEST)
-                if model_artifacts.installation_kind(assembly_dir)
-                == model_artifacts.PACKAGE
-                else {}
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path, local_files_only=True, trust_remote_code=False
             )
-            diffusion = isinstance(manifest.get("diffusion"), dict)
-        except (model_artifacts.ModelError, OSError):
-            diffusion = False
-        backend = NativeBackend(
-            runtime,
-            tokenizer,
-            request_logger=print_request,
-            think_end_id=contract.think_end_id,
-            visible_token_ids=visible_token_ids,
-            tool_call_open_id=contract.tool_call_open_id,
-            diffusion=diffusion,
-        )
-        try:
+            contract = validate_tokenizer(
+                tokenizer, str(tokenizer_path), serving_contract
+            )
+            chat_templates = ChatTemplates(
+                tokenizer,
+                allow_missing=bool(
+                    serving_contract.decision or serving_contract.encoder
+                ),
+                override=custom,
+            )
+            print_status(f"Chat template · {chat_templates.describe()}")
+            # Special tokens the output parser needs as text: the dialect's
+            # call markup, and the think-close token where it is a special
+            # token.
+            visible_token_ids = {contract.think_end_id, contract.think_open_id}
+            dialects = {
+                template.dialect
+                for template in chat_templates.templates.values()
+                if template.dialect is not None
+            }
+            # The contract's dialect counts too: the probe may render a
+            # template whose call markup it cannot classify while the family
+            # file names it.
+            declared = dialect_named(serving_contract.tool_dialect)
+            if declared is not None:
+                dialects.add(declared)
+            for dialect in dialects:
+                for marker in dialect.structural:
+                    ids = tokenizer.encode(marker, add_special_tokens=False)
+                    if len(ids) == 1:
+                        visible_token_ids.add(ids[0])
+            visible_token_ids.discard(None)
+            # The packed manifest names diffusion targets (packed-only
+            # families install as packages; an assembly has no manifest);
+            # their canvas bursts need burst-aware throughput in the
+            # request metrics.
+            from install import layout
+            from install import models as model_artifacts
+
+            try:
+                manifest = (
+                    model_artifacts.read_json(
+                        assembly_dir / layout.PACKAGE_MANIFEST
+                    )
+                    if model_artifacts.installation_kind(assembly_dir)
+                    == model_artifacts.PACKAGE
+                    else {}
+                )
+                diffusion = isinstance(manifest.get("diffusion"), dict)
+            except (model_artifacts.ModelError, OSError):
+                diffusion = False
+            # The grammars' table, built while the engine loads (0.82 s on
+            # a 32-core M5 Max): its vocabulary is the contract's, which the
+            # engine holds to its own as it loads, and its stop tokens the
+            # contract's eos set.
+            grammar_table = ConstraintFactory.table(tokenizer, contract)
+            backend = NativeBackend(
+                runtime,
+                tokenizer,
+                request_logger=print_request,
+                think_end_id=contract.think_end_id,
+                visible_token_ids=visible_token_ids,
+                tool_call_open_id=contract.tool_call_open_id,
+                diffusion=diffusion,
+            )
             if not runtime.wait_ready():
                 raise engine_runtime.EngineUnhealthy(
                     "native runtime did not become ready"
@@ -379,7 +400,10 @@ class ModelHost:
                 )
             effective_context = readiness.max_context_tokens
             constraint_factory = ConstraintFactory(
-                tokenizer, contract, dfa_mode_default=serving_contract.dfa_mode
+                tokenizer,
+                contract,
+                dfa_mode_default=serving_contract.dfa_mode,
+                table=grammar_table,
             )
             app = Frontend(
                 tokenizer,
@@ -408,7 +432,11 @@ class ModelHost:
                 shared_prefix_states=self.args.shared_prefix_state,
             )
         except BaseException:
-            backend.close()
+            # A start that failed while the engine loaded stops it.
+            if backend is not None:
+                backend.close()
+            else:
+                runtime.close()
             raise
         return runtime, backend, app, effective_context, readiness.vision
 

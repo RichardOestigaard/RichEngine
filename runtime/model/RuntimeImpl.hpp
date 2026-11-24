@@ -1490,7 +1490,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // A batch verifies the selector's comb trees only when every lane can:
   // greedy, unconstrained and unpenalized tree-capable lanes, at most two
   // wide (a tree lane doubles its row block, and four virtual lanes is the
-  // row budget), on a target with the tree kernels — GDN, conv and
+  // row budget), on a target with the tree kernels — GDN, Mamba-2, conv and
   // attention mixers, dense FFN, no fp8 KV. Anything else runs the chain
   // verify.
   bool treeVerifyBatch(std::span<Request *const> entries, uint32_t width,
@@ -1526,11 +1526,6 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // the encoder's input hook, so it cannot stage either. qwen4exp
     // verifies the chain, streamed table or not.
     if (std::holds_alternative<Qwen4ExpWeights>(package.target))
-      return false;
-    // The Mamba-2 mixers have no tree-verify or tree-commit kernels
-    // (addVerifyMamba/addStateCommitTree throw) — nemotron verifies the
-    // chain only.
-    if (geometry.target.mambaLayers)
       return false;
     // Adaptive admission: the batch trees only while every lane's
     // accepted-proposal EWMA sits inside the band — saturated lanes keep
@@ -1870,7 +1865,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                   step.capturedRows, chunk,
                                   std::move(pageTable),
                                   std::move(captures), {}, {}});
-        if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+        static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+        if (verifyDump2)
           fprintf(stderr,
                   "dump2 prefill seq=%u id=%llu sl=%u tokens=%u pos=%llu "
                   "astride=%u qoff=%llu kvoff=%llu "
@@ -1882,7 +1878,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                   (unsigned long long)kvOffsets[at], chunk.committed_tokens,
                   chunk.chunk_tokens, chunk.chunk_stride,
                   chunk.page_table_entries);
-        if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+        if (verifyDump2) {
           for (const auto pt : part.pageTable)
             fprintf(stderr, "%llx ", (unsigned long long)pt);
           fprintf(stderr, "]\n");
@@ -2470,6 +2466,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // shared tile-count scratch; this readback is why the flag is debug-only.
     ops::MoE::logStats(decodeArena->moeScratch(1).tileCount);
     static const bool finTiming = envFlag("RICHENGINE_DECODE_TIMING");
+    static const bool verifyDump = envFlag("RICHENGINE_VERIFY_DUMP");
+    static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+    static const bool verifyDfaDump = envFlag("RICHENGINE_VERIFY_DFA_DUMP");
+    static const bool mtpDump = envFlag("RICHENGINE_MTP_DUMP");
+    static const bool dSpineDump = envFlag("RICHENGINE_DSPINE_DUMP");
     const auto f0 = richengine::AwakeClock::now();
     // The acceptance kernels pack a lane's emitted rows at the chain's
     // verify stride (the tree's at its node stride), not the lane's
@@ -2525,7 +2526,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // RICHENGINE_VERIFY_DFA_DUMP: the lane's live/trunc bookkeeping beside
       // its raw selected rows — a dead row read as live shows as a sentinel
       // inside the retained span.
-      if (envFlag("RICHENGINE_VERIFY_DFA_DUMP")) {
+      if (verifyDfaDump) {
         const uint32_t trunc = *contents<uint32_t>(
             d(DecodeTensor::DfaTrunc), "dfa trunc rows");
         std::string toks;
@@ -2564,7 +2565,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // RICHENGINE_VERIFY_DUMP2: per-lane FNV of the verify step's arena
       // tensors — lane N should hash like lane 0 on replayed prompts; the
       // first mismatch pins the mis-strided buffer.
-      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+      if (verifyDump2) {
         static uint64_t dumpStep = 0;
         if (!lane) fprintf(stderr, "dumpstep %llu items=%zu\n",
                            (unsigned long long)++dumpStep, items.size());
@@ -2988,7 +2989,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // RICHENGINE_MTP_DUMP: lane 0's MTP pass scratch, anchors, rings and
       // selector rows to /tmp/mtpdump/step%04u_*.bin — post-step contents,
       // so a chained reference can bisect the draft's stages offline.
-      if (!lane && !tree && envFlag("RICHENGINE_MTP_DUMP")) {
+      if (!lane && !tree && mtpDump) {
         static uint32_t dumpStep = 0;
         static bool dumpDirReady = [] {
           std::system("mkdir -p /tmp/mtpdump");
@@ -3139,7 +3140,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // RICHENGINE_VERIFY_DUMP: per-tensor FNV hashes for stride-mismatch
         // hunts — lane N's hash should equal lane 0's at width 1 when the
         // same prompt is replayed (B1 vs B2 lane 0 is the oracle).
-        if (envFlag("RICHENGINE_VERIFY_DUMP")) {
+        if (verifyDump) {
           const auto fnv = [](const void *ptr, size_t bytes) {
             uint64_t h = 1469598103934665603ULL;
             const auto *b = static_cast<const uint8_t *>(ptr);
@@ -3350,7 +3351,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       // ping-ponged hidden banks (post-write layer-3 and layer-5 streams),
       // the normed head input, the lane's draft rings and the step's
       // captured target hidden / context K/V. Bounded dump count.
-      if (envFlag("RICHENGINE_DSPINE_DUMP") && !tree &&
+      if (dSpineDump && !tree &&
           std::holds_alternative<DSplineDraft>(draftModel)) {
         static uint32_t dumpBudget = 6;
         if (dumpBudget && lane == 0) {
@@ -4078,7 +4079,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     settledPredraftGpu_ = 0.0;
     settledPredraftWall_ = 0.0;
     kickAnePredictors(lanes, items);
-    if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+    if (verifyDump2)
       fprintf(stderr, "dump2 finalize-end items=%zu\n", items.size());
     if (finTiming) {
       const auto f2 = richengine::AwakeClock::now();

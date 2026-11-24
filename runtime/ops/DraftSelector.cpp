@@ -215,15 +215,11 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
-  graph.add(std::string(kDsparkSelectEdges),
-            {buffers.partialIds, buffers.partialValues, markov.embedding,
-             markov.projection, buffers.draftInput},
-            params, {uint64_t{lanes} * kPositions, 1, 1},
-            {kEdgeThreads, 1, 1});
-  graph.add(std::string(kDraftSelectDspark),
+  graph.add(std::string(kDraftSelectDsparkMarkov),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.proposalProbabilities, buffers.proposedTokens,
-             buffers.confidence},
+             buffers.confidence, markov.embedding, markov.projection,
+             buffers.draftInput},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 
@@ -260,16 +256,11 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
-  graph.add(std::string(kDsparkSelectEdges),
-            {buffers.partialIds, buffers.partialValues, markov.embedding,
-             markov.projection, buffers.draftInput},
-            params, {uint64_t{lanes} * kPositions, 1, 1},
-            {kEdgeThreads, 1, 1});
-  graph.add(std::string(kDraftSelectDsparkTree),
+  graph.add(std::string(kDraftSelectDsparkMarkovTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
              buffers.proposalProbabilities, buffers.proposedTokens,
              buffers.treeTokens, buffers.treeNodes, buffers.treeCounts,
-             buffers.draftInput},
+             buffers.draftInput, markov.embedding, markov.projection},
             params, {uint64_t{lanes}, 1, 1}, {32, 1, 1});
 }
 

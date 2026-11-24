@@ -161,6 +161,62 @@ PreparedInput Mamba2::addDecode(metal::CommandGraph &graph,
   return {buffers.hidden, input};
 }
 
+PreparedInput Mamba2::addDecodeTree(metal::CommandGraph &graph,
+                                    Mamba2DecodeBuffers buffers,
+                                    metal::MetalBuffer treeNodes,
+                                    metal::MetalBuffer treeCounts,
+                                    Mamba2Shape shape, uint32_t lanes,
+                                    uint32_t layer, Mamba2StateStrides state,
+                                    LinearInput input) {
+  if (!lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH || !state.valid() ||
+      !treeNodes || !treeCounts)
+    throw std::invalid_argument("invalid Mamba2 tree decode geometry");
+  (void)kernelShape(shape);
+  std::vector<metal::MetalBuffer> bindings{buffers.packed,
+                                           buffers.convolutionWeights};
+  const bool prepare = input != LinearInput::Plain;
+  if (prepare)
+    requireTableScratch(buffers.linearScratch, input, shape.innerSize,
+                        lanes * RICHENGINE_TREE_VERIFY_NODES);
+  bindings.reserve(prepare ? 22 : 20);
+  appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  bindings.insert(bindings.end(),
+                  {buffers.mixed, buffers.aWeights, buffers.timeBias,
+                   buffers.stepSizes, buffers.skipWeights,
+                   buffers.mixerNorm.buffer, buffers.hidden, treeNodes,
+                   treeCounts});
+  if (prepare)
+    bindings.insert(bindings.end(),
+                    {buffers.linearScratch.input, buffers.linearScratch.sums});
+  // The conv bias binds past the params slot (19 plain, 21 with a
+  // linear-input table), like the chain kernel's slot at 21.
+  bindings.push_back(buffers.convolutionBias);
+  Mamba2DecodeBatchParams params{0u,
+                                 layer,
+                                 shape.dtMinimum,
+                                 shape.dtMaximum,
+                                 buffers.mixerNorm.rmsEpsilon,
+                                 state.convolutionLayerBytes,
+                                 state.recurrentLayerBytes,
+                                 state.convolutionStateBytes,
+                                 {},
+                                 RICHENGINE_TARGET_VERIFY_ROWS,
+                                 {},
+                                 {},
+                                 {}};
+  for (uint32_t lane = 0; lane < RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lane)
+    params.live_rows[lane] = RICHENGINE_TARGET_VERIFY_ROWS;
+  const std::string name =
+      std::string(kVerifyTreeMamba2Fused) + tableSuffix(input);
+  const std::string kernel_name =
+      mamba2Kernel(name, buffers.mixerNorm, shape.innerSize);
+  graph.addParamsAt(kernel_name, std::move(bindings), params,
+                    prepare ? 21u : 19u, {shape.groups, lanes, 1});
+  if (!prepare)
+    return {};
+  return {buffers.hidden, input};
+}
+
 void Mamba2::addCommit(metal::CommandGraph &graph, Mamba2CommitBuffers buffers,
                        Mamba2Shape shape, uint32_t layers, uint32_t lanes,
                        Mamba2StateStrides state, uint32_t verifyStride) {
@@ -181,6 +237,30 @@ void Mamba2::addCommit(metal::CommandGraph &graph, Mamba2CommitBuffers buffers,
   // state swap alternates between the span cache's two slots.
   graph.beginBakedSpan();
   graph.add(kVerifyMamba2Commit.data(), std::move(bindings), params,
+            {shape.groups, layers, lanes});
+  graph.endBakedSpan();
+}
+
+void Mamba2::addCommitTree(metal::CommandGraph &graph,
+                           Mamba2CommitBuffers buffers,
+                           metal::MetalBuffer retainedPath, Mamba2Shape shape,
+                           uint32_t layers, uint32_t lanes,
+                           Mamba2StateStrides state) {
+  if (!layers || !lanes || lanes > RICHENGINE_MAXIMUM_BATCH_WIDTH ||
+      !state.valid() || !retainedPath)
+    throw std::invalid_argument("invalid Mamba2 tree commit geometry");
+  (void)kernelShape(shape);
+  std::vector<metal::MetalBuffer> bindings{
+      buffers.packed, buffers.mixed, buffers.stepSizes, buffers.aWeights};
+  bindings.reserve(14);
+  appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
+  bindings.insert(bindings.end(), {buffers.retainedCounts, retainedPath});
+  const Mamba2BatchCommitParams params{state.convolutionLayerBytes,
+                                       state.recurrentLayerBytes,
+                                       state.convolutionStateBytes,
+                                       RICHENGINE_TARGET_VERIFY_ROWS};
+  graph.beginBakedSpan();
+  graph.add(kVerifyMamba2CommitTree.data(), std::move(bindings), params,
             {shape.groups, layers, lanes});
   graph.endBakedSpan();
 }

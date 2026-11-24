@@ -174,3 +174,36 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
     }
   }
 }
+
+// The same repack from a stored-planes source (model/AffineToBlock.cpp,
+// metal/abi/GgufRepack.h): the codes, scales and biases of a 4-bit MLX
+// affine tensor staged at 0, src_scales and src_biases, a contiguous run a
+// plane. One thread per (row, 32-wide group) writes what the GGUF_FMT_AF4
+// case above writes of the native block {qs[32], scale, bias} the planes
+// keep as parts: group g's 16 code bytes are codes[16 j] of row n's block b,
+// and group j == 0 writes the block's scale and bias as its meta unit.
+kernel void gguf_repack_stored(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                               constant GgufRepackStoredParams &p [[buffer(2)]],
+                               uint t [[thread_position_in_grid]]) {
+  const uint G = p.input_size / 32;
+  if (t >= p.rows * G) return;
+  const uint n = t / G, g = t % G;
+  constant QuantFormat &f = kQuantFormats[p.fmt];
+  const uint b = g / f.meta_groups, j = g % f.meta_groups, blocks = G / f.meta_groups;
+  device const uchar *codes =
+      src + ulong(n) * p.codes_row_bytes + ulong(b) * (p.codes_row_bytes / blocks) + 16 * j;
+  device const uchar *scales = src + p.src_scales + ulong(n) * p.meta_row_bytes + 2 * b;
+  device const uchar *biases = src + p.src_biases + ulong(n) * p.meta_row_bytes + 2 * b;
+  const uint r = p.first_row + n;
+  device uchar *out0 = dst + quant_tile_index(r, g, G) * f.plane0_bytes;
+  device uchar *meta = dst + p.dst_meta + quant_tile_index(r, b, blocks) * f.meta_bytes;
+  uchar lo[32];
+  for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (codes[e / 2] >> (4 * (e & 1))) & 15;
+  gguf_store_pairs(lo, out0);
+  if (j == 0) {
+    meta[0] = scales[0];
+    meta[1] = scales[1];
+    meta[2] = biases[0];
+    meta[3] = biases[1];
+  }
+}

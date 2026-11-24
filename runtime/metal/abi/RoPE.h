@@ -18,7 +18,10 @@ struct RopeTableParams {
   // Rotary pairs each draft row's table holds: the draft's head dimension
   // over two. Hardcoded 64 broke the 64-dim DSpark drafts' context commits.
   uint32_t draft_dims;
+  // What the draft table's cosines and sines are scaled by: YaRN's
+  // attention factor (model::yarnAttentionFactor), 1 without YaRN.
+  float draft_scale;
 };
 
-static_assert(sizeof(RopeTableParams) == 20,
-              "RoPE table parameters are 20 bytes on both sides");
+static_assert(sizeof(RopeTableParams) == 24,
+              "RoPE table parameters are 24 bytes on both sides");

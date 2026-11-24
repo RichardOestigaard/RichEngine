@@ -84,18 +84,24 @@ kernel void draft_select_plain(
   const float maximum = simd_max(scaled);
   const float weight =
       lane < Candidates ? fast::exp(scaled - maximum) : 0.0f;
-  const float probability = weight / simd_sum(weight);
+  const float mass = simd_sum(weight);
+  const float probability = weight / mass;
   if (lane < Candidates)
     probabilities[row * Candidates + lane] = probability;
 
   // The largest of the position's candidate probabilities at temperature 1
-  // (VerifyRowsParams): the top score's share of its softmax.
-  const float maximum_t1 =
-      simd_max(lane < Candidates ? value : -INFINITY);
-  const float weight_t1 =
-      lane < Candidates ? fast::exp(value - maximum_t1) : 0.0f;
+  // (VerifyRowsParams): the top score's share of its softmax. A greedy row's
+  // temperature is 1, where scaled == value and mass is already the t1 mass.
+  float confidence_mass = mass;
+  if (sampling) {
+    const float maximum_t1 =
+        simd_max(lane < Candidates ? value : -INFINITY);
+    const float weight_t1 =
+        lane < Candidates ? fast::exp(value - maximum_t1) : 0.0f;
+    confidence_mass = simd_sum(weight_t1);
+  }
   if (lane == 0)
-    confidence[row] = 1.0f / simd_sum(weight_t1);
+    confidence[row] = 1.0f / confidence_mass;
 
   uint selected = 0;
   if (sampling) {

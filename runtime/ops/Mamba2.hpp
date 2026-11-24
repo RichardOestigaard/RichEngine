@@ -173,6 +173,16 @@ public:
                                  uint32_t verifyStride =
                                      RICHENGINE_TARGET_VERIFY_ROWS,
                                  const Mamba2TapeLanes *tapeLanes = nullptr);
+  // The tree-verify variants: RICHENGINE_TREE_VERIFY_NODES rows per lane,
+  // the node descriptors and emitted counts steering the conv taps and the
+  // leaf-on-copy scan. addCommitTree replays the retained path.
+  static PreparedInput addDecodeTree(metal::CommandGraph &graph,
+                                     Mamba2DecodeBuffers buffers,
+                                     metal::MetalBuffer treeNodes,
+                                     metal::MetalBuffer treeCounts,
+                                     Mamba2Shape shape, uint32_t lanes,
+                                     uint32_t layer, Mamba2StateStrides state,
+                                     LinearInput input);
   // Replays the retained verify rows of each lane over the incoming cells:
   // the convolution carry rewinds to the retained rows' raw conv inputs and
   // the recurrent matrix recomputes over the emitted post-conv rows and dt'.
@@ -181,6 +191,11 @@ public:
                         uint32_t layers, uint32_t lanes,
                         Mamba2StateStrides state,
                         uint32_t verifyStride = RICHENGINE_TARGET_VERIFY_ROWS);
+  static void addCommitTree(metal::CommandGraph &graph,
+                            Mamba2CommitBuffers buffers,
+                            metal::MetalBuffer retainedPath,
+                            Mamba2Shape shape, uint32_t layers, uint32_t lanes,
+                            Mamba2StateStrides state);
   // One tape slot's per-layer bytes for `rows` verify rows:
   // rows * (2 * convDim * 2 + heads * 4) — the raw conv inputs, the
   // post-conv x|B|C and dt'.

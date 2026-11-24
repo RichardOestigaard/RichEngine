@@ -152,14 +152,20 @@ class PromptTokenizer:
     `encode` reads the template's text between two of the tokens the template
     wrote as ordinary text, a marked token as its characters.
 
-    It reuses a cached prompt's tokens up to its last `marker`, the chat
-    turn's end token, where the tokenizer splits its input, and splices the
+    It reuses a cached prompt's tokens up to a message end: a `marker`, the
+    chat turn's end token, where the tokenizer splits its input. A prompt
+    that extends a cached prompt reuses it whole; any other prompt reuses
+    the longest run of whole messages it shares with a cached prompt, which
+    keeps where each of its markers ends. So a branch of a conversation, or
+    a return to an earlier turn, reuses the messages they share. It keeps up
+    to CAPACITY prompts, in storage for BUDGET_BYTES, and splices the
     remembered ids of replies the prompt resends."""
 
     MIN_PREFIX_CHARS = 4096
     BUDGET_BYTES = 8 * 1024 * 1024
-    # One entry per live conversation prefix; BUDGET_BYTES is the real
-    # memory bound, so this only needs to outnumber concurrent sessions.
+    # One entry per live conversation prefix, and each branch of one its own;
+    # BUDGET_BYTES is the real memory bound, so this only needs to outnumber
+    # concurrent sessions.
     CAPACITY = 32
     REPLY_CAPACITY = 256
 
@@ -224,7 +230,7 @@ class PromptTokenizer:
                 self._plain.normalizer = backend.normalizer
             self._plain.pre_tokenizer = backend.pre_tokenizer
         self.entries = OrderedDict()
-        self.bytes = self.hits = self.reused_tokens = 0
+        self.bytes = self.hits = self.misses = self.evictions = self.reused_tokens = 0
         # Reply text -> the ids the model emitted for it, a small LRU.
         self.replies = OrderedDict()
         # Reply text suffix -> the reply texts carrying it, so _reply_at
@@ -456,43 +462,92 @@ class PromptTokenizer:
                     return middle + self.tokens(text[boundary:])
             return self.tokens(text)
         with self.lock:
+            # An extension, an agent's ordinary request, reuses the longest
+            # cached prompt it extends, whole: one comparison a prompt, which
+            # stops at the first character that differs. Only a prompt that
+            # extends none, which would encode from its start, compares
+            # message by message. A shorter cached prompt the prompt extends
+            # is taken even where another shares more of its messages: that
+            # needs a stale entry beside a longer branch, and costs encode
+            # time, never a token.
             key = max(
-                (key for key in self.entries if prefix.startswith(key)),
+                (kept for kept in self.entries if prefix.startswith(kept)),
                 key=len,
-                default="",
+                default=None,
             )
-            cached = self.entries.get(key)
-            if cached is not None:
+            # How many of its messages: all ([:None]) of one the prompt extends.
+            shared = None
+            reused_chars = 0 if key is None else len(key)
+            if key is None:
+                for kept, (_, ends, _) in self.entries.items():
+                    count = start = 0
+                    for end in ends:
+                        if prefix[start:end] != kept[start:end]:
+                            break
+                        count, start = count + 1, end
+                    if start > reused_chars:
+                        key, shared, reused_chars = kept, count, start
+            if key is None:
+                self.misses += 1
+                reused, char_ends, token_ends = array("I"), array("Q"), array("Q")
+            else:
+                cached_tokens, char_ends, token_ends = self.entries[key]
                 self.entries.move_to_end(key)
+                char_ends, token_ends = char_ends[:shared], token_ends[:shared]
+                reused = cached_tokens[: token_ends[-1]]
                 self.hits += 1
-                self.reused_tokens += len(cached) // array("I").itemsize
-        tokens = array("I", cached).tolist() if cached is not None else []
-        if key != prefix:
-            span = prefix[len(key) :]
+                self.reused_tokens += len(reused)
+        tokens = reused.tolist()
+        if reused_chars < boundary:
+            span = prefix[reused_chars:]
             middle = self._encode_middle(span) if remembered else None
+            # The rest of the prefix encodes in one call: one call per message
+            # took a cold 800-message, 15.9K-token prompt from 11.9 to 17.1 ms.
+            # Each marker in it is the marker's token, which no other text
+            # encodes to (enabled) and a remembered reply never holds, so the
+            # n-th marker's token ends the n-th message. A different added
+            # token can consume part of a marker, which is then no tokenizer
+            # boundary: fewer tokens than markers are left, the last marker
+            # finds none, and the prompt encodes whole.
+            index = len(tokens) - 1
             tokens.extend(middle if middle is not None else self.tokens(span))
-            # A different added token can consume part of the marker. In that
-            # case this literal occurrence is not a tokenizer boundary.
-            if not tokens or tokens[-1] != self.marker_id:
-                return self.tokens(text)
-            packed = array("I", tokens).tobytes()
-            size = sys.getsizeof(prefix) + sys.getsizeof(packed)
+            end = reused_chars
+            while end < boundary:
+                end = prefix.find(self.marker, end) + len(self.marker)
+                try:
+                    index = tokens.index(self.marker_id, index + 1)
+                except ValueError:
+                    return self.tokens(text)
+                char_ends.append(end)
+                token_ends.append(index + 1)
+            # A cached prompt: its tokens, and where each of its messages
+            # ends, in characters and in tokens.
+            entry = (array("I", tokens), char_ends, token_ends)
+            size = sys.getsizeof(prefix) + sys.getsizeof(entry)
+            size += sum(map(sys.getsizeof, entry))
             if size <= self.BUDGET_BYTES:
                 with self.lock:
-                    # An extension replaces its earlier prefix; unrelated
-                    # concurrent conversations retain their own LRU entries.
-                    for old in {key, prefix}:
+                    # An extension replaces the prompt it extends, whose
+                    # message ends it holds; a branch keeps its own.
+                    for old in {key, prefix} - {None}:
+                        if old == key and not prefix.startswith(key):
+                            continue
                         previous = self.entries.pop(old, None)
                         if previous is not None:
-                            self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
-                    self.entries[prefix] = packed
+                            self.bytes -= sys.getsizeof(old) + sys.getsizeof(
+                                previous
+                            ) + sum(map(sys.getsizeof, previous))
+                    self.entries[prefix] = entry
                     self.bytes += size
                     while (
                         self.bytes > self.BUDGET_BYTES
                         or len(self.entries) > self.CAPACITY
                     ):
                         old, previous = self.entries.popitem(last=False)
-                        self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
+                        self.bytes -= sys.getsizeof(old) + sys.getsizeof(
+                            previous
+                        ) + sum(map(sys.getsizeof, previous))
+                        self.evictions += 1
         return tokens + self.tokens(text[boundary:])
 
     def split(self, text):
@@ -519,6 +574,8 @@ class PromptTokenizer:
                 "budget_bytes": self.BUDGET_BYTES,
                 "capacity": self.CAPACITY,
                 "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
                 "reused_tokens": self.reused_tokens,
                 "reply_entries": len(self.replies),
                 "reply_hits": self.reply_hits,

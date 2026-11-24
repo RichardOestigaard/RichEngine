@@ -93,12 +93,15 @@ inline uint gdn_tree_ancestor(device const uint *nodes, uint row, uint hops) {
 
 // The tree counterpart of gdn_conv_silu: the node's four taps cover path
 // positions depth-3..depth, taken from the carried state below zero and
-// from the ancestor row above it.
+// from the ancestor row above it. conv_bias adds into the fp32 accumulator
+// before the bf16 rounding, as in gdn_conv_silu_pending (mamba2's
+// ssm_conv1d.bias; the GDN blocks pass nullptr).
 inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
                                  device const bfloat *conv_state_in,
                                  device const bfloat *conv_weights,
                                  uint packed_width, uint conv_dim, uint row,
-                                 uint channel, device const uint *nodes) {
+                                 uint channel, device const uint *nodes,
+                                 device const bfloat *conv_bias = nullptr) {
   const uint depth = RICHENGINE_TREE_NODE_DEPTH(nodes[row]);
   float value = 0.0f;
   for (uint tap = 0; tap < 4; ++tap) {
@@ -111,6 +114,8 @@ inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
                      channel];
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
+  if (conv_bias)
+    value += float(conv_bias[channel]);
   value = float(bfloat(value));
   return bfloat(richengine_silu(value));
 }

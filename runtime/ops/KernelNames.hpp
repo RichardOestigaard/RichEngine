@@ -87,10 +87,11 @@ inline constexpr std::string_view kDraftSelectPlain = "draft_select_plain";
 inline constexpr std::string_view kDraftSelectPlainTree = "draft_select_plain_tree";
 inline constexpr std::string_view kDraftSelectDspark = "draft_select_dspark";
 inline constexpr std::string_view kDraftSelectDsparkTree = "draft_select_dspark_tree";
+inline constexpr std::string_view kDraftSelectDsparkMarkov = "draft_select_dspark_markov";
+inline constexpr std::string_view kDraftSelectDsparkMarkovTree = "draft_select_dspark_markov_tree";
 inline constexpr std::string_view kDraftVerifyRows = "draft_verify_rows";
 inline constexpr std::string_view kDraftConfScore = "draft_conf_score";
 inline constexpr std::string_view kDsparkSelectTop16Sharded = "dspark_select_top16_sharded";
-inline constexpr std::string_view kDsparkSelectEdges = "dspark_select_edges";
 inline constexpr std::string_view kDflashSelectPoolEdges = "dflash_select_pool_edges";
 
 // Row movement and tables.
@@ -133,7 +134,9 @@ inline constexpr std::string_view kPrefillMamba2Scan = "prefill_mamba2_scan";
 inline constexpr std::string_view kPrefillMamba2Gate = "prefill_mamba2_gate";
 inline constexpr std::string_view kPrefillMamba2GateSums = "prefill_mamba2_gate_sums";
 inline constexpr std::string_view kVerifyMamba2Fused = "verify_mamba2_fused";
+inline constexpr std::string_view kVerifyTreeMamba2Fused = "verify_tree_mamba2_fused";
 inline constexpr std::string_view kVerifyMamba2Commit = "verify_mamba2_commit";
+inline constexpr std::string_view kVerifyMamba2CommitTree = "verify_mamba2_commit_tree";
 
 // RMS norms (normKernel() appends the epsilon/width tags).
 inline constexpr std::string_view kNormRms = "norm_rms";

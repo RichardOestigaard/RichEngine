@@ -31,6 +31,11 @@ void RoPE::addTables(
   const uint64_t elements =
       std::max<uint64_t>(uint64_t{rows.target_rows} * rows.target_dims,
                          uint64_t{rows.draft_rows} * rows.draft_dims);
+  // A NoPE side carries zero rotary dims: a call with rows on that side
+  // alone (the tree path's target-only build on a NoPE target) has nothing
+  // to write — dispatching it would encode a zero-size grid.
+  if (!elements)
+    return;
   graph.add(std::string(kRopeBuildTables),
             {std::move(targetPositions), std::move(draftPositions),
              std::move(targetInverseFrequencies),

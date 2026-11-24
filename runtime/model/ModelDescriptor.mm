@@ -384,6 +384,16 @@ void applyManifestDraftKind(NSDictionary *format, ModelDescriptor &descriptor,
     throw std::invalid_argument("unsupported draft layer magic: " + magic);
   }
   descriptor.stateLayout.draft = descriptor.draft.stateLayout();
+  // The makeModelDescriptor default was computed against the family's
+  // maker-time draft — a Null-draft family (nemotron) leaves treeVerify On
+  // even after a real GPU draft lands here. Recompute against the declared
+  // kind, mirroring the makeModelDescriptor rule. Lfm2Moe24B's explicit On
+  // survives: its declared draft stays Null, so the rule returns On again.
+  descriptor.tuning.treeVerify =
+      descriptor.draft.kind == DraftKind::Null &&
+              !descriptor.target.indexerHeads
+          ? ModelTuning::TreeVerify::On
+          : ModelTuning::TreeVerify::OptIn;
 }
 
 // Defined below validateNewPackedFormat, which it calls.
@@ -727,6 +737,13 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
       throw std::invalid_argument("unsupported draft layer magic: " + magic);
   }
   const DraftKind kind = descriptor.draft.kind;
+  // Same recompute as applyManifestDraftKind: the maker's treeVerify
+  // default was derived from its maker-time draft, and a Null-draft
+  // family's On must not leak onto the GPU draft declared here.
+  descriptor.tuning.treeVerify =
+      kind == DraftKind::Null && !descriptor.target.indexerHeads
+          ? ModelTuning::TreeVerify::On
+          : ModelTuning::TreeVerify::OptIn;
   const bool accepted =
       kind == DraftKind::DSpark
           ? dsparkArchitectureAccepted(descriptor, architecture)
@@ -742,11 +759,13 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
           requireUnsigned(draft, @"num_key_value_heads", "draft num_key_value_heads");
       const uint64_t headDim = requireUnsigned(draft, @"head_dim", "draft head_dim");
       // The compiled draft attention cores cover 32x8x128 (half-split),
-      // 16x2x128 and interleaved 32x8x64 head patterns.
+      // 16x2x128, interleaved 32x8x64 and Nemotron's 32x2x128 head
+      // patterns.
       const bool supported =
           (heads == 32 && kvHeads == 8 && headDim == 128) ||
           (heads == 16 && kvHeads == 2 && headDim == 128) ||
-          (heads == 32 && kvHeads == 8 && headDim == 64);
+          (heads == 32 && kvHeads == 8 && headDim == 64) ||
+          (heads == 32 && kvHeads == 2 && headDim == 128);
       if (!supported)
         throw std::invalid_argument("unsupported draft head geometry");
       d.layers = static_cast<uint32_t>(
@@ -761,6 +780,23 @@ void applyDeclaredDraft(NSDictionary *manifest, NSDictionary *format,
       d.qkvSize = static_cast<uint32_t>((heads + 2 * kvHeads) * headDim);
       d.rotaryTheta = static_cast<float>(
           requireUnsigned(draft, @"rope_theta", "draft rope_theta"));
+      // A YaRN draft's scaling fields, which the pack writes as
+      // rope_factor / rope_original_max / rope_max_position (install/
+      // pack.py); a manifest without them keeps the unscaled defaults.
+      if (id value = draft[@"rope_factor"];
+          [value isKindOfClass:[NSNumber class]] &&
+          CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID())
+        d.ropeFactor = static_cast<float>([value doubleValue]);
+      if (id value = draft[@"rope_original_max"];
+          [value isKindOfClass:[NSNumber class]] &&
+          CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID())
+        d.ropeOriginalMax =
+            static_cast<uint32_t>([value unsignedLongLongValue]);
+      if (id value = draft[@"rope_max_position"];
+          [value isKindOfClass:[NSNumber class]] &&
+          CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID())
+        d.ropeMaxPosition =
+            static_cast<uint32_t>([value unsignedLongLongValue]);
       const uint64_t blockSize =
           requireUnsigned(draft, @"block_size", "draft block_size");
       // The runtime dispatches the draft's verifyRows — the trained
@@ -1226,21 +1262,29 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         requireUnsigned(draft, @"num_key_value_heads", "num_key_value_heads");
     const uint64_t headDim = requireUnsigned(draft, @"head_dim", "head_dim");
     // The compiled draft attention cores cover 32x8x128 (half-split),
-    // 16x2x128 and interleaved 32x8x64 head patterns — the same set
-    // applyDeclaredDraft accepts for packed manifests.
+    // 16x2x128, interleaved 32x8x64 and Nemotron's 32x2x128 head
+    // patterns — the same set applyDeclaredDraft accepts for packed
+    // manifests.
     const bool headGeometrySupported =
         (heads == 32 && kvHeads == 8 && headDim == 128) ||
         (heads == 16 && kvHeads == 2 && headDim == 128) ||
-        (heads == 32 && kvHeads == 8 && headDim == 64);
+        (heads == 32 && kvHeads == 8 && headDim == 64) ||
+        (heads == 32 && kvHeads == 2 && headDim == 128);
     if (!headGeometrySupported)
       throw std::invalid_argument("unsupported draft head geometry");
     d.kvHeads = static_cast<uint32_t>(kvHeads);
     d.attentionHeadDimension = static_cast<uint32_t>(headDim);
     d.attentionSize = static_cast<uint32_t>(heads * headDim);
     d.qkvSize = static_cast<uint32_t>((heads + 2 * kvHeads) * headDim);
-    d.slidingWindow = static_cast<uint32_t>(std::min<uint64_t>(
-        requireUnsigned(draft, @"sliding_window", "draft sliding_window"),
-        ExecutionLimits::draftRingCapacity));
+    // NVIDIA's DFlash declares sliding_window null — the draft trains no
+    // window at all — where the sliding drafts bound one; absent or null
+    // reads as the ring's physical capacity.
+    id window = draft[@"sliding_window"];
+    d.slidingWindow = [window isKindOfClass:[NSNumber class]]
+        ? static_cast<uint32_t>(std::min<uint64_t>(
+              [window unsignedLongLongValue],
+              ExecutionLimits::draftRingCapacity))
+        : ExecutionLimits::draftRingCapacity;
     // Sliding layers attend causally inside the block unless the config
     // overrides is_causal; a full_attention layer never does.
     NSArray *types = requireArray(draft, @"layer_types", "draft layer_types");
@@ -1422,7 +1466,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         ![draft[@"tie_word_embeddings"] isEqual:@NO])
       throw std::invalid_argument("unsupported MTP draft tied embeddings");
   } else if (![draft[@"attention_bias"] isEqual:@NO] ||
-             ![draft[@"tie_word_embeddings"] isEqual:@NO] ||
+             // NVIDIA's DFlash omits tie_word_embeddings outright — an
+             // absent key reads as the untied default, as the DSpark
+             // branch's optional fields read.
+             (draft[@"tie_word_embeddings"] &&
+              ![draft[@"tie_word_embeddings"] isEqual:@NO]) ||
              ![draft[@"rms_norm_eps"] isEqual:@(expectedRmsEps)] ||
              ![draft[@"hidden_act"] isEqual:@"silu"]) {
     throw std::invalid_argument("unsupported draft attention or normalization configuration");
@@ -1435,11 +1483,37 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (nemotronMtp) {
     // The nextn attention block is NoPE like the trunk's: no rope_theta
     // is declared or consumed.
-  } else if (id rope = draft[@"rope_parameters"];
-      [rope isKindOfClass:[NSDictionary class]]) {
-    requireEqual(requireString(rope, @"rope_type", "draft rope type"),
-                 "default", "draft rope type");
+  } else if (id ropeValue = draft[@"rope_parameters"];
+      [ropeValue isKindOfClass:[NSDictionary class]]) {
+    NSDictionary *rope = static_cast<NSDictionary *>(ropeValue);
+    const std::string ropeType =
+        requireString(rope, @"rope_type", "draft rope type");
     ropeTheta = requireUnsigned(rope, @"rope_theta", "draft rotary theta");
+    if (ropeType == "yarn") {
+      // NVIDIA's Nemotron DFlash: YaRN's declared factor and the window
+      // it stretches (model/YarnRope.hpp scales the draft's frequencies
+      // and tables by them). The draft's own max_position_embeddings,
+      // when it states one, gives the attention factor's scale — the
+      // factor alone when it does not (HF _compute_yarn_parameters).
+      id factor = rope[@"factor"];
+      if (![factor isKindOfClass:[NSNumber class]] ||
+          CFGetTypeID((__bridge CFTypeRef)factor) == CFBooleanGetTypeID() ||
+          !([factor doubleValue] > 1.0))
+        throw std::invalid_argument(
+            "draft rope_parameters factor must exceed 1");
+      d.ropeFactor = static_cast<float>([factor doubleValue]);
+      d.ropeOriginalMax = static_cast<uint32_t>(
+          requireUnsigned(rope, @"original_max_position_embeddings",
+                          "draft rope original window"));
+      if (id maxPositions = draft[@"max_position_embeddings"];
+          [maxPositions isKindOfClass:[NSNumber class]] &&
+          CFGetTypeID((__bridge CFTypeRef)maxPositions) !=
+              CFBooleanGetTypeID())
+        d.ropeMaxPosition = static_cast<uint32_t>(
+            [maxPositions unsignedLongLongValue]);
+    } else if (ropeType != "default") {
+      throw std::invalid_argument("unsupported draft rope type: " + ropeType);
+    }
   } else {
     ropeTheta = requireUnsigned(draft, @"rope_theta", "draft rotary theta");
   }
@@ -1455,16 +1529,27 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   }
   if (dflashV1Draft) {
     // A DSpine draft states its block size at the root, a plain draft
-    // inside dflash_config.
+    // inside dflash_config; NVIDIA's DFlash declares none at all — the
+    // compiled tile's draftQueryRows stands in, since the block only
+    // caps the proposal budget and a wrong guess costs acceptance, never
+    // correctness.
+    id declaredBlock =
+        dspineDraft ? draft[@"block_size"] : flash[@"block_size"];
     const uint64_t blockSize =
-        dspineDraft
-            ? requireUnsigned(draft, @"block_size", "draft block_size")
-            : requireUnsigned(flash, @"block_size", "draft block_size");
+        [declaredBlock isKindOfClass:[NSNumber class]]
+            ? requireUnsigned(dspineDraft ? draft : flash, @"block_size",
+                              "draft block_size")
+            : ExecutionLimits::draftQueryRows;
     // The runtime dispatches the draft's verifyRows query rows: a shorter
     // trained block verifies exactly its own rows.
     if (blockSize < 2)
       throw std::invalid_argument("draft block_size is below a proposal row");
     d.blockSize = static_cast<uint32_t>(blockSize);
+    // A draft shipping embed_tokens (Nemotron's DFlash trains a mask row
+    // the target's table lacks) gathers it for the block's input rows.
+    // The DSpline image carries no embedding tail.
+    if (!dspineDraft)
+      d.tokenEmbedding = [draft[@"has_embed_tokens"] isEqual:@YES];
   } else if (dsparkDraft) {
     // block_size is a root field in both DSpark dialects; only LFM2.5 nests
     // the mask and capture fields under dflash_config.
@@ -1595,10 +1680,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.targetHiddenSize = static_cast<uint32_t>(taps.count *
                                              result.target.hiddenSize);
   }
-  // Nemotron's DSpark taps six trunk layers (its fc reads the
-  // 6 x hidden concat) — the capture set follows the checkpoint's
-  // declared target_layer_ids like a DSpine draft's does.
-  if (dsparkDraft && result.target.arch == "nemotron") {
+  // Nemotron's DSpark and DFlash drafts tap six trunk layers (their fc
+  // reads the 6 x hidden concat) — the capture set follows the
+  // checkpoint's declared target_layer_ids like a DSpine draft's does.
+  if ((dsparkDraft || dflashV1Draft) &&
+      result.target.arch == "nemotron") {
     NSArray *taps =
         requireArray(flash, @"target_layer_ids", "draft target layers");
     if (!taps.count || taps.count > result.target.hiddenCaptureLayers.size())

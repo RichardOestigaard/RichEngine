@@ -157,9 +157,9 @@ void NemotronMtpDraft::addDecode(
     std::span<const uint32_t> passLimits) const {
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t envCap = std::min(
-      layout.proposalLimit(),
-      envUint("RICHENGINE_MTP_PASSES", layout.proposalLimit()));
+  static const uint32_t envPasses =
+      envUint("RICHENGINE_MTP_PASSES", ~uint32_t{0});
+  const uint32_t envCap = std::min(layout.proposalLimit(), envPasses);
   if (!passLimits.empty() && passLimits.size() < lanes)
     throw std::invalid_argument("invalid MTP pass-limit batch");
   const uint32_t stride = layout.verifyRows();

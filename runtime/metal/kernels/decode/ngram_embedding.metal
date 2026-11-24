@@ -73,9 +73,12 @@ kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
     context[back] = cut ? p.eos : previous;
   }
   const uint heads = (p.ngram - 1) * p.heads_per_ngram;
+  ulong terms[NGRAM_EMBEDDING_MAXIMUM_NGRAM];
+  for (uint j = 0; j < p.ngram; ++j)
+    terms[j] = context[j] * p.multipliers[j];
   for (uint gram = 2; gram <= p.ngram; ++gram) {
-    ulong mixed = context[0] * p.multipliers[0];
-    for (uint j = 1; j < gram; ++j) mixed ^= context[j] * p.multipliers[j];
+    ulong mixed = terms[0];
+    for (uint j = 1; j < gram; ++j) mixed ^= terms[j];
     for (uint g = 0; g < p.heads_per_ngram; ++g) {
       const uint head = (gram - 2) * p.heads_per_ngram + g;
       indices[ulong(index) * heads + head] =

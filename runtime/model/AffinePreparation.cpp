@@ -11,11 +11,13 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace richengine::model::affine {
 namespace {
@@ -261,15 +263,21 @@ void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint
   bias = nearestBfloat16(offset);
 }
 
-void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
+namespace {
+
+void writeImage(std::span<uint8_t> destination, const Image &image, metal::MetalBackend *backend,
+                const metal::MetalBuffer *buffer) {
   if (destination.size() != image.bytes) throw std::invalid_argument("affine image destination size differs");
   const auto header = weightFileHeader(image.magic, image.layer, image.type);
   std::vector<std::pair<uint64_t, uint64_t>> extents{{0, header.size()}};
   for (const Section &section : image.sections) extents.emplace_back(section.offset, section.bytes);
   zeroUnwritten(destination, std::move(extents));
   std::memcpy(destination.data(), header.data(), header.size());
-  // Every task writes bytes of its own and stages through its thread's buffer.
+  // Every task writes bytes of its own and stages through its thread's
+  // buffer; a Block section whose parts are stored planes writes its tiles
+  // on the GPU instead, staged through writeBlockGpuChunks' buffers.
   std::vector<std::function<void(std::vector<uint8_t> &)>> tasks;
+  std::vector<BlockGpuChunk> gpuChunks;
   for (const Section &section : image.sections) {
     uint8_t *const at = destination.data() + section.offset;
     const uint64_t fieldRows = uint64_t(section.rows) * (section.columns / kQ4GroupElements);
@@ -340,7 +348,10 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
       break;
     }
     case SectionKind::Block:
-      addBlockTasks(section, at, tasks);
+      if (backend && buffer && blockStoredPlanes(section))
+        addBlockGpuTasks(section, at, tasks, gpuChunks);
+      else
+        addBlockTasks(section, at, tasks);
       break;
     case SectionKind::Oq:
       oq::addTasks(section, at, tasks);
@@ -356,8 +367,41 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
     }
     }
   }
-  std::vector<std::vector<uint8_t>> staging(loadThreads());
-  parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
+  if (gpuChunks.empty()) {
+    std::vector<std::vector<uint8_t>> staging(loadThreads());
+    parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
+    return;
+  }
+  // The CPU writes ride the load threads while this thread stages the GPU
+  // chunks' planes and submits their dispatches (submissions stay on the
+  // backend's one thread).
+  std::exception_ptr taskFailure;
+  std::thread workers([&] {
+    try {
+      std::vector<std::vector<uint8_t>> staging(loadThreads());
+      parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](staging[thread]); });
+    } catch (...) {
+      taskFailure = std::current_exception();
+    }
+  });
+  try {
+    writeBlockGpuChunks(*backend, *buffer, gpuChunks);
+  } catch (...) {
+    workers.join();
+    throw;
+  }
+  workers.join();
+  if (taskFailure) std::rethrow_exception(taskFailure);
+}
+
+} // namespace
+
+void writeAffineImage(std::span<uint8_t> destination, const Image &image) {
+  writeImage(destination, image, nullptr, nullptr);
+}
+
+void writeAffineImage(metal::MetalBackend &backend, const metal::MetalBuffer &buffer, const Image &image) {
+  writeImage(contentsOf(buffer), image, &backend, &buffer);
 }
 
 std::string packedStamp(const std::filesystem::path &directory,

@@ -637,7 +637,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       float top_p, float mass, uint admitted,
                                       threadgroup VocabularyScratch &scratch,
                                       uint thread_index, uint lane,
-                                      uint simd_group) {
+                                      uint simd_group, thread float &kept) {
   OrderBoundary end{kNoKey, 0};
   Bracket bracket{kLowestKey, logit_key(row.maximum) + 1, admitted, 0, mass,
                   0.0f};
@@ -678,18 +678,24 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
           }
         }
         scratch.selection.last = end;
+        scratch.selection.mass = walked;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      kept = scratch.selection.mass;
       return scratch.selection.last;
     }
     bracket.lo = end.key;
     bracket.lo_count = top.count;
     bracket.lo_mass = top.mass;
   }
-  if (top_p < 1.0f)
-    end = select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
-                      scratch, thread_index, lane, simd_group)
-              .last;
+  if (top_p < 1.0f) {
+    const Selection last =
+        select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
+                    scratch, thread_index, lane, simd_group);
+    kept = last.mass;
+    return last.last;
+  }
+  kept = mass;
   return end;
 }
 
@@ -742,10 +748,22 @@ inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
 // weights once, adds the ranges in order and walks the one that holds the
 // draw with prefix sums. A range's weight and its walk add the same token
 // weights, so the range the draw picks always has a token to draw.
+// A token's probability in the draft's candidate table, 0 when absent.
+inline float sparse_lookup(device const uint *ids,
+                           device const float *probabilities, uint count,
+                           uint token) {
+  for (uint i = 0; i < count; ++i) {
+    if (ids[i] == token)
+      return probabilities[i];
+  }
+  return 0.0f;
+}
+
 inline bool vocabulary_draw(
     TargetRow row, OrderBoundary end, bool drafted, uint draft_token,
     device const uint *draft_ids, device const float *draft_probabilities,
-    float uniform, device coherent(device) TargetVocabularyRange *ranges,
+    float draft_discount, float uniform,
+    device coherent(device) TargetVocabularyRange *ranges,
     device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
     uint thread_index, uint lane, uint simd_group, thread uint &drawn,
     thread float &draft_probability) {
@@ -804,10 +822,14 @@ inline bool vocabulary_draw(
     bool residual = false;
     for (uint range = 0; drafted && range < kVocabularyRanges; ++range)
       residual = residual || scratch.range_rest[range] > 0.0f;
+    // Block verification's residual is p - min(q, a * p) in weights: the
+    // prefix-discount a (draft_discount) refunds the candidate (1-a) of its
+    // weight. a = 1 (chain head or undiscounted) recovers p - min(p, q).
     for (uint index = 0; drafted && index < kDraftCandidates; ++index) {
-      const float left = max(scratch.draft_weights[index] -
-                                 scratch.draft_probabilities[index] * kept_mass,
-                             0.0f);
+      const float left =
+          max(scratch.draft_weights[index] -
+                  scratch.draft_probabilities[index] * kept_mass,
+              (1.0f - draft_discount) * scratch.draft_weights[index]);
       scratch.draft_draw_weights[index] = left;
       residual = residual || left > 0.0f;
     }
@@ -884,18 +906,26 @@ inline bool vocabulary_draw(
 // admitted count, then the search. The record keeps the maximum and the
 // end, which the draw reads.
 inline void search_row(TargetRow row, device const TargetShardMass *masses,
-                       float min_p, uint top_k, float top_p,
+                       float min_p, uint top_k, float top_p, uint draft_token,
                        device TargetVocabularyRow &record,
                        threadgroup VocabularyScratch &scratch,
                        uint thread_index, uint lane, uint simd_group) {
   const TargetShardMass merged =
       merge_masses(masses, RICHENGINE_TARGET_SAMPLING_SHARDS, row.temperature);
   row.maximum = merged.maximum;
+  // kept is the draw's kept_mass: the weights at or before the end, which
+  // merged.sum counts only before the min_p/top_k/top_p cuts.
+  float kept = merged.sum;
   const OrderBoundary end =
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
-                       scratch, thread_index, lane, simd_group);
+                       scratch, thread_index, lane, simd_group, kept);
+  // A drafted row's draft_probability ships with the record now — the
+  // block-verification discount in the draw multiplies the earlier rows'
+  // p/q ratios, which the parallel draw pass could not otherwise see.
+  const float probability =
+      draft_token == ~0u ? 0.0f : kept_weight(row, end, draft_token) / kept;
   if (thread_index == 0)
-    record = {merged.maximum, end.key, end.last, 0.0f};
+    record = {merged.maximum, end.key, end.last, probability};
 }
 
 // Where the distribution of each selected row of the sampled lanes ends, one
@@ -906,7 +936,8 @@ kernel void decode_sample_vocabulary_search(
     device const short *dfa_next [[buffer(2)]],
     device const TargetShardMass *partial_masses [[buffer(3)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(4)]],
-    constant TargetSamplingParams &params [[buffer(5)]],
+    device const uint *input_tokens [[buffer(5)]],
+    constant TargetSamplingParams &params [[buffer(6)]],
     uint s [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -916,10 +947,15 @@ kernel void decode_sample_vocabulary_search(
       dfa_row_disabled(dfa_next, params, s))
     return;
   const uint batch = selected_lane(params, s);
+  const uint index = s % params.rows;
+  const uint live = params.live_rows[batch];
+  const bool drafted =
+      index < params.drafted_rows && (!live || index + 1 < live);
   search_row(selected_row(logits, token_mask, dfa_next, params, s),
              partial_masses + ulong(s) * RICHENGINE_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
-             vocabulary_rows[s], scratch, thread_index, lane, simd_group);
+             drafted ? input_tokens[s + 1] : ~0u, vocabulary_rows[s], scratch,
+             thread_index, lane, simd_group);
 }
 
 // The draw of each selected row of the sampled lanes, kVocabularyGroups
@@ -962,13 +998,32 @@ kernel void decode_sample_vocabulary_draw(
       index < params.drafted_rows && (!live || index + 1 < live);
   const ulong position =
       ulong(batch) * RICHENGINE_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
+  // Block verification's prefix discount: the joint survival probability
+  // min(1, prod of p_j/q_j over the proposal positions before this row).
+  // The search pass wrote every earlier row's draft_probability; a row the
+  // search skipped is unreachable through acceptance, so its record stays
+  // stale but unread.
+  float discount = 1.0f;
+  if (drafted) {
+    const ulong base = ulong(batch) * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+    const uint row_base = batch * params.rows;
+    for (uint j = 0; j < index; ++j) {
+      const float pj = vocabulary_rows[row_base + j].draft_probability;
+      const uint jtok = input_tokens[row_base + j + 1];
+      const float qj =
+          sparse_lookup(draft_ids + (base + j) * kDraftCandidates,
+                        draft_probabilities + (base + j) * kDraftCandidates,
+                        kDraftCandidates, jtok);
+      discount = min(1.0f, discount * (qj > 0.0f ? pj / qj : 1.0e30f));
+    }
+  }
   uint token;
   float draft_probability;
   if (vocabulary_draw(
           row, {record.end_key, record.end_last}, drafted,
           drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
-          draft_probabilities + position * kDraftCandidates,
+          draft_probabilities + position * kDraftCandidates, discount,
           uniforms[ulong(batch) * RICHENGINE_SAMPLING_UNIFORMS + params.uniform],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
@@ -1251,15 +1306,7 @@ kernel void draft_select_top16_sharded(
                             simd_group, query_rows);
 }
 
-inline float sparse_lookup(device const uint *ids,
-                           device const float *probabilities, uint count,
-                           uint token) {
-  for (uint i = 0; i < count; ++i) {
-    if (ids[i] == token)
-      return probabilities[i];
-  }
-  return 0.0f;
-}
+
 
 // One lane's view of AcceptBatchParams, built by decode_accept_dflash.
 struct AcceptParams {
@@ -1302,6 +1349,11 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &retained,
                                 device uint &accepted_count,
                                 AcceptParams params) {
+  // Block verification (Sun et al.): the block's joint acceptance walks a
+  // single uniform down the running product min(1, prod p_i/q_i) — never
+  // fewer expected tokens than per-token draws, same distribution.
+  const float uniform = uniforms[RICHENGINE_UNIFORM_ACCEPTANCE];
+  float odds = 1.0f;
   uint accepted = 0;
   while (accepted < params.limit) {
     uint token = draft_tokens[accepted];
@@ -1309,7 +1361,8 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                             draft_probs + accepted * params.candidate_stride,
                             params.candidate_stride, token);
     float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[RICHENGINE_UNIFORM_ACCEPTANCE + accepted] * q < p))
+    odds = min(1.0f, odds * (q > 0.0f ? p / q : 1.0e30f));
+    if (!(uniform < odds))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -1574,7 +1627,7 @@ kernel void decode_accept_dflash(
       params.stop_token_1,
       min(params.proposals[batch],
           min(uint(RICHENGINE_DRAFT_PROPOSAL_TOKENS),
-              params.verify_stride - 1)),
+              min(params.verify_stride - 1, verify_rows[batch]))),
       params.candidate_stride};
   if (params.trunc_mask & (1u << batch))
     lane_params.limit = min(lane_params.limit, trunc_rows[batch]);

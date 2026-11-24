@@ -439,7 +439,7 @@ void runDSparkCase(MetalBackend &backend, const Case &c, bool tree) {
     selector.addDSparkTree(graph, buffers, markov, anchors, policies, treeMask);
   else
     selector.addDSpark(graph, buffers, markov, anchors, policies);
-  require(graph.dispatches().size() == 3,
+  require(graph.dispatches().size() == 2,
           "dspark selector dispatch count changed");
   static_cast<void>(backend.submitCommand(graph.dispatches()));
 

@@ -16,3 +16,23 @@ struct GgufRepackParams {
   uint32_t dst_meta;
 };
 static_assert(sizeof(GgufRepackParams) == 24, "GGUF repack parameters are 24 bytes on both sides");
+
+// The same repack from a safetensors affine tensor's stored planes
+// (gguf_repack_stored, model/AffineToBlock.cpp): the host stages the chunk's
+// codes, scales and biases as the checkpoint stores them — a contiguous run
+// per plane — and one thread per (row, 32-wide K group) writes the same
+// plane0 and meta tiles gguf_repack writes of the native block the planes
+// hold as parts.
+struct GgufRepackStoredParams {
+  uint32_t rows;            // rows of the chunk
+  uint32_t input_size;      // K of the chunk (a multiple of the format's groups)
+  uint32_t first_row;       // image row of the chunk's row 0 (its plane tile row)
+  uint32_t fmt;             // GGUF_FMT_AF4
+  uint32_t codes_row_bytes; // staged bytes a row of the codes plane
+  uint32_t meta_row_bytes;  // of the scale plane and of the bias plane alike
+  uint32_t src_scales;      // the scale and bias planes' byte offsets in src
+  uint32_t src_biases;
+  uint32_t dst_meta;        // the meta plane's byte offset in dst (plane0 at 0)
+};
+static_assert(sizeof(GgufRepackStoredParams) == 36,
+              "GGUF stored-planes repack parameters are 36 bytes on both sides");

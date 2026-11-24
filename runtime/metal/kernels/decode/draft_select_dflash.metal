@@ -153,7 +153,7 @@ kernel void draft_select_edges(
 
 // The pool-wide variant of draft_select_edges: the same hidden-conditioned
 // codebook edge, but over every shard partial slot (the 128-entry pool the
-// merged top-16 truncates away), matching dspark_select_edges' table shape
+// merged top-16 truncates away), matching the DSpark table shape
 // so the shared pool walk consumes either draft kind. No merge is needed —
 // predecessors and successors are read straight from the shard partials,
 // with the anchor as position zero's only predecessor. A simdgroup still

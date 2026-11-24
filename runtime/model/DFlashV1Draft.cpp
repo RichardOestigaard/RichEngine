@@ -151,20 +151,57 @@ void DFlashV1Draft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
-  operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
-                                     weights_.contextProjection, rows);
-  operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows,
-                                 buffers.linearScratch);
-  ops::Normalization::addRmsWithQ4Sums(
-      graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
-      buffers.projectionSums, layout.hiddenSize, rows);
+  // An off-tile draft's context projection is a float segment the GGUF
+  // block plans run; the affine input sums and their norm variant do not
+  // apply.
+  if (weights_.contextProjection.layout() == ops::WeightLayout::Block32) {
+    operators_.linear().addPrefill(graph, buffers.capturedTargetHidden,
+                                   weights_.contextProjection, buffers.projected,
+                                   buffers.projectionSums, rows,
+                                   buffers.linearScratch);
+    ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm,
+                               buffers.hidden, layout.hiddenSize, rows);
+  } else {
+    operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
+                                       weights_.contextProjection, rows);
+    operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
+                                   buffers.projected, buffers.projectionSums, rows,
+                                   buffers.linearScratch);
+    ops::Normalization::addRmsWithQ4Sums(
+        graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
+        buffers.projectionSums, layout.hiddenSize, rows);
+  }
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    operators_.linear().addPrefill(graph, buffers.hidden,
-                      contextKvProjections_[layer],
-                      buffers.contextKv, buffers.projectionSums, rows,
-                      buffers.linearScratch);
+    // The affine prefill tile miscomputes a block projection, so the
+    // context K/V runs through the decode plan — the commit path's proven
+    // kernel — in verify-row tiles.
+    if (contextKvProjections_[layer].layout() == ops::WeightLayout::Block32) {
+      for (uint32_t begin = 0; begin < rows; begin += layout.verifyRows()) {
+      // Decode tiles run verifyRows rows; the tail's extra rows write past
+      // the used span into the padded arena buffer.
+      const ops::LinearPlan plan = operators_.linear().decodePlan(
+          contextKvProjections_[layer], 1, ops::LinearEpilogue::None, nullptr,
+          layout.verifyRows());
+      operators_.linear().add(
+          graph,
+          {.input = backend_.view(buffers.hidden,
+                                  uint64_t{begin} * layout.hiddenSize * 2,
+                                  uint64_t{layout.verifyRows()} *
+                                      layout.hiddenSize * 2),
+           .output = backend_.view(buffers.contextKv,
+                                   uint64_t{begin} * layout.contextKvSize() * 2,
+                                   uint64_t{layout.verifyRows()} *
+                                       layout.contextKvSize() * 2),
+           .scratch = buffers.linearScratch},
+          contextKvProjections_[layer], plan);
+      }
+    } else {
+      operators_.linear().addPrefill(graph, buffers.hidden,
+                        contextKvProjections_[layer],
+                        buffers.contextKv, buffers.projectionSums, rows,
+                        buffers.linearScratch);
+    }
     for (const DFlashPrefillSpan &span : spans) {
       const uint64_t kvOffset =
           uint64_t{span.compactRow} * layout.contextKvSize() * sizeof(uint16_t);
@@ -416,6 +453,12 @@ DFlashV1DraftWeights readDraft(metal::MetalBackend &backend, Files &files,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
+    // The draft's own embed_tokens trails the norms when the layout
+    // declares one (has_embed_tokens): F32 native rows the block's input
+    // gather reads instead of the target's table.
+    if (layout.tokenEmbedding)
+      result.tokenEmbedding = readOqEmbedding(
+          file, layout.vocabularySize, layout.hiddenSize, "token-embedding");
     file.finish();
     result.files.push_back(file.record());
   }

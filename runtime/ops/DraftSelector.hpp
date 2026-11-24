@@ -134,16 +134,15 @@ public:
                     uint32_t queryRows =
                         RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
-  // dspark_select_edges + draft_select_dspark): like the plain path, but
-  // position p reads logits row p + rowOffset (0 on anchor-first drafts,
-  // whose anchor row already predicts a token; 1 on bonus-anchor ones,
-  // whose anchor row reproduces the anchor like a DFlash draft's) and each
-  // position's candidates are rescored with the Markov bias of the
-  // previously sampled token. A parallel pass scores every
-  // predecessor/candidate edge in advance — the predecessor set is the
-  // previous position's unbiased top-16, not the walk's pick — and the walk
-  // chooses the positions serially. selectorHidden is unused; unary holds
-  // the merged top-16 logits.
+  // draft_select_dspark_markov): like the plain path, but position p reads
+  // logits row p + rowOffset (0 on anchor-first drafts, whose anchor row
+  // already predicts a token; 1 on bonus-anchor ones, whose anchor row
+  // reproduces the anchor like a DFlash draft's) and each position's
+  // candidates are rescored with the Markov bias of the previously sampled
+  // token. The walk scores its four slots per lane against the chosen
+  // predecessor inline — only that one predecessor row is ever read — so no
+  // edge table pass or pool-squared scratch is needed. selectorHidden is
+  // unused; unary holds the merged top-16 logits.
   void addDSpark(metal::CommandGraph &graph,
                  const DraftSelectorBuffers &buffers,
                  const DraftMarkovHead &markov,
@@ -152,9 +151,9 @@ public:
                  uint32_t queryRows =
                      RICHENGINE_DRAFT_QUERY_ROWS,
                  uint32_t rowOffset = 0) const;
-  // The same DSpark pipeline ending in draft_select_dspark_tree, which
-  // emits each lane's verify tree tables: the chain plus, for lanes in
-  // treeMask, every position's biased runner-up as a sibling leaf.
+  // The same DSpark pipeline ending in draft_select_dspark_markov_tree,
+  // which emits each lane's verify tree tables: the chain plus, for lanes
+  // in treeMask, every position's biased runner-up as a sibling leaf.
   void addDSparkTree(metal::CommandGraph &graph,
                     const DraftSelectorBuffers &buffers,
                     const DraftMarkovHead &markov,

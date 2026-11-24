@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llguidance import LLExecutor, LLMatcher, LLTokenizer
-from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import (
     allocate_token_bitmask,
     fill_next_token_bitmask_par,
@@ -29,6 +28,15 @@ from .tool_schema import (
     TOOL_CALL_OPEN_ALT,
     dialect_named,
 )
+
+
+def guidance_tokenizer(tokenizer, **options):
+    """llguidance's table of a fast tokenizer (llguidance.hf.from_tokenizer).
+    Imported when a table is built: llguidance.hf imports transformers, which
+    the host imports only once its engine has started (model_host._build)."""
+    from llguidance.hf import from_tokenizer
+
+    return from_tokenizer(tokenizer, **options)
 
 
 def dfa_mode(default="off"):
@@ -800,7 +808,20 @@ class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer, contract, dfa_mode_default=None):
+    @staticmethod
+    def table(tokenizer, contract):
+        """llguidance's table of `tokenizer`, which every grammar's masks
+        cover: the contract's vocabulary and stop tokens. The host builds
+        it while the engine loads its weights (model_host._build): it
+        takes 0.82 s on a 32-core M5 Max."""
+        return guidance_tokenizer(
+            tokenizer,
+            n_vocab=contract.vocabulary,
+            eos_token=list(contract.eos_tokens),
+            slices=LLTokenizer.json_slices(),
+        )
+
+    def __init__(self, tokenizer, contract, dfa_mode_default=None, table=None):
         self.contract = contract
         # The serving contract's dfa_mode: the family's engine descriptor
         # declares the same mode, so this default and the engine's resolve
@@ -809,11 +830,12 @@ class ConstraintFactory:
             dfa_mode_default if dfa_mode_default in ("full", "forced") else "off"
         )
         self.hf_tokenizer = tokenizer
-        self.tokenizer = guidance_tokenizer(
-            tokenizer,
-            n_vocab=contract.vocabulary,
-            eos_token=list(contract.eos_tokens),
-            slices=LLTokenizer.json_slices(),
+        # The table built before the engine's Ready (table), or built here
+        # for a caller that has none.
+        self.tokenizer = (
+            table
+            if table is not None
+            else self.table(tokenizer, contract)
         )
         self.executor = LLExecutor()
         self.source_bytes = 0

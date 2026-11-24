@@ -46,7 +46,54 @@
         "sliding_attention",
         "sliding_attention"
       ]
-    }
+    },
+    "alternates": [
+      {
+        "repo": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "base": "dflash",
+        "signature": {
+          "architectures": [
+            "DFlashDraftModel"
+          ],
+          "num_hidden_layers": 6,
+          "hidden_size": 2688,
+          "vocab_size": 131072,
+          "intermediate_size": 6144,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 2,
+          "head_dim": 128,
+          "rms_norm_eps": 1e-06,
+          "has_embed_tokens": true,
+          "mask_token_id": 990,
+          "max_position_embeddings": 1048576,
+          "sliding_window": null,
+          "tie_word_embeddings": null,
+          "rope_theta": 10000,
+          "rope_parameters.rope_type": "yarn",
+          "rope_parameters.rope_theta": 10000,
+          "rope_parameters.factor": 128.0,
+          "rope_parameters.original_max_position_embeddings": 8192,
+          "dflash_config.block_size": 8,
+          "dflash_config.mask_token_id": 990,
+          "dflash_config.target_layer_ids": [
+            1,
+            5,
+            19,
+            29,
+            41,
+            51
+          ],
+          "layer_types": [
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention"
+          ]
+        }
+      }
+    ]
   },
   "signature": {
     "model_type": "nemotron_h_moe_text",

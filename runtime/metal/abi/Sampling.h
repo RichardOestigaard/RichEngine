@@ -209,7 +209,7 @@ struct SelectorBatchParams {
   // The lanes' packed draft query-row stride: the draft's trained-block
   // depth (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
   uint32_t query_rows;
-  // The DSpark Markov head's inner rank (dspark_select_edges's W1/W2 row
+  // The DSpark Markov head's inner rank (dspark_markov_edges's W1/W2 row
   // stride): RICHENGINE_DRAFT_SELECTOR_RANK or wider, at most
   // RICHENGINE_DRAFT_SELECTOR_RANK_MAXIMUM. Unused by the other selectors.
   uint32_t rank;

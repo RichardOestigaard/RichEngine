@@ -68,7 +68,9 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 4)
+                self.assertEqual(run.call_count, 5)
+                # pip, three smoke runs, then the bytecode compile.
+                self.assertIn("compileall", run.call_args.args[0])
                 with tarfile.open(
                     root / f"dist/richengine-{version}-arm64-macos26.tar.gz"
                 ) as archive:

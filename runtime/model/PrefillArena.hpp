@@ -4,6 +4,7 @@
 
 #include "model/CompositeStateStorage.hpp"
 #include "model/RuntimeGeometry.hpp"
+#include "model/YarnRope.hpp"
 
 #include "Checked.hpp"
 #include "metal/MetalBackend.hpp"
@@ -227,10 +228,13 @@ public:
           std::pow(geometry.target.rotaryTheta,
                    -static_cast<float>(dim) / geometry.target.rotaryPairs);
     }
-    for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
-      draft[dim] = std::pow(geometry.draft.rotaryTheta,
-                            -static_cast<float>(dim) / geometry.draftRotaryPairs());
-    }
+    // YaRN-scaled where the draft declares it (ropeFactor over 1): the
+    // helper fills the unscaled theta^(-dim/pairs) progression otherwise,
+    // so a "default" rope's frequencies are bit-identical to before.
+    yarnInverseRotaryFrequencies(
+        geometry.draft.rotaryTheta, geometry.draftRotaryPairs(),
+        geometry.draft.ropeFactor, geometry.draft.ropeOriginalMax,
+        {draft, geometry.draftRotaryPairs()});
     // The dual-geometry target's alternate (Gemma global) frequencies.
     // Proportional rope derives its inverse frequencies over the full head
     // dimension, not the rotated-pair count: base^(-2i/headDim).

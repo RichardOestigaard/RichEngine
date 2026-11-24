@@ -423,7 +423,7 @@ ImagePlan AffineTargetLoader::imagePlan(size_t index, std::string_view directory
     return packedImage(directory_ / image.name,
                        std::string(directory) + "/" + image.name, image.magic,
                        image.layer, image.type);
-  ImagePlan result = affine::imagePlan(planned_, index, directory);
+  ImagePlan result = affine::imagePlan(planned_, index, directory, &images_.backend());
   const std::filesystem::path cached = directory_ / image.name;
   const std::vector<Image> *plan_images = &planned_->images;
   result.write = [write = std::move(result.write), cached, plan_images,

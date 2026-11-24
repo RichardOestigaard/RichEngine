@@ -290,7 +290,7 @@ void Sampling::addSelection(metal::CommandGraph &graph,
     graph.add(std::string(kDecodeSampleVocabularySearch),
               {buffers.logits, buffers.constraintMasks,
                buffers.dfaNextStates, buffers.partialMasses,
-               buffers.vocabularyRows},
+               buffers.vocabularyRows, buffers.inputTokens},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
     graph.add(std::string(kDecodeSampleVocabularyDraw),
               {buffers.logits, buffers.constraintMasks,

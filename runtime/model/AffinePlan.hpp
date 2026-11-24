@@ -98,13 +98,18 @@ struct PlannedCheckpoint final {
 };
 
 // Image `index` of planned, the component directory/name, written from the
-// checkpoint.
+// checkpoint. With a backend, the image's stored-planes Block sections
+// repack on the GPU (affine::blockStoredPlanes); without one — a test's —
+// everything writes on the CPU.
 [[nodiscard]] inline ImagePlan imagePlan(const std::shared_ptr<const PlannedCheckpoint> &planned, size_t index,
-                                         std::string_view directory) {
+                                         std::string_view directory, metal::MetalBackend *backend = nullptr) {
   const Image &image = planned->images.at(index);
   return {std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
-          [planned, index](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
-            writeAffineImage(bytes, planned->images[index]);
+          [planned, index, backend](std::span<uint8_t> bytes, const metal::MetalBuffer &buffer) {
+            if (backend)
+              writeAffineImage(*backend, buffer, planned->images[index]);
+            else
+              writeAffineImage(bytes, planned->images[index]);
             planned->source.checkUnchanged();
           }};
 }

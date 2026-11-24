@@ -19,6 +19,11 @@
 #include <utility>
 #include <vector>
 
+namespace richengine::metal {
+class MetalBackend;
+class MetalBuffer;
+} // namespace richengine::metal
+
 namespace richengine::model::affine {
 
 using QuantSpec = SafetensorsCheckpoint::QuantSpec;
@@ -100,6 +105,14 @@ void quantizeGroup(const uint8_t *weights, uint8_t *codes, uint16_t &scale, uint
 
 // Writes every byte of a bound image into destination, which is its size.
 void writeAffineImage(std::span<uint8_t> destination, const Image &image);
+// The Metal form, writing into buffer's contents: a Block section whose
+// parts are its stored planes (affine::blockStoredPlanes) stages the codes,
+// scales and biases as the checkpoint stores them and gguf_repack_stored
+// builds its plane0 and meta tiles on the GPU, overlapping the load
+// threads' reads with the GPU writes. Everything else writes as the span
+// form does.
+void writeAffineImage(metal::MetalBackend &backend, const metal::MetalBuffer &buffer,
+                      const Image &image);
 
 // The packed cache of a safetensors load: every image written verbatim to
 // directory/<name>.bin, and .packed listing the safetensors shards it came

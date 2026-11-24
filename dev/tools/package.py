@@ -270,15 +270,38 @@ def main(argv=None):
             cwd=stage,
             check=True,
         )
+        # The bytecode the smoke tests' imports wrote goes, and all of it is
+        # compiled anew: the installed runtime writes none (the launcher's
+        # wrappers export PYTHONDONTWRITEBYTECODE=1), so without it every
+        # process compiled what it imported. An installer's copy changes the
+        # sources' times, so the bytecode is checked by no time stamp or hash
+        # (unchecked-hash), which would otherwise read stale. A fixed hash
+        # seed and -B, which keeps the compiler's own imports from writing
+        # theirs first, make each build write the same bytes. Transformers'
+        # thousands of model modules stay source: the server's start imports
+        # a handful of them.
+        for cache in list(stage.rglob("__pycache__")):
+            shutil.rmtree(cache)
+        subprocess.run(
+            [
+                str(python),
+                "-B",
+                "-s",
+                "-P",
+                "-m",
+                "compileall",
+                "-q",
+                "--invalidation-mode=unchecked-hash",
+                "-x/transformers/models/",
+                f"-s{stage}",
+                str(stage),
+            ],
+            env={"PYTHONHASHSEED": "0"},
+            check=True,
+        )
         packed = Path(temporary) / archive.name
         with tarfile.open(packed, "w:gz") as release:
-            release.add(
-                stage,
-                arcname=name,
-                filter=lambda item: (
-                    None if "__pycache__" in Path(item.name).parts else item
-                ),
-            )
+            release.add(stage, arcname=name)
         packed.replace(archive)
     checksum = digest(archive)
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")

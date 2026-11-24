@@ -70,7 +70,8 @@ namespace {
 // splits' _rP/_m8 forms and the sparse splits. The Gemma, DuoAttention,
 // tree, windowed, q8q, fp8 and canvas paths keep the fp32 accumulator.
 [[nodiscard]] bool attentionAcc16() {
-  if (!envFlag("RICHENGINE_ATTENTION_ACC16")) return false;
+  static const bool enabled = envFlag("RICHENGINE_ATTENTION_ACC16");
+  if (!enabled) return false;
   static const bool apple10Plus = [] {
     try {
       return DevicePolicy::of(metal::probeDeviceCapabilities()).apple10Plus();
@@ -705,8 +706,8 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   // A chain verify at the block-8 draft's native eight rows runs its
   // upstream-shaped _m8 fused-M variants; every wider stride keeps the
   // compiled sixteen. Tree nodes always take the 16-node tile.
-  const bool narrow = !tree && rows == 8 &&
-                      !envFlag("RICHENGINE_VERIFY_M8_OFF");
+  static const bool verifyM8Off = envFlag("RICHENGINE_VERIFY_M8_OFF");
+  const bool narrow = !tree && rows == 8 && !verifyM8Off;
   const bool chainR2 = !tree && !narrow && !sparse &&
                        !tuning().verifySplitR2Off;
   // The q8q gate: INT8 pages, a dense full-attention or DuoAttention
@@ -1037,7 +1038,8 @@ void PagedAttention::addVerify(
                        plan.sparse
                            ? uint32_t(blocks.list + lane * plan.rowTiles)
                            : uint32_t{0}};
-    if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+    static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+    if (verifyDump2)
       fprintf(stderr,
               "addVerify lane=%u committed=%u pte=%u splits=%u slots=%u "
               "active=%u cap=%u kvpages=%u kvoff=%u\n",

@@ -259,8 +259,6 @@ private:
                {.input = b.normalized, .output = b.gdnPacked[layer],
                 .scratch = b.linearScratch, .prepared = normalized},
                mixer.inputProjection, inputPlan);
-    if (step.tree)
-      throw std::invalid_argument("mamba2 verify does not support trees");
     const ops::Mamba2DecodeBuffers mamba{
         b.gdnPacked[layer], mixer.convolutionWeights, mixer.convolutionBias,
         b.currentGdnStates,
@@ -269,7 +267,8 @@ private:
         b.linearScratch, b.gdnTape};
     // The tape lane record carries byte offsets only — the GDN record and
     // the mamba one are layout-identical, the layer stride aside, and the
-    // stride the runtime computes is already the mamba shape's.
+    // stride the runtime computes is already the mamba shape's. A tree
+    // batch runs no tape fold: tapeLanes is only ever set for a chain.
     ops::Mamba2TapeLanes mambaTape;
     const ops::Mamba2TapeLanes *tape = nullptr;
     if (step.tapeLanes) {
@@ -279,10 +278,16 @@ private:
       mambaTape.layerBytes = step.tapeLanes->layerBytes;
       tape = &mambaTape;
     }
-    const ops::PreparedInput hidden = ops::Mamba2::addDecode(
-        step.graph, mamba, model_.geometry_.mambaShape(), step.lanes, layer,
-        nemotronState(model_.geometry_), outputPlan.input(), step.liveRows,
-        step.rowCapacity, tape);
+    const ops::PreparedInput hidden =
+        step.tree
+            ? ops::Mamba2::addDecodeTree(
+                  step.graph, mamba, b.treeNodes, b.treeCounts,
+                  model_.geometry_.mambaShape(), step.lanes, layer,
+                  nemotronState(model_.geometry_), outputPlan.input())
+            : ops::Mamba2::addDecode(
+                  step.graph, mamba, model_.geometry_.mambaShape(),
+                  step.lanes, layer, nemotronState(model_.geometry_),
+                  outputPlan.input(), step.liveRows, step.rowCapacity, tape);
     linear.add(step.graph,
                {.input = b.gdnHidden, .output = output, .residual = input,
                 .scratch = b.linearScratch, .prepared = hidden},

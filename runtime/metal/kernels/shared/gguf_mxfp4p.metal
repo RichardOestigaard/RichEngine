@@ -29,7 +29,15 @@ kernel void gguf_pack_half(device bfloat *input [[buffer(0)]], device half *pack
                            uint i [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
   const uint groups = p.input_size / 32;
   const uint s = i & 31, g = i >> 5;
-  const uint row = g / groups, slot = g % groups;
+  uint row, slot;
+  if ((groups & (groups - 1)) == 0) {
+    const uint shift = 31u - clz(groups);
+    row = g >> shift;
+    slot = g & (groups - 1);
+  } else {
+    row = g / groups;
+    slot = g % groups;
+  }
   const float a = float(input[ulong(row) * p.input_size + slot * 32 +
                               16 * ((s >> 2) & 1) + 4 * (s >> 3) + (s & 3)]);
   const float m = simd_max(fabs(a));

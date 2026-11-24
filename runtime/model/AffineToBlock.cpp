@@ -1,13 +1,17 @@
 #include "model/AffineToBlock.hpp"
 
 #include "Checked.hpp"
+#include "metal/abi/GgufRepack.h"
 #include "model/AffinePlan.hpp"
 #include "model/GgufImageLayout.hpp"
+#include "model/GgufPreparation.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -126,6 +130,93 @@ void repackRows(const Section &section, uint32_t firstRow, uint32_t rows, uint8_
   }
 }
 
+// The task writing the descriptor and the section's internal alignment
+// gaps: the extent is the whole section, so zeroUnwritten covers none of
+// them. The CPU and the stored-planes GPU writes of a section share it.
+void addBlockDescriptorTask(const Section &section, uint8_t *at,
+                            std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
+  const uint32_t rows = section.rows, columns = section.columns;
+  const uint64_t plane0 = blockSectionPlane0(rows, columns), meta = blockSectionMeta(rows, columns);
+  const uint64_t codes = plane0Bytes(rows, columns);
+  tasks.push_back([at, rows, columns, plane0, meta, codes](std::vector<uint8_t> &) {
+    GgufTensorDescriptor descriptor{};
+    descriptor.type = kQuantFormats[GGUF_FMT_AF4].ggml_type;
+    descriptor.outputSize = rows;
+    descriptor.inputSize = columns;
+    const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4];
+    descriptor.p0 = format.plane0_bytes;
+    descriptor.p1 = format.plane1_bytes;
+    descriptor.metaBytes = format.meta_bytes;
+    descriptor.metaGroups = format.meta_groups;
+    descriptor.plane0Bytes = codes;
+    descriptor.metaTotalBytes = uint64_t(rows) * (columns / 64) * format.meta_bytes;
+    std::memcpy(at, &descriptor, sizeof descriptor);
+    std::memset(at + sizeof descriptor, 0, plane0 - sizeof descriptor);
+    std::memset(at + plane0 + codes, 0, meta - (plane0 + codes));
+  });
+}
+
+// The bytes of one row of the codes plane (4-bit codes, two a byte) and of
+// the scales and biases planes (a bf16 a 64-column group) of a section's
+// parts, staged as the checkpoint stores them.
+constexpr uint32_t codeRowBytes(uint32_t columns) { return columns / 2; }
+constexpr uint32_t metaRowBytes(uint32_t columns) { return (columns / kQ4GroupElements) * 2; }
+
+// The reads a chunk's planes stage as, as GgufPreparation splits its
+// chunks' rows into kChunkReadBytes: each part's run is a contiguous piece
+// of each of its three tensors, split so the load threads keep reads in
+// flight.
+constexpr uint64_t kBlockReadBytes = 1 << 20;
+struct PlaneRead {
+  const SourceTensor *tensor;
+  uint64_t at;
+  uint8_t *to;
+  uint64_t bytes;
+};
+
+// Rows [firstRow, firstRow + rows) of the parts staged as stored planes:
+// every part's run of the codes, scales and biases tensors, each a
+// contiguous read. Rows past the parts are zero, as gatherRows leaves them.
+void stagePlanes(const Section &section, uint32_t firstRow, uint32_t rows, uint8_t *staging) {
+  const uint64_t codes = codeRowBytes(section.columns), meta = metaRowBytes(section.columns);
+  uint8_t *const scales = staging + uint64_t(rows) * codes;
+  uint8_t *const biases = scales + uint64_t(rows) * meta;
+  std::vector<PlaneRead> reads;
+  uint32_t partStart = 0;
+  for (const auto &part : section.parts) {
+    const uint32_t begin = std::max(firstRow, partStart);
+    const uint32_t end = std::min(firstRow + rows, partStart + part.rows);
+    if (begin < end) {
+      const uint64_t out = begin - firstRow, run = end - begin, source = begin - partStart;
+      reads.push_back({part.fields[0].tensor, source * codes, staging + out * codes, run * codes});
+      reads.push_back({part.fields[1].tensor, source * meta, scales + out * meta, run * meta});
+      reads.push_back({part.fields[2].tensor, source * meta, biases + out * meta, run * meta});
+    }
+    partStart += part.rows;
+  }
+  std::vector<PlaneRead> pieces;
+  for (const PlaneRead &read : reads)
+    for (uint64_t at = 0; at < read.bytes; at += kBlockReadBytes)
+      pieces.push_back({read.tensor, read.at + at, read.to + at, std::min(kBlockReadBytes, read.bytes - at)});
+  parallelFor(pieces.size(), [&](size_t index, unsigned) {
+    const PlaneRead &piece = pieces[index];
+    piece.tensor->read(piece.at, {piece.to, piece.bytes});
+  });
+  if (firstRow + rows > partStart) {
+    const uint32_t gathered = std::max(firstRow, partStart) - firstRow;
+    std::memset(staging + gathered * codes, 0, uint64_t(rows - gathered) * codes);
+    std::memset(scales + gathered * meta, 0, uint64_t(rows - gathered) * meta);
+    std::memset(biases + gathered * meta, 0, uint64_t(rows - gathered) * meta);
+  }
+}
+
+template <class Params>
+std::vector<uint8_t> paramBytes(const Params &params) {
+  std::vector<uint8_t> bytes(sizeof(params));
+  std::memcpy(bytes.data(), &params, sizeof(params));
+  return bytes;
+}
+
 } // namespace
 
 uint64_t blockSectionPlane0(uint32_t, uint32_t) { return kWeightFileAlignment; }
@@ -170,25 +261,7 @@ void addBlockTasks(const Section &section, uint8_t *at,
                    std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
   const uint32_t rows = section.rows, columns = section.columns;
   const uint64_t plane0 = blockSectionPlane0(rows, columns), meta = blockSectionMeta(rows, columns);
-  const uint64_t codes = plane0Bytes(rows, columns);
-  // The descriptor, and the section's internal alignment gaps: the extent is
-  // the whole section, so zeroUnwritten covers none of them.
-  tasks.push_back([at, rows, columns, plane0, meta, codes](std::vector<uint8_t> &) {
-    GgufTensorDescriptor descriptor{};
-    descriptor.type = kQuantFormats[GGUF_FMT_AF4].ggml_type;
-    descriptor.outputSize = rows;
-    descriptor.inputSize = columns;
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4];
-    descriptor.p0 = format.plane0_bytes;
-    descriptor.p1 = format.plane1_bytes;
-    descriptor.metaBytes = format.meta_bytes;
-    descriptor.metaGroups = format.meta_groups;
-    descriptor.plane0Bytes = codes;
-    descriptor.metaTotalBytes = uint64_t(rows) * (columns / 64) * format.meta_bytes;
-    std::memcpy(at, &descriptor, sizeof descriptor);
-    std::memset(at + sizeof descriptor, 0, plane0 - sizeof descriptor);
-    std::memset(at + plane0 + codes, 0, meta - (plane0 + codes));
-  });
+  addBlockDescriptorTask(section, at, tasks);
   // Steps of whole rows within the staging bound, as the affine writer's.
   // A converted Quantize section's parts hold one BF16 weight field and
   // quantize on write; a Projection's hold the stored codes, scale and bias.
@@ -208,6 +281,82 @@ void addBlockTasks(const Section &section, uint8_t *at,
       }
     });
   }
+}
+
+bool blockStoredPlanes(const Section &section) {
+  if (section.bits != 4 || section.experts != 1 || section.columns % kGgufBlockColumns) return false;
+  // The kernel's offsets into the dst view are 32-bit.
+  if (blockSectionBytes(section.rows, section.columns) - blockSectionPlane0(section.rows, section.columns) >
+      std::numeric_limits<uint32_t>::max())
+    return false;
+  for (const ProjectionPart &part : section.parts)
+    if (part.fields.size() != 3 || part.unquantized || part.dequantize || part.nativeRows ||
+        part.expertStride || part.expertOffset || !part.fields[0].tensor || !part.fields[1].tensor ||
+        !part.fields[2].tensor)
+      return false;
+  return true;
+}
+
+void addBlockGpuTasks(const Section &section, uint8_t *at,
+                      std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks,
+                      std::vector<BlockGpuChunk> &chunks) {
+  addBlockDescriptorTask(section, at, tasks);
+  const uint32_t rows = section.rows, columns = section.columns;
+  const uint64_t plane0 = blockSectionPlane0(rows, columns), meta = blockSectionMeta(rows, columns);
+  const uint64_t codes = codeRowBytes(columns), metaRow = metaRowBytes(columns);
+  const uint64_t rowBytes = codes + 2 * metaRow;
+  // Chunks of whole rows within the repack staging bound (the GGUF path's):
+  // a chunk's staged planes are its codes, then its scales, then its biases.
+  const uint32_t stepRows = std::max<uint32_t>(1, static_cast<uint32_t>(kGgufRepackStagingBytes / rowBytes));
+  for (uint32_t firstRow = 0; firstRow < rows; firstRow += stepRows) {
+    const uint32_t count = std::min(stepRows, rows - firstRow);
+    const uint64_t scales = uint64_t(count) * codes, biases = scales + uint64_t(count) * metaRow;
+    GgufRepackStoredParams params{};
+    params.rows = count;
+    params.input_size = columns;
+    params.first_row = firstRow;
+    params.fmt = GGUF_FMT_AF4;
+    params.codes_row_bytes = static_cast<uint32_t>(codes);
+    params.meta_row_bytes = static_cast<uint32_t>(metaRow);
+    params.src_scales = static_cast<uint32_t>(scales);
+    params.src_biases = static_cast<uint32_t>(biases);
+    params.dst_meta = static_cast<uint32_t>(meta - plane0);
+    chunks.push_back({[&section, firstRow, count](uint8_t *host) {
+                        stagePlanes(section, firstRow, count, host);
+                      },
+                      section.offset + plane0,
+                      meta + metaBytes(rows, columns) - plane0,
+                      paramBytes(params),
+                      uint64_t(count) * (columns / 32),
+                      uint64_t(count) * rowBytes});
+  }
+}
+
+void writeBlockGpuChunks(metal::MetalBackend &backend, const metal::MetalBuffer &image,
+                         const std::vector<BlockGpuChunk> &chunks) {
+  if (chunks.empty()) return;
+  uint64_t staging = 0;
+  for (const BlockGpuChunk &chunk : chunks) staging = std::max(staging, chunk.stagingBytes);
+  // Two staging buffers serve every chunk, one while a single chunk has
+  // nothing to overlap — writeGgufImage's scheme (model/GgufPreparation.cpp).
+  std::array<metal::MetalBuffer, 2> inputs;
+  for (size_t i = 0; i < std::min<size_t>(2, chunks.size()); ++i)
+    inputs[i] = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/affine-planes");
+  pipelineChunks(
+      chunks.size(),
+      [&](size_t index, unsigned buffer) {
+        chunks[index].stage(static_cast<uint8_t *>(inputs[buffer].contents()));
+      },
+      [&](size_t index, unsigned buffer) {
+        const BlockGpuChunk &chunk = chunks[index];
+        const metal::ComputeDispatch dispatch{
+            "gguf_repack_stored",
+            {{0, inputs[buffer]}, {1, backend.view(image, chunk.viewOffset, chunk.viewBytes)}},
+            {{2, chunk.params.data(), chunk.params.size()}},
+            {(chunk.items + 255) / 256, 1, 1},
+            {256, 1, 1}};
+        return backend.submitCommandAsync(std::span<const metal::ComputeDispatch>(&dispatch, 1));
+      });
 }
 
 } // namespace richengine::model::affine

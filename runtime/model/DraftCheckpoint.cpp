@@ -146,6 +146,12 @@ Image dflashV1ModelImage(const DFlashDraftLayout &layout, bool floats = false) {
     quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
   copy(result, "hidden_norm.weight", {layout.hiddenSize});
   copy(result, "norm.weight", {layout.hiddenSize});
+  // A draft carrying its own embed_tokens (Nemotron's trained mask row):
+  // unquantized, the oQ writer widens the bf16 rows to the F32 native table
+  // readOqEmbedding binds for gguf_embed_f32.
+  if (layout.tokenEmbedding)
+    embeddingSection(result, "embed_tokens", layout.vocabularySize,
+                     layout.hiddenSize, keepFloat());
   return result;
 }
 
@@ -263,10 +269,10 @@ DFlash2CheckpointLoader::DFlash2CheckpointLoader(WeightImages &images, const std
 DFlash2CheckpointLoader::~DFlash2CheckpointLoader() = default;
 WeightFile DFlash2CheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return images_.load(affine::imagePlan(planned_, index, "draft"));
+  return images_.load(affine::imagePlan(planned_, index, "draft", &images_.backend()));
 }
 WeightFile DFlash2CheckpointLoader::model() {
-  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft", &images_.backend()));
 }
 
 std::vector<Image> dflashV1DraftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -287,10 +293,10 @@ DFlashV1DraftCheckpointLoader::DFlashV1DraftCheckpointLoader(WeightImages &image
 DFlashV1DraftCheckpointLoader::~DFlashV1DraftCheckpointLoader() = default;
 WeightFile DFlashV1DraftCheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return images_.load(affine::imagePlan(planned_, index, "draft"));
+  return images_.load(affine::imagePlan(planned_, index, "draft", &images_.backend()));
 }
 WeightFile DFlashV1DraftCheckpointLoader::model() {
-  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft", &images_.backend()));
 }
 
 std::vector<Image> dsparkDraftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -321,10 +327,10 @@ DSparkCheckpointLoader::DSparkCheckpointLoader(WeightImages &images, const std::
 DSparkCheckpointLoader::~DSparkCheckpointLoader() = default;
 WeightFile DSparkCheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return images_.load(affine::imagePlan(planned_, index, "draft"));
+  return images_.load(affine::imagePlan(planned_, index, "draft", &images_.backend()));
 }
 WeightFile DSparkCheckpointLoader::model() {
-  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft", &images_.backend()));
 }
 
 std::vector<Image> dsplineDraftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -347,10 +353,10 @@ DSplineCheckpointLoader::DSplineCheckpointLoader(WeightImages &images, const std
 DSplineCheckpointLoader::~DSplineCheckpointLoader() = default;
 WeightFile DSplineCheckpointLoader::layer(uint32_t index) {
   if (index >= planned_->images.size() - 1) throw WeightStoreError("draft layer is out of range");
-  return images_.load(affine::imagePlan(planned_, index, "draft"));
+  return images_.load(affine::imagePlan(planned_, index, "draft", &images_.backend()));
 }
 WeightFile DSplineCheckpointLoader::model() {
-  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft"));
+  return images_.load(affine::imagePlan(planned_, planned_->images.size() - 1, "draft", &images_.backend()));
 }
 
 std::vector<Image> nemotronMtpDraftCheckpointImages(const DFlashDraftLayout &layout) {
@@ -367,7 +373,7 @@ NemotronMtpCheckpointLoader::NemotronMtpCheckpointLoader(WeightImages &images, c
 }
 NemotronMtpCheckpointLoader::~NemotronMtpCheckpointLoader() = default;
 WeightFile NemotronMtpCheckpointLoader::mtp() {
-  return images_.load(affine::imagePlan(planned_, 0, "draft"));
+  return images_.load(affine::imagePlan(planned_, 0, "draft", &images_.backend()));
 }
 
 } // namespace richengine::model

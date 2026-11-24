@@ -303,9 +303,10 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
   uint64_t groups = 0;
+  // A row tile's spans of groups each (moe_expert_load).
   for (const MoeExpertLoadProjection &projection : params.projections)
-    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
-                                  MOE_EXPERT_LOAD_THREADS);
+    groups = std::max(groups, (uint64_t{projection.rows} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS *
+                                ((projection.columns / 32 + MOE_EXPERT_LOAD_SPAN - 1) / MOE_EXPERT_LOAD_SPAN));
   return static_cast<uint32_t>(groups);
 }
 
@@ -314,6 +315,8 @@ void MoE::addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &st
                         const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
                         const metal::IndirectGrid &grid) {
   if (chunks.empty()) throw std::invalid_argument("MoE expert chunks have no slots");
+  if (params.source_planes != 1 && params.source_planes != 3)
+    throw std::invalid_argument("a MoE expert load's jobs name 1 or 3 staged planes a projection");
   MoeExpertLoadParams load = params;
   load.floor_slots = chunks.floorSlots();
   load.chunk_slots = chunks.chunkSlots();

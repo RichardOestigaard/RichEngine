@@ -421,9 +421,23 @@ void TargetModel::addStateCommitTree(metal::CommandGraph &graph,
                                     uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || !retainedPath)
     throw std::invalid_argument("invalid tree state commit batch");
-  if (geometry_.mambaLayers)
-    throw std::invalid_argument(
-        "mamba2 commit does not support tree verify");
+  if (geometry_.mambaLayers) {
+    // nemotron's Mamba-2 cells: the retained path's packed in_proj rows
+    // replay the conv FIFO and the recurrent scan like the GDN tree
+    // commit's; the decay buffer holds the layers' dt' rows.
+    ops::Mamba2::addCommitTree(
+        graph,
+        {std::move(buffers.packed), std::move(buffers.mixed),
+         std::move(buffers.decay), weights_->mambaDecays,
+         buffers.currentStates, buffers.nextStates,
+         std::move(buffers.retainedCounts)},
+        std::move(retainedPath), geometry_.mambaShape(),
+        geometry_.stateLayout.layers, lanes,
+        {geometry_.stateLayout.convolutionLayerBytes(),
+         geometry_.stateLayout.recurrentLayerBytes(),
+         geometry_.stateLayout.convolutionBytes()});
+    return;
+  }
   if (!geometry_.gdnLayers) {
     // LFM2's conv FIFOs: one dispatch rolls every conv layer's lanes forward
     // by the retained path's bx rows — the tree counterpart of the chain

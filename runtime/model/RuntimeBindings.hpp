@@ -355,7 +355,8 @@ inline   MetalBuffer Runtime::Impl::synchronizedPageTable(Request &entry,
     // one, and everything after two changes or for another request.
     const auto size = static_cast<uint32_t>(item.pageTable.size());
     uint32_t first = 0;
-    if (envFlag("RICHENGINE_FORCE_PT_REWRITE")) {
+    static const bool forcePtRewrite = envFlag("RICHENGINE_FORCE_PT_REWRITE");
+    if (forcePtRewrite) {
       first = 0;
     } else if (binding.requestId == entry.id) {
       if (binding.revision == item.pageTableRevision)
@@ -372,7 +373,8 @@ inline   MetalBuffer Runtime::Impl::synchronizedPageTable(Request &entry,
             item.pageTable, first,
             decodeArena->get(entry.stateLane, DecodeTensor::IndexTable));
     }
-    if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+    static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+    if (verifyDump2) {
       const auto *te = contents<uint64_t>(destination, "page table");
       fprintf(stderr,
               "dump2 sync sl=%u id=%llu bind=[%llu r%llu] rev=%llu fc=%u "
@@ -443,7 +445,8 @@ inline   void Runtime::Impl::bindPageTables(
       pageTables[lane] =
           decodeArena->get(laneEntry(entries, lane).stateLane,
                            DecodeTensor::PageTable);
-      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+      static const bool verifyDump2 = envFlag("RICHENGINE_VERIFY_DUMP2");
+      if (verifyDump2) {
         const uint32_t sl = laneEntry(entries, lane).stateLane;
         const auto direct = decodeArena->get(sl, DecodeTensor::PageTable);
         const auto *e = contents<uint64_t>(pageTables[lane], "pt");

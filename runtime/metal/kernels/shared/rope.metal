@@ -30,7 +30,10 @@ kernel void rope_build_tables(
     const uint dim = element % params.draft_dims;
     const float angle =
         float(draft_positions[row]) * draft_inverse_frequencies[dim];
-    draft_cosine[element] = cos(angle);
-    draft_sine[element] = sin(angle);
+    // YaRN's attention factor folds into the draft's tables (1 without
+    // YaRN): the rotated queries and keys pick it up as mscale squared on
+    // the attention logits, HF's _compute_yarn_parameters convention.
+    draft_cosine[element] = params.draft_scale * cos(angle);
+    draft_sine[element] = params.draft_scale * sin(angle);
   }
 }

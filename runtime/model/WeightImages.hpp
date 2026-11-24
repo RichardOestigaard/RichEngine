@@ -57,6 +57,9 @@ public:
   // (ModelDescriptor::sourceIdentity); the records of files a loader reads
   // without an image (a streamed table) report the same.
   [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
+  // The backend the images' buffers come from, for a loader whose writers
+  // run GPU commands (affine::imagePlan's stored-planes repack).
+  [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;
 

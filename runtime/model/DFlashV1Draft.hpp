@@ -47,6 +47,10 @@ struct DFlashV1DraftWeights final {
   ops::Projection contextProjection;
   ops::NormWeights hiddenNorm;
   ops::NormWeights finalNorm;
+  // The draft's own embed_tokens (has_embed_tokens — Nemotron's DFlash
+  // draft trains a mask embedding the target's table lacks): F32 native
+  // rows the block's input gather reads.
+  ops::EmbeddingWeights tokenEmbedding;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
 };
@@ -104,6 +108,8 @@ public:
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions) const;
+
+  const DFlashV1DraftWeights &weights() const { return weights_; }
 
 private:
   const DFlashV1DraftWeights &weights_;

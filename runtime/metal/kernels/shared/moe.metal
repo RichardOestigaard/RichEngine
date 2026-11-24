@@ -700,6 +700,7 @@ kernel void moe_route_cap(
   constexpr uint Experts = 256;
   const uint routes = params.rows * params.routes_per_row;
   threadgroup atomic_float mass[Experts];
+  threadgroup float massPlain[Experts];
   threadgroup bool keep[Experts];
   if (thread_index < Experts)
     atomic_store_explicit(&mass[thread_index], 0.0f, memory_order_relaxed);
@@ -711,13 +712,15 @@ kernel void moe_route_cap(
                                 memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
-  if (thread_index < Experts) {
-    const float mine =
+  if (thread_index < Experts)
+    massPlain[thread_index] =
         atomic_load_explicit(&mass[thread_index], memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  if (thread_index < Experts) {
+    const float mine = massPlain[thread_index];
     uint rank = 0;
     for (uint e = 0; e < Experts; ++e) {
-      const float theirs =
-          atomic_load_explicit(&mass[e], memory_order_relaxed);
+      const float theirs = massPlain[e];
       rank += theirs > mine || (theirs == mine && e < thread_index);
     }
     keep[thread_index] = rank < params.budget;

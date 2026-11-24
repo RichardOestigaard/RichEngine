@@ -89,9 +89,13 @@ inline float mtp_group_sum(float v, uint lane, uint sg,
   const float s = simd_sum(v);
   if (!lane) partials[sg] = s;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  float total = 0.0f;
-  for (uint i = 0; i < 32; ++i) total += partials[i];
-  return total;
+  if (!sg && !lane) {
+    float total = 0.0f;
+    for (uint i = 0; i < 32; ++i) total += partials[i];
+    partials[0] = total;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return partials[0];
 }
 
 // The eh rows of `rows` MTP inputs whose stream state is bf16: columns

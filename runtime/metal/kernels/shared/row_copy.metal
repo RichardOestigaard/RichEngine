@@ -7,7 +7,16 @@ kernel void copy_rows_bf16(device const bfloat *source [[buffer(0)]],
                            uint index [[thread_position_in_grid]]) {
   if (index >= p.rows * p.width)
     return;
-  const uint row = index / p.width, column = index % p.width;
+  const uint width = p.width;
+  uint row, column;
+  if ((width & (width - 1)) == 0) {
+    const uint shift = 31u - clz(width);
+    row = index >> shift;
+    column = index & (width - 1);
+  } else {
+    row = index / width;
+    column = index % width;
+  }
   destination[ulong(p.destination_row + row) * p.destination_stride +
               p.destination_column + column] =
       source[ulong(p.source_row + row) * p.source_stride + p.source_column +

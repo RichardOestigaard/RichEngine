@@ -303,8 +303,14 @@ inline void draft_attention_split_phase(
       bool empty = next_max == -INFINITY;
       float scale = empty ? 1.0f : fast::exp(row_max[matrix_row] - next_max);
       float tile_sum = 0.0f;
+      // A masked column's exp(-inf - next_max) is +0 for any non-NaN max;
+      // the NaN guard keeps a NaN max propagating exactly as before.
+      const bool finite_max = next_max == next_max;
       for (ushort i = 0; i < N / 32; ++i) {
-        local_scores[i] = empty ? 0.0f : fast::exp(local_scores[i] - next_max);
+        local_scores[i] =
+            empty || (finite_max && local_scores[i] == -INFINITY)
+                ? 0.0f
+                : fast::exp(local_scores[i] - next_max);
         tile_sum += local_scores[i];
       }
       tile_sum = simd_sum(tile_sum);

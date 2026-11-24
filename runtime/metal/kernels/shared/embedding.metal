@@ -284,7 +284,16 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
                                                          device bfloat *output, constant GgufEmbedParams &p,
                                                          uint index) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
-  const uint row = index / p.hidden, dim = index % p.hidden;
+  const uint hidden = p.hidden;
+  uint row, dim;
+  if ((hidden & (hidden - 1)) == 0) {
+    const uint shift = 31u - clz(hidden);
+    row = index >> shift;
+    dim = index & (hidden - 1);
+  } else {
+    row = index / hidden;
+    dim = index % hidden;
+  }
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
   device const uchar *block = table + (ulong(token) * (p.hidden / F::Weights) + dim / F::Weights) * F::Bytes;
   output[index] = F::value(block, dim);

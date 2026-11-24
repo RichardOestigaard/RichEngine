@@ -68,7 +68,11 @@ void validate(LinearWorkload w) {
       w.weightLayout == WeightLayout::Block32 ? GGUF_TILE_COLUMNS : 256;
   if (!w.matrix.outputSize || w.matrix.outputSize % columns ||
       !w.matrix.inputSize || w.matrix.inputSize % kQuantGroup)
-    throw std::invalid_argument("invalid linear matrix");
+    throw std::invalid_argument(
+        "invalid linear matrix " + std::to_string(w.matrix.outputSize) + "x" +
+        std::to_string(w.matrix.inputSize) + " rows=" + std::to_string(w.rows) +
+        " layout=" + std::to_string(int(w.weightLayout)) +
+        " phase=" + std::to_string(int(w.phase)));
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > RICHENGINE_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)

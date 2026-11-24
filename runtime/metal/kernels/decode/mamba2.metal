@@ -106,6 +106,9 @@ inline void mamba2_decode_prologue(
   constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   static_assert(!(RICHENGINE_TARGET_VERIFY_ROWS % kMamba2DecodeSimdgroups),
                 "rows stride over the simdgroups");
+  float a_w = 0.0f;
+  if (lane < HeadsPerGroup)
+    a_w = a_weights[group * HeadsPerGroup + lane];
   for (uint token = simd_group; token < Tokens;
        token += kMamba2DecodeSimdgroups) {
     for (uint e = lane; e < GroupChannels; e += 32) {
@@ -130,7 +133,7 @@ inline void mamba2_decode_prologue(
           float(dt_bias[head]), dt_min, dt_max);
       shared.step[token * HeadsPerGroup + lane] = dtv;
       shared.decay[token * HeadsPerGroup + lane] =
-          fast::exp(dtv * a_weights[head]);
+          fast::exp(dtv * a_w);
       step_sizes[token * Heads + head] = dtv;
       if (token == 0)
         shared.skip[lane] = skip_weights[head];
@@ -223,13 +226,15 @@ inline void mamba2_decode_scan(
     uint rows[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r)
       rows[r] = (batch + r) * kMamba2DecodeSimdgroups + simd_group;
+    float a_w[RowsInFlight];
+    for (uint r = 0; r < RowsInFlight; ++r)
+      a_w[r] = a_weights[group * HeadsPerGroup + rows[r] / HeadDim];
     for (uint token = 0; token < pending; ++token) {
       for (uint r = 0; r < RowsInFlight; ++r) {
         const uint head = rows[r] / HeadDim;
         const float dtv =
             tape_dt[token * Heads + group * HeadsPerGroup + head];
-        const float dA =
-            fast::exp(dtv * a_weights[group * HeadsPerGroup + head]);
+        const float dA = fast::exp(dtv * a_w[r]);
         const float scale = dtv * float(tape_x[token * ConvDim + rows[r]]);
         for (uint i = 0; i < 4; ++i)
           state[r][i] =
@@ -495,6 +500,360 @@ MAMBA2_DECODE_PACKED_ENTRY(verify_mamba2_fused_packed, 64, 64, 8, 128, 6144,
 #undef MAMBA2_DECODE_BUFFERS
 
 // ---------------------------------------------------------------------------
+// Tree verify: one lane's RICHENGINE_TREE_VERIFY_NODES rows, the chain at
+// rows 0..7 and each position's sibling leaf at row 8 + position. Mirrors
+// the GDN tree kernels: the prologue takes a row's conv taps along its path
+// (tree_nodes' ancestors), the scan runs the chain and extends a register
+// copy per leaf so the committed chain state is untouched, and there is no
+// conv_state_out — the commit always recomputes the carry over the retained
+// path. The tape fold is chain-only.
+// ---------------------------------------------------------------------------
+
+// The tree prologue: simdgroup g prepares rows g, g + 8. Rows past the
+// lane's live count are zeroed so a leaf's discarded advance reads no
+// stale operands.
+template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
+          uint PackedWidth>
+inline void mamba2_decode_tree_prologue(
+    device const bfloat *conv_rows, device const bfloat *packed,
+    device const bfloat *conv_weights, device const bfloat *conv_bias,
+    device const bfloat *conv_state_in, device bfloat *mixed,
+    device const float *a_weights, device const bfloat *dt_bias,
+    device float *step_sizes, device const float *skip_weights,
+    threadgroup Mamba2DecodeShared<Heads / Groups, HeadDim, StateSize,
+                                   RICHENGINE_TREE_VERIFY_NODES> &shared,
+    device const uint *nodes, uint count, float dt_min, float dt_max,
+    uint group, uint lane, uint simd_group) {
+  constexpr uint HeadsPerGroup = Heads / Groups;
+  constexpr uint InnerSize = Heads * HeadDim;
+  constexpr uint GroupWidth = HeadsPerGroup * HeadDim;
+  constexpr uint GroupChannels = GroupWidth + 2 * StateSize;
+  constexpr uint Rows = RICHENGINE_TREE_VERIFY_NODES;
+  float a_w = 0.0f;
+  if (lane < HeadsPerGroup)
+    a_w = a_weights[group * HeadsPerGroup + lane];
+  for (uint token = simd_group; token < Rows;
+       token += kMamba2DecodeSimdgroups) {
+    if (token >= count) {
+      for (uint e = lane; e < GroupChannels; e += 32) {
+        if (e < GroupWidth)
+          shared.x[token * GroupWidth + e] = bfloat(0.0f);
+        else
+          shared.bc[token * 2 * StateSize + e - GroupWidth] = bfloat(0.0f);
+      }
+      if (lane < HeadsPerGroup) {
+        shared.step[token * HeadsPerGroup + lane] = 0.0f;
+        shared.decay[token * HeadsPerGroup + lane] = 0.0f;
+      }
+      continue;
+    }
+    for (uint e = lane; e < GroupChannels; e += 32) {
+      const uint channel =
+          mamba2_group_channel<InnerSize, Groups, StateSize>(group, e,
+                                                             GroupWidth);
+      const bfloat value =
+          gdn_conv_silu_tree(conv_rows, conv_state_in, conv_weights,
+                             PackedWidth, ConvDim, token, channel, nodes,
+                             conv_bias);
+      if (e < GroupWidth)
+        shared.x[token * GroupWidth + e] = value;
+      else
+        shared.bc[token * 2 * StateSize + e - GroupWidth] = value;
+      mixed[token * ConvDim + channel] = value;
+    }
+    // dt' per head of the group: lanes 0..HeadsPerGroup-1 own one each.
+    if (lane < HeadsPerGroup) {
+      const uint head = group * HeadsPerGroup + lane;
+      const float dtv = mamba2_step_size(
+          float(packed[token * PackedWidth + InnerSize + ConvDim + head]),
+          float(dt_bias[head]), dt_min, dt_max);
+      shared.step[token * HeadsPerGroup + lane] = dtv;
+      shared.decay[token * HeadsPerGroup + lane] =
+          fast::exp(dtv * a_w);
+      step_sizes[token * Heads + head] = dtv;
+      if (token == 0)
+        shared.skip[lane] = skip_weights[head];
+    }
+  }
+}
+
+// The tree scan: the chain rows advance the lane's state as usual; after
+// each of the first eight, the position's leaf extends a register copy so
+// its emission is produced without disturbing the chain's state. state_out
+// still takes the chain's end state; the commit replays the retained path.
+template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
+          uint RowsInFlight>
+inline void mamba2_decode_tree_scan(
+    device const float *state_in, device float *state_out,
+    device bfloat *hidden,
+    threadgroup Mamba2DecodeShared<Heads / Groups, HeadDim, StateSize,
+                                   RICHENGINE_TREE_VERIFY_NODES> &shared,
+    uint count, uint group, uint lane, uint simd_group) {
+  constexpr uint HeadsPerGroup = Heads / Groups;
+  constexpr uint InnerSize = Heads * HeadDim;
+  constexpr uint GroupWidth = HeadsPerGroup * HeadDim;
+  constexpr uint ChainRows = RICHENGINE_TREE_VERIFY_NODES / 2;
+  constexpr uint Batches = GroupWidth / kMamba2DecodeSimdgroups;
+  static_assert(Batches % RowsInFlight == 0, "rows in flight tile the group");
+  const auto base = [&](uint batch, uint r) {
+    const uint row = (batch + r) * kMamba2DecodeSimdgroups + simd_group;
+    return (ulong(group) * GroupWidth + row) * StateSize + lane * 4;
+  };
+  float state[RowsInFlight][4];
+  for (uint r = 0; r < RowsInFlight; ++r)
+    for (uint i = 0; i < 4; ++i)
+      state[r][i] = state_in[base(0, r) + i];
+  for (uint batch = 0; batch < Batches; batch += RowsInFlight) {
+    uint rows[RowsInFlight];
+    for (uint r = 0; r < RowsInFlight; ++r)
+      rows[r] = (batch + r) * kMamba2DecodeSimdgroups + simd_group;
+    // S = dA*S + (dt'*x_d) B_n' then y_d = sum_n C_n S_dn + D_h x_d — the
+    // chain advance on `state`, the leaf's on the `branch` copy.
+    const auto advance = [&](float (&s)[RowsInFlight][4], uint token) {
+      float result[RowsInFlight];
+      for (uint r = 0; r < RowsInFlight; ++r) {
+        const uint head = rows[r] / HeadDim;
+        const float dA = shared.decay[token * HeadsPerGroup + head];
+        const float x = float(shared.x[token * GroupWidth + rows[r]]);
+        const float scale = shared.step[token * HeadsPerGroup + head] * x;
+        float partial = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+          s[r][i] =
+              fma(scale,
+                  float(shared.bc[token * 2 * StateSize + lane * 4 + i]),
+                  s[r][i] * dA);
+          partial +=
+              s[r][i] *
+              float(
+                  shared.bc[token * 2 * StateSize + StateSize + lane * 4 + i]);
+        }
+        result[r] = simd_sum(partial) + shared.skip[head] * x;
+      }
+      if (lane == 0) {
+        for (uint r = 0; r < RowsInFlight; ++r)
+          hidden[token * InnerSize + group * GroupWidth + rows[r]] =
+              bfloat(result[r]);
+      }
+    };
+    for (uint token = 0; token < ChainRows; ++token) {
+      advance(state, token);
+      const uint leaf = ChainRows + token;
+      if (leaf < count) {
+        float branch[RowsInFlight][4];
+        for (uint r = 0; r < RowsInFlight; ++r)
+          for (uint i = 0; i < 4; ++i)
+            branch[r][i] = state[r][i];
+        advance(branch, leaf);
+      }
+    }
+    float upcoming[RowsInFlight][4] = {};
+    if (batch + RowsInFlight < Batches) {
+      for (uint r = 0; r < RowsInFlight; ++r)
+        for (uint i = 0; i < 4; ++i)
+          upcoming[r][i] = state_in[base(batch + RowsInFlight, r) + i];
+    }
+    for (uint r = 0; r < RowsInFlight; ++r)
+      for (uint i = 0; i < 4; ++i) {
+        state_out[base(batch, r) + i] = state[r][i];
+        state[r][i] = upcoming[r][i];
+      }
+  }
+}
+
+// Grid {groups, lanes}; the lane's rows of a layer's packed, mixed, dt' and
+// hidden tensors are RICHENGINE_TREE_VERIFY_NODES apart.
+template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
+          uint PackedWidth, uint RowsInFlight, class Table, class W,
+          class TP, class SP>
+inline void mamba2_decode_tree_batch_phase(
+    device const bfloat *packed, device const bfloat *conv_weights,
+    device const bfloat *conv_bias,
+    device const uchar *current0, device const uchar *current1,
+    device const uchar *current2, device const uchar *current3,
+    device uchar *next0, device uchar *next1, device uchar *next2,
+    device uchar *next3, device bfloat *mixed, device const float *a_weights,
+    device const bfloat *dt_bias, device float *step_sizes,
+    device const float *skip_weights, device const W *norm_weight,
+    device bfloat *hidden, device const uint *tree_nodes,
+    device const uint *tree_counts,
+    constant Mamba2DecodeBatchParams &params, uint2 group, uint lane,
+    uint simd_group,
+    threadgroup Mamba2DecodeShared<Heads / Groups, HeadDim, StateSize,
+                                   RICHENGINE_TREE_VERIFY_NODES> &shared,
+    TP *table, SP *sums) {
+  constexpr uint HeadsPerGroup = Heads / Groups;
+  constexpr uint InnerSize = Heads * HeadDim;
+  constexpr uint GroupWidth = HeadsPerGroup * HeadDim;
+  constexpr uint Rows = RICHENGINE_TREE_VERIFY_NODES;
+  const uint batch = group.y;
+  device const uchar *current = batch == 0
+      ? current0
+      : (batch == 1 ? current1 : (batch == 2 ? current2 : current3));
+  device uchar *next = batch == 0
+      ? next0
+      : (batch == 1 ? next1 : (batch == 2 ? next2 : next3));
+  packed += ulong(batch) * Rows * PackedWidth;
+  mixed += ulong(batch) * Rows * ConvDim;
+  step_sizes += ulong(batch) * Rows * Heads;
+  device const bfloat *conv_state_in =
+      reinterpret_cast<device const bfloat *>(
+          current + ulong(params.layer) * params.conv_layer_bytes);
+  device const float *state_in = reinterpret_cast<device const float *>(
+      current + params.convolution_state_bytes +
+      ulong(params.layer) * params.recurrent_layer_bytes);
+  device float *state_out = reinterpret_cast<device float *>(
+      next + params.convolution_state_bytes +
+      ulong(params.layer) * params.recurrent_layer_bytes);
+  device const uint *nodes = tree_nodes + batch * Rows;
+  const uint count = tree_counts[batch];
+  device bfloat *lane_hidden = hidden + ulong(batch) * Rows * InnerSize;
+  // The conv columns sit InnerSize into the packed row.
+  device const bfloat *conv_rows = packed + InnerSize;
+
+  mamba2_decode_tree_prologue<Heads, HeadDim, Groups, StateSize, ConvDim,
+                              PackedWidth>(
+      conv_rows, packed, conv_weights, conv_bias, conv_state_in, mixed,
+      a_weights, dt_bias, step_sizes, skip_weights, shared, nodes, count,
+      params.dt_min, params.dt_max, group.x, lane, simd_group);
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  mamba2_decode_tree_scan<Heads, HeadDim, Groups, StateSize, ConvDim,
+                          RowsInFlight>(state_in, state_out, lane_hidden,
+                                        shared, count, group.x, lane,
+                                        simd_group);
+  // The gate reads the scan's hidden writes across simdgroups.
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device,
+                      memory_order_acq_rel);
+  const uint thread_index = simd_group * 32 + lane;
+  for (uint token = 0; token < Rows; ++token) {
+    const uint dim = 2 * thread_index;
+    const uint column = group.x * GroupWidth + dim;
+    const float y0 = float(lane_hidden[token * InnerSize + column]);
+    const float y1 = float(lane_hidden[token * InnerSize + column + 1]);
+    const float z0 = float(packed[token * PackedWidth + column]);
+    const float z1 = float(packed[token * PackedWidth + column + 1]);
+    const float v0 = y0 * richengine_silu(z0);
+    const float v1 = y1 * richengine_silu(z1);
+    const float inverse = rms_inverse_of_sums<kMamba2DecodeSimdgroups>(
+        v0 * v0 + v1 * v1, GroupWidth,
+        shared.reductions + (token & 1) * kMamba2DecodeSimdgroups,
+        thread_index, lane, simd_group, params.rms_eps);
+    const bfloat gated0 =
+        bfloat((v0 * inverse) * float(norm_weight[column]));
+    const bfloat gated1 =
+        bfloat((v1 * inverse) * float(norm_weight[column + 1]));
+    lane_hidden[token * InnerSize + column] = gated0;
+    lane_hidden[token * InnerSize + column + 1] = gated1;
+    if (table) {
+      // The thread's adjacent pair of dims is its table slot's pair: the
+      // simdgroup covers this group's (g*8+sg)-th 64-column tile, lane the
+      // (2*lane, 2*lane+1) elements.
+      Table::write_row(
+          table + ulong(batch) * InnerSize * Rows,
+          sums + ulong(batch) * (Rows / q4sg::kRows) *
+                     Table::sums_per_tile(InnerSize),
+          InnerSize, group.x * HeadsPerGroup + simd_group, token, lane,
+          gated0, gated1);
+    }
+  }
+}
+
+// The chain kernel's binding layout plus the tree tables at 17 and 18; the
+// params sit at 19 (21 with a linear-input table) and the conv bias rides
+// the slot just past them, as the chain's buffer(21) does.
+#define MAMBA2_TREE_DECODE_BUFFERS(W)                                         \
+  device const bfloat *packed [[buffer(0)]],                                  \
+      device const bfloat *conv_weights [[buffer(1)]],                        \
+      device const uchar *current0 [[buffer(2)]],                             \
+      device const uchar *current1 [[buffer(3)]],                             \
+      device const uchar *current2 [[buffer(4)]],                             \
+      device const uchar *current3 [[buffer(5)]],                             \
+      device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]],   \
+      device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]],   \
+      device bfloat *mixed [[buffer(10)]],                                    \
+      device const float *a_weights [[buffer(11)]],                           \
+      device const bfloat *dt_bias [[buffer(12)]],                            \
+      device float *step_sizes [[buffer(13)]],                                \
+      device const float *skip_weights [[buffer(14)]],                        \
+      device const W *norm_weight [[buffer(15)]],                             \
+      device bfloat *hidden [[buffer(16)]],                                   \
+      device const uint *tree_nodes [[buffer(17)]],                           \
+      device const uint *tree_counts [[buffer(18)]]
+#define MAMBA2_TREE_DECODE_THREADS                                            \
+  uint2 group [[threadgroup_position_in_grid]],                               \
+      uint lane [[thread_index_in_simdgroup]],                                \
+      uint simd_group [[simdgroup_index_in_threadgroup]]
+#define MAMBA2_TREE_DECODE_BODY(Heads, HeadDim, Groups, StateSize, ConvDim,   \
+                                PackedWidth, table, sums, Layout)             \
+  threadgroup Mamba2DecodeShared<Heads / Groups, HeadDim, StateSize,          \
+                                 RICHENGINE_TREE_VERIFY_NODES>                \
+      shared;                                                                 \
+  mamba2_decode_tree_batch_phase<Heads, HeadDim, Groups, StateSize, ConvDim,  \
+                                 PackedWidth, 2, Layout>(                     \
+      packed, conv_weights, conv_bias, current0, current1, current2,          \
+      current3, next0, next1, next2, next3, mixed, a_weights, dt_bias,        \
+      step_sizes, skip_weights, norm_weight, hidden, tree_nodes,              \
+      tree_counts, params, group, lane, simd_group, shared, table, sums);
+#define MAMBA2_TREE_DECODE_ENTRY(Name, Heads, HeadDim, Groups, StateSize,     \
+                                 ConvDim, PackedWidth, W)                     \
+  [[max_total_threads_per_threadgroup(256)]]                                  \
+  kernel void Name(                                                           \
+      MAMBA2_TREE_DECODE_BUFFERS(W),                                          \
+      constant Mamba2DecodeBatchParams &params [[buffer(19)]],                \
+      device const bfloat *conv_bias [[buffer(20)]],                          \
+      MAMBA2_TREE_DECODE_THREADS) {                                           \
+    MAMBA2_TREE_DECODE_BODY(Heads, HeadDim, Groups, StateSize, ConvDim,       \
+                            PackedWidth, (device bfloat *)nullptr,            \
+                            (device float *)nullptr, q4sg::Table64)           \
+  }
+#define MAMBA2_TREE_DECODE_TABLE_ENTRY(Name, Heads, HeadDim, Groups,          \
+                                       StateSize, ConvDim, PackedWidth,       \
+                                       Layout, W)                             \
+  [[max_total_threads_per_threadgroup(256)]]                                  \
+  kernel void Name(                                                           \
+      MAMBA2_TREE_DECODE_BUFFERS(W), device bfloat *table [[buffer(19)]],     \
+      device float *sums [[buffer(20)]],                                      \
+      constant Mamba2DecodeBatchParams &params [[buffer(21)]],                \
+      device const bfloat *conv_bias [[buffer(22)]],                          \
+      MAMBA2_TREE_DECODE_THREADS) {                                           \
+    MAMBA2_TREE_DECODE_BODY(Heads, HeadDim, Groups, StateSize, ConvDim,       \
+                            PackedWidth, table, sums, Layout)                 \
+  }
+#define MAMBA2_TREE_DECODE_PACKED_ENTRY(Name, Heads, HeadDim, Groups,         \
+                                        StateSize, ConvDim, PackedWidth, W)   \
+  [[max_total_threads_per_threadgroup(256)]]                                  \
+  kernel void Name(                                                           \
+      MAMBA2_TREE_DECODE_BUFFERS(W), device half *plane [[buffer(19)]],       \
+      device uchar *exponents [[buffer(20)]],                                 \
+      constant Mamba2DecodeBatchParams &params [[buffer(21)]],                \
+      device const bfloat *conv_bias [[buffer(22)]],                          \
+      MAMBA2_TREE_DECODE_THREADS) {                                           \
+    MAMBA2_TREE_DECODE_BODY(Heads, HeadDim, Groups, StateSize, ConvDim,       \
+                            PackedWidth, plane, exponents, gguf_sg::Packed)   \
+  }
+
+// The tree variants of Nemotron 3.5's decode list: one per chain variant.
+MAMBA2_TREE_DECODE_ENTRY(verify_tree_mamba2_fused, 64, 64, 8, 128, 6144,
+                         10496, bfloat)
+MAMBA2_TREE_DECODE_ENTRY(verify_tree_mamba2_fused_f32, 64, 64, 8, 128, 6144,
+                         10496, float)
+MAMBA2_TREE_DECODE_TABLE_ENTRY(verify_tree_mamba2_fused_table64, 64, 64, 8,
+                               128, 6144, 10496, q4sg::Table64, bfloat)
+MAMBA2_TREE_DECODE_TABLE_ENTRY(verify_tree_mamba2_fused_table16_f32, 64, 64,
+                               8, 128, 6144, 10496, gguf_sg::Table16, float)
+MAMBA2_TREE_DECODE_TABLE_ENTRY(verify_tree_mamba2_fused_table16, 64, 64, 8,
+                               128, 6144, 10496, gguf_sg::Table16, bfloat)
+MAMBA2_TREE_DECODE_PACKED_ENTRY(verify_tree_mamba2_fused_packed_f32, 64, 64,
+                                8, 128, 6144, 10496, float)
+MAMBA2_TREE_DECODE_PACKED_ENTRY(verify_tree_mamba2_fused_packed, 64, 64, 8,
+                                128, 6144, 10496, bfloat)
+#undef MAMBA2_TREE_DECODE_PACKED_ENTRY
+#undef MAMBA2_TREE_DECODE_TABLE_ENTRY
+#undef MAMBA2_TREE_DECODE_ENTRY
+#undef MAMBA2_TREE_DECODE_BODY
+#undef MAMBA2_TREE_DECODE_THREADS
+#undef MAMBA2_TREE_DECODE_BUFFERS
+
+// ---------------------------------------------------------------------------
 // The commit: replays the retained verify rows onto the incoming state — the
 // conv carry rewinds to the retained rows' raw conv inputs and the recurrent
 // matrix recomputes over their post-conv x|B|C rows and dt'. Mirrors the GDN
@@ -539,10 +898,11 @@ inline void mamba2_commit_phase(
     float local_state[4];
     for (uint i = 0; i < 4; ++i)
       local_state[i] = state_in[state_base + lane * 4 + i];
+    const float a_w = a_weights[head];
     for (uint token = 0; token < count; ++token) {
       const ulong conv_base = ulong(token) * ConvDim;
       const float dtv = step_sizes[token * Heads + head];
-      const float dA = fast::exp(dtv * a_weights[head]);
+      const float dA = fast::exp(dtv * a_w);
       const float x = float(mixed[conv_base + head * HeadDim + dim]);
       const float scale = dtv * x;
       for (uint i = 0; i < 4; ++i) {
@@ -634,3 +994,155 @@ inline void mamba2_commit_batch_phase(
 
 MAMBA2_COMMIT_ENTRY(verify_mamba2_commit, 64, 64, 8, 128, 6144, 10496)
 #undef MAMBA2_COMMIT_ENTRY
+
+// The tree commit: the carried convolution always moves to the retained
+// path's tail (the tree decode wrote none), and the recurrent state replays
+// the path's rows unless the path is the whole chain, in which case the
+// scan's chain-end state already matches.
+template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
+          uint PackedWidth>
+inline void mamba2_commit_tree_phase(
+    device const bfloat *packed, device const bfloat *mixed,
+    device const float *step_sizes, device const float *a_weights,
+    device const bfloat *conv_state_in, device bfloat *conv_state_out,
+    device const float *state_in, device float *state_out,
+    device const uint *path, uint retained, uint group, uint thread_index,
+    uint lane, uint simd_group) {
+  constexpr uint HeadsPerGroup = Heads / Groups;
+  constexpr uint InnerSize = Heads * HeadDim;
+  constexpr uint DimBatches = HeadDim / kMamba2DecodeSimdgroups;
+  const uint count = retained;
+  // The packed row's conv columns lead at InnerSize.
+  device const bfloat *conv_rows = packed + InnerSize;
+  for (uint element = group * 256 + thread_index; element < 3 * ConvDim;
+       element += Groups * 256) {
+    const uint row = element / ConvDim;
+    const uint channel = element % ConvDim;
+    conv_state_out[element] =
+        gdn_conv_carry_tree(conv_rows, conv_state_in, PackedWidth, ConvDim,
+                            path, count, row, channel);
+  }
+
+  // A full retained chain (path[i] == i) already ended at the scan's
+  // chain-row state; only a truncation or a leaf detour needs the replay.
+  const bool full_chain =
+      count == RICHENGINE_TARGET_VERIFY_ROWS &&
+      path[RICHENGINE_TARGET_VERIFY_ROWS - 1] ==
+          RICHENGINE_TARGET_VERIFY_ROWS - 1;
+  if (full_chain)
+    return;
+  for (uint task = group; task < Heads * DimBatches; task += Groups) {
+    const uint head = task / DimBatches;
+    const uint dim = (task % DimBatches) * kMamba2DecodeSimdgroups + simd_group;
+    const uint grp = head / HeadsPerGroup;
+    const ulong state_base = (ulong(head) * HeadDim + dim) * StateSize;
+    float local_state[4];
+    for (uint i = 0; i < 4; ++i)
+      local_state[i] = state_in[state_base + lane * 4 + i];
+    const float a_w = a_weights[head];
+    for (uint token = 0; token < count; ++token) {
+      const ulong conv_base = ulong(path[token]) * ConvDim;
+      const float dtv = step_sizes[path[token] * Heads + head];
+      const float dA = fast::exp(dtv * a_w);
+      const float x = float(mixed[conv_base + head * HeadDim + dim]);
+      const float scale = dtv * x;
+      for (uint i = 0; i < 4; ++i) {
+        const uint n = lane * 4 + i;
+        local_state[i] =
+            fma(scale,
+                float(mixed[conv_base + InnerSize + grp * StateSize + n]),
+                local_state[i] * dA);
+      }
+    }
+    for (uint i = 0; i < 4; ++i)
+      state_out[state_base + lane * 4 + i] = local_state[i];
+  }
+}
+
+// Grid {groups, layers, lanes}; the lane's rows of a layer's packed, mixed
+// and dt' tensors are RICHENGINE_TREE_VERIFY_NODES apart, and retained_path
+// holds the committed path's DFS rows.
+template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
+          uint PackedWidth>
+inline void mamba2_commit_tree_batch_phase(
+    device const bfloat *packed, device const bfloat *mixed,
+    device const float *step_sizes, device const float *a_weights,
+    device const uchar *current_0, device const uchar *current_1,
+    device const uchar *current_2, device const uchar *current_3,
+    device uchar *next_0, device uchar *next_1, device uchar *next_2,
+    device uchar *next_3, device const uint *retained,
+    device const uint *retained_path,
+    constant Mamba2BatchCommitParams &params, uint3 group, uint thread_index,
+    uint simd_lane, uint simd_group) {
+  const uint batch = group.z;
+  const uint layer = group.y;
+  device const uchar *current = batch == 0   ? current_0
+                                : batch == 1 ? current_1
+                                : batch == 2 ? current_2
+                                             : current_3;
+  device uchar *next = batch == 0   ? next_0
+                       : batch == 1 ? next_1
+                       : batch == 2 ? next_2
+                                    : next_3;
+  // The arena's mamba tensors hold verify_stride-row units per lane slot; a
+  // tree lane's Nodes rows occupy Nodes/Verify units of the sixteen-row
+  // stride a tree batch carries.
+  const ulong rows =
+      (ulong(layer) * RICHENGINE_MAXIMUM_BATCH_WIDTH +
+       batch * (RICHENGINE_TREE_VERIFY_NODES / RICHENGINE_TARGET_VERIFY_ROWS)) *
+      params.verify_stride;
+  packed += rows * PackedWidth;
+  mixed += rows * ConvDim;
+  step_sizes += rows * Heads;
+  // One buffer holds every layer's ssm_a: the dispatch's own layer's Heads
+  // floats lead it.
+  a_weights += ulong(layer) * Heads;
+  device const bfloat *conv_state_in = reinterpret_cast<device const bfloat *>(
+      current + ulong(layer) * params.conv_layer_bytes);
+  device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
+      next + ulong(layer) * params.conv_layer_bytes);
+  device const float *state_in = reinterpret_cast<device const float *>(
+      current + params.convolution_state_bytes +
+      ulong(layer) * params.recurrent_layer_bytes);
+  device float *state_out = reinterpret_cast<device float *>(
+      next + params.convolution_state_bytes +
+      ulong(layer) * params.recurrent_layer_bytes);
+  mamba2_commit_tree_phase<Heads, HeadDim, Groups, StateSize, ConvDim,
+                           PackedWidth>(
+      packed, mixed, step_sizes, a_weights, conv_state_in, conv_state_out,
+      state_in, state_out,
+      retained_path + batch * RICHENGINE_TARGET_VERIFY_ROWS, retained[batch],
+      group.x, thread_index, simd_lane, simd_group);
+}
+
+#define MAMBA2_TREE_COMMIT_ENTRY(Name, Heads, HeadDim, Groups, StateSize,    \
+                                 ConvDim, PackedWidth)                        \
+  kernel void Name(                                                           \
+      device const bfloat *packed [[buffer(0)]],                              \
+      device const bfloat *mixed [[buffer(1)]],                               \
+      device const float *step_sizes [[buffer(2)]],                           \
+      device const float *a_weights [[buffer(3)]],                            \
+      device const uchar *current_0 [[buffer(4)]],                            \
+      device const uchar *current_1 [[buffer(5)]],                            \
+      device const uchar *current_2 [[buffer(6)]],                            \
+      device const uchar *current_3 [[buffer(7)]],                            \
+      device uchar *next_0 [[buffer(8)]], device uchar *next_1 [[buffer(9)]], \
+      device uchar *next_2 [[buffer(10)]],                                    \
+      device uchar *next_3 [[buffer(11)]],                                    \
+      device const uint *retained [[buffer(12)]],                             \
+      device const uint *retained_path [[buffer(13)]],                        \
+      constant Mamba2BatchCommitParams &params [[buffer(14)]],                \
+      uint3 group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint simd_lane [[thread_index_in_simdgroup]],                           \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    mamba2_commit_tree_batch_phase<Heads, HeadDim, Groups, StateSize,         \
+                                   ConvDim, PackedWidth>(                     \
+        packed, mixed, step_sizes, a_weights, current_0, current_1,           \
+        current_2, current_3, next_0, next_1, next_2, next_3, retained,       \
+        retained_path, params, group, thread_index, simd_lane, simd_group);   \
+  }
+
+MAMBA2_TREE_COMMIT_ENTRY(verify_mamba2_commit_tree, 64, 64, 8, 128, 6144,
+                         10496)
+#undef MAMBA2_TREE_COMMIT_ENTRY

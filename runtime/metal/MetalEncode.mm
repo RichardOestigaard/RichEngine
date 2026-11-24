@@ -1419,6 +1419,14 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
+            if (!dispatch.threadgroups.x || !dispatch.threadgroups.y ||
+                !dispatch.threadgroups.z)
+                fprintf(stderr,
+                        "zero-grid dispatch pipeline=%s groups={%llu,%llu,%llu}\n",
+                        dispatch.pipelineName.c_str(),
+                        (unsigned long long)dispatch.threadgroups.x,
+                        (unsigned long long)dispatch.threadgroups.y,
+                        (unsigned long long)dispatch.threadgroups.z);
             item.groups = metalSize(dispatch.threadgroups, "threadgroups");
             item.threads = metalSize(
                 dispatch.threadsPerThreadgroup, "threadsPerThreadgroup");

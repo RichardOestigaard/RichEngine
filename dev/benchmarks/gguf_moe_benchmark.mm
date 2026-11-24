@@ -8,6 +8,12 @@
 // per request lane (decode, short chunks) or of all 256 (chunks of 64 rows or more), identically for both formats:
 // expert e scores 4 x[e], so the first 256 inputs pick the routes. The weights exceed the system cache, so each layer
 // streams its experts from DRAM.
+//   gguf-moe-benchmark <metallib> int8 [rounds] [gate/up format] [down format] [shared format] [a1b]
+// - prefill chunks of 64 to 2048 rows routed at random on the staged expert passes and on the int8 passes
+//   (MoeConfig::int8Passes, kernels/shared/moe_int8.metal: the MLX affine formats gguf_prefill_int8_format takes,
+//   af4 throughout by default), with the routes per expert, the rows each routed expert takes on average and the
+//   passes the device's plan picks (ExecutionPlans::moeConfig's gate). The mode arms
+//   RICHENGINE_PREFILL_FAST_INT8 so the gate's model-policy term holds.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "DispatchReplay.hpp"
@@ -89,7 +95,8 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFormat, Fmt sharedFormat, bool a1b) {
+int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, Fmt downFormat, Fmt sharedFormat,
+           bool a1b) {
   // The 35B shape by default; `a1b` is LFM2.5-8B-A1B's sparse block: 32
   // experts, top 4, intermediate 1792, sigmoid-bias router, no shared expert.
   const uint32_t H = 2048, I = a1b ? 1792 : 512, E = a1b ? 32 : 256,
@@ -189,6 +196,45 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
          backend.capabilities().gpuCoreCount, rounds);
+  if (int8) {
+    // The staged prefill passes against the int8 ones: forced off and on at
+    // the same plan, as upstream's `int8` mode A/Bs them. The "plan" column
+    // asks the real gate — moeConfig over a shape whose int8Experts every
+    // resident AF block sets (TargetModelGeometry::moeInt8Experts).
+    const auto passes = [&](uint32_t rows, bool on) {
+      MoeConfig config = plans.moePrefill(ggufShape, rows).configuration();
+      config.int8Passes = on;
+      return MoE::prefillPlan(ggufShape, rows, config);
+    };
+    MoeShape int8Shape = ggufShape;
+    int8Shape.int8Experts = true;
+    // Warm the clocks as the default mode's 2048-row chunk does.
+    b.input = bfloatBuffer(backend, input(kRowsMax, E), "input");
+    static_cast<void>(time(gguf, passes(kRowsMax, false)));
+    printf("  rows | routes per expert | rows per routed expert | staged ms | int8 ms | int8/staged | tile | "
+           "plan\n");
+    for (const uint32_t rows : {64u, 96u, 128u, 160u, 192u, 256u, 320u, 384u, 512u, 768u, 1024u, 2048u}) {
+      const MoePlan stagedPlan = passes(rows, false), int8Plan = passes(rows, true);
+      b.input = bfloatBuffer(backend, input(rows, E), "input");
+      const double staged = time(gguf, stagedPlan), quantized = time(gguf, int8Plan),
+                   staged2 = time(gguf, stagedPlan), quantized2 = time(gguf, int8Plan);
+      const double before = (staged + staged2) / 2, after = (quantized + quantized2) / 2;
+      // The rows each routed expert of this chunk's routes took on average:
+      // its routes over the distinct experts the last run selected (the
+      // routes are the staged and int8 plans' alike — the same input rows).
+      const auto *selected = static_cast<const uint32_t *>(b.scratch.selectedExperts.contents());
+      std::vector<uint8_t> seen(E, 0);
+      uint32_t distinct = 0;
+      for (uint64_t route = 0; route < uint64_t{rows} * ggufShape.routesPerToken(); ++route)
+        if (selected[route] < E && !seen[selected[route]]++) ++distinct;
+      const double perExpert = double(rows) * TOPK / std::max(distinct, 1u);
+      printf("  %4u | %5.2f | %6.2f | %.4f | %.4f | %.3f | M%u | %s\n", rows, double(rows) * TOPK / E,
+             perExpert, before, after, after / before,
+             uint32_t(stagedPlan.configuration().expertTile),
+             plans.moePrefill(int8Shape, rows).configuration().int8Passes ? "int8" : "staged");
+    }
+    return 0;
+  }
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
   b.input = bfloatBuffer(backend, input(kRowsMax, E), "input");
   const double affinePrefill = time(affine, plans.moePrefill(affineShape, kRowsMax));
@@ -241,19 +287,29 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 } // namespace
 
 int main(int argc, const char *argv[]) {
+  // `int8` runs the opt-in RICHENGINE_PREFILL_FAST_INT8 passes, whose plan
+  // gate reads modelPolicy().prefillFastInt8 — arm it before anything reads
+  // tuning() or modelPolicy(), as gguf-prefill-int8's binary does.
+  const bool int8 = argc > 2 && std::string_view(argv[2]) == "int8";
+  if (int8) setenv("RICHENGINE_PREFILL_FAST_INT8", "1", 1);
   @autoreleasepool {
     const bool a1b = argc > 1 && std::string_view(argv[argc - 1]) == "a1b";
-    const int args = argc - (a1b ? 1 : 0);
-    const Fmt gateUp = args > 3 ? fmtNamed(argv[3]) : Q4K, down = args > 4 ? fmtNamed(argv[4]) : Q5K,
-              shared = args > 5 ? fmtNamed(argv[5]) : Q80;
-    if (args < 2 || args > 6 || gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] "
+    std::vector<const char *> args(argv, argv + argc - (a1b ? 1 : 0));
+    if (int8) args.erase(args.begin() + 2);
+    const size_t count = args.size();
+    // The int8 passes take the MLX affine formats alone
+    // (gguf_prefill_int8_format): af4 throughout by default.
+    const Fmt gateUp = count > 3 ? fmtNamed(args[3]) : int8 ? AF4 : Q4K,
+              down = count > 4 ? fmtNamed(args[4]) : int8 ? AF4 : Q5K,
+              shared = count > 5 ? fmtNamed(args[5]) : int8 ? AF4 : Q80;
+    if (count < 2 || count > 6 || gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [int8] [rounds] [gate/up format] [down format] "
                    "[shared format] [a1b]\n";
       return 2;
     }
     try {
-      MetalBackend backend(argv[1]);
-      return timing(backend, args > 2 ? std::stoul(argv[2]) : 20, gateUp, down, shared, a1b);
+      MetalBackend backend(args[1]);
+      return timing(backend, count > 2 ? std::stoul(args[2]) : 20, int8, gateUp, down, shared, a1b);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;
