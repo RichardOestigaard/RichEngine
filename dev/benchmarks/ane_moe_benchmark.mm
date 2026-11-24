@@ -328,13 +328,13 @@ int run(MetalBackend &backend, uint32_t rounds) {
         const AffineWeights &w = projection->affine();
         graph.add("ane_ffn_row_scale_inputs",
                   {w.weights, w.scales, w.biases, scalesOf(e, matrix), signsBuffer},
-                  AneFfnWeightParams{uint32_t(kHidden / 64), 0, 0, kHidden, 0, 0, 0},
+                  AneFfnWeightParams{uint32_t(kHidden / 64), 0, 0, kHidden, 0, 0, 0, kIntermediate},
                   {kIntermediate / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
       }
       const AffineWeights &w = down[e].affine();
       graph.add("ane_ffn_row_scale_intermediate",
                 {w.weights, w.scales, w.biases, scalesOf(e, 2), signsBuffer},
-                AneFfnWeightParams{uint32_t(kIntermediate / 64), 0, 0, kIntermediate, 0, 0, 0},
+                AneFfnWeightParams{uint32_t(kIntermediate / 64), 0, 0, kIntermediate, 0, 0, 0, kHidden},
                 {kHidden / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
     }
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -351,7 +351,7 @@ int run(MetalBackend &backend, uint32_t rounds) {
                   {w.weights, w.scales, w.biases, scalesOf(expert, matrix), wset->buffer, scale->buffer,
                    signsBuffer},
                   AneFfnWeightParams{uint32_t(kHidden / 64), 0, k * kInputSegment, kInputSegment,
-                                     wset->strideBytes, scaleStride(*scale), 0},
+                                     wset->strideBytes, scaleStride(*scale), 0, kIntermediate},
                   {kIntermediate / ANE_FFN_WEIGHT_ROWS, kInputSegment / ANE_FFN_INPUT_BLOCK, 1},
                   {ANE_FFN_WEIGHT_THREADS, 1, 1});
       }
@@ -361,7 +361,7 @@ int run(MetalBackend &backend, uint32_t rounds) {
               {w.weights, w.scales, w.biases, scalesOf(expert, 2), target.down.buffer,
                target.downScale.buffer, signsBuffer},
               AneFfnWeightParams{uint32_t(kIntermediate / 64), 0, 0, kIntermediate, target.down.strideBytes,
-                                 scaleStride(target.downScale), 0},
+                                 scaleStride(target.downScale), 0, kHidden},
               {kHidden / ANE_FFN_WEIGHT_ROWS, kIntermediate / ANE_FFN_INTERMEDIATE_BLOCK, 1},
               {ANE_FFN_WEIGHT_THREADS, 1, 1});
   };
@@ -455,13 +455,13 @@ int run(MetalBackend &backend, uint32_t rounds) {
       const uint32_t bucket = bucketIndex(rows);
       addEval(graph, bucket, 0, rows, false, 0);
       static_cast<void>(submitWait(graph));
-      const std::optional<AwakeClock::duration> ran = handoff.finish();
+      const std::optional<ane::Handoff::Ran> ran = handoff.finish();
       if (!ran || std::exchange(*static_cast<uint32_t *>(status.contents()), 0u)) {
         std::printf("  ANE eval at %u rows failed (%s)\n", rows, handoff.reason().c_str());
         return 1;
       }
       if (i) {
-        ane.push_back(std::chrono::duration<double, std::milli>(*ran).count());
+        ane.push_back(std::chrono::duration<double, std::milli>(ran->total).count());
       }
     }
     // RMS error of the ANE path's output against the GPU's.
@@ -518,12 +518,12 @@ int run(MetalBackend &backend, uint32_t rounds) {
       for (uint32_t e = 0; e < k; ++e)
         addEval(graph, bucket, e & 1, rows, e + 1 < k, (e + 1) % kExperts);
       const double wall = submitWait(graph);
-      const std::optional<AwakeClock::duration> ran = handoff.finish();
+      const std::optional<ane::Handoff::Ran> ran = handoff.finish();
       if (!ran || std::exchange(*static_cast<uint32_t *>(status.contents()), 0u)) {
         std::printf("  chained evals failed (%s)\n", handoff.reason().c_str());
         return 1;
       }
-      const double aneMs = std::chrono::duration<double, std::milli>(*ran).count();
+      const double aneMs = std::chrono::duration<double, std::milli>(ran->total).count();
       std::printf("%8u %8u %10.3f %10.3f %10.0f\n", k, rows, wall, aneMs, k / (aneMs / 1000.0));
     }
   }

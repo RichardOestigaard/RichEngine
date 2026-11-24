@@ -9,6 +9,7 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -145,6 +146,48 @@ enum class DecodeTensor : uint32_t {
   // A verify lane's pleNgram - 1 prior tokens, the PLE hash's tail inputs
   // (qwen4exp; addVerifyInput's trailing argument). 0 bytes elsewhere.
   PlePriorTokens,
+  // The maxwell-moe MTP draft's per-lane pass scratch and stream anchor
+  // (model/MaxwellMtpDraft.cpp): the fp32 chained stream state, the fused
+  // eh operand rows and projection output, the mHC fp32 planes, the
+  // layer's ordinary bf16 rows and the pass token; the anchor the next
+  // pass 0 reads, one 8192-wide bf16 row per state lane; and the context
+  // commit's lanes*verifyRows row scratch. All zero-sized unless the
+  // draft is DraftKind::Mtp.
+  MtpStreams,
+  MtpEh,
+  MtpEhOut,
+  MtpPlane,
+  MtpMappings,
+  MtpHeadWeights,
+  MtpEmbed,
+  MtpEmbedNormed,
+  MtpAggregate,
+  MtpNormed,
+  MtpQueries,
+  MtpKeys,
+  MtpValues,
+  MtpAttention,
+  MtpBranch,
+  MtpShared,
+  MtpIntermediate,
+  MtpHead,
+  MtpLogits,
+  MtpTokenIn,
+  // The nemotron MTP draft's sigmoid-MoE scratch: the nmtp_moe_route
+  // records (16 u32 per row) and the down pass's fp32 per-slot partials
+  // ([topK + 1][hidden] per row). Zero-sized on maxwell.
+  MtpMoeRoutes,
+  MtpMoePartials,
+  MtpAnchor,
+  MtpCtxStreams,
+  MtpCtxEh,
+  MtpCtxEhOut,
+  MtpCtxPlane,
+  MtpCtxMappings,
+  MtpCtxEmbed,
+  MtpCtxEmbedNormed,
+  MtpCtxKeys,
+  MtpCtxValues,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -300,8 +343,26 @@ public:
     // One private gate buffer is reused serially by the target dense FFN (when
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize, ops::WeightLayout::Affine64});
+    // The draft's shared expert may carry either tile layout (MTP's GGUF
+    // weights plan Block32) — hedge as linearScratchSize does.
+    // A nemotron draft's weights are GGUF-block or float segments — no
+    // affine projections exist to hedge (its 2688-wide hidden fails the
+    // affine tile contract anyway).
+    const bool nemotronDraft = geometry.target.mambaLayers != 0;
+    const uint64_t draft =
+        geometry.draft.kind == DraftKind::Null
+            ? 0
+            : std::max(
+                  nemotronDraft
+                      ? 0
+                      : operators.gateUpWorkspace(
+                            {geometry.draft.intermediateSize,
+                             geometry.draft.hiddenSize,
+                             ops::WeightLayout::Affine64}),
+                  operators.gateUpWorkspace(
+                      {geometry.draft.intermediateSize,
+                       geometry.draft.hiddenSize,
+                       ops::WeightLayout::Block32}));
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p));

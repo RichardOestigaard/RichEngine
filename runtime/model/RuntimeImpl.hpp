@@ -17,6 +17,8 @@
 #include "model/DFlashTwo8width.hpp"
 #include "model/DFlashTwo16width.hpp"
 #include "model/DSplineDraft.hpp"
+#include "model/MaxwellMtpDraft.hpp"
+#include "model/NemotronMtpDraft.hpp"
 #include "model/CompositeStateStorage.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/TargetModel.hpp"
@@ -27,6 +29,7 @@
 #include "metal/abi/Dfa.h"
 #include "metal/abi/StepPack.h"
 #include "ops/Embedding.hpp"
+#include "ops/FfnSplit.hpp"
 #include "ops/KernelNames.hpp"
 #include "ops/LfmAudioEnc.hpp"
 #include "ops/LfmSpeechGen.hpp"
@@ -126,9 +129,12 @@ private:
   bool representativePrefillTiming_;
 };
 
-// A prefill arena's tensors as the target's prefill reads them.
-inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
-  auto p = [&](PrefillTensor tensor) { return arena.get(tensor); };
+// Step `step`'s views of an arena's tensors as that step's prefill reads
+// them: each step's own of the step tensors (prefillStepTensor), the
+// shared ones' whole buffers.
+inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena,
+                                                uint32_t step) {
+  auto p = [&](PrefillTensor tensor) { return arena.get(tensor, step); };
   TargetModelPrefillBuffers buffers;
   // Prefill plans read plain bf16 rows; the input and sums slots hold a
   // GGUF chunk's packed plane and exponent bytes (ops::LinearGguf.cpp).
@@ -150,6 +156,7 @@ inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
   buffers.gdnValues = p(PrefillTensor::GdnValues);
   buffers.gdnDecay = p(PrefillTensor::GdnDecay);
   buffers.gdnBeta = p(PrefillTensor::GdnBeta);
+  buffers.gdnPostConv = p(PrefillTensor::GdnPostConv);
   buffers.recurrent = p(PrefillTensor::Recurrent);
   buffers.gdnHidden = p(PrefillTensor::GdnHidden);
   buffers.gdnOutput = p(PrefillTensor::GdnOutput);
@@ -180,7 +187,8 @@ inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena) {
 using DraftModel =
     std::variant<NullDraft, DFlashDraft, DFlashTwo8width, DFlashTwo16width,
                  DFlashV1Draft,
-                 DSparkDraft, DSplineDraft>;
+                 DSparkDraft, DSplineDraft, MaxwellMtpDraft,
+                 NemotronMtpDraft>;
 
 // The DraftModel alternative each draft weights type constructs. The
 // mapping is total: a weights type with no specialization fails to compile
@@ -193,6 +201,12 @@ template <> struct DraftModelFor<DFlashV1DraftWeights> {
 };
 template <> struct DraftModelFor<DSparkDraftWeights> { using Type = DSparkDraft; };
 template <> struct DraftModelFor<DSplineDraftWeights> { using Type = DSplineDraft; };
+template <> struct DraftModelFor<MaxwellMtpDraftWeights> {
+  using Type = MaxwellMtpDraft;
+};
+template <> struct DraftModelFor<NemotronMtpDraftWeights> {
+  using Type = NemotronMtpDraft;
+};
 
 } // namespace detail
 
@@ -280,6 +294,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // their k|v columns, then decay (fp32) and beta (bf16).
   uint64_t gdnTapeLayerBytes() const {
     const uint64_t rows = RICHENGINE_TARGET_VERIFY_ROWS;
+    // nemotron's Mamba-2 tape region: the raw conv inputs, the post-conv
+    // x|B|C rows and dt' (ops::Mamba2::tapeLayerBytes), 256-aligned.
+    if (geometry.target.mambaLayers)
+      return (ops::Mamba2::tapeLayerBytes(geometry.target.mambaShape(),
+                                          uint32_t(rows)) +
+              255) /
+             256 * 256;
     const uint64_t kv =
         (uint64_t{geometry.target.gdnKeyHeads} +
          geometry.target.gdnValueHeads) *
@@ -851,9 +872,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, kLaneCount);
-    // The folded-commit tape is GDN-only: LFM2's conv layers share the
-    // state layout but keep the standalone commit.
-    if (geometry.target.gdnLayers &&
+    // The folded-commit tape is GDN- and Mamba-2-only: LFM2's conv layers
+    // share the state layout but keep the standalone commit.
+    if ((geometry.target.gdnLayers || geometry.target.mambaLayers) &&
         !std::getenv("RICHENGINE_NO_GDN_FOLD")) {
       const uint64_t layerBytes = gdnTapeLayerBytes();
       gdnTape_ = backend.allocateBuffer(
@@ -1179,7 +1200,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
                      MetalBuffer draftSin, MetalBuffer targetCosAlt = {},
-                     MetalBuffer targetSinAlt = {}) const;
+                     MetalBuffer targetSinAlt = {},
+                     uint32_t maximumRows = kPrefillRows) const;
   // A constrained lane keeps its final prompt row, which prefill leaves at
   // row 0 of its Hidden0 block, until its first mask arrives.
   void captureFinalHidden(Request &entry, uint32_t lane) const {
@@ -1449,6 +1471,9 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     static_assert(RICHENGINE_TREE_VERIFY_NODES >= 2 &&
                       RICHENGINE_TREE_VERIFY_NODES % 2 == 0,
                   "the comb splits the verify nodes into equal halves");
+    // The MTP draft emits a chain only — no comb-tree tables.
+    if (geometry.draft.kind == DraftKind::Mtp)
+      return false;
     const auto policy = geometry.tuning.treeVerify;
     if (policy == ModelTuning::TreeVerify::Off)
       return false;
@@ -1501,6 +1526,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // the encoder's input hook, so it cannot stage either. qwen4exp
     // verifies the chain, streamed table or not.
     if (std::holds_alternative<Qwen4ExpWeights>(package.target))
+      return false;
+    // The Mamba-2 mixers have no tree-verify or tree-commit kernels
+    // (addVerifyMamba/addStateCommitTree throw) — nemotron verifies the
+    // chain only.
+    if (geometry.target.mambaLayers)
       return false;
     // Adaptive admission: the batch trees only while every lane's
     // accepted-proposal EWMA sits inside the band — saturated lanes keep
@@ -1723,6 +1753,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   struct PackedPrefillSequence final {
     Request *entry = nullptr;
     const ModelBatchItem *item = nullptr;
+    // The item's span this sequence covers: the item itself where the
+    // command's steps do not split it, else its part of this step's rows
+    // (preparePackedPrefill).
+    ModelBatchItem part{};
     uint32_t lane = 0;
     uint32_t rowBegin = 0;
     uint32_t attentionStride = 0;
@@ -1738,8 +1772,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::vector<uint32_t> pleRowIds;
     std::vector<BlockIndexerBlock> qsaBlocks;
   };
-  struct PackedPrefillBatch final {
+  // A command's steps of sequences, each's rows and captured rows
+  // (PrefillTensor::Captured) of its own.
+  struct PackedPrefillStep final {
     std::vector<PackedPrefillSequence> sequences;
+    uint32_t rows = 0;
+    uint32_t capturedRows = 0;
+  };
+  struct PackedPrefillBatch final {
+    std::vector<PackedPrefillStep> steps;
     uint32_t rows = 0;
     uint32_t capturedRows = 0;
   };
@@ -1753,9 +1794,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                        std::array<Request *, kLaneCount> &entries,
                        uint32_t inputBank) {
     PackedPrefillBatch batch;
-    batch.sequences.reserve(items.size());
-    uint64_t queryOffset = 0;
-    uint64_t kvOffset = 0;
+    uint32_t totalRows = 0;
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = request(item.requestId);
@@ -1779,130 +1818,202 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // the reset rides along every eye-checked non-cold item too.
         gdnPendingRows_[entry.stateLane] = 0;
       }
-      if (item.tokenCount > kPrefillRows - batch.rows) {
+      if (item.tokenCount > kPrefillRows - totalRows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }
-      auto captures = activeDraftCaptures(entry, item);
-      const uint32_t capturedRows = captureRows(captures);
-      const uint32_t attentionStride =
-          ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
-      const ChunkedPrefillParams chunk =
-          chunkParams(item.logicalPosition, item.tokenCount, attentionStride,
-                      item.pageTable);
-      MetalBuffer pageTable = synchronizedPageTable(entry, item);
-      PackedPrefillSequence &sequence = batch.sequences.emplace_back(
-          PackedPrefillSequence{&entry, &item, lane, batch.rows,
-                                attentionStride, queryOffset, kvOffset,
-                                batch.capturedRows, chunk, std::move(pageTable),
-                                std::move(captures), {}, {}});
-      if (envFlag("RICHENGINE_VERIFY_DUMP2"))
-        fprintf(stderr,
-                "dump2 prefill seq=%u id=%llu sl=%u tokens=%u pos=%llu "
-                "astride=%u qoff=%llu kvoff=%llu "
-                "chunk[c=%u t=%u s=%u pte=%u] pt=[",
-                lane, (unsigned long long)item.requestId, entry.stateLane,
-                item.tokenCount,
-                (unsigned long long)item.logicalPosition, attentionStride,
-                (unsigned long long)queryOffset,
-                (unsigned long long)kvOffset, chunk.committed_tokens,
-                chunk.chunk_tokens, chunk.chunk_stride,
-                chunk.page_table_entries);
-      if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
-        for (const auto p : item.pageTable)
-          fprintf(stderr, "%llx ", (unsigned long long)p);
-        fprintf(stderr, "]\n");
-      }
-      // qwen4exp's n-gram tails and QSA block records span the whole
-      // prompt: the chunk's inputTokens alone lacks both.
-      if (const auto *qwen4 =
-              std::get_if<Qwen4ExpWeights>(&package.target)) {
-        sequence.pleRowIds.resize(
-            uint64_t{item.tokenCount} * qwen4->layout.pleHeads());
-        if (item.requestTokens.size() < item.logicalPosition)
-          throw std::invalid_argument(
-              "prefill item lacks its request's tokens");
-        qwen4ExpPleRows(*qwen4, item.logicalPosition, item.inputTokens,
-                        item.requestTokens, sequence.pleRowIds.data());
-        for (uint64_t last = item.logicalPosition;
-             last < item.logicalPosition + item.tokenCount; ++last) {
-          if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1)
-            continue;
-          const uint64_t first = last - (BLOCK_INDEXER_BLOCK - 1);
-          const std::array<uint32_t, 3> rotary =
-              ropePosition(entry, first);
-          sequence.qsaBlocks.push_back(
-              {static_cast<uint32_t>(first),
-               {rotary[0], rotary[1], rotary[2]}});
-        }
-      }
       entries[lane] = &entry;
-      batch.rows += item.tokenCount;
-      batch.capturedRows += capturedRows;
-      queryOffset += bytesFor<uint16_t>(
-          uint64_t{geometry.target.attentionQueryHeads} * attentionStride *
-          geometry.target.attentionHeadDimension);
-      kvOffset += bytesFor<uint16_t>(
-          uint64_t{geometry.target.attentionKvHeads} * attentionStride *
-          geometry.target.attentionHeadDimension);
+      totalRows += item.tokenCount;
     }
-    if (!batch.rows ||
-        queryOffset >
-            prefillArena->get(PrefillTensor::FullQueries).sizeBytes() ||
-        kvOffset > prefillArena->get(PrefillTensor::ChunkKeys).sizeBytes()) {
-      throw std::logic_error("packed prefill scratch geometry overflowed");
-    }
-
-    auto *input =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::InputTokens,
-                                             inputBank),
-                           "packed prefill input tokens");
-    auto *targetPositions =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions,
-                                             inputBank),
-                           "target RoPE positions");
-    auto *draftPositions =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions,
-                                             inputBank),
-                           "draft RoPE positions");
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
-      const ModelBatchItem &item = *sequence.item;
-      std::copy(item.inputTokens.begin(), item.inputTokens.end(),
-                input + sequence.rowBegin);
-      for (uint32_t localRow = 0; localRow < item.tokenCount; ++localRow) {
-        const uint32_t row = sequence.rowBegin + localRow;
-        if (input[row] >= geometry.target.vocabularySize) {
-          throw std::invalid_argument("prompt token is out of vocabulary");
+    // Where the split's two-step commands break: the first step's rows of
+    // this command (FfnSplit::firstStepRows), or the whole of one that runs
+    // one step.
+    const uint32_t firstRows =
+        aneFfn ? aneFfn->firstStepRows(totalRows) : kPrefillRows;
+    // The steps' sequences: an item straddling the first step's rows fills
+    // it with a part and lands its rest — the second part — in the next
+    // (PrefillArena::groupCell carries its lane's state between the parts).
+    uint64_t queryOffsets[2] = {0, 0};
+    uint64_t kvOffsets[2] = {0, 0};
+    batch.steps.emplace_back();
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      const ModelBatchItem &item = items[lane];
+      Request &entry = *entries[lane];
+      uint32_t offset = 0;
+      while (offset < item.tokenCount) {
+        PackedPrefillStep &step = batch.steps.back();
+        const uint32_t capacity =
+            batch.steps.size() == 1 ? firstRows : kPrefillRows;
+        if (step.rows == capacity) {
+          batch.steps.emplace_back();
+          continue;
         }
-        const std::array<uint32_t, 3> rotary =
-            ropePosition(*sequence.entry, item.logicalPosition + localRow);
-        std::copy(rotary.begin(), rotary.end(), targetPositions + row * 3);
+        const uint32_t take =
+            std::min(capacity - step.rows, item.tokenCount - offset);
+        ModelBatchItem part = item;
+        part.logicalPosition += offset;
+        part.tokenCount = take;
+        part.inputTokens =
+            item.inputTokens.subspan(offset, take);
+        auto captures = activeDraftCaptures(entry, part);
+        const uint32_t capturedRows = captureRows(captures);
+        const uint32_t attentionStride =
+            ((take + kTileRows - 1) / kTileRows) * kTileRows;
+        const ChunkedPrefillParams chunk =
+            chunkParams(part.logicalPosition, take, attentionStride,
+                        part.pageTable);
+        MetalBuffer pageTable = synchronizedPageTable(entry, part);
+        const uint32_t at = static_cast<uint32_t>(batch.steps.size() - 1);
+        PackedPrefillSequence &sequence = step.sequences.emplace_back(
+            PackedPrefillSequence{&entry, &item, std::move(part), lane,
+                                  step.rows, attentionStride,
+                                  queryOffsets[at], kvOffsets[at],
+                                  step.capturedRows, chunk,
+                                  std::move(pageTable),
+                                  std::move(captures), {}, {}});
+        if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+          fprintf(stderr,
+                  "dump2 prefill seq=%u id=%llu sl=%u tokens=%u pos=%llu "
+                  "astride=%u qoff=%llu kvoff=%llu "
+                  "chunk[c=%u t=%u s=%u pte=%u] pt=[",
+                  lane, (unsigned long long)item.requestId, entry.stateLane,
+                  take,
+                  (unsigned long long)part.logicalPosition, attentionStride,
+                  (unsigned long long)queryOffsets[at],
+                  (unsigned long long)kvOffsets[at], chunk.committed_tokens,
+                  chunk.chunk_tokens, chunk.chunk_stride,
+                  chunk.page_table_entries);
+        if (envFlag("RICHENGINE_VERIFY_DUMP2")) {
+          for (const auto pt : part.pageTable)
+            fprintf(stderr, "%llx ", (unsigned long long)pt);
+          fprintf(stderr, "]\n");
+        }
+        // qwen4exp's n-gram tails and QSA block records span the whole
+        // prompt: the chunk's inputTokens alone lacks both.
+        if (const auto *qwen4 =
+                std::get_if<Qwen4ExpWeights>(&package.target)) {
+          sequence.pleRowIds.resize(
+              uint64_t{take} * qwen4->layout.pleHeads());
+          if (part.requestTokens.size() < part.logicalPosition)
+            throw std::invalid_argument(
+                "prefill item lacks its request's tokens");
+          qwen4ExpPleRows(*qwen4, part.logicalPosition, part.inputTokens,
+                          part.requestTokens, sequence.pleRowIds.data());
+          for (uint64_t last = part.logicalPosition;
+               last < part.logicalPosition + take; ++last) {
+            if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1)
+              continue;
+            const uint64_t first = last - (BLOCK_INDEXER_BLOCK - 1);
+            const std::array<uint32_t, 3> rotary =
+                ropePosition(entry, first);
+            sequence.qsaBlocks.push_back(
+                {static_cast<uint32_t>(first),
+                 {rotary[0], rotary[1], rotary[2]}});
+          }
+        }
+        step.rows += take;
+        step.capturedRows += capturedRows;
+        batch.rows += take;
+        batch.capturedRows += capturedRows;
+        queryOffsets[at] += bytesFor<uint16_t>(
+            uint64_t{geometry.target.attentionQueryHeads} * attentionStride *
+            geometry.target.attentionHeadDimension);
+        kvOffsets[at] += bytesFor<uint16_t>(
+            uint64_t{geometry.target.attentionKvHeads} * attentionStride *
+            geometry.target.attentionHeadDimension);
+        offset += take;
       }
-      for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
-        for (uint32_t row = capture.absoluteBegin; row < capture.absoluteEnd;
-             ++row) {
-          const uint32_t compactRow = sequence.captureBegin +
-                                      capture.compactDestinationRow + row -
-                                      capture.absoluteBegin;
-          draftPositions[compactRow] = row;
+    }
+    if (batch.steps.size() > geometry.prefillChunks)
+      throw std::logic_error("packed prefill exceeds the command's steps");
+    if (batch.steps.back().sequences.empty())
+      throw std::invalid_argument("empty packed prefill step");
+    for (uint32_t at = 0; at < batch.steps.size(); ++at)
+      if (queryOffsets[at] >
+              prefillArena->get(PrefillTensor::FullQueries).sizeBytes() ||
+          kvOffsets[at] >
+              prefillArena->get(PrefillTensor::ChunkKeys).sizeBytes()) {
+        throw std::logic_error("packed prefill scratch geometry overflowed");
+      }
+    if (!batch.rows)
+      throw std::logic_error("packed prefill scratch geometry overflowed");
+
+    // The host's inputs of each step, into the step's own views of the
+    // host-written tensors.
+    for (uint32_t at = 0; at < batch.steps.size(); ++at) {
+      const PackedPrefillStep &step = batch.steps[at];
+      auto *input =
+          contents<uint32_t>(prefillArena->get(PrefillTensor::InputTokens,
+                                               at, inputBank),
+                             "packed prefill input tokens");
+      auto *targetPositions =
+          contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions,
+                                               at, inputBank),
+                             "target RoPE positions");
+      auto *draftPositions =
+          contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions,
+                                               at, inputBank),
+                             "draft RoPE positions");
+      for (const PackedPrefillSequence &sequence : step.sequences) {
+        const ModelBatchItem &part = sequence.part;
+        std::copy(part.inputTokens.begin(), part.inputTokens.end(),
+                  input + sequence.rowBegin);
+        for (uint32_t localRow = 0; localRow < part.tokenCount; ++localRow) {
+          const uint32_t row = sequence.rowBegin + localRow;
+          if (input[row] >= geometry.target.vocabularySize) {
+            throw std::invalid_argument("prompt token is out of vocabulary");
+          }
+          const std::array<uint32_t, 3> rotary =
+              ropePosition(*sequence.entry, part.logicalPosition + localRow);
+          std::copy(rotary.begin(), rotary.end(), targetPositions + row * 3);
+        }
+        for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
+          for (uint32_t row = capture.absoluteBegin; row < capture.absoluteEnd;
+               ++row) {
+            const uint32_t compactRow = sequence.captureBegin +
+                                        capture.compactDestinationRow + row -
+                                        capture.absoluteBegin;
+            draftPositions[compactRow] = row;
+          }
         }
       }
     }
     return batch;
   }
   void addPackedDraftContext(CommandGraph &graph,
-                             const PackedPrefillBatch &batch) {
-    if (!batch.capturedRows)
+                             const PackedPrefillStep &step,
+                             uint32_t stepIndex,
+                             uint32_t inputBank = 0) {
+    if (!step.capturedRows)
       return;
-    auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
+    auto p = [&](PrefillTensor tensor) {
+      return prefillArena->get(tensor, stepIndex);
+    };
+    auto pi = [&](PrefillTensor tensor) {
+      return prefillArena->get(tensor, stepIndex, inputBank);
+    };
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
+    for (const PackedPrefillSequence &sequence : step.sequences) {
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         DFlashPrefillSpan &span = spans.at(spanCount++);
         span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
         span.rows = capture.absoluteEnd - capture.absoluteBegin;
         span.startPosition = capture.absoluteBegin;
         span.ring = states.draft(sequence.entry->stateLane);
+        // The MTP draft's rolled-token reads and stream anchor: the
+        // span's packed input rows and — on the prompt's tail capture —
+        // the last row's state-lane anchor slot.
+        const ModelBatchItem &part = sequence.part;
+        span.inputRow = sequence.rowBegin + capture.absoluteBegin -
+                        static_cast<uint32_t>(part.logicalPosition);
+        span.inputEnd = sequence.rowBegin +
+                        static_cast<uint32_t>(part.tokenCount);
+        if (capture.absoluteEnd ==
+            part.logicalPosition + part.tokenCount) {
+          span.anchorRow = span.compactRow + span.rows - 1;
+          span.anchor = decodeArena->get(sequence.entry->stateLane,
+                                         DecodeTensor::MtpAnchor);
+        }
       }
     }
     std::visit([&](const auto &model) {
@@ -1921,8 +2032,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           .i8codes = p(PrefillTensor::I8Codes),
           .i8codesLo = p(PrefillTensor::I8CodesLo),
           .i8params = p(PrefillTensor::I8Params),
-          .i8paramsLo = p(PrefillTensor::I8ParamsLo)}},
-        batch.capturedRows, std::span(spans).first(spanCount));
+          .i8paramsLo = p(PrefillTensor::I8ParamsLo)},
+         pi(PrefillTensor::InputTokens),
+         {p(PrefillTensor::MtpStreams), p(PrefillTensor::MtpEh),
+          p(PrefillTensor::MtpEhOut), p(PrefillTensor::MtpPlane),
+          p(PrefillTensor::MtpMappings), p(PrefillTensor::MtpTokens),
+          p(PrefillTensor::MtpEmbed), p(PrefillTensor::MtpEmbedNormed),
+          p(PrefillTensor::MtpKeys), p(PrefillTensor::MtpValues)}},
+        step.capturedRows, std::span(spans).first(spanCount));
     }, draftModel);
   }
   // Returns each lane's draft captures, indexed like `entries`.
@@ -1932,107 +2049,148 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                            std::array<Request *, kLaneCount> &entries,
                            uint32_t inputBank = 0) {
     PackedPrefillBatch batch = preparePackedPrefill(items, entries, inputBank);
-    auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
-    auto pi = [&](PrefillTensor tensor) {
-      return prefillArena->get(tensor, inputBank);
+    auto p = [&](PrefillTensor tensor, uint32_t step) {
+      return prefillArena->get(tensor, step);
+    };
+    auto pi = [&](PrefillTensor tensor, uint32_t step) {
+      return prefillArena->get(tensor, step, inputBank);
     };
 
-    addRopeTables(graph, pi(PrefillTensor::TargetPositions), batch.rows,
-                  pi(PrefillTensor::DraftPositions), batch.capturedRows,
-                  p(PrefillTensor::RopeCos), p(PrefillTensor::RopeSin),
-                  p(PrefillTensor::DraftRopeCos),
-                  p(PrefillTensor::DraftRopeSin),
-                  p(PrefillTensor::RopeCosAlt), p(PrefillTensor::RopeSinAlt));
-
-    targetModel.addEmbedding(graph, pi(PrefillTensor::InputTokens),
-                             p(PrefillTensor::Hidden0), batch.rows);
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
-      addImageRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
-      addAudioRows(graph, *sequence.entry, *sequence.item, sequence.rowBegin);
-    }
-
-    std::array<TargetModelPrefillSequence, kLaneCount> modelSequences{};
-    const uint32_t modelSequenceCount =
-        static_cast<uint32_t>(batch.sequences.size());
-    const uint64_t stateBindingCount = uint64_t{modelSequenceCount} *
-                                       geometry.target.stateLayout.layers;
-    std::vector<MetalBuffer> convolutionIn(stateBindingCount);
-    std::vector<MetalBuffer> convolutionOut(stateBindingCount);
-    std::vector<MetalBuffer> recurrentIn(stateBindingCount);
-    std::vector<MetalBuffer> recurrentOut(stateBindingCount);
-    for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
-      const PackedPrefillSequence &sequence = batch.sequences[lane];
-      TargetModelPrefillSequence &destination = modelSequences[lane];
-      destination.rowBegin = sequence.rowBegin;
-      destination.rows = sequence.item->tokenCount;
-      destination.attentionStride = sequence.attentionStride;
-      destination.queryOffset = sequence.queryOffset;
-      destination.kvOffset = sequence.kvOffset;
-      destination.chunk = sequence.chunk;
-      destination.pageTable = sequence.pageTable;
-      const uint32_t gdnLayers = geometry.target.stateLayout.layers;
-      const uint64_t stateBegin = uint64_t{lane} * gdnLayers;
-      destination.convolutionIn =
-          std::span(convolutionIn).subspan(stateBegin, gdnLayers);
-      destination.convolutionOut =
-          std::span(convolutionOut).subspan(stateBegin, gdnLayers);
-      destination.recurrentIn =
-          std::span(recurrentIn).subspan(stateBegin, gdnLayers);
-      destination.recurrentOut =
-          std::span(recurrentOut).subspan(stateBegin, gdnLayers);
-      // An odd count of unconsumed chunks means the pending command's output
-      // is this chunk's input: bind the parities it will swap between.
-      const bool pendingSwap =
-          (sequence.entry->prefillUnapplied & 1) != 0;
-      const GdnParityBuffers &in = pendingSwap
-          ? states.next(sequence.entry->stateLane)
-          : states.current(sequence.entry->stateLane);
-      const GdnParityBuffers &out = pendingSwap
-          ? states.current(sequence.entry->stateLane)
-          : states.next(sequence.entry->stateLane);
-      for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
-        convolutionIn[stateBegin + layer] = in.convolutionLayers[layer];
-        convolutionOut[stateBegin + layer] = out.convolutionLayers[layer];
-        recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
-        recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
-      }
-      // The state cells' auxiliary region (PLE history + QSA pending keys)
-      // and the block index plane's entries, for the layouts that carry
-      // them — qwen4exp's.
-      if (const uint64_t auxiliary =
-              geometry.target.stateLayout.auxiliaryBytes) {
-        const uint64_t offset =
-            geometry.target.stateLayout.convolutionBytes() +
-            geometry.target.stateLayout.recurrentBytes();
-        destination.auxiliaryIn =
-            backend.view(in.stateBase, offset, auxiliary);
-        destination.auxiliaryOut =
-            backend.view(out.stateBase, offset, auxiliary);
-      }
-      if (geometry.target.kvLayout.indexDimension)
-        destination.indexTable =
-            decodeArena->get(sequence.entry->stateLane,
-                             DecodeTensor::IndexTable);
-      destination.pleRowIds = std::span<const uint32_t>(sequence.pleRowIds);
-      destination.qsaBlocks =
-          std::span<const BlockIndexerBlock>(sequence.qsaBlocks);
-      destination.captureCount = sequence.captures.size();
-      for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
-        const DispatchDraftCaptureSpan &capture = sequence.captures[index];
-        destination.captures[index] = {
-            sequence.rowBegin +
-                static_cast<uint32_t>(capture.absoluteBegin -
-                                      sequence.item->logicalPosition),
-            sequence.captureBegin + capture.compactDestinationRow,
-            capture.absoluteEnd - capture.absoluteBegin};
+    // The host-visible rope tables, embeddings and image rows of each step,
+    // into the step's own views.
+    for (uint32_t at = 0; at < batch.steps.size(); ++at) {
+      const PackedPrefillStep &step = batch.steps[at];
+      // The step's positions views cover its rows from its offset on;
+      // maximumRows is the view's own capacity.
+      const uint32_t positionsRows =
+          static_cast<uint32_t>(
+              pi(PrefillTensor::TargetPositions, at).sizeBytes() /
+              (3 * sizeof(uint32_t)));
+      addRopeTables(graph, pi(PrefillTensor::TargetPositions, at), step.rows,
+                    pi(PrefillTensor::DraftPositions, at), step.capturedRows,
+                    p(PrefillTensor::RopeCos, at), p(PrefillTensor::RopeSin, at),
+                    p(PrefillTensor::DraftRopeCos, at),
+                    p(PrefillTensor::DraftRopeSin, at),
+                    p(PrefillTensor::RopeCosAlt, at),
+                    p(PrefillTensor::RopeSinAlt, at), positionsRows);
+      targetModel.addEmbedding(graph, pi(PrefillTensor::InputTokens, at),
+                               p(PrefillTensor::Hidden0, at), step.rows);
+      for (const PackedPrefillSequence &sequence : step.sequences) {
+        addImageRows(graph, *sequence.entry, sequence.part, sequence.rowBegin);
+        addAudioRows(graph, *sequence.entry, sequence.part, sequence.rowBegin);
       }
     }
-    TargetModelPrefillBuffers buffers = detail::prefillBuffers(*prefillArena);
-    const MetalBuffer finalHidden = targetModel.addPrefill(
-        graph, std::move(buffers),
-        std::span(modelSequences).first(batch.sequences.size()), batch.rows,
+
+    // Each step's lane bindings: a part the boundary splits hands its lane
+    // from the command's scratch cell (PrefillArena::groupCell), which the
+    // lane's own cells carry only at the command's ends.
+    const GdnParityBuffers *groupCell =
+        batch.steps.size() > 1 ? prefillArena->groupCell() : nullptr;
+    const uint32_t gdnLayers = geometry.target.stateLayout.layers;
+    const GdnStateLayout &stateLayout = geometry.target.stateLayout;
+    std::vector<std::array<TargetModelPrefillSequence, kLaneCount>>
+        modelSequences(batch.steps.size());
+    std::vector<std::vector<MetalBuffer>> convolutionIn(batch.steps.size()),
+        convolutionOut(batch.steps.size()), recurrentIn(batch.steps.size()),
+        recurrentOut(batch.steps.size());
+    for (uint32_t at = 0; at < batch.steps.size(); ++at) {
+      const PackedPrefillStep &step = batch.steps[at];
+      const uint64_t stateBindingCount =
+          uint64_t{step.sequences.size()} * gdnLayers;
+      convolutionIn[at].resize(stateBindingCount);
+      convolutionOut[at].resize(stateBindingCount);
+      recurrentIn[at].resize(stateBindingCount);
+      recurrentOut[at].resize(stateBindingCount);
+      for (uint32_t lane = 0; lane < step.sequences.size(); ++lane) {
+        const PackedPrefillSequence &sequence = step.sequences[lane];
+        TargetModelPrefillSequence &destination = modelSequences[at][lane];
+        destination.rowBegin = sequence.rowBegin;
+        destination.rows = sequence.part.tokenCount;
+        destination.attentionStride = sequence.attentionStride;
+        destination.queryOffset = sequence.queryOffset;
+        destination.kvOffset = sequence.kvOffset;
+        destination.chunk = sequence.chunk;
+        destination.pageTable = sequence.pageTable;
+        const uint64_t stateBegin = uint64_t{lane} * gdnLayers;
+        destination.convolutionIn =
+            std::span(convolutionIn[at]).subspan(stateBegin, gdnLayers);
+        destination.convolutionOut =
+            std::span(convolutionOut[at]).subspan(stateBegin, gdnLayers);
+        destination.recurrentIn =
+            std::span(recurrentIn[at]).subspan(stateBegin, gdnLayers);
+        destination.recurrentOut =
+            std::span(recurrentOut[at]).subspan(stateBegin, gdnLayers);
+        // An odd count of unconsumed chunks means the pending command's
+        // output is this chunk's input: bind the parities it will swap
+        // between — or, for a part of a straddled item, the scratch cell
+        // the other step's part reads its written state back from.
+        const bool pendingSwap =
+            (sequence.entry->prefillUnapplied & 1) != 0;
+        const GdnParityBuffers &in = pendingSwap
+            ? states.next(sequence.entry->stateLane)
+            : states.current(sequence.entry->stateLane);
+        const GdnParityBuffers &out = pendingSwap
+            ? states.current(sequence.entry->stateLane)
+            : states.next(sequence.entry->stateLane);
+        const bool firstPart = sequence.part.tokenCount < sequence.item->tokenCount &&
+                               sequence.part.logicalPosition == sequence.item->logicalPosition;
+        const bool lastPart = sequence.part.logicalPosition > sequence.item->logicalPosition;
+        const GdnParityBuffers &partIn = lastPart ? *groupCell : in;
+        const GdnParityBuffers &partOut = firstPart ? *groupCell : out;
+        for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
+          convolutionIn[at][stateBegin + layer] = partIn.convolutionLayers[layer];
+          convolutionOut[at][stateBegin + layer] = partOut.convolutionLayers[layer];
+          recurrentIn[at][stateBegin + layer] = partIn.recurrentLayers[layer];
+          recurrentOut[at][stateBegin + layer] = partOut.recurrentLayers[layer];
+        }
+        // The state cells' auxiliary region (PLE history + QSA pending
+        // keys) and the block index plane's entries, for the layouts that
+        // carry them — qwen4exp's. The scratch cell's auxiliary follows
+        // one layer's state, a lane cell's every layer's.
+        if (const uint64_t auxiliary = stateLayout.auxiliaryBytes) {
+          const uint64_t offset = stateLayout.convolutionBytes() +
+                                  stateLayout.recurrentBytes();
+          const uint64_t groupOffset =
+              stateLayout.convolutionLayerBytes() +
+              stateLayout.recurrentLayerBytes();
+          destination.auxiliaryIn = backend.view(
+              partIn.stateBase, lastPart ? groupOffset : offset, auxiliary);
+          destination.auxiliaryOut = backend.view(
+              partOut.stateBase, firstPart ? groupOffset : offset, auxiliary);
+        }
+        if (geometry.target.kvLayout.indexDimension)
+          destination.indexTable =
+              decodeArena->get(sequence.entry->stateLane,
+                               DecodeTensor::IndexTable);
+        destination.pleRowIds =
+            std::span<const uint32_t>(sequence.pleRowIds);
+        destination.qsaBlocks =
+            std::span<const BlockIndexerBlock>(sequence.qsaBlocks);
+        destination.captureCount = sequence.captures.size();
+        for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
+          const DispatchDraftCaptureSpan &capture = sequence.captures[index];
+          destination.captures[index] = {
+              sequence.rowBegin +
+                  static_cast<uint32_t>(capture.absoluteBegin -
+                                        sequence.part.logicalPosition),
+              sequence.captureBegin + capture.compactDestinationRow,
+              capture.absoluteEnd - capture.absoluteBegin};
+        }
+      }
+    }
+    std::array<TargetModelPrefillChunk, 2> parts;
+    for (uint32_t at = 0; at < batch.steps.size(); ++at) {
+      parts[at].buffers =
+          detail::prefillBuffers(*prefillArena, at);
+      parts[at].sequences =
+          std::span(modelSequences[at]).first(batch.steps[at].sequences.size());
+      parts[at].rows = batch.steps[at].rows;
+    }
+    const std::vector<MetalBuffer> finalHidden = targetModel.addPrefill(
+        graph, std::span(parts).first(batch.steps.size()),
         kvPages.layers(), aneFfn, encoderLayerScalars());
-    addPackedDraftContext(graph, batch);
+    for (uint32_t at = 0; at < batch.steps.size(); ++at)
+      addPackedDraftContext(graph, batch.steps[at], at, inputBank);
 
     // A lane that finishes its prompt copies the prompt's last row to row 0
     // of its Hidden0 block. A constrained lane's completion captures that
@@ -2043,36 +2201,60 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     std::array<InitialSelection, kLaneCount> selections{};
     uint32_t selectionCount = 0;
     lastFinalRows_.clear();
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
-      Request &entry = *sequence.entry;
-      const ModelBatchItem &item = *sequence.item;
-      if (diffusion || entry.replayingGeneration ||
-          item.logicalPosition + item.tokenCount != entry.promptTokens)
-        continue;
-      const uint32_t hidden = geometry.target.hiddenSize;
-      ops::RowCopy::add(
-          graph,
-          prefillU16(finalHidden, sequence.rowBegin, item.tokenCount, hidden),
-          {item.tokenCount - 1, hidden, 0},
-          decodeArena->get(sequence.lane, DecodeTensor::Hidden0),
-          {0, hidden, 0}, 1, hidden);
-      lastFinalHidden_ = finalHidden;
-      lastFinalRows_.push_back(sequence.rowBegin + item.tokenCount - 1);
-      if (entry.constraint != ConstraintMode::None)
-        continue;
-      const bool scoring = !entry.scoreTokens.empty();
-      if (!scoring && samplingEnabled(entry))
-        uploadInitialUniform(entry, sequence.lane);
-      selections[selectionCount++] = {&entry, sequence.lane, !scoring};
+    uint32_t sequenceLanes = 0;
+    for (uint32_t at = 0; at < batch.steps.size(); ++at) {
+      sequenceLanes += batch.steps[at].sequences.size();
+      for (const PackedPrefillSequence &sequence : batch.steps[at].sequences) {
+        Request &entry = *sequence.entry;
+        const ModelBatchItem &part = sequence.part;
+        if (diffusion || entry.replayingGeneration ||
+            part.logicalPosition + part.tokenCount != entry.promptTokens)
+          continue;
+        const uint32_t hidden = geometry.target.hiddenSize;
+        ops::RowCopy::add(
+            graph,
+            prefillU16(finalHidden[at], sequence.rowBegin, part.tokenCount,
+                       hidden),
+            {part.tokenCount - 1, hidden, 0},
+            decodeArena->get(sequence.lane, DecodeTensor::Hidden0),
+            {0, hidden, 0}, 1, hidden);
+        lastFinalHidden_ = finalHidden[at];
+        lastFinalRows_.push_back(sequence.rowBegin + part.tokenCount - 1);
+        if (entry.constraint != ConstraintMode::None)
+          continue;
+        const bool scoring = !entry.scoreTokens.empty();
+        if (!scoring && samplingEnabled(entry))
+          uploadInitialUniform(entry, sequence.lane);
+        selections[selectionCount++] = {&entry, sequence.lane, !scoring};
+      }
     }
     if (selectionCount) {
       encodeInitialSelections(
           graph, std::span(selections).first(selectionCount),
-          static_cast<uint32_t>(batch.sequences.size()));
+          sequenceLanes);
     }
     std::array<DispatchDraftCapturePlan, kLaneCount> captures{};
-    for (const PackedPrefillSequence &sequence : batch.sequences)
-      captures[sequence.lane] = sequence.captures;
+    for (const PackedPrefillStep &step : batch.steps)
+      for (const PackedPrefillSequence &sequence : step.sequences) {
+        DispatchDraftCapturePlan &lane = captures[sequence.lane];
+        for (const DispatchDraftCaptureSpan &span : sequence.captures) {
+          // A part the step boundary splits captures the rest of its item's
+          // spans in the next step: join the piece the lane's last span
+          // ends into so the lane's plan covers its item whole.
+          if (lane.count &&
+              lane.values[lane.count - 1].absoluteEnd == span.absoluteBegin) {
+            DispatchDraftCaptureSpan &last = lane.values[lane.count - 1];
+            last.absoluteEnd = span.absoluteEnd;
+            last.activeRows += span.activeRows;
+            last.materializationRows += span.materializationRows;
+            continue;
+          }
+          if (lane.count == lane.values.size())
+            throw std::logic_error(
+                "more than two draft capture spans in one dispatch");
+          lane.values[lane.count++] = span;
+        }
+      }
     return captures;
   }
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
@@ -2228,6 +2410,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                              std::span<const uint32_t> proposals = {},
                              uint32_t truncLanes = 0);
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
+                            DecodeTensor output, uint32_t lanes,
+                            uint32_t rowFactor = 1,
+                            uint32_t rowStride = kDecodeRows);
+  void encodeDraftInputEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes,
                             uint32_t rowFactor = 1,
                             uint32_t rowStride = kDecodeRows);
@@ -2543,7 +2729,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                           "%04x %04x]\n", lane, raw[0], raw[1], raw[2],
                   raw[3], raw[4], raw[5], raw[6], raw[7]);
         }
-        {
+        try {
           // Gates are packed lanes-contiguous at row_capacity*256 u16 per
           // lane (8192B), not the denseIntermediate 7680-wide stride.
           const auto &gb = decodeArena->packed(DecodeTensor::Intermediate,
@@ -2592,6 +2778,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
               }
             }
           }
+        } catch (...) {
         }
         laneHash(decodeArena->packed(DecodeTensor::Normalized, nlane),
                  "normalized", 1 << 20);
@@ -2607,10 +2794,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                      DecodeTensor::ChunkKeysBase,
                      geometry.target.kvLayout.attentionLayers - 1,
                      nlane), "chunkKeysN", 1 << 20);
-        laneHash(decodeArena->gdnBatchSlice(DecodeTensor::VerifyMixedBase, 0,
-                                            nlane), "gdnMixed0", 1 << 20);
-        laneHash(decodeArena->gdnBatchSlice(DecodeTensor::VerifyPackedBase, 0,
-                                            nlane), "gdnPacked0", 1 << 20);
+        if (geometry.target.stateLayout.layers) {
+          laneHash(decodeArena->gdnBatchSlice(
+                       DecodeTensor::VerifyMixedBase, 0,
+                       nlane), "gdnMixed0", 1 << 20);
+          laneHash(decodeArena->gdnBatchSlice(
+                       DecodeTensor::VerifyPackedBase, 0,
+                       nlane), "gdnPacked0", 1 << 20);
+        }
         laneHash(decodeArena->packed(DecodeTensor::GdnHidden, nlane),
                  "gdnHidden", 1 << 20);
         laneHash(decodeArena->packed(DecodeTensor::Hidden0, nlane),
@@ -2755,10 +2946,35 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // batch of identical prompts, every sequence's last row must hash
         // identically; a mismatch means batched prefill diverged.
         if (lane == 0 && lastFinalHidden_ && lastFinalHidden_.sizeBytes() &&
-            lastFinalRows_.size() > 1) {
+            !lastFinalRows_.empty()) {
           const uint8_t *base =
               contents<uint8_t>(lastFinalHidden_, "last final hidden");
           const size_t rowBytes = geometry.target.hiddenSize * 2;
+          // Per-row bf16 sums for every prompt row: the fingerprint a
+          // RICHENGINE_PREFILL_LIMIT bisection compares against an
+          // external reference's per-block residual sums.
+          {
+            const uint32_t lastRow = lastFinalRows_.back();
+            const size_t cap = lastFinalHidden_.sizeBytes() / rowBytes;
+            for (uint32_t r = 0; r <= lastRow && r < cap; ++r) {
+              const size_t off = size_t(r) * rowBytes;
+              const auto elem = [&](uint32_t c) {
+                const uint16_t u = *reinterpret_cast<const uint16_t *>(
+                    base + off + 2 * c);
+                const uint32_t f = uint32_t{u} << 16;
+                return *reinterpret_cast<const float *>(&f);
+              };
+              double sum = 0.0;
+              for (uint32_t c = 0; c < geometry.target.hiddenSize; ++c)
+                sum += elem(c);
+              const uint32_t h = geometry.target.hiddenSize;
+              fprintf(stderr,
+                      "dump2 finalHidden row%u sum=%.6f "
+                      "e=[%.6f %.6f %.6f .. %.6f %.6f %.6f]\n",
+                      r, sum, elem(0), elem(1), elem(2), elem(h - 3),
+                      elem(h - 2), elem(h - 1));
+            }
+          }
           for (uint32_t s = 0; s < lastFinalRows_.size(); ++s) {
             const size_t off = size_t(lastFinalRows_[s]) * rowBytes;
             if (off + 4096 > lastFinalHidden_.sizeBytes())
@@ -2768,6 +2984,102 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                     (unsigned long long)fnv64(base + off, 4096));
           }
         }
+      }
+      // RICHENGINE_MTP_DUMP: lane 0's MTP pass scratch, anchors, rings and
+      // selector rows to /tmp/mtpdump/step%04u_*.bin — post-step contents,
+      // so a chained reference can bisect the draft's stages offline.
+      if (!lane && !tree && envFlag("RICHENGINE_MTP_DUMP")) {
+        static uint32_t dumpStep = 0;
+        static bool dumpDirReady = [] {
+          std::system("mkdir -p /tmp/mtpdump");
+          return true;
+        }();
+        static_cast<void>(dumpDirReady);
+        const auto dump = [&](const MetalBuffer &buffer,
+                              const char *name) {
+          if (!buffer || !buffer.sizeBytes()) return;
+          char path[160];
+          std::snprintf(path, sizeof(path), "/tmp/mtpdump/step%04u_%s.bin",
+                        dumpStep, name);
+          FILE *file = std::fopen(path, "wb");
+          if (!file) return;
+          const void *data = buffer.contents();
+          if (data) std::fwrite(data, 1, buffer.sizeBytes(), file);
+          std::fclose(file);
+        };
+        const auto dumpTensor = [&](DecodeTensor tensor, const char *name) {
+          try {
+            dump(decodeArena->get(0, tensor), name);
+          } catch (...) {
+          }
+        };
+        dumpTensor(DecodeTensor::MtpAnchor, "anchor");
+        dumpTensor(DecodeTensor::MtpStreams, "streams");
+        dumpTensor(DecodeTensor::MtpEh, "eh");
+        dumpTensor(DecodeTensor::MtpEhOut, "ehout");
+        dumpTensor(DecodeTensor::MtpPlane, "plane");
+        dumpTensor(DecodeTensor::MtpMappings, "mappings");
+        dumpTensor(DecodeTensor::MtpHeadWeights, "headweights");
+        dumpTensor(DecodeTensor::MtpEmbed, "embed");
+        dumpTensor(DecodeTensor::MtpEmbedNormed, "embednormed");
+        dumpTensor(DecodeTensor::MtpAggregate, "aggregate");
+        dumpTensor(DecodeTensor::MtpNormed, "normed");
+        dumpTensor(DecodeTensor::MtpQueries, "queries");
+        dumpTensor(DecodeTensor::MtpKeys, "keys");
+        dumpTensor(DecodeTensor::MtpValues, "values");
+        dumpTensor(DecodeTensor::MtpAttention, "attention");
+        dumpTensor(DecodeTensor::MtpBranch, "branch");
+        dumpTensor(DecodeTensor::MtpShared, "shared");
+        dumpTensor(DecodeTensor::MtpIntermediate, "intermediate");
+        dumpTensor(DecodeTensor::MtpHead, "head");
+        dumpTensor(DecodeTensor::MtpLogits, "logitsscratch");
+        dumpTensor(DecodeTensor::MtpTokenIn, "tokenin");
+        dumpTensor(DecodeTensor::DraftPositions, "draftpositions");
+        dumpTensor(DecodeTensor::DraftInputTokens, "draftinput");
+        dumpTensor(DecodeTensor::InputTokens, "inputtokens");
+        dumpTensor(DecodeTensor::OutputTokens, "outputtokens");
+        dumpTensor(DecodeTensor::ProposedTokens, "proposed");
+        dumpTensor(DecodeTensor::RetainedCount, "retained");
+        dumpTensor(DecodeTensor::AcceptedCount, "accepted");
+        dumpTensor(DecodeTensor::CapturedTargetHidden, "captured");
+        dumpTensor(DecodeTensor::DraftHidden0, "dh0");
+        dumpTensor(DecodeTensor::DraftHidden1, "dh1");
+        dumpTensor(DecodeTensor::DraftNormalized, "dnorm");
+        dumpTensor(DecodeTensor::DraftProposalQkv, "dqkv");
+        dumpTensor(DecodeTensor::DraftQueryKeys, "dqk");
+        dumpTensor(DecodeTensor::DraftQueryValues, "dqv");
+        dumpTensor(DecodeTensor::DraftAttention, "datt");
+        dumpTensor(DecodeTensor::DraftResidual, "dresid");
+        dumpTensor(DecodeTensor::DraftIntermediate, "dinter");
+        dumpTensor(DecodeTensor::DraftFinalHidden, "dfh");
+        try {
+          const uint32_t stateLane =
+              request(items[lane].requestId).stateLane;
+          const auto &rings = states.draft(stateLane);
+          for (uint32_t l = 0; l < rings.size(); ++l) {
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "ringkeys%u", l);
+            dump(rings[l].keys, tag);
+            std::snprintf(tag, sizeof(tag), "ringvalues%u", l);
+            dump(rings[l].values, tag);
+          }
+        } catch (...) {
+        }
+        // The pass-major selector logits: lane 0's pass rows sit at
+        // (pass * lanes + 0) * paddedVocabularySize floats.
+        try {
+          const auto logits = decodeArena->packed(
+              DecodeTensor::Logits, static_cast<uint32_t>(items.size()));
+          const uint64_t stride = geometry.target.paddedVocabularySize *
+                                  sizeof(float);
+          const uint64_t rows =
+              std::min<uint64_t>(8, logits.sizeBytes() / stride);
+          for (uint64_t pass = 0; pass < rows; ++pass)
+            dump(backend.view(logits, pass * stride, stride),
+                 (std::string("passlogits") + std::to_string(pass)).c_str());
+        } catch (...) {
+        }
+        ++dumpStep;
       }
       if (draftDebug_ && !tree) {
         const uint32_t *props = contents<uint32_t>(
@@ -3766,6 +4078,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     settledPredraftGpu_ = 0.0;
     settledPredraftWall_ = 0.0;
     kickAnePredictors(lanes, items);
+    if (envFlag("RICHENGINE_VERIFY_DUMP2"))
+      fprintf(stderr, "dump2 finalize-end items=%zu\n", items.size());
     if (finTiming) {
       const auto f2 = richengine::AwakeClock::now();
       fprintf(stderr, "finalize-detail loop=%.3fms tail=%.3fms\n",

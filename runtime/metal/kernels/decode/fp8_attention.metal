@@ -243,4 +243,114 @@ PAGED_VERIFY_FP8_SPLIT_SWA_R2(verify_attention_fp8_split_swa_k4q4d128_r2, 4, 4, 
 PAGED_VERIFY_FP8_SPLIT_R2_BOTH(verify_attention_fp8_split_k4q4d128_r2, verify_attention_fp8_split_k4q4d128_r2_m8, 4, 4, 128)
 #undef PAGED_VERIFY_FP8_SPLIT_R2
 
+// Nemotron's KV2 group-16 core of 128 (_k2q16d128) on fp8 pages: M = 256
+// fused rows at the chain tile, so the plain split runs the tile's
+// fused-row passes in-kernel at MPasses = 4 (MP = 64, the standard
+// variants' per-pass scratch) and the 8-row tile's M = 128 halves as usual.
+// The chain's _r8 gives each of the eight passes its own threadgroup —
+// the INT8 _rP splits' group.x packing (KV head = group.x / Passes).
+#define PAGED_VERIFY_FP8_SPLIT_MP(Name, Heads, Group, HeadDim, VRows,        \
+                                  Passes)                                    \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(               \
+      device bfloat *queries [[buffer(0)]],                                  \
+      device bfloat *partials [[buffer(1)]],                                 \
+      device float *statistics [[buffer(2)]],                                \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    constexpr uint M = Group * VRows;                                        \
+    constexpr uint MP = M / Passes;                                          \
+    constexpr uint N = RichKvPageTokens;                                     \
+    alignas(16) threadgroup float scores[MP * N];                            \
+    alignas(16) threadgroup half probabilities[MP * N];                      \
+    alignas(16) threadgroup half staged_queries[MP * HeadDim];               \
+    threadgroup float row_max[MP];                                           \
+    threadgroup float row_sum[MP];                                           \
+    threadgroup float previous_scale[MP];                                    \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;              \
+    constexpr uint D = HeadDim;                                              \
+    constexpr ulong group_stride =                                           \
+        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                   \
+    uint kv_head = group.x;                                                  \
+    uint split = group.y;                                                    \
+    uint batch = group.z;                                                    \
+    constant RichVerifyAttentionParams &lane_params = params[batch];         \
+    if (!richengine_verify_attention_contract_valid(lane_params) ||          \
+        kv_head >= Heads || split >= lane_params.split_count)                \
+      return;                                                                \
+    device const RichKvPage *page_table =                                    \
+        batch == 0 ? page_table0                                             \
+                   : (batch == 1 ? page_table1                               \
+                                 : (batch == 2 ? page_table2 : page_table3)); \
+    richengine_paged_attention_tile_fp8<Heads, Group, VRows,                 \
+                                    HeadDim, Passes>(                        \
+        queries + (ulong(batch) * Heads + kv_head) * group_stride,           \
+        page_table, lane_params.kv, kv_head, lane_params.committed_tokens,   \
+        lane_params.active_rows, lane_params.split_count, split, partials,   \
+        statistics,                                                          \
+        (ulong(batch) * Heads + kv_head) * lane_params.slot_splits + split,  \
+        scores, probabilities, row_max, row_sum, previous_scale, &rescale,   \
+        staged_queries, thread_index, lane_params.score_scale, 0, 0,         \
+        Passes);                                                             \
+  }
+
+#define PAGED_VERIFY_FP8_SPLIT_RP(Name, Heads, Group, HeadDim, Passes)       \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(               \
+      device bfloat *queries [[buffer(0)]],                                  \
+      device bfloat *partials [[buffer(1)]],                                 \
+      device float *statistics [[buffer(2)]],                                \
+      device const RichKvPage *page_table0 [[buffer(3)]],                    \
+      device const RichKvPage *page_table1 [[buffer(4)]],                    \
+      device const RichKvPage *page_table2 [[buffer(5)]],                    \
+      device const RichKvPage *page_table3 [[buffer(6)]],                    \
+      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      uint3 group [[threadgroup_position_in_grid]],                          \
+      uint thread_index [[thread_index_in_threadgroup]]) {                   \
+    constexpr uint M = Group * RICHENGINE_TARGET_VERIFY_ROWS;                \
+    constexpr uint MP = M / Passes;                                          \
+    constexpr uint N = RichKvPageTokens;                                     \
+    alignas(16) threadgroup float scores[MP * N];                            \
+    alignas(16) threadgroup half probabilities[MP * N];                      \
+    alignas(16) threadgroup half staged_queries[MP * HeadDim];               \
+    threadgroup float row_max[MP];                                           \
+    threadgroup float row_sum[MP];                                           \
+    threadgroup float previous_scale[MP];                                    \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;              \
+    constexpr uint D = HeadDim;                                              \
+    constexpr ulong group_stride =                                           \
+        ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * Group * D;                   \
+    uint kv_head = group.x / Passes;                                         \
+    uint split = group.y;                                                    \
+    uint batch = group.z;                                                    \
+    constant RichVerifyAttentionParams &lane_params = params[batch];         \
+    if (!richengine_verify_attention_contract_valid(lane_params) ||          \
+        kv_head >= Heads || split >= lane_params.split_count)                \
+      return;                                                                \
+    device const RichKvPage *page_table =                                    \
+        batch == 0 ? page_table0                                             \
+                   : (batch == 1 ? page_table1                               \
+                                 : (batch == 2 ? page_table2 : page_table3)); \
+    const uint pass = group.x % Passes;                                      \
+    richengine_paged_attention_tile_fp8<Heads, Group,                        \
+        RICHENGINE_TARGET_VERIFY_ROWS, HeadDim, Passes>(                     \
+        queries + (ulong(batch) * Heads + kv_head) * group_stride,           \
+        page_table, lane_params.kv, kv_head, lane_params.committed_tokens,   \
+        lane_params.active_rows, lane_params.split_count, split, partials,   \
+        statistics,                                                          \
+        (ulong(batch) * Heads + kv_head) * lane_params.slot_splits + split,  \
+        scores, probabilities, row_max, row_sum, previous_scale, &rescale,   \
+        staged_queries, thread_index, lane_params.score_scale, 0, pass,      \
+        pass + 1);                                                           \
+  }
+
+PAGED_VERIFY_FP8_SPLIT_MP(verify_attention_fp8_split_k2q16d128, 2, 16, 128, RICHENGINE_TARGET_VERIFY_ROWS, 4)
+PAGED_VERIFY_FP8_SPLIT_MP(verify_attention_fp8_split_k2q16d128_m8, 2, 16, 128, 8, 2)
+PAGED_VERIFY_FP8_SPLIT_RP(verify_attention_fp8_split_k2q16d128_r8, 2, 16, 128, 8)
+#undef PAGED_VERIFY_FP8_SPLIT_MP
+#undef PAGED_VERIFY_FP8_SPLIT_RP
+
 #endif // __HAVE_METAL_FP8_E4M3_FORMAT_TYPE__

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <execinfo.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -946,6 +947,23 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   w.weightLayout = p.layout();
   const std::array<const Projection *, 2> projections{&p, gate};
   LinearPlan plan(w, baseline(w, projections), p.destination);
+  // An all-float projection dispatches the fp32 kernels on the raw input
+  // rows (addGgufFloatSegments) whatever the plan's tile — a register tile
+  // would only ask the producer for the Table16 input they cannot read.
+  // The staged tile's input is plain.
+  if (plan.configuration().tile == LinearTile::GgufRegister) {
+    bool floats = true;
+    for (const Projection *q : projections) {
+      if (!q) continue;
+      floats = floats && q->layout() == WeightLayout::Block32;
+      if (floats)
+        for (const QuantizedSegment &s : q->blocks().segments)
+          floats = s.isFloat();
+    }
+    if (floats)
+      plan = LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged},
+                        p.destination);
+  }
   plan.rotated_ = static_cast<bool>(p.rotation);
   plan.packs_ = (packsPrefill(policy_, w) && (hasMxfp4(&p) || hasMxfp4(gate))) ||
                 packsDecode(policy_, w, &p, gate);

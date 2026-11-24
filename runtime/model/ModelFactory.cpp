@@ -5,6 +5,8 @@
 #include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/MaxwellMtpDraft.hpp"
+#include "model/NemotronMtpDraft.hpp"
 #include "model/ModelRegistry.hpp"
 #include "model/OqTarget.hpp"
 #include "model/TargetLoader.hpp"
@@ -75,12 +77,24 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   const bool dflashV1Draft = result.descriptor.draft.kind == DraftKind::DFlashV1;
   const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
   const bool dspineDraft = result.descriptor.draft.kind == DraftKind::DSpline;
+  const bool mtpDraft = result.descriptor.draft.kind == DraftKind::Mtp;
+  // Maxwell's MTP reads its block out of the target GGUF; nemotron's is a
+  // checkpoint dir like the other drafts.
+  const bool nemotronMtpDraft =
+      mtpDraft && result.descriptor.target.arch == "nemotron";
+  std::optional<WeightFile> mtpImage;
+  uint64_t mtpBaseline = 0;
   std::optional<DFlash2CheckpointLoader> draft;
   std::optional<DFlashV1DraftCheckpointLoader> dflashV1DraftLoader;
   std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
   std::optional<DSplineCheckpointLoader> dspineDraftLoader;
-  if (result.descriptor.draftFromCheckpoint() && !nullDraft) {
-    if (dflashV1Draft)
+  std::optional<NemotronMtpCheckpointLoader> nemotronMtpDraftLoader;
+  if (result.descriptor.draftFromCheckpoint() && !nullDraft &&
+      !(mtpDraft && !nemotronMtpDraft)) {
+    if (nemotronMtpDraft)
+      nemotronMtpDraftLoader.emplace(images, root / "draft",
+                                     result.descriptor.draft);
+    else if (dflashV1Draft)
       dflashV1DraftLoader.emplace(images, root / "draft", result.descriptor.draft);
     else if (dsparkDraft)
       dsparkDraftLoader.emplace(images, root / "draft", result.descriptor.draft);
@@ -137,14 +151,22 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
     }
     break;
   case TargetSource::Gguf:
-    if (layout.packedOnly)
-      throw std::invalid_argument(
-          "this target loads from packed files only");
+    // ggufTargetGeometry throws for a layout without a GGUF image plan —
+    // the packed-only ones (Gemma 4) named in its message.
     {
       GgufTargetLoader loader(backend, images, findTargetGguf(directory),
                               ggufTargetGeometry(layout));
       targetBlock = true;
       result.target = readTarget(backend, layout, std::ref(loader));
+      // The MTP draft's weights are sections of the same GGUF's mtp.bin
+      // image — open it while the loader lives.
+      if (mtpDraft) {
+        // Capture the baseline before the image's buffer allocates — the
+        // draft weights' sections are views of it, so their own delta is
+        // zero.
+        mtpBaseline = backend.memoryStats().allocatedBytes;
+        mtpImage = loader.mtp();
+      }
     }
     break;
   default:
@@ -182,6 +204,25 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
             ? DSplineDraftFiles(std::ref(*dspineDraftLoader))
             : DSplineDraftFiles(PackedDSplineDraftFiles{images, root / "draft", result.descriptor.draft}),
         result.descriptor.draft, &head);
+  } else if (mtpDraft) {
+    if (nemotronMtpDraft) {
+      result.draft = loadNemotronMtpDraftWeights(
+          backend,
+          nemotronMtpDraftLoader
+              ? NemotronMtpDraftFiles(std::ref(*nemotronMtpDraftLoader))
+              : NemotronMtpDraftFiles(
+                    PackedNemotronMtpFiles{images, root / "draft",
+                                           result.descriptor.draft}),
+          result.descriptor.draft,
+          std::get<TargetModelWeights>(result.target));
+    } else {
+    if (!mtpImage)
+      throw std::invalid_argument(
+          "the maxwell MTP draft requires a GGUF target");
+    result.draft = loadMaxwellMtpDraftWeights(
+        backend, result.descriptor.draft, std::move(*mtpImage),
+        std::get<MaxwellMoeWeights>(result.target), mtpBaseline);
+    }
   } else {
     result.draft = loadDFlashDraftWeights(
         backend,
@@ -287,7 +328,8 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     }
   }
   if (descriptor.draftFromCheckpoint() &&
-      descriptor.draft.kind != DraftKind::Null) {
+      descriptor.draft.kind != DraftKind::Null &&
+      descriptor.draft.kind != DraftKind::Mtp) {
     auto draftImagesFor = [&descriptor] {
       return descriptor.draft.kind == DraftKind::DFlashV1
                  ? dflashV1DraftCheckpointImages(descriptor.draft)

@@ -125,11 +125,14 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
 
 // One threadgroup: 4 simdgroups x GGUF_REGISTER_COLUMNS = GGUF_TILE_COLUMNS columns of one segment,
 // L request lanes of eight rows, one K partition (tg.y) of `splits`, into a destination of type Out.
+// `row0` shifts the weight columns' plane addressing alone (the MoE expert
+// kernels' row0: a routed expert's first row in the planes' tile-major
+// image, not necessarily a tile boundary); 0 for whole-tensor segments.
 template <class F, uint L, GgufEpilogue Ep, class Out>
 inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
                    device uchar *w1, device uchar *meta, device Out *out,
                    device coherent(device) float *partials, device atomic_uint *counters,
-                   device const bfloat *aux, const GgufDecodeParams p, uint2 tg, uint tid, uint sg,
+                   device const bfloat *aux, const GgufDecodeParams p, uint row0, uint2 tg, uint tid, uint sg,
                    uint lane, threadgroup const bfloat2 *lut, threadgroup Coef<F> *coefs,
                    threadgroup uint *arrival) {
   typedef Shape<F> S;
@@ -141,8 +144,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   const uint u0 = tg.y * units / splits, u1 = (tg.y + 1) * units / splits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint fm = l.fm, fn = l.fn, c = fn / 2;
-  const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS, plane_tile = base / QUANT_TILE_ROWS,
-             plane_row = base % QUANT_TILE_ROWS;
+  const uint base = tg.x * GGUF_TILE_COLUMNS + sg * GGUF_REGISTER_COLUMNS;
+  const uint wbase = row0 + base, plane_tile = wbase / QUANT_TILE_ROWS,
+             plane_row = wbase % QUANT_TILE_ROWS;
   constexpr uint NC = GGUF_REGISTER_COLUMNS;
   threadgroup C *cu = coefs + sg * NC * S::J;
 
@@ -319,7 +323,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
     threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F>];                                                 \
     threadgroup uint arrival;                                                                               \
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);                                                                              \
-    gguf_sg::decode<F, L, EP>(table, sums, w0, w1, meta, out, partials, counters, aux, p, tg, tid, sg, lane, \
+    gguf_sg::decode<F, L, EP>(table, sums, w0, w1, meta, out, partials, counters, aux, p, 0, tg, tid, sg, lane, \
                               lut, coefs, &arrival);                                                        \
   }
 // Each epilogue into bf16, and the plain one also into fp32 (_a_f32: the logits, ops::Projection::destination).
@@ -364,7 +368,7 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   pick([&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
-    gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
+    gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, 0, local,
                                               tid, sg, lane, lut,
                                               reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs), &arrival);
   });
@@ -432,7 +436,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, 1, Ep>(
         table + rows * K, sums + tile_row * table16_sums_per_tile(K), s.w0, s.w1, s.meta, out + rows * N, nullptr, nullptr,
-        aux + rows * N, q, uint2(colb, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
+        aux + rows * N, q, s.row0, uint2(colb, 0), tid, sg, lane, lut, reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs),
         arrival);
   });
 }

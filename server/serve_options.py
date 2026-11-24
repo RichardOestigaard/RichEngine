@@ -537,6 +537,15 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--recalibrate-ane",
+        dict(
+            action="store_true",
+            default=False,
+            help="calibrate the Neural Engine's share of long prompts again at "
+            "this start instead of taking the one this Mac kept",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         dict(
             action="store_true",
@@ -594,6 +603,10 @@ def add_serve_arguments(parser):
 
 def check_serve_arguments(parser, args):
     """The checks of the shared options that involve more than one."""
+    if args.recalibrate_ane and args.disable_ane:
+        parser.error(
+            "--recalibrate-ane needs the Neural Engine --disable-ane turns off"
+        )
     if args.announce_served_name and not args.served_model_name:
         parser.error("--announce-served-name needs --served-model-name")
     if args.persistent_cache and not args.max_cache_disk:

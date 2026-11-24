@@ -72,6 +72,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (richengine serve --disable-ane turns
   // it off).
   bool neuralEngine = true;
+  // --recalibrate-ane on|off: calibrate this Mac's ANE FFN split again, none
+  // of what it remembered of the model serving (richengine serve
+  // --recalibrate-ane).
+  bool recalibrateAne = false;
   // --moe-union EXPERTS: the decode step's routed-expert budget per MoE
   // dispatch — a verify pass's rows share that many experts, the rest of
   // their routes dropped. 0 keeps every route.
@@ -313,6 +317,10 @@ NativeArguments parseArguments(int argc, char **argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--recalibrate-ane") {
+      if (value != "on" && value != "off")
+        throw UsageError("--recalibrate-ane requires on or off");
+      result.recalibrateAne = value == "on";
     } else if (option == "--weight-layout") {
       if (value != "auto" && value != "block" && value != "affine")
         throw UsageError("--weight-layout requires auto, block or affine");
@@ -371,6 +379,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.aneFfn.recalibrate = arguments.recalibrateAne;
   // RICHENGINE_ANE_D1=<share>: a d1 decision model's opt-in split — measured
   // up to 2x slower than the GPU (docs/ANE_EXPERIMENTS.md), serving for the
   // GPU work it frees. 0 or unset leaves the GPU alone.

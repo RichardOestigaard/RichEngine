@@ -329,10 +329,13 @@ int main(int argc, char **argv) {
                                       model.stateLayout(), nullptr);
 
       // The prefill FFN's Neural Engine split (--ane-ffn-share), prepared as
-      // a start prepares it (engine::startAneFfn): a given share serves
-      // without calibrating, "auto" calibrates once and remembers. The pages
-      // above are already committed, so the memory plan here only checks the
-      // split leaves the model's own footprint room, not the pool's.
+      // a start prepares it (engine::startAneFfn, engine::finishAneFfn once
+      // the runtime has prefilled a full chunk on the GPU alone): a given
+      // share serves without calibrating, "auto" calibrates once and
+      // remembers. The pages above are already committed, so the memory plan
+      // here only checks the split leaves the model's own footprint room,
+      // not the pool's.
+      engine::AneFfnStart started;
       std::unique_ptr<ops::FfnSplit> aneFfn;
       if (aneFfnShare || aneFfnCalibrate) {
         if (aneFfnCalibrate && aneFfnMinimumRows)
@@ -355,7 +358,7 @@ int main(int argc, char **argv) {
             aneFfnCalibrate
                 ? engine::AneFfnSetting{}
                 : engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
-        engine::AneFfnStart started = engine::startAneFfn(
+        started = engine::startAneFfn(
             engine::aneFfnModel(backend, model, operators, format, "decode-profile", {}),
             setting, 0, planMemory, {});
         std::printf("ane-ffn %s: %s\n",
@@ -367,6 +370,27 @@ int main(int argc, char **argv) {
       }
       model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
       model::Runtime executor(context);
+      // A split the start left pending is set up once the runtime has
+      // prefilled a full chunk on the GPU alone, whose GPU time gives the
+      // mixer, on the runtime's own prefill buffers, which then takes it.
+      if (started.outcome.kind == engine::AneFfnOutcome::Kind::Pending) {
+        const double before = executor.telemetry().totalPrefillGpuSeconds;
+        static_cast<void>(executor.warmupPrefill(ops::FfnSplit::kMaximumRows));
+        const double prefillMilliseconds =
+            1000.0 * (executor.telemetry().totalPrefillGpuSeconds - before);
+        engine::AneFfnTiming timing;
+        timing.buffers = [&](const engine::AneFfnTiming::Use &use) { executor.withPrefillFfn(use); };
+        engine::AneFfnFinished finished = engine::finishAneFfn(
+            engine::aneFfnModel(backend, model, operators, format, "decode-profile", timing),
+            started, prefillMilliseconds, {});
+        std::printf("ane-ffn-finished %s: %s\n",
+                    std::string(engine::aneFfnOutcomeName(finished.outcome.kind)).c_str(),
+                    finished.outcome.reason.c_str());
+        if (finished.outcome.kind == engine::AneFfnOutcome::Kind::Unavailable)
+          throw std::runtime_error("the Neural Engine split is unavailable: " + finished.outcome.reason);
+        aneFfn = std::move(finished.split);
+        executor.setAneFfn(aneFfn.get());
+      }
 
       std::printf("device %s, %u prompt tokens, %u cycles per width\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,

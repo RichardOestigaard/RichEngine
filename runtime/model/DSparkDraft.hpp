@@ -39,6 +39,9 @@ struct DSparkDraftWeights final {
   // markov_w1 and markov_w2, [vocabularySize][markovRank] bf16 rows each.
   metal::MetalBuffer markovEmbedding;
   metal::MetalBuffer markovProjection;
+  // The draft's own embed_tokens (has_embed_tokens — Nemotron's draft
+  // trains a mask row); empty when the block embeds from the target's.
+  ops::EmbeddingWeights tokenEmbedding;
   // confidence_head.proj, [1][hiddenSize + markovRank] plus its bias; loaded
   // for completeness, unused this phase.
   metal::MetalBuffer confidenceWeight;

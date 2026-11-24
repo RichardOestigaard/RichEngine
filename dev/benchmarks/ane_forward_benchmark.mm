@@ -453,9 +453,9 @@ double chainN(MetalBackend &backend, ane::Handoff &handoff, std::span<const Prob
     }
   }
   static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
-  const std::optional<AwakeClock::duration> ran = handoff.finish();
+  const std::optional<ane::Handoff::Ran> ran = handoff.finish();
   if (!ran) throw std::runtime_error("ANE chain failed (" + handoff.reason() + ")");
-  return std::chrono::duration<double, std::milli>(*ran).count() / k;
+  return std::chrono::duration<double, std::milli>(ran->total).count() / k;
 }
 double chain(MetalBackend &backend, ane::Handoff &handoff, const Probe &probe, uint32_t k,
              const std::function<void(CommandGraph &)> &dispatch) {

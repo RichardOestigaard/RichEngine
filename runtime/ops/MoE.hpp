@@ -35,15 +35,64 @@ struct MoeShape final {
   // Whether every row carries a shared-expert route (id `experts`) weighted
   // by the sigmoid of its scalar gate, as the Qwen MoE does.
   bool sharedExpert = true;
+  // NVIDIA Nemotron's ungated experts: the projections are up and down
+  // alone (no gate slab, BlockMoeWeights::gate stays empty) and the up pass
+  // stores relu(up)^2 instead of silu(gate) * up — the EpReluSquared
+  // epilogue of the `_r` kernels. GGUF blocks only.
+  bool ungatedExperts = false;
+  // A shared expert whose route weight is a constant 1 — no scalar gate
+  // (sharedScalarGate stays empty; the block still carries expertBias for
+  // the routed select) — run on the dense shared passes
+  // (moe_shared_gguf_*, grouping shared == 2), so its intermediate width
+  // does not have to match the routed experts'.
+  bool sharedExpertUnitWeight = false;
+  // The shared expert's intermediate width when it differs from the routed
+  // experts' (Nemotron's is twice). Zero reads expertIntermediateSize.
+  // Only the unit-weight dense passes honor it.
+  uint32_t sharedExpertIntermediateSize = 0;
+  // The routed scaling factor the select multiplies the norm_topk_prob
+  // weights by (GGUF expert_weights_scale; Nemotron's is 2.5).
+  float expertWeightScale = 1.0f;
+  // Whether every block's experts are resident and in formats the int8
+  // prefill tile takes (TargetModelGeometry::moeInt8Experts): its prefill
+  // plans then run the int8 passes and size their scratch
+  // (MoeConfig::int8Passes).
+  bool int8Experts = false;
+
+  // The shared expert's intermediate width (expertIntermediateSize unless
+  // sharedExpertIntermediateSize overrides it).
+  [[nodiscard]] constexpr uint32_t sharedIntermediate() const noexcept {
+    return sharedExpertIntermediateSize ? sharedExpertIntermediateSize
+                                        : expertIntermediateSize;
+  }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     if ((weightLayout != WeightLayout::Affine64 &&
          weightLayout != WeightLayout::Block32) ||
-        !hiddenSize || hiddenSize % 256 != 0 || !experts || !expertsPerToken ||
+        !hiddenSize || !experts || !expertsPerToken ||
         expertsPerToken > experts || !expertIntermediateSize)
       return false;
+    // Ungated experts are a GGUF-block-only feature (the affine slabs'
+    // fused gate/up tiles have no relu^2 form), and an ungated block's
+    // shared expert is either absent or unit-weight: the scalar-gated
+    // shared route needs the gated select and passes. The unit-weight
+    // route and the separate shared intermediate only exist on the
+    // ungated dense passes.
+    if ((ungatedExperts && weightLayout != WeightLayout::Block32) ||
+        (ungatedExperts && sharedExpert && !sharedExpertUnitWeight) ||
+        (sharedExpertUnitWeight && (!ungatedExperts || !sharedExpert)) ||
+        (sharedExpertIntermediateSize &&
+         (!sharedExpertUnitWeight || sharedExpertIntermediateSize % 64 != 0)))
+      return false;
+    // The ungated block path bounds its 256-column gather and combine
+    // blocks (moe_gather_rows, moe_combine) and stages 64-column tiles, so
+    // it needs only the 64 alignment the tile math requires of K; every
+    // other shape keeps the affine kernels' 256.
+    const bool ungatedBlock = ungatedExperts;
+    if (hiddenSize % (ungatedBlock ? 64u : 256u) != 0)
+      return false;
     if (experts <= MOE_EXPERT_SLOTS)
-      return expertIntermediateSize % 256 == 0;
+      return expertIntermediateSize % (ungatedBlock ? 64u : 256u) == 0;
     // More experts than the routing kernels' slots hold: the wide (_e512)
     // family routes a GGUF block with a shared expert on 512-slot scores
     // and 512-slot select and grouping instances (upstream's
@@ -84,7 +133,10 @@ struct BlockExpertProjection final {
 // scalar gate are float tensors llama.cpp keeps unquantized, and they run in
 // fp32. A target without a shared expert (sharedExpert false) leaves the
 // shared segments empty and carries the F32 per-expert selection bias
-// (exp_probs_b) instead.
+// (exp_probs_b) instead. An ungated block (MoeShape::ungatedExperts) leaves
+// `gate` empty, and a unit-weight shared expert (sharedExpertUnitWeight)
+// leaves sharedScalarGate empty but keeps expertBias, whose segments the
+// shared up and down segments size by MoeShape::sharedIntermediate().
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
@@ -182,6 +234,13 @@ struct MoeWorkspace final {
   // (kernels/common/split_reduce.h); counters self-reset, so zero init once.
   uint64_t expertPartialsBytes = 0;
   uint64_t expertCountersBytes = 0;
+  // The int8 passes' (MoeConfig::int8Passes): the chunk's input rows as
+  // int8 codes and their scales per 64 inputs, and the grouped rows' (the
+  // input's, then the intermediate's), a row per grouped slot.
+  uint64_t inputCodesBytes = 0;
+  uint64_t inputScalesBytes = 0;
+  uint64_t groupedCodesBytes = 0;
+  uint64_t groupedScalesBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -212,6 +271,14 @@ struct MoeScratch final {
   // tile, and the splits' arrival counters of split_reduce.h.
   metal::MetalBuffer expertPartials;
   metal::MetalBuffer expertCounters;
+  // The int8 passes' (MoeConfig::int8Passes): the chunk's input rows as
+  // int8 codes and their scales per 64 inputs, and the grouped rows' codes
+  // and scales — the input's first, then the intermediate's for the down
+  // pass. Empty for plans without them.
+  metal::MetalBuffer inputCodes;
+  metal::MetalBuffer inputScales;
+  metal::MetalBuffer groupedCodes;
+  metal::MetalBuffer groupedScales;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -219,7 +286,7 @@ struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
 };
-inline constexpr std::array<MoeScratchField, 13> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 17> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
@@ -233,6 +300,10 @@ inline constexpr std::array<MoeScratchField, 13> kMoeScratchFields{{
     {&MoeScratch::groupedPacked, &MoeWorkspace::groupedPackedBytes},
     {&MoeScratch::expertPartials, &MoeWorkspace::expertPartialsBytes},
     {&MoeScratch::expertCounters, &MoeWorkspace::expertCountersBytes},
+    {&MoeScratch::inputCodes, &MoeWorkspace::inputCodesBytes},
+    {&MoeScratch::inputScales, &MoeWorkspace::inputScalesBytes},
+    {&MoeScratch::groupedCodes, &MoeWorkspace::groupedCodesBytes},
+    {&MoeScratch::groupedScales, &MoeWorkspace::groupedScalesBytes},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -298,6 +369,10 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
 [[nodiscard]] inline MoeGgufTile moeGgufTile(const DevicePolicy &device, MoeShape shape) noexcept {
+  // Ungated experts have no register tile (the Table16 gathers' 256-column
+  // blocks do not bound their ragged last block); staged it is.
+  if (shape.ungatedExperts)
+    return MoeGgufTile::Staged;
   // RICHENGINE_MOE_GGUF_TILE=register|staged forces the tile for a family
   // the policy has not measured (Apple10's staged K-quants).
   const std::string_view env = richengine::tuning().moeGgufTile;
@@ -359,6 +434,10 @@ struct MoeConfig final {
   // Decode plans only: route through the 16x64 score tile instead of the
   // 8x32 tile when the 32-row tile would not already be selected.
   bool routeM16 = false;
+  // A resident block's prefill passes on int8 activations where its expert
+  // projections are formats the int8 prefill tile takes (MoE::add's
+  // addInt8Experts, kernels/shared/moe_int8.metal).
+  bool int8Passes = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

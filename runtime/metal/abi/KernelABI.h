@@ -12,6 +12,7 @@
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/LfmConv.h"
 #include "metal/abi/Linear.h"
+#include "metal/abi/Mamba2.h"
 #include "metal/abi/MoE.h"
 #include "metal/abi/NgramEmbedding.h"
 #include "metal/abi/PagedAttention.h"

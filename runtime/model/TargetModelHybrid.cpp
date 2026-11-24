@@ -11,6 +11,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
+#include "ops/Mamba2.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -365,11 +366,24 @@ void TargetModel::addStateCommit(metal::CommandGraph &graph,
   // pending keys) reads the lane cells and retained counts the shared
   // commit below consumes; keep them for it.
   const TargetModelCommitBuffers commit = buffers;
+  if (geometry_.mambaLayers) {
+    // nemotron's Mamba-2 cells: the retained prefix's packed in_proj rows
+    // replay the conv FIFO and the recurrent scan like the GDN commit's.
+    ops::Mamba2::addCommit(
+        graph,
+        {std::move(buffers.packed), std::move(buffers.mixed),
+         std::move(buffers.decay), weights_->mambaDecays,
+         buffers.currentStates, buffers.nextStates,
+         std::move(buffers.retainedCounts)},
+        geometry_.mambaShape(), geometry_.stateLayout.layers, lanes,
+        {geometry_.stateLayout.convolutionLayerBytes(),
+         geometry_.stateLayout.recurrentLayerBytes(),
+         geometry_.stateLayout.convolutionBytes()},
+        verifyStride);
+    encoder_->commitState(graph, commit, lanes, verifyStride);
+    return;
+  }
   if (!geometry_.gdnLayers) {
-    // LFM2's conv FIFOs: every conv layer rolls its lanes' states forward by
-    // the retained rows' bx, kept in VerifyMixedBase like the GDN's. The
-    // layer's slice of it is lane-major with the decode row count's stride.
-    if (!geometry_.convLayers) return;
     const uint32_t laneStride = verifyStride *
                                 geometry_.convolutionDimension * 2;
     const uint64_t layerBytes =
@@ -407,6 +421,9 @@ void TargetModel::addStateCommitTree(metal::CommandGraph &graph,
                                     uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || !retainedPath)
     throw std::invalid_argument("invalid tree state commit batch");
+  if (geometry_.mambaLayers)
+    throw std::invalid_argument(
+        "mamba2 commit does not support tree verify");
   if (!geometry_.gdnLayers) {
     // LFM2's conv FIFOs: one dispatch rolls every conv layer's lanes forward
     // by the retained path's bx rows — the tree counterpart of the chain

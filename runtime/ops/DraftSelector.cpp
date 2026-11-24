@@ -65,7 +65,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
@@ -103,7 +103,7 @@ void DraftSelector::addTree(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectEdges),
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
@@ -143,7 +143,7 @@ void DraftSelector::addPlain(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlain),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
@@ -174,7 +174,7 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlainTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
@@ -189,15 +189,22 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
                               const DraftMarkovHead &markov,
                               std::span<const uint32_t> anchors,
                               std::span<const SamplingPolicy> policies,
-                              uint32_t queryRows) const {
+                              uint32_t queryRows, uint32_t rowOffset) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (!markov.rank ||
+      markov.rank > RICHENGINE_DRAFT_SELECTOR_RANK_MAXIMUM ||
+      markov.embedding.sizeBytes() <
+          uint64_t{vocabulary_} * markov.rank * 2 ||
+      markov.projection.sizeBytes() < uint64_t{vocabulary_} * markov.rank * 2)
+    throw std::invalid_argument("invalid draft Markov head");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
+  params.rank = markov.rank;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
     params.temperature[lane] = policies[lane].temperature;
@@ -206,7 +213,7 @@ void DraftSelector::addDSpark(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDsparkSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
@@ -225,16 +232,24 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
                               const DraftMarkovHead &markov,
                               std::span<const uint32_t> anchors,
                               std::span<const SamplingPolicy> policies,
-                              uint32_t treeMask, uint32_t queryRows) const {
+                              uint32_t treeMask, uint32_t queryRows,
+                              uint32_t rowOffset) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (!markov.rank ||
+      markov.rank > RICHENGINE_DRAFT_SELECTOR_RANK_MAXIMUM ||
+      markov.embedding.sizeBytes() <
+          uint64_t{vocabulary_} * markov.rank * 2 ||
+      markov.projection.sizeBytes() < uint64_t{vocabulary_} * markov.rank * 2)
+    throw std::invalid_argument("invalid draft Markov head");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.query_rows = queryRows;
   params.vocabulary = vocabulary_;
   params.tree_mask = treeMask;
+  params.rank = markov.rank;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
     params.temperature[lane] = policies[lane].temperature;
@@ -243,7 +258,7 @@ void DraftSelector::addDSparkTree(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDsparkSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDsparkSelectEdges),
             {buffers.partialIds, buffers.partialValues, markov.embedding,
@@ -280,7 +295,7 @@ void DraftSelector::addPool(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,
@@ -320,7 +335,7 @@ void DraftSelector::addPoolTree(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDflashSelectPoolEdges),
             {buffers.partialIds, buffers.partialValues, buffers.selectorHidden,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "MaxwellMtpBuffers.hpp"
 #include "Model.hpp"
 #include "StateLayout.hpp"
 #include "WeightImages.hpp"
@@ -77,7 +78,7 @@ private:
 // gated adjacent writes of each position's predicted feature into its
 // successor; the bridge writes run as the dspline_bridge_* kernels between
 // the plain layers, the serial last-write refinement stays deferred).
-enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, DSpline, Null };
+enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, DSpline, Mtp, NemotronMtp, Null };
 
 // The kind's user-facing name; Null reads "none" since the n-gram predraft
 // still proposes for a draft-less family.
@@ -87,6 +88,8 @@ inline constexpr std::string_view draftKindName(DraftKind kind) {
   case DraftKind::DFlashV1: return "DFlash";
   case DraftKind::DSpark: return "DSpark";
   case DraftKind::DSpline: return "DSpline";
+  case DraftKind::Mtp: return "MTP";
+  case DraftKind::NemotronMtp: return "Nemotron MTP";
   default: return "none";
   }
 }
@@ -146,6 +149,26 @@ struct DFlashDraftLayout final {
   uint32_t bridgeRank = 0;
   uint32_t bridgeWriteLayers = 0;
   uint32_t bridgeHeadTopk = 0;
+  // DSpark only: the layer stack's per-head attention-sink bias
+  // (layers.N.self_attn.attention_sink_bias, [queryHeads] bf16 — the
+  // Nemotron-3.5-Lightning DSpark draft): each head's softmax denominator
+  // gains exp(sink) with no K/V row, GPT-OSS style. And whether the
+  // checkpoint carries the confidence head (enable_confidence_head);
+  // every shipped DSpark draft except Nemotron's does.
+  bool attentionSinks = false;
+  bool confidenceHead = true;
+  // The draft carries its own embed_tokens (has_embed_tokens — Nemotron's
+  // DSpark draft trains a mask embedding the target's table lacks); the
+  // block's input rows gather it instead of the target's.
+  bool tokenEmbedding = false;
+  // A bonus-anchor DSpark (Nemotron's, dspark_bonus_anchor): its config's
+  // block_size counts the input block's rows — the anchor plus
+  // block_size - 1 masks — and block row 0 is a bonus slot whose output
+  // reproduces the anchor, so the proposals read block rows
+  // 1..blockSize - 1. The anchor-first dialects declare emitted proposals
+  // instead: their block is the anchor plus block_size masks and row 0 is
+  // already a real prediction (sample_from_anchor).
+  bool bonusAnchor = false;
 
   // The trained block's usable proposal count. A plain or DFlash2
   // block_size counts the block's query rows (the anchor among them);
@@ -155,7 +178,9 @@ struct DFlashDraftLayout final {
     if (kind == DraftKind::Null || !blockSize)
       return ExecutionLimits::draftProposalTokens;
     const uint32_t trained =
-        kind == DraftKind::DSpark ? blockSize : blockSize - 1;
+        kind == DraftKind::DSpark
+            ? (bonusAnchor ? blockSize - 1 : blockSize)
+            : blockSize - 1;
     return std::min(trained, ExecutionLimits::draftProposalTokens);
   }
 
@@ -174,7 +199,9 @@ struct DFlashDraftLayout final {
     if (!allowVerifyNarrow())
       return ExecutionLimits::targetVerifyRows;
     const uint32_t trained =
-        kind == DraftKind::DSpark ? blockSize + 1 : blockSize;
+        kind == DraftKind::DSpark
+            ? (bonusAnchor ? blockSize : blockSize + 1)
+            : blockSize;
     return !blockSize || trained >= ExecutionLimits::targetVerifyRows
                ? ExecutionLimits::targetVerifyRows
                : (trained + 7) / 8 * 8;
@@ -186,7 +213,9 @@ struct DFlashDraftLayout final {
   // 27B DFlash2; a deeper block keeps sixteen.
   [[nodiscard]] constexpr uint32_t queryRows() const noexcept {
     const uint32_t trained =
-        kind == DraftKind::DSpark ? blockSize + 1 : blockSize;
+        kind == DraftKind::DSpark
+            ? (bonusAnchor ? blockSize : blockSize + 1)
+            : blockSize;
     return !blockSize || trained >= ExecutionLimits::targetVerifyRows
                ? ExecutionLimits::targetVerifyRows
                : (trained + 7) / 8 * 8;
@@ -198,7 +227,12 @@ struct DFlashDraftLayout final {
                : ExecutionLimits::draftRingCapacity;
   }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, draftWindow()};
+    // A Null draft holds no ring: its layout is zero throughout, so the
+    // composite snapshot neither allocates nor expects draft state.
+    return kind == DraftKind::Null
+               ? DraftStateLayout{}
+               : DraftStateLayout{layers, kvHeads, attentionHeadDimension,
+                                  draftWindow()};
   }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
@@ -242,6 +276,12 @@ struct DFlashDecodeBuffers final {
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentValues;
+  // MaxwellMtpDraft only: the lanes' draft positions (the pass slots'
+// base), the per-state-lane stream anchors and the pass scratch.
+  metal::MetalBuffer positions;
+  std::array<metal::MetalBuffer,
+             ExecutionLimits::maximumBatchWidth> mtpAnchors{};
+  MtpDecodeScratch mtp{};
 };
 
 struct DFlashContextBuffers final {
@@ -257,6 +297,12 @@ struct DFlashContextBuffers final {
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentValues;
+  // MaxwellMtpDraft only: the verify step's committed output tokens (the
+  // retained rows' eh tokens) and the anchors each lane's pass 0 reads.
+  metal::MetalBuffer outputTokens;
+  std::array<metal::MetalBuffer,
+             ExecutionLimits::maximumBatchWidth> mtpAnchors{};
+  MtpContextScratch mtp{};
 };
 
 struct DFlashPrefillSpan final {
@@ -264,6 +310,16 @@ struct DFlashPrefillSpan final {
   uint32_t rows = 0;
   uint32_t startPosition = 0;
   std::span<const DFlashDraftRingLayer> ring;
+  // MaxwellMtpDraft only: the span's first captured row's input row (its
+  // prompt tokens sit at inputRow + i), the sequence's packed input row
+  // end (the last row's rolled token is past it), and — on the span that
+  // covers the sequence tail — the compact row whose streams anchor the
+  // first decode plus that state lane's anchor buffer. anchorRow of ~0u
+  // marks a non-tail span.
+  uint32_t inputRow = 0;
+  uint32_t inputEnd = 0;
+  uint32_t anchorRow = ~0u;
+  metal::MetalBuffer anchor;
 };
 
 struct DFlashPrefillBuffers final {
@@ -277,6 +333,10 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   // RICHENGINE_PREFILL_FAST_INT8 operand buffers (empty when the flag is off).
   ops::LinearScratch linearScratch{};
+  // MaxwellMtpDraft only: the packed input tokens (its rolled-token
+  // gathers) and the context scratch at kMtpPrefillChunk rows.
+  metal::MetalBuffer inputTokens;
+  MtpContextScratch mtp{};
 };
 
 } // namespace richengine::model

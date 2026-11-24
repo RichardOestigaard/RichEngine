@@ -57,6 +57,8 @@ PAGED_PREFILL_FP8_SPLIT(prefill_attention_fp8_split_hd64, 8, 4, 64)
 // Granite 3B's group-5 tile is not a valid fp8 matmul shape.
 PAGED_PREFILL_FP8_SPLIT(prefill_attention_fp8_split_k8q4d128, 8, 4, 128)
 PAGED_PREFILL_FP8_SPLIT(prefill_attention_fp8_split_k4q4d128, 4, 4, 128)
+// Nemotron's KV2 group-16 core of 128: M = 128 fused rows at MP = 64.
+PAGED_PREFILL_FP8_SPLIT(prefill_attention_fp8_split_k2q16d128, 2, 16, 128)
 #undef PAGED_PREFILL_FP8_SPLIT
 
 // LFM3's sliding layers on fp8 pages: the windowed prefill split, the

@@ -461,6 +461,7 @@ inline void draft_attention_split_phase(
 template <uint M, uint D, uint QHeads>
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
+                                         device const bfloat *sinks,
                                          uint group, uint rows,
                                          uint thread_index) {
   constexpr uint Stride = M * D + 2 * M;
@@ -469,10 +470,21 @@ inline void draft_attention_reduce_phase(device const float *partials,
   constexpr uint Attention = QHeads * D;
   for (uint row = thread_index / 8; row < M; row += 32) {
     uint dim = (thread_index % 8) * Chunk;
+    // The tile's grouped rows are consecutive (head, query) pairs of the
+    // prepare's [head][row][dim] layout; the group's base is a whole number
+    // of query heads.
+    const uint grouped = group * M + row;
+    const uint head = grouped / rows;
+    const uint query_row = grouped - head * rows;
     float maximum = -INFINITY;
     for (uint split = 0; split < Splits; ++split)
       maximum = max(maximum, partials[split * Stride + M * D + row]);
-    float total = 0.0f;
+    // An attention-sink draft's extra logit: exp(sink) joins the row's
+    // softmax denominator (and its maximum) with no K/V row contributing
+    // to the accumulator.
+    const float sink = sinks ? float(sinks[head]) : -INFINITY;
+    maximum = max(maximum, sink);
+    float total = sinks ? fast::exp(sink - maximum) : 0.0f;
     float accumulated[Chunk];
     for (uint i = 0; i < Chunk; ++i)
       accumulated[i] = 0.0f;
@@ -488,12 +500,6 @@ inline void draft_attention_reduce_phase(device const float *partials,
       for (uint i = 0; i < Chunk; ++i)
         accumulated[i] += scale * partial[row * D + dim + i];
     }
-    // The tile's grouped rows are consecutive (head, query) pairs of the
-    // prepare's [head][row][dim] layout; the group's base is a whole number
-    // of query heads.
-    const uint grouped = group * M + row;
-    const uint head = grouped / rows;
-    const uint query_row = grouped - head * rows;
     device bfloat *destination =
         output + query_row * Attention + head * D + dim;
     for (uint i = 0; i < Chunk; ++i)
@@ -625,12 +631,17 @@ DRAFT_QKV_KERNEL(draft_attention_qkv, 32, 8, 128, false, false)
 DRAFT_QKV_KERNEL(draft_attention_qkv_q16k2, 16, 2, 128, false, false)
 DRAFT_QKV_KERNEL(draft_attention_qkv_q32k8d64i, 32, 8, 64, true, true)
 DRAFT_QKV_KERNEL(draft_attention_qkv_q8k2d256, 8, 2, 256, false, false)
+DRAFT_QKV_KERNEL(draft_attention_qkv_q32k2, 32, 2, 128, false, false)
 
 // Grid {kv heads, lanes, splits}: every split streams its share of the live
 // ring tiles of its head and the last one adds the current rows. Partials
 // follow the grouped queries in the same allocation, one (M x D + 2M) fp32
 // block per (lane, head, split).
-template <uint M, uint N, uint KVHeads, uint HeadDim>
+// HeadTiles subdivides a KV group's head block when M over the whole group
+// would overflow a threadgroup's 32 KB of score workspace: the q32k2 core's
+// sixteen-head group runs as two M=64 subtiles per eight rows, group.x
+// walking the (head subtile, block row tile) pairs of each KV head.
+template <uint M, uint N, uint KVHeads, uint HeadDim, uint HeadTiles>
 inline void draft_attention_split_impl(
     device bfloat *queries, device bfloat *keys0, device bfloat *keys1,
     device bfloat *keys2, device bfloat *keys3, device bfloat *values0,
@@ -643,8 +654,8 @@ inline void draft_attention_split_impl(
   // M rows of a KV group's head block per threadgroup: at 8-row blocks the
   // tile covers the group's M/8 heads outright; wider blocks split the group
   // into Rows/8 head tiles, which group.x walks before the KV head.
-  const uint RowTiles = uint(Rows) / 8;
-  constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
+  const uint RowTiles = uint(Rows) / 8 * HeadTiles;
+  constexpr ulong Attention = ulong(M) * HeadTiles / 8 * KVHeads * HeadDim;
   constexpr ulong Window = RICHENGINE_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y, kv_head = group.x / RowTiles;
@@ -691,7 +702,7 @@ kernel void draft_attention_bf16_split(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[32 * 128 + 3 * 32];
-  draft_attention_split_impl<32, 128, 8, 128>(
+  draft_attention_split_impl<32, 128, 8, 128, 1>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
@@ -714,7 +725,7 @@ kernel void draft_attention_bf16_split_q16k2(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[64 * 64 + 3 * 64];
-  draft_attention_split_impl<64, 64, 2, 128>(
+  draft_attention_split_impl<64, 64, 2, 128, 1>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
@@ -737,7 +748,7 @@ kernel void draft_attention_bf16_split_q32k8d64i(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[32 * 128 + 3 * 32];
-  draft_attention_split_impl<32, 128, 8, 64>(
+  draft_attention_split_impl<32, 128, 8, 64, 1>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
@@ -763,19 +774,49 @@ kernel void draft_attention_bf16_split_q8k2d256(
   // bf16 (2048 floats here) — 64-wide tiles leave it overhanging the row
   // statistics.
   threadgroup float workspace[32 * 128 + 3 * 32];
-  draft_attention_split_impl<32, 128, 2, 256>(
+  draft_attention_split_impl<32, 128, 2, 256, 1>(
       queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }
 
-template <uint M, uint KVHeads, uint HeadDim>
+// Nemotron-3.5-Lightning's DSpark draft: 32 query heads over 2 KV heads of
+// 128. One M=128 tile's score region would need 33 KB of threadgroup memory,
+// so each KV group runs as two M=64 head subtiles (HeadTiles 2).
+kernel void draft_attention_bf16_split_q32k2(
+    device bfloat *queries [[buffer(0)]],
+    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
+    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
+    device bfloat *values0 [[buffer(5)]],
+    device bfloat *values1 [[buffer(6)]],
+    device bfloat *values2 [[buffer(7)]],
+    device bfloat *values3 [[buffer(8)]],
+    device bfloat *query_keys [[buffer(9)]],
+    device bfloat *query_values [[buffer(10)]],
+    device const DecodeStepPackLane *step_pack [[buffer(11)]],
+    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float workspace[64 * 64 + 3 * 64];
+  draft_attention_split_impl<64, 64, 2, 128, 2>(
+      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      query_keys, query_values, step_pack, params, workspace, group,
+      thread_index, lane, simd_group);
+}
+
+// The same HeadTiles subdivision as the split: group.x walks each KV head's
+// head-subtile/row-tile pairs, and sinks — when the core binds a per-head
+// bias — adds each query head's exp(sink) to its row's denominator.
+template <uint M, uint KVHeads, uint HeadDim, uint HeadTiles>
 inline void draft_attention_reduce_impl(device bfloat *queries,
+                                        device const bfloat *sinks,
                                         constant DraftAttentionBatchParams &params,
                                         uint2 group, uint thread_index) {
   const ulong Rows = params.query_rows;
-  const ulong RowTiles = Rows / 8;
-  constexpr ulong Attention = ulong(M) / 8 * KVHeads * HeadDim;
+  const ulong RowTiles = Rows / 8 * HeadTiles;
+  constexpr ulong Attention = ulong(M) * HeadTiles / 8 * KVHeads * HeadDim;
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y;
   device const float *partials =
@@ -783,8 +824,9 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
                                              params.lanes * Rows * Attention) +
       (batch * KVHeads * RowTiles + group.x) * kDraftAttentionSplits *
           PartialFloats;
-  draft_attention_reduce_phase<M, HeadDim, M / 8 * KVHeads>(
-      partials, queries + batch * Rows * Attention, group.x,
+  draft_attention_reduce_phase<M, HeadDim, M / 8 * KVHeads * HeadTiles>(
+      partials, queries + batch * Rows * Attention,
+      params.attention_sinks ? sinks : nullptr, group.x,
       params.query_rows, thread_index);
 }
 
@@ -794,14 +836,27 @@ inline void draft_attention_reduce_impl(device bfloat *queries,
       constant DraftAttentionBatchParams &params [[buffer(1)]],              \
       uint2 group [[threadgroup_position_in_grid]],                          \
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
-    draft_attention_reduce_impl<M, KV, HD>(queries, params, group,           \
-                                          thread_index);                     \
+    draft_attention_reduce_impl<M, KV, HD, 1>(queries, nullptr, params,      \
+                                              group, thread_index);          \
   }
 
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce, 32, 8, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q16k2, 64, 2, 128)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q32k8d64i, 32, 8, 64)
 DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_q8k2d256, 32, 2, 256)
+
+// The q32k2 reduce carries the draft's per-head attention-sink bias at
+// buffer(1): a dummy buffer rides there when params.attention_sinks clears
+// the term.
+kernel void draft_attention_bf16_reduce_q32k2(
+    device bfloat *queries [[buffer(0)]],
+    device const bfloat *attention_sinks [[buffer(1)]],
+    constant DraftAttentionBatchParams &params [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  draft_attention_reduce_impl<64, 2, 128, 2>(queries, attention_sinks,
+                                             params, group, thread_index);
+}
 
 // The plain transformer draft's residual adds, which the DFlash2 path folds
 // into its convolutions: output = input + residual over one lane's rows.

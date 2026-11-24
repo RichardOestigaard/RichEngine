@@ -332,7 +332,7 @@ void Runtime::Impl::encodeCanvasCommitPrefill(
     CommandGraph &graph, std::span<const CommitLane> lanes) {
   if (lanes.empty())
     return;
-  TargetModelPrefillBuffers buffers = detail::prefillBuffers(*prefillArena);
+  TargetModelPrefillBuffers buffers = detail::prefillBuffers(*prefillArena, 0);
   const uint64_t hiddenRow =
       uint64_t{geometry.target.hiddenSize} * sizeof(uint16_t);
   const uint64_t ropeRow =
@@ -371,10 +371,12 @@ void Runtime::Impl::encodeCanvasCommitPrefill(
     sequences.push_back(std::move(sequence));
     rowOffset += lane.rows;
   }
-  static_cast<void>(
-      targetModel.addPrefill(graph, std::move(buffers), sequences, rowOffset,
-                             kvPages.layers(), nullptr,
-                             encoderLayerScalars()));
+  const TargetModelPrefillChunk part{.buffers = std::move(buffers),
+                                     .sequences = sequences,
+                                     .rows = rowOffset};
+  static_cast<void>(targetModel.addPrefill(
+      graph, {&part, 1}, kvPages.layers(), nullptr,
+      encoderLayerScalars()));
 }
 
 std::unique_ptr<ModelBatchTicket>
@@ -530,7 +532,7 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
       CommandGraph graph;
       for (uint32_t slot = 0; slot < slots; ++slot) {
         TargetModelPrefillBuffers buffers =
-            detail::prefillBuffers(*prefillArena);
+            detail::prefillBuffers(*prefillArena, 0);
         std::vector<TargetModelPrefillSequence> sequences;
         sequences.reserve(lanes.size());
         uint32_t spanRows = 0;
@@ -562,17 +564,21 @@ Runtime::Impl::decodeDiffusion(const BatchPlan &plan,
         // every lane.
         const MetalBuffer headSums = buffers.projectionSums;
         MetalBuffer finalHidden = buffers.hidden[0];
-        if (diffusion_.canvasProbe_ != "notrunk")
-          finalHidden =
-              targetModel.addPrefill(graph, std::move(buffers), sequences,
-                                     spanRows, kvPages.layers());
+        if (diffusion_.canvasProbe_ != "notrunk") {
+          const TargetModelPrefillChunk part{
+              .buffers = std::move(buffers), .sequences = sequences,
+              .rows = spanRows};
+          finalHidden = targetModel.addPrefill(graph, {&part, 1},
+                                               kvPages.layers())
+                            .front();
+        }
         ops::Normalization::addRmsWithQ4Sums(
             graph, finalHidden, weights.finalNorm, a.headHidden, headSums,
             hidden, spanRows);
         if (diffusion_.canvasProbe_ != "notail")
         {
           TargetModelPrefillBuffers head =
-              detail::prefillBuffers(*prefillArena);
+              detail::prefillBuffers(*prefillArena, 0);
           linear.addPrefill(graph, a.headHidden, weights.logitsProjection,
                             a.logits, head.projectionSums, spanRows,
                             head.linearScratch, {}, true);

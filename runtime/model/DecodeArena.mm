@@ -15,12 +15,18 @@ static uint64_t gdnMixedStride(const RuntimeGeometry &geometry) noexcept {
                             geometry.target.convolutionDimension);
 }
 static uint64_t gdnDecayStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<float>(uint64_t{kDecodeRows} *
-                         geometry.target.gdnValueHeads);
+  // nemotron's Mamba-2 layers keep a per-row fp32 dt where a GDN layer's
+  // decay logits land.
+  const uint32_t values = geometry.target.gdnValueHeads
+                              ? geometry.target.gdnValueHeads
+                              : geometry.target.mambaHeads;
+  return bytesFor<float>(uint64_t{kDecodeRows} * values);
 }
 static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
-                            geometry.target.gdnValueHeads);
+  const uint32_t values = geometry.target.gdnValueHeads
+                              ? geometry.target.gdnValueHeads
+                              : geometry.target.mambaHeads;
+  return bytesFor<uint16_t>(uint64_t{kDecodeRows} * values);
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   // The layer slab covers the wider of the target's two KV geometries.
@@ -32,8 +38,12 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
+  // The MTP draft runs its own mtp_attention kernel — no shared draft
+  // attention workspace, and its headCore stays Unspecified (the Q32K4
+  // geometry has no compiled core).
   const auto draftWorkspace =
-      geometry.draft.kind == DraftKind::Null
+      (geometry.draft.kind == DraftKind::Null ||
+       geometry.draft.kind == DraftKind::Mtp)
           ? ops::DraftAttentionWorkspace{}
           : operators.draftAttentionWorkspacePerLane(
                 geometry.draft.attentionShape());
@@ -55,7 +65,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Normalized,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::GdnHidden,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
+      bytesFor<uint16_t>(r * std::max(geometry.target.attentionWidth,
+                                     geometry.target.mambaInnerSize)));
   put(DecodeTensor::GdnOutput,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Intermediate,
@@ -246,6 +257,83 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       put(moeScratchTensor<DecodeTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
+  if (geometry.draft.kind == DraftKind::Mtp) {
+    const uint32_t h = geometry.draft.hiddenSize;
+    // The MTP layout carries the streams' full width in
+    // targetHiddenSize, the mHC mix width in dynamicSize and the shared
+    // expert's intermediate in intermediateSize.
+    const uint32_t streams = geometry.draft.targetHiddenSize;
+    const uint32_t mix = geometry.draft.dynamicSize;
+    const uint32_t q = geometry.draft.attentionSize;
+    const uint32_t kv = geometry.draft.contextKvSize() / 2;
+    const uint32_t cr = r; // context commit rows per lane
+    // The decode linear's eight-row activation tile: each lane's slice
+    // of a buffer a projection reads or writes is eight rows deep (one
+    // real row — the chained pass's — and seven pad rows).
+    // The nemotron draft's chain state is the hidden row itself (2688 fp32)
+    // and its eh operand the [embed | hidden] concat — its scratch keeps
+    // the decode tile's eight rows; the nmtp MoE kernels take their own
+    // route/partial buffers instead of the generic workspace.
+    const bool nemotronMtp = geometry.target.mambaLayers != 0;
+    put(DecodeTensor::MtpStreams, bytesFor<float>(streams));
+    put(DecodeTensor::MtpEh,
+        bytesFor<uint16_t>(uint64_t{streams} * (nemotronMtp ? 16 : 4)));
+    put(DecodeTensor::MtpEhOut,
+        bytesFor<uint16_t>(uint64_t{streams} * (nemotronMtp ? 8 : 2)));
+    put(DecodeTensor::MtpPlane, bytesFor<float>(mix));
+    put(DecodeTensor::MtpMappings, bytesFor<float>(mix));
+    put(DecodeTensor::MtpHeadWeights, bytesFor<float>(mix));
+    put(DecodeTensor::MtpEmbed, bytesFor<uint16_t>(h));
+    put(DecodeTensor::MtpEmbedNormed, bytesFor<uint16_t>(h));
+    put(DecodeTensor::MtpAggregate, bytesFor<uint16_t>(8 * h));
+    put(DecodeTensor::MtpNormed, bytesFor<uint16_t>(8 * h));
+    put(DecodeTensor::MtpQueries, bytesFor<uint16_t>(8 * q));
+    put(DecodeTensor::MtpKeys, bytesFor<uint16_t>(8 * kv));
+    put(DecodeTensor::MtpValues, bytesFor<uint16_t>(8 * kv));
+    put(DecodeTensor::MtpAttention, bytesFor<uint16_t>(8 * q));
+    put(DecodeTensor::MtpBranch, bytesFor<uint16_t>(8 * h));
+    put(DecodeTensor::MtpShared, bytesFor<uint16_t>(8 * h));
+    put(DecodeTensor::MtpIntermediate,
+        bytesFor<uint16_t>(nemotronMtp
+                               ? uint64_t{8} * 7 * 4096
+                               : 8 * geometry.draft.intermediateSize));
+    if (nemotronMtp) {
+      put(DecodeTensor::MtpMoeRoutes, bytesFor<uint32_t>(8 * 16));
+      put(DecodeTensor::MtpMoePartials,
+          bytesFor<float>(uint64_t{8} * 7 * h));
+    }
+    put(DecodeTensor::MtpHead, bytesFor<uint16_t>(8 * h));
+    // The vocabulary head's eight-row tile output: row 0 holds the pass's
+    // logits, copied into the pass's selector slot.
+    put(DecodeTensor::MtpLogits,
+        bytesFor<float>(uint64_t{8} *
+                        paddedVocabularySize(geometry.draft.vocabularySize)));
+    put(DecodeTensor::MtpTokenIn, bytesFor<uint32_t>(1));
+    put(DecodeTensor::MtpAnchor, bytesFor<uint16_t>(streams));
+    put(DecodeTensor::MtpCtxStreams, bytesFor<float>(uint64_t{cr} * streams));
+    put(DecodeTensor::MtpCtxEh, bytesFor<uint16_t>(uint64_t{cr} * streams * 2));
+    put(DecodeTensor::MtpCtxEhOut, bytesFor<uint16_t>(uint64_t{cr} * streams));
+    put(DecodeTensor::MtpCtxPlane, bytesFor<float>(uint64_t{cr} * mix));
+    put(DecodeTensor::MtpCtxMappings, bytesFor<float>(uint64_t{cr} * mix));
+    put(DecodeTensor::MtpCtxEmbed, bytesFor<uint16_t>(uint64_t{cr} * h));
+    put(DecodeTensor::MtpCtxEmbedNormed, bytesFor<uint16_t>(uint64_t{cr} * h));
+    put(DecodeTensor::MtpCtxKeys, bytesFor<uint16_t>(uint64_t{cr} * kv));
+    put(DecodeTensor::MtpCtxValues, bytesFor<uint16_t>(uint64_t{cr} * kv));
+    // The MTP block's own routed MoE needs the decode scratch of its
+    // shape too — the target's fields sized for its plan cover a draft
+    // plan's smaller or equal footprint. Nemotron's nmtp kernels read
+    // moeRoutes/moePartials instead of the generic workspace.
+    if (nemotronMtp)
+      return result;
+    const ops::MoeWorkspace draftMoe = operators.moeDecodeWorkspacePerLane(
+        {h, geometry.target.experts, geometry.target.expertsPerToken,
+         geometry.target.expertIntermediateSize,
+         geometry.target.moeLayout, geometry.target.moeExpertFormat,
+         false});
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      put(moeScratchTensor<DecodeTensor>(field),
+          draftMoe.*ops::kMoeScratchFields[field].bytes);
+  }
   return result;
 }
 
@@ -265,6 +353,22 @@ namespace {
 // The draft forward's projection shapes; its dynamic and selector heads
 // are absent (size 0) on plain drafts, which callers skip.
 std::array<ops::ProjectionShape, 8> draftProjectionShapes(const DFlashDraftLayout &d) {
+  if (d.kind == DraftKind::Null)
+    return {};
+  if (d.kind == DraftKind::Mtp)
+    // The MTP block's own shapes: the per-stream eh projection, the GQA
+    // query and key/value projections, the attention output and the
+    // shared expert's SwiGLU. Its mHC planes and HC head are float
+    // segments the mhc kernels read directly, and its vocabulary head is
+    // the target's.
+    return {ops::ProjectionShape{d.hiddenSize, 2 * d.hiddenSize},
+            {d.attentionSize, d.hiddenSize},
+            {d.contextKvSize() / 2, d.hiddenSize},
+            {d.contextKvSize() / 2, d.hiddenSize},
+            {d.hiddenSize, d.attentionSize},
+            {d.intermediateSize, d.hiddenSize},
+            {d.intermediateSize, d.hiddenSize},
+            {d.hiddenSize, d.intermediateSize}};
   return {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
           {d.qkvSize, d.hiddenSize},
           {d.contextKvSize(), d.hiddenSize},
@@ -285,11 +389,14 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // projections are affine.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
   // A DSpark draft's context projections are dequantized float segments;
-  // every other draft's stay affine.
+  // every other draft's stay affine. Nemotron's drafts carry no affine
+  // projections at all (their 2688-wide hidden is off the affine tile).
+  const bool nemotronDraft = geometry.target.mambaLayers != 0;
   for (const ops::ProjectionShape shape : draftProjectionShapes(d)) {
     // A plain draft's dynamic and selector projections are absent (size 0).
     if (!shape.outputSize || !shape.inputSize) continue;
-    result.include(operators.linear().decodeScratchSize(shape));
+    if (!nemotronDraft)
+      result.include(operators.linear().decodeScratchSize(shape));
     // Draft checkpoint images load as AF4 blocks (affine::blockImages):
     // the GGUF decode plans need their own, larger scratch bound.
     ops::ProjectionShape block = shape;

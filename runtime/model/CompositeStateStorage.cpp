@@ -682,9 +682,15 @@ void CompositeStateStorage::validateLengths(const LogicalLengths &lengths,
       lengths.draftEnd() > lengths.targetTokens) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
+  // A draft-less layout's ring is empty: the snapshot carries no draft
+  // span at all, so draftLength alone must be zero (a never-drafted
+  // lane's draftBase stays 0).
+  const bool draftComplete =
+      layout_.draft.window
+          ? lengths.hasCompleteDraftWindow(layout_.draft.window)
+          : !lengths.draftLength;
   if (cacheSnapshot &&
-      (!lengths.targetTokens ||
-       !lengths.hasCompleteDraftWindow(layout_.draft.window) ||
+      (!lengths.targetTokens || !draftComplete ||
        lengths.targetTokens % kv::kPageTokens)) {
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");

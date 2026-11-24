@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/memory/MemoryPlan.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/AneFfnCalibration.hpp"
 #include "ops/FfnSplit.hpp"
 
@@ -34,6 +35,10 @@ struct AneFfnSetting final {
   // measured ~30% faster per evaluation (docs/ANE_EXPERIMENTS.md). Takes
   // the share whatever a calibration would say, like `given`.
   std::optional<Given> coreai;
+  // Calibrate this Mac's again: none of what it remembered of the model
+  // serves (--recalibrate-ane, after an OS update or for a calibration whose
+  // GPU alone this Mac no longer takes).
+  bool recalibrate = false;
 
   // The setting of a dev tool's --ane-ffn-share and --ane-ffn-minimum-rows:
   // none calibrates the split, and a share of 0 runs the GPU alone. Throws
@@ -64,36 +69,42 @@ struct AneFfnModel final {
   // Why this Mac cannot run the split (ane::unavailable), asked only of a
   // split that may run; none when it can.
   std::function<std::optional<std::string>()> unavailable;
-  // The channel units of the split (ops::AneFfn::units).
-  uint32_t units = 0;
+  // The channel units of the split (ops::AneFfn::units), and the model's
+  // layers for its two-step fit (ops::AneFfn::fits).
+  uint32_t units = 0, layers = 0;
   // The split's Metal memory with the ANE taking `aneUnits` of them.
   std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
   // The same for the CoreAI split; null falls back to plannedBytes.
   std::function<uint64_t(uint32_t aneUnits)> plannedBytesCoreAi;
-  // Calibration's timings (ops::ane_ffn::Measurement::time).
+  // Calibration's timings (ops::ane_ffn::Measurement::time), all but the
+  // mixer, and the same of the split with the ANE taking `aneUnits`, on the
+  // layers they timed, each beside the GPU alone read right before it.
   std::function<ops::ane_ffn::Timings()> time;
-  // The split that serves with the ANE taking `aneUnits`, verified, with its
-  // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
+  std::function<ops::ane_ffn::Timing(uint32_t aneUnits)> timeAt;
+  // The split that serves at `shares` in commands of `rows`, verified, with
+  // its chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
-  std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
+  std::function<AneFfnPrepared(ops::AneFfn::Shares shares,
+                               ops::AneFfn::Rows rows, bool timeChunks)> prepare;
   // The same over the CoreAI framework (AneFfnSetting::coreai); null where
   // the machine lacks the framework or the model's shape no CoreAI asset
   // covers, which a coreai given reports as unavailable.
   std::function<AneFfnPrepared(uint32_t aneUnits)> prepareCoreAi;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
-  // is remembered; remembering one; and forgetting it.
+  // is remembered; remembering one, true once kept.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
-  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
-  std::function<void(uint32_t maxAneUnits)> forget;
+  std::function<bool(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
 };
 
 // How a start's split came out: off as given, not taken by the model or this
-// Mac, refused by the memory plan, gaining too little, failed, or running,
-// and why or how. Startup logs it (startAneFfn).
+// Mac, refused by the memory plan, gaining too little, failed, running, or
+// set up once the engine's runtime has prefilled a full chunk on the GPU
+// alone (finishAneFfn), and why or how. Startup logs it (startAneFfn,
+// finishAneFfn).
 struct AneFfnOutcome final {
-  enum class Kind : uint8_t { Off, Unsupported, Refused, NoGain, Unavailable, Split };
+  enum class Kind : uint8_t { Off, Unsupported, Refused, NoGain, Unavailable, Split, Pending };
   Kind kind = Kind::Off;
   std::string reason;
   // The context the engine serves without --max-context, and the one the
@@ -110,33 +121,56 @@ struct AneFfnOutcome final {
 [[nodiscard]] std::string_view aneFfnOutcomeName(AneFfnOutcome::Kind kind) noexcept;
 
 // The split a start runs and the memory plan that sets its memory aside,
-// both none without one, and the outcome.
+// both none without one, and the outcome. A start whose split is Pending
+// holds the largest split's memory and sets the split up after its
+// runtime's prefill of a full chunk (finishAneFfn): within `maxAneUnits`,
+// the units the plan holds, from this Mac's `calibration` of the model as
+// recalled, if one.
 struct AneFfnStart final {
   std::unique_ptr<ops::FfnSplit> split;
   std::optional<EngineMemoryPlan> plan;
   AneFfnOutcome outcome;
+  uint32_t maxAneUnits = 0;
+  std::optional<ops::ane_ffn::Calibration> calibration;
+  // The context the start was asked to leave, which the log line weighs.
+  uint32_t requested = 0;
 };
 
 // The prefill FFN's Neural Engine split of `model` as `setting` allows,
 // within the memory plan `planMemory` makes with the split's bytes set aside:
 // one whose plan still holds `requestedContextTokens`, or with zero the
-// automatic context (AneFfnOutcome::context). Every step is arithmetic until
-// the plan holds a split; then it logs that it sets the split up. The split
-// takes this Mac's calibration of the model within the units the plan holds,
-// once remembered; else it is calibrated: timed, its share chosen
-// (ops::ane_ffn::choose), the split that serves prepared, its chunks timed
-// and the least it takes found (ops::ane_ffn::minimumRows), and the outcome
-// remembered, a split or none. The split then judges itself against the GPU
-// alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
-// when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
-// outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
-// the wait for the ANE was interrupted or the backend no longer serves, which
-// the failure's exception reports. Throws std::invalid_argument for a given
-// split of no units or of least rows no function holds.
+// automatic context (AneFfnOutcome::context). Every step is arithmetic but a
+// given split's, which is set up here and takes the given least chunk, no
+// breaker, and nothing remembered. Where the Neural Engine refused this
+// Mac's split of the model, within the units the plan holds, twice, the GPU
+// runs alone; otherwise the split is Pending: the plan holds the most units,
+// and finishAneFfn sets it up once the engine's runtime has prefilled a full
+// chunk on the GPU alone. Logs the outcome. A failure leaves the GPU alone,
+// unless `cancelled` returns true, the wait for the ANE was interrupted or
+// the backend no longer serves, which the failure's exception reports.
+// Throws std::invalid_argument for a given split of no units or of least
+// rows no function holds.
 [[nodiscard]] AneFfnStart
 startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t requestedContextTokens,
             const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory,
             const std::function<bool()> &cancelled);
+
+// The split a start left Pending (startAneFfn), once the engine's runtime has
+// prefilled a full chunk on the GPU alone in `prefillMilliseconds` of GPU
+// time, and how it came out, which it logs; the context and plan stay the
+// start's. It takes this Mac's calibration of the model, as recalled, unless
+// the calibration's mixer reads more than a tenth longer than the one this
+// start's prefill gives: one taken on a busier Mac. Else it is calibrated
+// (AneFfnStartup.cpp), the mixer the rest of that prefill's layer, and a
+// split it finds remembered, no split not. The split judges itself against
+// the GPU alone as calibrated (ops::ane_ffn::Breaker), and a split that stops
+// for losing keeps the calibration; the Neural Engine's refusals count
+// (ops::ane_ffn::Calibration). Fails as startAneFfn does.
+struct AneFfnFinished final {
+  std::unique_ptr<ops::FfnSplit> split;
+  AneFfnOutcome outcome;
+};
+[[nodiscard]] AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start,
+                                        double prefillMilliseconds, const std::function<bool()> &cancelled);
 
 } // namespace richengine::engine

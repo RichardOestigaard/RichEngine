@@ -80,32 +80,35 @@ inline uint2 moe_expert_group(constant MoeExpertParams &params, uint2 group) {
 
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):
 // every routed expert of the projection is one image segment of experts *
-// output_size rows, so expert e's planes start at tile e * output_size /
-// QUANT_TILE_ROWS (metal/abi/QuantFormat.h); the shared expert (id `experts`) has a segment
-// of its own, possibly in another format. w1 is the meta plane for formats
-// without a second plane, as the host binds it.
+// output_size rows. The planes' tiles are QUANT_TILE_ROWS rows
+// (metal/abi/QuantFormat.h), and output_size need not be a multiple of them
+// (Nemotron's 1856, the ungated tests' 192): the routed planes stay at the
+// image's base and `row0` holds expert e's first row, e * output_size, which
+// the callers add to their column coordinate before its plane_tile /
+// plane_row decomposition. The shared expert (id `experts`) has a segment of
+// its own, possibly in another format — its planes are self-contained, so
+// its row0 is 0. w1 is the meta plane for formats without a second plane, as
+// the host binds it.
 struct MoeGgufSegment {
   device uchar *w0;
   device uchar *w1;
   device uchar *meta;
   uint format;
+  uint row0;
 };
 
 // As moe_gguf_segment, with the routed and shared format ids explicit: the
 // fused gate/up pass describes two segments per expert through one params
 // struct and calls this for each.
 inline MoeGgufSegment moe_gguf_segment_fmt(uint expert, uint experts,
-                                           uint input_size, uint output_size,
+                                           uint /* input_size */, uint output_size,
                                            uint routed_format, uint shared_format,
                                            device uchar *w0, device uchar *w1, device uchar *meta,
                                            device uchar *shared_w0, device uchar *shared_w1,
                                            device uchar *shared_meta) {
   if (expert == experts)
-    return {shared_w0, shared_w1, shared_meta, shared_format};
-  constant QuantFormat &f = kQuantFormats[routed_format];
-  const ulong rows = ulong(expert) * output_size, groups = input_size / 32;
-  return {w0 + rows * groups * f.plane0_bytes, w1 + rows * groups * f.plane1_bytes,
-          meta + rows * (groups / f.meta_groups) * f.meta_bytes, routed_format};
+    return {shared_w0, shared_w1, shared_meta, shared_format, 0};
+  return {w0, w1, meta, routed_format, expert * output_size};
 }
 
 inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams &p,
@@ -132,15 +135,15 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams
 inline MoeGgufSegment moe_gguf_stream_segment(
     uint expert, constant MoeGgufStreamParams &p, device const uint *slots,
     device const ulong *chunks, device uchar *shared_w0, device uchar *shared_w1,
-    device uchar *shared_meta, bool &resident) {
+    device uchar *shared_meta, thread bool &resident) {
   if (expert == p.experts) {
     resident = true;
-    return {shared_w0, shared_w1, shared_meta, p.shared_format};
+    return {shared_w0, shared_w1, shared_meta, p.shared_format, 0};
   }
   const uint slot = slots[expert];
   if (slot == 0xffffffffu) {
     resident = false;
-    return {nullptr, nullptr, nullptr, p.routed_format};
+    return {nullptr, nullptr, nullptr, p.routed_format, 0};
   }
   resident = true;
   uint chunk = 0, local = slot;
@@ -154,10 +157,7 @@ inline MoeGgufSegment moe_gguf_stream_segment(
   device uchar *w0 = reinterpret_cast<device uchar *>(regions[0]);
   device uchar *w1 = reinterpret_cast<device uchar *>(regions[1]);
   device uchar *meta = reinterpret_cast<device uchar *>(regions[2]);
-  constant QuantFormat &f = kQuantFormats[p.routed_format];
-  const ulong rows = ulong(local) * p.output_size, groups = p.input_size / 32;
-  return {w0 + rows * groups * f.plane0_bytes,
-          w1 + rows * groups * f.plane1_bytes,
-          meta + rows * (groups / f.meta_groups) * f.meta_bytes,
-          p.routed_format};
+  // The region's planes pack its slots' segments back to back: the same
+  // row0 convention as the resident segment's.
+  return {w0, w1, meta, p.routed_format, local * p.output_size};
 }

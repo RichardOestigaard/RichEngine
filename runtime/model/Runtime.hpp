@@ -79,6 +79,8 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+  void setAneFfn(ops::FfnSplit *split) override;
+  void withPrefillFfn(const PrefillFfnUse &use) override;
   [[nodiscard]] uint32_t draftWindow() const noexcept override;
   [[nodiscard]] uint32_t decodeAdmissionTokens() const noexcept override;
 

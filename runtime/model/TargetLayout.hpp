@@ -14,6 +14,7 @@
 // StateLayout.hpp, where the state accounting declares it.
 #include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
+#include "ops/Mamba2.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <array>
@@ -143,9 +144,13 @@ struct TargetLayout final {
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
   // The layers whose hidden states the draft reads; the first
-  // captureLayerCount entries are live.
+  // captureLayerCount entries are live. captureStreams marks a hyper-
+  // connected target whose capture is the layer's full streamWidth()
+  // residual state rather than a hiddenSize hidden row — maxwell-moe's MTP
+  // draft consumes the layer-44 streams.
   std::array<uint32_t, kMaximumCaptureLayers> hiddenCaptureLayers{};
   uint32_t captureLayerCount = 0;
+  bool captureStreams = false;
   // The compiled attention kernels the layers bind (ops/PagedKv.hpp):
   // attentionCore the primary geometry, altAttentionCore the
   // globalLayerMask layers (Gemma's k_eq_v globals).
@@ -218,6 +223,14 @@ struct TargetLayout final {
   // Whether the MoE blocks carry a shared-expert route; LFM2-MoE and Gemma
   // clear it (Gemma's shared block runs as a dense GeGLU beside the router).
   bool moeSharedExpert = true;
+  // NVIDIA Nemotron's ungated relu-squared experts (ops::MoeShape's
+  // ungatedExperts + sharedExpertUnitWeight): the blocks have no gate
+  // slab and the shared expert runs at unit weight of
+  // sharedIntermediateSize.
+  bool moeUngatedExperts = false;
+  // The routed experts' norm_topk_prob scaling factor (GGUF
+  // expert_weights_scale; Nemotron's 2.5). Zero reads as 1.
+  float moeRoutedScale = 0.0F;
   // The DiffusionGemma trunk's denoising schedule; inert on every other
   // target.
   DiffusionSchedule diffusion{};
@@ -245,11 +258,55 @@ struct TargetLayout final {
   // token it reads at an image's prompt positions (<|image_pad|>).
   uint32_t pleEosToken = 0;
   uint32_t pleImageToken = 0;
+  // The maxwell_moe arch's additions, all zero on every other target. Its
+  // indexer keeps every token's post-RoPE index key in the index plane
+  // (indexerPerTokenKeys), not one pooled key per indexer block, so no
+  // state cell keeps pending keys. Each row's route, one per KV group
+  // (indexerHeads is the group count), selects indexerRemoteBlocks blocks
+  // of indexerBlockTokens tokens by per-token block-max score inside the
+  // eligible band — past the indexerPrefixBlocks prefix blocks and before
+  // the indexerLocalBlocks local blocks ending at the row's own block,
+  // both always attended. The manifold-constrained hyper-connection
+  // (mhcMixWidth the mapping's width — streams*streams + 2*streams — and
+  // mhcSinkhornIterations its Sinkhorn passes) replaces the qwen4exp
+  // mixes' low-rank gate, and mhcHead the learned streams-to-one output
+  // contraction the model runs before its final norm.
+  uint32_t indexerRouteGroups = 0;
+  uint32_t indexerPrefixBlocks = 0;
+  uint32_t indexerLocalBlocks = 0;
+  uint32_t indexerRemoteBlocks = 0;
+  bool indexerPerTokenKeys = false;
+  uint32_t mhcMixWidth = 0;
+  uint32_t mhcSinkhornIterations = 0;
+  bool mhcHead = false;
   // The opt-in DuoAttention policy (kv::DuoPolicy, metal/abi/DuoAttention.h):
   // the streaming KV heads' sink and trailing window in tokens, head_mask one
   // bit per (attention ordinal, KV head) pair at bit 4*ordinal + head.
   // kvLayout() forwards it; the all-zero default is dense attention.
   kv::DuoPolicy duoAttention{};
+  // The nemotron_h_moe arch's additions, all zero on every other target. A
+  // block carries exactly one sub-layer after its input norm — the
+  // attentionMask bits name the attention blocks, moeMask the MoE blocks,
+  // the rest are Mamba-2 mixers — with no post norms and no second
+  // sub-layer. The Mamba-2 geometry: mambaHeads heads of
+  // mambaHeadDimension values over an mambaStateSize-wide state,
+  // mambaGroups shared B/C groups, a conv input of convolutionDimension
+  // rows (x | B | C), a mambaInnerSize gate and a packed in_proj of
+  // packedGdnWidth storage rows (gate | conv | dt | pad — the 10304
+  // logical rows pad to a tile), of which mambaTimeStepRank are the dt
+  // rows. mambaCore binds the compiled kernel set (ops/Mamba2.hpp).
+  uint64_t moeMask = 0;
+  uint32_t mambaHeads = 0;
+  uint32_t mambaHeadDimension = 0;
+  uint32_t mambaGroups = 0;
+  uint32_t mambaStateSize = 0;
+  uint32_t mambaInnerSize = 0;
+  uint32_t mambaTimeStepRank = 0;
+  // dt' = clamp(softplus(dt + dt_bias), mambaDtMinimum, mambaDtMaximum) —
+  // nemotron's time_step_limit (0.001, 0.1).
+  float mambaDtMinimum = 0.0f;
+  float mambaDtMaximum = 0.0f;
+  ops::Mamba2Core mambaCore = ops::Mamba2Core::Unspecified;
 
   // The full-attention layer set: the LFM2 mask where set, else every
   // fullAttentionPeriod-th layer on the hybrids, else Gemma's globals,
@@ -319,10 +376,12 @@ struct TargetLayout final {
                       0,
                       attentionCore,
                       altAttentionCore};
-    // A QSA target's pages carry the block index plane (one pooled key of
-    // indexerHeadDimension bf16 values per indexer block) and token-major
-    // values, which its sparse gathers read contiguously.
+    // A sparse-indexed target's pages carry the index plane (one pooled
+    // key of indexerHeadDimension bf16 values per indexer block, or every
+    // token's index key on a per-token index) and token-major values,
+    // which its sparse gathers read contiguously.
     result.indexDimension = indexerHeads ? indexerHeadDimension : 0;
+    result.indexPerToken = indexerPerTokenKeys;
     result.valuesTokenMajor = indexerHeads != 0;
     result.duo = duoAttention;
     return result;
@@ -357,22 +416,43 @@ struct TargetLayout final {
            GdnStateLayout::bfloat16Bytes;
   }
   // The QSA indexer's pending keys per state cell: per attention layer the
-  // raw keys (bf16) of the open block's tokens but its last.
+  // raw keys (bf16) of the open block's tokens but its last. A per-token
+  // indexer (maxwell_moe) has none — every token's key lands in the index
+  // plane as it is written and the open block is never eligible.
   [[nodiscard]] constexpr uint64_t indexerPendingBytes() const noexcept {
-    return indexerBlockTokens
+    return indexerBlockTokens && !indexerPerTokenKeys
                ? uint64_t{attentionLayerCount()} * (indexerBlockTokens - 1) *
                      indexerHeadDimension * GdnStateLayout::bfloat16Bytes
                : 0;
   }
+  // nemotron_h_moe's MoE sub-blocks (moeMask): they carry neither KV nor
+  // recurrent state, which the state-layer count excludes.
+  [[nodiscard]] constexpr uint32_t moeLayerCount() const noexcept {
+    uint32_t count = 0;
+    for (uint32_t layer = 0; layer < 64; ++layer)
+      count += (moeMask >> layer) & 1;
+    return count;
+  }
+  // A recurrent mixer: every non-attention block of the hybrids whose
+  // blocks are attention-or-recurrent, and nemotron's non-MoE ones.
+  [[nodiscard]] constexpr bool isRecurrentLayer(uint32_t layer) const noexcept {
+    return !isFullAttentionLayer(layer) && !isMoeLayer(layer);
+  }
   // The recurrent slots: the GDN hybrids keep the taps-1 convolution FIFO
   // and the value-head matrix; the LFM2 convolutions keep the FIFO alone; a
-  // convolution-free target has no state at all. qwen4exp's cells carry the
-  // PLE history and QSA pending keys after them.
+  // convolution-free target has no state at all. nemotron's Mamba-2 mixers
+  // keep the conv-input FIFO and the heads x headDim x state matrix.
+  // qwen4exp's cells carry the PLE history and QSA pending keys after them.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     if (!convolutionTaps) return {};
-    const uint32_t stateLayers = layers - attentionLayerCount();
+    const uint32_t stateLayers =
+        layers - attentionLayerCount() - moeLayerCount();
     GdnStateLayout state =
-        gdnHeadDimension
+        mambaHeads
+            ? GdnStateLayout{stateLayers, convolutionTaps - 1,
+                             convolutionDimension, mambaHeads,
+                             mambaHeadDimension, mambaStateSize}
+        : gdnHeadDimension
             ? GdnStateLayout{stateLayers, convolutionTaps - 1,
                              convolutionDimension, gdnValueHeads,
                              gdnHeadDimension, gdnHeadDimension}
@@ -388,7 +468,8 @@ struct TargetLayout final {
             attentionGateRows};
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * captureLayerCount;
+    return captureStreams ? streamWidth() * captureLayerCount
+                          : hiddenSize * captureLayerCount;
   }
   // One of the trailing bespoke decision blocks (LFM2's d1-omni).
   [[nodiscard]] constexpr bool isDecisionLayer(uint32_t layer) const noexcept {
@@ -431,8 +512,10 @@ struct TargetLayout final {
   [[nodiscard]] constexpr uint32_t intermediateSizeAt(uint32_t layer) const noexcept {
     return isDecisionLayer(layer) ? altIntermediateSize : intermediateSize;
   }
-  // The dense-FFN layers come first; every later layer's FFN is the MoE.
+  // The MoE sub-layers: nemotron's moeMask bits where set, else the
+  // dense-FFN layers come first and every later layer's FFN is the MoE.
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
+    if (moeMask) return layer < 64 && (moeMask >> layer) & 1;
     return layer >= denseLayers;
   }
 

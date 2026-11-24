@@ -24,6 +24,7 @@ enum class RuntimeBootstrapStage {
     DecodeWarmup,
     CompositeStateRestore,
     MemoryAudit,
+    AneFfnSetUp,
     AnnounceReady,
     Ready,
 };
@@ -121,12 +122,16 @@ public:
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
 
-    // Completes warmup and validation before announcing readiness.
+    // Completes warmup and validation before announcing readiness. `setUp`,
+    // where given, joins the prefill FFN's Neural Engine split as the
+    // warmup's last step, with the GPU time of its prefill of a full chunk on
+    // the GPU alone; the rows it returns warm the split's kernels.
     [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
         const EngineMemoryPlan &memoryPlan,
         model::RuntimeModel &modelRuntime,
         ActualMemoryReporter memoryReporter,
-        NativeRuntime &nativeLoop);
+        NativeRuntime &nativeLoop,
+        const std::function<uint32_t(double)> &setUp = {});
 
     RuntimeBootstrap(const RuntimeBootstrap &) = delete;
     RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;

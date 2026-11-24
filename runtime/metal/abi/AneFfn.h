@@ -50,10 +50,11 @@ struct AneFfnPackParams {
   uint32_t stride;
 };
 
-// Rotated int8 of a projection: its output rows [row, row + N) and inputs
+// Rotated int8 of a projection: its output rows [row, row + rows) and inputs
 // [input, input + width), where groups is its input count / 64 (affine Q4) or
 // / 32 (a GGUF image tensor of GGUF_FMT_* format), into rows of stride bytes
-// and their scales scale_stride halves apart.
+// and their scales scale_stride halves apart; the ANE's channels, gate's and
+// up's rows or down's inputs, in descending units (ane_ffn_descending).
 struct AneFfnWeightParams {
   uint32_t groups;
   uint32_t row;
@@ -62,6 +63,7 @@ struct AneFfnWeightParams {
   uint32_t stride;
   uint32_t scale_stride;
   uint32_t format;
+  uint32_t rows;
 };
 
 // output[t][c] += partial[c][t] * partial[hidden][t] * token_scale[t], in
@@ -83,6 +85,6 @@ struct CoreAiFfnParams {
 
 static_assert(sizeof(AneFfnRotateParams) == 4, "ANE FFN rotate parameters are 4 bytes");
 static_assert(sizeof(AneFfnPackParams) == 12, "ANE FFN pack parameters are 12 bytes");
-static_assert(sizeof(AneFfnWeightParams) == 28, "ANE FFN weight parameters are 28 bytes");
+static_assert(sizeof(AneFfnWeightParams) == 32, "ANE FFN weight parameters are 32 bytes");
 static_assert(sizeof(AneFfnJoinParams) == 12, "ANE FFN join parameters are 12 bytes");
 static_assert(sizeof(CoreAiFfnParams) == 8, "CoreAI FFN parameters are 8 bytes");

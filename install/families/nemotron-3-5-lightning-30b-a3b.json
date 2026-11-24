@@ -1,0 +1,112 @@
+{
+  "name": "Nemotron-3.5-Lightning-30B-A3B",
+  "repos": [
+    "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+  ],
+  "note": "NVIDIA's tri-hybrid Mamba-2/attention/MoE stack: 52 blocks whose kinds the GGUF's two per-layer lists state \u2014 the six attention blocks (5, 12, 19, 26, 33, 40) mark themselves with head_count_kv 2, the 23 MoE blocks with feed_forward_length 1856, and the 23 blocks stating both 0 are Mamba-2. Its GGUF's tokenizer.ggml.pre=pixtral is Mistral's Tekken split, which the pixtral tokenizer profile rebuilds. GGUF only for the target: no packed format. Its DSpark draft (six causal sliding-window layers, per-head attention sinks and a rank-512 Markov head) ships as safetensors; NVIDIA's MTP nextn block converts via dev/convert/gguf_mtp_to_safetensors.py.",
+  "draft": {
+    "repo": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16",
+    "base": "dspark",
+    "signature": {
+      "architectures": [
+        "Qwen3DSparkModel"
+      ],
+      "hidden_size": 2688,
+      "vocab_size": 131072,
+      "intermediate_size": 6144,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 2,
+      "head_dim": 128,
+      "num_hidden_layers": 6,
+      "block_size": 8,
+      "markov_rank": 512,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 10000,
+      "sliding_window": 1024,
+      "dflash_config.mask_token_id": 990,
+      "dflash_config.target_layer_ids": [
+        1,
+        5,
+        19,
+        29,
+        41,
+        51
+      ],
+      "dflash_config.swa_window_size": 1024,
+      "enable_confidence_head": false,
+      "has_embed_tokens": true,
+      "markov_head_type": "vanilla",
+      "attention_sink_bias": true,
+      "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention"
+      ]
+    }
+  },
+  "signature": {
+    "model_type": "nemotron_h_moe_text",
+    "hidden_size": 2688,
+    "num_hidden_layers": 52,
+    "vocab_size": 131072,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "num_experts": 128,
+    "num_experts_per_tok": 6
+  },
+  "vision": false,
+  "serving": {
+    "think": {
+      "end": "</think>",
+      "open": "<think>",
+      "open_token": "<think>"
+    },
+    "tool_dialect": "qwen3-xml",
+    "dfa_mode": "full",
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  "tuning": [
+    {
+      "env": "RICHENGINE_VERIFY_TREE",
+      "values": [
+        "0"
+      ],
+      "reason": "the n-gram comb tree vs the bare chain; on by default"
+    },
+    "VERIFY_ALL_LIVE",
+    "VERIFY_SPLITS_MAX",
+    "VERIFY_SPLIT_R2",
+    "PREFILL_SPLITS_MAX",
+    "NGRAM_PREDRAFT",
+    "NGRAM_DRAFT_EXPECT",
+    "NGRAM_WARMUP",
+    "NGRAM_TREE_MIN",
+    "TREE_ACCEPT_MIN",
+    "TREE_ACCEPT_MAX",
+    "ANE_WAIT",
+    "PREFILL_FAST_INT8",
+    "HEAD_FUSED",
+    "MTL4",
+    "GGUF_PACKED",
+    "SUBMIT_AHEAD",
+    "ICB_OFF",
+    "PREPARED_CACHE_OFF",
+    "PATCHABLE_OFF",
+    "NO_FUSED_GATE",
+    "MOE_UNION",
+    "MOE_PACKED_OFF",
+    "MOE_GGUF_TILE",
+    "MOE_GGUF_FUSED",
+    "DECODE_RING2",
+    "DEVICE_VERIFY_PARAMS",
+    "MOE_TILE_MAJOR"
+  ]
+}

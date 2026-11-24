@@ -1,6 +1,7 @@
 #include "DFlashV1Draft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+#include "metal/abi/Vision.h"
 
 #include "ops/KernelNames.hpp"
 
@@ -21,11 +22,23 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.kvHeads) {
     throw WeightStoreError("plain draft layout contains a zero dimension");
   }
-  validateQ4Layout(layout.qkvSize, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.attentionSize);
-  validateQ4Layout(layout.intermediateSize, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.intermediateSize);
-  validateQ4Layout(layout.hiddenSize, layout.targetHiddenSize);
+  // A draft whose dims are off the quantized tiles loads F32 float
+  // segments instead — DraftCheckpoint.cpp's floatProjections makes the
+  // same decision when it plans the files.
+  const auto q4 = [](uint32_t rows, uint32_t columns) {
+    return rows % kQ4StorageN == 0 && columns % kQ4GroupElements == 0;
+  };
+  if (q4(layout.qkvSize, layout.hiddenSize) &&
+      q4(layout.hiddenSize, layout.attentionSize) &&
+      q4(layout.intermediateSize, layout.hiddenSize) &&
+      q4(layout.hiddenSize, layout.intermediateSize) &&
+      q4(layout.hiddenSize, layout.targetHiddenSize)) {
+    validateQ4Layout(layout.qkvSize, layout.hiddenSize);
+    validateQ4Layout(layout.hiddenSize, layout.attentionSize);
+    validateQ4Layout(layout.intermediateSize, layout.hiddenSize);
+    validateQ4Layout(layout.hiddenSize, layout.intermediateSize);
+    validateQ4Layout(layout.hiddenSize, layout.targetHiddenSize);
+  }
 }
 
 // The key and value rows of each layer's fused QKV projection, without a
@@ -49,6 +62,27 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
       // 32-column group and 4-byte meta units per 64-column block.
       const ops::QuantizedSegment &fused =
           layer.qkvProjection.blocks().segments.at(0);
+      if (fused.isFloat()) {
+        // F32 float segments: the K/V rows are the segments covering the
+        // tail, renumbered to lead the slice projection's columns — each
+        // plane0 holds [rows][inputs] floats.
+        ops::BlockWeights slice;
+        uint32_t covered = 0;
+        for (const ops::QuantizedSegment &s :
+             layer.qkvProjection.blocks().segments) {
+          if (s.columnOffset < layout.attentionSize) continue;
+          ops::QuantizedSegment tail = s;
+          tail.columnOffset = covered;
+          covered += s.outputSize;
+          slice.segments.push_back(std::move(tail));
+        }
+        if (covered != layout.contextKvSize())
+          throw std::invalid_argument(
+              "draft float QKV does not slice the context K/V");
+        result.emplace_back(layout.contextKvSize(), layout.hiddenSize,
+                            std::move(slice));
+        continue;
+      }
       constexpr uint32_t kTileRows = 256;
       if (layout.attentionSize % kTileRows ||
           layout.contextKvSize() % kTileRows || fused.plane1)
@@ -169,6 +203,14 @@ void DFlashV1Draft::addDecode(
       operators_.draftAttention(layout.attentionShape(), lanes, layout.queryRows());
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
+  // F32 float segments (a draft off the quantized tiles): the fp32
+  // kernels take no epilogue, so the residual adds dispatch
+  // draft_residual_add and the gate/up pair a standalone silu-mul.
+  const bool floats =
+      !weights_.layers.empty() &&
+      weights_.layers.front().qkvProjection.layout() ==
+          ops::WeightLayout::Block32 &&
+      weights_.layers.front().qkvProjection.blocks().segments.front().isFloat();
 
   // Every draft decode dispatch is static per batch width except the
   // attention split/reduce, whose parameters carry each lane's cache length;
@@ -198,31 +240,72 @@ void DFlashV1Draft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
+         buffers.queryValues, {}},
         cacheLengths, attentionPlan, causal, devicePack);
-    linear.add(graph, {.input = buffers.attention, .output = buffers.residual,
-                       .residual = buffers.hidden[current], .scratch = scratch},
-               weights.outputProjection,
-               linear.decodePlan(weights.outputProjection, lanes,
-                                 ops::LinearEpilogue::Residual, nullptr,
-                                 layout.queryRows()));
+    if (floats) {
+      linear.add(graph, {.input = buffers.attention, .output = buffers.residual,
+                         .scratch = scratch},
+                 weights.outputProjection,
+                 linear.decodePlan(weights.outputProjection, lanes,
+                                   ops::LinearEpilogue::None, nullptr,
+                                   layout.queryRows()));
+      ops::DraftAttention::addResidual(graph, buffers.residual,
+                                       buffers.hidden[current],
+                                       buffers.residual, attentionPlan);
+    } else {
+      linear.add(graph, {.input = buffers.attention, .output = buffers.residual,
+                         .residual = buffers.hidden[current], .scratch = scratch},
+                 weights.outputProjection,
+                 linear.decodePlan(weights.outputProjection, lanes,
+                                   ops::LinearEpilogue::Residual, nullptr,
+                                   layout.queryRows()));
+    }
     const ops::LinearPlan mlpPlan = linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
     const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpPlan.input());
-    linear.add(graph,
-               {.input = buffers.normalized, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
-                .scratch = scratch,
-                .prepared = mlpNormalized},
-               weights.upProjection,
-               linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection, layout.queryRows()),
-               &weights.gateProjection);
-    linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
-                       .residual = buffers.residual, .scratch = scratch},
-               weights.downProjection,
-               linear.decodePlan(weights.downProjection, lanes,
-                                 ops::LinearEpilogue::Residual, nullptr,
-                                 layout.queryRows()));
+    if (floats) {
+      // gate into the scratch, up over it, then the elementwise
+      // silu(gate) * up — the vision encoder's is the kernel that takes it.
+      linear.add(graph, {.input = buffers.normalized, .output = buffers.gateScratch,
+                         .scratch = scratch, .prepared = mlpNormalized},
+                 weights.gateProjection, mlpPlan);
+      linear.add(graph, {.input = buffers.normalized, .output = buffers.intermediate,
+                         .scratch = scratch, .prepared = mlpNormalized},
+                 weights.upProjection, mlpPlan);
+      const uint32_t elements = rows * layout.intermediateSize;
+      graph.add(std::string(ops::kLfmVisionSiluMul),
+                {buffers.gateScratch, buffers.intermediate,
+                 buffers.intermediate},
+                VisionNormParams{elements}, {(elements + 255) / 256, 1, 1},
+                {256, 1, 1});
+    } else {
+      linear.add(graph,
+                 {.input = buffers.normalized, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
+                  .scratch = scratch,
+                  .prepared = mlpNormalized},
+                 weights.upProjection,
+                 linear.decodePlan(weights.upProjection, lanes, ops::LinearEpilogue::GateUp, &weights.gateProjection, layout.queryRows()),
+                 &weights.gateProjection);
+    }
+    if (floats) {
+      linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
+                         .scratch = scratch},
+                 weights.downProjection,
+                 linear.decodePlan(weights.downProjection, lanes,
+                                   ops::LinearEpilogue::None, nullptr,
+                                   layout.queryRows()));
+      ops::DraftAttention::addResidual(graph, buffers.hidden[next],
+                                       buffers.residual,
+                                       buffers.hidden[next], attentionPlan);
+    } else {
+      linear.add(graph, {.input = buffers.intermediate, .output = buffers.hidden[next],
+                         .residual = buffers.residual, .scratch = scratch},
+                 weights.downProjection,
+                 linear.decodePlan(weights.downProjection, lanes,
+                                   ops::LinearEpilogue::Residual, nullptr,
+                                   layout.queryRows()));
+    }
   }
 
   // The final norm feeds the shared vocabulary head; the plain selector
@@ -300,8 +383,14 @@ DFlashV1DraftWeights readDraft(metal::MetalBackend &backend, Files &files,
     WeightFile file = files.layer(layerIndex);
     DFlashV1DraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
-    layer.qkvProjection = readProjection(
-        file, layout.qkvSize, layout.hiddenSize, "qkv");
+    // Block files read the fused QKV through the oQ loop: it covers both
+    // the single AF4 segment of a quantized draft and the three F32 float
+    // segments (q, k, v) of an off-tile one.
+    layer.qkvProjection = file.record().type & kBlockWeightsImageType
+                              ? readOqFused(file, layout.qkvSize,
+                                            layout.hiddenSize, "qkv")
+                              : readProjection(file, layout.qkvSize,
+                                               layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
     layer.outputProjection = readProjection(

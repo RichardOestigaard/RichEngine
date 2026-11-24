@@ -116,6 +116,20 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
     config.ggufTile = tile;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
     config.mxfp4Native = policy_.nativeFormats();
+    // A chunk's experts run the int8 passes where its dense projections run
+    // the int8 prefill tile (prefill chunks past the decode tiles' rows,
+    // RICHENGINE_PREFILL_FAST_INT8 on, the int8-matmul families) and the
+    // block's experts take it (shape.int8Experts), once its routes average
+    // 6 or more an expert — the quantity that drives the passes' cost, not
+    // the chunk's rows. Below it the int8 tile runs both 16-row fragments
+    // of an expert's tile whatever its live rows, where the staged passes
+    // run 8-, 16- or 32-row matmuls by live rows (upstream 1.7.1's measured
+    // crossover: from 6 routes an expert shorter in every run). A streamed
+    // block never reaches them — the streamed passes have no int8 form.
+    config.int8Passes =
+        prefill && shape.int8Experts && policy_.apple10Plus() &&
+        model::modelPolicy().prefillFastInt8 && rows > kMaximumDecodeTileRows &&
+        uint64_t{rows} * shape.expertsPerToken >= 6 * uint64_t{shape.experts};
   }
   return config;
 }

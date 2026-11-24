@@ -97,6 +97,8 @@ using KernelLayout = kv::Core;
     return 256;
   case KernelLayout::Kv2Group8D128:
   case KernelLayout::Kv4Group4D128:
+  case KernelLayout::Kv4Group8D128:
+  case KernelLayout::Kv2Group16D128:
     return 128;
   case KernelLayout::Kv8Group4D64:
   case KernelLayout::Kv8Group5D64:
@@ -131,6 +133,10 @@ using KernelLayout = kv::Core;
     return "_k8q4d128";
   case KernelLayout::Kv4Group4D128:
     return "_k4q4d128";
+  case KernelLayout::Kv4Group8D128:
+    return "_k4q8d128";
+  case KernelLayout::Kv2Group16D128:
+    return "_k2q16d128";
   case KernelLayout::GemmaKv8H256:
     return "_gemma_h256";
   case KernelLayout::GemmaKv2H512:
@@ -214,6 +220,13 @@ using KernelLayout = kv::Core;
   case KernelLayout::Kv4Group4D128:
     return layout.kvHeads == 4 && layout.headDimension == 128 &&
            queryHeads == 16;
+  case KernelLayout::Kv4Group8D128:
+    return layout.kvHeads == 4 && layout.headDimension == 128 &&
+           queryHeads == 32;
+  // Nemotron 3.5's dense layers: 32 query heads over 2 KV heads of 128.
+  case KernelLayout::Kv2Group16D128:
+    return layout.kvHeads == 2 && layout.headDimension == 128 &&
+           queryHeads == 32;
   case KernelLayout::GemmaKv8H256:
     return layout.kvHeads == 8 && layout.headDimension == 256 &&
            queryHeads == 16;
@@ -343,10 +356,14 @@ using KernelLayout = kv::Core;
       case KernelLayout::Kv2Group8:
       case KernelLayout::Kv2Group8D128:
         return 8u;
+      case KernelLayout::Kv2Group16D128:
+        return 16u;
       case KernelLayout::Kv8Group4D64:
       case KernelLayout::Kv8Group4D128:
       case KernelLayout::Kv4Group4D128:
         return 4u;
+      case KernelLayout::Kv4Group8D128:
+        return 8u;
       case KernelLayout::Kv8Group5D64:
         return 5u;
       default:
@@ -354,18 +371,34 @@ using KernelLayout = kv::Core;
       }
     }();
     const uint32_t fused = group * kv::kVerifyRows;
-    const uint32_t passes = fused >= 128 ? 4 : 2;
+    const uint32_t passes = fused >= 256 ? 8 : fused >= 128 ? 4 : 2;
     if (group && fused % passes == 0 && (fused / passes) % 8 == 0)
-      name += passes == 4 ? "_r4" : "_r2";
+      name += "_r" + std::to_string(passes);
   }
   return name;
 }
 
 [[nodiscard]] std::string storeKernel(std::string_view stem, kv::Format format,
                                       const kv::Layout &layout) {
-  std::string kernel = std::string(stem) + "_" + formatTag(format) + "_store" +
-                       std::string(storageSuffix(layout));
+  std::string_view suffix = storageSuffix(layout);
   // A valuesTokenMajor layout's pages take the token-major store variants.
+  // The kv4/d128 TM kernels carry their query group in the name (page
+  // geometry alone cannot tell Kv4Group4D128 from Kv4Group8D128), so the
+  // declared core resolves it.
+  if (layout.valuesTokenMajor) {
+    switch (layout.attentionCore) {
+    case KernelLayout::Kv4Group4D128:
+      suffix = "_k4q4d128";
+      break;
+    case KernelLayout::Kv4Group8D128:
+      suffix = "_k4q8d128";
+      break;
+    default:
+      break;
+    }
+  }
+  std::string kernel = std::string(stem) + "_" + formatTag(format) + "_store" +
+                       std::string(suffix);
   if (layout.valuesTokenMajor) kernel += "_tm";
   return kernel;
 }
@@ -390,7 +423,8 @@ using KernelLayout = kv::Core;
 // values the gather can read: token-major, INT8 or BF16.
 void requireSparseLayout(const kv::Layout &layout, KernelLayout kernel) {
   if (kernel != KernelLayout::Kv2Group12H256 &&
-      kernel != KernelLayout::Kv4Group4D128)
+      kernel != KernelLayout::Kv4Group4D128 &&
+      kernel != KernelLayout::Kv4Group8D128)
     throw std::invalid_argument("no sparse attention kernel for layout");
   if (!layout.valuesTokenMajor)
     throw std::invalid_argument("sparse attention requires token-major values");
@@ -750,11 +784,13 @@ void PagedAttention::addPrefillProjection(
                        std::string(kernelSuffix(kernelLayout));
   if (hasNorms) kernel = qkNormKernel(kernel, queryNorm, keyNorm);
   FullPrefillParams params{.tokens = tokens, .stride = stride};
-  // Unused norm slots keep the binding contract satisfied.
+  // Unused norm and rope slots (a NoPE core's rope tensors are empty) keep
+  // the binding contract satisfied.
   graph.add(kernel,
             {packed, hasNorms ? queryNorm.buffer : queries,
-             hasNorms ? keyNorm.buffer : queries, ropeCos, ropeSin, queries,
-             chunkKeys, chunkValues},
+             hasNorms ? keyNorm.buffer : queries,
+             ropeCos ? ropeCos : queries, ropeSin ? ropeSin : queries,
+             queries, chunkKeys, chunkValues},
             params,
             {tokens * (queryHeads + layout.kvHeads), 1, 1},
             {layout.headDimension, 1, 1});
@@ -808,8 +844,9 @@ void PagedAttention::addVerifyProjection(
                                .rope_stride = RICHENGINE_TARGET_VERIFY_ROWS};
   graph.add(kernel,
             {packed, hasNorms ? queryNorm.buffer : queries,
-             hasNorms ? keyNorm.buffer : queries, ropeCos, ropeSin, queries,
-             chunkKeys, chunkValues},
+             hasNorms ? keyNorm.buffer : queries,
+             ropeCos ? ropeCos : queries, ropeSin ? ropeSin : queries,
+             queries, chunkKeys, chunkValues},
             params,
             {uint64_t{rows} * (queryHeads + layout.kvHeads), lanes, 1},
             {layout.headDimension, 1, 1});

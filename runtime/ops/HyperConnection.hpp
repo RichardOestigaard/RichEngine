@@ -81,6 +81,13 @@ public:
                             metal::MetalBuffer streams,
                             metal::MetalBuffer destination, RowRegion to,
                             HyperShape shape, uint32_t rows);
+  // Every stream of each of `rows` rows, bf16 and `shape.width()` wide,
+  // into `destination` at `to`: a hyper-connected target's capture for the
+  // MTP draft, which consumes the full residual state.
+  static void addStreamCapture(metal::CommandGraph &graph,
+                               metal::MetalBuffer streams,
+                               metal::MetalBuffer destination, RowRegion to,
+                               HyperShape shape, uint32_t rows);
 };
 
 } // namespace richengine::ops

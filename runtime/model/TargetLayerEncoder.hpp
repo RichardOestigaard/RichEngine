@@ -88,4 +88,17 @@ makeQwen4LayerEncoder(const TargetModel &model);
 [[nodiscard]] std::unique_ptr<TargetLayerEncoder>
 makeLfm3LayerEncoder(const TargetModel &model);
 
+// The maxwell_moe target's layer encoder (MaxwellMoe.cpp): the
+// hyper-connected streams' mHC mixes and the per-KV-group MBSA routes. The
+// pieces whose kernels richengine does not have yet throw named errors at
+// encode time rather than silently skipping.
+[[nodiscard]] std::unique_ptr<TargetLayerEncoder>
+makeMaxwellLayerEncoder(const TargetModel &model);
+
+// The nemotron target's layer encoder (Nemotron.cpp): the tri-hybrid's
+// one-sub-layer blocks — the Mamba-2 mixers, the plain GQA attention
+// blocks and the ungated relu-squared MoE blocks.
+[[nodiscard]] std::unique_ptr<TargetLayerEncoder>
+makeNemotronLayerEncoder(const TargetModel &model);
+
 } // namespace richengine::model

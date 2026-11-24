@@ -209,10 +209,14 @@ struct SelectorBatchParams {
   // The lanes' packed draft query-row stride: the draft's trained-block
   // depth (draft.queryRows()), at most RICHENGINE_DRAFT_QUERY_ROWS.
   uint32_t query_rows;
+  // The DSpark Markov head's inner rank (dspark_select_edges's W1/W2 row
+  // stride): RICHENGINE_DRAFT_SELECTOR_RANK or wider, at most
+  // RICHENGINE_DRAFT_SELECTOR_RANK_MAXIMUM. Unused by the other selectors.
+  uint32_t rank;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 52,
-              "Draft selector parameters are 52 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 56,
+              "Draft selector parameters are 56 bytes on both sides");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
 // rows, draft_verify_rows), chosen for the whole batch by expected accepted
@@ -269,15 +273,18 @@ static_assert(sizeof(DraftConfScoreParams) == 20,
               "Draft confidence score parameters are 20 bytes on both sides");
 
 // The draft top-16 shard kernels' scalar payload (draft_select_top16_sharded,
-// dspark_select_top16_sharded): the token bound and the logits row stride,
-// which differ on a padded-vocabulary target.
+// dspark_select_top16_sharded): the token bound, the logits row stride, which
+// differ on a padded-vocabulary target, and the logits row of proposal
+// position zero — 1 for drafts whose anchor row reproduces the anchor
+// (DFlash and bonus-anchor DSpark), 0 for anchor-first DSpark.
 struct DraftTop16Params {
   uint32_t vocabulary;
   uint32_t logits_stride;
+  uint32_t row_offset;
 };
 
-static_assert(sizeof(DraftTop16Params) == 8,
-              "Draft top-16 parameters are 8 bytes on both sides");
+static_assert(sizeof(DraftTop16Params) == 12,
+              "Draft top-16 parameters are 12 bytes on both sides");
 
 // One node of a lane's verify tree (draft_select_tree): the DFS row of its
 // parent (0xFF for the anchor), its depth from the anchor, and its proposal

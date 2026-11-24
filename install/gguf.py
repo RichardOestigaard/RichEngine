@@ -161,6 +161,18 @@ LFM2_PATTERNS = (
     r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+",
 )
+# The maxwell-moe profile the Maxwell port declares: newlines and Han and
+# Southeast Asian script runs split out ahead of a case-aware GPT-2 pattern,
+# as the published tokenizer.json's Split pretokenizers do.
+MAXWELL_PATTERNS = (
+    r"\n",
+    r"[^\p{L}\p{N}]?[\p{Han}]+",
+    "[\u0E00-\u0E7F\u0E80-\u0EFF\u1000-\u109F\u1780-\u17FF]+",
+    r"[^\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
 # Each tokenizer.ggml.pre profile RichEngine can rebuild: its Split patterns in
 # application order and whether the input is NFC-normalized first.
 # The granite-docling profile is the original GPT-2 pattern, unchanged.
@@ -168,11 +180,22 @@ GRANITE_DOCLING_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+"
     r"| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
 )
+# The pixtral profile is Mistral's Tekken split — case-aware letter runs
+# (lowercase-headed or fully uppercase words, a number left whole) as the
+# published Nemotron 3.5 tokenizer.json states it; llama.cpp's PIXTRAL
+# pre-type declares the same. No normalization.
+PIXTRAL_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "minicpm5": (MINICPM5_PATTERNS, False),
     "lfm2": (LFM2_PATTERNS, False),
+    "maxwell-moe": (MAXWELL_PATTERNS, False),
     "granite-docling": ((GRANITE_DOCLING_PATTERN,), False),
+    "pixtral": ((PIXTRAL_PATTERN,), False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -323,7 +346,7 @@ def tokenizer_files(metadata):
     for key in ("tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token"):
         automatic = metadata.values.get(key, False)
         if automatic is not False and not (
-            model == "gemma4"
+            model in ("gpt2", "gemma4")
             and key == "tokenizer.ggml.add_bos_token"
             and automatic is True
             and type(bos) is int
@@ -334,6 +357,21 @@ def tokenizer_files(metadata):
         backend = _bpe_tokenizer(metadata, tokens, types)
     else:
         backend = _unigram_tokenizer(metadata, tokens, types)
+    if model == "gpt2" and metadata.values.get("tokenizer.ggml.add_bos_token"):
+        # A gpt2 vocabulary's ByteLevel post-processor trims offsets only;
+        # sequence it with the BOS template transformers' own add_bos_token
+        # prepends, which the GGUF's flag mirrors.
+        from tokenizers import processors
+
+        backend.post_processor = processors.Sequence(
+            [
+                backend.post_processor,
+                processors.TemplateProcessing(
+                    single=f"{tokens[bos]} $A",
+                    special_tokens=[(tokens[bos], bos)],
+                ),
+            ]
+        )
     # The index of each added token, and whether it is special.
     added = {
         index: kind == CONTROL_TOKEN
@@ -722,6 +760,10 @@ def text_architecture(metadata):
 # from a GGUF: deriving just their model_type reaches pack.packable's
 # refusal, which names the safetensors checkpoint to install instead.
 PACKED_ONLY_ARCHS = {"diffusiongemma": "diffusion_gemma_text"}
+
+# Architectures packable and GGUF-loadable both (a GGUF image plan covers
+# the tensor set; upstream.select's packable refusal exempts them).
+PACKED_AND_GGUF_ARCHS = {"maxwell-moe"}
 
 
 def model_config(metadata, vision=None):
@@ -1433,7 +1475,336 @@ def _qwen4exp_tensors(metadata, layers):
     return tensors
 
 
+# The Maxwell-MoE target (maxwell-moe): attention on every layer with the
+# MBSA indexer, the manifold-constrained hyper-connection modules and HC
+# head, and the sigmoid MoE with a per-expert bias and an ungated shared
+# expert beside its leading dense layers.
+FLOAT_OR_BF16 = {"F32", "BF16"}
+MAXWELL_MIXER_TENSORS = {
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_q_norm.weight": F32,
+    "attn_k_norm.weight": F32,
+    "attn_output.weight": QUANTIZED_TYPES,
+    "indexer.q_proj.weight": FLOAT_OR_BF16,
+    "indexer.k_proj.weight": FLOAT_OR_BF16,
+    "indexer.q_norm.weight": F32,
+    "indexer.k_norm.weight": F32,
+}
+MAXWELL_MHC_TENSORS = {
+    "hc_attn_fn.weight": FLOAT_OR_BF16,
+    "hc_attn_scale.weight": F32,
+    "hc_attn_base.weight": F32,
+    "hc_ffn_fn.weight": FLOAT_OR_BF16,
+    "hc_ffn_scale.weight": F32,
+    "hc_ffn_base.weight": F32,
+}
+# The sigmoid router and its selection bias, the routed expert slabs and
+# the ungated shared expert (no ffn_gate_inp_shexp).
+MAXWELL_MOE_TENSORS = {
+    "ffn_gate_inp.weight": F32,
+    "exp_probs_b.bias": F32,
+    "ffn_gate_exps.weight": QUANTIZED_TYPES,
+    "ffn_up_exps.weight": QUANTIZED_TYPES,
+    "ffn_down_exps.weight": QUANTIZED_TYPES,
+    "ffn_gate_shexp.weight": QUANTIZED_TYPES,
+    "ffn_up_shexp.weight": QUANTIZED_TYPES,
+    "ffn_down_shexp.weight": QUANTIZED_TYPES,
+}
+MAXWELL_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output_norm.weight": F32,
+    "output.weight": QUANTIZED_TYPES,
+    "output_hc_fn.weight": FLOAT_OR_BF16,
+    "output_hc_base.weight": F32,
+    "output_hc_scale.weight": F32,
+}
+
+
+def _maxwell_fields(arch, text, metadata):
+    """The maxwell_moe source config's fields, from the metadata keys the
+    family's source-config check reads (families/Maxwell.mm)."""
+
+    def positive(key):
+        return metadata.positive(arch + "." + key)
+
+    indexer = "attention.indexer."
+    streams = positive("hyper_connection.count")
+    text.update(
+        attention_head_size=positive("attention.key_length"),
+        moe_intermediate_size=positive("expert_feed_forward_length"),
+        shared_expert_intermediate_size=positive(
+            "expert_shared_feed_forward_length"
+        ),
+        num_experts=positive("expert_count"),
+        num_experts_per_tok=positive("expert_used_count"),
+        num_residual_streams=streams,
+        mhc_sinkhorn_iterations=positive(
+            "hyper_connection.sinkhorn_iterations"
+        ),
+        mtp_num_layers=metadata.values.get(arch + ".nextn_predict_layers", 0),
+        block_sparse_gqa_indexer_n_heads=positive(indexer + "head_count"),
+        block_sparse_gqa_indexer_head_dim=positive(indexer + "key_length"),
+        block_sparse_gqa_block_size=positive(indexer + "block_size"),
+        block_sparse_gqa_group_reduction="per_group_max",
+        router_score_function="sigmoid",
+        hidden_act="silu",
+        qk_layernorm=True,
+        enable_hyper_connections=True,
+        moe_router_enable_expert_bias=True,
+        use_shared_expert_gate=False,
+        tie_word_embeddings=False,
+    )
+    dense = positive("leading_dense_block_count")
+    if dense > text["num_hidden_layers"]:
+        raise ModelError(
+            "invalid GGUF metadata: " + arch + ".leading_dense_block_count"
+        )
+    text["mlp_only_layers"] = list(range(dense))
+    text["block_sparse_gqa_layer_freq"] = [1] * text["num_hidden_layers"]
+    prefix = positive(indexer + "prefix_blocks")
+    local = positive(indexer + "local_blocks")
+    remote = positive(indexer + "top_k")
+    block = text["block_sparse_gqa_block_size"]
+    text["block_sparse_gqa_prefix_window_size"] = prefix * block
+    text["block_sparse_gqa_local_window_size"] = local * block
+    text["block_sparse_gqa_num_remote_blocks"] = remote
+    text["block_sparse_gqa_total_support_blocks"] = prefix + local + remote
+    text["rope_theta"] = metadata.values.get(arch + ".rope.freq_base")
+    epsilon = metadata.values.get(arch + ".attention.layer_norm_rms_epsilon")
+    if type(epsilon) is not float or epsilon <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.layer_norm_rms_epsilon"
+        )
+    text["rms_norm_eps"] = epsilon
+    if (
+        metadata.values.get(arch + ".expert_gating_func") != 2
+        or metadata.values.get(arch + ".expert_weights_norm") is not True
+        or metadata.values.get(arch + ".expert_shared_count") != 1
+    ):
+        raise ModelError(
+            "unsupported GGUF metadata: " + arch + " expert routing fields"
+        )
+    types = metadata.values.get(arch + "." + indexer + "types")
+    if types is not None and (
+        not isinstance(types, list)
+        or len(types) != text["num_hidden_layers"]
+        or not all(types)
+    ):
+        raise ModelError(
+            "unsupported GGUF metadata: " + arch + ".attention.indexer.types"
+        )
+
+
+def _maxwell_tensors(metadata, layers):
+    """maxwell-moe: attention and the MBSA indexer on every layer, the mHC
+    modules, dense FFNs on the leading dense layers and the sigmoid MoE
+    after; the HC head on the model head."""
+    dense_layers = metadata.positive(
+        text_architecture(metadata) + ".leading_dense_block_count"
+    )
+    tensors = dict(MAXWELL_MODEL_TENSORS)
+    for layer in range(layers):
+        ffn = DENSE_TENSORS if layer < dense_layers else MAXWELL_MOE_TENSORS
+        parts = (
+            LLAMA_LAYER_TENSORS | MAXWELL_MIXER_TENSORS | MAXWELL_MHC_TENSORS | ffn
+        )
+        for name, types in parts.items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+# The nemotron_h_moe target (NVIDIA Nemotron-3.5 Lightning): a tri-hybrid
+# of three block kinds under one per-layer schedule, where every block
+# carries only attn_norm beside its mixer — the attention blocks plain GQA
+# projections with no QK norm, the Mamba-2 blocks the in_proj/taps-major
+# conv/per-head scalars set with its group norm, and the MoE blocks the
+# biased sigmoid router over gate-less experts beside one ungated shared
+# expert.
+NEMOTRON_LAYER_TENSORS = {"attn_norm.weight": F32}
+NEMOTRON_ATTENTION_TENSORS = {
+    "attn_q.weight": QUANTIZED_TYPES,
+    "attn_k.weight": QUANTIZED_TYPES,
+    "attn_v.weight": QUANTIZED_TYPES,
+    "attn_output.weight": QUANTIZED_TYPES,
+}
+NEMOTRON_MAMBA_TENSORS = {
+    "ssm_in.weight": QUANTIZED_TYPES,
+    "ssm_conv1d.weight": F32,
+    "ssm_conv1d.bias": F32,
+    "ssm_a": F32,
+    "ssm_d": F32,
+    "ssm_dt.bias": F32,
+    "ssm_norm.weight": F32,
+    "ssm_out.weight": QUANTIZED_TYPES,
+}
+NEMOTRON_MOE_TENSORS = {
+    "ffn_gate_inp.weight": F32,
+    "exp_probs_b.bias": F32,
+    "ffn_up_exps.weight": QUANTIZED_TYPES,
+    "ffn_down_exps.weight": QUANTIZED_TYPES,
+    "ffn_up_shexp.weight": QUANTIZED_TYPES,
+    "ffn_down_shexp.weight": QUANTIZED_TYPES,
+}
+NEMOTRON_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "output_norm.weight": F32,
+    "output.weight": QUANTIZED_TYPES,
+}
+
+
+def _nemotron_layer_kinds(metadata, arch, layers):
+    """Each block's kind, as the two per-layer lists state it: a nonzero
+    head_count_kv entry marks an attention block (one count across them,
+    which the flat num_key_value_heads states), a nonzero
+    feed_forward_length entry an MoE block, and a block stating both 0 is
+    a Mamba-2 block. No block is two kinds."""
+    kv = metadata.values.get(arch + ".attention.head_count_kv")
+    ffl = metadata.values.get(arch + ".feed_forward_length")
+    if (
+        not isinstance(kv, list)
+        or len(kv) < layers
+        or not all(type(count) is int and count >= 0 for count in kv[:layers])
+        or not isinstance(ffl, list)
+        or len(ffl) < layers
+        or not all(type(width) is int and width >= 0 for width in ffl[:layers])
+        or any(kv[layer] and ffl[layer] for layer in range(layers))
+        or len({count for count in kv[:layers] if count}) > 1
+    ):
+        raise ModelError(
+            "missing or invalid GGUF metadata: "
+            + arch
+            + ".attention.head_count_kv or .feed_forward_length"
+        )
+    return [
+        "attention" if kv[layer] else "moe" if ffl[layer] else "mamba"
+        for layer in range(layers)
+    ]
+
+
+def _nemotron_h_moe_fields(arch, text, metadata):
+    layers = text["num_hidden_layers"]
+    # layer_types carries the three-kind schedule the tensor plan reads
+    # off the same two lists.
+    text["layer_types"] = _nemotron_layer_kinds(metadata, arch, layers)
+
+    def positive(key):
+        return metadata.positive(arch + "." + key)
+
+    # The MoE blocks share one expert width; a GGUF narrowing a block
+    # states a geometry the tensor set does not.
+    moe_width = positive("expert_feed_forward_length")
+    ffl = metadata.values.get(arch + ".feed_forward_length")
+    if any(width and width != moe_width for width in ffl[:layers]):
+        raise ModelError(
+            "unsupported GGUF metadata: "
+            + arch
+            + ".feed_forward_length differs between MoE blocks"
+        )
+    # The Mamba-2 head count is its time-step rank (the per-head scalar
+    # vectors' width); the head width is the inner size divided evenly.
+    heads = positive("ssm.time_step_rank")
+    inner = positive("ssm.inner_size")
+    if inner % heads:
+        raise ModelError("invalid GGUF metadata: " + arch + ".ssm.inner_size")
+    text.update(
+        num_experts=positive("expert_count"),
+        num_experts_per_tok=positive("expert_used_count"),
+        # Every FFN is a MoE block's expert width, stated flat as the
+        # config's intermediate_size too.
+        intermediate_size=moe_width,
+        moe_intermediate_size=moe_width,
+        shared_expert_intermediate_size=positive("expert_shared_feed_forward_length"),
+        expert_weights_norm=True,
+        hidden_act="relu2",
+        tie_word_embeddings=False,
+        mamba_num_heads=heads,
+        mamba_head_dim=inner // heads,
+        mamba_groups=positive("ssm.group_count"),
+        ssm_state_size=positive("ssm.state_size"),
+        conv_kernel=positive("ssm.conv_kernel"),
+        ssm_inner_size=inner,
+        time_step_rank=heads,
+    )
+    scale = metadata.values.get(arch + ".expert_weights_scale")
+    if type(scale) is not float or scale <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".expert_weights_scale"
+        )
+    text["expert_weights_scale"] = scale
+    # Routing beyond the biased sigmoid gate — grouped selection, another
+    # shared-expert count or unnormalized weights the tensor set does not
+    # carry — is unsupported.
+    if (
+        metadata.values.get(arch + ".expert_group_count") != 1
+        or metadata.values.get(arch + ".expert_group_used_count") != 1
+        or metadata.values.get(arch + ".expert_shared_count") != 1
+        or metadata.values.get(arch + ".expert_weights_norm") is not True
+    ):
+        raise ModelError(
+            "unsupported GGUF metadata: " + arch + " expert routing fields"
+        )
+    # Every attention block is K == V.
+    if metadata.values.get(arch + ".attention.value_length") != metadata.values.get(
+        arch + ".attention.key_length"
+    ):
+        raise ModelError(
+            "unsupported GGUF metadata: "
+            + arch
+            + ".attention.key_length and its value_length differ"
+        )
+    # The GGUF stores the F32 rounding of config.json's norm epsilons;
+    # emit the literal when the stored value is its image.
+    for name, key in (
+        ("rms_norm_eps", "attention.layer_norm_rms_epsilon"),
+        ("norm_eps", "attention.layer_norm_epsilon"),
+    ):
+        epsilon = metadata.values.get(arch + "." + key)
+        if type(epsilon) is not float or epsilon <= 0:
+            raise ModelError("missing or invalid GGUF metadata: " + arch + "." + key)
+        text[name] = 1e-5 if abs(epsilon - 1e-5) <= 1e-5 * 1e-6 else epsilon
+    theta = metadata.values.get(arch + ".rope.freq_base")
+    if type(theta) is not float or theta <= 0:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".rope.freq_base"
+        )
+    text["rope_theta"] = theta
+    # The attention blocks' rotary is partial: rope.dimension_count is the
+    # rotated head width, half of it the pair count the table holds.
+    rotary = metadata.values.get(arch + ".rope.dimension_count")
+    if type(rotary) is not int or rotary <= 0 or rotary % 2:
+        raise ModelError(
+            "missing or invalid GGUF metadata: " + arch + ".rope.dimension_count"
+        )
+    text["rotary_pairs"] = rotary // 2
+
+
+def _nemotron_tensors(metadata, layers):
+    """nemotron_h_moe: attn_norm on every block, and the attention, MoE or
+    Mamba-2 tensor set beside it as the two per-layer lists schedule it."""
+    kinds = _nemotron_layer_kinds(metadata, text_architecture(metadata), layers)
+    block = {
+        "attention": NEMOTRON_ATTENTION_TENSORS,
+        "moe": NEMOTRON_MOE_TENSORS,
+        "mamba": NEMOTRON_MAMBA_TENSORS,
+    }
+    tensors = dict(NEMOTRON_MODEL_TENSORS)
+    for layer in range(layers):
+        for name, types in (NEMOTRON_LAYER_TENSORS | block[kinds[layer]]).items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
 GGUF_ARCHS = {
+    "maxwell-moe": GgufArch(
+        "maxwell_moe",
+        feed_forward=True,
+        fields=_maxwell_fields,
+        tensors=_maxwell_tensors,
+    ),
     "qwen35": GgufArch("qwen3_5_text", tensors=_gdn_tensors),
     "qwen35moe": GgufArch(
         "qwen3_5_moe_text", fields=_qwen35moe_fields, tensors=_gdn_tensors
@@ -1480,6 +1851,12 @@ GGUF_ARCHS = {
         feed_forward=True,
         fields=_gemma4_fields,
         tensors=_gemma4_tensors,
+    ),
+    "nemotron_h_moe": GgufArch(
+        "nemotron_h_moe_text",
+        kv_per_layer=True,
+        fields=_nemotron_h_moe_fields,
+        tensors=_nemotron_tensors,
     ),
 }
 

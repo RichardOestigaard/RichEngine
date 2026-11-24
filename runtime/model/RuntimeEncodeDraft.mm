@@ -45,9 +45,14 @@ namespace richengine::model {
       std::span<Request *const> entries,
       std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
       std::vector<std::array<MetalBuffer, kLaneCount>> &values) const {
-    keys.resize(geometry.draft.layers);
-    values.resize(geometry.draft.layers);
-    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
+    // A draft-less geometry's ring has no layers: the layout still
+    // reports its default count, so stop at what the ring holds.
+    const uint32_t layers = std::min<uint32_t>(
+        geometry.draft.layers,
+        states.draft(laneEntry(entries, 0).stateLane).size());
+    keys.resize(layers);
+    values.resize(layers);
+    for (uint32_t layer = 0; layer < layers; ++layer) {
       for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
         const auto &ring =
             states.draft(laneEntry(entries, lane).stateLane)[layer];
@@ -103,6 +108,37 @@ namespace richengine::model {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    if (geometry.draft.kind == DraftKind::Mtp) {
+      // The MTP draft's positions, per-state-lane stream anchors and
+      // pass scratch; the MoE fields take the draft block's own shape.
+      buffers.positions = d(DecodeTensor::DraftPositions);
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        buffers.mtpAnchors[lane] = decodeArena->get(
+            laneEntry(entries, lane).stateLane, DecodeTensor::MtpAnchor);
+      buffers.mtp.moe = decodeArena->moeScratch(storage);
+      buffers.mtp.streams = d(DecodeTensor::MtpStreams);
+      buffers.mtp.eh = d(DecodeTensor::MtpEh);
+      buffers.mtp.ehOut = d(DecodeTensor::MtpEhOut);
+      buffers.mtp.plane = d(DecodeTensor::MtpPlane);
+      buffers.mtp.mappings = d(DecodeTensor::MtpMappings);
+      buffers.mtp.headWeights = d(DecodeTensor::MtpHeadWeights);
+      buffers.mtp.embed = d(DecodeTensor::MtpEmbed);
+      buffers.mtp.embedNormed = d(DecodeTensor::MtpEmbedNormed);
+      buffers.mtp.aggregate = d(DecodeTensor::MtpAggregate);
+      buffers.mtp.normed = d(DecodeTensor::MtpNormed);
+      buffers.mtp.queries = d(DecodeTensor::MtpQueries);
+      buffers.mtp.keys = d(DecodeTensor::MtpKeys);
+      buffers.mtp.values = d(DecodeTensor::MtpValues);
+      buffers.mtp.attention = d(DecodeTensor::MtpAttention);
+      buffers.mtp.branch = d(DecodeTensor::MtpBranch);
+      buffers.mtp.shared = d(DecodeTensor::MtpShared);
+      buffers.mtp.intermediate = d(DecodeTensor::MtpIntermediate);
+      buffers.mtp.moeRoutes = d(DecodeTensor::MtpMoeRoutes);
+      buffers.mtp.moePartials = d(DecodeTensor::MtpMoePartials);
+      buffers.mtp.head = d(DecodeTensor::MtpHead);
+      buffers.mtp.logits = d(DecodeTensor::MtpLogits);
+      buffers.mtp.tokenIn = d(DecodeTensor::MtpTokenIn);
+    }
     std::visit([&](const auto &model) {
       using DraftModelType = std::decay_t<decltype(model)>;
       // Every GPU draft whose decode binds the step pack: the V1/DSpark
@@ -115,6 +151,24 @@ namespace richengine::model {
         model.addDecode(graph, std::move(buffers),
                         targetModel.vocabularyProjection(),
                         std::span(cacheLengths).first(lanes), devicePack);
+      } else if constexpr (std::is_same_v<DraftModelType,
+                                          MaxwellMtpDraft> ||
+                           std::is_same_v<DraftModelType,
+                                          NemotronMtpDraft>) {
+        // The MTP chain costs a full decoder layer per pass, so each lane
+        // runs only as deep as its accepted-token EWMA earned — the same
+        // proposalBudget the verify row cap already follows.
+        std::array<uint32_t, kLaneCount> passLimits{};
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          passLimits[lane] =
+              adaptiveProposals_
+                  ? std::clamp(laneEntry(entries, lane).proposalBudget, 1u,
+                               geometry.draft.proposalLimit())
+                  : geometry.draft.proposalLimit();
+        model.addDecode(graph, std::move(buffers),
+                        targetModel.vocabularyProjection(),
+                        std::span(cacheLengths).first(lanes),
+                        std::span(passLimits).first(lanes));
       } else {
         model.addDecode(graph, std::move(buffers),
                         targetModel.vocabularyProjection(),
@@ -158,6 +212,11 @@ namespace richengine::model {
     if (modelPolicy().draftConfMin > 0.0) {
       if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
         const DSparkDraftWeights &w = dspark->weights();
+        // A draft without a confidence head (enable_confidence_head off —
+        // Nemotron's DSpark draft) leaves the proposals' selector-mass
+        // confidences in place; nothing rewrites them.
+        if (!w.layout.confidenceHead)
+          return;
         graph.add(
             std::string(ops::kDraftConfScore),
             {d(DecodeTensor::DraftFinalHidden), d(DecodeTensor::ProposedTokens),
@@ -220,7 +279,7 @@ namespace richengine::model {
         decodeArena->packed(DecodeTensor::RopeSin, width),
         decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         decodeArena->packed(DecodeTensor::DraftRopeSin, width));
-    encodeBatchEmbedding(graph, DecodeTensor::DraftInputTokens,
+    encodeDraftInputEmbedding(graph, DecodeTensor::DraftInputTokens,
                          DecodeTensor::DraftHidden0, width, 1,
                          geometry.draft.queryRows());
     encodeDraftBatchGraph(graph, {entries.data(), width},
@@ -330,6 +389,22 @@ namespace richengine::model {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    if (geometry.draft.kind == DraftKind::Mtp) {
+      // The MTP commit's verify output tokens, anchors and row scratch.
+      buffers.outputTokens = d(DecodeTensor::OutputTokens);
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        buffers.mtpAnchors[lane] = decodeArena->get(
+            laneEntry(entries, lane).stateLane, DecodeTensor::MtpAnchor);
+      buffers.mtp.streams = d(DecodeTensor::MtpCtxStreams);
+      buffers.mtp.eh = d(DecodeTensor::MtpCtxEh);
+      buffers.mtp.ehOut = d(DecodeTensor::MtpCtxEhOut);
+      buffers.mtp.plane = d(DecodeTensor::MtpCtxPlane);
+      buffers.mtp.mappings = d(DecodeTensor::MtpCtxMappings);
+      buffers.mtp.embed = d(DecodeTensor::MtpCtxEmbed);
+      buffers.mtp.embedNormed = d(DecodeTensor::MtpCtxEmbedNormed);
+      buffers.mtp.keys = d(DecodeTensor::MtpCtxKeys);
+      buffers.mtp.values = d(DecodeTensor::MtpCtxValues);
+    }
     std::visit([&](const auto &model) {
       model.addContextCommit(graph, std::move(buffers),
                              std::span(startPositions).first(lanes));
@@ -397,7 +472,7 @@ namespace richengine::model {
         decodeArena->packed(DecodeTensor::RopeSin, width),
         decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         decodeArena->packed(DecodeTensor::DraftRopeSin, width));
-    encodeBatchEmbedding(graph, DecodeTensor::DraftInputTokens,
+    encodeDraftInputEmbedding(graph, DecodeTensor::DraftInputTokens,
                          DecodeTensor::DraftHidden0, width, 1,
                          geometry.draft.queryRows());
     std::array<uint64_t, kLaneCount> zeroPositions{};

@@ -354,7 +354,7 @@ void DSplineDraft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
+         buffers.queryValues, {}},
         cacheLengths, attentionPlan, causal, devicePack);
     linear.add(graph, {.input = buffers.attention, .output = buffers.residual,
                        .residual = buffers.hidden[current], .scratch = scratch},
@@ -489,7 +489,7 @@ void DSplineDraft::addSelection(
   graph.addTail(std::string(ops::kDraftSelectTop16Sharded),
                 {buffers.logits, buffers.partialIds,
                  buffers.partialValues},
-                DraftTop16Params{layout.vocabularySize, logitsStride},
+                DraftTop16Params{layout.vocabularySize, logitsStride, 1},
                 queryRows,
                 {uint64_t{lanes} * RICHENGINE_DRAFT_PROPOSAL_TOKENS *
                      RICHENGINE_DRAFT_SAMPLING_SHARDS,

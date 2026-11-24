@@ -65,6 +65,15 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+// What a Program throws when the service refuses it: a step of the service's
+// (compiling, loading or evaluating it, or making an object it needs)
+// reports a failure. Not a wait the limit ended, an interface this client
+// lacks or memory Metal refused.
+class Refused final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 // A MIL program compiled and loaded on the Neural Engine through the private
 // AppleNeuralEngine client, the service behind Core ML. Each of its functions
 // is a procedure of the loaded model. The service holds memory for a loaded
@@ -190,7 +199,9 @@ private:
 // calibration on this Mac; none until remembered, once forgotten or macOS
 // clears the cache directory, or when it cannot be read.
 [[nodiscard]] std::optional<std::string> recall(std::string_view key) noexcept;
-void remember(std::string_view key, std::string_view line) noexcept;
+// True once the line is kept; false where it could not be written, which the
+// next start treats as none kept.
+bool remember(std::string_view key, std::string_view line) noexcept;
 void forget(std::string_view key) noexcept;
 
 } // namespace richengine::ane

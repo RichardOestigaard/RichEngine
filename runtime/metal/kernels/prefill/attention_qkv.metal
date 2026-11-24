@@ -65,6 +65,33 @@ prefill_attention_qkv_hd128(device const bfloat *qkv [[buffer(0)]],
       simd_group);
 }
 
+// Nemotron 3.5's KV2 group-16 core of 128 (32 query heads): NoPE — the
+// attention blocks carry no positional embedding (HF's NemotronHAttention
+// applies none; the GGUF's rope.dimension_count 84 is a converter
+// artifact), so the row walk stores without a rotary — no query gate and
+// no per-head norms.
+kernel void
+prefill_attention_qkv_k2q16d128(device const bfloat *qkv [[buffer(0)]],
+                            device const bfloat *q_norm [[buffer(1)]],
+                            device const bfloat *k_norm [[buffer(2)]],
+                            device const float *rope_cos [[buffer(3)]],
+                            device const float *rope_sin [[buffer(4)]],
+                            device bfloat *queries [[buffer(5)]],
+                            device bfloat *chunk_keys [[buffer(6)]],
+                            device bfloat *chunk_values [[buffer(7)]],
+                            constant FullPrefillParams &params [[buffer(8)]],
+                            uint task [[threadgroup_position_in_grid]],
+                            uint thread_index [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[256];
+  full_qkv_storage_phase<32, 2, 128, 0, false, false>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys,
+      chunk_values, params, reductions, normalized, task, thread_index, lane,
+      simd_group);
+}
+
 #define PREFILL_ATTENTION_QKV_HD64(Name, W) \
   kernel void Name( \
       device const bfloat *qkv [[buffer(0)]], \
@@ -251,6 +278,8 @@ PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd128, 16, 2, 128)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_hd64, 32, 8, 64)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q5d64, 40, 8, 64)
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_k8q4d128, 32, 8, 128)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_k4q8d128, 32, 4, 128)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_k2q16d128, 32, 2, 128)
 // The no-gate gathers for Gemma's out-projections (same layouts as the other
 // targets' gathers).
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_gemma_h256, 16, 8, 256)
@@ -344,6 +373,35 @@ kernel void prefill_attention_qkv_gemma_hd512(
 PREFILL_ATTENTION_QKV_K4Q4D128(prefill_attention_qkv_k4q4d128, bfloat)
 PREFILL_ATTENTION_QKV_K4Q4D128(prefill_attention_qkv_k4q4d128_f32, float)
 #undef PREFILL_ATTENTION_QKV_K4Q4D128
+
+// Maxwell's MBSA mixers: 32 query heads grouped 8-to-1 over 4 KV heads of
+// 128 dimensions, all 64 pairs rotated and per-head RMS norms of epsilon
+// 1e-6 (_f32 for a GGUF's F32 norms).
+#define PREFILL_ATTENTION_QKV_K4Q8D128(Name, W) \
+  kernel void Name( \
+      device const bfloat *qkv [[buffer(0)]], \
+      device const W *q_norm [[buffer(1)]], \
+      device const W *k_norm [[buffer(2)]], \
+      device const float *rope_cos [[buffer(3)]], \
+      device const float *rope_sin [[buffer(4)]], \
+      device bfloat *queries [[buffer(5)]], \
+      device bfloat *chunk_keys [[buffer(6)]], \
+      device bfloat *chunk_values [[buffer(7)]], \
+      constant FullPrefillParams &params [[buffer(8)]], \
+      uint task [[threadgroup_position_in_grid]], \
+      uint thread_index [[thread_index_in_threadgroup]], \
+      uint lane [[thread_index_in_simdgroup]], \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[4]; \
+    threadgroup bfloat normalized[128]; \
+    full_qkv_storage_phase<32, 4, 128, 64, false, true, W>( \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, chunk_keys, \
+        chunk_values, params, reductions, normalized, task, thread_index, \
+        lane, simd_group); \
+  }
+PREFILL_ATTENTION_QKV_K4Q8D128(prefill_attention_qkv_k4q8d128, bfloat)
+PREFILL_ATTENTION_QKV_K4Q8D128(prefill_attention_qkv_k4q8d128_f32, float)
+#undef PREFILL_ATTENTION_QKV_K4Q8D128
 
 // LFM3's head-wise gate: `gates` holds each row's QHeads sigmoid inputs
 // (the gate projection's output), one scalar per query head — where the

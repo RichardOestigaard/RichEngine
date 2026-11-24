@@ -55,9 +55,9 @@ public:
   [[nodiscard]] uint64_t allocatedBytes() const override { return allocatedBytes_; }
   [[nodiscard]] uint32_t minimumRows() const override { return minimumRows_; }
   void setMinimumRows(uint32_t rows) override;
-  void setBreaker(ane_ffn::Breaker breaker, std::function<void()> lost) override {
+  void setBreaker(ane_ffn::Breaker breaker, AwakeClock::duration pause = ane_ffn::Pause::kLength) override {
     breaker_ = std::move(breaker);
-    lost_ = std::move(lost);
+    pause_ = ane_ffn::Pause(pause);
   }
 
   [[nodiscard]] const Served &served() const override { return served_; }
@@ -71,12 +71,14 @@ public:
   [[nodiscard]] bool retired() const override { return handoff_.retired(); }
   [[nodiscard]] std::string reason() const override { return handoff_.reason(); }
 
-  bool begin() override;
+  // One step only: steps() never returns Two, and Two here is refused.
+  using FfnSplit::begin;
+  bool begin(Steps steps) override;
   void add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn, metal::MetalBuffer residual,
            metal::MetalBuffer output, uint32_t rows) override;
   [[nodiscard]] metal::CommandTicket commit(const metal::CommandGraph &graph,
                                             metal::CommandCompletion completion) override;
-  [[nodiscard]] bool finish() override;
+  [[nodiscard]] bool finish(const metal::CommandTiming &timing = {}) override;
 
   // The idle release: drops the loaded function and model, which restore()
   // opens again. Same contract as AneFfn::release.
@@ -136,7 +138,7 @@ private:
   void addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const;
   [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
   void queue(const Job &job);
-  [[nodiscard]] std::optional<AwakeClock::duration> completed();
+  [[nodiscard]] std::optional<ane::Handoff::Ran> completed();
   void warnStopped();
   // Opens the function: the shim handle or null when it could not.
   [[nodiscard]] void *open();
@@ -151,9 +153,9 @@ private:
   void *function_ = nullptr;
   std::vector<Job> jobs_;
   uint32_t nextLayer_ = 0;
-  uint32_t committedEvaluations_ = 0, committedRows_ = 0;
+  uint32_t committedLayers_ = 0, committedEvaluations_ = 0, committedRows_ = 0;
   ane_ffn::Breaker breaker_;
-  std::function<void()> lost_;
+  ane_ffn::Pause pause_;
   Served served_;
   bool unfinished_ = false;
   bool released_ = false;

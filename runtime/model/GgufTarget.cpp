@@ -11,7 +11,7 @@ namespace richengine::model {
 // expert-free sigmoid MoE with leading dense-FFN layers — and the hybrids
 // the empty arch that resolves to "qwen35"/"qwen35moe" on the MoE split.
 gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout) {
-  if (layout.packedOnly)
+  if (layout.packedOnly && layout.ggufArch != "maxwell-moe")
     throw std::invalid_argument("Gemma 4 targets load from packed files only");
   gguf::TargetGeometry geometry;
   geometry.layers = layout.layers;
@@ -50,6 +50,45 @@ gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout) {
     geometry.sharedExpert = layout.moeSharedExpert;
   }
   geometry.arch = std::string(layout.ggufArch);
+  if (layout.ggufArch == "maxwell-moe") {
+    // The Maxwell (maxwell-moe) extras: the MBSA indexer, the mHC modules
+    // and HC head, and the MoE's selection bias beside its wider ungated
+    // shared expert.
+    geometry.indexerHeads = layout.indexerHeads;
+    geometry.indexerHeadDimension = layout.indexerHeadDimension;
+    geometry.indexerBlockTokens = layout.indexerBlockTokens;
+    geometry.indexerPrefixBlocks = layout.indexerPrefixBlocks;
+    geometry.indexerLocalBlocks = layout.indexerLocalBlocks;
+    geometry.indexerRemoteBlocks = layout.indexerRemoteBlocks;
+    geometry.mhcMixWidth = layout.mhcMixWidth;
+    geometry.mhcStreams = layout.hyperConnections;
+    geometry.mhcSinkhornIterations = layout.mhcSinkhornIterations;
+    geometry.mhcHead = layout.mhcHead;
+    // layout.moeSharedExpert is false because the shared expert runs
+    // beside the routed block, but the GGUF carries its shexp tensors.
+    geometry.sharedExpert = true;
+    geometry.expertBias = true;
+    geometry.sharedIntermediateSize = layout.sharedIntermediateSize;
+    // The one MTP block the maxwell-moe GGUFs ship (nextn_predict_layers;
+    // requireMaxwellMetadata accounts for it in block_count).
+    geometry.mtpLayers = 1;
+  }
+  if (layout.ggufArch == "nemotron_h_moe") {
+    // The nemotron extras: the MoE-only blocks' mask, the Mamba-2
+    // geometry and the sigmoid router's per-expert bias beside its
+    // ungated shared expert (expertBias carries both facts — the MoE
+    // block routes the shared slot at unit weight).
+    geometry.moeMask = layout.moeMask;
+    geometry.mambaHeads = layout.mambaHeads;
+    geometry.mambaHeadDimension = layout.mambaHeadDimension;
+    geometry.mambaGroups = layout.mambaGroups;
+    geometry.mambaStateSize = layout.mambaStateSize;
+    geometry.mambaInnerSize = layout.mambaInnerSize;
+    geometry.mambaTimeStepRank = layout.mambaTimeStepRank;
+    geometry.mambaInputRows = layout.packedGdnWidth;
+    geometry.expertBias = true;
+    geometry.sharedIntermediateSize = layout.sharedIntermediateSize;
+  }
   // The LFM2 targets tie their output head to the token embedding.
   geometry.tiedOutput = layout.tiedOutput;
   return geometry;
@@ -70,6 +109,7 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::filesystem::path &path, const gguf::TargetGeometry &geometry)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(path)) {
+  planned_->geometry = geometry;
   const GgufFile file(planned_->source);
   rotation_ = file.rotation();
   planned_->images = gguf::planImages(file, geometry);
@@ -93,5 +133,16 @@ WeightFile GgufTargetLoader::layer(uint32_t index) {
 WeightFile GgufTargetLoader::head() { return open(planned_->images.size() - 2); }
 
 WeightFile GgufTargetLoader::embedding() { return open(planned_->images.size() - 1); }
+
+WeightFile GgufTargetLoader::mtp() {
+  const GgufFile file(planned_->source);
+  const gguf::Image plan = gguf::planMtpImage(file, planned_->geometry);
+  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+                       [&backend = backend_, planned = planned_, plan](std::span<uint8_t>,
+                                                                       const metal::MetalBuffer &buffer) {
+                         writeGgufImage(backend, planned->source, buffer, plan);
+                         planned->source.checkUnchanged();
+                       }});
+}
 
 } // namespace richengine::model

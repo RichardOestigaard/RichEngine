@@ -103,8 +103,12 @@ std::vector<LinearTuningInput> collectTuningWorkloads(
       throw std::invalid_argument("operator probes require target layers");
     for (const auto &layer : target.layers) {
       std::visit([&](const auto &mixer) {
-        bothPhases(mixer.inputProjection);
-        bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
+        // nemotron's MoE blocks keep an empty mixer record.
+        if constexpr (!std::is_same_v<std::decay_t<decltype(mixer)>,
+                                      EmptyMixerWeights>) {
+          bothPhases(mixer.inputProjection);
+          bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
+        }
       }, layer.mixer);
       if (const auto *ffn = std::get_if<DenseFfnWeights>(&layer.ffn)) {
         projection(ffn->gateProjection, LinearPhase::Prefill,

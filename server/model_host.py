@@ -88,6 +88,8 @@ def _native_command(args):
         )
     if args.disable_ane:
         command.extend(("--ane", "off"))
+    if args.recalibrate_ane:
+        command.extend(("--recalibrate-ane", "on"))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
     if args.moe_union:

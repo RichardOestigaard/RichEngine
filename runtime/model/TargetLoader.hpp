@@ -243,7 +243,12 @@ readTargetModelWeights(metal::MetalBackend &backend, const TargetLayout &layout,
 
 // Throws unless every dimension of a family's layout is set, the dimensions
 // agree with each other and every projection fits the Q4 storage tiles.
-inline void requireTargetLayout(const TargetLayout &layout) {
+// `affine` gates the packed-AF4 contract: rotary pairs (a NoPE target
+// declares none) and the StorageN projection tiles, which a block-format
+// target (nemotron's GGUF planes — 2688/1856-wide tensors never take)
+// does not store.
+inline void requireTargetLayout(const TargetLayout &layout,
+                                bool affine = true) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
   uint32_t ffnWidth = 0;
   bool ffnZero = false;
@@ -265,10 +270,11 @@ inline void requireTargetLayout(const TargetLayout &layout) {
   // period — every target declares exactly one.
   const bool scheduled = layout.attentionMask || layout.fullAttentionPeriod ||
                          layout.globalLayerPeriod;
-  if (ffnZero || !(layout.rotaryTheta > 0.0F) || !scheduled ||
+  if (ffnZero || (affine && !(layout.rotaryTheta > 0.0F)) || !scheduled ||
       zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedFullWidth, layout.attentionWidth, layout.attentionQueryHeads,
-           layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs) ||
+           layout.attentionKvHeads, layout.attentionHeadDimension) ||
+      (affine && !layout.rotaryPairs) ||
       (gdn && zero(layout.packedGdnWidth, layout.convolutionDimension,
                    layout.gdnKeyHeads, layout.gdnValueHeads)) ||
       (conv && zero(layout.packedGdnWidth, layout.convolutionDimension)))
@@ -290,6 +296,7 @@ inline void requireTargetLayout(const TargetLayout &layout) {
                           [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("target layout is inconsistent");
+  if (!affine) return;
   if (gdn || conv)
     validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
   validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);

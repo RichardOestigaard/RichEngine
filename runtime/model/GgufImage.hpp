@@ -76,14 +76,64 @@ struct TargetGeometry {
   // dense target).
   bool attentionQueryGate = true;
   bool attentionQkNorm = true;
+  // maxwell-moe: the MBSA indexer projections (query of indexerHeads heads,
+  // the shared key of one, each indexerHeadDimension wide) and their
+  // per-head norms after the mixer's output projection; the manifold-
+  // constrained hyper-connection modules before the attention and FFN
+  // blocks, each a [mhcMixWidth][mhcStreams*hiddenSize] fp32 mapping the
+  // GGUF keeps BF16 (hc_attn_fn, hc_ffn_fn) plus the F32 scale triple and
+  // base vector (hc_*_scale [3], hc_*_base [mhcMixWidth]); and the head
+  // image's HC head (output_hc_*).
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t mhcMixWidth = 0;
+  uint32_t mhcStreams = 0;
+  bool mhcHead = false;
+  // maxwell-moe's MBSA routing geometry and mHC mixing, validated against
+  // the metadata; the image's bytes do not depend on them.
+  uint32_t indexerBlockTokens = 0;
+  uint32_t indexerPrefixBlocks = 0;
+  uint32_t indexerLocalBlocks = 0;
+  uint32_t indexerRemoteBlocks = 0;
+  uint32_t mhcSinkhornIterations = 0;
+  // The MoE block's per-expert selection bias (exp_probs_b), which
+  // maxwell-moe carries beside its shared expert — lfm2moe's bias implies
+  // no shared expert instead.
+  bool expertBias = false;
+  // A shared expert of a width other than the routed experts' (maxwell's
+  // 1024 against their 512); zero keeps sharedExpert's default.
+  uint32_t sharedIntermediateSize = 0;
   // Whether the LM head shares the token embedding (LFM2 ties them).
   bool tiedOutput = false;
+  // maxwell-moe's internal MTP blocks, blk.layers .. blk.layers+mtpLayers-1
+  // (nextn_predict_layers); they are not part of the target's layer images —
+  // planMtpImage plans the first as the MTP draft's weights.
+  uint32_t mtpLayers = 0;
+  // nemotron_h_moe's additions, all zero on every other arch: the blocks
+  // are MoE sub-layers where moeMask's bit is set, attention where
+  // attentionMask's is, and Mamba-2 mixers elsewhere — a block carries
+  // exactly one sub-layer. The Mamba-2 geometry: mambaHeads heads of
+  // mambaHeadDimension values over an mambaStateSize state, mambaGroups
+  // shared B/C groups, a mambaInnerSize gate, mambaTimeStepRank dt rows
+  // and the ssm_in projection's padded storage rows.
+  uint64_t moeMask = 0;
+  uint32_t mambaHeads = 0;
+  uint32_t mambaHeadDimension = 0;
+  uint32_t mambaGroups = 0;
+  uint32_t mambaStateSize = 0;
+  uint32_t mambaInnerSize = 0;
+  uint32_t mambaTimeStepRank = 0;
+  uint32_t mambaInputRows = 0;
   // The general.architecture a GGUF of this target declares; empty keeps
   // the Qwen families' names.
   std::string arch;
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
     if (attentionMask) return layer < 64 && (attentionMask >> layer) & 1;
     return (layer + 1) % fullAttentionPeriod == 0;
+  }
+  // nemotron_h_moe's MoE sub-layers (zero moeMask elsewhere).
+  [[nodiscard]] bool isMoeLayer(uint32_t layer) const noexcept {
+    return layer < 64 && (moeMask >> layer) & 1;
   }
   // LFM3's global layers inside its attention mask (zero elsewhere).
   [[nodiscard]] bool isGlobalAttentionLayer(uint32_t layer) const noexcept {
@@ -170,5 +220,12 @@ struct Image {
 // norms included, and each tensor's shape; throws GgufError naming every
 // missing tensor and every tensor of a type this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry);
+
+// The maxwell-moe MTP block's image (blk.layers, "mtp.bin"), in
+// loadMaxwellMtpWeights' read order: the nextn norms and eh projection, the
+// dense layer's attention, its mHC modules and sigmoid MoE, the HC head and
+// the layer output norm. Throws GgufError for a target without an MTP
+// block.
+[[nodiscard]] Image planMtpImage(const GgufFile &file, const TargetGeometry &geometry);
 
 } // namespace richengine::model::gguf

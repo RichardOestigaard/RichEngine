@@ -121,6 +121,14 @@ public:
            Conversion::NarrowToBfloat16);
   }
 
+  // The depthwise conv's per-channel bias, as the bf16 values the conv
+  // kernels read (Nemotron's ssm_conv1d.bias).
+  void convBias(const std::string &name) {
+    if (const GgufTensor *tensor = floatVector(name, geometry_.convolutionDimension))
+      copy(tensorRows(*tensor, 1, tensor->bytes),
+           Conversion::RoundToBfloat16);
+  }
+
   // LFM2's conv kernel F32, as the bf16 values the conv kernel reads, in
   // the stored channel-major [channels, taps] order. The taps are a few
   // thousand values: rounding them is how every serving stack loads the
@@ -141,6 +149,15 @@ public:
       copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), conversion);
   }
 
+  // A per Mamba-2 head F32 vector in stored order — nemotron's heads are
+  // already group-major, unlike the GDN vectors headVector regroups: as
+  // stored, or the exact bf16 values the kernels read.
+  void mambaHeadVector(const std::string &name, Conversion conversion) {
+    const uint32_t heads = geometry_.mambaHeads;
+    if (const GgufTensor *tensor = floatVector(name, heads))
+      copy(tensorRows(*tensor, heads, tensor->bytes / heads), conversion);
+  }
+
   // Native token rows, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
     const GgufTensor *tensor = find(name, embeddingType);
@@ -159,6 +176,25 @@ public:
       throw GgufError("expected an F32 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
     copiedRows(*tensor);
+  }
+
+  // A [rows, columns] float segment the kernels read as fp32: F32 as
+  // stored, or BF16 widened exactly — the tensors llama.cpp keeps BF16
+  // (maxwell's mHC mappings and MBSA indexer projections) while the fp32
+  // segments of the packed target keep them unrounded.
+  void floatSegment(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = file_.find(name);
+    if (!tensor || (tensor->type != ggml::kF32 && tensor->type != ggml::kBF16)) {
+      reject(name, tensor);
+      return;
+    }
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("expected a float [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] tensor: " + name);
+    const uint64_t widening = tensor->type == ggml::kBF16 ? 2 : 1;
+    descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
+    copy(tensorRows(*tensor, rows, tensor->bytes / rows),
+         widening == 2 ? Conversion::WidenToFloat32 : Conversion::None);
   }
 
   // Value heads of headRows rows from row `from` on, in grouped order.
@@ -202,9 +238,14 @@ private:
     return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order};
   }
 
-  // Rows written as stored, or narrowed to bf16, into their own section.
+  // Rows written as stored, narrowed to bf16, or widened to F32, into
+  // their own section.
   void copy(TensorRows source, Conversion conversion = Conversion::None) {
-    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 || conversion == Conversion::RoundToBfloat16 ? 2 : 1);
+    uint64_t bytes = source.rows * source.rowBytes;
+    if (conversion == Conversion::NarrowToBfloat16 || conversion == Conversion::RoundToBfloat16)
+      bytes /= 2;
+    else if (conversion == Conversion::WidenToFloat32)
+      bytes *= 2;
     image_.copies.push_back({section(bytes), std::move(source), conversion});
   }
 
@@ -214,15 +255,24 @@ private:
     copy(tensorRows(tensor, tensor.rows(), tensor.bytes / tensor.rows()));
   }
 
-  // The descriptor and planes of a [rows, columns] quantized tensor.
+  // The descriptor and planes of a [rows, columns] quantized tensor. The
+  // column unit is the format's register-tile span — 64 inputs for the
+  // one-meta-group formats (Q4_0, Q8_0, MXFP4 — nemotron's 2688-wide
+  // hidden fills forty-two), a whole 256-superblock for the K-quants. The
+  // planes store whole 256-row tiles: a tensor whose rows are not a tile
+  // multiple (nemotron's 2688-wide outputs) declares its logical rows and
+  // pads its stored tiles; the tail rows' stale bytes are never read.
   Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
-    if (rows % QUANT_TILE_ROWS || columns % kGgufBlockColumns) throw GgufError("tensor is not tile aligned: " + name);
+    if (!rows || columns % quant_register_unit(format))
+      throw GgufError("tensor is not tile aligned: " + name);
+    const uint64_t storedRows =
+        (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
     const QuantFormat &layout = kQuantFormats[format];
-    const GgufPlaneBytes bytes = ggufPlaneBytes(layout, rows, columns);
+    const GgufPlaneBytes bytes = ggufPlaneBytes(layout, storedRows, columns);
     descriptor(layout.ggml_type, rows, columns, layout, bytes, name);
     Repack repack;
     repack.format = format;
-    repack.rows = rows;
+    repack.rows = storedRows;
     repack.columns = columns;
     repack.plane0 = section(bytes.plane0);
     repack.plane1 = bytes.plane1 ? section(bytes.plane1) : 0;
@@ -386,6 +436,11 @@ void requireNewTargetMetadata(const GgufFile &file, const TargetGeometry &geomet
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
+void requireMaxwellMetadata(const GgufFile &file, const TargetGeometry &geometry,
+                            const std::string &arch);
+void requireNemotronMetadata(const GgufFile &file, const TargetGeometry &geometry,
+                             const std::string &arch);
+
 // The target geometry the metadata declares, with the rotary embedding and
 // norms the kernels compute: the RoPE base and rotated dimensions, the RMS
 // epsilon and no RoPE scaling. One error names every mismatch.
@@ -393,6 +448,14 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   const std::string arch = geometry.architecture();
   if (file.architecture() != arch)
     throw GgufError("GGUF architecture is " + file.architecture() + ", but the package's target is " + arch);
+  if (arch == "maxwell-moe") {
+    requireMaxwellMetadata(file, geometry, arch);
+    return;
+  }
+  if (arch == "nemotron_h_moe") {
+    requireNemotronMetadata(file, geometry, arch);
+    return;
+  }
   if (arch == "llama" || arch == "lfm2" || arch == "lfm2moe" ||
       arch == "lfm3" || arch == "granite") {
     requireNewTargetMetadata(file, geometry, arch);
@@ -444,8 +507,287 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
+// The maxwell-moe GGUF's metadata: the geometry the Maxwell target
+// compiles, the MTP block it ships (nextn_predict_layers adds a layer the
+// images do not plan), its indexer and hyper-connection parameters and its
+// sigmoid MoE with per-expert bias and an ungated shared expert.
+void requireMaxwellMetadata(const GgufFile &file, const TargetGeometry &geometry,
+                            const std::string &arch) {
+  std::string mismatched;
+  const auto expect = [&](const char *key, uint64_t value) {
+    const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
+    if (found != value)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
+                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
+  };
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = file.floatValue(arch + "." + key);
+    if (found && std::abs(*found - value) <= value * 1e-6) return;
+    std::ostringstream text;
+    text << (mismatched.empty() ? "" : ", ") << key << ' ';
+    if (found) text << *found;
+    else text << "missing";
+    text << " (expected " << value << ')';
+    mismatched += text.str();
+  };
+  expect("block_count", geometry.layers + file.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
+  expect("embedding_length", geometry.hiddenSize);
+  expect("feed_forward_length", geometry.intermediateSize);
+  expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
+  expect("attention.head_count_kv", geometry.attentionKvHeads);
+  expect("attention.key_length", geometry.attentionHeadDimension);
+  expect("attention.value_length", geometry.attentionHeadDimension);
+  expect("attention.indexer.head_count", geometry.indexerHeads);
+  expect("attention.indexer.key_length", geometry.indexerHeadDimension);
+  expect("attention.indexer.block_size", geometry.indexerBlockTokens);
+  expect("attention.indexer.prefix_blocks", geometry.indexerPrefixBlocks);
+  expect("attention.indexer.local_blocks", geometry.indexerLocalBlocks);
+  expect("attention.indexer.top_k", geometry.indexerRemoteBlocks);
+  expect("hyper_connection.count", geometry.mhcStreams);
+  expect("hyper_connection.sinkhorn_iterations", geometry.mhcSinkhornIterations);
+  expectFloat("hyper_connection.epsilon", geometry.rmsEpsilon);
+  expect("expert_count", geometry.experts);
+  expect("expert_used_count", geometry.expertsPerToken);
+  expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+  expect("expert_shared_count", 1);
+  expect("expert_shared_feed_forward_length", geometry.sharedIntermediateSize);
+  expect("expert_gating_func", 2); // sigmoid
+  expect("expert_weights_norm", 1);
+  expect("leading_dense_block_count", geometry.leadingDenseLayers);
+  expectFloat("rope.freq_base", geometry.rotaryTheta);
+  expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
+  expect("vocab_size", geometry.vocabularySize);
+  if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+}
+
+// The nemotron_h_moe GGUF's metadata: the geometry the Nemotron target
+// compiles, the per-layer arrays the two block masks mirror, the Mamba-2
+// and MoE dimensions and the rope/norm settings.
+void requireNemotronMetadata(const GgufFile &file,
+                             const TargetGeometry &geometry,
+                             const std::string &arch) {
+  std::string mismatched;
+  const auto expect = [&](const char *key, uint64_t value) {
+    const std::optional<uint64_t> found = file.unsignedValue(arch + "." + key);
+    if (found != value)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key) + " " +
+                    (found ? std::to_string(*found) : "missing") + " (expected " + std::to_string(value) + ")";
+  };
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = file.floatValue(arch + "." + key);
+    if (found && std::abs(*found - value) <= value * 1e-6) return;
+    std::ostringstream text;
+    text << (mismatched.empty() ? "" : ", ") << key << ' ';
+    if (found) text << *found;
+    else text << "missing";
+    text << " (expected " << value << ')';
+    mismatched += text.str();
+  };
+  expect("block_count", geometry.layers);
+  expect("embedding_length", geometry.hiddenSize);
+  expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);
+  expect("attention.key_length", geometry.attentionHeadDimension);
+  expect("attention.value_length", geometry.attentionHeadDimension);
+  // The nemotron attention blocks are NoPE — the released GGUF's
+  // rope.dimension_count 84 and freq_base are converter artifacts the
+  // kernels never read, so they are not pinned here.
+  expectFloat("attention.layer_norm_rms_epsilon", geometry.rmsEpsilon);
+  expect("ssm.conv_kernel", 4);
+  expect("ssm.state_size", geometry.mambaStateSize);
+  expect("ssm.group_count", geometry.mambaGroups);
+  expect("ssm.inner_size", geometry.mambaInnerSize);
+  expect("ssm.time_step_rank", geometry.mambaTimeStepRank);
+  expect("expert_count", geometry.experts);
+  expect("expert_used_count", geometry.expertsPerToken);
+  expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+  expect("expert_shared_feed_forward_length", geometry.sharedIntermediateSize);
+  expect("expert_shared_count", 1);
+  expect("expert_weights_norm", 1);
+  expectFloat("expert_weights_scale", 2.5);
+  // The per-layer arrays name the block schedule: head_count_kv 2 on the
+  // attention blocks, feed_forward_length the experts' width on the MoE
+  // blocks and 0 elsewhere.
+  if (const std::optional<std::span<const double>> kvs =
+          file.numericArray(arch + ".attention.head_count_kv")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= kvs->size()) break;
+      const uint64_t expected =
+          geometry.isFullAttentionLayer(layer) ? geometry.attentionKvHeads : 0;
+      if (uint64_t((*kvs)[layer]) != expected)
+        mismatched += (mismatched.empty() ? "" : ", ") +
+                      std::string("attention.head_count_kv[") + std::to_string(layer) + "]";
+    }
+  }
+  if (const std::optional<std::span<const double>> ffl =
+          file.numericArray(arch + ".feed_forward_length")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= ffl->size()) break;
+      const uint64_t expected =
+          geometry.isMoeLayer(layer) ? geometry.expertIntermediateSize : 0;
+      if (uint64_t((*ffl)[layer]) != expected)
+        mismatched += (mismatched.empty() ? "" : ", ") +
+                      std::string("feed_forward_length[") + std::to_string(layer) + "]";
+    }
+  }
+  if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+}
+
+// One nemotron_h_moe block's image, in loadNemotronWeights' read order:
+// the input norm, then the one sub-layer's sections — the Mamba-2
+// mixer's ssm_*, the attention block's attn_* or the MoE block's ffn_*.
+Image nemotronLayerImage(const GgufFile &file, const TargetGeometry &g,
+                         std::vector<std::string> &problems,
+                         uint32_t index) {
+  const std::string p = prefix(index);
+  const uint32_t kind = g.isFullAttentionLayer(index) ? 1u
+                        : g.isMoeLayer(index)         ? 2u
+                                                      : 0u;
+  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin",
+            index, kind);
+  const uint64_t hidden = g.hiddenSize;
+  b.floatNorm(p + "attn_norm.weight", hidden);
+  if (kind == 1) {
+    const uint64_t kvRows =
+        uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+    b.quantized(p + "attn_q.weight", g.attentionWidth, hidden);
+    b.quantized(p + "attn_k.weight", kvRows, hidden);
+    b.quantized(p + "attn_v.weight", kvRows, hidden);
+    b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+  } else if (kind == 2) {
+    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
+    b.floatTensor(p + "ffn_gate_inp.weight", routed, hidden);
+    b.floatTensor(p + "exp_probs_b.bias", 1, routed);
+    b.quantized(p + "ffn_up_exps.weight", routed * width, hidden);
+    b.quantized(p + "ffn_down_exps.weight", routed * hidden, width);
+    const uint64_t shared = g.sharedIntermediateSize;
+    b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+    b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+  } else {
+    // The Mamba-2 mixer: the in_proj (its stored rows pad to the image's
+    // storage tile), the taps-major conv kernel and bias, the raw ssm_a
+    // (the kernels apply -exp), the D skip and dt bias as the bf16
+    // values the kernels read, the grouped gated norm and the out
+    // projection.
+    b.quantized(p + "ssm_in.weight", g.mambaInputRows, hidden);
+    b.convTaps(p + "ssm_conv1d.weight");
+    b.convBias(p + "ssm_conv1d.bias");
+    b.floatNorm(p + "ssm_a", g.mambaHeads);
+    // D the kernels read as fp32; dt bias the bf16 rows they read.
+    b.floatNorm(p + "ssm_d", g.mambaHeads);
+    b.mambaHeadVector(p + "ssm_dt.bias", Conversion::RoundToBfloat16);
+    b.floatNorm(p + "ssm_norm.weight", g.mambaInnerSize);
+    b.quantized(p + "ssm_out.weight", hidden, g.mambaInnerSize);
+  }
+  return b.finish();
+}
+
+// One maxwell-moe layer's image, in loadMaxwellMoeWeights' read order
+// (runtime/model/MaxwellMoe.cpp): the input norm, the attention mixer's
+// QKV, per-head norms and output, the MBSA indexer's float projections
+// and norms, the post-attention norm, the attention mHC, the dense or
+// MoE FFN and the FFN mHC.
+Image maxwellLayerImage(const GgufFile &file, const TargetGeometry &g,
+                        std::vector<std::string> &problems, uint32_t index) {
+  const std::string p = prefix(index);
+  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, 1u);
+  const uint64_t hidden = g.hiddenSize;
+  const uint64_t streams = g.mhcStreams, mix = g.mhcMixWidth;
+  b.floatNorm(p + "attn_norm.weight", hidden);
+  const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  b.quantized(p + "attn_q.weight", g.attentionWidth, hidden);
+  b.quantized(p + "attn_k.weight", kvRows, hidden);
+  b.quantized(p + "attn_v.weight", kvRows, hidden);
+  b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+  b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+  b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+  b.floatSegment(p + "indexer.q_proj.weight",
+                 uint64_t{g.indexerHeads} * g.indexerHeadDimension, hidden);
+  b.floatSegment(p + "indexer.k_proj.weight", g.indexerHeadDimension, hidden);
+  b.floatNorm(p + "indexer.q_norm.weight", g.indexerHeadDimension);
+  b.floatNorm(p + "indexer.k_norm.weight", g.indexerHeadDimension);
+  b.floatNorm(p + "ffn_norm.weight", hidden);
+  b.floatSegment(p + "hc_attn_fn.weight", mix, streams * hidden);
+  b.floatNorm(p + "hc_attn_scale.weight", 3);
+  b.floatNorm(p + "hc_attn_base.weight", mix);
+  if (index >= g.leadingDenseLayers) {
+    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
+    b.floatTensor(p + "ffn_gate_inp.weight", routed, hidden);
+    b.floatTensor(p + "exp_probs_b.bias", 1, routed);
+    b.quantized(p + "ffn_gate_exps.weight", routed * width, hidden);
+    b.quantized(p + "ffn_up_exps.weight", routed * width, hidden);
+    b.quantized(p + "ffn_down_exps.weight", routed * hidden, width);
+    const uint64_t shared = g.sharedIntermediateSize;
+    b.quantized(p + "ffn_gate_shexp.weight", shared, hidden);
+    b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+    b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+  } else {
+    b.quantized(p + "ffn_gate.weight", g.intermediateSize, hidden);
+    b.quantized(p + "ffn_up.weight", g.intermediateSize, hidden);
+    b.quantized(p + "ffn_down.weight", hidden, g.intermediateSize);
+  }
+  b.floatSegment(p + "hc_ffn_fn.weight", mix, streams * hidden);
+  b.floatNorm(p + "hc_ffn_scale.weight", 3);
+  b.floatNorm(p + "hc_ffn_base.weight", mix);
+  return b.finish();
+}
+
+// The maxwell-moe MTP block's image, in loadMaxwellMtpWeights' read order:
+// the nextn input norms and fused eh projection, the dense layer's
+// attention and its mHC modules, the sigmoid MoE with its shared expert,
+// the nextn HC head and the layer output norm. The MTP block shares the
+// target's token table and vocabulary head.
+Image maxwellMtpImage(const GgufFile &file, const TargetGeometry &g,
+                      std::vector<std::string> &problems) {
+  const std::string p = prefix(g.layers);
+  Builder b(file, g, problems, "mtp.bin", g.layers, 1u);
+  const uint64_t hidden = g.hiddenSize;
+  const uint64_t streams = g.mhcStreams, mix = g.mhcMixWidth;
+  const std::string nextn = p + "nextn.";
+  b.floatNorm(nextn + "enorm.weight", hidden);
+  b.floatNorm(nextn + "hnorm.weight", hidden);
+  b.quantized(nextn + "eh_proj.weight", hidden, 2 * hidden);
+  b.floatNorm(p + "attn_norm.weight", hidden);
+  const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  b.quantized(p + "attn_q.weight", g.attentionWidth, hidden);
+  b.quantized(p + "attn_k.weight", kvRows, hidden);
+  b.quantized(p + "attn_v.weight", kvRows, hidden);
+  b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+  b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+  b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+  b.floatNorm(p + "ffn_norm.weight", hidden);
+  b.floatSegment(p + "hc_attn_fn.weight", mix, streams * hidden);
+  b.floatNorm(p + "hc_attn_scale.weight", 3);
+  b.floatNorm(p + "hc_attn_base.weight", mix);
+  const uint64_t routed = g.experts, width = g.expertIntermediateSize;
+  b.floatSegment(p + "ffn_gate_inp.weight", routed, hidden);
+  b.floatSegment(p + "exp_probs_b.bias", 1, routed);
+  b.quantized(p + "ffn_gate_exps.weight", routed * width, hidden);
+  b.quantized(p + "ffn_up_exps.weight", routed * width, hidden);
+  b.quantized(p + "ffn_down_exps.weight", routed * hidden, width);
+  const uint64_t shared = g.sharedIntermediateSize;
+  b.quantized(p + "ffn_gate_shexp.weight", shared, hidden);
+  b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+  b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+  b.floatSegment(p + "hc_ffn_fn.weight", mix, streams * hidden);
+  b.floatNorm(p + "hc_ffn_scale.weight", 3);
+  b.floatNorm(p + "hc_ffn_base.weight", mix);
+  b.floatSegment(nextn + "hc_head_fn.weight", streams, streams * hidden);
+  b.floatNorm(nextn + "hc_head_base.weight", streams);
+  b.floatNorm(nextn + "hc_head_scale.weight", 1);
+  b.floatNorm(p + "layer_output_norm.weight", hidden);
+  return b.finish();
+}
+
 Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std::string> &problems,
                  uint32_t index) {
+  if (g.architecture() == "maxwell-moe")
+    return maxwellLayerImage(file, g, problems, index);
+  if (g.architecture() == "nemotron_h_moe")
+    return nemotronLayerImage(file, g, problems, index);
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
   const std::string arch = g.architecture();
@@ -554,6 +896,14 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
     images.push_back(layerImage(file, geometry, problems, layer));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
+  // maxwell-moe's head image leads with the HC head — its fp32 mapping
+  // projection (BF16 stored), base and scale — before the final norm.
+  if (geometry.mhcHead) {
+    head.floatSegment("output_hc_fn.weight", geometry.mhcStreams,
+                      uint64_t{geometry.mhcStreams} * geometry.hiddenSize);
+    head.floatNorm("output_hc_base.weight", geometry.mhcStreams);
+    head.floatNorm("output_hc_scale.weight", 1);
+  }
   // The LFM2 targets name their final norm token_embd_norm and tie their
   // output head to the token embedding; an lfm3 GGUF ties the head but
   // keeps the dense targets' output_norm name.
@@ -574,6 +924,20 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
   }
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+Image planMtpImage(const GgufFile &file, const TargetGeometry &geometry) {
+  if (geometry.architecture() != "maxwell-moe" || !geometry.mtpLayers)
+    throw GgufError("this target's GGUF ships no MTP block");
+  std::vector<std::string> problems;
+  Image image = maxwellMtpImage(file, geometry, problems);
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems)
+      names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("GGUF tensors this build cannot load: " + names);
+  }
+  return image;
 }
 
 } // namespace richengine::model::gguf

@@ -26,10 +26,14 @@ struct MoeRouteParams {
   // scores + rows * 256 for the select to read, 2 when the select re-dots
   // the input against the gate planes (RICHENGINE_MOE_FOLDED_GATE_OFF).
   uint32_t shared;
+  // The routed scaling factor applied after norm_topk_prob (NVIDIA
+  // Nemotron's expert_weights_scale 2.5); 1.0 leaves the weights as the
+  // winners' normalized sigmoid scores.
+  float weight_scale = 1.0f;
 };
 
-static_assert(sizeof(MoeRouteParams) == 20,
-              "MoE routing parameters are 20 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 24,
+              "MoE routing parameters are 24 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the shared expert, whose
 // id is `experts` and whose routing weight is the sigmoid of its scalar gate.
@@ -118,8 +122,8 @@ struct MoeRouteGroupParams {
   MoeGroupParams group;
 };
 
-static_assert(sizeof(MoeRouteGroupParams) == 48,
-              "MoE route-group parameters are 48 bytes on both sides");
+static_assert(sizeof(MoeRouteGroupParams) == 52,
+              "MoE route-group parameters are 52 bytes on both sides");
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp): the decode union cap keeps the
 // `budget` routed experts with the largest summed routing weight across the
@@ -150,6 +154,39 @@ struct MoeSharedParams {
 static_assert(sizeof(MoeSharedParams) == 16,
               "MoE shared-expert parameters are 16 bytes on both sides");
 
+// The dense GGUF shared-expert passes (moe_shared_gguf_*, kernels/shared/
+// moe_gguf.metal): the same dispatch pattern as MoeSharedParams'
+// moe_shared_*_q4 for a quantized shared slab whose intermediate width can
+// differ from the routed experts' (Nemotron's is twice), so it cannot ride
+// the routed passes' MoeGgufExpertParams. With the grouping's shared == 2
+// every row's shared route aims at grouped row tile_count * tile_rows + row:
+// the up pass reads the row's input at row `row` (input_region 0) and stores
+// relu(up)^2 at tile_count * tile_rows + row of the intermediate's private
+// region, which begins tile_count * tile_rows * input_region elements in —
+// so the down pass, whose input_region is the routed experts' intermediate
+// width, reads the same rows. Its output_region is likewise the routed
+// region's row width in its output (expertOutput's hiddenSize).
+struct MoeGgufSharedParams {
+  uint32_t rows;
+  uint32_t input_size;  // the pass's K
+  uint32_t output_size; // the shared expert's own N
+  uint32_t tile_rows;
+  uint32_t format;
+  // Element width of the routed region the input buffer leads with; 0 reads
+  // the pass input ungrouped at row `row`.
+  uint32_t input_region;
+  // Element width of the routed region the output buffer leads with (the
+  // shared rows follow at tile_count * tile_rows * output_region + row *
+  // output_size).
+  uint32_t output_region;
+  // Nonzero applies relu(v)^2 to the bf16-rounded sum (the up pass); zero
+  // stores it plain (the down pass).
+  uint32_t relu2;
+};
+
+static_assert(sizeof(MoeGgufSharedParams) == 32,
+              "MoE GGUF shared-expert parameters are 32 bytes on both sides");
+
 struct MoeGatherParams {
   uint32_t tile_rows;
   uint32_t input_size;
@@ -176,8 +213,11 @@ static_assert(sizeof(MoeExpertParams) == 40,
               "MoE expert parameters are 40 bytes on both sides");
 
 // A GGUF expert pass (ops/MoE.cpp): every routed expert of the projection
-// is one image segment of experts * output_size rows, expert e's planes
-// starting at tile e * output_size / QUANT_TILE_ROWS; the shared expert (id `experts`)
+// is one image segment of experts * output_size rows, expert e's rows
+// starting at row e * output_size of the planes' tile-major image — not
+// necessarily a QUANT_TILE_ROWS boundary (Nemotron's 1856), which the
+// kernels' segment row0 carries to their column addressing
+// (kernels/common/moe_expert_slab.h); the shared expert (id `experts`)
 // has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;
@@ -253,3 +293,42 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// moe_gather_int8 (kernels/shared/moe_int8.metal, ops/MoE.cpp): the grouped
+// rows' int8 codes and scales from the chunk's — rows of input_size codes
+// and scales [input_size / 64][rows] — so every expert tile is a dense
+// matrix of its live rows. Tile t covers grouped rows
+// [t * tile_rows, t * tile_rows + rows) of one expert, and `routes` is the
+// grouped rows' bound (tiles * tile_rows), the grouped scales' row stride.
+struct MoeGatherInt8Params {
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t rows;      // the chunk's, its scales' row stride
+  uint32_t routes;    // the grouped rows', their scales' row stride
+  uint32_t tile_rows;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(MoeGatherInt8Params) == 24,
+              "MoE int8 gather parameters are 24 bytes on both sides");
+
+// An int8 expert pass of a prefill chunk (kernels/shared/moe_int8.metal,
+// ops/MoE.cpp): the grouped rows' int8 codes and scales (the dense
+// prefill's rule, per row and 64 inputs, kernels/common/int8_activations.h),
+// a row per route and `routes` the scales' row stride, through the AF
+// planes of the tile's expert as MoeGgufExpertParams reaches them
+// (moe_gguf_segment_fmt). Resident blocks only — the streamed passes'
+// slot-table resolution has no int8 form.
+struct MoeInt8ExpertParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t routed_format;
+  uint32_t shared_format;
+  uint32_t tile_rows;
+  uint32_t routes;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(MoeInt8ExpertParams) == 32,
+              "MoE int8 expert parameters are 32 bytes on both sides");

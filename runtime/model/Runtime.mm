@@ -333,7 +333,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
-    impl_->aneFfn->begin();
+    uint64_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    impl_->aneFfn->begin(impl_->aneFfn->steps(static_cast<uint32_t>(rows)));
   }
   // The submit-ahead ring admits a second in-flight prefill; its host-written
   // input tensors come from the other bank so the running chunk's inputs are
@@ -388,7 +390,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // first ticket was released before this completion runs
     // (DeferredMetalTicket::wait), so the backend takes the rerun's command,
     // whose time counts in the chunk's.
-    if (impl->aneFfn && !impl->aneFfn->finish()) {
+    if (impl->aneFfn && !impl->aneFfn->finish(timing)) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
       CommandGraph again;
@@ -798,7 +800,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->dfaForcedSpan(entry.stateLane).tokens >= proposals[lane];
   }
   if (!predrafted && !draftBypassed && !spanSkipDraft) {
-    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+    impl_->encodeDraftInputEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width, 1,
                                 impl_->geometry.draft.queryRows());
     impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -963,12 +965,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  items = std::move(copiedItems), tree,
                  encodeStart, encodeEnd](CommandTiming timing) mutable {
     const auto t0 = richengine::AwakeClock::now();
+    static const bool dbg = getenv("RICHENGINE_VERIFY_DUMP2") != nullptr;
+    if (dbg) fprintf(stderr, "probe finish-enter\n");
     // A predraft left in flight by the overlap path ended on the queue
     // before this command did — its ticket wait is a bookkeeping read,
     // freeing the slot the next launch needs. It runs first so its GPU
     // seconds count in this cycle's lastDecodeGpuSeconds.
     impl->settleGpuPredraft();
+    if (dbg) fprintf(stderr, "probe settle-done\n");
     auto result = impl->finalizeDecode(lanes, items, timing, tree);
+    if (dbg) fprintf(stderr, "probe finalize-returned\n");
     const auto t1 = richengine::AwakeClock::now();
     // The committed step's anchors and positions are host-known now: the
     // next block's draft forward runs on the GPU through the host's
@@ -976,6 +982,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // batch would only discard a chain table.
     if (!tree)
       impl->completeGpuPredraft(lanes, items);
+    if (dbg) fprintf(stderr, "probe predraft-done\n");
     if (tuning().opTimings &&
         std::any_of(lanes.begin(), lanes.end(), [](const auto &l) {
           return l.request->generatedTokens >= l.request->maxNewTokens;
@@ -1602,7 +1609,16 @@ void withPrefillArena(
     MetalBackend &backend, const ModelPackage &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
   const PrefillArena arena(backend, RuntimeGeometry::from(model, format), operators);
-  const TargetModelPrefillBuffers buffers = detail::prefillBuffers(arena);
+  const TargetModelPrefillBuffers buffers = detail::prefillBuffers(arena, 0);
+  use(buffers.ffn(), buffers.hidden);
+}
+
+void Runtime::setAneFfn(ops::FfnSplit *split) {
+  impl_->aneFfn = split;
+}
+
+void Runtime::withPrefillFfn(const PrefillFfnUse &use) {
+  const TargetModelPrefillBuffers buffers = detail::prefillBuffers(*impl_->prefillArena, 0);
   use(buffers.ffn(), buffers.hidden);
 }
 

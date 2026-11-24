@@ -183,4 +183,6 @@ PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_kv2_g8_tm, 2, bfloat, RI
 // LFM3's sparse global layers: the k4q4d128 core's token-major stores.
 PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_k4q4d128_tm, 4, int8_t, 128)
 PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_k4q4d128_tm, 4, bfloat, 128)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_q8_store_k4q8d128_tm, 4, int8_t, 128)
+PREFILL_ATTENTION_STORE_TM(prefill_attention_bf16_store_k4q8d128_tm, 4, bfloat, 128)
 #undef PREFILL_ATTENTION_STORE_TM

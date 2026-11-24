@@ -528,6 +528,10 @@ void NativeRuntime::promptProgress(uint64_t requestId,
 
 void NativeRuntime::tokens(uint64_t requestId,
                            std::span<const uint32_t> values) {
+  static const bool dbg = getenv("RICHENGINE_VERIFY_DUMP2") != nullptr;
+  if (dbg)
+    fprintf(stderr, "probe tokens-send id=%llu n=%zu\n",
+                (unsigned long long)requestId, values.size());
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = clocks_.monotonicMilliseconds();
   if (!telemetry.firstTokenMilliseconds) {

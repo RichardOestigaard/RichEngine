@@ -73,10 +73,14 @@ struct DraftCodebooks final {
 
 // A DSpark draft's Markov head: the previous-token feature table
 // (markov_w1, [vocabulary][rank]) and the bias projection (markov_w2,
-// [vocabulary][rank]), both bf16 row-major.
+// [vocabulary][rank]), both bf16 row-major. rank is the head's declared
+// markov_rank — RICHENGINE_DRAFT_SELECTOR_RANK on the shipped drafts,
+// 512 on Nemotron-3.5-Lightning's — which the edge kernel reads from the
+// batch parameters rather than a compiled constant.
 struct DraftMarkovHead final {
   metal::MetalBuffer embedding;
   metal::MetalBuffer projection;
+  uint32_t rank = RICHENGINE_DRAFT_SELECTOR_RANK;
 };
 
 // The DFlash draft's proposal policy (draft_select_* in
@@ -131,8 +135,10 @@ public:
                         RICHENGINE_DRAFT_QUERY_ROWS) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
   // dspark_select_edges + draft_select_dspark): like the plain path, but
-  // position p reads logits row p (the anchor row already predicts a token)
-  // and each position's candidates are rescored with the Markov bias of the
+  // position p reads logits row p + rowOffset (0 on anchor-first drafts,
+  // whose anchor row already predicts a token; 1 on bonus-anchor ones,
+  // whose anchor row reproduces the anchor like a DFlash draft's) and each
+  // position's candidates are rescored with the Markov bias of the
   // previously sampled token. A parallel pass scores every
   // predecessor/candidate edge in advance — the predecessor set is the
   // previous position's unbiased top-16, not the walk's pick — and the walk
@@ -144,7 +150,8 @@ public:
                  std::span<const uint32_t> anchors,
                  std::span<const SamplingPolicy> policies,
                  uint32_t queryRows =
-                     RICHENGINE_DRAFT_QUERY_ROWS) const;
+                     RICHENGINE_DRAFT_QUERY_ROWS,
+                 uint32_t rowOffset = 0) const;
   // The same DSpark pipeline ending in draft_select_dspark_tree, which
   // emits each lane's verify tree tables: the chain plus, for lanes in
   // treeMask, every position's biased runner-up as a sibling leaf.
@@ -155,7 +162,8 @@ public:
                     std::span<const SamplingPolicy> policies,
                     uint32_t treeMask,
                     uint32_t queryRows =
-                        RICHENGINE_DRAFT_QUERY_ROWS) const;
+                        RICHENGINE_DRAFT_QUERY_ROWS,
+                    uint32_t rowOffset = 0) const;
   // The DFlash2 selector over the whole shard pool
   // (dflash_select_pool_edges + the shared draft_select_dspark pool walk):
   // the hidden-conditioned codebook edge scores all 128 partial slots per

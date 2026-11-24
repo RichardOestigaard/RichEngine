@@ -246,6 +246,45 @@ PREFILL_ATTENTION_SPLIT_HD(prefill_attention_int4_split_k4q4d128_a16, 4, 4, Rich
 PREFILL_ATTENTION_SPLIT_HD(prefill_attention_bf16_split_k4q4d128_a16, 4, 4, bfloat, 128, 1, false, bfloat)
 #undef PREFILL_ATTENTION_SPLIT_HD
 
+// Nemotron's KV2 group-16 core of 128 (_k2q16d128): M = 16 x 8 = 128 fused
+// rows, whose full-M scratch (~33 KB) exceeds the 32 KB threadgroup budget
+// — the hd512 _m2 splits' halving at a head dimension the budget allows.
+// The plain, q8q and _a16 variants run the tile in two fused-row passes at
+// MP = 64; the trailing variadic forwards Int8Queries/Accumulator.
+#define PREFILL_ATTENTION_SPLIT_HD_MP(Name, Heads, Group, CacheElement,      \
+                                      HeadDim, Passes, ...)                 \
+  [[max_total_threads_per_threadgroup(256)]] kernel void Name(              \
+      device bfloat *queries [[buffer(0)]],                                 \
+      device bfloat *partials [[buffer(1)]],                                 \
+      device float *statistics [[buffer(2)]],                               \
+      device const RichKvPage *page_table [[buffer(3)]],                  \
+      constant RichPrefillAttentionParams &params [[buffer(4)]],          \
+      uint3 group [[threadgroup_position_in_grid]],                         \
+      uint thread_index [[thread_index_in_threadgroup]]) {                  \
+    constexpr uint M = Group * RICHENGINE_PREFILL_ATTENTION_TILE_ROWS;          \
+    constexpr uint MP = M / Passes;                                         \
+    constexpr uint N = RichKvPageTokens;                                  \
+    alignas(16) threadgroup float scores[MP * N];                           \
+    alignas(16) threadgroup bfloat probabilities[2 * MP * N];               \
+    threadgroup float row_max[MP];                                          \
+    threadgroup float row_sum[MP];                                          \
+    threadgroup float previous_scale[MP];                                   \
+    threadgroup atomic<uint, thread_scope_threadgroup> rescale;                                        \
+    richengine_prefill_attention_split_phase<Heads, Group, CacheElement,        \
+                                         HeadDim, Passes, ##__VA_ARGS__>(   \
+        queries, partials, statistics, page_table, params, scores,          \
+        probabilities, row_max, row_sum, previous_scale, &rescale,          \
+        group, thread_index);                                               \
+  }
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_q8_split_k2q16d128, 2, 16, int8_t, 128, 2)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_int4_split_k2q16d128, 2, 16, RichKvPacked4, 128, 2)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_bf16_split_k2q16d128, 2, 16, bfloat, 128, 2)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_q8q_split_k2q16d128, 2, 16, int8_t, 128, 2, true)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_q8_split_k2q16d128_a16, 2, 16, int8_t, 128, 2, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_int4_split_k2q16d128_a16, 2, 16, RichKvPacked4, 128, 2, false, bfloat)
+PREFILL_ATTENTION_SPLIT_HD_MP(prefill_attention_bf16_split_k2q16d128_a16, 2, 16, bfloat, 128, 2, false, bfloat)
+#undef PREFILL_ATTENTION_SPLIT_HD_MP
+
 // The _m2 hd512 variants run the tile in two fused-row passes (MP = M/2 =
 // 32), halving the PV accumulator's ~128 fp32/thread — the M5 per-core
 // register/SRAM pool — plus halving score/probability scratch. Partials,
@@ -300,6 +339,7 @@ PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_hd64, 8, 4, 64)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k8q5d64, 8, 5, 64)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k8q4d128, 8, 4, 128)
 PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k4q4d128, 4, 4, 128)
+PREFILL_ATTENTION_REDUCE_HD(prefill_attention_reduce_k2q16d128, 2, 16, 128)
 #undef PREFILL_ATTENTION_REDUCE_HD
 
 // ---------------------------------------------------------------------------

@@ -37,8 +37,11 @@ constant uint RichCanvasMaximumSplits =
 // richengine_attention_page_softmax except the admission test. Every fused
 // row admits t in [window_begin, visible_tokens); window_begin bounds the
 // paged prefix only. Score scaling and the rescale machinery are unchanged.
+// Masked false is a page lying wholly inside [window_begin, visible): its
+// tokens are all admitted, untested.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint TokensPerLane = 8>
+          bool Masked, uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          uint TokensPerLane = 8>
 inline void richengine_canvas_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -61,15 +64,27 @@ inline void richengine_canvas_page_softmax(
     return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
-  // Canvas rows see the whole visible range; a nonzero window bounds only
-  // the paged prefix, so every canvas position (t >= committed_tokens) is
-  // admitted regardless of the window.
-  const uint limit = visible_tokens;
-  const uint window_begin =
-      window_tokens != 0 && committed_tokens > window_tokens
-          ? committed_tokens - window_tokens
-          : 0;
-  const uint token = token_start + column;
+  bool admitted[TokensPerLane];
+  if constexpr (Masked) {
+    // Canvas rows see the whole visible range; a nonzero window bounds only
+    // the paged prefix, so every canvas position (t >= committed_tokens) is
+    // admitted regardless of the window.
+    const uint limit = visible_tokens;
+    const uint window_begin =
+        window_tokens != 0 && committed_tokens > window_tokens
+            ? committed_tokens - window_tokens
+            : 0;
+    const uint token = token_start + column;
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      const uint t = token + j;
+      admitted[j] = t >= window_begin && t < limit;
+    }
+  } else {
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j)
+      admitted[j] = true;
+  }
   threadgroup const float4 *scores4 =
       reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
                                                    column);
@@ -92,11 +107,8 @@ inline void richengine_canvas_page_softmax(
     }
   }
   float local_max = -INFINITY;
-  bool admitted[TokensPerLane];
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    const uint t = token + j;
-    admitted[j] = t >= window_begin && t < limit;
     score[j] = admitted[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
@@ -176,6 +188,14 @@ inline void richengine_canvas_attention_tile(
   if (page_begin >= pages)
     return;
   uint page_end = min(pages, page_begin + per_split);
+  // Canvas admission is row-independent: the pages wholly inside
+  // [window_begin, visible) take the unmasked softmax.
+  const uint canvas_window_begin =
+      window_tokens != 0 && committed_tokens > window_tokens
+          ? committed_tokens - window_tokens
+          : 0;
+  const uint whole_begin = (canvas_window_begin + N - 1) / N;
+  const uint whole_end = visible_tokens / N;
 
   auto st = tensor(scores, dextents<int, 2>{N, MP}, array<int, 2>{1, N});
   typedef decltype(tensor(static_cast<threadgroup bfloat *>(nullptr),
@@ -245,13 +265,22 @@ inline void richengine_canvas_attention_tile(
         if (thread_index == 0)
           atomic_store_explicit(rescale, 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
-        richengine_canvas_page_softmax<QueryHeadsPerKVHead,
-            RowsPerTile / MPasses, Quantized, HeadDim, (MP > 64 ? 16 : 8)>(
-            scores, pbuf, row_max, row_sum, previous_scale, rescale,
-            reinterpret_cast<device const float4 *>(key_scales),
-            reinterpret_cast<device const float4 *>(value_scales), token_start,
-            visible_tokens, committed_tokens, thread_index, qk_scale,
-            window_tokens);
+        if (page >= whole_begin && page < whole_end)
+          richengine_canvas_page_softmax<QueryHeadsPerKVHead,
+              RowsPerTile / MPasses, Quantized, false, HeadDim, (MP > 64 ? 16 : 8)>(
+              scores, pbuf, row_max, row_sum, previous_scale, rescale,
+              reinterpret_cast<device const float4 *>(key_scales),
+              reinterpret_cast<device const float4 *>(value_scales), token_start,
+              visible_tokens, committed_tokens, thread_index, qk_scale,
+              window_tokens);
+        else
+          richengine_canvas_page_softmax<QueryHeadsPerKVHead,
+              RowsPerTile / MPasses, Quantized, true, HeadDim, (MP > 64 ? 16 : 8)>(
+              scores, pbuf, row_max, row_sum, previous_scale, rescale,
+              reinterpret_cast<device const float4 *>(key_scales),
+              reinterpret_cast<device const float4 *>(value_scales), token_start,
+              visible_tokens, committed_tokens, thread_index, qk_scale,
+              window_tokens);
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

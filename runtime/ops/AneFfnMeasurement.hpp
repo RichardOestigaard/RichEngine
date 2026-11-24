@@ -6,32 +6,42 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace richengine::ops::ane_ffn {
 
 // Times the prefill FFN's Neural Engine split of `layers` (AneFfn) on this
-// device, with chunks in `ffn` and the residual and output of alternate
-// layers in `hidden`, all of which it overwrites, through the split's path:
-// begin(), its layers as add() encodes them, commit() and its completion
-// check (layer() in AneFfnMeasurement.cpp). A program it compiles waits for
-// the ANE's service until `interrupted` returns true. Each duration passes
-// usable() where it is measured.
+// device, the GPU's part through `linear`, with chunks in `ffn` and the
+// residual and output of alternate layers in `hidden`, all of which it
+// overwrites, through the split's path: begin(), its layers as add() encodes
+// them, commit() and its completion check (layer() in
+// AneFfnMeasurement.cpp). A program it compiles waits for the ANE's service
+// until `interrupted` returns true. Each duration passes usable() where it
+// is measured.
 class Measurement final {
 public:
-  Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
-              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted);
+  Measurement(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+              const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
+              std::function<bool()> interrupted);
 
   // The split's GPU part alone and its split layer of full chunks with the
-  // ANE taking the channel units nearest two shares, and the GPU's FFN
-  // alone, on the same four layers spread over the model, whose formats can
-  // differ with depth: a program of one function of a full chunk's rows
-  // each, which the ANE's service keeps once compiled.
+  // ANE taking the channel units nearest two shares, at the higher one also
+  // of a step of half a full chunk's rows, and the GPU's FFN alone, on the
+  // same five layers spread over the model, whose formats can differ with
+  // depth: a program of one function of a full chunk's rows, and of a
+  // half's too at the higher share, which the ANE's service keeps once
+  // compiled. Not the mixer (Timings::mixer), which the model's side times.
   [[nodiscard]] Timings time();
-  // The GPU alone over the least and the most rows of `split`'s functions,
-  // and `split` over a chunk of the rows of each of its functions, on the
-  // first layers.
-  [[nodiscard]] ChunkTimings chunks(AneFfn &split);
+  // The same at `aneUnits`: what calibration fits again at the units it
+  // first chooses (ane_ffn::refit), on the layers it fitted.
+  [[nodiscard]] Timing time(uint32_t aneUnits);
+  // The GPU alone at the least rows and a full chunk, and the split of
+  // `shares` over a step of the rows of each of its one-step functions, on
+  // the layers time() times: on the program a split of `shares` serves
+  // (AneFfn::programRows), which its own split then loads.
+  [[nodiscard]] ChunkTimings chunks(AneFfn::Shares shares);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
@@ -41,6 +51,12 @@ private:
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
                              AneFfn *split = nullptr, double standIn = 0.0);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
+  // The kSampledLayers layers time() spreads over the model, first and last
+  // among them (AneFfnMeasurement.cpp).
+  [[nodiscard]] std::vector<SwiGluProjections> sampled() const;
+  // The Metal readers of `layers` through the split `split` holds, which
+  // load() makes, one at a time.
+  [[nodiscard]] Readers readers(std::span<const SwiGluProjections> layers, std::unique_ptr<AneFfn> &split);
 
   metal::MetalBackend &backend_;
   std::span<const SwiGluProjections> layers_;

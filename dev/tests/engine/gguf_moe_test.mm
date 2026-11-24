@@ -701,18 +701,249 @@ int moe(MetalBackend &backend) {
   return failures;
 }
 
+// ------------------------------------------------ ungated MoE (Nemotron)
+// The ungated block (MoeShape::ungatedExperts + sharedExpertUnitWeight): no
+// gate slab, relu(x)^2 between up and down, the sigmoid+bias routed select
+// with the shared expert's route appended at weight 1, and the shared
+// expert on its dense passes, whose intermediate width (384) differs from
+// the routed experts' (192) and whose row region follows the routed tiles'.
+// Hidden 320 and both intermediates are multiples of 64 but not 256, so the
+// ragged gather/combine column blocks run.
+constexpr uint32_t kUngatedHidden = 320;
+constexpr uint32_t kUngatedIntermediate = 192;
+constexpr uint32_t kUngatedSharedIntermediate = 384;
+constexpr uint32_t kUngatedExperts = 16;
+constexpr uint32_t kUngatedTopK = 4;
+constexpr uint32_t kUngatedRoutes = kUngatedTopK + 1;
+
+struct UngatedModel {
+  Tensor router, expertBias;
+  Tensor up, down; // routed: experts * N rows
+  Tensor sharedUp, sharedDown;
+  MoeWeights weights;
+};
+
+UngatedModel makeUngatedModel(MetalBackend &backend, Fmt routedFormat, Fmt sharedFormat) {
+  UngatedModel m;
+  m.router = floating(backend, kUngatedExperts, kUngatedHidden, 0.05f);
+  m.expertBias = floating(backend, 1, kUngatedExperts, 0.2f);
+  m.up = quantized(backend, routedFormat, kUngatedExperts * kUngatedIntermediate, kUngatedHidden);
+  m.down = quantized(backend, routedFormat, kUngatedExperts * kUngatedHidden, kUngatedIntermediate);
+  m.sharedUp = quantized(backend, sharedFormat, kUngatedSharedIntermediate, kUngatedHidden);
+  m.sharedDown = quantized(backend, sharedFormat, kUngatedHidden, kUngatedSharedIntermediate);
+  BlockMoeWeights gguf;
+  gguf.router = m.router.segment;
+  gguf.expertBias = m.expertBias.segment;
+  gguf.up = {m.up.segment, m.sharedUp.segment};
+  gguf.down = {m.down.segment, m.sharedDown.segment};
+  m.weights = gguf;
+  return m;
+}
+
+double relu2(double value) { return value > 0 ? value * value : 0.0; }
+
+// One ungated plan's run checked against the fp64 model, as runPlan's.
+std::vector<uint16_t> runUngated(MetalBackend &backend, const UngatedModel &m, Buffers &b,
+                                 const MoePlan &plan, Stats &stats, const std::string &label) {
+  const uint32_t rows = plan.rows();
+  allocate(backend, b, plan);
+  std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+  CommandGraph graph;
+  MoE::add(graph, b.moe, m.weights, plan);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+  const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
+  const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+  const auto *intermediate = static_cast<const __bf16 *>(b.moe.scratch.expertIntermediate.contents());
+  const auto *down = static_cast<const __bf16 *>(b.moe.scratch.expertOutput.contents());
+  const auto *output = static_cast<const __bf16 *>(b.moe.output.contents());
+  const uint32_t tileRows = plan.tileRows();
+  const uint64_t groupedRows = uint64_t{plan.maximumTiles()} * tileRows;
+  // The routed tiles' end: where the shared region of the intermediates and
+  // the shared rows of expertOutput begin (the grouping's shared == 2).
+  const uint64_t sharedBase =
+      uint64_t{*static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents())} * tileRows;
+  for (uint32_t r = 0; r < rows; ++r) {
+    const float *x = b.input.data() + uint64_t{r} * kUngatedHidden;
+    // fp64 scores; the select's keys are sigmoid(score) + bias.
+    std::array<double, kUngatedExperts> score{}, bound{}, key{};
+    for (uint32_t e = 0; e < kUngatedExperts; ++e) {
+      const Dot d = dot(x, m.router.row(e), kUngatedHidden);
+      score[e] = d.value;
+      bound[e] = floatBound(d, kUngatedHidden, plan.configuration().ggufRouterTile);
+      key[e] = 1.0 / (1.0 + std::exp(-d.value)) + double(m.expertBias.values[e]);
+    }
+    std::array<uint32_t, kUngatedExperts> order;
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t c) {
+      return key[a] != key[c] ? key[a] > key[c] : a < c;
+    });
+    for (uint32_t rank = 0; rank < kUngatedTopK; ++rank) {
+      const uint32_t got = selected[r * kUngatedRoutes + rank], want = order[rank];
+      require(got == want || std::fabs(key[got] - key[want]) <= bound[got] + bound[want],
+              label + ": row " + std::to_string(r) + " routes expert " + std::to_string(got) + " at rank " +
+                  std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
+    }
+    // norm_topk_prob over the winners' sigmoid scores.
+    double sum = 0, scoreError = 0;
+    for (uint32_t rank = 0; rank < kUngatedTopK; ++rank) {
+      sum += 1.0 / (1.0 + std::exp(-score[order[rank]]));
+      scoreError = std::max(scoreError, bound[order[rank]]);
+    }
+    for (uint32_t rank = 0; rank < kUngatedTopK; ++rank) {
+      const double want = (1.0 / (1.0 + std::exp(-score[order[rank]]))) / sum;
+      require(std::fabs(routing[r * kUngatedRoutes + rank] - want) <= 2 * scoreError + std::ldexp(1.0, -14),
+              label + ": routing weight of row " + std::to_string(r) + " differs from the fp64 norm_topk_prob");
+    }
+    require(selected[r * kUngatedRoutes + kUngatedTopK] == kUngatedExperts &&
+                routing[r * kUngatedRoutes + kUngatedTopK] == 1.0f,
+            label + ": shared expert route of row " + std::to_string(r) + " is not the unit-weight route");
+
+    std::vector<double> expected(kUngatedHidden), magnitude(kUngatedHidden);
+    for (uint32_t c = 0; c < kUngatedHidden; ++c) expected[c] = b.residual[uint64_t{r} * kUngatedHidden + c];
+    for (uint32_t slot = 0; slot < kUngatedRoutes; ++slot) {
+      const uint32_t route = r * kUngatedRoutes + slot, expert = selected[route], grouped = routeRows[route];
+      const bool isShared = expert == kUngatedExperts;
+      require(grouped < groupedRows, label + ": grouped row out of range");
+      const uint32_t inter = isShared ? kUngatedSharedIntermediate : kUngatedIntermediate;
+      std::vector<float> h(inter);
+      for (uint32_t n = 0; n < inter; ++n) {
+        const uint64_t wrow = isShared ? n : uint64_t{expert} * kUngatedIntermediate + n;
+        const Dot u = dot(x, (isShared ? m.sharedUp : m.up).row(wrow), kUngatedHidden);
+        const double eu = projectionBound(u, true);
+        // relu(bf16(u))^2 over the up product's interval: min 0 while the
+        // interval holds a nonpositive endpoint, else monotone.
+        const double u0 = bf16(u.value - eu), u1 = bf16(u.value + eu);
+        const double lo = u0 <= 0.0 ? 0.0 : relu2(u0);
+        const double hi = relu2(std::max(u1, 0.0));
+        const double slack = std::ldexp(std::max(std::fabs(lo), std::fabs(hi)), -8) + 1e-7;
+        const uint64_t at = isShared ? sharedBase * kUngatedIntermediate + uint64_t{r} * inter + n
+                                     : uint64_t{grouped} * inter + n;
+        const float got = float(intermediate[at]);
+        h[n] = got;
+        if (!(got >= bf16(lo - slack) && got <= bf16(hi + slack)))
+          fail(label + ": up of row " + std::to_string(r) + " expert " + std::to_string(expert) + " column " +
+               std::to_string(n) + ": " + std::to_string(got) + " outside relu^2[" + std::to_string(lo) + ", " +
+               std::to_string(hi) + "]");
+        const double exact = relu2(bf16(u.value));
+        stats.gateUpFlips += got != bf16(exact);
+        // First order in the product's magnitude: relu^2's slope 2u sum|x w|.
+        stats.gateUpWorst = std::max(stats.gateUpWorst,
+                                     std::fabs(got - exact) / (std::fabs(u.value) * u.magnitude + 1e-30));
+      }
+      const double weight = routing[route];
+      for (uint32_t n = 0; n < kUngatedHidden; ++n) {
+        const uint64_t wrow = isShared ? n : uint64_t{expert} * kUngatedHidden + n;
+        const Dot y = dot(h.data(), (isShared ? m.sharedDown : m.down).row(wrow), inter);
+        const double e = projectionBound(y, true);
+        const float got = float(down[uint64_t{grouped} * kUngatedHidden + n]);
+        if (!inside(got, y.value, e))
+          fail(label + ": down of row " + std::to_string(r) + " expert " + std::to_string(expert) + " column " +
+               std::to_string(n) + ": " + std::to_string(got) + " outside fp64 " + std::to_string(y.value) + " +- " +
+               std::to_string(e));
+        stats.downFlips += got != bf16(y.value);
+        stats.downWorst = std::max(stats.downWorst, std::fabs(got - y.value) / y.magnitude);
+        ++stats.outputs;
+        expected[n] += weight * got;
+        magnitude[n] += std::fabs(weight * got);
+      }
+    }
+    for (uint32_t c = 0; c < kUngatedHidden; ++c) {
+      const double e = std::ldexp(magnitude[c] + std::fabs(b.residual[uint64_t{r} * kUngatedHidden + c]), -21);
+      const float got = float(output[uint64_t{r} * kUngatedHidden + c]);
+      require(inside(got, expected[c], e),
+              label + ": output of row " + std::to_string(r) + " column " + std::to_string(c) +
+                  " differs from the weighted expert sum");
+    }
+  }
+  std::vector<uint16_t> result(uint64_t{rows} * kUngatedHidden);
+  std::memcpy(result.data(), output, result.size() * 2);
+  return result;
+}
+
+int moeUngated(MetalBackend &backend) {
+  int failures = 0;
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kUngatedHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kUngatedHidden);
+  for (float &v : b.residual) v = bf16(0.1f * v);
+  b.moe.input = bfloatBuffer(backend, b.input, "ungated-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "ungated-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kUngatedHidden * 2, "ungated-output");
+  const MoeShape shape{kUngatedHidden,        kUngatedExperts, kUngatedTopK, kUngatedIntermediate,
+                       WeightLayout::Block32, GGUF_FMT_Q80,    true,         true,
+                       true,                  kUngatedSharedIntermediate};
+  for (const auto [routedFormat, sharedFormat] : {std::pair{Q80, Q80}, std::pair{Q80, Q40}, std::pair{Q40, Q80}}) {
+    const UngatedModel m = makeUngatedModel(backend, routedFormat, sharedFormat);
+    const std::string formats =
+        std::string(fmtName(routedFormat)) + "/" + fmtName(sharedFormat) + " ungated";
+    const int before = failures;
+    Stats stats;
+    std::vector<uint16_t> widest;
+    for (uint32_t lanes = 4; lanes >= 1; --lanes) {
+      MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight,
+                       MoeGgufTile::Staged};
+      const MoePlan plan = MoE::decodePlan(shape, lanes, RICHENGINE_TARGET_VERIFY_ROWS, config);
+      const std::string label = formats + " decode B" + std::to_string(lanes);
+      const std::vector<uint16_t> rows = runUngated(backend, m, b, plan, stats, label);
+      if (widest.empty()) widest = rows;
+      else if (const size_t diffs = dispatchDiffs(rows, widest)) {
+        printf("  %s: %zu rows differ from the four-lane dispatch FAIL\n", label.c_str(), diffs);
+        ++failures;
+      }
+    }
+    for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
+      MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight,
+                       MoeGgufTile::Staged};
+      const MoePlan plan = MoE::prefillPlan(shape, chunk, config);
+      const std::string label = formats + " prefill rows=" + std::to_string(chunk);
+      const std::vector<uint16_t> rows = runUngated(backend, m, b, plan, stats, label);
+      if (const size_t diffs = dispatchDiffs(rows, widest)) {
+        printf("  %s: %zu rows differ from the four-lane dispatch FAIL\n", label.c_str(), diffs);
+        ++failures;
+      }
+    }
+    // The 32-row tiles, on both router float tiles.
+    for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
+        MoeConfig config{MoeExpertTile::M32};
+        config.ggufRouterTile = router;
+        const MoePlan plan = MoE::prefillPlan(shape, rows, config);
+        const std::string label = formats + " prefill rows=" + std::to_string(rows) +
+                                  (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
+        const std::vector<uint16_t> result = runUngated(backend, m, b, plan, stats, label);
+        if (const size_t diffs = dispatchDiffs(result, widest)) {
+          printf("  %s: %zu rows differ from the %u-row chunk FAIL\n", label.c_str(), diffs, kMaximumRows);
+          ++failures;
+        }
+      }
+    }
+    printf("%-28s decode B1-4, prefill 263/27/9 + 263/33/16 (32-row): up %.2f%% and down %.2f%% of outputs differ "
+           "from bf16(fp64), errors at most %.1e/%.1e %s\n",
+           formats.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2),
+           100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst, stats.downWorst,
+           failures > before ? "FAIL" : "ok");
+  }
+  return failures;
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf_moe_test <metallib>\n";
+    if (argc < 2 || argc > 3) {
+      std::cerr << "usage: gguf_moe_test <metallib> [all|ungated|gated]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
-                           floatOnlyChain(backend) + moe(backend);
+      const std::string only = argc == 3 ? argv[2] : "all";
+      const int failures =
+          (only == "ungated"   ? moeUngated(backend)
+           : only == "gated"   ? moe(backend)
+                              : floatProjection(backend) + floatSegments(backend, 64) +
+                                    floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
+                                    moeUngated(backend));
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

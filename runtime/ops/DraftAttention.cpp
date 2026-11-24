@@ -106,6 +106,11 @@ using KernelLayout = DraftContextCore;
         shape.headDimension == 256 && !shape.ropeInterleaved)
       return HeadKernel::Q8K2D256;
     break;
+  case HeadKernel::Q32K2D128:
+    if (shape.queryHeads == 32 && shape.kvHeads == 2 &&
+        shape.headDimension == 128 && !shape.ropeInterleaved)
+      return HeadKernel::Q32K2D128;
+    break;
   case HeadKernel::Unspecified:
     break;
   }
@@ -126,10 +131,19 @@ using KernelLayout = DraftContextCore;
     return draftCore32x8x64Interleaved(base);
   case HeadKernel::Q8K2D256:
     return draftCore8x2x256(base);
+  case HeadKernel::Q32K2D128:
+    return draftCore32x2x128(base);
   case HeadKernel::Unspecified:
     break;
   }
   throw std::invalid_argument("unknown draft attention kernel");
+}
+
+// The head subtiles each KV group's eight-row block splits into: the
+// q32k2 group's sixteen query heads run as two M=64 tiles so the score
+// workspace stays under a threadgroup's 32 KB.
+[[nodiscard]] uint32_t headSubtiles(HeadKernel kernel) {
+  return kernel == HeadKernel::Q32K2D128 ? 2 : 1;
 }
 
 [[nodiscard]] KernelLayout kernelShape(DraftAttentionShape shape) {
@@ -179,6 +193,12 @@ using KernelLayout = DraftContextCore;
   case KernelLayout::Plain2048:
     if (shape.dynamicSize == 0 && shape.hiddenSize == 2048)
       return KernelLayout::Plain2048;
+    break;
+  case KernelLayout::Plain2688:
+    // Nemotron-3.5-Lightning's DSpark draft: hidden 2688 over its own
+    // 32x2x128 head geometry; no convolutions, like the other plain cores.
+    if (shape.dynamicSize == 0 && shape.hiddenSize == 2688)
+      return KernelLayout::Plain2688;
     break;
   case KernelLayout::Unspecified:
     break;
@@ -311,7 +331,8 @@ void DraftAttention::addDecode(
       std::max(1u, std::min(shape.slidingWindow, kWindow));
   DraftAttentionBatchParams params{kWindow, window, lanes,
                                    causal ? 1u : 0u, plan.rows(), {},
-                                   devicePack ? 1u : 0u};
+                                   devicePack ? 1u : 0u,
+                                   buffers.attentionSinks ? 1u : 0u};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};
@@ -328,12 +349,30 @@ void DraftAttention::addDecode(
   // enclosing baked span replays the pair with the lengths rewritten into
   // its parameter arena.
   const HeadKernel kernel = headKernel(shape);
-  const uint32_t rowTiles = plan.rows() / 8;
+  if (buffers.attentionSinks) {
+    // The per-head sink bias binds only on the q32k2 reduce, whose
+    // signature carries it; another core's reduce would read it as params.
+    if (kernel != HeadKernel::Q32K2D128)
+      throw std::invalid_argument(
+          "draft attention sinks require the q32k2 head core");
+    requireBuffer(buffers.attentionSinks, uint64_t{shape.queryHeads} * 2);
+  }
+  const uint32_t rowTiles = plan.rows() / 8 * headSubtiles(kernel);
   graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Split),
                      std::move(bindings), params,
                      {shape.kvHeads * rowTiles, lanes, splits()});
-  graph.addPatchable(headKernelName(kernel, kDraftAttentionBf16Reduce),
-                     {buffers.groupedQueries}, params,
+  const char *reduce = headKernelName(kernel, kDraftAttentionBf16Reduce);
+  if (kernel == HeadKernel::Q32K2D128) {
+    // The sink-capable reduce always binds a second buffer; an empty
+    // sinks field rides a dummy binding while the flag clears the term.
+    graph.addPatchable(reduce,
+                       {buffers.groupedQueries,
+                        buffers.attentionSinks ? buffers.attentionSinks
+                                               : buffers.queryKeys},
+                       params, {shape.kvHeads * rowTiles, lanes, 1});
+    return;
+  }
+  graph.addPatchable(reduce, {buffers.groupedQueries}, params,
                      {shape.kvHeads * rowTiles, lanes, 1});
 }
 

@@ -97,13 +97,16 @@ constexpr Signature kSignatures[] = {
     {"_ANESharedEvents", '+', "sharedEventsWithSignalEvents:waitEvents:", "@@:@@"},
 };
 
-constexpr unsigned kQos = QOS_CLASS_DEFAULT;
+// The QoS of every request to the service, which orders the ANE's queue:
+// user-initiated, so another process's background work (its indexing, for
+// one) no longer queues ahead of our evaluations.
+constexpr unsigned kQos = QOS_CLASS_USER_INITIATED;
 // How often a caller waiting for the service asks whether to stop.
 constexpr auto kWaitSlice = std::chrono::milliseconds(50);
 
 [[noreturn]] void fail(const char *what, NSError *error) {
-  throw std::runtime_error(std::string("ANE ") + what + " failed" +
-                           (error ? std::string(": ") + error.description.UTF8String : std::string()));
+  throw Refused(std::string("ANE ") + what + " failed" +
+                (error ? std::string(": ") + error.description.UTF8String : std::string()));
 }
 
 // Runs `body`, which messages the private interface, and throws an
@@ -1071,12 +1074,14 @@ std::optional<std::string> recall(std::string_view key) noexcept {
   return std::nullopt;
 }
 
-void remember(std::string_view key, std::string_view line) noexcept {
+bool remember(std::string_view key, std::string_view line) noexcept {
   try {
     std::filesystem::create_directories(cacheDirectory());
     writeWhole(rememberedFile(key), bytesOf(line));
+    return true;
   } catch (const std::exception &) {
     // The next start calibrates again.
+    return false;
   }
 }
 

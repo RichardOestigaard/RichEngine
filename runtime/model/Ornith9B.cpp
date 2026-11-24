@@ -33,8 +33,12 @@ void rotateInputs(metal::MetalBackend &backend, TargetModelWeights &weights, con
   const auto rotate = [&](ops::Projection &projection) { projection.rotation.signs = signsOf(projection.inputSize); };
   for (auto &layer : weights.layers) {
     std::visit([&](auto &mixer) {
-      rotate(mixer.inputProjection);
-      rotate(mixer.outputProjection);
+      // nemotron's MoE blocks keep an empty mixer record.
+      if constexpr (!std::is_same_v<std::decay_t<decltype(mixer)>,
+                                    EmptyMixerWeights>) {
+        rotate(mixer.inputProjection);
+        rotate(mixer.outputProjection);
+      }
     }, layer.mixer);
     if (auto *gdn = std::get_if<GdnMixerWeights>(&layer.mixer)) gdn->outputHeadOrder = ops::GdnHeadOrder::Grouped;
     auto &ffn = std::get<DenseFfnWeights>(layer.ffn);

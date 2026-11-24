@@ -235,7 +235,10 @@ def _gguf_target(repo, variant, language_only):
         name=f"{repo.name} {name} {header.values.get('general.name', '')}",
     )
     language_only = language_only or not family.vision
-    if pack.packable(config):
+    if pack.packable(config) and (
+        header.values.get("general.architecture")
+        not in gguf.PACKED_AND_GGUF_ARCHS
+    ):
         # The runtime has no gemma4/diffusion_gemma GGUF tensor map; the
         # safetensors checkpoint is packed at installation instead.
         packed_repos = [

@@ -166,12 +166,16 @@ void requireAtMost(NSDictionary *object, NSString *key, uint64_t maximum,
 // JSON number, never a boolean, equal to the value expected. A config saved
 // from Python may write a whole number as a float, rope_theta=1e7 as
 // 10000000.0, which equals that integer; every value expected is exact as a
-// double.
+// double — except values the layout stores as float32 (rms_norm_eps's
+// 1e-5 reads back as 9.999999747378752e-06), so the compare keeps a
+// float32-rounding tolerance.
 void requireNumber(id value, double expected, std::string_view label) {
   if (![value isKindOfClass:[NSNumber class]] ||
       CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
     throw std::invalid_argument(std::string(label) + " must be a number");
-  if ([value doubleValue] != expected)
+  if ([value doubleValue] != expected &&
+      std::abs([value doubleValue] - expected) >
+          std::abs(expected) * 1e-6 + 1e-30)
     throw std::invalid_argument(std::string(label) + " mismatch: package " +
                                 [value description].UTF8String + ", runtime " +
                                 @(expected).description.UTF8String);
@@ -311,6 +315,9 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
   if (queryHeads == 8 && kvHeads == 2 && headDimension == 256 &&
       !ropeInterleaved)
     return Core::Q8K2D256;
+  if (queryHeads == 32 && kvHeads == 2 && headDimension == 128 &&
+      !ropeInterleaved)
+    return Core::Q32K2D128;
   return Core::Unspecified;
 }
 
@@ -326,6 +333,7 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic,
     if (hiddenSize == 4096) return Core::Plain4096;
     if (hiddenSize == 2816) return Core::Plain2816;
     if (hiddenSize == 2048) return Core::Plain2048;
+    if (hiddenSize == 2688) return Core::Plain2688;
   }
   return Core::Unspecified;
 }
@@ -389,7 +397,8 @@ void validateGemma4(NSDictionary *manifest,
 
 void validateTokenizer(const std::filesystem::path &root,
                        const ModelDescriptor &descriptor,
-                       std::string_view expectedTextModelType) {
+                       std::string_view expectedTextModelType,
+                       uint64_t trainedContextTokens = 0) {
   NSDictionary *config = readObject(root / "tokenizer" / "config.json",
                                     "tokenizer model config");
   // Flat tokenizer configs (the dense and LFM2 targets) declare the fields
@@ -402,9 +411,12 @@ void validateTokenizer(const std::filesystem::path &root,
       text, "tokenizer text config",
       {{"hidden_size", descriptor.target.hiddenSize},
        {"vocab_size", descriptor.capabilities.vocabularySize}});
-  // Exports disagree on the trained context (131072 vs 128000).
+  // Exports disagree on the trained context (131072 vs 128000); a target
+  // that serves less than its trained context passes the trained bound.
   requireAtMost(text, @"max_position_embeddings",
-                descriptor.capabilities.maximumContextTokens,
+                trainedContextTokens
+                    ? trainedContextTokens
+                    : descriptor.capabilities.maximumContextTokens,
                 "tokenizer max_position_embeddings");
 }
 
@@ -611,6 +623,75 @@ void validateQwen4Exp(NSDictionary *manifest,
                     {"target_hidden_size", draftLayout.targetHiddenSize}});
   }
   validateTokenizer(root, descriptor, "qwen4_exp_text");
+}
+
+// The packed maxwell_moe manifest (install/pack.py's
+// richengine-packed-gguf-maxwell): the family's target geometry, every
+// layer an attention layer. The MTP checkpoint's draft wiring is deferred;
+// a declared draft is refused until its phase lands.
+void validateMaxwell(NSDictionary *manifest,
+                     const std::filesystem::path &root,
+                     const ModelDescriptor &descriptor) {
+  requireEqual(requireUnsigned(manifest, @"schema_version", "schema_version"),
+               1, "schema_version");
+  NSDictionary *format =
+      requireObject(manifest, @"format", "model weight format");
+  requireNumbers(format, "format",
+                 {{"q4_bits", 4},
+                  {"q4_group_size", kQ4GroupElements},
+                  {"q4_storage_n", kQ4StorageN}});
+  validateCommonFormat(format, descriptor.target.layerMagic,
+                       draftLayerMagic(descriptor.draft));
+
+  const TargetLayout &targetLayout = descriptor.target;
+  NSDictionary *target =
+      requireObject(manifest, @"target", "target declaration");
+  requireEqual(requireString(target, @"architecture", "target architecture"),
+               "maxwell_moe", "target architecture");
+  requireNumbers(target, "target",
+                 {{"layers", targetLayout.layers},
+                  {"hidden_size", targetLayout.hiddenSize},
+                  {"vocabulary_size", targetLayout.vocabularySize},
+                  {"attention_width", targetLayout.attentionWidth},
+                  {"attention_query_heads",
+                   targetLayout.attentionQueryHeads},
+                  {"attention_kv_heads", targetLayout.attentionKvHeads},
+                  {"attention_head_dimension",
+                   targetLayout.attentionHeadDimension},
+                  {"experts", targetLayout.experts},
+                  {"experts_per_token", targetLayout.expertsPerToken},
+                  {"expert_intermediate_size",
+                   targetLayout.expertIntermediateSize},
+                  {"shared_intermediate_size",
+                   targetLayout.sharedIntermediateSize},
+                  {"hyper_connections", targetLayout.hyperConnections},
+                  {"indexer_heads", targetLayout.indexerHeads},
+                  {"indexer_head_dimension",
+                   targetLayout.indexerHeadDimension},
+                  {"indexer_block_tokens", targetLayout.indexerBlockTokens},
+                  {"indexer_prefix_blocks", targetLayout.indexerPrefixBlocks},
+                  {"indexer_local_blocks", targetLayout.indexerLocalBlocks},
+                  {"indexer_remote_blocks", targetLayout.indexerRemoteBlocks},
+                  {"mhc_mix_width", targetLayout.mhcMixWidth},
+                  {"mhc_sinkhorn_iterations",
+                   targetLayout.mhcSinkhornIterations}});
+  NSArray *types = requireArray(target, @"layer_types", "target layer_types");
+  requireEqual(types.count, uint64_t{targetLayout.layers},
+               "target layer_types count");
+  for (uint32_t layer = 0; layer < targetLayout.layers; ++layer) {
+    id value = types[layer];
+    const char *actual =
+        [value isKindOfClass:[NSString class]]
+            ? static_cast<NSString *>(value).UTF8String
+            : nullptr;
+    requireEqual(actual ? actual : "", "attention",
+                 "target layer " + std::to_string(layer));
+  }
+  if ([manifest[@"draft"] isKindOfClass:[NSDictionary class]])
+    throw std::invalid_argument("maxwell targets take no declared draft");
+  // The checkpoint trained 512K positions; the family serves the first
+  // 256K (the layout's maximumContextTokens is the serving bound).
+  validateTokenizer(root, descriptor, "maxwell_moe", 524288);
 }
 
 // The dense and LFM2 packed formats' draft declaration: a plain transformer
@@ -1020,7 +1101,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (entry->takesNoDraft &&
       std::filesystem::exists(root / "draft" / "config.json"))
     throw std::invalid_argument("diffusion gemma targets take no draft");
-  if (result.draft.kind != DraftKind::Null || declaredDraft) {
+  if ((result.draft.kind != DraftKind::Null &&
+       result.draft.kind != DraftKind::Mtp) ||
+      declaredDraft) {
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1)
@@ -1036,10 +1119,15 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       dflashV1Draft && [dspineFlash isKindOfClass:[NSDictionary class]] &&
       [static_cast<NSDictionary *>(dspineFlash)
            objectForKey:@"selected_prefix_code_bridge"] != nil;
-  if (!dflashV1Draft && !dsparkDraft && draftArch != "DFlash2DraftModel")
+  // The synthesized Nemotron nextn checkpoint converts to a
+  // NemotronHMtpModel config (dev/convert/gguf_mtp_to_safetensors.py).
+  const bool nemotronMtp = draftArch == "NemotronHMtpModel";
+  if (!dflashV1Draft && !dsparkDraft && !nemotronMtp &&
+      draftArch != "DFlash2DraftModel")
     throw std::invalid_argument("draft is not a DFlash, DFlash2 or DSpark model");
   DFlashDraftLayout d = result.draft;
-  if (!dflashV1Draft && !dsparkDraft && d.kind != DraftKind::DFlashTwo) {
+  if (!dflashV1Draft && !dsparkDraft && !nemotronMtp &&
+      d.kind != DraftKind::DFlashTwo) {
     // The descriptor's default draft for this target is not DFlash2, but
     // the assembly declares a DFlash2 draft: swap in the family's
     // registered DFlash2 layout where it declares one.
@@ -1058,11 +1146,49 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   }
   // A DFlash2 draft's config is the checkpoint's: one rule checks it before
   // the dialect parsers below read the fields it names.
-  if (!dflashV1Draft && !dsparkDraft) {
+  if (!dflashV1Draft && !dsparkDraft && !nemotronMtp) {
     result.draft.blockSize = validateDraftConfig(
         draft, result.draft, result.target.maskToken,
         {result.target.hiddenCaptureLayers.data(),
          result.target.captureLayerCount});
+  }
+  if (nemotronMtp) {
+    if (result.target.arch != "nemotron")
+      throw std::invalid_argument(
+          "a NemotronHMtpModel draft needs a Nemotron target");
+    // The nextn block: one full attention-plus-MoE decoder layer over the
+    // trunk hidden, checked against the checkpoint's declared geometry.
+    d = {};
+    d.kind = DraftKind::Mtp;
+    d.layers = 1;
+    d.hiddenSize = static_cast<uint32_t>(
+        requireUnsigned(draft, @"hidden_size", "draft hidden_size"));
+    d.vocabularySize = static_cast<uint32_t>(
+        requireUnsigned(draft, @"vocab_size", "draft vocab_size"));
+    const uint64_t mtpHeads =
+        requireUnsigned(draft, @"num_attention_heads", "draft heads");
+    const uint64_t mtpKv =
+        requireUnsigned(draft, @"num_key_value_heads", "draft kv heads");
+    const uint64_t mtpDim =
+        requireUnsigned(draft, @"head_dim", "draft head_dim");
+    if (mtpHeads != 32 || mtpKv != 2 || mtpDim != 128)
+      throw std::invalid_argument("unsupported MTP draft head geometry");
+    d.kvHeads = static_cast<uint32_t>(mtpKv);
+    d.attentionHeadDimension = static_cast<uint32_t>(mtpDim);
+    d.attentionSize = static_cast<uint32_t>(mtpHeads * mtpDim);
+    d.qkvSize = static_cast<uint32_t>((mtpHeads + 2 * mtpKv) * mtpDim);
+    requireGeometryNumbers(draft,
+        {{"num_hidden_layers", 1}, {"num_experts", 128},
+         {"num_experts_per_tok", 6}, {"moe_intermediate_size", 1856},
+         {"shared_expert_intermediate_size", 3712}});
+    // The nextn block reads the trunk's last-layer hidden — the one-row
+    // capture every nemotron target already stages. blockSize carries the
+    // chain depth the verify-row cap allows, as Maxwell's does.
+    d.targetHiddenSize = result.target.hiddenSize;
+    d.intermediateSize = 1856;
+    d.blockSize = ExecutionLimits::targetVerifyRows;
+    result.draft = d;
+    result.stateLayout.draft = d.stateLayout();
   }
   if (dflashV1Draft) {
     // The plain transformer draft: the layout is read from the config.
@@ -1173,7 +1299,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
         (heads == 16 && kvHeads == 2 && headDim == 128) ||
         (heads == 32 && kvHeads == 8 && headDim == 64) ||
         (heads == 32 && kvHeads == 8 && headDim == 128) ||
-        (heads == 8 && kvHeads == 2 && headDim == 256);
+        (heads == 8 && kvHeads == 2 && headDim == 256) ||
+        (heads == 32 && kvHeads == 2 && headDim == 128);
     if (!supported)
       throw std::invalid_argument("unsupported DSpark draft head geometry");
     d.kvHeads = static_cast<uint32_t>(kvHeads);
@@ -1191,8 +1318,10 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
           addEntriesFromDictionary:static_cast<NSDictionary *>(nested)];
     d.markovRank = static_cast<uint32_t>(
         requireUnsigned(dsparkFields, @"markov_rank", "draft markov_rank"));
-    requireEqual(d.markovRank, RICHENGINE_DRAFT_SELECTOR_RANK,
-                 "draft markov_rank");
+    // The compiled Markov cores cover rank 256 (the selector-rank dialects)
+    // and Nemotron's rank 512.
+    if (d.markovRank != RICHENGINE_DRAFT_SELECTOR_RANK && d.markovRank != 512)
+      throw std::invalid_argument("unsupported draft markov_rank");
     if (id markovType = dsparkFields[@"markov_head_type"])
       requireEqual(
           std::string(static_cast<NSString *>(markovType).UTF8String),
@@ -1200,21 +1329,60 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     // rope_is_neox_style = false (LFM2.5) selects the interleaved pairing;
     // the field's absence means the half-split default.
     d.ropeInterleaved = [draft[@"rope_is_neox_style"] isEqual:@NO] ? 1 : 0;
-    if (dsparkFields[@"enable_confidence_head"] &&
-        ![dsparkFields[@"enable_confidence_head"] isEqual:@YES])
-      throw std::invalid_argument("unsupported DSpark confidence head");
+    // Nemotron's DSpark trains no confidence head; the released dialects
+    // all carry one.
+    d.confidenceHead =
+        !dsparkFields[@"enable_confidence_head"] ||
+        [dsparkFields[@"enable_confidence_head"] isEqual:@YES];
+    // Nemotron's DSpark layers carry per-head sink biases and attend over
+    // a trained sliding window (both nested under dflash_config).
+    d.attentionSinks =
+        [dsparkFields[@"attention_sink_bias"] isEqual:@YES];
+    if (dsparkFields[@"sample_from_anchor"] &&
+        ![dsparkFields[@"sample_from_anchor"] isEqual:@NO])
+      throw std::invalid_argument(
+          "unsupported DSpark sample_from_anchor");
+    if (id window = dsparkFields[@"swa_window_size"];
+        [window isKindOfClass:[NSNumber class]]) {
+      d.slidingWindow = std::min<uint32_t>(
+          static_cast<uint32_t>([window unsignedLongLongValue]),
+          ExecutionLimits::draftRingCapacity);
+    } else if (id window = draft[@"sliding_window"];
+               [window isKindOfClass:[NSNumber class]]) {
+      d.slidingWindow = std::min<uint32_t>(
+          static_cast<uint32_t>([window unsignedLongLongValue]),
+          ExecutionLimits::draftRingCapacity);
+    }
     NSArray *types = requireArray(draft, @"layer_types", "draft layer_types");
     requireEqual(types.count, d.layers, "draft layer_types count");
     for (uint32_t layer = 0; layer < d.layers; ++layer) {
       id value = types[layer];
-      if (![value isKindOfClass:[NSString class]] ||
-          std::string(static_cast<NSString *>(value).UTF8String) !=
-              "full_attention")
+      if (![value isKindOfClass:[NSString class]])
         throw std::invalid_argument("unsupported DSpark draft layer type");
+      const std::string layerType =
+          static_cast<NSString *>(value).UTF8String;
+      // Nemotron's DSpark trains sliding_attention layers that mask the
+      // block rows causally; other dialects are block-bidirectional
+      // full_attention throughout.
+      if (layerType == "sliding_attention")
+        d.causalLayers |= uint32_t{1} << layer;
+      else if (layerType != "full_attention")
+        throw std::invalid_argument(
+            "unsupported DSpark draft layer type: " + layerType);
     }
-    d.causalLayers = 0;
+    // An explicit dflash_config.causal overrides the per-layer read the
+    // same way is_causal does for plain drafts.
+    if (id causalFlag = dsparkFields[@"causal"];
+        [causalFlag isKindOfClass:[NSNumber class]]) {
+      const uint32_t all = (uint32_t{1} << d.layers) - 1;
+      d.causalLayers = [causalFlag boolValue] ? all : 0;
+    }
     d.headCore = draftHeadCoreFor(heads, kvHeads, headDim, d.ropeInterleaved);
     d.contextCore = draftContextCoreFor(d.hiddenSize, d.dynamicSize);
+  } else if (nemotronMtp) {
+    // The MTP block's own fields were checked above; it shares neither
+    // the draft head/context cores nor the fc capture projection.
+    static_cast<void>(0);
   } else {
     requireGeometryNumbers(draft, {{"num_hidden_layers", d.layers}, {"hidden_size", d.hiddenSize},
         {"vocab_size", d.vocabularySize}, {"intermediate_size", d.intermediateSize},
@@ -1225,8 +1393,13 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       throw std::invalid_argument("unsupported draft attention configuration");
   }
   // The draft norm epsilon follows the target family's (the LFM2 targets'
-  // 1e-5).
-  const double expectedRmsEps = entry->draftNormEpsilon;
+  // 1e-5); a Nemotron family's drafts state their own (the DSpark draft's
+  // 1e-6, the MTP block's 1e-5) since they differ across kinds.
+  const double expectedRmsEps =
+      result.target.arch == "nemotron" &&
+              [draft[@"rms_norm_eps"] isKindOfClass:[NSNumber class]]
+          ? [static_cast<NSNumber *>(draft[@"rms_norm_eps"]) doubleValue]
+          : entry->draftNormEpsilon;
   if (dsparkDraft) {
     d.rmsEpsilon = static_cast<float>(expectedRmsEps);
     if (![draft[@"rms_norm_eps"] isEqual:@(expectedRmsEps)] ||
@@ -1238,6 +1411,16 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     if (draft[@"tie_word_embeddings"] &&
         ![draft[@"tie_word_embeddings"] isEqual:@NO])
       throw std::invalid_argument("unsupported DSpark draft tied embeddings");
+  } else if (nemotronMtp) {
+    d.rmsEpsilon = static_cast<float>(expectedRmsEps);
+    if (![draft[@"hidden_act"] isEqual:@"relu2"])
+      throw std::invalid_argument("unsupported MTP draft activation");
+    if (draft[@"attention_bias"] &&
+        ![draft[@"attention_bias"] isEqual:@NO])
+      throw std::invalid_argument("unsupported MTP draft attention bias");
+    if (draft[@"tie_word_embeddings"] &&
+        ![draft[@"tie_word_embeddings"] isEqual:@NO])
+      throw std::invalid_argument("unsupported MTP draft tied embeddings");
   } else if (![draft[@"attention_bias"] isEqual:@NO] ||
              ![draft[@"tie_word_embeddings"] isEqual:@NO] ||
              ![draft[@"rms_norm_eps"] isEqual:@(expectedRmsEps)] ||
@@ -1248,8 +1431,11 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   // flat rope_theta. Every draft's RoPE base is its own: the dense target's
   // DSpark and Draftfit's MiniCPM5 DFlash2 keep the target's 5e6 where
   // incoai's DFlash2 drafts state 1e7.
-  uint64_t ropeTheta;
-  if (id rope = draft[@"rope_parameters"];
+  uint64_t ropeTheta = 0;
+  if (nemotronMtp) {
+    // The nextn attention block is NoPE like the trunk's: no rope_theta
+    // is declared or consumed.
+  } else if (id rope = draft[@"rope_parameters"];
       [rope isKindOfClass:[NSDictionary class]]) {
     requireEqual(requireString(rope, @"rope_type", "draft rope type"),
                  "default", "draft rope type");
@@ -1264,7 +1450,7 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   if (![flash isKindOfClass:[NSDictionary class]]) {
     if (dsparkDraft)
       flash = draft;
-    else
+    else if (!nemotronMtp)
       flash = requireObject(draft, @"dflash_config", "draft configuration");
   }
   if (dflashV1Draft) {
@@ -1284,9 +1470,16 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     // the mask and capture fields under dflash_config.
     d.blockSize = static_cast<uint32_t>(
         requireUnsigned(draft, @"block_size", "draft block_size"));
+    // A bonus-anchor draft's block_size counts the input block's rows —
+    // the anchor among them, whose logits row reproduces it — where the
+    // anchor-first dialects' counts emitted proposals.
+    d.bonusAnchor = [draft[@"dspark_bonus_anchor"] isEqual:@YES];
+    // A draft shipping embed_tokens (Nemotron's trains a mask row the
+    // target's table lacks) gathers it for the block's input rows.
+    d.tokenEmbedding = [draft[@"has_embed_tokens"] isEqual:@YES];
     // The runtime dispatches the draft's verifyRows query rows — the
     // trained block's own span; a longer block caps the proposal budget.
-    if (d.blockSize < 1)
+    if (d.blockSize < 1 + (d.bonusAnchor ? 1 : 0))
       throw std::invalid_argument("draft block_size is below a proposal row");
     if (id layers = flash[@"num_target_layers"]) {
       requireEqual(requireUnsigned(flash, @"num_target_layers",
@@ -1294,6 +1487,9 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
                    result.target.layers, "draft num_target_layers");
       static_cast<void>(layers);
     }
+  } else if (nemotronMtp) {
+    // The nextn block declares no block_size: it emits a single token per
+    // pass rather than a proposal block.
   } else {
     const uint64_t blockSize =
         requireUnsigned(flash, @"block_size", "draft block_size");
@@ -1399,6 +1595,28 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     d.targetHiddenSize = static_cast<uint32_t>(taps.count *
                                              result.target.hiddenSize);
   }
+  // Nemotron's DSpark taps six trunk layers (its fc reads the
+  // 6 x hidden concat) — the capture set follows the checkpoint's
+  // declared target_layer_ids like a DSpine draft's does.
+  if (dsparkDraft && result.target.arch == "nemotron") {
+    NSArray *taps =
+        requireArray(flash, @"target_layer_ids", "draft target layers");
+    if (!taps.count || taps.count > result.target.hiddenCaptureLayers.size())
+      throw std::invalid_argument("draft target layer count out of range");
+    result.target.captureLayerCount = static_cast<uint32_t>(taps.count);
+    for (NSUInteger i = 0; i < taps.count; ++i) {
+      id value = taps[i];
+      if (![value isKindOfClass:[NSNumber class]] ||
+          CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID())
+        throw std::invalid_argument("draft target layer must be an integer");
+      const uint64_t layer =
+          static_cast<NSNumber *>(value).unsignedLongLongValue;
+      if (layer >= result.target.layers)
+        throw std::invalid_argument("draft target layer out of range");
+      result.target.hiddenCaptureLayers[i] = static_cast<uint32_t>(layer);
+    }
+  }
+  if (!nemotronMtp) {
   NSArray *capture = requireArray(flash, @"target_layer_ids", "draft target layers");
   {
     const TargetLayout &layout = result.target;
@@ -1413,7 +1631,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       d.targetHiddenSize = static_cast<uint32_t>(
           capture.count * layout.hiddenSize);
   }
-  if (dflashV1Draft || dsparkDraft) {
+  }
+  if (dflashV1Draft || dsparkDraft || nemotronMtp) {
     result.draft = d;
     result.stateLayout.draft = d.stateLayout();
   }
@@ -1504,7 +1723,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   // The tokenizer's copy of the model configuration agrees with the family
   // the record named, as the packed manifest's tokenizer check does.
   if (std::filesystem::exists(root / "tokenizer" / "config.json"))
-    validateTokenizer(root, result, type);
+    validateTokenizer(root, result, type,
+                      type == "maxwell_moe" ? 524288 : 0);
   result.sourceIdentity = std::move(sourceIdentity);
   if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
   return result;
@@ -1540,9 +1760,12 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 
 
 
+  // An indexed target's sparse verify has no tree kernels either: the
+  // n-gram comb stays opt-in for it as for the GPU drafts.
   result.tuning.treeVerify =
-      draft.kind == DraftKind::Null ? ModelTuning::TreeVerify::On
-                                    : ModelTuning::TreeVerify::OptIn;
+      draft.kind == DraftKind::Null && !target.indexerHeads
+          ? ModelTuning::TreeVerify::On
+          : ModelTuning::TreeVerify::OptIn;
   return result;
 }
 
@@ -1550,8 +1773,9 @@ bool ModelDescriptor::valid() const noexcept {
   // The kernel bindings are declared, not probed: a real draft names its
   // draft cores and every attention layer its kv::Core, so a geometry that
   // would silently bind another model's kernels is invalid.
+  // The internal MTP draft binds its own kernels — no draft cores.
   const bool draftCoreBound =
-      draft.kind == DraftKind::Null ||
+      draft.kind == DraftKind::Null || draft.kind == DraftKind::Mtp ||
       (draft.headCore != ops::DraftHeadCore::Unspecified &&
        draft.contextCore != ops::DraftContextCore::Unspecified);
   const bool attentionCoreBound =
@@ -1760,6 +1984,15 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
             packedFamily->draftLayout ? &dflash2Layout : nullptr);
       }
       validateQwen4Exp(manifest, root, descriptor);
+    } else if (canonicalFormat == "richengine-packed-gguf-maxwell") {
+      const std::string family =
+          requireString(manifest, @"family", "model family");
+      const ModelFamilyRegistration *entry = findModelFamily(family);
+      if (!entry)
+        throw std::invalid_argument("unsupported model family: " + family);
+      descriptor = entry->makeDescriptor(model);
+      descriptor.family = entry->name;
+      validateMaxwell(manifest, root, descriptor);
     } else {
       // "richengine-packed-q4-diffusiongemma" is refused here while the
       // family is disabled; the branch and validateDiffusionGemma stay in

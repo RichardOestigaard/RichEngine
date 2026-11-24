@@ -47,10 +47,15 @@ struct DraftAttentionBatchParams {
   // bound DecodeStepPackLane block (the chained predraft, whose lengths
   // the encode could not know) instead of this payload.
   uint32_t device_pack;
+  // Nonzero: the reduce kernel's bound per-head attention-sink bias
+  // ([queryHeads] bf16) contributes exp(sink) to every row's softmax
+  // denominator — a GPT-OSS style sink with no K/V row. Only the q32k2
+  // head core's reduce declares the binding.
+  uint32_t attention_sinks;
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 40,
-              "Draft attention parameters are 40 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 44,
+              "Draft attention parameters are 44 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

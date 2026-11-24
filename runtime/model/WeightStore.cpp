@@ -279,9 +279,18 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     // section (the token table) stores flat rows, so a vocabulary that is
     // not a tile multiple is fine.
     const bool affine = d.type == ggml::kAffineQ4;
+    // The column unit a repacked format's register tile takes: 64 inputs
+    // for the one-meta-group formats, 256 for the K-quants; a type no
+    // format covers keeps the superblock unit.
+    const uint32_t format = gguf_format_of(d.type);
+    const uint64_t columnUnit =
+        format < GGUF_FMT_COUNT ? quant_register_unit(format) : kGgufBlockColumns;
+    // Rows bound only by the decode kernels' 64-column output tile — the
+    // stored planes pad the tail tile (a nemotron projection's 2688
+    // outputs fill forty-two tiles' worth).
     if (!d.outputSize || !d.inputSize ||
         (tiled && d.type != ggml::kF32 && !affine &&
-         (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)) ||
+         (d.outputSize % GGUF_TILE_COLUMNS || d.inputSize % columnUnit)) ||
         (tiled && affine && (d.outputSize % kQ4StorageN || d.inputSize % kQ4GroupElements)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
@@ -303,7 +312,11 @@ ops::QuantizedSegment segmentFromDescriptor(WeightFile &file,
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
     const QuantFormat &layout = kQuantFormats[format];
-    const GgufPlaneBytes planes = ggufPlaneBytes(layout, d.outputSize, d.inputSize);
+    // The image stores whole QUANT_TILE_ROWS tiles (GgufImage.cpp's
+    // planes()); the descriptor declares the tensor's logical rows.
+    const uint64_t storedRows =
+        (d.outputSize + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    const GgufPlaneBytes planes = ggufPlaneBytes(layout, storedRows, d.inputSize);
     if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
         d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||
         d.plane0Bytes != planes.plane0 || d.plane1Bytes != planes.plane1 || d.metaTotalBytes != planes.meta)

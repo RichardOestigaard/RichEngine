@@ -64,10 +64,12 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, float)
 #undef VERIFY_ATTENTION_QKV
 
-// The head-dimension variants' decode phase: no query gate, a full rotary of
-// HeadDim/2 pairs and per-head norms of epsilon `Eps` (LFM2's 1e-5; the
+// The head-dimension variants' decode phase: no query gate, a rotary of
+// RotaryPairs pairs (the full HeadDim/2 by default; nemotron's 42 of a
+// partial rotary) and per-head norms of epsilon `Eps` (LFM2's 1e-5; the
 // dense target runs none).
-template <uint QHeads, uint KHeads, uint HeadDim, bool Norms, class W>
+template <uint QHeads, uint KHeads, uint HeadDim, bool Norms, class W,
+          uint RotaryPairs = HeadDim / 2>
 inline void full_qkv_decode_phase_hd(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -76,7 +78,6 @@ inline void full_qkv_decode_phase_hd(
     threadgroup bfloat *normalized, constant FullDecodeBatchParams &params,
     uint2 group, uint thread_index, uint lane,
     uint simd_group, float eps) {
-  constexpr uint RotaryPairs = HeadDim / 2;
   constexpr uint PackedStride = QHeads * HeadDim + 2 * KHeads * HeadDim;
   constexpr uint Stride = RICHENGINE_VERIFY_CHUNK_STRIDE;
   const uint rows = params.rows;
@@ -124,6 +125,30 @@ VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_hd64_f32, 32, 8, 64, true, float, 1
 VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_k8q5d64, 40, 8, 64, false, bfloat, 1e-5f)
 VERIFY_ATTENTION_QKV_HD(verify_attention_qkv_k8q4d128, 32, 8, 128, false, bfloat, 1e-5f)
 #undef VERIFY_ATTENTION_QKV_HD
+
+// Nemotron 3.5's KV2 group-16 core of 128 (32 query heads): the same phase
+// at a zero rotary — the attention blocks are NoPE (HF's NemotronHAttention
+// applies none), no norms.
+kernel void verify_attention_qkv_k2q16d128(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]],
+    device bfloat *values [[buffer(7)]],
+    constant FullDecodeBatchParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[128 / 32];
+  threadgroup bfloat normalized[128];
+  full_qkv_decode_phase_hd<32, 2, 128, false, bfloat, 0>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values,
+      reductions, normalized, params, group, thread_index, lane,
+      simd_group, 1e-6f);
+}
 
 template <uint QHeads, uint KHeads, uint HeadDim = 256, bool Gate = true>
 inline bfloat full_attention_gate_value(device const bfloat *packed_qkv,
@@ -249,6 +274,12 @@ ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q5d64, 40, 8, q4sg::Table
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q5d64, 40, 8, gguf_sg::Table16, 64, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table64_k8q4d128, 32, 8, q4sg::Table64, 128, false)
 ATTENTION_GATE_TABLE(verify_attention_gather_table16_k8q4d128, 32, 8, gguf_sg::Table16, 128, false)
+// Maxwell's MBSA layout: KV4, 32 query heads (group 8) of 128, no gate.
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_k4q8d128, 32, 4, q4sg::Table64, 128, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_k4q8d128, 32, 4, gguf_sg::Table16, 128, false)
+// Nemotron's KV2 layout: 32 query heads (group 16) of 128, no gate.
+ATTENTION_GATE_TABLE(verify_attention_gather_table64_k2q16d128, 32, 2, q4sg::Table64, 128, false)
+ATTENTION_GATE_TABLE(verify_attention_gather_table16_k2q16d128, 32, 2, gguf_sg::Table16, 128, false)
 // Gemma 4's no-gate shapes: the sliding layers' 16x8 of 256 and the global
 // layers' 16x2 of 512.
 ATTENTION_GATE_TABLE(verify_attention_gather_table64_gemma_h256, 16, 8, q4sg::Table64, 256, false)
@@ -287,6 +318,8 @@ ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd128, 16, 2, 128, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_hd64, 32, 8, 64, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_k8q5d64, 40, 8, 64, false)
 ATTENTION_GATE_PACKED(verify_attention_gather_packed_k8q4d128, 32, 8, 128, false)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_k4q8d128, 32, 4, 128, false)
+ATTENTION_GATE_PACKED(verify_attention_gather_packed_k2q16d128, 32, 2, 128, false)
 #undef ATTENTION_GATE_PACKED
 
 // The no-gate gather of a Plain-input out-projection: attention rows as
@@ -306,6 +339,8 @@ VERIFY_ATTENTION_GATHER(verify_attention_gather_hd128, 16, 2, 128)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_hd64, 32, 8, 64)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q5d64, 40, 8, 64)
 VERIFY_ATTENTION_GATHER(verify_attention_gather_k8q4d128, 32, 8, 128)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_k4q8d128, 32, 4, 128)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_k2q16d128, 32, 2, 128)
 #undef VERIFY_ATTENTION_GATHER
 
 // Gemma 4 26B-A4B's verify QKV phases, no query gate and per-head QK norms:
@@ -428,6 +463,34 @@ VERIFY_ATTENTION_GATHER(verify_attention_gather_gemma_hd512, 16, 2, 512)
 VERIFY_ATTENTION_QKV_K4Q4D128(verify_attention_qkv_k4q4d128, bfloat)
 VERIFY_ATTENTION_QKV_K4Q4D128(verify_attention_qkv_k4q4d128_f32, float)
 #undef VERIFY_ATTENTION_QKV_K4Q4D128
+
+// Maxwell's MBSA mixers: 32 query heads grouped 8-to-1 over 4 KV heads of
+// 128 dimensions, all 64 pairs rotated and per-head RMS norms of epsilon
+// 1e-6 (_f32 for a GGUF's F32 norms).
+#define VERIFY_ATTENTION_QKV_K4Q8D128(Name, W) \
+  kernel void Name( \
+      device const bfloat *qkv [[buffer(0)]], \
+      device const W *q_norm [[buffer(1)]], \
+      device const W *k_norm [[buffer(2)]], \
+      device const float *rope_cos [[buffer(3)]], \
+      device const float *rope_sin [[buffer(4)]], \
+      device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]], \
+      device bfloat *values [[buffer(7)]], \
+      constant FullDecodeBatchParams &params [[buffer(8)]], \
+      uint2 group [[threadgroup_position_in_grid]], \
+      uint thread_index [[thread_index_in_threadgroup]], \
+      uint lane [[thread_index_in_simdgroup]], \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float reductions[4]; \
+    threadgroup bfloat normalized[128]; \
+    full_qkv_decode_phase_hd<32, 4, 128, true, W>( \
+        qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values, \
+        reductions, normalized, params, group, thread_index, lane, \
+        simd_group, 1e-6f); \
+  }
+VERIFY_ATTENTION_QKV_K4Q8D128(verify_attention_qkv_k4q8d128, bfloat)
+VERIFY_ATTENTION_QKV_K4Q8D128(verify_attention_qkv_k4q8d128_f32, float)
+#undef VERIFY_ATTENTION_QKV_K4Q8D128
 
 // LFM3's head-wise gate: `gates` holds each lane-row's QHeads sigmoid
 // inputs (the gate projection's output), one scalar per query head.

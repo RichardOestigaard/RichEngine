@@ -64,6 +64,7 @@ PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 # cooperative-tensor operands (retested on the macOS 27.2 SDK / Xcode 27.2;
 # tensor-operand int8 matmuls still compile). The kernel hand-fills its
 # fragments, so it cannot take the tensor-operand route without a rewrite.
+# moe_int8.metal shares the tile (kernels/common/gguf_prefill_int8_tile.h).
 METAL40_FLAGS := $(subst metal4.1,metal4.0,$(PROD_METALFLAGS))
 ENGINE_CXXFLAGS := -std=c++20 -O3 $(M5_CXXFLAGS) -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
@@ -218,7 +219,9 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
 $(METAL_BUILD)/prefill/gguf_prefill_int8.air \
-	$(METAL8_BUILD)/prefill/gguf_prefill_int8.air: PROD_METALFLAGS := $(METAL40_FLAGS)
+	$(METAL_BUILD)/shared/moe_int8.air \
+	$(METAL8_BUILD)/prefill/gguf_prefill_int8.air \
+	$(METAL8_BUILD)/shared/moe_int8.air: PROD_METALFLAGS := $(METAL40_FLAGS)
 
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
@@ -318,6 +321,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/draft_cores/Draft32x8x128.cpp \
 	runtime/ops/draft_cores/Draft32x8x64Interleaved.cpp \
 	runtime/ops/draft_cores/Draft8x2x256.cpp \
+	runtime/ops/draft_cores/Draft32x2x128.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -326,6 +330,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/LfmSpeechGen.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
+	runtime/ops/Mamba2.cpp \
+	runtime/ops/Mbsa.cpp \
+	runtime/ops/Mhc.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/Normalization.cpp \
@@ -376,7 +383,11 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Lfm2Moe.cpp \
 	runtime/model/Lfm2Moe24B.cpp \
 	runtime/model/Lfm3.cpp \
+	runtime/model/MaxwellMoe.cpp \
+	runtime/model/MaxwellMtpDraft.cpp \
+	runtime/model/NemotronMtpDraft.cpp \
 	runtime/model/MiniCpmV47.cpp \
+	runtime/model/Nemotron.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/Qwen4Exp.cpp \
@@ -428,7 +439,9 @@ ENGINE_MM_SOURCES := \
 	runtime/model/families/Lfm2.mm \
 	runtime/model/families/Lfm2Moe24B.mm \
 	runtime/model/families/Lfm3.mm \
+	runtime/model/families/Maxwell.mm \
 	runtime/model/families/Granite.mm \
+	runtime/model/families/Nemotron.mm \
 	runtime/model/families/Gemma.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeDiffusion.mm \

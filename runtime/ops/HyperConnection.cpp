@@ -158,4 +158,23 @@ void HyperConnection::addStreamMean(metal::CommandGraph &graph,
             {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
 }
 
+void HyperConnection::addStreamCapture(metal::CommandGraph &graph,
+                                       metal::MetalBuffer streams,
+                                       metal::MetalBuffer destination,
+                                       RowRegion to, HyperShape shape,
+                                       uint32_t rows) {
+  requireShape(shape);
+  if (!rows || uint64_t{to.column} + shape.width() > to.stride)
+    throw std::invalid_argument("invalid stream capture");
+  requireBytes(streams, streamBytes(shape, rows), "stream capture input");
+  requireBytes(destination,
+               (uint64_t{to.row} + rows) * to.stride * sizeof(uint16_t),
+               "stream capture output");
+  const HyperStreamMeanParams params{rows,   shape.hidden, shape.streams,
+                                     to.row, to.stride,    to.column};
+  graph.add("hyper_connection_stream_capture",
+            {std::move(streams), std::move(destination)}, params,
+            {rows, groups(shape.width()), 1}, {kThreads, 1, 1});
+}
+
 } // namespace richengine::ops

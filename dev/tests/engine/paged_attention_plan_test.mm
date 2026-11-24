@@ -84,9 +84,9 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
 // The production GQA geometries as (query heads, KV heads, head dimension)
 // triples. kv4 carries two group sizes, each its own kernel family; the
 // d64/d128 cores cover the LFM2, Granite and dense layouts.
-constexpr std::array<std::array<uint32_t, 3>, 7> kGeometries{
+constexpr std::array<std::array<uint32_t, 3>, 8> kGeometries{
     {{24, 4, 256}, {16, 4, 256}, {16, 2, 256}, {16, 2, 128},
-     {32, 8, 64}, {40, 8, 64}, {32, 8, 128}}};
+     {32, 8, 64}, {40, 8, 64}, {32, 8, 128}, {32, 2, 128}}};
 
 // The declared attention core each fixture geometry binds (the family
 // makers declare these; the fixtures mirror them).
@@ -94,7 +94,9 @@ constexpr std::array<std::array<uint32_t, 3>, 7> kGeometries{
                                          uint32_t kvHeads,
                                          uint32_t headDim) noexcept {
   if (headDim == 128) {
-    if (kvHeads == 2) return kv::Core::Kv2Group8D128;
+    if (kvHeads == 2)
+      return queryHeads == 32 ? kv::Core::Kv2Group16D128
+                              : kv::Core::Kv2Group8D128;
     return queryHeads == 32 ? kv::Core::Kv8Group4D128 : kv::Core::Unspecified;
   }
   if (headDim == 64)
@@ -114,7 +116,9 @@ constexpr std::array<std::array<uint32_t, 3>, 7> kGeometries{
 
 std::string geometrySuffix(uint32_t queryHeads, kv::Layout layout) {
   if (layout.headDimension == 128)
-    return layout.kvHeads == 2 ? "_hd128" : "_k8q4d128";
+    return layout.kvHeads == 2
+               ? (queryHeads == 32 ? "_k2q16d128" : "_hd128")
+               : "_k8q4d128";
   if (layout.headDimension == 64)
     return queryHeads == 32 ? "_hd64" : "_k8q5d64";
   return layout.kvHeads == 2    ? "_kv2_g8"
@@ -168,6 +172,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   const bool chainR2 = !narrow && !richengine::tuning().verifySplitR2Off;
   const uint32_t splitPasses =
       narrow ? 0
+      : layout.attentionCore == kv::Core::Kv2Group16D128
+          ? 8
       : (layout.attentionCore == kv::Core::Kv2Group8 ||
          layout.attentionCore == kv::Core::Kv2Group8D128)
           ? 4

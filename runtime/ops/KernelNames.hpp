@@ -58,14 +58,17 @@ inline constexpr std::string_view kDraftAttentionQkv = "draft_attention_qkv";
 inline constexpr std::string_view kDraftAttentionQkvQ16k2 = "draft_attention_qkv_q16k2";
 inline constexpr std::string_view kDraftAttentionQkvQ32k8d64i = "draft_attention_qkv_q32k8d64i";
 inline constexpr std::string_view kDraftAttentionQkvQ8k2d256 = "draft_attention_qkv_q8k2d256";
+inline constexpr std::string_view kDraftAttentionQkvQ32k2 = "draft_attention_qkv_q32k2";
 inline constexpr std::string_view kDraftAttentionBf16Split = "draft_attention_bf16_split";
 inline constexpr std::string_view kDraftAttentionBf16SplitQ16k2 = "draft_attention_bf16_split_q16k2";
 inline constexpr std::string_view kDraftAttentionBf16SplitQ32k8d64i = "draft_attention_bf16_split_q32k8d64i";
 inline constexpr std::string_view kDraftAttentionBf16SplitQ8k2d256 = "draft_attention_bf16_split_q8k2d256";
+inline constexpr std::string_view kDraftAttentionBf16SplitQ32k2 = "draft_attention_bf16_split_q32k2";
 inline constexpr std::string_view kDraftAttentionBf16Reduce = "draft_attention_bf16_reduce";
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ16k2 = "draft_attention_bf16_reduce_q16k2";
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ32k8d64i = "draft_attention_bf16_reduce_q32k8d64i";
 inline constexpr std::string_view kDraftAttentionBf16ReduceQ8k2d256 = "draft_attention_bf16_reduce_q8k2d256";
+inline constexpr std::string_view kDraftAttentionBf16ReduceQ32k2 = "draft_attention_bf16_reduce_q32k2";
 inline constexpr std::string_view kDraftContextKvCommit = "draft_context_kv_commit";
 inline constexpr std::string_view kDraftContextKvCommitQ16k2 = "draft_context_kv_commit_q16k2";
 inline constexpr std::string_view kDraftContextKvCommitQ32k8d64i = "draft_context_kv_commit_q32k8d64i";
@@ -122,6 +125,15 @@ inline constexpr std::string_view kVerifyGdnCommitSplit = "verify_gdn_commit_spl
 inline constexpr std::string_view kVerifyGdnCommitSplitVh32 = "verify_gdn_commit_split_vh32";
 inline constexpr std::string_view kVerifyGdnCommitTree = "verify_gdn_commit_tree";
 inline constexpr std::string_view kVerifyGdnCommitTreeVh32 = "verify_gdn_commit_tree_vh32";
+
+// Mamba-2 (nemotron's mixers). The fused verify and gate names take the
+// norm-weights "_f32" tag; the fused verify also takes the table suffixes.
+inline constexpr std::string_view kPrefillMamba2Prepare = "prefill_mamba2_prepare";
+inline constexpr std::string_view kPrefillMamba2Scan = "prefill_mamba2_scan";
+inline constexpr std::string_view kPrefillMamba2Gate = "prefill_mamba2_gate";
+inline constexpr std::string_view kPrefillMamba2GateSums = "prefill_mamba2_gate_sums";
+inline constexpr std::string_view kVerifyMamba2Fused = "verify_mamba2_fused";
+inline constexpr std::string_view kVerifyMamba2Commit = "verify_mamba2_commit";
 
 // RMS norms (normKernel() appends the epsilon/width tags).
 inline constexpr std::string_view kNormRms = "norm_rms";
@@ -511,5 +523,42 @@ inline constexpr std::string_view kBenchMoeUpGeluKsplit4M32 = "bench_moe_up_gelu
 inline constexpr std::string_view kBenchDenseQ4N256Pipe = "bench_dense_q4_n256_pipe";
 inline constexpr std::string_view kBenchDenseQ4N256Sg4 = "bench_dense_q4_n256_sg4";
 inline constexpr std::string_view kBenchDenseQ4N256M64Sg4 = "bench_dense_q4_n256_m64_sg4";
+
+// mHC (the maxwell_moe manifold-constrained hyper-connection,
+// kernels/shared/mhc.metal, ops::Mhc): the per-row mapping gates and
+// Sinkhorn residual matrix, the streams' weighted contraction (a block's
+// input and the head reduce), the in-place expand-and-mix, and the
+// head's contraction weights.
+inline constexpr std::string_view kMhcModule = "mhc_module";
+inline constexpr std::string_view kMhcMappings = "mhc_mappings";
+inline constexpr std::string_view kMhcWeightedSum = "mhc_weighted_sum";
+inline constexpr std::string_view kMhcExpandMix = "mhc_expand_mix";
+inline constexpr std::string_view kMhcHeadWeights = "mhc_head_weights";
+inline constexpr std::string_view kMhcProject = "mhc_project";
+
+// MBSA (maxwell_moe's multi-block sparse attention indexer,
+// kernels/shared/mbsa_indexer.metal, ops::Mbsa): the fused index
+// projection — normalized, rotated group queries to the queries scratch and
+// the shared head's per-token keys to the index plane — and the per-group
+// route emit into the sparse attention's block lists.
+inline constexpr std::string_view kMbsaIndexProject = "mbsa_index_project";
+inline constexpr std::string_view kMbsaRoute = "mbsa_route";
+
+// The nemotron target's KV2 group-16 core of 128 (kv::Core::Kv2Group16D128,
+// suffix _k2q16d128): its QKV prepare and no-gate gather pipelines — the
+// split/reduce names compose the shared stems with the suffix.
+inline constexpr std::string_view kPrefillAttentionQkvK2q16d128 = "prefill_attention_qkv_k2q16d128";
+inline constexpr std::string_view kPrefillAttentionGatherK2q16d128 = "prefill_attention_gather_k2q16d128";
+inline constexpr std::string_view kVerifyAttentionQkvK2q16d128 = "verify_attention_qkv_k2q16d128";
+inline constexpr std::string_view kVerifyAttentionGatherK2q16d128 = "verify_attention_gather_k2q16d128";
+
+// The ungated MoE of NVIDIA Nemotron (ops::MoE's ungatedExperts +
+// sharedExpertUnitWeight): the sigmoid+bias select that appends the shared
+// expert's route at weight 1, the "_r" (EpReluSquared) epilogue tag of the
+// staged expert stem kMoeExpertGgufM — moe_expert_gguf_m8_r[_n] and
+// _m32_r[_n] — and the stem of the dense unit-weight shared-expert passes,
+// moe_shared_gguf_m8 and moe_shared_gguf_m32.
+inline constexpr std::string_view kMoeRouteSelectSigmoidShared = "moe_route_select_sigmoid_shared";
+inline constexpr std::string_view kMoeSharedGgufM = "moe_shared_gguf_m";
 
 } // namespace richengine::ops

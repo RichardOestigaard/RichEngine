@@ -166,6 +166,11 @@ enum class Core : uint8_t {
   Kv2Group12H256,
   // LFM3: 4 KV heads of 128 dimensions, 16 query heads (group 4).
   Kv4Group4D128,
+  // Maxwell's: 4 KV heads of 128 dimensions, 32 query heads (group 8).
+  Kv4Group8D128,
+  // Nemotron 3.5's: 2 KV heads of 128 dimensions, 32 query heads
+  // (group 16).
+  Kv2Group16D128,
 };
 
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric
@@ -206,6 +211,13 @@ struct Layout final {
   // has a pooled key in a page: whoever owns the sequence keeps the keys of
   // its open block (ops::BlockIndexer).
   uint32_t indexDimension = 0;
+  // A per-token index (maxwell_moe's MBSA): instead of one pooled key per
+  // RICHENGINE_ATTENTION_BLOCK_TOKENS-token block, the plane holds every
+  // token's indexDimension bf16 index key, so a page's plane is
+  // kPageTokens * indexDimension values. The token's key lands with its K/V
+  // row; no pending pool, and the block reduction the route applies happens
+  // at score time, not storage time.
+  bool indexPerToken = false;
   // Whether a page holds each head's values token-major like its keys
   // ([token][dimension]) rather than dimension-major ([dimension][token]).
   // The page loop of dense attention reads whole pages, and its PV runs
@@ -238,7 +250,8 @@ struct Layout final {
             format,      scoreScale,       0,
             0,           0,                windowTokens,
             attentionCoreAt(layer),        Core::Unspecified,
-            indexDimension,                valuesTokenMajor};
+            indexDimension,                indexPerToken,
+            valuesTokenMajor};
   }
 
   [[nodiscard]] constexpr bool valid() const noexcept {
@@ -299,10 +312,14 @@ struct Layout final {
     return 2 * (dataBytesPerLayerPageAt(layer) + scaleBytesPerLayerPageAt(layer));
   }
   // One layer's bytes of one page's block index (Layout::indexDimension),
-  // in the extent's index plane.
+  // in the extent's index plane: a pooled key per
+  // RICHENGINE_ATTENTION_BLOCK_TOKENS-token block, or every token's key on
+  // a per-token index.
   [[nodiscard]] constexpr uint64_t indexBytesPerLayerPage() const noexcept {
-    return uint64_t{kPageTokens} / RICHENGINE_ATTENTION_BLOCK_TOKENS *
-           indexDimension * 2;
+    const uint64_t rows = indexPerToken
+                              ? kPageTokens
+                              : kPageTokens / RICHENGINE_ATTENTION_BLOCK_TOKENS;
+    return rows * indexDimension * 2;
   }
   // A page's K/V bytes in every layer; its block index's bytes are apart.
   [[nodiscard]] constexpr uint64_t kvBytesPerModelPage() const noexcept {

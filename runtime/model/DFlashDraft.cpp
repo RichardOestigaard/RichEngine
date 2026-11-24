@@ -12,6 +12,10 @@ DFlashDraftRing::DFlashDraftRing(
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
   const uint64_t before = backend.memoryStats().allocatedBytes;
+  // A draft-less layout holds no layers and no bytes: skip the empty
+  // allocation entirely.
+  if (!layout.ringBytes())
+    return;
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
   uint64_t cursor = 0;

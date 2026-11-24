@@ -243,7 +243,7 @@ void DFlashDraft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
+         buffers.queryValues, {}},
         cacheLengths, attentionPlan, /*causal=*/false, devicePack);
     linear.add(graph, {.input = buffers.attention, .output = buffers.projected, .scratch = scratch},
                weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows()));

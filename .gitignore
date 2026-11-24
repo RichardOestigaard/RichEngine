@@ -25,3 +25,4 @@ server/webui/
 
 # Per-experiment/agent build trees (make BUILD=build-<name>) and bench output.
 build-*/
+/scratch

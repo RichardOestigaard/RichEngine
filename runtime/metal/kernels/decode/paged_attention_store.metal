@@ -224,6 +224,8 @@ VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_kv2_g8_tm, 2, bfloat, RICH
 // LFM3's sparse global layers: the k4q4d128 core's token-major stores.
 VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_k4q4d128_tm, 4, int8_t, 128)
 VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_k4q4d128_tm, 4, bfloat, 128)
+VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_k4q8d128_tm, 4, int8_t, 128)
+VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_k4q8d128_tm, 4, bfloat, 128)
 #undef VERIFY_ATTENTION_STORE_TM
 
 // Tree verify compaction. A tree lane's retained path names the scratch rows

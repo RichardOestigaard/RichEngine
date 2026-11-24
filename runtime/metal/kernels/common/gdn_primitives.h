@@ -8,13 +8,17 @@
 // lane's tape between the carried state and this step's packed rows, so the
 // window's sources are state for the last three, the tape for the pending
 // prefix and the packed rows after (the commit folded into the scan).
+// The conv bias variant: Nemotron's ssm_conv1d.bias adds into the fp32
+// accumulator before the bf16 rounding (conv + bias, then SiLU); nullptr is
+// the GDN blocks' bias-free conv.
 inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
                                     device const bfloat *conv_state_in,
                                     device const bfloat *tape_conv,
                                     uint pending,
                                     device const bfloat *conv_weights,
                                     uint packed_width, uint conv_dim,
-                                    uint token, uint channel) {
+                                    uint token, uint channel,
+                                    device const bfloat *conv_bias = nullptr) {
   float value = 0.0f;
   for (uint tap = 0; tap < 4; ++tap) {
     // The window stays three slots: the pending rows' tail slides into it —
@@ -30,6 +34,8 @@ inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
       input = conv_state_in[(position + pending) * conv_dim + channel];
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
+  if (conv_bias)
+    value += float(conv_bias[channel]);
   value = float(bfloat(value));
   return bfloat(richengine_silu(value));
 }
@@ -41,10 +47,11 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
                             device const bfloat *conv_state_in,
                             device const bfloat *conv_weights,
                             uint packed_width, uint conv_dim, uint token,
-                            uint channel) {
+                            uint channel,
+                            device const bfloat *conv_bias = nullptr) {
   return gdn_conv_silu_pending(packed, conv_state_in, nullptr, 0,
                                conv_weights, packed_width, conv_dim,
-                               token, channel);
+                               token, channel, conv_bias);
 }
 
 // Row `row` of the carried state after consumed_tokens: the last three inputs

@@ -27,11 +27,14 @@ def pack_spec(family):
 def pack_layout(family):
     """The family's packed target geometry, per its file's pack.layout."""
     spec = pack_spec(family)
-    # qwen4exp's pack.layout states Qwen4ExpLayout's fields; every other
-    # family's states Layout's.
+    # qwen4exp's pack.layout states Qwen4ExpLayout's fields, maxwell_moe's
+    # MaxwellLayout's; every other family's states Layout's.
+    model_type = dict(family.signature).get("model_type")
     layout_type = (
         Qwen4ExpLayout
-        if dict(family.signature).get("model_type") == "qwen4_exp_text"
+        if model_type == "qwen4_exp_text"
+        else MaxwellLayout
+        if model_type == "maxwell_moe"
         else Layout
     )
     return layout_type(**spec["layout"])
@@ -313,3 +316,59 @@ class Qwen4ExpLayout:
             "attention" if self.is_full_attention(layer) else "gdn"
             for layer in range(self.layers)
         ]
+
+
+@dataclass(frozen=True)
+class MaxwellLayout:
+    """Maxwell-V1.0-Flash's packed target geometry, the fields of
+    maxwellMoeTargetLayout (runtime/model/MaxwellMoe.hpp) a pack declares:
+    a pure-attention fine-grained MoE whose residual is four mHC streams,
+    whose every layer routes over its MBSA indexer's per-token keys, and
+    whose head contracts the streams with the learned hc_head before the
+    final norm. The file magics (MDFM0001 layer, MDFM0002 head, MDFE0001
+    embedding) and the compiled kernel cores are the format's and the
+    runtime's, not the family's data. The MTP layer is not packed yet —
+    its draft binding is phase 2."""
+
+    maximum_context_tokens: int = 262144
+    layers: int = 45
+    dense_layers: int = 3
+    hidden_size: int = 2048
+    vocabulary_size: int = 200704
+    packed_full_width: int = 5120
+    attention_width: int = 4096
+    attention_query_heads: int = 32
+    attention_kv_heads: int = 4
+    attention_head_dimension: int = 128
+    attention_qk_norm: bool = True
+    rotary_pairs: int = 64
+    rotary_theta: float = 20_000_000.0
+    stop_tokens: tuple = (200001, 2)
+    intermediate_size: int = 6144
+    experts: int = 256
+    experts_per_token: int = 12
+    expert_intermediate_size: int = 512
+    packed_expert_width: int = 512
+    shared_intermediate_size: int = 1024
+    packed_shared_width: int = 1024
+    hyper_connections: int = 4
+    indexer_heads: int = 4
+    indexer_head_dimension: int = 128
+    indexer_block_tokens: int = 128
+    indexer_prefix_blocks: int = 8
+    indexer_local_blocks: int = 8
+    indexer_remote_blocks: int = 16
+    mhc_mix_width: int = 24
+    mhc_sinkhorn_iterations: int = 20
+
+    def is_moe(self, layer: int) -> bool:
+        return layer >= self.dense_layers
+
+    @property
+    def stream_width(self) -> int:
+        """One row's mHC streams: hyper_connections x hidden_size."""
+        return self.hyper_connections * self.hidden_size
+
+    def layer_types(self):
+        # Every layer runs the same block-sparse attention mixer.
+        return ["attention" for _ in range(self.layers)]

@@ -257,7 +257,7 @@ CoreAiFfn::CoreAiFfn(metal::MetalBackend &backend, std::span<const SwiGluProject
       graph.add(kernel(kCoreAiFfnRowScale.data(), planes.suffix, rotation),
                 {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix),
                  memory_.rowScales},
-                AneFfnWeightParams{planes.groups, row, input, width, 0, 0, planes.format},
+                AneFfnWeightParams{planes.groups, row, input, width, 0, 0, planes.format, rows},
                 {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
     };
     add(Matrix::Gate, shape_.gpu, 0, shape_.hidden, shape_.ane, Rotation::Inputs);
@@ -337,7 +337,7 @@ void CoreAiFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t 
     graph.add(kernel(weights.data(), planes.suffix, rotation),
               {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), output, scale,
                memory_.rowScales},
-              AneFfnWeightParams{planes.groups, row, input, width, stride, scaleStride, planes.format},
+              AneFfnWeightParams{planes.groups, row, input, width, stride, scaleStride, planes.format, rows},
               {rows / ANE_FFN_WEIGHT_ROWS, width / blockOf(rotation), 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   };
   add(Matrix::Gate, target.gateQ, target.gateS, shape_.gpu, 0, shape_.hidden, shape_.ane, Rotation::Inputs);
@@ -345,7 +345,8 @@ void CoreAiFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t 
   add(Matrix::Down, target.downQ, target.downS, 0, shape_.gpu, shape_.ane, shape_.hidden, Rotation::Intermediate);
 }
 
-bool CoreAiFfn::begin() {
+bool CoreAiFfn::begin(Steps steps) {
+  if (steps == Steps::Two) throw std::invalid_argument("CoreAI FFN split runs one step");
   if (std::exchange(unfinished_, false)) {
     handoff_.cancel("a command it split did not finish");
     warnStopped();
@@ -392,8 +393,8 @@ void CoreAiFfn::encode(metal::CommandGraph &graph, uint32_t layer, const Prefill
 
 metal::CommandTicket CoreAiFfn::commit(const metal::CommandGraph &graph, metal::CommandCompletion completion) {
   const std::vector<Job> jobs = std::exchange(jobs_, {});
-  for (const Job &job : jobs) queue(job);
   unfinished_ = !jobs.empty();
+  committedLayers_ = jobs.empty() ? 0 : nextLayer_;
   committedEvaluations_ = static_cast<uint32_t>(jobs.size());
   committedRows_ = jobs.empty() ? 0 : jobs.front().rows;
   const auto cancel = [&](const std::string &reason) {
@@ -401,8 +402,9 @@ metal::CommandTicket CoreAiFfn::commit(const metal::CommandGraph &graph, metal::
     handoff_.cancel(reason);
     warnStopped();
   };
+  metal::CommandTicket ticket;
   try {
-    return backend_.submitCommandAsync(graph.command(), std::move(completion));
+    ticket = backend_.submitCommandAsync(graph.command(), std::move(completion));
   } catch (const std::exception &error) {
     cancel(std::string("its Metal command was not submitted: ") + error.what());
     throw;
@@ -410,30 +412,57 @@ metal::CommandTicket CoreAiFfn::commit(const metal::CommandGraph &graph, metal::
     cancel("its Metal command was not submitted");
     throw;
   }
+  // Queued once the command is submitted, as AneFfn::commit.
+  for (const Job &job : jobs) queue(job);
+  return ticket;
 }
 
-bool CoreAiFfn::finish() {
-  const std::optional<AwakeClock::duration> ran = completed();
+bool CoreAiFfn::finish(const metal::CommandTiming &timing) {
+  const std::optional<ane::Handoff::Ran> ran = completed();
   if (!ran) {
     warnStopped();
     return false;
   }
-  if (!committedEvaluations_) return true;
-  const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
-  ++served_.commands;
-  served_.evaluations += committedEvaluations_;
-  served_.milliseconds += milliseconds;
-  if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
+  std::string losing;
+  if (committedLayers_) {
+    const double milliseconds = std::chrono::duration<double, std::milli>(ran->total).count(),
+                 longest = std::chrono::duration<double>(ran->longest).count();
+    if (const std::optional<ane_ffn::Late> late =
+            ane_ffn::late(timing.longestBufferSeconds, timing.medianBufferSeconds, longest))
+      logWarning("CoreAI FFN split: a buffer of a command took ", std::fixed, std::setprecision(2),
+                 timing.longestBufferSeconds, " s against a median of ", std::setprecision(1),
+                 1000.0 * timing.medianBufferSeconds, " ms; the ",
+                 *late == ane_ffn::Late::NeuralEngine ? "Neural Engine was late" : "GPU was late",
+                 " (the longest evaluation took ", 1000.0 * longest, " ms from its notice to its report).");
+    ++served_.commands;
+    served_.evaluations += committedEvaluations_;
+    served_.milliseconds += milliseconds;
+    const bool pipelined = committedEvaluations_ > committedLayers_;
+    losing = breaker_.judge(committedRows_, committedLayers_, pipelined, milliseconds);
+    const std::optional<double> alone = breaker_.alone(committedRows_, committedLayers_, pipelined);
+    if (losing.empty() && alone &&
+        ane_ffn::shared(1000.0 * timing.gpuSeconds, 1000.0 * timing.encodeGpuSeconds, *alone))
+      logWarning("CoreAI FFN split: a command took ", std::fixed, std::setprecision(2),
+                 timing.gpuSeconds - timing.encodeGpuSeconds,
+                 " s on the GPU against ", *alone / 1000.0, " s on the GPU alone over its layers; the GPU was busy "
+                 "with another process's work.");
+  }
+  const AwakeClock::time_point now = AwakeClock::now();
+  const ane_ffn::Pause::Verdict verdict = pause_.finished(now, committedLayers_ != 0, !losing.empty());
+  if (verdict == ane_ffn::Pause::Verdict::Paused)
+    logWarning("CoreAI FFN split paused (", losing, "); the GPU runs the prefill FFN alone for ",
+               std::chrono::duration_cast<std::chrono::minutes>(pause_.until() - now).count(),
+               " min, then the split tries again.");
+  if (verdict == ane_ffn::Pause::Verdict::Stopped) {
     handoff_.retire(std::move(losing));
     warnStopped();
-    if (lost_) std::exchange(lost_, {})();
   }
   return true;
 }
 
-std::optional<AwakeClock::duration> CoreAiFfn::completed() {
+std::optional<ane::Handoff::Ran> CoreAiFfn::completed() {
   unfinished_ = false;
-  std::optional<AwakeClock::duration> ran = handoff_.finish();
+  std::optional<ane::Handoff::Ran> ran = handoff_.finish();
   if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && ran) {
     handoff_.retire("the CoreAI function's output was not finite");
     ran.reset();

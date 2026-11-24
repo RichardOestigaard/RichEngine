@@ -36,6 +36,9 @@ struct DFlashV1DraftLayerWeights final {
   ops::Projection gateProjection;
   ops::Projection upProjection;
   ops::Projection downProjection;
+  // A DSpark draft's per-head attention-sink bias ([queryHeads] bf16),
+  // read only when the layout's attentionSinks is set; empty otherwise.
+  metal::MetalBuffer attentionSinks;
 };
 
 struct DFlashV1DraftWeights final {

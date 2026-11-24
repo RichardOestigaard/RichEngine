@@ -73,6 +73,10 @@
   (RICHENGINE_DRAFT_SAMPLING_SHARDS * RICHENGINE_DRAFT_CANDIDATES)
 // The rank of the draft selector's codebooks.
 #define RICHENGINE_DRAFT_SELECTOR_RANK 256u
+// The DSpark Markov head's inner rank may differ from the codebook rank: the
+// selector's edge kernel reads it from the batch parameters, capped by the
+// largest shipped head (Nemotron-3.5-Lightning's 512).
+#define RICHENGINE_DRAFT_SELECTOR_RANK_MAXIMUM 512u
 // Rows of one value head's recurrent state a prefill GDN scan threadgroup
 // carries through the chunk: four simdgroups whose lanes each own sixteen key
 // columns of one row. The thread count follows from the rows: 128 columns /

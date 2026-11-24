@@ -105,6 +105,35 @@ inline uint richengine_duo_page(RichDuoPageRange range, uint vpage) {
              : range.window_begin_page + (vpage - range.sink_pages);
 }
 
+// The mapped pages whose every token every fused row of the tile admits
+// untested, so their softmax tests none. [begin, end) is the trailing run:
+// all its tokens are committed — below committed_tokens a row_mask bit is
+// never read and every row's causal limit passes — at or past the last
+// active row's window start, whose causal end is the largest and whose
+// window start therefore bounds every row's. Pages below `sink` are whole
+// through the mask's t < duo_sink clause instead; the page loop tests the
+// duo-mapped page, whose token range is what the softmax sees. Upstream
+// 1.7.1's whole-page fast path (splash_attention_whole_pages); llama.cpp's
+// fa_tensor.metal likewise skips the mask of blocks it classed unmasked.
+struct RichAttentionWholePages {
+  uint begin;
+  uint end;
+  uint sink;
+};
+
+inline RichAttentionWholePages
+richengine_attention_whole_pages(uint committed_tokens, uint active_rows,
+                                 uint window_tokens, uint duo_sink_tokens) {
+  constexpr uint N = RichKvPageTokens;
+  const uint last_end = committed_tokens + active_rows;
+  const uint window_begin =
+      window_tokens != 0 && last_end > window_tokens
+          ? last_end - window_tokens
+          : 0;
+  return {(window_begin + N - 1) / N, committed_tokens / N,
+          min(duo_sink_tokens, committed_tokens) / N};
+}
+
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
 // probabilities and the row statistics advance. Four lanes own one fused row,
 // eight consecutive tokens each, so the row maximum and sum are two xor
@@ -123,9 +152,11 @@ inline uint richengine_duo_page(RichDuoPageRange range, uint vpage) {
 // of the q8q kernels (int32 is exact: |sum| < 2^24 at 512 dimensions).
 // query_scale is the fused row's INT8 query scale — 1.0 on the bf16 path,
 // whose product is unchanged.
+// Masked false is a page every row of the tile sees wholly
+// (richengine_attention_whole_pages): its tokens are all admitted, untested.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized,
-          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION, uint TokensPerLane = 8,
-          typename Score = float>
+          bool Masked, uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
+          uint TokensPerLane = 8, typename Score = float>
 inline void richengine_attention_page_softmax(
     threadgroup const Score *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -149,26 +180,41 @@ inline void richengine_attention_page_softmax(
     return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
-  const uint query_row =
-      (fused_row_offset + fused_row) / QueryHeadsPerKVHead;
-  const uint causal_end =
-      committed_tokens + min(query_row, active_rows - 1) + 1;
-  const uint limit = min(visible_tokens, causal_end);
-  // A nonzero window_tokens admits only the last window_tokens tokens ending
-  // at the row's causal end (Gemma 4's sliding-window layers); zero is the
-  // full causal history. A nonzero duo_sink_tokens additionally admits the
-  // first duo_sink_tokens tokens unconditionally — a DuoAttention streaming
-  // head's sink range beside its trailing window.
-  const uint duo_sink = duo_sink_tokens;
-  const uint window_begin =
-      window_tokens != 0 && causal_end > window_tokens
-          ? causal_end - window_tokens
-          : 0;
-  // A tree lane's scratch tokens are not a prefix of its query row: the row's
-  // ancestor bitmask decides which of the visible rows past the committed
-  // history it attends. A null mask is the chain's causal limit.
-  const uint row_mask = row_masks ? row_masks[query_row] : 0u;
-  const uint token = token_start + column;
+  bool admitted[TokensPerLane];
+  if constexpr (Masked) {
+    const uint query_row =
+        (fused_row_offset + fused_row) / QueryHeadsPerKVHead;
+    const uint causal_end =
+        committed_tokens + min(query_row, active_rows - 1) + 1;
+    const uint limit = min(visible_tokens, causal_end);
+    // A nonzero window_tokens admits only the last window_tokens tokens
+    // ending at the row's causal end (Gemma 4's sliding-window layers); zero
+    // is the full causal history. A nonzero duo_sink_tokens additionally
+    // admits the first duo_sink_tokens tokens unconditionally — a
+    // DuoAttention streaming head's sink range beside its trailing window.
+    const uint duo_sink = duo_sink_tokens;
+    const uint window_begin =
+        window_tokens != 0 && causal_end > window_tokens
+            ? causal_end - window_tokens
+            : 0;
+    // A tree lane's scratch tokens are not a prefix of its query row: the
+    // row's ancestor bitmask decides which of the visible rows past the
+    // committed history it attends. A null mask is the chain's causal limit.
+    const uint row_mask = row_masks ? row_masks[query_row] : 0u;
+    const uint token = token_start + column;
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      const uint t = token + j;
+      admitted[j] = (t < duo_sink || t >= window_begin) &&
+          (!row_masks ? t < limit
+          : (t < committed_tokens) ||
+                (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
+    }
+  } else {
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j)
+      admitted[j] = true;
+  }
   threadgroup const vec<Score, 4> *scores4 =
       reinterpret_cast<threadgroup const vec<Score, 4> *>(
           scores + fused_row * N + column);
@@ -195,14 +241,8 @@ inline void richengine_attention_page_softmax(
     }
   }
   float local_max = -INFINITY;
-  bool admitted[TokensPerLane];
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    const uint t = token + j;
-    admitted[j] = (t < duo_sink || t >= window_begin) &&
-        (!row_masks ? t < limit
-        : (t < committed_tokens) ||
-              (t < visible_tokens && (row_mask >> (t - committed_tokens)) & 1u));
     score[j] = admitted[j] ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
@@ -383,6 +423,12 @@ inline void richengine_paged_attention_tile(
   if (page_begin >= pages)
     return;
   uint page_end = min(pages, page_begin + per_split);
+  // Pages every row sees wholly take the unmasked softmax; the window and
+  // sink the mask applies are the streaming head's when it streams.
+  const RichAttentionWholePages whole = richengine_attention_whole_pages(
+      committed_tokens, active_rows,
+      duo_streaming ? duo.window_tokens : window_tokens,
+      duo_streaming ? duo.sink_tokens : 0);
 
   threadgroup Score *score_tile =
       reinterpret_cast<threadgroup Score *>(scores);
@@ -490,16 +536,28 @@ inline void richengine_paged_attention_tile(
         if (thread_index == 0)
           atomic_store_explicit(rescale, 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
-        richengine_attention_page_softmax<QueryHeadsPerKVHead,
-            RowsPerTile / MPasses, Quantized, HeadDim,
-            (MP > 64 ? 16 : 8), Score>(
-            score_tile, pbuf, row_max, row_sum, previous_scale, rescale,
-            reinterpret_cast<device const float4 *>(key_scales),
-            reinterpret_cast<device const float4 *>(value_scales), token_start,
-            row_offset, visible_tokens, committed_tokens, active_rows,
-            row_masks, thread_index, qk_scale,
-            duo_streaming ? duo.window_tokens : window_tokens,
-            duo_streaming ? duo.sink_tokens : 0, query_score_scale);
+        if ((page >= whole.begin && page < whole.end) || page < whole.sink)
+          richengine_attention_page_softmax<QueryHeadsPerKVHead,
+              RowsPerTile / MPasses, Quantized, false, HeadDim,
+              (MP > 64 ? 16 : 8), Score>(
+              score_tile, pbuf, row_max, row_sum, previous_scale, rescale,
+              reinterpret_cast<device const float4 *>(key_scales),
+              reinterpret_cast<device const float4 *>(value_scales), token_start,
+              row_offset, visible_tokens, committed_tokens, active_rows,
+              row_masks, thread_index, qk_scale,
+              duo_streaming ? duo.window_tokens : window_tokens,
+              duo_streaming ? duo.sink_tokens : 0, query_score_scale);
+        else
+          richengine_attention_page_softmax<QueryHeadsPerKVHead,
+              RowsPerTile / MPasses, Quantized, true, HeadDim,
+              (MP > 64 ? 16 : 8), Score>(
+              score_tile, pbuf, row_max, row_sum, previous_scale, rescale,
+              reinterpret_cast<device const float4 *>(key_scales),
+              reinterpret_cast<device const float4 *>(value_scales), token_start,
+              row_offset, visible_tokens, committed_tokens, active_rows,
+              row_masks, thread_index, qk_scale,
+              duo_streaming ? duo.window_tokens : window_tokens,
+              duo_streaming ? duo.sink_tokens : 0, query_score_scale);
         threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
         if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

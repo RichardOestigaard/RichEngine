@@ -15,6 +15,7 @@
 #include "engine/wire/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
 
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -233,6 +234,13 @@ public:
   [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
   // How the start's split came out, and the automatic context.
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // Whether the start left the split to set up once `runtime`, the engine's,
+  // has prefilled a full chunk on the GPU alone; and setting it up then, on
+  // `runtime`'s prefill buffers, with that prefill's `prefillMilliseconds`
+  // of GPU time (engine::finishAneFfn), which `runtime` takes from its next
+  // command on (model::RuntimeModel::setAneFfn).
+  [[nodiscard]] bool aneFfnPending() const noexcept { return aneFfnPending_.has_value(); }
+  void finishAneFfn(double prefillMilliseconds, model::RuntimeModel &runtime);
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
 
@@ -255,8 +263,8 @@ private:
                    std::unique_ptr<model::CompositeStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
                    std::unique_ptr<KvPool> kvPool,
-                   std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::FfnSplit> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<engine::Cache> cache, AneFfnStart aneFfn,
+                   kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
                    std::optional<uint64_t> hostAvailableAtStart);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
@@ -279,6 +287,12 @@ private:
   // Over model_'s images and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
+  // The start's split left to set up (aneFfnPending), and what its model
+  // needs then: the KV format, the build and the start's cancellation.
+  std::optional<AneFfnStart> aneFfnPending_;
+  kv::Format kvFormat_;
+  std::string buildId_;
+  std::function<bool()> cancelled_;
   std::optional<uint64_t> hostAvailableAtStart_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
@@ -287,16 +301,26 @@ private:
   bool probationStopped_ = false;
 };
 
+// Where the model's side of the split (aneFfnModel) times and prepares it:
+// with `buffers`, on the prefill buffers of a dense FFN and the hidden rows
+// its layers alternate between that `buffers` hands its use, the engine's
+// own; without, on a prefill arena allocated for each call. Its programs wait
+// for the ANE's service until `cancelled` returns true.
+struct AneFfnTiming final {
+  using Use = std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)>;
+  std::function<bool()> cancelled;
+  std::function<void(const Use &)> buffers;
+};
+
 // The model's side of the split of `loaded`'s target on `backend`, valid
-// while `backend`, `loaded` and `operators` are: its timing and prepared split
-// run on a prefill arena of their own, its programs wait for the ANE's
-// service until `cancelled` returns true, and its calibrations are
-// remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId` and the
-// most units the plan holds.
+// while `backend`, `loaded` and `operators` are: it times and prepares the
+// split as `timing` says, and its calibrations are remembered beside the
+// programs (ane::recall) under its layers' shapes and formats, the device,
+// the macOS version, the engine's `buildId` and the most units the plan
+// holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::ModelPackage &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
-                                      std::string_view buildId, std::function<bool()> cancelled);
+                                      std::string_view buildId, AneFfnTiming timing);
 
 // Connects an engine to the governor that admits its memory: the engine asks
 // it whether the host pauses growth, and marks the allocations a request in

@@ -30,6 +30,9 @@ public:
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The maxwell-moe MTP block's image ("mtp.bin"), planned on demand — it
+  // is not part of the target's layer/head/embedding image list.
+  [[nodiscard]] WeightFile mtp();
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
@@ -39,6 +42,7 @@ private:
   struct Planned {
     explicit Planned(const std::filesystem::path &path) : source(path) {}
     WeightSource source;
+    gguf::TargetGeometry geometry;
     std::vector<gguf::Image> images; // layers, head, embedding
   };
   [[nodiscard]] WeightFile open(size_t index);

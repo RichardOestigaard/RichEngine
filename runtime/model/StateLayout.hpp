@@ -109,7 +109,10 @@ struct DraftStateLayout final {
   uint32_t window = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && window;
+    // A draft-less model's layout is entirely zero; a real draft's is
+    // entirely set.
+    return (layers && kvHeads && headDimension && window) ||
+           (!layers && !kvHeads && !headDimension && !window);
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
     return uint64_t{kvHeads} * RICHENGINE_DRAFT_SLIDING_WINDOW * headDimension *

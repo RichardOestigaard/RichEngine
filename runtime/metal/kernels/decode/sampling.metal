@@ -1244,7 +1244,8 @@ kernel void draft_select_top16_sharded(
   threadgroup float round_values[2][8];
   threadgroup uint round_ids[2][8];
   draft_top16_sharded_phase(logits, partial_ids, partial_values,
-                            params.vocabulary, params.logits_stride, 1,
+                            params.vocabulary, params.logits_stride,
+                            params.row_offset,
                             maxima, thresholds, &round_values[0][0],
                             &round_ids[0][0], group, thread_index, lane,
                             simd_group, query_rows);

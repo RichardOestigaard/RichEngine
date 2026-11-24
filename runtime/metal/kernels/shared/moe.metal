@@ -1006,12 +1006,93 @@ kernel void moe_route_select_sigmoid(
   }
   simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
                     thread_scope_simdgroup);
-  // norm_topk_prob: the winners' sigmoid scores over their sum.
+  // norm_topk_prob: the winners' sigmoid scores over their sum, times the
+  // routed scaling factor (1.0 on every shape but Nemotron's).
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     float denominator = 0.0f;
     for (uint other = 0; other < params.top_k; ++other)
       denominator += ordered[other];
-    routing_weights[row_routes + rank] = ordered[rank] / denominator;
+    routing_weights[row_routes + rank] =
+        ordered[rank] / denominator * params.weight_scale;
+  }
+}
+
+// The sigmoid-gated select for a block whose shared expert carries no scalar
+// gate (ops::MoE's sharedExpertUnitWeight, NVIDIA Nemotron): the routed keys
+// and weights are moe_route_select_sigmoid's — sigmoid score plus per-expert
+// bias to order, the winners' sigmoid scores normalized — and the row's
+// route block is top_k + 1 long, its last route the shared expert (id
+// `experts`) at weight 1, which the combine multiplies straight in.
+kernel void moe_route_select_sigmoid_shared(
+    device const float *scores [[buffer(0)]],
+    device const float *expert_bias [[buffer(1)]],
+    device uint *selected [[buffer(2)]],
+    device float *routing_weights [[buffer(3)]],
+    constant MoeRouteParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint StorageN = 256;
+  constexpr uint ExpertsPerLane = StorageN / 32;
+  const uint row = group;
+  if (row >= params.rows)
+    return;
+  threadgroup float row_probs[256];
+  threadgroup float row_keys[256];
+  threadgroup float ordered[256];
+  const bool live = thread_index < params.experts;
+  const float prob =
+      live ? richengine_sigmoid(scores[ulong(row) * StorageN + thread_index])
+           : 0.0f;
+  row_probs[thread_index] = prob;
+  row_keys[thread_index] =
+      live ? prob + expert_bias[thread_index]
+           : -numeric_limits<float>::infinity();
+  const ulong row_routes = ulong(row) * (params.top_k + 1);
+  if (thread_index == 0) {
+    selected[row_routes + params.top_k] = params.experts;
+    routing_weights[row_routes + params.top_k] = 1.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  if (simd_group != 0)
+    return;
+  // Lane l holds experts l, l + 32, ... Each rank takes the highest
+  // remaining key and the lowest expert id among ties.
+  float lane_keys[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot)
+    lane_keys[slot] = row_keys[simd_lane + 32 * slot];
+  for (uint rank = 0; rank < params.top_k; ++rank) {
+    float best = -numeric_limits<float>::infinity();
+    uint best_slot = 0;
+    for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+      if (lane_keys[slot] > best) {
+        best = lane_keys[slot];
+        best_slot = slot;
+      }
+    }
+    const float row_best = simd_max(best);
+    const uint candidate =
+        best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
+    const uint winner = simd_min(candidate);
+    if (candidate == winner)
+      lane_keys[best_slot] = -numeric_limits<float>::infinity();
+    if (simd_lane == 0) {
+      ordered[rank] = row_probs[winner];
+      selected[row_routes + rank] = winner;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);
+  // norm_topk_prob: the winners' sigmoid scores over their sum, times
+  // weight_scale — NVIDIA Nemotron's routed scaling factor 2.5, which the
+  // shape sets only on this unit-weight shared-expert select.
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
+    float denominator = 0.0f;
+    for (uint other = 0; other < params.top_k; ++other)
+      denominator += ordered[other];
+    routing_weights[row_routes + rank] =
+        ordered[rank] / denominator * params.weight_scale;
   }
 }
 
@@ -1053,12 +1134,14 @@ inline void moe_sigmoid_select_row(device uint *selected,
   }
   simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
                     thread_scope_simdgroup);
-  // norm_topk_prob: the winners' sigmoid scores over their sum.
+  // norm_topk_prob: the winners' sigmoid scores over their sum, times the
+  // routed scaling factor (Nemotron's 2.5; 1.0 elsewhere).
   for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     float denominator = 0.0f;
     for (uint other = 0; other < params.top_k; ++other)
       denominator += row_ordered[other];
-    routing_weights[row_routes + rank] = row_ordered[rank] / denominator;
+    routing_weights[row_routes + rank] =
+        row_ordered[rank] / denominator * params.weight_scale;
   }
 }
 
@@ -1131,6 +1214,10 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
   if (group.x >= *tile_count)
     return;
   uint column = group.y * 256 + thread_index;
+  // The host grids 256-column blocks (ceiling, so a hidden width that is not
+  // a multiple of 256 — the ungated shapes' — leaves a ragged last block.
+  if (column >= params.input_size)
+    return;
   const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
   for (uint local = 0; local < rows; ++local) {
     uint row = group.x * params.tile_rows + local;
@@ -1193,6 +1280,10 @@ kernel void moe_gather_packed(device const bfloat *input [[buffer(0)]],
   if (group.x >= *tile_count)
     return;
   const uint column = group.y * 256 + thread_index;
+  // Same ragged last block as moe_gather_rows for hidden widths that are
+  // not a multiple of 256.
+  if (column >= params.input_size)
+    return;
   const uint s = column & 31, g = column >> 5;
   const uint slot = g * 32 + 16 * ((s >> 2) & 1) + 4 * (s >> 3) + (s & 3);
   const uint groups = params.input_size / 32;

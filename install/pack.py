@@ -50,6 +50,7 @@ from .pack_layouts import (
     DFlash2Layout,
     DraftLayout,
     Layout,
+    MaxwellLayout,
     Qwen4ExpLayout,
     draft_layout_from_spec,
     execution_geometry,
@@ -82,11 +83,16 @@ QWEN4_FORMAT_NAME = "richengine-packed-gguf-qwen4exp"
 TARGET_FORMAT = "packed-gemma4"
 DIFFUSION_TARGET_FORMAT = "packed-diffusiongemma"
 QWEN4_TARGET_FORMAT = "packed-qwen4exp"
-PackedFormat = Literal["packed-gemma4", "packed-diffusiongemma", "packed-qwen4exp"]
+MAXWELL_FORMAT_NAME = "richengine-packed-gguf-maxwell"
+MAXWELL_TARGET_FORMAT = "packed-maxwell"
+PackedFormat = Literal[
+    "packed-gemma4", "packed-diffusiongemma", "packed-qwen4exp", "packed-maxwell"
+]
 TARGET_FORMATS: tuple[PackedFormat, ...] = (
     TARGET_FORMAT,
     DIFFUSION_TARGET_FORMAT,
     QWEN4_TARGET_FORMAT,
+    MAXWELL_TARGET_FORMAT,
 )
 # The text model_types the installer packs, to their package format name
 # and target format.
@@ -94,6 +100,7 @@ PACKABLE = {
     "gemma4_text": (FORMAT_NAME, TARGET_FORMAT),
     "diffusion_gemma_text": (DIFFUSION_FORMAT_NAME, DIFFUSION_TARGET_FORMAT),
     "qwen4_exp_text": (QWEN4_FORMAT_NAME, QWEN4_TARGET_FORMAT),
+    "maxwell_moe": (MAXWELL_FORMAT_NAME, MAXWELL_TARGET_FORMAT),
 }
 
 
@@ -1533,6 +1540,364 @@ def _build_qwen4exp_package(
     return manifest
 
 
+# ============================ maxwell_moe ============================
+# Maxwell-V1.0-Flash (model_type maxwell_moe): the packed-only target
+# runtime/model/MaxwellMoe.cpp loads. Same GGUF-block segment convention
+# as qwen4exp — quantized projections are Q8_0 descriptor+plane triples,
+# the segments the exact path reads unrounded stay F32 — under the MDFM
+# magics. The layer files' section order is loadMaxwellMoeWeights' read
+# order: input norm; fused q/k/v, the per-head q/k norms and o_proj; the
+# indexer; the attention mHC; the post-attention norm; the FFN (the dense
+# layers' w1/w3/w2 or the MoE block's router, F32 expert bias, routed
+# slabs and the ungated shared expert's); the FFN mHC. head.bin carries
+# the HC head, the final norm and the lm_head.
+
+MAXWELL_LAYER_MAGIC = b"MDFM0001"
+MAXWELL_HEAD_MAGIC = b"MDFM0002"
+
+
+def _maxwell_mhc_sections(checkpoint, prefix: str) -> list:
+    """One hyper-connection module's sections: the F32 mapping projection
+    [mhc_mix_width][stream_width], the three F32 gating factors and the
+    F32 bias, in readMhc's order."""
+    sections = _f32_segment(
+        checkpoint.read(prefix + "mapping_proj.weight").astype(np.float32)
+    )
+    alphas = np.array(
+        [
+            float(checkpoint.read(prefix + "alpha_pre").reshape(-1)[0]),
+            float(checkpoint.read(prefix + "alpha_post").reshape(-1)[0]),
+            float(checkpoint.read(prefix + "alpha_res").reshape(-1)[0]),
+        ],
+        np.float32,
+    )
+    sections.append(_raw_f32(alphas))
+    sections.append(_raw_f32(checkpoint.read(prefix + "bias").reshape(-1)))
+    return sections
+
+
+def _maxwell_indexer_sections(checkpoint, prefix: str, layout) -> list:
+    """The MBSA indexer's sections (readIndexer): the F32 group query and
+    shared key projections and their per-head norms."""
+    hidden = layout.hidden_size
+    query_width = layout.indexer_heads * layout.indexer_head_dimension
+    query = checkpoint.read(prefix + "indexer.linear_q_proj.weight")
+    key = checkpoint.read(prefix + "indexer.linear_k_proj.weight")
+    if query.shape != (query_width, hidden) or key.shape != (
+        layout.indexer_head_dimension,
+        hidden,
+    ):
+        raise models.ModelError(f"{prefix}indexer projections do not match the layout")
+    sections = _f32_segment(query.astype(np.float32))
+    sections += _f32_segment(key.astype(np.float32))
+    sections.append(
+        _raw_f32(
+            checkpoint.read(prefix + "indexer.q_layernorm.weight").reshape(-1)
+        )
+    )
+    sections.append(
+        _raw_f32(
+            checkpoint.read(prefix + "indexer.k_layernorm.weight").reshape(-1)
+        )
+    )
+    return sections
+
+
+def _maxwell_attention_sections(checkpoint, prefix: str, layout) -> list:
+    """Every layer's mixer sections: the fused attn-q/k/v segments, the
+    per-head QK norms and the output projection."""
+    hidden = layout.hidden_size
+    head_dim = layout.attention_head_dimension
+    q = checkpoint.read(prefix + "self_attn.q_proj.weight")
+    k = checkpoint.read(prefix + "self_attn.k_proj.weight")
+    v = checkpoint.read(prefix + "self_attn.v_proj.weight")
+    kv_rows = layout.attention_kv_heads * head_dim
+    if (
+        q.shape != (layout.attention_width, hidden)
+        or k.shape != (kv_rows, hidden)
+        or v.shape != (kv_rows, hidden)
+    ):
+        raise models.ModelError(
+            f"{prefix}self_attn projections do not match the packed QKV"
+        )
+    sections = []
+    for weight in (q, k, v):
+        sections += _q8o_segment(weight)
+    sections.append(
+        _raw_f32(checkpoint.read(prefix + "self_attn.q_layernorm.weight").reshape(-1))
+    )
+    sections.append(
+        _raw_f32(checkpoint.read(prefix + "self_attn.k_layernorm.weight").reshape(-1))
+    )
+    sections += _q8o_segment(checkpoint.read(prefix + "self_attn.o_proj.weight"))
+    return sections
+
+
+def _maxwell_dense_sections(checkpoint, prefix: str, layout) -> list:
+    """A leading dense layer's SwiGLU: w1 gate, w3 up, w2 down."""
+    hidden = layout.hidden_size
+    width = layout.intermediate_size
+    gate = checkpoint.read(prefix + "block_sparse_moe.w1.weight")
+    up = checkpoint.read(prefix + "block_sparse_moe.w3.weight")
+    down = checkpoint.read(prefix + "block_sparse_moe.w2.weight")
+    if (
+        gate.shape != (width, hidden)
+        or up.shape != (width, hidden)
+        or down.shape != (hidden, width)
+    ):
+        raise models.ModelError(f"{prefix}dense FFN shapes do not match the layout")
+    sections = _q8o_segment(gate)
+    sections += _q8o_segment(up)
+    sections += _q8o_segment(down)
+    return sections
+
+
+def _maxwell_expert_stack(checkpoint, prefix: str, name: str, experts: int):
+    """The per-expert experts.N.<name>.weight tensors stacked expert-major."""
+    pieces = [
+        checkpoint.read(prefix + f"block_sparse_moe.experts.{expert}.{name}.weight")
+        for expert in range(experts)
+    ]
+    return np.stack(pieces)
+
+
+def _maxwell_moe_sections(checkpoint, prefix: str, layout) -> list:
+    """The MoE block's sections (readMoeBlock then readSharedFfn): the F32
+    router, the F32 expert-selection bias, the routed experts' gate/up/down
+    slabs and the ungated shared expert's SwiGLU."""
+    hidden = layout.hidden_size
+    width = layout.expert_intermediate_size
+    packed = layout.packed_expert_width
+    experts = layout.experts
+    router = checkpoint.read(prefix + "block_sparse_moe.gate.weight")
+    bias = checkpoint.read(prefix + "block_sparse_moe.expert_bias")
+    if router.shape != (experts, hidden) or bias.shape != (experts,):
+        raise models.ModelError(f"{prefix}block_sparse_moe router shapes are off")
+    gate = _maxwell_expert_stack(checkpoint, prefix, "w1", experts)
+    up = _maxwell_expert_stack(checkpoint, prefix, "w3", experts)
+    down = _maxwell_expert_stack(checkpoint, prefix, "w2", experts)
+    if (
+        gate.shape != (experts, width, hidden)
+        or up.shape != (experts, width, hidden)
+        or down.shape != (experts, hidden, width)
+    ):
+        raise models.ModelError(f"{prefix}routed expert shapes are off")
+    pad = packed - width
+    if pad < 0:
+        raise models.ModelError(f"{prefix}packed expert width is under the logical one")
+    sections = _f32_segment(router.astype(np.float32))
+    # The selection bias must stay F32: BF16 storage would round its small
+    # spread away (the HF code carries the same workaround).
+    sections += _f32_segment(bias.reshape(1, experts).astype(np.float32))
+    sections += _q8o_segment_experts(_pad_axis(gate, 1, pad), packed, hidden)
+    sections += _q8o_segment_experts(_pad_axis(up, 1, pad), packed, hidden)
+    sections += _q8o_segment_experts(_pad_axis(down, 2, pad), hidden, packed)
+    shared_width = layout.shared_intermediate_size
+    shared_pad = layout.packed_shared_width - shared_width
+    if shared_pad < 0:
+        raise models.ModelError(f"{prefix}packed shared width is under the logical one")
+    shared_gate = checkpoint.read(prefix + "block_sparse_moe.shared_expert.w1.weight")
+    shared_up = checkpoint.read(prefix + "block_sparse_moe.shared_expert.w3.weight")
+    shared_down = checkpoint.read(prefix + "block_sparse_moe.shared_expert.w2.weight")
+    if (
+        shared_gate.shape != (shared_width, hidden)
+        or shared_up.shape != (shared_width, hidden)
+        or shared_down.shape != (hidden, shared_width)
+    ):
+        raise models.ModelError(f"{prefix}shared expert shapes are off")
+    sections += _q8o_segment(_pad_axis(shared_gate, 0, shared_pad))
+    sections += _q8o_segment(_pad_axis(shared_up, 0, shared_pad))
+    sections += _q8o_segment(_pad_axis(shared_down, 1, shared_pad))
+    return sections
+
+
+def pack_maxwell_layer_sections(checkpoint: Checkpoint, layout, layer: int):
+    """One maxwell_moe layer file's sections, in loadMaxwellMoeWeights'
+    read order."""
+    prefix = f"layers.{layer}."
+    sections = []
+    sections.append(
+        _raw_f32(checkpoint.read(prefix + "input_layernorm.weight").reshape(-1))
+    )
+    sections += _maxwell_attention_sections(checkpoint, prefix, layout)
+    sections += _maxwell_indexer_sections(checkpoint, prefix + "self_attn.", layout)
+    sections.append(
+        _raw_f32(
+            checkpoint.read(prefix + "post_attention_layernorm.weight").reshape(-1)
+        )
+    )
+    sections += _maxwell_mhc_sections(checkpoint, prefix + "self_attn_hyper_connection.")
+    if layout.is_moe(layer):
+        sections += _maxwell_moe_sections(checkpoint, prefix, layout)
+    else:
+        sections += _maxwell_dense_sections(checkpoint, prefix, layout)
+    sections += _maxwell_mhc_sections(checkpoint, prefix + "mlp_hyper_connection.")
+    return sections
+
+
+def _maxwell_head_sections(checkpoint, layout):
+    """head.bin's sections: the HC head's F32 fn projection, base and
+    scale, the final norm and the F32 logits."""
+    fn = checkpoint.read("hc_head.hc_head_fn")
+    if fn.shape != (layout.hyper_connections, layout.stream_width):
+        raise models.ModelError("hc_head.hc_head_fn shape does not match the layout")
+    sections = _f32_segment(fn.astype(np.float32))
+    sections.append(_raw_f32(checkpoint.read("hc_head.hc_head_base").reshape(-1)))
+    sections.append(_raw_f32(checkpoint.read("hc_head.hc_head_scale").reshape(-1)))
+    sections.append(_raw_f32(checkpoint.read("norm.weight").reshape(-1)))
+    sections += _q8o_segment(
+        checkpoint.read_sharded("lm_head.weight").astype(np.float32)
+    )
+    return sections
+
+
+def _maxwell_embedding_sections(checkpoint, layout):
+    """embedding.bin's sections: the native-descriptor token table."""
+    embedding = checkpoint.read_sharded("embed_tokens.weight")
+    if embedding.shape != (layout.vocabulary_size, layout.hidden_size):
+        raise models.ModelError("embed_tokens shape does not match the layout")
+    rows = _q8o_native_rows(embedding.astype(np.float32))
+    return [
+        _gguf_descriptor(
+            GGML_Q8_0, layout.vocabulary_size, layout.hidden_size, (len(rows), 0, 0)
+        ),
+        rows,
+    ]
+
+
+def _maxwell_manifest(
+    model,
+    family_name,
+    layout,
+    sources,
+    artifacts,
+    geometry,
+    serving,
+    signature,
+):
+    """manifest.json of a maxwell_moe package: the family's geometry under
+    target/, the packed format's magics (inspectModelPackage's
+    richengine-packed-gguf-maxwell branch binds it)."""
+    return {
+        "model": model,
+        "schema_version": 1,
+        "family": family_name,
+        **({"serving": dict(serving)} if serving else {}),
+        **(
+            {"signature": {k: _jsonable(v) for k, v in signature.items()}}
+            if signature
+            else {}
+        ),
+        "built_by": "install/pack.py",
+        "sources": sources,
+        "format": {
+            "name": MAXWELL_FORMAT_NAME,
+            "q4_bits": 4,
+            "q4_group_size": Q4_GROUP,
+            "q4_storage_n": Q4_TILE_ROWS,
+            "section_alignment_bytes": ALIGNMENT,
+            "target_layer_magic": MAXWELL_LAYER_MAGIC.decode(),
+            # The Null default still declares the shared draft magic.
+            "draft_layer_magic": DRAFT_MAGIC,
+            "vision_magic": VISION_MAGIC,
+        },
+        "execution_geometry": geometry,
+        TARGET: {
+            "architecture": "maxwell_moe",
+            "layers": layout.layers,
+            "dense_layers": layout.dense_layers,
+            "hidden_size": layout.hidden_size,
+            "vocabulary_size": layout.vocabulary_size,
+            "packed_full_width": layout.packed_full_width,
+            "attention_width": layout.attention_width,
+            "attention_query_heads": layout.attention_query_heads,
+            "attention_kv_heads": layout.attention_kv_heads,
+            "attention_head_dimension": layout.attention_head_dimension,
+            "experts": layout.experts,
+            "experts_per_token": layout.experts_per_token,
+            "expert_intermediate_size": layout.expert_intermediate_size,
+            "shared_intermediate_size": layout.shared_intermediate_size,
+            "hyper_connections": layout.hyper_connections,
+            "indexer_heads": layout.indexer_heads,
+            "indexer_head_dimension": layout.indexer_head_dimension,
+            "indexer_block_tokens": layout.indexer_block_tokens,
+            "indexer_prefix_blocks": layout.indexer_prefix_blocks,
+            "indexer_local_blocks": layout.indexer_local_blocks,
+            "indexer_remote_blocks": layout.indexer_remote_blocks,
+            "mhc_mix_width": layout.mhc_mix_width,
+            "mhc_sinkhorn_iterations": layout.mhc_sinkhorn_iterations,
+            "layer_types": layout.layer_types(),
+        },
+        "artifacts": artifacts,
+    }
+
+
+def _build_maxwell_package(
+    stage: Path,
+    model: str,
+    family_name: str,
+    config,
+    weights,
+    tokenizer_files,
+    sources,
+    *,
+    layout,
+    serving=None,
+    signature=None,
+    geometry=None,
+):
+    """Write the maxwell_moe packed package into stage."""
+    if not isinstance(layout, MaxwellLayout):
+        raise models.ModelError("maxwell packing needs a MaxwellLayout")
+    stage.mkdir(parents=True, exist_ok=True)
+    target_dir = stage / TARGET
+    target_dir.mkdir()
+    checkpoint = Checkpoint(
+        [weights[name] for name in sorted(weights) if name.endswith(".safetensors")]
+    )
+    for layer in range(layout.layers):
+        write_packed_file(
+            target_dir / f"layer-{layer}.bin",
+            MAXWELL_LAYER_MAGIC,
+            layer,
+            1 if layout.is_moe(layer) else 0,
+            pack_maxwell_layer_sections(checkpoint, layout, layer),
+        )
+    write_packed_file(
+        target_dir / "head.bin",
+        MAXWELL_HEAD_MAGIC,
+        layout.layers,
+        2,
+        _maxwell_head_sections(checkpoint, layout),
+    )
+    write_packed_file(
+        target_dir / "embedding.bin",
+        EMBEDDING_MAGIC,
+        layout.vocabulary_size,
+        layout.hidden_size,
+        _maxwell_embedding_sections(checkpoint, layout),
+    )
+    for name, source in tokenizer_files.items():
+        _copy(source, stage / TOKENIZER, name)
+    _write_tokenizer_config(stage, config)
+    # The MTP layer ships in the checkpoint (mtp_layers.0.*) but no draft
+    # payload yet: the package carries the Null draft until the phase-2
+    # draft binding lands, so the manifest declares no draft object.
+    written = sorted(p for p in stage.rglob("*") if p.is_file())
+    manifest = _maxwell_manifest(
+        model,
+        family_name,
+        layout,
+        sources,
+        [_artifact(path, stage) for path in written],
+        geometry or {},
+        serving,
+        signature,
+    )
+    (stage / PACKAGE_MANIFEST).write_bytes(models.json_bytes(manifest))
+    return manifest
+
+
 def package_manifest(
     model,
     family_name,
@@ -1757,6 +2122,30 @@ def build_package(
     or the layouts directly (tests). serving and signature are the family's
     serving contract and identity signature, recorded into the manifest so
     the package self-describes (server/serving.py reads it at load)."""
+    if _text_type(config) == "maxwell_moe":
+        # maxwell_moe is packed-only: its own writer, layout and manifest;
+        # the MTP draft stays out until its phase-2 binding lands.
+        if pack is not None and "layout" in pack:
+            maxwell_layout = MaxwellLayout(**pack["layout"])
+        elif isinstance(layout, MaxwellLayout):
+            maxwell_layout = layout
+        else:
+            raise models.ModelError(
+                "maxwell packing needs the family's MaxwellLayout"
+            )
+        return _build_maxwell_package(
+            stage,
+            model,
+            family_name,
+            config,
+            weights,
+            tokenizer_files,
+            sources,
+            layout=maxwell_layout,
+            serving=serving,
+            signature=signature,
+            geometry=(pack or {}).get("execution_geometry"),
+        )
     if _text_type(config) == "qwen4_exp_text":
         # qwen4exp is packed-only: its own writer, layout and manifest.
         if pack is not None and "layout" in pack:

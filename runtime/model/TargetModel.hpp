@@ -56,6 +56,25 @@ struct AttentionMixerWeights final {
   ops::Projection gateProjection;
 };
 
+// nemotron_h_moe's Mamba-2 mixer: the fused in_proj (gate | conv input |
+// dt) in padded storage rows, the depthwise convolution's taps-major kernel
+// and bias, the decay's raw ssm_a (the kernels apply -exp) and D skip, the
+// dt bias, the grouped gated RMS norm and the out projection.
+struct Mamba2MixerWeights final {
+  ops::Projection inputProjection;
+  metal::MetalBuffer convolutionWeights;
+  metal::MetalBuffer convolutionBias;
+  metal::MetalBuffer decay;
+  metal::MetalBuffer skip;
+  metal::MetalBuffer timeBias;
+  ops::NormWeights mixerNorm;
+  ops::Projection outputProjection;
+};
+
+// The block of a tri-hybrid target whose one sub-layer is the MoE
+// (nemotron's moeMask layers) keeps an empty mixer record.
+struct EmptyMixerWeights final {};
+
 // LFM2's double-gated short convolution: in_proj produces [B|C|x], the
 // causal depthwise convolution runs over the FIFO state, and the result is
 // C*conv fed to out_proj. `convolutionTapsMajor` records the weight's
@@ -68,7 +87,8 @@ struct LfmConvWeights final {
 };
 
 using MixerWeights =
-    std::variant<GdnMixerWeights, AttentionMixerWeights, LfmConvWeights>;
+    std::variant<GdnMixerWeights, AttentionMixerWeights, LfmConvWeights,
+                 Mamba2MixerWeights, EmptyMixerWeights>;
 
 // A target's weights outside its layers and the record of every file
 // its weights were read from.
@@ -76,6 +96,9 @@ struct TargetModelWeightsBase {
   ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
   ops::EmbeddingWeights tokenEmbedding;
+  // nemotron's state layers' ssm_a decays stacked in state order — the
+  // batch commit's single a_weights operand. Empty elsewhere.
+  metal::MetalBuffer mambaDecays;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
@@ -130,11 +153,16 @@ struct Gemma4FfnWeights final {
   float layerScalar = 1.0F;
 };
 
+// nemotron_h_moe's attention and Mamba-2 blocks have no FFN at all: the
+// block is its one sub-layer.
+struct EmptyFfnWeights final {};
+
 // The FFN kinds a target layer can carry: the plain dense triple, a routed
 // MoE block (Qwen3.6-MoE, MiniCPM-V), LFM2-MoE's dense/MoE mix and Gemma's
-// routed-plus-shared-expert block.
+// routed-plus-shared-expert block, or none (nemotron's mixer blocks).
 using TargetLayerFfn = std::variant<DenseFfnWeights, ops::MoeWeights,
-                                    Lfm2FfnWeights, Gemma4FfnWeights>;
+                                    Lfm2FfnWeights, Gemma4FfnWeights,
+                                    EmptyFfnWeights>;
 
 // One target layer: the mixer norm, the mixer, the FFN norm and the FFN.
 // Gemma's extra norms and tensors live in its Gemma4FfnWeights.
@@ -179,6 +207,23 @@ struct TargetModelGeometry final {
   // The compiled GDN kernel set the recurrent blocks bind (ops/GDN.hpp);
   // the family maker declares it, geometryFor copies it here.
   ops::GdnCore gdnCore = ops::GdnCore::Unspecified;
+  // nemotron_h_moe's Mamba-2 mixers: their count (a third of
+  // stateLayout.layers is never one), heads, per-head dimension, B/C
+  // groups, state size and the gate branch's width, and the compiled
+  // kernel set they bind (ops/Mamba2.hpp).
+  uint32_t mambaLayers = 0;
+  uint32_t mambaHeads = 0;
+  uint32_t mambaHeadDimension = 0;
+  uint32_t mambaGroups = 0;
+  uint32_t mambaStateSize = 0;
+  uint32_t mambaInnerSize = 0;
+  uint32_t mambaTimeStepRank = 0;
+  float mambaDtMinimum = 0.0f;
+  float mambaDtMaximum = 0.0f;
+  ops::Mamba2Core mambaCore = ops::Mamba2Core::Unspecified;
+  // Blocks that are an MoE sub-layer alone (nemotron's moeMask): they take
+  // neither a KV slot nor a state cell, which valid() accounts.
+  uint32_t ffnOnlyLayers = 0;
   uint32_t attentionWidth = 0;
   uint32_t attentionQueryHeads = 0;
   uint32_t attentionKvHeads = 0;
@@ -194,7 +239,8 @@ struct TargetModelGeometry final {
   uint32_t expertIntermediateSize = 0;
   FfnKind ffnKind = FfnKind::Dense;
   // The stateLayout.layers recurrent slots are gdnLayers GDN layers plus
-  // convLayers LFM2 convolution layers; a pure dense target has neither.
+  // convLayers LFM2 convolution layers plus mambaLayers Mamba-2 mixers; a
+  // pure dense target has none.
   uint32_t gdnLayers = 0;
   uint32_t convLayers = 0;
   // The convolution FIFO's kernel taps (kGdnConvolutionTaps for GDN, the
@@ -211,6 +257,19 @@ struct TargetModelGeometry final {
   ops::WeightLayout moeLayout = ops::WeightLayout::Affine64;
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   bool moeSharedExpert = true;
+  // NVIDIA Nemotron's ungated relu-squared blocks (MoeShape's
+  // ungatedExperts + sharedExpertUnitWeight, shared expert of
+  // sharedIntermediateSize at unit weight).
+  bool moeUngatedExperts = false;
+  uint32_t sharedIntermediateSize = 0;
+  // The routed experts' norm_topk_prob scaling factor (GGUF
+  // expert_weights_scale; Nemotron's 2.5, 1.0 elsewhere).
+  float moeRoutedScale = 1.0F;
+  // Every block's gate, up and down expert projections — routed and shared
+  // — resident in a format the int8 prefill tile takes
+  // (gguf_prefill_int8_format): its prefill plans run the int8 expert
+  // passes (MoeConfig::int8Passes, kernels/shared/moe_int8.metal).
+  bool moeInt8Experts = false;
   // Collection-time marker: a mixed-FFN target's first MoE block seeds
   // moeLayout, not its first layer.
   bool moeSeeded = false;
@@ -218,6 +277,9 @@ struct TargetModelGeometry final {
   std::array<uint32_t, 2> stopTokens{};
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
+  // A hyper-connected capture's row width (the streams' streamWidth,
+  // maxwell-moe's MTP input); zero keeps the hiddenSize slots.
+  uint32_t captureStreamWidth = 0;
   kv::Layout kvLayout{};
   // The resolved DuoAttention policy (kv::DuoPolicy): head_mask holds one
   // bit per (attention ordinal, KV head) pair; layerDuoPolicy derives each
@@ -272,11 +334,22 @@ struct TargetModelGeometry final {
     return gdnKeyHeads * gdnHeadDimension;
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * captureLayerCount;
+    return (captureStreamWidth ? captureStreamWidth : hiddenSize) *
+           captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeLayout, moeExpertFormat,
-            moeSharedExpert};
+    return {hiddenSize,
+            experts,
+            expertsPerToken,
+            expertIntermediateSize,
+            moeLayout,
+            moeExpertFormat,
+            moeSharedExpert,
+            moeUngatedExperts,
+            moeUngatedExperts,
+            moeUngatedExperts ? sharedIntermediateSize : 0u,
+            moeRoutedScale,
+            moeInt8Experts};
   }
   // The widest FFN intermediate of the target: a mixed target (LFM2-MoE)
   // carries both a dense intermediate for its leading layers and the MoE
@@ -299,6 +372,17 @@ struct TargetModelGeometry final {
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth, gdnCore};
+  }
+  [[nodiscard]] constexpr ops::Mamba2Shape mambaShape() const noexcept {
+    // packedWidth is the packed buffers' element stride: the in_proj's
+    // padded storage tile packedGdnWidth, not the logical row count.
+    return {mambaHeads,     mambaHeadDimension,
+            mambaGroups,    mambaStateSize,
+            convolutionTaps, mambaInnerSize,
+            convolutionDimension,
+            packedGdnWidth,
+            mambaDtMinimum, mambaDtMaximum,
+            mambaCore};
   }
   [[nodiscard]] constexpr ops::LfmConvShape convShape() const noexcept {
     return {convolutionDimension, convolutionTaps, packedGdnWidth};
@@ -392,11 +476,14 @@ struct TargetModelGeometry final {
       });
     };
     const bool recurrentShape =
-        gdnLayers ? gdnShape().valid()
-                  : convLayers ? convShape().valid() : true;
+        gdnLayers    ? gdnShape().valid()
+        : convLayers ? convShape().valid()
+        : mambaLayers ? mambaShape().valid()
+                     : true;
     return captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
-           stateLayout.layers + kvLayout.attentionLayers == layers &&
-           stateLayout.layers == gdnLayers + convLayers &&
+           stateLayout.layers + kvLayout.attentionLayers + ffnOnlyLayers ==
+               layers &&
+           stateLayout.layers == gdnLayers + convLayers + mambaLayers &&
            (!convLayers || attentionQueryHeads / attentionKvHeads * attentionKvHeads == attentionQueryHeads) &&
            recurrentShape &&
            kvLayout.kvHeads == attentionKvHeads &&
@@ -477,6 +564,9 @@ struct TargetModelPrefillBuffers final {
   metal::MetalBuffer gdnValues;
   metal::MetalBuffer gdnDecay;
   metal::MetalBuffer gdnBeta;
+  // nemotron's Mamba-2 prepare kernel's post-conv x|B|C rows
+  // ([rows][convolutionDimension] bf16); empty on other targets.
+  metal::MetalBuffer gdnPostConv;
   metal::MetalBuffer recurrent;
   metal::MetalBuffer gdnHidden;
   metal::MetalBuffer gdnOutput;
@@ -510,6 +600,17 @@ struct TargetModelPrefillBuffers final {
   [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
     return {normalized, projectionSums, denseGateScratch, denseIntermediate, downProjectionSums, linearScratch};
   }
+};
+
+// One step of a prefill command (addPrefill): its rows' buffers, its
+// sequences and their count. A command the Neural Engine's split takes
+// runs as two steps of firstStepRows and the rest (ops::FfnSplit), whose
+// layers interleave so that the agent's part of a step's FFN runs beside
+// the other step's mixer.
+struct TargetModelPrefillChunk final {
+  TargetModelPrefillBuffers buffers;
+  std::span<const TargetModelPrefillSequence> sequences;
+  uint32_t rows = 0;
 };
 
 struct TargetModelVerifyBuffers final {
@@ -627,16 +728,17 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows. The
-  // dense FFN of a chunk the split takes (FfnSplit::splits) runs split with the
-  // Neural Engine on `aneFfn`, when given.
+  // Returns each step's hidden buffer holding the last layer's output rows.
+  // The dense FFN of a command the split takes (FfnSplit::splits) runs
+  // split with the Neural Engine on `aneFfn`, when given, the steps'
+  // layers interleaved (TargetModelPrefillChunk).
   // layerScalars, when nonempty, replaces each layer's packed layer_scalar —
   // the DiffusionGemma encoder pass runs the trunk with the separately
   // packed encoder scalars while its canvas pass keeps the files' (decoder)
   // values.
-  [[nodiscard]] metal::MetalBuffer addPrefill(
-      metal::CommandGraph &graph, TargetModelPrefillBuffers buffers,
-      std::span<const TargetModelPrefillSequence> sequences, uint32_t rows,
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(
+      metal::CommandGraph &graph,
+      std::span<const TargetModelPrefillChunk> chunks,
       std::span<const RichKvLayer> kvLayers, ops::FfnSplit *aneFfn = nullptr,
       std::span<const float> layerScalars = {}) const;
   // liveRows, when nonempty, gives each chain lane's live verify row count
@@ -766,6 +868,8 @@ private:
   friend class GemmaLayerEncoder;
   friend class Qwen4LayerEncoder;
   friend class Lfm3LayerEncoder;
+  friend class MaxwellLayerEncoder;
+  friend class NemotronLayerEncoder;
 
   const TargetModelWeights *weights_;
   const TargetModelWeightsBase &weightsBase_;

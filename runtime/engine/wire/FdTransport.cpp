@@ -646,6 +646,9 @@ void FdTransport::requestShutdown() noexcept {
 }
 
 void FdTransport::writeAll(std::span<const uint8_t> bytes) const {
+  static const bool dbg = getenv("RICHENGINE_VERIFY_DUMP2") != nullptr;
+  if (dbg)
+    fprintf(stderr, "probe writeAll bytes=%zu\n", bytes.size());
   size_t offset = 0;
   while (offset < bytes.size()) {
     ssize_t count =

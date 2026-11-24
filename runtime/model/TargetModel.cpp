@@ -6,6 +6,7 @@
 #include "model/ModelPolicy.hpp"
 
 #include "metal/abi/GDN.h"
+#include "metal/abi/Gguf.h"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
@@ -45,17 +46,31 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.gdnKeyHeads = layout.gdnKeyHeads;
   result.gdnValueHeads = layout.gdnValueHeads;
   result.gdnHeadDimension = layout.gdnHeadDimension;
+  result.mambaHeads = layout.mambaHeads;
+  result.mambaHeadDimension = layout.mambaHeadDimension;
+  result.mambaGroups = layout.mambaGroups;
+  result.mambaStateSize = layout.mambaStateSize;
+  result.mambaInnerSize = layout.mambaInnerSize;
+  result.mambaTimeStepRank = layout.mambaTimeStepRank;
+  result.mambaDtMinimum = layout.mambaDtMinimum;
+  result.mambaDtMaximum = layout.mambaDtMaximum;
+  result.mambaCore = layout.mambaCore;
+  result.ffnOnlyLayers = layout.moeLayerCount();
   result.maskToken = layout.maskToken;
   result.stopTokens = layout.stopTokens;
   result.ffnKind = layout.ffnKind;
   result.kvLayout = layout.kvLayout();
   result.stateLayout = layout.gdnStateLayout();
   // The stateLayout.layers recurrent slots are the GDN hybrids' gdnLayers,
-  // the LFM2 targets' convLayers; a target without recurrent state has
-  // neither.
+  // the LFM2 targets' convLayers, nemotron's mambaLayers; a target without
+  // recurrent state has none.
   result.gdnLayers = layout.gdnHeadDimension ? result.stateLayout.layers : 0;
+  result.mambaLayers =
+      !layout.gdnHeadDimension && layout.mambaHeads
+          ? result.stateLayout.layers
+          : 0;
   result.convLayers =
-      !layout.gdnHeadDimension && layout.convolutionTaps
+      !layout.gdnHeadDimension && !layout.mambaHeads && layout.convolutionTaps
           ? result.stateLayout.layers
           : 0;
   result.convolutionTaps = layout.convolutionTaps;
@@ -64,9 +79,16 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.attentionQueryGate = layout.attentionQueryStride == 2;
   result.attentionQkNorm = layout.attentionQkNorm;
   result.moeSharedExpert = layout.moeSharedExpert;
+  result.moeUngatedExperts = layout.moeUngatedExperts;
+  result.sharedIntermediateSize = layout.sharedIntermediateSize;
+  result.moeRoutedScale = layout.moeRoutedScale ? layout.moeRoutedScale : 1.0F;
   result.gdnCore = layout.gdnCore;
   result.pleNgram = layout.pleNgram;
   result.captureLayerCount = layout.captureLayerCount;
+  // A hyper-connected target's capture width is the streams' streamWidth,
+  // not hiddenSize (maxwell-moe's MTP draft reads the layer-44 streams).
+  result.captureStreamWidth =
+      layout.captureStreams ? layout.streamWidth() : 0;
   std::copy_n(layout.hiddenCaptureLayers.begin(), layout.captureLayerCount,
               result.captureLayerValues.begin());
   result.sandwichNorm = layout.sandwichNorm;
@@ -182,8 +204,15 @@ public:
                                      metal::MetalBuffer output) const override {
     const TargetLayerWeights &layer = model_.weights_->layers[index];
     const metal::MetalBuffer residual = std::visit(
-        [&](const auto &mixer) {
-          return model_.addPrefillMixer(step, mixer, layer.inputNorm, input);
+        [&](const auto &mixer) -> metal::MetalBuffer {
+          using Mixer = std::decay_t<decltype(mixer)>;
+          // The nemotron arch's mixers encode in its own layer encoder.
+          if constexpr (std::is_same_v<Mixer, Mamba2MixerWeights> ||
+                        std::is_same_v<Mixer, EmptyMixerWeights>)
+            throw std::logic_error(
+                "nemotron mixer outside a nemotron layer encode");
+          else
+            return model_.addPrefillMixer(step, mixer, layer.inputNorm, input);
         },
         layer.mixer);
     model_.addPrefillFfn(step, index, layer, residual, output);
@@ -195,8 +224,14 @@ public:
                       metal::MetalBuffer output) const override {
     const TargetLayerWeights &layer = model_.weights_->layers[index];
     const metal::MetalBuffer residual = std::visit(
-        [&](const auto &mixer) {
-          return model_.addVerifyMixer(step, mixer, layer.inputNorm, input);
+        [&](const auto &mixer) -> metal::MetalBuffer {
+          using Mixer = std::decay_t<decltype(mixer)>;
+          if constexpr (std::is_same_v<Mixer, Mamba2MixerWeights> ||
+                        std::is_same_v<Mixer, EmptyMixerWeights>)
+            throw std::logic_error(
+                "nemotron mixer outside a nemotron layer encode");
+          else
+            return model_.addVerifyMixer(step, mixer, layer.inputNorm, input);
         },
         layer.mixer);
     model_.addVerifyFfn(step, layer, residual, output);
@@ -295,6 +330,8 @@ void includeFfn(TargetModelGeometry &geometry, const TargetLayerWeights &layer) 
                   includeMoeFfn(geometry, inner);
               },
               ffn.ffn);
+        } else if constexpr (std::is_same_v<Ffn, EmptyFfnWeights>) {
+          // nemotron's mixer blocks carry no FFN.
         } else {
           static_assert(std::is_same_v<Ffn, Gemma4FfnWeights>);
           // Gemma's expert slabs are always affine; the first block seeds
@@ -339,23 +376,58 @@ uint32_t routedExpertFormat(std::span<const TargetLayerWeights> layers) {
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
 
+// Whether every MoE block's expert projections — routed and shared, gate,
+// up and down — are resident in formats the int8 prefill tile takes
+// (gguf_prefill_int8_format): a prefill chunk's blocks then run the int8
+// passes (MoeConfig::int8Passes) where its routes average enough an expert.
+// Blocks of another layout, and layers without a routed block (a dense FFN,
+// Gemma's always-affine slabs, a shared-free block whose shared segment
+// ids never appear in a tile — its `takes` fails on the absent shared
+// segment), leave it off.
+bool moeInt8Experts(std::span<const TargetLayerWeights> layers) {
+  const auto takes = [](const ops::BlockExpertProjection &p) {
+    return p.routed.formatId == p.shared.formatId &&
+           gguf_prefill_int8_format(p.routed.formatId);
+  };
+  bool any = false;
+  for (const TargetLayerWeights &layer : layers) {
+    const ops::MoeWeights *moe = std::get_if<ops::MoeWeights>(&layer.ffn);
+    if (!moe) {
+      if (const auto *lfm2 = std::get_if<Lfm2FfnWeights>(&layer.ffn))
+        moe = std::get_if<ops::MoeWeights>(&lfm2->ffn);
+      if (!moe) continue;
+    }
+    if (moe->layout() != ops::WeightLayout::Block32) return false;
+    const ops::BlockMoeWeights &block = moe->blocks();
+    if (!takes(block.gate) || !takes(block.up) || !takes(block.down))
+      return false;
+    any = true;
+  }
+  return any;
+}
+
 } // namespace
 
 TargetModelGeometry targetModelGeometry(const TargetModelWeights &weights) {
   auto geometry = geometryFor(weights.layout);
   for (const auto &layer : weights.layers) {
     std::visit([&](const auto &mixer) {
-      includeProjection(geometry, mixer.inputProjection);
-      includeProjection(geometry, mixer.outputProjection);
-      // LFM3's head-wise gate projection (hidden -> query heads).
-      if constexpr (std::is_same_v<std::decay_t<decltype(mixer)>,
-                                   AttentionMixerWeights>)
-        if (mixer.gateProjection.outputSize)
-          includeProjection(geometry, mixer.gateProjection);
+      // nemotron's MoE blocks keep an empty mixer record.
+      if constexpr (!std::is_same_v<std::decay_t<decltype(mixer)>,
+                                    EmptyMixerWeights>) {
+        includeProjection(geometry, mixer.inputProjection);
+        includeProjection(geometry, mixer.outputProjection);
+        // LFM3's head-wise gate projection (hidden -> query heads).
+        if constexpr (std::is_same_v<std::decay_t<decltype(mixer)>,
+                                     AttentionMixerWeights>)
+          if (mixer.gateProjection.outputSize)
+            includeProjection(geometry, mixer.gateProjection);
+      }
     }, layer.mixer);
     includeFfn(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
+  geometry.moeInt8Experts = moeInt8Experts(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
   includeProjection(geometry, weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,
@@ -399,69 +471,131 @@ void addCapture(metal::CommandGraph &graph, const TargetModelGeometry &geometry,
 
 } // namespace
 
-metal::MetalBuffer TargetModel::addPrefill(
-    metal::CommandGraph &graph, TargetModelPrefillBuffers buffers,
-    std::span<const TargetModelPrefillSequence> sequences, uint32_t rows,
+std::vector<metal::MetalBuffer> TargetModel::addPrefill(
+    metal::CommandGraph &graph,
+    std::span<const TargetModelPrefillChunk> chunks,
     std::span<const RichKvLayer> kvLayers, ops::FfnSplit *aneFfn,
     std::span<const float> layerScalars) const {
-  if (sequences.empty() ||
-      sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
-      rows > ExecutionLimits::prefillTokenBudget ||
+  if (chunks.empty() || chunks.size() > 2 ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       (!layerScalars.empty() && layerScalars.size() != geometry_.layers)) {
     throw std::invalid_argument("invalid packed prefill batch");
   }
-  for (const TargetModelPrefillSequence &sequence : sequences) {
-    if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
-        sequence.convolutionOut.size() != geometry_.stateLayout.layers ||
-        sequence.recurrentIn.size() != geometry_.stateLayout.layers ||
-        sequence.recurrentOut.size() != geometry_.stateLayout.layers) {
-      throw std::invalid_argument("prefill state layer mismatch");
+  uint32_t totalRows = 0;
+  for (const TargetModelPrefillChunk &chunk : chunks) {
+    if (chunk.sequences.empty() ||
+        chunk.sequences.size() > ExecutionLimits::maximumBatchWidth ||
+        !chunk.rows || chunk.rows > ExecutionLimits::prefillTokenBudget)
+      throw std::invalid_argument("invalid packed prefill batch");
+    totalRows += chunk.rows;
+    for (const TargetModelPrefillSequence &sequence : chunk.sequences) {
+      if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
+          sequence.convolutionOut.size() != geometry_.stateLayout.layers ||
+          sequence.recurrentIn.size() != geometry_.stateLayout.layers ||
+          sequence.recurrentOut.size() != geometry_.stateLayout.layers) {
+        throw std::invalid_argument("prefill state layer mismatch");
+      }
     }
   }
-  PrefillStep step{graph, buffers, sequences, rows, kvLayers};
-  // The pass inputs routed to the active layer encoder (the DiffusionGemma
-  // encoder's per-layer scalars); its beginPrefill replaces the seed with
-  // its own state record.
-  step.extension = TargetPrefillInputs{layerScalars};
-  // A canvas pass is homogeneous: either every sequence spans canvas rows or
-  // none does (the commit pass encodes separately).
-  const bool canvas = sequences.front().canvas;
-  for (const TargetModelPrefillSequence &sequence : sequences)
-    if (sequence.canvas != canvas)
-      throw std::invalid_argument("mixed canvas and causal prefill sequences");
-  for (const TargetModelPrefillSequence &sequence : sequences) {
-    step.attention.push_back(
-        sequence.canvas
-            ? ops::PagedAttention::prefillCanvasPlan(
-                  sequence.rows, geometry_.attentionQueryHeads,
-                  geometry_.layerKvLayout(false))
-            : operators_.prefillAttention(
-                  sequence.rows, geometry_.attentionQueryHeads,
-                  geometry_.layerKvLayout(false),
-                  sequence.chunk.committed_tokens));
+  if (totalRows > ExecutionLimits::prefillTokenBudget)
+    throw std::invalid_argument("invalid packed prefill batch");
+  // The split takes a command whole, in its steps' chunks: two at the
+  // first step's rows where it runs two, one otherwise.
+  ops::FfnSplit *split = nullptr;
+  if (aneFfn && aneFfn->splits(totalRows)) {
+    const uint32_t first = aneFfn->firstStepRows(totalRows);
+    if (chunks.size() != (first < totalRows ? 2u : 1u) ||
+        chunks.front().rows != first)
+      throw std::invalid_argument(
+          "a prefill the Neural Engine splits runs in its steps' chunks");
+    split = aneFfn;
   }
-  encoder_->beginPrefill(step);
-  if (geometry_.ffnKind == FfnKind::SparseMoe)
-    step.moe = canvas ? operators_.moeCanvas(geometry_.moeShape(), rows)
-                      : operators_.moePrefill(geometry_.moeShape(), rows);
-  if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
+  std::vector<PrefillStep> steps;
+  steps.reserve(chunks.size());
+  for (const TargetModelPrefillChunk &chunk : chunks) {
+    PrefillStep &step =
+        steps.emplace_back(PrefillStep{graph, chunk.buffers, chunk.sequences,
+                                       chunk.rows, kvLayers});
+    // The pass inputs routed to the active layer encoder (the
+    // DiffusionGemma encoder's per-layer scalars); its beginPrefill
+    // replaces the seed with its own state record.
+    step.extension = TargetPrefillInputs{layerScalars};
+    // A canvas pass is homogeneous: either every sequence spans canvas
+    // rows or none does (the commit pass encodes separately).
+    const bool canvas = chunk.sequences.front().canvas;
+    for (const TargetModelPrefillSequence &sequence : chunk.sequences)
+      if (sequence.canvas != canvas)
+        throw std::invalid_argument(
+            "mixed canvas and causal prefill sequences");
+    for (const TargetModelPrefillSequence &sequence : chunk.sequences) {
+      step.attention.push_back(
+          sequence.canvas
+              ? ops::PagedAttention::prefillCanvasPlan(
+                    sequence.rows, geometry_.attentionQueryHeads,
+                    geometry_.layerKvLayout(false))
+              : operators_.prefillAttention(
+                    sequence.rows, geometry_.attentionQueryHeads,
+                    geometry_.layerKvLayout(false),
+                    sequence.chunk.committed_tokens));
+    }
+    encoder_->beginPrefill(step);
+    if (geometry_.ffnKind == FfnKind::SparseMoe)
+      step.moe = canvas ? operators_.moeCanvas(geometry_.moeShape(),
+                                               chunk.rows)
+                        : operators_.moePrefill(geometry_.moeShape(),
+                                                chunk.rows);
+    step.aneFfn = split;
+  }
+  // The command's layers over its steps: each step's next layer runs
+  // whole — its mixer, which may read the other step's written K/V through
+  // the shared page tables, then its FFN, whose split part the other
+  // step's join drains once this step's mixer is encoded (addPrefillFfn);
+  // here where no other step's mixer comes next, or where the layer's
+  // output rows are read before it.
+  // RICHENGINE_PREFILL_LIMIT=N: stop after N layers — divergence
+  // bisection aid mirroring RICHENGINE_LAYER_LIMIT on the verify path.
+  static const uint32_t prefillLimit = [] {
+    const char *e = std::getenv("RICHENGINE_PREFILL_LIMIT");
+    return e ? static_cast<uint32_t>(std::atoi(e)) : 0u;
+  }();
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
-    const metal::MetalBuffer input = buffers.hidden[index & 1];
-    const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-    const metal::MetalBuffer layerOutput =
-        encoder_->addPrefillLayer(step, index, input, output);
+    if (prefillLimit && index >= prefillLimit)
+      break;
+    std::array<metal::MetalBuffer, 2> layerOutputs;
+    for (size_t at = 0; at < steps.size(); ++at) {
+      PrefillStep &step = steps[at];
+      const metal::MetalBuffer input = step.buffers.hidden[index & 1];
+      const metal::MetalBuffer output = step.buffers.hidden[(index & 1) ^ 1];
+      layerOutputs[at] =
+          encoder_->addPrefillLayer(step, index, input, output);
+    }
+    if (split &&
+        (steps.size() == 1 || index + 1 == geometry_.layers ||
+         geometry_.captureSlot(index)))
+      split->join(graph);
     if (const auto slot = geometry_.captureSlot(index);
         slot && !encoder_->capturesHidden())
-      for (const TargetModelPrefillSequence &sequence : sequences)
-        for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
-          const TargetModelPrefillCapture &c = sequence.captures[capture];
-          addCapture(graph, geometry_, *slot, layerOutput, c.sourceStart, buffers.captured, c.destinationStart,
-                     c.rows);
-        }
+      for (size_t at = 0; at < steps.size(); ++at)
+        for (const TargetModelPrefillSequence &sequence :
+             steps[at].sequences)
+          for (uint32_t capture = 0; capture < sequence.captureCount;
+               ++capture) {
+            const TargetModelPrefillCapture &c = sequence.captures[capture];
+            addCapture(graph, geometry_, *slot, layerOutputs[at],
+                       c.sourceStart, steps[at].buffers.captured,
+                       c.destinationStart, c.rows);
+          }
   }
-  requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-  return buffers.hidden[geometry_.layers & 1];
+  std::vector<metal::MetalBuffer> outputs;
+  outputs.reserve(steps.size());
+  for (PrefillStep &step : steps) {
+    if (!prefillLimit)
+      requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
+    outputs.push_back(
+        step.buffers.hidden[(prefillLimit ? prefillLimit : geometry_.layers) &
+                            1]);
+  }
+  return outputs;
 }
 
 // An affine prefill projection reads the Q4 input sums of its rows, which the
@@ -508,9 +642,17 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
     const metal::MetalBuffer attentionRows = backend_.view(b.fullAttention, sequence.queryOffset, queryBytes);
     const metal::MetalBuffer keys = backend_.view(b.chunkKeys, sequence.kvOffset, kvBytes);
     const metal::MetalBuffer values = backend_.view(b.chunkValues, sequence.kvOffset, kvBytes);
+    // A NoPE target's rope tensors are unallocated: the compiled core has
+    // zero rotary pairs and never reads them, so any live buffer binds.
+    const metal::MetalBuffer ropeCos =
+        geometry_.rotaryPairs ? f32(b.ropeCos, geometry_.rotaryPairs)
+                              : queries;
+    const metal::MetalBuffer ropeSin =
+        geometry_.rotaryPairs ? f32(b.ropeSin, geometry_.rotaryPairs)
+                              : queries;
     ops::PagedAttention::addPrefillProjection(
         step.graph, u16(b.fullPacked, geometry_.packedFullWidth), mixer.queryNorm, mixer.keyNorm,
-        f32(b.ropeCos, geometry_.rotaryPairs), f32(b.ropeSin, geometry_.rotaryPairs), queries, keys, values,
+        ropeCos, ropeSin, queries, keys, values,
         sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
     if (std::getenv("RICHENGINE_VERIFY_DUMP2")) {
       auto fnv = [](const void *p, size_t n) {
@@ -578,9 +720,15 @@ void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const TargetL
   const TargetModelPrefillBuffers &b = step.buffers;
   const auto dense = [&](const ops::Projection &gate, const ops::Projection &up,
                          const ops::Projection &down) {
+    // The other step's split FFN joins once this step's mixer is encoded
+    // (addPrefill): the Neural Engine ran it beside that mixer.
+    if (step.aneFfn)
+      step.aneFfn->join(step.graph);
     addPrefillNorm(step, residual, layer.postAttentionNorm, gate.layout());
     const ops::PrefillFfnBuffers ffn = b.ffn();
-    if (step.aneFfn)
+    // The model's last layer runs on the GPU alone (its rows are read
+    // alone): the in-flight bound counts on it (ops::FfnSplit::fits).
+    if (step.aneFfn && index + 1 < geometry_.layers)
       step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
     else
       operators_.linear().addPrefillSwiGlu(step.graph, {&gate, &up, &down},
@@ -715,8 +863,14 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch, .prepared = normalized},
              mixer.inputProjection, inputPlan);
-  ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
-                                           b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
+  // NoPE targets carry no rope tensors; the zero-pair core never reads
+  // the slots, so the query rows stand in for them.
+  const metal::MetalBuffer ropeCos =
+      geometry_.rotaryPairs ? b.ropeCos : b.fullQueries;
+  const metal::MetalBuffer ropeSin =
+      geometry_.rotaryPairs ? b.ropeSin : b.fullQueries;
+  ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, ropeCos,
+                                           ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes,
                                            step.rowCapacity);
   const ops::LinearPlan outputPlan =

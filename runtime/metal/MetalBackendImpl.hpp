@@ -671,6 +671,9 @@ struct SplitFeedback4 {
     std::atomic<double> gpuStart{std::numeric_limits<double>::infinity()};
     std::mutex mutex;
     __strong NSError *error = nil;
+    // Each commit's GPU span, for the per-buffer longest and median
+    // finishCommand reads off its leading buffers.
+    std::vector<double> durations;
 
     // Merges one commit's feedback: the earliest start and the first
     // error win, matching the leading-buffers scan of finishCommand.
@@ -680,10 +683,10 @@ struct SplitFeedback4 {
         while (start < current &&
                !gpuStart.compare_exchange_weak(current, start,
                                                std::memory_order_relaxed)) {}
-        if (NSError *failure = feedback.error) {
-            std::lock_guard lock(mutex);
-            if (!error) error = failure;
-        }
+        const double duration = feedback.GPUEndTime - start;
+        std::lock_guard lock(mutex);
+        if (NSError *failure = feedback.error; failure && !error) error = failure;
+        durations.push_back(duration);
     }
 };
 #endif
@@ -744,6 +747,16 @@ struct CommandTicket::State {
         }
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
+        if (!leadingCommands.empty()) {
+            std::vector<double> buffers;
+            for (id<MTLCommandBuffer> buffer : leadingCommands) {
+                buffers.push_back(buffer.GPUEndTime - buffer.GPUStartTime);
+            }
+            buffers.push_back(command.GPUEndTime - command.GPUStartTime);
+            std::ranges::nth_element(buffers, buffers.begin() + buffers.size() / 2);
+            timing.medianBufferSeconds = buffers[buffers.size() / 2];
+            timing.longestBufferSeconds = std::ranges::max(buffers);
+        }
 
         std::string error;
         // The first buffer that failed names the error: the buffers after a
@@ -803,12 +816,14 @@ struct CommandTicket::State {
         // leading commits report through split4, which completes what
         // this commit's own feedback covers — the whole command's start
         // and its first error, like finishCommand's leading-buffers scan.
+        std::vector<double> buffers;
         if (split4) {
             const double earlier =
                 split4->gpuStart.load(std::memory_order_relaxed);
             if (earlier < gpuStart) gpuStart = earlier;
             std::lock_guard lock(split4->mutex);
             if (split4->error) failure = split4->error;
+            buffers = split4->durations;
         }
         timing.gpuSeconds = feedback.GPUEndTime - gpuStart;
         if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
@@ -816,6 +831,12 @@ struct CommandTicket::State {
         }
         timing.wallSeconds =
             std::chrono::duration<double>(wallEnd - wallStart).count();
+        if (split4) {
+            buffers.push_back(feedback.GPUEndTime - feedback.GPUStartTime);
+            std::ranges::nth_element(buffers, buffers.begin() + buffers.size() / 2);
+            timing.medianBufferSeconds = buffers[buffers.size() / 2];
+            timing.longestBufferSeconds = std::ranges::max(buffers);
+        }
 
         std::string error;
         if (failure) {

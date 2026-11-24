@@ -12,6 +12,8 @@
 #include "LfmVision.hpp"
 #include "LfmAudio.hpp"
 #include "model/NullDraft.hpp"
+#include "model/MaxwellMtpDraft.hpp"
+#include "model/NemotronMtpDraft.hpp"
 #include "VisionLoader.hpp"
 #include "LfmVisionLoader.hpp"
 #include "LfmAudioLoader.hpp"
@@ -39,7 +41,8 @@ class CompositeStateStorage;
 
 using DraftWeights =
     std::variant<NullDraftWeights, DFlashDraftWeights, DFlashV1DraftWeights,
-                 DSparkDraftWeights, DSplineDraftWeights>;
+                 DSparkDraftWeights, DSplineDraftWeights,
+                 MaxwellMtpDraftWeights, NemotronMtpDraftWeights>;
 
 // The vision tower's weights, whichever tower the model serves; the default
 // alternative is the empty Qwen weights a text-only model carries.

@@ -42,6 +42,13 @@ struct RuntimeGeometry final {
   // The descriptor's runtime policy, copied here so the model's makers —
   // not type probes on the weight variants — own the switches below.
   ModelTuning tuning;
+  // The steps of a prefill command: two halves of kPrefillRows for a dense
+  // target, whose Neural Engine split pipelines a command's two steps
+  // (ops::FfnSplit::firstStepRows); otherwise one. And the rows each step's
+  // views of the step tensors begin after the one before's: a step tensor
+  // holds prefillChunks * prefillChunkRows rows, the first step's view all
+  // of them, so that a command of one step takes them all.
+  uint32_t prefillChunks = 1, prefillChunkRows = kPrefillRows;
 
   [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package,
                                             kv::Format format) {
@@ -63,6 +70,12 @@ struct RuntimeGeometry final {
     result.draft = std::visit(
         [](const auto &weights) { return weights.layout; }, package.draft);
     result.tuning = package.descriptor.tuning;
+    // Two halves of a command's rows pipeline beside the Neural Engine's
+    // evaluations; a MoE target's experts leave the split nothing to take.
+    if (result.target.ffnKind != FfnKind::SparseMoe) {
+      result.prefillChunks = 2;
+      result.prefillChunkRows = kPrefillRows / 2;
+    }
     // A Null draft carries a placeholder layout only: it never encodes, so
     // it needs no hidden/vocabulary agreement with the target. Real drafts
     // still require a valid ring layout and matching sizes.

@@ -51,6 +51,8 @@ std::string_view runtimeBootstrapStageName(RuntimeBootstrapStage stage) {
     return "composite_state_restore";
   case RuntimeBootstrapStage::MemoryAudit:
     return "memory_audit";
+  case RuntimeBootstrapStage::AneFfnSetUp:
+    return "ane_ffn_set_up";
   case RuntimeBootstrapStage::AnnounceReady:
     return "announce_ready";
   case RuntimeBootstrapStage::Ready:
@@ -151,7 +153,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime,
-    ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop) {
+    ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop,
+    const std::function<uint32_t(double)> &setUp) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
@@ -192,12 +195,17 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   // warmups only re-prove what the sweep times anyway. The memory audit
   // and the ready announcement still run; the warmup steps stay Pending.
   const bool tuneChild = std::getenv("RICHENGINE_TUNE_CHILD") != nullptr;
+  double mostRowsMilliseconds = 0.0;
   if (!tuneChild) {
     model::WarmupStepResult maximumPrefill = run(
         RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
         [&] {
-          return modelRuntime.warmupPrefill(
+          const double before = modelRuntime.telemetry().totalPrefillGpuSeconds;
+          model::WarmupStepResult result = modelRuntime.warmupPrefill(
               model::ExecutionLimits::prefillTokenBudget);
+          mostRowsMilliseconds =
+              1000.0 * (modelRuntime.telemetry().totalPrefillGpuSeconds - before);
+          return result;
         });
     nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
                              maximumPrefill.wallSeconds * 1000.0);
@@ -227,29 +235,49 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
         [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);
   }
 
-  ActualMemoryReport actual;
-  try {
-    actual = memoryReporter();
-  } catch (const metal::MetalAllocationError &error) {
-    report.resourceFailure = resourceAllocationFailure(error.failure());
-    fail(report, RuntimeBootstrapStage::MemoryAudit,
-         std::string("actual memory reporting failed: ") + error.what());
-  } catch (const std::exception &error) {
-    fail(report, RuntimeBootstrapStage::MemoryAudit,
-         std::string("actual memory reporting failed: ") + error.what());
-  } catch (...) {
-    fail(report, RuntimeBootstrapStage::MemoryAudit,
-         "actual memory reporting failed with an unknown exception");
-  }
-  // The audit reads arenas the warmups allocate; the tuning child skips
-  // both — a knob that breaks accounting still fails inside its measured
-  // batches, where the sweep scores it as failed.
-  if (!tuneChild) {
-    report.memoryAudit = auditActualMemory(memoryPlan, actual);
-    if (!report.memoryAudit.valid) {
+  const auto audit = [&] {
+    ActualMemoryReport actual;
+    try {
+      actual = memoryReporter();
+    } catch (const metal::MetalAllocationError &error) {
+      report.resourceFailure = resourceAllocationFailure(error.failure());
       fail(report, RuntimeBootstrapStage::MemoryAudit,
-           report.memoryAudit.describe());
+           std::string("actual memory reporting failed: ") + error.what());
+    } catch (const std::exception &error) {
+      fail(report, RuntimeBootstrapStage::MemoryAudit,
+           std::string("actual memory reporting failed: ") + error.what());
+    } catch (...) {
+      fail(report, RuntimeBootstrapStage::MemoryAudit,
+           "actual memory reporting failed with an unknown exception");
     }
+    // The audit reads arenas the warmups allocate; the tuning child skips
+    // both — a knob that breaks accounting still fails inside its measured
+    // batches, where the sweep scores it as failed.
+    if (!tuneChild) {
+      report.memoryAudit = auditActualMemory(memoryPlan, actual);
+      if (!report.memoryAudit.valid) {
+        fail(report, RuntimeBootstrapStage::MemoryAudit,
+             report.memoryAudit.describe());
+      }
+    }
+  };
+  audit();
+  // The split a start left to set up joins last, at the least memory the
+  // engine holds: the audit above gave back what the engine does not keep
+  // idle, and runs again after it so that it sees the split. The tuning
+  // child skips it with the rest of the warmups.
+  if (setUp && !tuneChild) {
+    WarmupStepStatus status = WarmupStepStatus::Pending;
+    run(RuntimeBootstrapStage::AneFfnSetUp, status, [&] {
+      const auto started = AwakeClock::now();
+      if (const uint32_t rows = setUp(mostRowsMilliseconds))
+        return modelRuntime.warmupPrefill(rows);
+      // A set-up that left the GPU alone took at least the clock's tick
+      // (1 ns), even where the clock read none.
+      return model::WarmupStepResult{
+          "the GPU alone", std::max(millisecondsSince(started) / 1000.0, 1e-9), {}};
+    }, true);
+    audit();
   }
 
   try {
@@ -391,6 +419,16 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
 
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
+  // A split left to set up joins as the warmup's last step, with the GPU time
+  // of its prefill of a full chunk on the GPU alone, which gives the mixer;
+  // a prefill of the least rows it takes creates its kernels. The runtime
+  // reads the split live, so none of its limits need refreshing.
+  std::function<uint32_t(double)> aneFfn;
+  if (resources->aneFfnPending())
+    aneFfn = [resourcesPointer, modelPointer](double gpuMilliseconds) {
+      resourcesPointer->finishAneFfn(gpuMilliseconds, *modelPointer);
+      return resourcesPointer->aneFfnMinimumRows();
+    };
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime,
       [resourcesPointer, modelPointer] {
@@ -406,7 +444,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
         return report;
       },
-      *nativeLoop);
+      *nativeLoop, aneFfn);
 
   // The per-operation guard RuntimeResources installed is only for startup:
   // once Ready, the engine meets memory pressure between its ticks.

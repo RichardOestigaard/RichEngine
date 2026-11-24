@@ -370,9 +370,17 @@ bool Engine::tick(double now) {
       Pending command = std::move(pending_.front());
       pending_.pop_front();
       std::vector<ModelStepResult> results = command.ticket->wait();
+      static const bool dbgProbe = getenv("RICHENGINE_VERIFY_DUMP2") != nullptr;
+      if (dbgProbe)
+        fprintf(stderr,
+                "probe engine-wait-done results=%zu out0=%zu fail=[%s]\n",
+                results.size(),
+                results.empty() ? 0 : results[0].outputTokens.size(),
+                results.empty() ? "" : results[0].failure.c_str());
       // The step's wait() committed the anchors the next decode needs; its
       // command can go to the GPU while apply() retires this step's lanes.
       static_cast<void>(trySubmitAheadDecode(command, results, now));
+      if (dbgProbe) fprintf(stderr, "probe ahead-done\n");
       apply(command.plan, results, command.ticket->wallMilliseconds(),
             now - command.startedMilliseconds,
             command.ticket->prefillTimingIsRepresentative(), now);

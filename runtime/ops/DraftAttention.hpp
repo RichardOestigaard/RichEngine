@@ -19,6 +19,10 @@ enum class DraftHeadCore : uint8_t {
   Q16K2D128,
   Q32K8D64Interleaved,
   Q8K2D256,
+  // 32 query heads over 2 KV heads of 128 (Nemotron-3.5-Lightning's DSpark
+  // draft): sixteen-head KV groups tile as two M=64 head subtiles, and its
+  // reduce optionally binds a per-head attention-sink bias.
+  Q32K2D128,
 };
 enum class DraftContextCore : uint8_t {
   Unspecified,
@@ -30,6 +34,7 @@ enum class DraftContextCore : uint8_t {
   Plain4096,
   Plain2816,
   Plain2048,
+  Plain2688,
 };
 
 struct DraftAttentionShape final {
@@ -113,6 +118,11 @@ struct DraftDecodeAttentionBuffers final {
   std::span<const metal::MetalBuffer> persistentValues;
   metal::MetalBuffer queryKeys;
   metal::MetalBuffer queryValues;
+  // An optional per-head attention-sink bias ([queryHeads] bf16) bound per
+  // layer: the sink's exp joins each row's softmax denominator with no K/V
+  // row (GPT-OSS style). Only the Q32K2D128 head core's reduce declares the
+  // binding; other cores reject a non-empty buffer.
+  metal::MetalBuffer attentionSinks;
 };
 
 class DraftAttention final {

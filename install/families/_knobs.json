@@ -435,5 +435,12 @@
     ],
     "reason": "host-written verify mask grid vs the device-written indirect grid; device grid on by default",
     "agentic": true
+  },
+  "MOE_TILE_MAJOR": {
+    "env": "RICHENGINE_MOE_TILE_MAJOR",
+    "values": [
+      "1"
+    ],
+    "reason": "tile-major expert traversal on the staged GGUF tile; +1.5% on nemotron verify, off by default"
   }
 }

@@ -96,4 +96,24 @@ private:
 
 [[nodiscard]] std::vector<affine::Image> dsplineDraftCheckpointImages(const DFlashDraftLayout &layout);
 
+// A NemotronHMtpModel checkpoint (dev/convert/gguf_mtp_to_safetensors.py),
+// config.json and BF16 safetensors -> the single mtp.bin of a nemotron MTP
+// package (NemotronMtpDraft.cpp): every projection an F32 float segment
+// (hidden 2688 sits off every quantized tile), every norm and the MoE
+// tensors bf16 copies the draft's own kernels read. One file: mtp() loads
+// it.
+class NemotronMtpCheckpointLoader final {
+public:
+  NemotronMtpCheckpointLoader(WeightImages &images, const std::filesystem::path &directory,
+                          const DFlashDraftLayout &layout);
+  ~NemotronMtpCheckpointLoader();
+  [[nodiscard]] WeightFile mtp();
+
+private:
+  WeightImages &images_;
+  std::shared_ptr<affine::PlannedCheckpoint> planned_; // mtp.bin alone
+};
+
+[[nodiscard]] std::vector<affine::Image> nemotronMtpDraftCheckpointImages(const DFlashDraftLayout &layout);
+
 } // namespace richengine::model

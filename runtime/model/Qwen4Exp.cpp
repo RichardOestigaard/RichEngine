@@ -996,8 +996,12 @@ public:
     if (extra.ple) addVerifyPle(step, *extra.ple, verify_.streams,
                                 step.rowCapacity);
     const ops::Projection *inputProjection = nullptr;
-    std::visit([&](const auto &mixer) { inputProjection = &mixer.inputProjection; },
-               layer.mixer);
+    std::visit([&](const auto &mixer) {
+      // nemotron's MoE blocks keep an empty mixer record.
+      if constexpr (!std::is_same_v<std::decay_t<decltype(mixer)>,
+                                    EmptyMixerWeights>)
+        inputProjection = &mixer.inputProjection;
+    }, layer.mixer);
     const ops::PreparedInput mixInput =
         addVerifyMix(step, extra.mixerHyper, inputProjection);
     if (std::holds_alternative<GdnMixerWeights>(layer.mixer))

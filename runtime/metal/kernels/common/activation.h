@@ -30,3 +30,11 @@ inline float richengine_gelu_tanh(float x) {
       0.79788456080286536f * (x + 0.044715f * x * x * x);
   return 0.5f * x * (1.0f + richengine_tanh(inner));
 }
+
+// relu(x)^2 (NVIDIA Nemotron's ungated expert activation): max(x, 0)^2, no
+// gate operand. It applies to the same bf16-rounded sum the gated epilogues
+// activate, so relu2(bfloat(v)) is the store-time form.
+inline float richengine_relu2(float x) {
+  const float r = max(x, 0.0f);
+  return r * r;
+}

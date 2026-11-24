@@ -367,3 +367,20 @@ kernel void hyper_connection_stream_mean(
   destination[ulong(p.row + row) * p.stride + p.column + d] =
       bfloat(sum / float(p.streams));
 }
+
+// The full stream state of each row (bf16, streams * hidden wide), at
+// column p.column of row p.row + r of the destination: the MTP draft's
+// capture, which needs every stream, not their mean.
+kernel void hyper_connection_stream_capture(
+    device const float *streams [[buffer(0)]],
+    device bfloat *destination [[buffer(1)]],
+    constant HyperStreamMeanParams &p [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = group.x, d = group.y * kRowThreads + tid;
+  const uint width = p.streams * p.hidden;
+  if (row >= p.rows || d >= width)
+    return;
+  destination[ulong(p.row + row) * p.stride + p.column + d] =
+      bfloat(streams[ulong(row) * width + d]);
+}

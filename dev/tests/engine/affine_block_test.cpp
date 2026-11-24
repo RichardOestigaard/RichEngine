@@ -322,8 +322,40 @@ int main() {
           if (section.kind == affine::SectionKind::Block) ++projections;
       require(projections > 0, "a draft checkpoint's projections did not take the block layout");
     }
+
+    // A draft off the quantized tiles (the nemotron DSpark draft's hidden
+    // 2688) plans oQ float sections instead: every part unquantized, the
+    // image still carrying the block-weights type flag the readers key on.
+    DFlashDraftLayout offTile;
+    offTile.kind = DraftKind::DSpark;
+    offTile.layers = 6;
+    offTile.hiddenSize = 2688;
+    offTile.attentionSize = 4096;
+    offTile.qkvSize = 4608;
+    offTile.intermediateSize = 6144;
+    offTile.kvHeads = 2;
+    offTile.targetHiddenSize = 16128;
+    offTile.markovRank = 512;
+    offTile.attentionSinks = true;
+    offTile.confidenceHead = false;
+    uint32_t oqSections = 0;
+    for (const affine::Image &image :
+         affine::blockImages(dsparkDraftCheckpointImages(offTile))) {
+      require(image.type & kBlockWeightsImageType,
+              "a float draft image missed the block type flag");
+      for (const affine::Section &section : image.sections) {
+        if (section.kind != affine::SectionKind::Oq) continue;
+        for (const affine::ProjectionPart &part : section.parts)
+          require(part.unquantized,
+                  "an off-tile draft part was planned quantized");
+        ++oqSections;
+      }
+    }
+    // Five projections per layer (qkv, o, gate, up, down) plus the fc.
+    require(oqSections == 5 * offTile.layers + 1,
+            "the off-tile draft did not plan float projections");
     std::cout << "affine block: descriptor, repacked planes equal to the affine tiles, fused parts, "
-                 "section rejection, draft checkpoints PASS\n";
+                 "section rejection, draft checkpoints, off-tile float draft PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

@@ -178,8 +178,9 @@ inline void draft_top16_sharded_phase(
   }
 }
 
-// The DSpark draft's anchor row already predicts the next token: position p
-// reads logits row p, not p + 1.
+// An anchor-first DSpark draft's anchor row already predicts the next token
+// (row_offset 0); a bonus-anchor one's row 0 reproduces the anchor, like a
+// DFlash draft's (row_offset 1). params.row_offset carries the dialect.
 kernel void dspark_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
@@ -195,7 +196,8 @@ kernel void dspark_select_top16_sharded(
   threadgroup float round_values[2][8];
   threadgroup uint round_ids[2][8];
   draft_top16_sharded_phase(logits, partial_ids, partial_values,
-                            params.vocabulary, params.logits_stride, 0,
+                            params.vocabulary, params.logits_stride,
+                            params.row_offset,
                             maxima, thresholds, &round_values[0][0],
                             &round_ids[0][0], group, thread_index, lane,
                             simd_group, query_rows);
@@ -224,31 +226,66 @@ kernel void dspark_select_edges(
   constexpr uint Shards = RICHENGINE_DRAFT_SAMPLING_SHARDS;
   constexpr uint Candidates = RICHENGINE_DRAFT_CANDIDATES;
   constexpr uint Pool = Shards * Candidates;
-  constexpr uint Rank = RICHENGINE_DRAFT_SELECTOR_RANK;
+  // The head's declared markov_rank, no longer compiled: Nemotron's 512
+  // rides the same kernel as the 256 drafts'.
+  const uint Rank = params.rank;
   const uint batch = row / Positions;
   const uint position = row % Positions;
   device float *table =
       partial_values + ulong(params.lanes) * Positions * Pool +
       ulong(row) * Pool * Pool;
   const uint edges = position ? Pool * Pool : Pool;
-  for (uint e = thread_index; e < edges; e += 256) {
-    const uint predecessor = e / Pool;
-    const uint candidate = e % Pool;
-    // Ids come from the shard top-k and are always in range; the clamp only
-    // keeps a corrupted id inside the Markov tables.
-    const uint prev_token = position
-        ? partial_ids[(row - 1) * Pool + predecessor]
-        : draft_input[batch * params.query_rows];
-    const uint safe_predecessor = min(prev_token, params.vocabulary - 1u);
-    const uint safe_candidate =
-        min(partial_ids[row * Pool + candidate], params.vocabulary - 1u);
-    device const bfloat *feature_row =
-        markov_w1 + ulong(safe_predecessor) * Rank;
-    device const bfloat *bias_row = markov_w2 + ulong(safe_candidate) * Rank;
-    float bias = 0.0f;
-    for (uint dim = 0; dim < Rank; ++dim)
-      bias += float(bias_row[dim]) * float(feature_row[dim]);
-    table[predecessor * Pool + candidate] = bias;
+  // Four edges in flight per thread with independent accumulators: the dim
+  // loop's loads are the bottleneck, so the interleave hides their latency.
+  // Each edge still adds its dims 0..Rank-1 in order, so it rounds exactly
+  // as the serial walk's per-lane dot did.
+  constexpr uint Ilp = 4;
+  for (uint e = thread_index; e < edges; e += 256 * Ilp) {
+    uint predecessors[Ilp];
+    uint candidates[Ilp];
+    device const bfloat *feature_rows[Ilp];
+    device const bfloat *bias_rows[Ilp];
+    uint live = 0;
+    for (uint j = 0; j < Ilp && e + 256 * j < edges; ++j) {
+      const uint edge = e + 256 * j;
+      const uint predecessor = edge / Pool;
+      const uint candidate = edge % Pool;
+      // Ids come from the shard top-k and are always in range; the clamp
+      // only keeps a corrupted id inside the Markov tables.
+      const uint prev_token = position
+          ? partial_ids[(row - 1) * Pool + predecessor]
+          : draft_input[batch * params.query_rows];
+      const uint safe_predecessor = min(prev_token, params.vocabulary - 1u);
+      const uint safe_candidate =
+          min(partial_ids[row * Pool + candidate], params.vocabulary - 1u);
+      feature_rows[j] = markov_w1 + ulong(safe_predecessor) * Rank;
+      bias_rows[j] = markov_w2 + ulong(safe_candidate) * Rank;
+      predecessors[j] = predecessor;
+      candidates[j] = candidate;
+      live = j + 1;
+    }
+    float bias[Ilp] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if ((Rank & 3u) == 0) {
+      // Rank % 4 == 0 keeps every row 8-byte aligned for the vector loads.
+      for (uint d4 = 0; d4 < Rank / 4; ++d4) {
+        for (uint j = 0; j < live; ++j) {
+          const bfloat4 b =
+              reinterpret_cast<device const bfloat4 *>(bias_rows[j])[d4];
+          const bfloat4 f =
+              reinterpret_cast<device const bfloat4 *>(feature_rows[j])[d4];
+          bias[j] += float(b.x) * float(f.x);
+          bias[j] += float(b.y) * float(f.y);
+          bias[j] += float(b.z) * float(f.z);
+          bias[j] += float(b.w) * float(f.w);
+        }
+      }
+    } else {
+      for (uint dim = 0; dim < Rank; ++dim)
+        for (uint j = 0; j < live; ++j)
+          bias[j] += float(bias_rows[j][dim]) * float(feature_rows[j][dim]);
+    }
+    for (uint j = 0; j < live; ++j)
+      table[predecessors[j] * Pool + candidates[j]] = bias[j];
   }
 }
 
