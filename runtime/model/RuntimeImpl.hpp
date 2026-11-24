@@ -1495,6 +1495,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // verify.
   bool treeVerifyBatch(std::span<Request *const> entries, uint32_t width,
                        bool constrained) const {
+    // The folded-commit tape assumes every verify step is a chain: a tree
+    // batch binds no tape, so its lanes' pending rows would fold stale
+    // tape contents on the next chain step (and the tree scan itself
+    // never sees the pending prefix). Fold models keep the chain verify;
+    // RICHENGINE_NO_GDN_FOLD restores tree verify for them.
+    if (gdnTape_)
+      return false;
     // GPU-drafted sparse MoE keeps the chain verify: the tree's doubled
     // lane block routes its dead slot too, which measured a 2.5x union
     // (31 -> 79 experts/layer) for no retained-token gain on MiniCPM-V-4.7 —
@@ -3915,8 +3922,14 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
 
       states.swapParity(entry.stateLane);
       if (gdnTape_) {
-        gdnPendingRows_[entry.stateLane] = laneResult.retained;
-        gdnTapeParity_[entry.stateLane] ^= 1;
+        if (!tree) {
+          gdnPendingRows_[entry.stateLane] = laneResult.retained;
+          gdnTapeParity_[entry.stateLane] ^= 1;
+        } else {
+          // A tree step commits the recurrent state outright — nothing
+          // stays folded on the tape for the next chain step.
+          gdnPendingRows_[entry.stateLane] = 0;
+        }
       }
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;

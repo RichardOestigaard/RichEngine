@@ -600,6 +600,8 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
           std::to_string(observed.completed ? 1 : 0) +
           " finish=" + std::to_string(static_cast<int>(observed.finishReason)) +
           " tokens=" + std::to_string(observed.outputTokens.size()) +
+          " cache=" + observed.cacheStatus + "/" +
+          std::to_string(observed.matchedTokens) +
           " failure=[" + observed.failure + "] all=" + tokens + ")");
     }
     if (reference && reference->outputTokens != observed.outputTokens) {
@@ -1067,6 +1069,17 @@ int main(int argc, char **argv) {
         token = 100 + token % (promptVocabulary - 100);
         decodePromptRemapped = true;
       }
+    // Tokenizers that reserve a wide special-id band (nemotron's 0-999)
+    // turn the fixed payload into control tokens; the model then ends the
+    // turn immediately. DBG_NOSPECIAL remaps ids under 1024 into the
+    // ordinary range so the throughput shape is still exercised.
+    if (getenv("DBG_NOSPECIAL")) {
+      for (uint32_t &token : decodePrompt)
+        if (token < 1024) {
+          token += 1024;
+          decodePromptRemapped = true;
+        }
+    }
     const std::string decodePromptSha256 = model::weightDigest(
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t *>(decodePrompt.data()),

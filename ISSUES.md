@@ -1404,6 +1404,62 @@ tile. Ornith ANE FFN split self-disabled at 97.7% > 10%
 threshold (AneFfn.cpp self-check) — GPU fallback correct; ANE
 program shape/coverage for Ornith is a separate issue.
 
+Update 76 (Nemotron-30B-A3B decode divergence — FIXED): width>=2
+co-batched decode diverged (lane emitted EOS as first token /
+tokens differed). Bisected to the GDN tape fold vs tree verify
+interaction: chain verify steps leave retained rows folded on
+the per-stateLane tape (gdnPendingRows_/gdnTapeParity_ advance
+at result time, RuntimeImpl.hpp ~3924), but tree verify binds
+no tape — a tree step's lanes then fold STALE tape rows on the
+next chain step and the tree scan itself never sees the pending
+prefix. treeVerifyBatch now returns false whenever gdnTape_ is
+allocated (fold models keep chain verify; ~45% faster than
+NO_GDN_FOLD anyway: 198.6 vs 136.8 tok/s w1), and the result
+handler only advances pendingRows/parity on !tree steps.
+Verified: decode passes widths 1-4, identical
+output_token_hash 6031611188250583029, ~200 tok/s w1.
+RICHENGINE_NO_GDN_FOLD=1 was the workaround oracle.
+
+Update 77 (Ornith-1.5-35B-A3B decode divergence — bisected,
+unfixed): qwen3_5_moe (GDN x3 + full_attention repeating, 256
+experts/8 active, affine MLX-4bit MoE). Deterministic divergence
+at width>=2, first diff ~token 8 ("753 vs 429"), identical
+across every run and every env toggle. Bisect:
+- NOT draft (NO_DRAFT fails), NOT tree (VERIFY_TREE=0 fails —
+  now moot under the update-76 gate), NOT tape fold
+  (NO_GDN_FOLD fails), NOT zsplat/bake/patchable/fused-gate.
+- NOT MoE compute: every toggle fails identically — INDIRECT,
+  TILE_MAJOR, DECODE_M32, SMALL_ROWS, SG4, ROUTE_M16, TOPK,
+  FOLDED_GATE_OFF, SHARED_DENSE, PACKED_OFF, UNION, STATS.
+  Affine expert kernels are fixed 8-row tiles; moe_combine
+  accumulates in fixed slot order; route select orders by
+  (score desc, id asc); score kernel is always the narrow m8
+  variant in decode (rows 16-64 << routeWideRows ~26*cores).
+- LAYER_LIMIT bisect: LIMIT=1,2 PASS with REAL co-batching
+  (tape debug: 92 lanes>=2 dispatches at LIMIT=2); LIMIT=3
+  FAILS. PREFILL_LIMIT=3+LAYER_LIMIT=3 also fails => bug is
+  inside the first THREE layers' compute (3x GDN+MoE), not
+  attention (layer 3 excluded) and not deeper-layer state.
+- Ornith-9B (same GDN hybrid, dense FFN, 24 GDN layers)
+  co-batches and passes => differentiator is MoE presence OR
+  35B-specific geometry, not GDN layer count.
+- live_rows/verifyRows path audited: draft_verify_rows kernel
+  is single-threaded per-lane; moe_group_routes_verified dead()
+  lambda indexes row/lane_rows correctly; state cell layout
+  ([all conv][all recurrent]) matches decode kernel offsets.
+Remaining suspects: (a) batched PREFILL of layers 0-2 writing
+seq>=1's GDN conv/recurrent state wrong (LFM3's desync
+pattern — prefill is NOT covered by LAYER_LIMIT, and decode
+LIMIT=3 reads exactly the state prefill wrote); (b) a
+kernel-internal lanes>=1 indexing bug in the GDN scan or MoE
+grouping invisible to host dumps (the update-66 pattern —
+needs kernel-side readback instrumentation); (c) benign
+width-dependent ulp numerics per update-74's granite
+resolution — but identical prompts argue against it.
+NEXT: hash seq>=1's GDN recurrent/conv state for state-layer 2
+right after batched prefill vs after a solo prefill of the
+same request — a mismatch exonerates verify entirely.
+
 ## DFA constraint compiler
 
 ### Compiled DFA over-admits vs llguidance — resolved
