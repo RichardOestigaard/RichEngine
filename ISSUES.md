@@ -1460,6 +1460,49 @@ NEXT: hash seq>=1's GDN recurrent/conv state for state-layer 2
 right after batched prefill vs after a solo prefill of the
 same request — a mismatch exonerates verify entirely.
 
+Update 78 (35B BREAKTHROUGH — first tensor-level localization):
+added a VERIFY_DUMP2 block hashing each lane's GDN state-cell
+convolutionLayers/recurrentLayers[0..3] (both parities) plus the
+existing gdnPacked0/gdnMixed0/hidden/normalized lane hashes, then
+ran decode LIMIT=3 (fails ~token 8). Findings from the w2
+throughput steps (dumpsteps 77-113, all items=2):
+- lane1's glayer0 CONV STATE freezes into a strict 2-buffer
+  alternation (7-8 distinct hashes / 37 steps) while lane0's and
+  lane1's glayers 1-2 evolve every step (36-37 distinct).
+  glayer3 static for BOTH lanes (outside LIMIT=3, benign).
+- recurrent state evolves for both lanes everywhere — only the
+  conv carry is stuck.
+- NO_GDN_FOLD=1 shows the IDENTICAL freeze => not the tape
+  pending mechanism (consumed=Tokens there cannot freeze).
+- ROOT PATTERN: lane1's gdnPacked0 AND gdnMixed0 (the layer-0
+  in-projection output and conv output) are BYTE-IDENTICAL stale
+  on alternating steps from ~step 86 (pk=93857252/mx=4cb32fb7
+  pinned), fresh on the others. The ENTIRE lane-1 layer-0 GDN
+  input slice stops being rewritten every other step => conv
+  carry sees a constant last-3 window => 2-cycle => wrong GDN
+  output => token divergence. hidden0/1 and normalized stay
+  fresh every step, so the staleness is specific to the
+  gdnPacked/gdnMixed layer-0 arena slices for lanes>=1.
+- Live-state comparison across positions is confounded by
+  retained-count skew (lane0@101 vs lane1@82 at step 113), but
+  the staleness signature is unambiguous.
+Suspects, ranked: (a) baked-span replay — CommandGraph's
+beginBakedSpan spans are cached in TWO parity banks
+(MetalBackendImpl.hpp ~1008) and replayed on submission parity;
+a span baked under a different lane/stateLane composition (or a
+stale bank) would replay wrong dispatches every other step —
+matches the alternation exactly; (b) per-lane dispatch skip in
+the verify layer loop for lanes>=1 at gdnLayer 0 (e.g. a
+live_rows/row-capacity edge that zeroes lane1's rows on
+alternate steps); (c) gdnBatchSlice stride misread making the
+dump hash a stale neighbor region (less likely — hash is
+byte-identical, not shifted).
+NEXT: check whether disabling baked spans (or forcing re-bake
+per step) makes lane1's gdnPacked0 fresh every step; then audit
+the span-match key for per-lane state-buffer/lanes-count
+coverage. RICHENGINE_VERIFY_DUMP2 instrumentation left in tree
+(gated, prints dump2 lines) — remove or keep per preference.
+
 ## DFA constraint compiler
 
 ### Compiled DFA over-admits vs llguidance — resolved
@@ -1477,3 +1520,71 @@ automaton is *more permissive* than the grammar path, not less. Root cause
 `dfa_mode=full`: the engine's DFA lane emits a token the delegate's
 commit()/finish() rejects. Fixed in `server/dfa.py` `_JSON_STRING`; a seed
 sweep over the qwen3 tool grammars walks clean.
+
+Update 79: 35B ROOT CAUSE LOCALIZED to the packed-prefill MoE FFN.
+New RICHENGINE_PREFILL_DUMP instrumentation (Runtime.mm, env-gated):
+per-item FNVs of every post-prefill GDN state cell (pre-swap parity)
+plus the last-encoded layer's arena tensors sliced at each item's
+rowBegin. With RICHENGINE_PREFILL_LIMIT=N the Nth layer's tensors
+persist for hashing.
+Findings (decode scenario, width 2, identical prompts):
+- The ONLY packed prefill command pairs req4's chunk2 (7 tok @pos32,
+  rowBegin 0) with req5's chunk1 (32 tok @pos0, rowBegin 7). req5 is
+  the lane that later diverges at decode token 8.
+- PREFILL_SOLO=1 (Scheduler.cpp planPrefill gate, breaks after first
+  item) makes all lanes produce identical 64 tokens -> packed prefill
+  is causal, decode exonerated.
+- PREFILL_LIMIT=1: seq1's layer-0 GDN internals are byte-IDENTICAL to
+  solo (normalized, gdnPacked, recurrentRows, gdnHidden, g0 state).
+  gdnOutput (correct hiddenSize stride — earlier attentionWidth hash
+  was a stride artifact) also identical. h1 (layer output) DIFFERS.
+- PREFILL_LIMIT=2: seq1's h1 (=layer-1 input) differs => norm/pk/
+  q/rec/g1-state all differ downstream. dec hash coincidentally
+  matches.
+=> Corruption enters inside ops::MoE::add for the 39-row dispatch:
+   inputs (normalized + residual/gout) identical, output rows 7-38
+   wrong, rows 0-6 right. Deterministic — the SAME wrong h1 hash
+   (d9da0c34) under MOE_PACKED_OFF, MOE_SHARED_DENSE, MOE_UNION =>
+   shared machinery (routing/grouping/gather/combine or scratch), not
+   a variant kernel. Per-row audit of scores_m8, select_q8, grouping,
+   combine all clean; routeTile/params/fusedRoute thresholds don't
+   switch at 39 rows. GGUF column-tile non-invariance (moe_expert_slab.h)
+   does not apply — 35B is affine.
+NEXT: hash MoE internals in the packed dispatch — selectedExperts /
+routingWeights / groupedInput (post-gather) / expertOutput — via
+PrefillTensor::MoeScratch slices; the first mismatched stage pins the
+kernel. The wrong-output hash being variant-invariant suggests
+comparing route_rows/grouped_routes content for seq1's rows between
+solo-32 and packed-39 is the cheapest oracle.
+
+Update 80: 35B ROOT CAUSE FOUND + FIXED — not corruption, documented
+GGUF staged-tile non-batch-invariance.
+- The 35B's experts are Block32-packed (mlx-affine target repacked via
+  AffineToBlock): moeGgufPrefillTile gives a solo 32-row chunk M8
+  tiles (32*8=256 <= 256 experts) but the packed 39-row step M32
+  (312 > 256). Earlier "M8 vs M32" dump confusion resolved: the t8
+  items were solo chunks legitimately on M8, not decode items.
+- Per-route pr-diff (packed seq1 vs solo refs, correct attribution):
+  only 3 routes differ — each crossed MOE_GGUF_COLUMN_ROWS=2
+  (tile live rows 2->3) when seq0's routes joined their experts:
+  column tile -> staged matmul, which sum in different orders BY
+  DESIGN (moe_expert_slab.h:16-26, abi/MoE.h:61-72). e86 pair:
+  ei SAME + eo DIFF; e235: ei DIFF — both pass-boundary flips
+  consistent with a kernel-variant switch, not stale reads.
+- RICHENGINE_MOE_GGUF_TILE=register run: identical output_token_hash
+  15389569776821759607 at all widths — confirms tile-variant
+  numerics as the sole cause (register tile is composition-invariant).
+FIX (TargetModel.cpp addPrefillFfn moe lambda): a packed prefill step
+with >1 sequence on a Block32 staged-GGUF model now runs ops::MoE::add
+per sequence — rowBegin-offset u16 views of normalized/residual/output
+and moePrefill(seq.rows) — exactly the plan the chunk gets solo, so
+grouping, tile composition and summation order are identical.
+Verified: packed command still forms (id5 rb=7 lane=1); seq1's h1 now
+bit-identical to solo refs (3b4f7226); output_token_hash identical
+w1-4 (15389569776821759607). Affine models (always M32, per-row
+invariant) untouched; register-tile GGUF, canvas and single-seq steps
+take the unchanged whole-step path.
+Perf: prefill pays one extra grouped pass set per co-packed sequence
+(rare; packing is opportunistic). The decode-scenario
+performance_pass failure (w3<w2 tok/s) predates the fix — same shape
+under register tile.
