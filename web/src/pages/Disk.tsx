@@ -312,92 +312,6 @@ export default function Disk() {
         )}
       </Show>
 
-      <Show when={diskStatus()}>
-        {(disk) => (
-          <section class="section">
-            <h2>KV disk cache</h2>
-            <Show
-              when={disk().capacity_bytes > 0}
-              fallback={
-                <p class="muted">SSD cache off — enable with --max-cache-disk</p>
-              }
-            >
-              <div class="panel">
-                <div class="kv-meter">
-                  <div
-                    class="meter"
-                    role="meter"
-                    aria-label="SSD cache used"
-                    aria-valuemin={0}
-                    aria-valuemax={disk().capacity_bytes}
-                    aria-valuenow={disk().used_bytes}
-                    aria-valuetext={`${fmtBytes(disk().used_bytes)} of ${fmtBytes(disk().capacity_bytes)}`}
-                  >
-                    <i style={{ width: `${meterPercent()}%` }} />
-                  </div>
-                </div>
-                <div class="panel-row">
-                  <span class="grow">SSD cache</span>
-                  <span class="num">
-                    {fmtBytes(disk().used_bytes)} of {fmtBytes(disk().capacity_bytes)} ·{" "}
-                    {Math.round(meterPercent())}%
-                    <Show when={disk().persistent}>
-                      {" "}
-                      <span class="badge ok">persistent</span>
-                    </Show>
-                  </span>
-                </div>
-                <div class="panel-row" title="KV blocks currently stored on SSD; pending pages are queued writes">
-                  <span class="grow">Cached KV</span>
-                  <span class="num">
-                    {fmtBytes(disk().kv_bytes)} in {fmtInt(disk().kv_blocks)} blocks
-                    <Show when={disk().kv_pending_pages > 0}>
-                      {" "}· {fmtInt(disk().kv_pending_pages)} pages pending
-                    </Show>
-                  </span>
-                </div>
-                <div class="panel-row" title="KV blocks moved from RAM to SSD under memory pressure; refused = skipped because pressure resolved first">
-                  <span class="grow">Demotions (RAM → SSD)</span>
-                  <span class="num">
-                    {fmtInt(disk().kv_demotions)}
-                    <Show when={disk().kv_demotion_failures > 0}>
-                      {" "}· {fmtInt(disk().kv_demotion_failures)} failed
-                    </Show>
-                    <Show when={disk().kv_demotions_refused > 0}>
-                      {" "}· {fmtInt(disk().kv_demotions_refused)} refused
-                    </Show>
-                  </span>
-                </div>
-                <div class="panel-row" title="KV blocks read back from SSD into RAM">
-                  <span class="grow">Restores (SSD → RAM)</span>
-                  <span class="num">
-                    {fmtInt(disk().kv_restores)}
-                    <Show when={disk().kv_restore_failures > 0}>
-                      {" "}· {fmtInt(disk().kv_restore_failures)} failed
-                    </Show>
-                  </span>
-                </div>
-                <div class="panel-row" title="Writes buffered before reaching disk — waiting = queued, durable = flushed; refused = skipped">
-                  <span class="grow">Write-behind</span>
-                  <span class="num">
-                    {fmtInt(disk().write_behind?.waiting)} waiting · {fmtInt(disk().write_behind?.durable)} durable
-                    <Show when={(disk().write_behind?.refused ?? 0) > 0}>
-                      {" "}· {fmtInt(disk().write_behind.refused)} refused
-                    </Show>
-                  </span>
-                </div>
-                <div class="panel-row" title="Total bytes read from and written to the SSD cache since start">
-                  <span class="grow">SSD read / written</span>
-                  <span class="num">
-                    {fmtBytes(disk().read_bytes)} / {fmtBytes(disk().written_bytes)}
-                  </span>
-                </div>
-              </div>
-            </Show>
-          </section>
-        )}
-      </Show>
-
       <section class="section">
         <h2>Duplicates</h2>
         <div class="dedupe-controls">
@@ -654,6 +568,93 @@ export default function Disk() {
           )}
         </For>
       </section>
+
+      <Show when={diskStatus()}>
+        {(disk) => (
+          <section class="section">
+            <h2>KV disk cache</h2>
+            <Show
+              when={disk().capacity_bytes > 0}
+              fallback={
+                <p class="muted">SSD cache off — enable with --max-cache-disk</p>
+              }
+            >
+              <div class="panel">
+                <div class="kv-meter">
+                  <div
+                    class="meter"
+                    role="meter"
+                    aria-label="SSD cache used"
+                    aria-valuemin={0}
+                    aria-valuemax={disk().capacity_bytes}
+                    aria-valuenow={disk().used_bytes}
+                    aria-valuetext={`${fmtBytes(disk().used_bytes)} of ${fmtBytes(disk().capacity_bytes)}`}
+                  >
+                    <i style={{ width: `${meterPercent()}%` }} />
+                  </div>
+                </div>
+                <div class="panel-row">
+                  <span class="grow">SSD cache</span>
+                  <span class="num">
+                    {fmtBytes(disk().used_bytes)} of {fmtBytes(disk().capacity_bytes)} ·{" "}
+                    {Math.round(meterPercent())}%
+                    <Show when={disk().persistent}>
+                      {" "}
+                      <span class="badge ok">persistent</span>
+                    </Show>
+                  </span>
+                </div>
+                <div class="panel-row" title="KV blocks currently stored on SSD; pending pages are queued writes">
+                  <span class="grow">Cached KV</span>
+                  <span class="num">
+                    {fmtBytes(disk().kv_bytes)} in {fmtInt(disk().kv_blocks)} blocks
+                    <Show when={disk().kv_pending_pages > 0}>
+                      {" "}· {fmtInt(disk().kv_pending_pages)} pages pending
+                    </Show>
+                  </span>
+                </div>
+                <div class="panel-row" title="KV blocks moved from RAM to SSD under memory pressure; refused = skipped because pressure resolved first">
+                  <span class="grow">Demotions (RAM → SSD)</span>
+                  <span class="num">
+                    {fmtInt(disk().kv_demotions)}
+                    <Show when={disk().kv_demotion_failures > 0}>
+                      {" "}· {fmtInt(disk().kv_demotion_failures)} failed
+                    </Show>
+                    <Show when={disk().kv_demotions_refused > 0}>
+                      {" "}· {fmtInt(disk().kv_demotions_refused)} refused
+                    </Show>
+                  </span>
+                </div>
+                <div class="panel-row" title="KV blocks read back from SSD into RAM">
+                  <span class="grow">Restores (SSD → RAM)</span>
+                  <span class="num">
+                    {fmtInt(disk().kv_restores)}
+                    <Show when={disk().kv_restore_failures > 0}>
+                      {" "}· {fmtInt(disk().kv_restore_failures)} failed
+                    </Show>
+                  </span>
+                </div>
+                <div class="panel-row" title="Writes buffered before reaching disk — waiting = queued, durable = flushed; refused = skipped">
+                  <span class="grow">Write-behind</span>
+                  <span class="num">
+                    {fmtInt(disk().write_behind?.waiting)} waiting · {fmtInt(disk().write_behind?.durable)} durable
+                    <Show when={(disk().write_behind?.refused ?? 0) > 0}>
+                      {" "}· {fmtInt(disk().write_behind.refused)} refused
+                    </Show>
+                  </span>
+                </div>
+                <div class="panel-row" title="Total bytes read from and written to the SSD cache since start">
+                  <span class="grow">SSD read / written</span>
+                  <span class="num">
+                    {fmtBytes(disk().read_bytes)} / {fmtBytes(disk().written_bytes)}
+                  </span>
+                </div>
+              </div>
+            </Show>
+          </section>
+        )}
+      </Show>
+
 
       <Confirm
         open={confirm() !== null}

@@ -6,6 +6,7 @@ import Toasts from "./toast";
 import Palette from "./palette/Palette";
 
 const TITLES: [RegExp, string][] = [
+  [/^\/$/, "Chat"],
   [/^\/models/, "Models"],
   [/^\/disk/, "Disk"],
   [/^\/playground/, "Playground"],

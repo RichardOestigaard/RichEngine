@@ -152,8 +152,11 @@
   gap: 8px;
   margin-bottom: 8px;
 }
-.option-row .option-id { width: 140px }
+.judge .field .option-row .option-id { width: 140px; flex: none }
 .option-row .grow { flex: 1; min-width: 0 }
+@media (max-width: 640px) {
+  .judge .field .option-row .option-id { width: 96px }
+}
 .judge .field > .btn.small { margin-top: 2px }
 
 /* Action row: copy on the left, submit on the right. */

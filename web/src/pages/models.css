@@ -272,3 +272,12 @@
   background: var(--panel); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px;
 }
+
+.model-choice{display:flex;align-items:center;gap:14px;padding:12px 14px;border-top:1px solid var(--border)}
+.model-choice:first-child{border-top:0}
+.model-choice-main{display:grid;gap:5px;min-width:0;flex:1}
+.model-choice-title{display:flex;align-items:center;gap:8px;font-weight:650}
+.model-choice-use{color:var(--muted);font-size:12.5px}
+.model-capabilities{justify-content:flex-start;max-width:none}
+.model-choice-id{overflow:hidden;color:var(--muted);font-size:11.5px;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:560px){.model-choice{align-items:flex-start;flex-direction:column}.model-choice .btn{align-self:flex-end;margin-top:-34px}}

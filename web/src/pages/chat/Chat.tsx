@@ -118,6 +118,8 @@ function callKey(call: ToolCallDraft): string {
 export default function Chat() {
   const savedEffort = storageGet(EFFORT_KEY);
   const savedSidebar = storageGet(SIDEBAR_KEY);
+  const sidebarMedia = window.matchMedia("(max-width: 720px)");
+  const [narrowSidebar, setNarrowSidebar] = createSignal(sidebarMedia.matches);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [activeId, setActiveId] = createSignal<string | null>(null);
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
@@ -129,9 +131,7 @@ export default function Chat() {
   // The drawer exists only at the chat.css 720px breakpoint; on wide screens
   // the sidebar is always shown and the flag is just a remembered preference.
   const [menuOpen, setMenuOpen] = createSignal(
-    savedSidebar !== null
-      ? savedSidebar === "1"
-      : !window.matchMedia("(max-width: 720px)").matches
+    !narrowSidebar() && (savedSidebar !== null ? savedSidebar === "1" : true)
   );
   const [modelData, setModelData] = createSignal<ModelInfo[]>([]);
   const [model, setModel] = createSignal(storageGet(MODEL_KEY) ?? "");
@@ -228,7 +228,12 @@ export default function Chat() {
   }
 
   createEffect(saveDraft);
-  createEffect(() => storageSet(SIDEBAR_KEY, menuOpen() ? "1" : "0"));
+  createEffect(() => {
+    if (narrowSidebar()) setMenuOpen(false);
+  });
+  createEffect(() => {
+    if (!narrowSidebar()) storageSet(SIDEBAR_KEY, menuOpen() ? "1" : "0");
+  });
 
   async function loadModels() {
     try {
@@ -1317,7 +1322,7 @@ export default function Chat() {
   }
 
   // A hidden tab keeps generating; the title says so, then reports done.
-  const baseTitle = document.title;
+  const baseTitle = "Chat — RichEngine";
   let generated = false;
   createEffect(() => {
     if (running()) {
@@ -1397,6 +1402,9 @@ export default function Chat() {
 
   onMount(() => {
     restoreDraft();
+    const onSidebarMedia = (event: MediaQueryListEvent) =>
+      setNarrowSidebar(event.matches);
+    sidebarMedia.addEventListener("change", onSidebarMedia);
     const onScroll = () => {
       pinned = nearBottom();
       if (toBottomEl) toBottomEl.hidden = pinned;
@@ -1490,6 +1498,7 @@ export default function Chat() {
     window.addEventListener("richengine:pin-chat", onPinActive);
     window.addEventListener("richengine:open-system", onOpenSystem);
     onCleanup(() => {
+      sidebarMedia.removeEventListener("change", onSidebarMedia);
       window.removeEventListener("scroll", onScroll);
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("visibilitychange", onVisible);

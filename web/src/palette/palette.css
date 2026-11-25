@@ -24,6 +24,7 @@
 
 .palette-panel {
   position: fixed;
+  z-index: 51;
   top: 18vh;
   left: 50%;
   transform: translateX(-50%);

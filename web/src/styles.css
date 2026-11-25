@@ -219,9 +219,17 @@ svg { display: block }
 .topdown { position: fixed; inset: var(--topbar) 0 auto; z-index: 29; padding: 8px 16px; border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, var(--bg)); color: var(--warn); font-size: 13px; text-align: center }
 /* Theme icon remounts keyed → plays icon-in on each cycle. */
 .theme-btn svg { animation: icon-in .2s ease-out }
+.page-menu { display: none }
 @media (max-width: 700px) {
-  .topnav { min-width: 0; overflow-x: auto; scrollbar-width: none }
-  .topnav::-webkit-scrollbar { display: none }
+  .topnav { display: none }
+  .page-menu { position: relative; display: block; flex: none }
+  .page-menu summary { padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 500; list-style: none; cursor: pointer; user-select: none }
+  .page-menu summary::-webkit-details-marker { display: none }
+  .page-menu summary:hover, .page-menu[open] summary { color: var(--text); background: var(--hover) }
+  .page-menu summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+  .page-menu-pop { position: absolute; top: calc(100% + 8px); left: 0; z-index: 35; display: grid; width: 170px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--composer); box-shadow: var(--shadow); animation: pop-in .12s ease-out }
+  .page-menu-pop .navlink { display: block; padding: 8px 10px }
+  .page-menu-pop .navlink.active { background: var(--hover) }
 }
 
 /* AlertDialog confirmation (Confirm.tsx): above palette overlay (50) and

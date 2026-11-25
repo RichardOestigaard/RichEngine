@@ -128,6 +128,16 @@ export default function TopBar() {
   const [menuOpen, setMenuOpen] = createSignal(false);
   let menuEl: HTMLDivElement | undefined;
   let navEl: HTMLElement | undefined;
+  let pagesEl: HTMLDetailsElement | undefined;
+
+  const closePagesOutside = (event: PointerEvent) => {
+    if (pagesEl?.open && !pagesEl.contains(event.target as Node))
+      pagesEl.open = false;
+  };
+  document.addEventListener("pointerdown", closePagesOutside);
+  onCleanup(() =>
+    document.removeEventListener("pointerdown", closePagesOutside)
+  );
 
   /* The sliding pill under the nav tracks the active link's box; CSS vars
      carry the position so the transition lives in styles.css. */
@@ -471,6 +481,35 @@ export default function TopBar() {
         <A href="/metrics" class="navlink" classList={{ active: active("/metrics") }} title="Metrics (⌘6)">Metrics</A>
         <A href="/settings" class="navlink" classList={{ active: active("/settings") }} title="Settings (⌘7)">Settings</A>
       </nav>
+      <details
+        class="page-menu"
+        ref={(el) => (pagesEl = el)}
+        onClick={(event) => {
+          if ((event.target as HTMLElement).closest("a") && pagesEl)
+            pagesEl.open = false;
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && pagesEl?.open) {
+            pagesEl.open = false;
+            pagesEl.querySelector("summary")?.focus();
+          }
+        }}
+      >
+        <summary aria-label="Open page menu">Pages</summary>
+        <div class="page-menu-pop">
+          <Show when={!decisionModel()}>
+            <A href="/" class="navlink" classList={{ active: active("/") }}>Chat</A>
+          </Show>
+          <A href="/models" class="navlink" classList={{ active: active("/models") }}>Models</A>
+          <A href="/disk" class="navlink" classList={{ active: active("/disk") }}>Disk</A>
+          <Show when={!decisionModel()}>
+            <A href="/playground" class="navlink" classList={{ active: active("/playground") }}>Playground</A>
+          </Show>
+          <A href="/judge" class="navlink" classList={{ active: active("/judge") }}>Judge</A>
+          <A href="/metrics" class="navlink" classList={{ active: active("/metrics") }}>Metrics</A>
+          <A href="/settings" class="navlink" classList={{ active: active("/settings") }}>Settings</A>
+        </div>
+      </details>
       <button
         type="button"
         class="palette-trigger"

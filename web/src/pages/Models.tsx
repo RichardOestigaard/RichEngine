@@ -306,6 +306,24 @@ const [history, setHistory] = createSignal<{
   memory: number[];
 }>({ t: [], decode: [], prefill: [], memory: [] });
 
+
+interface ModelGuide { title: string; use: string; quant: string; sizeGb: number; minGb: number; recommendedGb: number; capabilities: string[]; decision?: boolean }
+const MODEL_GUIDES: [RegExp, ModelGuide][] = [
+  [/qwen3\.8-27b/i,{title:"Qwen3.8 27B",use:"Best quality for coding and complex chat",quant:"Q4 balanced",sizeGb:16,minGb:24,recommendedGb:36,capabilities:["chat","vision","tools","draft"]}],
+  [/qwen3\.6-35b-a3b/i,{title:"Qwen3.6 35B-A3B",use:"Fast MoE quality with strong parallelism",quant:"Q4 balanced",sizeGb:20,minGb:24,recommendedGb:36,capabilities:["chat","vision","tools","draft"]}],
+  [/gemma-4-26b/i,{title:"Gemma4 26B-A4B",use:"Fast MoE assistant with large context",quant:"packed Q4",sizeGb:14.5,minGb:26,recommendedGb:40,capabilities:["chat","tools","draft"]}],
+  [/minicpm5-2b/i,{title:"MiniCPM5 2B",use:"Small responsive everyday assistant",quant:"Q4 compact",sizeGb:1.6,minGb:8,recommendedGb:12,capabilities:["chat","vision","draft"]}],
+  [/lfm2\.5-2\.6b/i,{title:"LFM2.5 2.6B",use:"Fast lightweight chat on smaller Macs",quant:"MXFP4 compact",sizeGb:1.7,minGb:8,recommendedGb:12,capabilities:["chat","draft"]}],
+  [/granite-4\.2-3b/i,{title:"Granite 3B",use:"Compact business-focused assistant",quant:"Q4 compact",sizeGb:2,minGb:8,recommendedGb:12,capabilities:["chat"]}],
+  [/granite-4\.2-8b/i,{title:"Granite 8B",use:"Stronger compact assistant",quant:"Q4 balanced",sizeGb:5,minGb:12,recommendedGb:18,capabilities:["chat"]}],
+  [/d1-/i,{title:"Liquid d1 decision",use:"Typed yes/no, choice, and score judgments",quant:"Q8 precise",sizeGb:2.5,minGb:8,recommendedGb:12,capabilities:["decision"],decision:true}],
+];
+function modelGuide(id:string):ModelGuide{
+ const found=MODEL_GUIDES.find(([pattern])=>pattern.test(id))?.[1]; if(found)return found;
+ const quant=/mxfp4/i.test(id)?"MXFP4 compact":/q8/i.test(id)?"Q8 precise":/q2|iq2|iq1/i.test(id)?"very compact":/q3|iq3/i.test(id)?"compact":"Q4 balanced";
+ return {title:id.split("/").pop()?.split(":")[0]??id,use:"Compatible Hugging Face model",quant,sizeGb:8,minGb:16,recommendedGb:24,capabilities:["chat"]};
+}
+
 /* ---- page ---- */
 
 export default function Models() {
@@ -1083,7 +1101,6 @@ export default function Models() {
                       </span>
                     </Show>
                     <span class="num">{fmtBytes(entry.bytes)}</span>
-                    <span class="num">{fmtBytes(entry.bytes)}</span>
                     <Show
                       when={entry.serving}
                       fallback={
@@ -1395,34 +1412,20 @@ export default function Models() {
         <Show when={suggested().length > 0}>
           <div class="panel install-suggested">
             <For each={suggested().slice(0, 6)}>
-              {(id) => (
-                <div class="panel-row">
-                  <span class="grow mono">{id}</span>
-                  <Show
-                    when={
-                      available()?.find((m) => m.model === id)?.bytes != null
-                    }
-                  >
-                    <span class="num">
-                      {fmtBytes(
-                        available()?.find((m) => m.model === id)?.bytes
-                      )}
-                    </span>
-                  </Show>
-                  <button
-                    type="button"
-                    class="btn small primary"
-                    disabled={installBlocked()}
-                    title={installBlockReason() || `Install ${id}`}
-                    onClick={() => {
-                      setInstallModel(id);
-                      void startInstall();
-                    }}
-                  >
-                    Install
-                  </button>
+              {(id) => {
+                const guide=modelGuide(id);
+                const budgetGb=()=>((status()?.memory_governor?.limit_bytes??0)/1e9)||24;
+                const fit=()=>budgetGb()>=guide.recommendedGb?["Recommended","ok"]:budgetGb()>=guide.minGb?["Fits","ok"]:budgetGb()>=guide.minGb*.75?["Tight","warn"]:["Not recommended","err"];
+                return <div class="model-choice">
+                  <div class="model-choice-main">
+                    <div class="model-choice-title"><span>{guide.title}</span><span class={`badge ${fit()[1]}`}>{fit()[0]}</span></div>
+                    <div class="model-choice-use">{guide.use}</div>
+                    <div class="chips model-capabilities"><For each={guide.capabilities}>{(cap)=><span class="chip">{cap}</span>}</For><span class="chip">{guide.quant}</span><span class="chip">~{guide.sizeGb} GB</span></div>
+                    <div class="model-choice-id mono" title={id}>{id}</div>
+                  </div>
+                  <button type="button" class="btn small primary" disabled={installBlocked()} title={installBlockReason()||`Install ${id}`} onClick={()=>{setInstallModel(id);void startInstall()}}>Install</button>
                 </div>
-              )}
+              }}
             </For>
           </div>
         </Show>

@@ -205,7 +205,7 @@
 /* The running turn's locked model/effort readout — a label, not dead selects. */
 .chat-shell .effort.static { overflow: hidden; max-width: 240px; padding-right: 12px; text-overflow: ellipsis; white-space: nowrap }
 .chat-shell .effort.static::after { content: none }
-.chat-shell select { display: block; min-width: 0; max-width: 140px; overflow: hidden; padding: 0; border: 0; outline: 0; background: transparent; text-overflow: ellipsis; white-space: nowrap; cursor: pointer }
+.chat-shell select { display: block; min-width: 0; max-width: 140px; overflow: hidden; padding: 0; border: 0; outline: 0; appearance: none; -webkit-appearance: none; background: transparent; text-overflow: ellipsis; white-space: nowrap; cursor: pointer }
 .chat-shell #send { display: grid; width: 34px; height: 34px; flex: none; place-items: center; border-radius: 50%; color: var(--composer); background: var(--text); font-size: 15px; transition: transform .12s ease }
 .chat-shell #send:not([aria-disabled="true"]):hover { transform: scale(1.06) }
 .chat-shell #send[aria-disabled="true"] { color: var(--muted); background: var(--hover) }
@@ -258,8 +258,13 @@
   .chat-shell textarea { max-height: 140px }
 }
 @media (max-width: 430px) {
-  .chat-shell .effort { padding-left: 5px }
-  .chat-shell .effort > span { display: none }
+  .chat-shell .toolbar { flex-wrap: nowrap; gap: 2px }
+  .chat-shell .effort { flex: 0 1 auto; min-width: 0; padding: 0 19px 0 7px }
+  .chat-shell .effort.picker { flex: 1 1 112px }
+  .chat-shell .effort > span { font-size: 11px }
+  .chat-shell .effort select { max-width: 72px; font-size: 12px }
+  .chat-shell .effort.picker select { max-width: 84px }
+  .chat-shell .token-meter, .chat-shell .stop-hint { display: none }
   .chat-shell .user { max-width: 88% }
 }
 @media (min-width: 1400px) {
