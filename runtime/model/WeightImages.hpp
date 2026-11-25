@@ -68,6 +68,10 @@ public:
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
   [[nodiscard]] bool restore() override;
+  // Runs once after restore() has rewritten the last image — for load-time
+  // transforms of image bytes a restore overwrites (the wbf16 repack, which
+  // narrows float-segment planes in place).
+  void setPostRestore(std::function<void()> hook) { postRestore_ = std::move(hook); }
 
   struct Contents final {
     std::string_view component;
@@ -87,6 +91,7 @@ private:
     metal::MetalBuffer buffer;
     ImageWriter write;
   };
+  std::function<void()> postRestore_;
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
   std::vector<Image> images_;

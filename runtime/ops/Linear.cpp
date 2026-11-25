@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <execinfo.h>
 #include <optional>
@@ -1057,6 +1058,12 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireLeadingInputs(selected, p);
   if (gate) requireLeadingInputs(selected, *gate);
   const uint64_t rows = selected.storageRows();
+  if (b.input && b.input.sizeBytes() < rows * k * 2)
+    fprintf(stderr, "linear input undersized: storageRows=%llu w.rows=%u "
+                    "w.lanes=%u n=%u k=%u phase=%u layout=%u buffer=%llu\n",
+            (unsigned long long)rows, w.rows, w.lanes, n, k,
+            (unsigned)w.phase, (unsigned)w.weightLayout,
+            (unsigned long long)b.input.sizeBytes());
   requireBytes(b.input, rows * k * 2, "input");
   requireBytes(b.output, rows * n * elementBytes(selected.destination()),
                (std::string("output ") + std::to_string(rows) + "x" +

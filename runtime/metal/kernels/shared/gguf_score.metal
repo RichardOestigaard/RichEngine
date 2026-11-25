@@ -72,11 +72,18 @@ kernel void gguf_decode_score(device bfloat *input [[buffer(0)]],
   auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
   gguf_zero(acc);
   // One group of 32 inputs per step, this thread staging its column's.
+  // A meta unit spans MetaGroups steps: the header reloads only on a unit
+  // change, not every step.
+  typename F::Meta hdr;
+  uint meta_unit = ~0u;
   for (uint step = 0; step < groups; ++step) {
     typename F::Payload packed = F::load(tw0 + ulong(step) * QUANT_TILE_ROWS * F::P0,
                                          tw1 + ulong(step) * QUANT_TILE_ROWS * F::P1);
     const uint unit = step / F::MetaGroups;
-    typename F::Meta hdr = F::loadMeta(tmeta + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+    if (unit != meta_unit) {
+      meta_unit = unit;
+      hdr = F::loadMeta(tmeta + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+    }
     dequant32<F>(packed, hdr, step % F::MetaGroups, tl, my + lane * KS);
     simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
                       thread_scope_simdgroup);

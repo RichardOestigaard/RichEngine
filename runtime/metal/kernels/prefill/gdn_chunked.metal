@@ -181,25 +181,32 @@ void gdn_chunked_prep_body(
     gram.run(q_view, k_view, gct);
     gct.store(g_dest);
     threadgroup_barrier(mem_flags::mem_device);
+    // e % C == tid % C on every iteration (Threads is a multiple of C), so
+    // j is fixed per thread and i sweeps; gate feeds only j <= i pairs.
+    static_assert(GdnChunkThreads % C == 0);
     for (uint e = tid; e < C * C; e += GdnChunkThreads) {
       const uint i = e / C, j = e % C;
-      const float gate =
-          float(beta[(base + j) * params.value_heads + head]) *
-          exp(lg[i] - lg[j]);
+      float gate = 0.0f;
+      if (j <= i && i < count)
+        gate = float(beta[(base + j) * params.value_heads + head]) *
+               exp(lg[i] - lg[j]);
       amat[e] = (j < i && i < count) ? amat[e] * gate : 0.0f;
       bmat[e] = (j <= i && i < count) ? bmat[e] * gate : 0.0f;
     }
   }  // WK[c][i] = beta_i P_i k_i[c] for the X = M' WK product.
+  // The coefficient depends only on i = tid % C: one exp per thread, not
+  // one per element.
+  const uint wi = tid % C;
+  const float wcoef =
+      wi < count
+          ? float(beta[(base + wi) * params.value_heads + head]) *
+                exp(lg[C] - lg[wi])
+          : 0.0f;
+  const ulong wk_base = ulong(base + wi) * kstride +
+                        key_head * GdnChunkHeadDim;
   for (uint e = tid; e < C * GdnChunkHeadDim; e += GdnChunkThreads) {
-    const uint c = e / C, i = e % C;
-    const float coef =
-        i < count
-            ? float(beta[(base + i) * params.value_heads + head]) *
-                  exp(lg[C] - lg[i])
-            : 0.0f;
-    wk[e] = coef *
-            float(k[ulong(base + i) * kstride + key_head * GdnChunkHeadDim +
-                    c]);
+    const uint c = e / C;
+    wk[e] = wcoef * float(k[wk_base + c]);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 

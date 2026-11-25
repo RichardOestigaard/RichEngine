@@ -135,6 +135,20 @@ def call_key(call):
     return function.get("name"), arguments_key(function.get("arguments"))
 
 
+def _cached_call_key(call, cache):
+    """call_key with the arguments parse memoized on the raw string: a
+    closed call is re-compared on every output event of the decode, and
+    its arguments arrive as the same string each time."""
+    function = call.get("function") or {}
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        key = cache.get(arguments)
+        if key is None:
+            key = cache[arguments] = arguments_key(arguments)
+        return function.get("name"), key
+    return function.get("name"), arguments_key(arguments)
+
+
 def previous_calls(messages):
     """(name, arguments) of the tool calls in the last assistant turn ->
     the text of their results. The turn before a fresh user message made
@@ -185,6 +199,7 @@ def detect(
     tools=False,
     max_calls=MAX_CALLS,
     state=None,
+    key_cache=None,
 ):
     """Why a reply should stop early: enough tool calls, a call repeated
     within the turn, or a token loop. `tokens` are the ids generated so far
@@ -203,7 +218,12 @@ def detect(
     the call was dropped)."""
     if len(closed_calls) >= max_calls:
         return "max_calls"
-    keys = [call_key(call) for call in closed_calls]
+    keys = [
+        _cached_call_key(call, key_cache)
+        if key_cache is not None
+        else call_key(call)
+        for call in closed_calls
+    ]
     if len(keys) != len(set(keys)):
         return "duplicate_call"
     if in_call:
@@ -265,6 +285,8 @@ class ReplyGuard:
         # calls; the job's prepared prompt carries them.
         self.prev = getattr(job, "prev_calls", None) or {}
         self.prev_names = {name for name, _arguments in self.prev}
+        # arguments_key memo for detect()'s per-event closed-call compares.
+        self.call_key_cache = {}
         # The response format a steered reply may answer under instead:
         # its schema, or its regex pattern (guided_regex), whichever the
         # request constrained output with.

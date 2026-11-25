@@ -97,7 +97,11 @@ inline void gguf_decode_mxfp4_tile(device bfloat *input, device uchar *w0, devic
       // the common case and lets the group accumulate without a partial;
       // only blocks at half's edges take a nonzero exponent.
       const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
-                        ? clamp(int(floor(log2(m))) - 14, -100, 100)
+                        ? clamp((m >= 1.17549435e-38f && m < INFINITY
+                                    ? int(as_type<uint>(m) >> 23) - 127
+                                    : int(floor(log2(m)))) -
+                                   14,
+                               -100, 100)
                         : 0;
       dst[row * 32 + s] = half(a * as_type<float>(uint(127 - e) << 23));
       scaled |= e != 0;

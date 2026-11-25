@@ -405,9 +405,12 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
     result.include(operators.linear().decodeScratchSize(block));
     // Small block projections take more decode splits than the tier bounds
     // reach: reserve per-split sums flatly rather than missing the kernel's
-    // pick (ggufDecodeScratchSize only adds register tiers on Apple9).
+    // pick (ggufDecodeScratchSize only adds register tiers on Apple9). A
+    // nemotron draft's float-segment projections stage 64 input rows
+    // (gguf_float's 64-row accelerator tile), the others' 32.
     ops::LinearScratchSize splits{};
-    splits.input = 32 /*staged rows*/ * uint64_t{shape.inputSize} * 2;
+    const uint64_t stagedRows = nemotronDraft ? 64 : 32;
+    splits.input = stagedRows * uint64_t{shape.inputSize} * 2;
     splits.rotated = splits.input;
     splits.sums = 64 /*rows*/ * (shape.inputSize / 32) * 32 /*splits*/;
     splits.partials = 64 /*rows*/ * uint64_t{shape.outputSize} * 4;

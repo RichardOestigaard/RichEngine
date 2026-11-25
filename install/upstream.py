@@ -71,6 +71,18 @@ def _imatrix_named(name):
     return Path(name).stem.lower().endswith(".imatrix")
 
 
+def _draft_named(name):
+    """Whether a root GGUF is a draft or MTP head published beside its
+    target (ggml-org's dspark-*, dflash-* and mtp-* artifacts), never the
+    target itself."""
+    return Path(name).stem.lower().split("-", 1)[0] in {
+        "dflash",
+        "dflash2",
+        "dspark",
+        "mtp",
+    }
+
+
 def _stem_words(name):
     """A GGUF stem as the tokens a repository separates with - or .:
     X-Q4_K_M and X.i1-Q4_K_M both end in a Q4_K_M word."""
@@ -89,7 +101,7 @@ def select_gguf(files, variant):
     candidates = [
         n
         for n in _root_ggufs(files)
-        if not _projector_named(n) and not _imatrix_named(n)
+        if not _projector_named(n) and not _imatrix_named(n) and not _draft_named(n)
     ]
     if variant is None:
         if len(candidates) == 1:
@@ -308,7 +320,7 @@ def _mlx_target(repo, language_only):
         ggufs = [
             n
             for n in _root_ggufs(repo.files)
-            if not _projector_named(n) and not _imatrix_named(n)
+            if not _projector_named(n) and not _imatrix_named(n) and not _draft_named(n)
         ]
         hint = (
             f"; select one with {repo.name}:VARIANT ({', '.join(ggufs)})"
@@ -565,12 +577,15 @@ def _install_commit(selection, target, installed):
             flush=True,
         )
     elif installed is not None:
-        print(
-            f"{models.accent(selection.repo_id)} moved from "
-            f"{models.dim(installed['sources'][layout.TARGET]['revision'][:12])} "
-            f"to {models.dim(target.revision[:12])}.",
-            flush=True,
-        )
+        # A local-directory source records no commit to move from.
+        recorded = installed["sources"][layout.TARGET]["revision"]
+        if recorded is not None:
+            print(
+                f"{models.accent(selection.repo_id)} moved from "
+                f"{models.dim(recorded[:12])} "
+                f"to {models.dim(target.revision[:12])}.",
+                flush=True,
+            )
     if installed is None:
         _install(selection, target, None)
         return

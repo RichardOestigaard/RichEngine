@@ -81,7 +81,11 @@ struct Packed {
     m = fmax(m, simd_shuffle_xor(m, 4u));
     m = fmax(m, simd_shuffle_xor(m, 8u));
     const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
-                      ? clamp(int(floor(log2(m))) - 14, -100, 100)
+                      ? clamp((m >= 1.17549435e-38f && m < INFINITY
+                                  ? int(as_type<uint>(m) >> 23) - 127
+                                  : int(floor(log2(m)))) -
+                                 14,
+                             -100, 100)
                       : 0;
     const float scale = as_type<float>(uint(127 - e) << 23);
     const uint group = span * 2 + (lane >> 4);

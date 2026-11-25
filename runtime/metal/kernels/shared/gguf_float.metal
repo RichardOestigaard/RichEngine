@@ -25,21 +25,21 @@ constant constexpr uint kSplits = 16;
 // K part s of every fragment; simdgroup f then adds fragment f's parts in order, so a result depends neither on
 // the grid nor on the row count. Lane (fm, fn) holds x[row fm][k + fn, k + fn + 1] as A,
 // W[column fn, fn + 1][k + fm] as B and the destination [row fm][column fn, fn + 1] (sgmatrix::lane_map).
-template <typename T>
-inline void project(device const bfloat *input, device const float *weights, device T *output,
+template <typename T, typename W>
+inline void project(device const bfloat *input, device const W *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint K = p.input_size, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
   const uint live = min(kRows, p.rows - row0);
   const uint steps = K / 8, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
-  device const float *w = weights + ulong(column) * K + l.fm;
+  device const W *w = weights + ulong(column) * K + l.fm;
   float2 acc[kFragments];
 #pragma unroll
   for (uint f = 0; f < kFragments; ++f) acc[f] = float2(0);
 #pragma unroll(4)
   for (uint step = first; step < last; ++step) {
     const uint k = step * 8;
-    const float2 b(w[k], w[K + k]);
+    const float2 b = float2(w[k], w[K + k]);
 #pragma unroll
     for (uint f = 0; f < kFragments; ++f) {
       if (f * 8 >= live) break;
@@ -67,16 +67,18 @@ inline void project(device const bfloat *input, device const float *weights, dev
 static_assert(gguf_float::kSplits >= gguf_float::kFragments, "simdgroup f reduces fragment f");
 
 // Grid (output_size / 8, ceil(rows / 32)), 32 kSplits threads.
-#define GGUF_FLOAT_KERNEL(Name, T)                                                                             \
-  kernel void Name(device const bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],       \
+#define GGUF_FLOAT_KERNEL(Name, T, W)                                                                          \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],           \
                    device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
                    uint lane [[thread_index_in_simdgroup]]) {                                                 \
     threadgroup float2 parts[gguf_float::kSplits * gguf_float::kFragments * 32];                              \
-    gguf_float::project<T>(input, weights, output, p, tg, sg, lane, parts);                                   \
+    gguf_float::project<T, W>(input, weights, output, p, tg, sg, lane, parts);                                \
   }
-GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat)
-GGUF_FLOAT_KERNEL(gguf_float_f32, float)
+GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat, float)
+GGUF_FLOAT_KERNEL(gguf_float_f32, float, float)
+GGUF_FLOAT_KERNEL(gguf_float_wbf16_bf16, bfloat, bfloat)
+GGUF_FLOAT_KERNEL(gguf_float_wbf16_f32, float, bfloat)
 #undef GGUF_FLOAT_KERNEL
 
 // The same projections on the neural accelerator (ops::FloatTile::NeuralAccelerator), whose matmul takes bf16
@@ -113,16 +115,22 @@ inline ushort3 split(float w) {
 // stay zero); after the barrier each simdgroup with live rows runs the three matmuls, and one past the rows only
 // stages. A simdgroup whose rows cross p.rows computes the 16 rows ending at p.rows instead and stores its own, so no
 // row past the input is read (p.rows >= 16).
-template <typename T>
-inline void project(device bfloat *input, device const float *weights, device T *output,
+// W = float: stage each weight's three bf16 parts and run three matmuls. W =
+// bfloat (a repacked draft segment, QuantizedSegment::kBfloat16): the weight
+// is already the matmul's operand — stage it alone and run one, for a third
+// of the matmul work and half the weight traffic.
+template <typename T, typename W>
+inline void project(device bfloat *input, device const W *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, ushort sg, ushort lane, threadgroup bfloat *stage) {
+  constexpr bool Split = is_same<W, float>::value;
+  using W4 = vec<W, 4>;
   const uint K = p.input_size, steps = K / kStep;
   const uint row0 = tg.y * kRows + sg * kRowsPerSimdgroup, first_row = min(row0, p.rows - kRowsPerSimdgroup);
   const uint col0 = tg.x * kColumns;
   const ushort t = sg * 32 + lane, column = t / (kStep / kPerThread), first = t % (kStep / kPerThread) * kPerThread;
   const bool live_column = col0 + column < p.output_size;
-  device const float4 *w =
-      reinterpret_cast<device const float4 *>(weights + ulong(live_column ? col0 + column : 0) * K + first);
+  device const W4 *w =
+      reinterpret_cast<device const W4 *>(weights + ulong(live_column ? col0 + column : 0) * K + first);
   auto a = tensor(input + ulong(first_row) * K, dextents<int, 2>{int(K), kRowsPerSimdgroup}, array<int, 2>{1, int(K)});
   constexpr auto descriptor = matmul2d_descriptor(kRowsPerSimdgroup, kColumns, kStep, false, true, false,
                                                   matmul2d_descriptor::mode::multiply_accumulate);
@@ -132,26 +140,34 @@ inline void project(device bfloat *input, device const float *weights, device T 
         stage + buffer * kBuffer + part * kPlane, dextents<int, 2>{kStep, kColumns}, array<int, 2>{1, kStep});
     return b.template slice<kStep, kColumns>(0, 0);
   };
-  auto h0 = plane(0, 0), m0 = plane(0, 1), l0 = plane(0, 2), h1 = plane(1, 0), m1 = plane(1, 1), l1 = plane(1, 2);
+  auto h0 = plane(0, 0), h1 = plane(1, 0);
+  auto m0 [[maybe_unused]] = plane(0, 1), l0 [[maybe_unused]] = plane(0, 2), m1 [[maybe_unused]] = plane(1, 1),
+       l1 [[maybe_unused]] = plane(1, 2);
   auto a0 = a.template slice<kStep, kRowsPerSimdgroup>(0, 0);
   auto high = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(h0), float>();
   auto low = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(h0), float>();
 #pragma unroll
   for (ushort i = 0; i < high.get_capacity(); ++i) high[i] = low[i] = 0.0f;
-  float4 next[kPerThread / 4];
+  W4 next[kPerThread / 4];
 #pragma unroll
-  for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = live_column ? w[j] : float4(0);
+  for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = live_column ? w[j] : W4(0);
   const bool owns_rows = row0 < p.rows;   // uniform per simdgroup
   for (uint step = 0; step < steps; ++step) {
     threadgroup ushort *parts =
         reinterpret_cast<threadgroup ushort *>(stage + (step & 1) * kBuffer) + column * kStep + first;
+    if constexpr (Split) {
 #pragma unroll
-    for (ushort j = 0; j < kPerThread / 4; ++j) {
-      const ushort3 x = split(next[j].x), y = split(next[j].y), z = split(next[j].z), v = split(next[j].w);
+      for (ushort j = 0; j < kPerThread / 4; ++j) {
+        const ushort3 x = split(next[j].x), y = split(next[j].y), z = split(next[j].z), v = split(next[j].w);
 #pragma unroll
-      for (ushort part = 0; part < kParts; ++part)
-        *reinterpret_cast<threadgroup ushort4 *>(parts + part * kPlane + 4 * j) =
-            ushort4(x[part], y[part], z[part], v[part]);
+        for (ushort part = 0; part < kParts; ++part)
+          *reinterpret_cast<threadgroup ushort4 *>(parts + part * kPlane + 4 * j) =
+              ushort4(x[part], y[part], z[part], v[part]);
+      }
+    } else {
+#pragma unroll
+      for (ushort j = 0; j < kPerThread / 4; ++j)
+        *reinterpret_cast<threadgroup ushort4 *>(parts + 4 * j) = as_type<ushort4>(next[j]);
     }
     if (step + 1 < steps && live_column) {
 #pragma unroll
@@ -160,14 +176,22 @@ inline void project(device bfloat *input, device const float *weights, device T 
     threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
     if (owns_rows) {
       auto slice = a.template slice<kStep, kRowsPerSimdgroup>(step * kStep, 0);
-      if (step & 1) {
-        operation.run(slice, h1, high);
-        operation.run(slice, m1, low);
-        operation.run(slice, l1, low);
+      if constexpr (Split) {
+        if (step & 1) {
+          operation.run(slice, h1, high);
+          operation.run(slice, m1, low);
+          operation.run(slice, l1, low);
+        } else {
+          operation.run(slice, h0, high);
+          operation.run(slice, m0, low);
+          operation.run(slice, l0, low);
+        }
       } else {
-        operation.run(slice, h0, high);
-        operation.run(slice, m0, low);
-        operation.run(slice, l0, low);
+        if (step & 1) {
+          operation.run(slice, h1, high);
+        } else {
+          operation.run(slice, h0, high);
+        }
       }
     }
   }
@@ -188,14 +212,16 @@ static_assert(gguf_float_na::kStep % gguf_float_na::kPerThread == 0 && gguf_floa
               "a thread stages whole float4s of one column");
 
 // Grid (ceil(output_size / 32), ceil(rows / 64)), 128 threads; rows >= 16, input_size a multiple of 32.
-#define GGUF_FLOAT_NA_KERNEL(Name, T)                                                                          \
-  kernel void Name(device bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],             \
+#define GGUF_FLOAT_NA_KERNEL(Name, T, W)                                                                       \
+  kernel void Name(device bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],                 \
                    device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
                    uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],   \
                    ushort lane [[thread_index_in_simdgroup]]) {                                               \
     threadgroup bfloat stage[2 * gguf_float_na::kBuffer];                                                      \
-    gguf_float_na::project<T>(input, weights, output, p, tg, sg, lane, stage);                                \
+    gguf_float_na::project<T, W>(input, weights, output, p, tg, sg, lane, stage);                             \
   }
-GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16, bfloat)
-GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16, bfloat, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32, float, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_wbf16_bf16, bfloat, bfloat)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_wbf16_f32, float, bfloat)
 #undef GGUF_FLOAT_NA_KERNEL

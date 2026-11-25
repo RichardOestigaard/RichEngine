@@ -235,7 +235,22 @@ inline void richengine_paged_attention_tile_fp8(
         running[index] = 0.0f;
     }
 
+    // Pages wholly below this pass's smallest window begin admit no token
+    // for any of its rows: the masked softmax leaves the running maximum,
+    // sum and output untouched, so their QK/PV work changes nothing. The
+    // split's statistics epilogue still runs — an empty page range writes
+    // the same -inf/0 a range of dead pages leaves behind.
+    uint dead_pages = 0;
+    if (window_tokens != 0) {
+      const uint query_row_min =
+          min((pass * MP) / QueryHeadsPerKVHead, active_rows - 1);
+      const uint causal_min = committed_tokens + query_row_min + 1;
+      if (causal_min > window_tokens)
+        dead_pages = (causal_min - window_tokens) / N;
+    }
     for (uint page = page_begin; page < page_end; ++page) {
+      if (page < dead_pages)
+        continue;
       const auto tensors = addressing.page(page_table[page]);
       uint token_start = page * N;
       device const float *key_scales = tensors.key_scales;

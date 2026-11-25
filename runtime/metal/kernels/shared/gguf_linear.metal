@@ -145,15 +145,27 @@ kernel void gguf_decode_amax(device bfloat *input [[buffer(0)]], device uchar *w
   }
   const uint tiles = hp.decode.out_stride / GGUF_TILE_COLUMNS;
   const uint ptile = hp.decode.out_offset / GGUF_TILE_COLUMNS + group.x;
+  // The head predicates depend only on the accumulator row, not the
+  // element: resolve them once into bitmasks instead of a divmod and two
+  // constant-space loads per element (Rows <= 64).
+  static_assert(Rows <= 64);
+  ulong row_pass = 0, row_masked = 0;
+#pragma unroll
+  for (ushort row = 0; row < Rows; ++row) {
+    const uint lane_index = row / hp.head.rows;
+    if (row % hp.head.rows < hp.head.live_rows[lane_index])
+      row_pass |= 1ull << row;
+    if (hp.head.exclude_stop_mask & (1u << lane_index))
+      row_masked |= 1ull << row;
+  }
   gguf_store_sums<Rows>(
       acc, hp.decode.splits, group.y, partials,
       counters + hp.decode.out_offset / GGUF_TILE_COLUMNS + group.x, hp.decode.out_stride, column0,
       simd_group * 32 + simd_lane, &arrival, [&](uint row, uint column, float v) {
         const uint token = column0 + column;
         if (token >= hp.head.output_size) return;
-        const uint lane_index = row / hp.head.rows;
-        if (row % hp.head.rows >= hp.head.live_rows[lane_index]) return;
-        if ((hp.head.exclude_stop_mask & (1u << lane_index)) &&
+        if (!((row_pass >> row) & 1)) return;
+        if (((row_masked >> row) & 1) &&
             (token == hp.head.stop_token_0 || token == hp.head.stop_token_1))
           return;
         if (v > best[row] || (v == best[row] && token < besti[row])) {

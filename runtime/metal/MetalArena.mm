@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <execinfo.h>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -283,6 +284,14 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
         message << "Metal buffer view is out of range: offset=" << offsetBytes
                 << " length=" << lengthBytes
                 << " base_length=" << base.impl_->lengthBytes;
+        void *frames[32];
+        const int count = backtrace(frames, 32);
+        char **symbols = backtrace_symbols(frames, count);
+        if (symbols) {
+            for (int i = 1; i < count && i < 16; ++i)
+                message << "\n  " << symbols[i];
+            free(symbols);
+        }
         throw MetalBackendError(message.str());
     }
     auto result = std::make_shared<MetalBuffer::Impl>();

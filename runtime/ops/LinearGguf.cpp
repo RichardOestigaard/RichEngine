@@ -1070,11 +1070,13 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
       (accelerator && (rows < 16 || k % 32)))
     throw std::invalid_argument("invalid float projection");
-  requireBytes(weights.plane0, uint64_t{n} * k * sizeof(float), "float projection weight");
+  requireBytes(weights.plane0, uint64_t{n} * k * weights.floatElementBytes(), "float projection weight");
   requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
   requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, element), "float projection output");
-  const std::string kernel = std::string(accelerator ? kGgufFloatNa : kGgufFloat) +
-                             (type == FloatOutput::Float32 ? "f32" : "bf16");
+  const std::string kernel =
+      std::string(accelerator ? kGgufFloatNa : kGgufFloat) +
+      (weights.formatId == QuantizedSegment::kBfloat16 ? "wbf16_" : "") +
+      (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
@@ -1118,6 +1120,8 @@ QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize
   return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
-const char *QuantizedSegment::name() const noexcept { return isFloat() ? "f32" : format().name; }
+const char *QuantizedSegment::name() const noexcept {
+  return isFloat() ? (formatId == kBfloat16 ? "wbf16" : "f32") : format().name;
+}
 
 } // namespace richengine::ops

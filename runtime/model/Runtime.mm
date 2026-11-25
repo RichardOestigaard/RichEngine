@@ -403,6 +403,215 @@ Runtime::prefillAsync(const BatchPlan &plan,
       ++impl->counters.aneFfnReruns;
     }
     impl->releasePrefillInputBank(inputBank);
+    // RICHENGINE_PREFILL_DUMP: per-sequence FNVs of the just-written GDN
+    // state cells (pre-swap parity) and of the last-encoded layer's arena
+    // tensors at each sequence's row slice. Pair with
+    // RICHENGINE_PREFILL_LIMIT=N to hold a specific layer's tensors.
+    static const bool prefillDump = envFlag("RICHENGINE_PREFILL_DUMP");
+    if (prefillDump) {
+      const auto fnv = [](const void *p, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (const uint8_t *b = static_cast<const uint8_t *>(p),
+                           *e = b + n;
+             b != e; ++b)
+          h = (h ^ *b) * 1099511628211ull;
+        return h;
+      };
+      const auto &tgt = impl->geometry.target;
+      const auto rowHash = [&](PrefillTensor t, uint64_t rowBytes,
+                               uint64_t rowBegin, uint64_t rows) {
+        const MetalBuffer buf = impl->prefillArena->get(t);
+        if (!buf.contents() || !buf.sizeBytes())
+          return uint64_t{0};
+        return fnv(static_cast<const uint8_t *>(buf.contents()) +
+                       rowBegin * rowBytes,
+                   rows * rowBytes);
+      };
+      const uint64_t rpr = tgt.moeShape().routesPerToken();
+      const auto scratchHash = [&](uint32_t field) {
+        const MetalBuffer buf = impl->prefillArena->get(
+            static_cast<PrefillTensor>(
+                static_cast<uint32_t>(PrefillTensor::MoeScratch) + field));
+        return (buf.contents() && buf.sizeBytes())
+                   ? fnv(buf.contents(), buf.sizeBytes())
+                   : uint64_t{0};
+      };
+      const auto routeHash = [&](uint32_t field, uint64_t rowBegin,
+                               uint64_t rows, uint32_t bytes) {
+        const MetalBuffer buf = impl->prefillArena->get(
+            static_cast<PrefillTensor>(
+                static_cast<uint32_t>(PrefillTensor::MoeScratch) + field));
+        if (!buf.contents() || !buf.sizeBytes())
+          return uint64_t{0};
+        return fnv(static_cast<const uint8_t *>(buf.contents()) +
+                       rowBegin * rpr * bytes,
+                   rows * rpr * bytes);
+      };
+      if (rpr)
+        fprintf(stderr,
+                "pdump-moe sel=%08llx rw=%08llx td=%08llx gr=%08llx rr=%08llx "
+                "gi=%08llx ei=%08llx eo=%08llx gs=%08llx\n",
+                (unsigned long long)scratchHash(0),
+                (unsigned long long)scratchHash(1),
+                (unsigned long long)scratchHash(2),
+                (unsigned long long)scratchHash(4),
+                (unsigned long long)scratchHash(5),
+                (unsigned long long)scratchHash(6),
+                (unsigned long long)scratchHash(7),
+                (unsigned long long)scratchHash(8),
+                (unsigned long long)scratchHash(9));
+      uint64_t rowBegin = 0;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        const Impl::Request &entry = *entries[lane];
+        const uint64_t rows = items[lane].tokenCount;
+        if (rpr) {
+          fprintf(stderr, "pdump-routes lane=%u sel=%08llx rw=%08llx rr=%08llx\n",
+                  lane, (unsigned long long)routeHash(0, rowBegin, rows, 4),
+                  (unsigned long long)routeHash(1, rowBegin, rows, 4),
+                  (unsigned long long)routeHash(5, rowBegin, rows, 4));
+          const MetalBuffer selB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 0));
+          const MetalBuffer rwB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 1));
+          const MetalBuffer rrB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 5));
+          const MetalBuffer giB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 6));
+          const MetalBuffer eiB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 7));
+          const MetalBuffer eoB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 8));
+          const MetalBuffer tdB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 2));
+          const MetalBuffer tcB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 3));
+          const MetalBuffer grB = impl->prefillArena->get(
+              static_cast<PrefillTensor>(
+                  static_cast<uint32_t>(PrefillTensor::MoeScratch) + 4));
+          if (tcB.contents())
+            fprintf(stderr, "pdump-tc lane=%u rows=%llu tile_count=%u\n",
+                    lane, (unsigned long long)rows,
+                    *static_cast<const uint32_t *>(tcB.contents()));
+          const uint64_t rowBytes = uint64_t{tgt.hiddenSize} * 2;
+          const uint64_t eiRowBytes =
+              uint64_t{tgt.moeShape().expertIntermediateSize} * 2;
+          for (uint64_t r = 0; r < rows * rpr; ++r) {
+            const uint64_t route = (rowBegin + r / rpr) * rpr + r % rpr;
+            const uint32_t e = static_cast<const uint32_t *>(
+                selB.contents())[route];
+            const float w =
+                static_cast<const float *>(rwB.contents())[route];
+            const uint32_t slot = static_cast<const uint32_t *>(
+                rrB.contents())[route];
+            const uint64_t gi =
+                slot != ~0u
+                    ? fnv(static_cast<const uint8_t *>(giB.contents()) +
+                              uint64_t{slot} * rowBytes,
+                          rowBytes)
+                    : 0;
+            const uint64_t ei =
+                slot != ~0u
+                    ? fnv(static_cast<const uint8_t *>(eiB.contents()) +
+                              uint64_t{slot} * eiRowBytes,
+                          eiRowBytes)
+                    : 0;
+            const uint64_t eo =
+                slot != ~0u
+                    ? fnv(static_cast<const uint8_t *>(eoB.contents()) +
+                              uint64_t{slot} * rowBytes,
+                          rowBytes)
+                    : 0;
+            uint32_t t8e = ~0u, t8r = 0, t16e = ~0u, t16r = 0, t32e = ~0u,
+                     t32r = 0, backRoute = ~0u;
+            if (slot != ~0u) {
+              const auto *td = static_cast<const MoeTileDescriptor *>(
+                  tdB.contents());
+              t8e = td[slot / 8].expert;
+              t8r = td[slot / 8].rows;
+              t16e = td[slot / 16].expert;
+              t16r = td[slot / 16].rows;
+              t32e = td[slot / 32].expert;
+              t32r = td[slot / 32].rows;
+              backRoute = static_cast<const uint32_t *>(
+                  grB.contents())[slot];
+            }
+            fprintf(stderr,
+                    "pr lane=%u row=%llu slot_in_row=%llu e=%u w=%08x "
+                    "slot=%u t8=%u:%u t16=%u:%u t32=%u:%u gr=%u gi=%08llx "
+                    "ei=%08llx eo=%08llx\n",
+                    lane, (unsigned long long)(r / rpr),
+                    (unsigned long long)(r % rpr), e,
+                    *reinterpret_cast<const uint32_t *>(&w), slot, t8e, t8r,
+                    t16e, t16r, t32e, t32r, backRoute,
+                    (unsigned long long)gi, (unsigned long long)ei,
+                    (unsigned long long)eo);
+          }
+        }
+        fprintf(stderr,
+                "pdump lane=%u id=%llu sl=%u rb=%llu rows=%llu "
+                "h0=%08llx h1=%08llx norm=%08llx pk=%08llx q=%08llx "
+                "k=%08llx v=%08llx dec=%08llx beta=%08llx rec=%08llx "
+                "gh=%08llx gout=%08llx",
+                lane, (unsigned long long)entry.id, entry.stateLane,
+                (unsigned long long)rowBegin, (unsigned long long)rows,
+                (unsigned long long)rowHash(PrefillTensor::Hidden0,
+                                            uint64_t{tgt.hiddenSize} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::Hidden1,
+                                            uint64_t{tgt.hiddenSize} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::Normalized,
+                                            uint64_t{tgt.hiddenSize} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnPacked,
+                                            uint64_t{tgt.packedGdnWidth} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnQueries,
+                                            uint64_t{tgt.gdnKeyWidth()} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnKeys,
+                                            uint64_t{tgt.gdnKeyWidth()} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnValues,
+                                            uint64_t{tgt.attentionWidth} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnDecay,
+                                            uint64_t{tgt.gdnValueHeads} * 4,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnBeta,
+                                            uint64_t{tgt.gdnValueHeads} * 4,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::Recurrent,
+                                            uint64_t{tgt.attentionWidth} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnHidden,
+                                            uint64_t{tgt.attentionWidth} * 2,
+                                            rowBegin, rows),
+                (unsigned long long)rowHash(PrefillTensor::GdnOutput,
+                                            uint64_t{tgt.hiddenSize} * 2,
+                                            rowBegin, rows));
+        const GdnParityBuffers &cell =
+            impl->states.next(entry.stateLane);
+        for (uint32_t gl = 0; gl < tgt.stateLayout.layers; ++gl)
+          fprintf(stderr, " g%u[r=%08llx c=%08llx]", gl,
+                  (unsigned long long)fnv(
+                      cell.recurrentLayers[gl].contents(),
+                      cell.recurrentLayers[gl].sizeBytes()),
+                  (unsigned long long)fnv(
+                      cell.convolutionLayers[gl].contents(),
+                      cell.convolutionLayers[gl].sizeBytes()));
+        fprintf(stderr, "\n");
+        rowBegin += rows;
+      }
+    }
     // RICHENGINE_MOE_STATS readback; a no-op unless the flag is "1".
     ops::MoE::logStats(impl->prefillArena->moeScratch().tileCount);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {

@@ -101,6 +101,14 @@ class FetchTest(unittest.TestCase):
                     self.send_header("Location", "/landing")
                     self.end_headers()
                     return
+                if self.path.startswith("/echo"):
+                    body = f"<html><body><p>{self.path}</p></body></html>".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path == "/binary":
                     body = b"\x89PNG\r\n"
                     self.send_response(200)
@@ -158,6 +166,13 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(result["status"], 200)
         self.assertIn("hello fixture", result["text"])
         self.assertNotIn("title", result)
+
+    def test_non_ascii_url_is_quoted(self):
+        # A model writes URLs unescaped; the fetch must percent-encode them
+        # rather than die on the transport's ASCII request line.
+        result = webfetch.fetch(f"{self.base}/echo?q=Østigaard")
+        self.assertEqual(result["status"], 200)
+        self.assertIn("/echo?q=%C3%98stigaard", result["text"])
 
     def test_binary_answers_metadata_only(self):
         result = webfetch.fetch(f"{self.base}/binary")

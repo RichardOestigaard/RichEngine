@@ -39,6 +39,7 @@ bool WeightImages::restore() {
     ++restored_;
   }
   released_ = restored_ < images_.size();
+  if (!released_ && postRestore_) postRestore_();
   return !released_;
 }
 

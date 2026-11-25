@@ -547,7 +547,8 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
                              uint thread_index, uint simd_lane,
                              uint simd_group, threadgroup float *row_scores,
                              threadgroup float *ordered,
-                             threadgroup float *scalar_partials) {
+                             threadgroup float *scalar_partials,
+                             threadgroup float *unnormalized_weights) {
   constexpr uint StorageN = 256;
   constexpr uint Simdgroups = StorageN / 32;
   constexpr uint ExpertsPerLane = StorageN / 32;
@@ -618,15 +619,23 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   }
   simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
                     thread_scope_simdgroup);
-  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
-    float denominator = 0.0f;
+  // The denominator is rank- and lane-invariant: lane 0 accumulates it in
+  // the same order and the simdgroup shares the one value.
+  float denominator = 0.0f;
+  if (simd_lane == 0) {
     for (uint other = 0; other < params.top_k; ++other) {
-      denominator +=
+      const float weight =
           fast::exp2((ordered[other] - ordered[0]) * 1.44269504089f);
+      unnormalized_weights[other] = weight;
+      denominator += weight;
     }
+  }
+  denominator = simd_broadcast(denominator, 0);
+  simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
+                    thread_scope_simdgroup);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
     routing_weights[row_routes + rank] =
-        fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
-        denominator;
+        unnormalized_weights[rank] / denominator;
   }
 }
 
@@ -646,6 +655,7 @@ kernel void moe_route_select_q8(
   threadgroup float row_scores[256];
   threadgroup float ordered[256];
   threadgroup float scalar_partials[8];
+  threadgroup float unnormalized_weights[256];
   // shared == 1: the scores tile parked the folded gate logit at
   // scores + rows * 256. shared == 2 (RICHENGINE_MOE_FOLDED_GATE_OFF):
   // re-dot the input against the gate planes, as the unfused select did.
@@ -655,13 +665,13 @@ kernel void moe_route_select_q8(
                                      shared_biases},
                      selected, routing_weights, params, group, thread_index,
                      simd_lane, simd_group, row_scores, ordered,
-                     scalar_partials);
+                     scalar_partials, unnormalized_weights);
   else
     moe_route_select(scores, nullptr,
                      MoeSharedGateScores{scores + ulong(params.rows) * 256},
                      selected, routing_weights, params, group, thread_index,
                      simd_lane, simd_group, row_scores, ordered,
-                     scalar_partials);
+                     scalar_partials, unnormalized_weights);
 }
 
 // The GGUF router: fp32 scores (kernels/shared/gguf_float.metal) and the F32
@@ -680,9 +690,11 @@ kernel void moe_route_select_f32(
   threadgroup float row_scores[256];
   threadgroup float ordered[256];
   threadgroup float scalar_partials[8];
+  threadgroup float unnormalized_weights[256];
   moe_route_select(scores, input, MoeSharedGateF32{shared_gate}, selected,
                    routing_weights, params, group, thread_index, simd_lane,
-                   simd_group, row_scores, ordered, scalar_partials);
+                   simd_group, row_scores, ordered, scalar_partials,
+                   unnormalized_weights);
 }
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp, abi/MoE.h): keep the `budget` routed
@@ -1011,13 +1023,15 @@ kernel void moe_route_select_sigmoid(
                     thread_scope_simdgroup);
   // norm_topk_prob: the winners' sigmoid scores over their sum, times the
   // routed scaling factor (1.0 on every shape but Nemotron's).
-  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
-    float denominator = 0.0f;
+  float denominator = 0.0f;
+  if (simd_lane == 0) {
     for (uint other = 0; other < params.top_k; ++other)
       denominator += ordered[other];
+  }
+  denominator = simd_broadcast(denominator, 0);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32)
     routing_weights[row_routes + rank] =
         ordered[rank] / denominator * params.weight_scale;
-  }
 }
 
 // The sigmoid-gated select for a block whose shared expert carries no scalar
@@ -1090,13 +1104,15 @@ kernel void moe_route_select_sigmoid_shared(
   // norm_topk_prob: the winners' sigmoid scores over their sum, times
   // weight_scale — NVIDIA Nemotron's routed scaling factor 2.5, which the
   // shape sets only on this unit-weight shared-expert select.
-  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
-    float denominator = 0.0f;
+  float denominator = 0.0f;
+  if (simd_lane == 0) {
     for (uint other = 0; other < params.top_k; ++other)
       denominator += ordered[other];
+  }
+  denominator = simd_broadcast(denominator, 0);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32)
     routing_weights[row_routes + rank] =
         ordered[rank] / denominator * params.weight_scale;
-  }
 }
 
 // One row's sigmoid-gated select on a single simdgroup: lane l holds
@@ -1139,13 +1155,15 @@ inline void moe_sigmoid_select_row(device uint *selected,
                     thread_scope_simdgroup);
   // norm_topk_prob: the winners' sigmoid scores over their sum, times the
   // routed scaling factor (Nemotron's 2.5; 1.0 elsewhere).
-  for (uint rank = simd_lane; rank < params.top_k; rank += 32) {
-    float denominator = 0.0f;
+  float denominator = 0.0f;
+  if (simd_lane == 0) {
     for (uint other = 0; other < params.top_k; ++other)
       denominator += row_ordered[other];
+  }
+  denominator = simd_broadcast(denominator, 0);
+  for (uint rank = simd_lane; rank < params.top_k; rank += 32)
     routing_weights[row_routes + rank] =
         row_ordered[rank] / denominator * params.weight_scale;
-  }
 }
 
 // The sigmoid-gated select fused with route grouping, for the small row

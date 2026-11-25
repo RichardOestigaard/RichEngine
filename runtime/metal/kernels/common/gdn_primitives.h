@@ -20,6 +20,11 @@ inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
                                     uint token, uint channel,
                                     device const bfloat *conv_bias = nullptr) {
   float value = 0.0f;
+  // The channel's four taps are one aligned bfloat4 (packed sections are
+  // kWeightFileAlignment-aligned and channel * 4 elements is 8 bytes).
+  const bfloat4 taps =
+      *reinterpret_cast<device const bfloat4 *>(conv_weights + channel * 4);
+  const bfloat wtap[4] = {taps.x, taps.y, taps.z, taps.w};
   for (uint tap = 0; tap < 4; ++tap) {
     // The window stays three slots: the pending rows' tail slides into it —
     // position p reads the (p + pending)-th token of the chained
@@ -32,7 +37,7 @@ inline bfloat gdn_conv_silu_pending(device const bfloat *packed,
       input = tape_conv[(position + pending - 3) * conv_dim + channel];
     else
       input = conv_state_in[(position + pending) * conv_dim + channel];
-    value += float(input) * float(conv_weights[channel * 4 + tap]);
+    value += float(input) * float(wtap[tap]);
   }
   if (conv_bias)
     value += float(conv_bias[channel]);
@@ -104,6 +109,9 @@ inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
                                  device const bfloat *conv_bias = nullptr) {
   const uint depth = RICHENGINE_TREE_NODE_DEPTH(nodes[row]);
   float value = 0.0f;
+  const bfloat4 taps =
+      *reinterpret_cast<device const bfloat4 *>(conv_weights + channel * 4);
+  const bfloat wtap[4] = {taps.x, taps.y, taps.z, taps.w};
   for (uint tap = 0; tap < 4; ++tap) {
     const int position = int(depth) + int(tap);
     const bfloat input =
@@ -112,7 +120,7 @@ inline bfloat gdn_conv_silu_tree(device const bfloat *packed,
             : packed[ulong(gdn_tree_ancestor(nodes, row, 3 - tap)) *
                          packed_width +
                      channel];
-    value += float(input) * float(conv_weights[channel * 4 + tap]);
+    value += float(input) * float(wtap[tap]);
   }
   if (conv_bias)
     value += float(conv_bias[channel]);

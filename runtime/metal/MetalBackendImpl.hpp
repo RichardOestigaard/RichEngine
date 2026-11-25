@@ -1192,9 +1192,12 @@ struct MetalBackend::Impl {
     // GPU-encoded spans of earlier submissions, keyed like bakedSpans.
     std::unordered_map<std::string, std::vector<std::shared_ptr<GpuSpan>>>
         gpuSpans;
-    // Prepared commands of earlier submissions, keyed by dispatch count and
-    // the run's first and last pipeline; alternates per key as the spans.
-    std::unordered_map<std::string,
+    // Prepared commands of earlier submissions, keyed by a fingerprint of
+    // the dispatch count and the run's first and last pipeline; alternates
+    // per key as the spans. The fingerprint only buckets — commandMatches
+    // still validates field-for-field, so a collision costs a scan, never
+    // a wrong reuse.
+    std::unordered_map<uint64_t,
                        std::vector<std::unique_ptr<CachedCommand>>>
         preparedCache;
     uint64_t bakedClock = 0;

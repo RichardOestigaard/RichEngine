@@ -38,10 +38,11 @@ Options: `--samples N` (default 1), `--progress FILE` (JSONL progress),
 
 ## Fixed conventions
 
-- **`--kv-format` defaults to `int8` in the benchmark**, not serve's
-  `int4`. The published decode numbers run INT8: INT4's quantization noise
-  flips near-tie argmaxes and measurably lowers draft acceptance. Always
-  compare against numbers taken at the same format.
+- **`--kv-format` defaults to `int8` in the benchmark**, matching serve's
+  own default (`int8` since the int4 default was reverted). The published
+  decode numbers run INT8: INT4's quantization noise flips near-tie
+  argmaxes and measurably lowers draft acceptance. Always compare against
+  numbers taken at the same format.
 - Draft acceptance depends on the prompt. The benchmark's prompt is
   synthetic; do not mix acceptance or decode figures across benchmark
   versions or prompt sets.

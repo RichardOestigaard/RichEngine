@@ -62,6 +62,9 @@ struct ProjectionPart {
   // Quantized in the source but written dequantized into an F32 float
   // segment: the block MoE reads its router and scalar gate as F32.
   bool dequantize = false;
+  // An unquantized part written bf16 instead of F32: the off-tile draft's
+  // packages (QuantizedSegment::kBfloat16) halve the float-segment bytes.
+  bool bfloat = false;
   bool nativeRows = false;
   // A window of a fused source's rows: MiniCPM-V's experts.gate_up_proj
   // stores each expert's gate and up rows interleaved [gate|up], so its

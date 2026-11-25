@@ -114,6 +114,9 @@ std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t
     std::vector<metal::MetalBuffer> views;
     uint64_t offset = 0;
     for (uint64_t part : parts) {
+        if (!part)
+            throw WeightStoreError("packed section part is empty: " +
+                                   std::string(label));
         views.push_back(impl_->backend->view(whole, offset, part));
         offset += part;
     }
@@ -289,10 +292,13 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     // stored planes pad the tail tile (a nemotron projection's 2688
     // outputs fill forty-two tiles' worth).
     if (!d.outputSize || !d.inputSize ||
-        (tiled && d.type != ggml::kF32 && !affine &&
+        (tiled && d.type != ggml::kF32 && d.type != ggml::kBF16 && !affine &&
          (d.outputSize % GGUF_TILE_COLUMNS || d.inputSize % columnUnit)) ||
         (tiled && affine && (d.outputSize % kQ4StorageN || d.inputSize % kQ4GroupElements)))
-        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
+        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label) +
+                               " (type=" + std::to_string(d.type) +
+                               " rows=" + std::to_string(d.outputSize) +
+                               " cols=" + std::to_string(d.inputSize) + ")");
     return d;
 }
 
@@ -301,12 +307,16 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 ops::QuantizedSegment segmentFromDescriptor(WeightFile &file,
                                             const GgufTensorDescriptor &d,
                                             std::string_view label) {
-    if (d.type == ggml::kF32) {
+    if (d.type == ggml::kF32 || d.type == ggml::kBF16) {
+        const uint64_t elementBytes = d.type == ggml::kBF16 ? 2 : sizeof(float);
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
-            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * elementBytes)
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        return ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
-                                             file.section(d.plane0Bytes, std::string(label) + "-floats"));
+        ops::QuantizedSegment segment =
+            ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
+                                          file.section(d.plane0Bytes, std::string(label) + "-floats"));
+        if (d.type == ggml::kBF16) segment.formatId = ops::QuantizedSegment::kBfloat16;
+        return segment;
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)

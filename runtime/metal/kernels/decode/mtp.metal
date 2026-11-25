@@ -20,11 +20,33 @@ inline float4 mtp_head_rope(float4 v, uint dim, uint pairs, float theta,
   const float4 low = lane < quarter ? v : other;
   const float4 high = lane < quarter ? other : v;
   const uint base = (lane < quarter ? lane : partner) * 4;
-  const float inv = 1.0f / pow(theta, 2.0f / float(dim));
-  const float4 angle = position *
-      float4(pow(inv, float(base)), pow(inv, float(base + 1)),
-             pow(inv, float(base + 2)), pow(inv, float(base + 3)));
-  const float4 c = cos(angle), s = sin(angle);
+  float4 c, s;
+  if (quarter == 16) {
+    // Lanes l and l + 16 share base, angle, cos and sin: half derive them,
+    // the rest take the partner's — the same bits either way.
+    c = float4(0.0f);
+    s = float4(0.0f);
+    if (lane < quarter) {
+      const float inv = 1.0f / pow(theta, 2.0f / float(dim));
+      const float4 angle =
+          position *
+          float4(pow(inv, float(base)), pow(inv, float(base + 1)),
+                 pow(inv, float(base + 2)), pow(inv, float(base + 3)));
+      c = cos(angle);
+      s = sin(angle);
+    }
+    const uint csrc = lane < quarter ? lane : partner;
+    c = simd_shuffle(c, csrc);
+    s = simd_shuffle(s, csrc);
+  } else {
+    const float inv = 1.0f / pow(theta, 2.0f / float(dim));
+    const float4 angle =
+        position *
+        float4(pow(inv, float(base)), pow(inv, float(base + 1)),
+               pow(inv, float(base + 2)), pow(inv, float(base + 3)));
+    c = cos(angle);
+    s = sin(angle);
+  }
   return lane < quarter ? low * c - high * s : low * s + high * c;
 }
 
@@ -335,7 +357,10 @@ kernel void mtp_attention(device const bfloat *queries [[buffer(0)]],
     }
     const float tileMax = simd_max(score);
     const float next = max(m, tileMax);
-    const float rescale = exp(m - next);
+    // next == m makes the rescale exp(0) == 1 exactly; the infinities keep
+    // the original exp path so NaN propagation is unchanged.
+    const float rescale =
+        next == m && m != INFINITY && m != -INFINITY ? 1.0f : exp(m - next);
     const float weight = position < length ? exp(score - next) : 0.0f;
     sum = sum * rescale + simd_sum(weight);
     acc *= rescale;

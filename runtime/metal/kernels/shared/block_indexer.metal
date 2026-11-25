@@ -532,11 +532,19 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
       const uint probeBlock = min(page * kPageBlocks, complete - 1);
       device const bfloat *k = keyOf(probeBlock);
       float score = 0.0f;
-      for (uint h = 0; h < kHeads; ++h) {
-        float dot = 0.0f;
-        for (uint d = 0; d < kDimension; ++d) dot += q[h * kDimension + d] * float(k[d]);
-        score += max(dot, 0.0f);
+      // k[d] serves every head: load it once per dimension, keep each
+      // head's dot in its own accumulator (same d-order as before).
+      float dots[kHeads];
+#pragma unroll
+      for (uint h = 0; h < kHeads; ++h) dots[h] = 0.0f;
+      for (uint d = 0; d < kDimension; ++d) {
+        const float kd = float(k[d]);
+#pragma unroll
+        for (uint h = 0; h < kHeads; ++h)
+          dots[h] += q[h * kDimension + d] * kd;
       }
+#pragma unroll
+      for (uint h = 0; h < kHeads; ++h) score += max(dots[h], 0.0f);
       probes[page] = score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
@@ -577,11 +585,19 @@ kernel void block_indexer_topk(device const bfloat *queries [[buffer(0)]],
     }
     device const bfloat *k = keyOf(b);
     float score = 0.0f;
-    for (uint h = 0; h < kHeads; ++h) {
-      float dot = 0.0f;
-      for (uint d = 0; d < kDimension; ++d) dot += q[h * kDimension + d] * float(k[d]);
-      score += max(dot, 0.0f);
+    // k[d] serves every head: load it once per dimension, keep each head's
+    // dot in its own accumulator (same d-order as before).
+    float dots[kHeads];
+#pragma unroll
+    for (uint h = 0; h < kHeads; ++h) dots[h] = 0.0f;
+    for (uint d = 0; d < kDimension; ++d) {
+      const float kd = float(k[d]);
+#pragma unroll
+      for (uint h = 0; h < kHeads; ++h)
+        dots[h] += q[h * kDimension + d] * kd;
     }
+#pragma unroll
+    for (uint h = 0; h < kHeads; ++h) score += max(dots[h], 0.0f);
     s[b] = score * norm;
   }
   threadgroup_barrier(mem_flags::mem_device);

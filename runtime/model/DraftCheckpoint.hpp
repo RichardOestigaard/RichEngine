@@ -68,6 +68,7 @@ public:
   ~DSparkCheckpointLoader();
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
+  [[nodiscard]] WeightImages &images() noexcept { return images_; }
 
 private:
   WeightImages &images_;

@@ -1410,9 +1410,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _client_disconnected(self):
         # A poll object holds no descriptor: running out of descriptors
-        # must not read as a disconnect.
-        poller = select.poll()
-        poller.register(self.connection, select.POLLIN)
+        # must not read as a disconnect. One poller per handler — poll()
+        # allocates under the hood, so it is made once, not per event.
+        poller = getattr(self, "_disconnect_poller", None)
+        if poller is None:
+            poller = self._disconnect_poller = select.poll()
+            poller.register(self.connection, select.POLLIN)
         try:
             # The body is already consumed and every response closes the
             # connection. Drain unexpected trailing bytes so they cannot hide EOF.
@@ -1688,6 +1691,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             ),
             tools=getattr(job, "may_call_tools", False),
             state=guard,
+            key_cache=getattr(guard, "call_key_cache", None),
         )
 
     @staticmethod

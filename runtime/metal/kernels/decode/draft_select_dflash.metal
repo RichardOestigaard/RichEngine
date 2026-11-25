@@ -264,20 +264,19 @@ kernel void draft_select_dflash(
     confidence[position] = 1.0f / mass;
     uint selected = 0;
     if (sampling) {
-      float maximum = scores[0];
-      for (uint i = 1; i < Candidates; ++i)
-        maximum = max(maximum, scores[i]);
+      // `best` already is max(scores): the temperature-1 confidence pass
+      // computed it.
+      const float maximum = best;
+      float raw[Candidates];
       float sum = 0.0f;
       for (uint i = 0; i < Candidates; ++i) {
-        float probability =
-            exp((scores[i] - maximum) / params.temperature[batch]);
-        q_probs[position * Candidates + i] = probability;
-        sum += probability;
+        raw[i] = exp((scores[i] - maximum) / params.temperature[batch]);
+        sum += raw[i];
       }
       float cumulative = 0.0f;
       selected = Candidates - 1;
       for (uint i = 0; i < Candidates; ++i) {
-        float probability = q_probs[position * Candidates + i] / sum;
+        const float probability = raw[i] / sum;
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&
@@ -353,17 +352,16 @@ kernel void draft_select_tree(
       float maximum = scores[0];
       for (uint i = 1; i < Candidates; ++i)
         maximum = max(maximum, scores[i]);
+      float raw[Candidates];
       float sum = 0.0f;
       for (uint i = 0; i < Candidates; ++i) {
-        float probability =
-            exp((scores[i] - maximum) / params.temperature[batch]);
-        q_probs[position * Candidates + i] = probability;
-        sum += probability;
+        raw[i] = exp((scores[i] - maximum) / params.temperature[batch]);
+        sum += raw[i];
       }
       float cumulative = 0.0f;
       selected = Candidates - 1;
       for (uint i = 0; i < Candidates; ++i) {
-        float probability = q_probs[position * Candidates + i] / sum;
+        const float probability = raw[i] / sum;
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
         if (selected == Candidates - 1 &&

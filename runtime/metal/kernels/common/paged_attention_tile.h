@@ -515,7 +515,23 @@ inline void richengine_paged_attention_tile(
         running[index] = Accumulator(0.0f);
     }
 
+    // Pages wholly below this pass's smallest window begin admit no token
+    // for any of its rows: the masked softmax leaves the running maximum,
+    // sum and output untouched, so their QK/PV work changes nothing. The
+    // split's statistics epilogue still runs — an empty page range writes
+    // the same -inf/0 a range of dead pages leaves behind. A streaming
+    // head's virtual pages already start at its live window.
+    uint dead_pages = 0;
+    if (!duo_streaming && window_tokens != 0) {
+      const uint query_row_min =
+          min((pass * MP) / QueryHeadsPerKVHead, active_rows - 1);
+      const uint causal_min = committed_tokens + query_row_min + 1;
+      if (causal_min > window_tokens)
+        dead_pages = (causal_min - window_tokens) / N;
+    }
     for (uint vpage = page_begin; vpage < page_end; ++vpage) {
+      if (vpage < dead_pages)
+        continue;
       // A streaming head's virtual page maps onto the sink's leading pages,
       // then the window's trailing ones; the mask trims tokens per row.
       const uint page = richengine_duo_page(duo_range, vpage);

@@ -5,6 +5,7 @@
 #include "ops/KernelNames.hpp"
 #include "ops/RowCopy.hpp"
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -505,6 +506,57 @@ DSparkDraftWeights readDraft(metal::MetalBackend &backend, Files &files,
   return result;
 }
 
+// The f32 elements of one float-segment plane0, narrowed to bf16 in place:
+// bf16 element i lands inside f32 element i / 2, which a forward pass
+// already consumed — so the values fit the plane's first half and no
+// allocation (the memory audit's headroom is zero) is needed. Runs at load
+// and again after a weight-memory restore rewrites the file's f32 bytes
+// over them (WeightImages::setPostRestore).
+void repackFloatPlane(const metal::MetalBuffer &plane, uint64_t elements) {
+  const float *source = static_cast<const float *>(plane.contents());
+  uint16_t *destination = static_cast<uint16_t *>(plane.contents());
+  if (!source || !destination)
+    throw std::invalid_argument("draft float segment is not CPU-readable");
+  // Round-to-nearest-even bf16.
+  for (uint64_t i = 0; i < elements; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, source + i, sizeof(bits));
+    destination[i] =
+        static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+  }
+}
+
+// RICHENGINE_DRAFT_WBF16=1 repacks a projection's F32 float segments to bf16
+// at load (QuantizedSegment::kBfloat16): the off-tile draft's whole weight
+// pass is float segments, so this halves its weight traffic, and the neural
+// accelerator kernel drops the fp32 operand split for a third of its matmul
+// work. The draft proposes; the target verifies — its F32 tensors stay exact.
+// `repacks` collects each converted segment's source plane and element count
+// for the post-restore re-run.
+ops::Projection bfloatSegments(
+    const ops::Projection &projection, metal::MetalBackend &backend,
+    std::vector<std::pair<metal::MetalBuffer, uint64_t>> &repacks) {
+  if (projection.layout() != ops::WeightLayout::Block32) return projection;
+  ops::BlockWeights blocks;
+  blocks.segments.reserve(projection.blocks().segments.size());
+  bool repacked = false;
+  for (const ops::QuantizedSegment &s : projection.blocks().segments) {
+    if (s.formatId != ops::QuantizedSegment::kFloat32) {
+      blocks.segments.push_back(s);
+      continue;
+    }
+    const uint64_t elements = uint64_t{s.outputSize} * s.inputSize;
+    repackFloatPlane(s.plane0, elements);
+    repacks.emplace_back(s.plane0, elements);
+    ops::QuantizedSegment converted = s;
+    converted.plane0 = backend.view(s.plane0, 0, elements * 2);
+    converted.formatId = ops::QuantizedSegment::kBfloat16;
+    blocks.segments.push_back(std::move(converted));
+    repacked = true;
+  }
+  return repacked ? projection.withSegments(std::move(blocks)) : projection;
+}
+
 } // namespace
 
 WeightFile PackedDSparkDraftFiles::layer(uint32_t index) const {
@@ -522,10 +574,35 @@ DSparkDraftWeights loadDSparkDraftWeights(metal::MetalBackend &backend,
                                           const DSparkDraftFiles &files,
                                           DFlashDraftLayout layout) {
   requireLayout(layout);
-  if (const auto *checkpoint =
-          std::get_if<std::reference_wrapper<DSparkCheckpointLoader>>(&files))
-    return readDraft(backend, checkpoint->get(), layout);
-  return readDraft(backend, std::get<PackedDSparkDraftFiles>(files), layout);
+  DSparkDraftWeights result =
+      std::holds_alternative<std::reference_wrapper<DSparkCheckpointLoader>>(files)
+          ? readDraft(backend, std::get<std::reference_wrapper<DSparkCheckpointLoader>>(files).get(), layout)
+          : readDraft(backend, std::get<PackedDSparkDraftFiles>(files), layout);
+  if (getenv("RICHENGINE_DRAFT_WBF16")) {
+    std::vector<std::pair<metal::MetalBuffer, uint64_t>> repacks;
+    for (DFlashV1DraftLayerWeights &layer : result.layers) {
+      layer.qkvProjection = bfloatSegments(layer.qkvProjection, backend, repacks);
+      layer.outputProjection = bfloatSegments(layer.outputProjection, backend, repacks);
+      layer.gateProjection = bfloatSegments(layer.gateProjection, backend, repacks);
+      layer.upProjection = bfloatSegments(layer.upProjection, backend, repacks);
+      layer.downProjection = bfloatSegments(layer.downProjection, backend, repacks);
+    }
+    result.contextProjection = bfloatSegments(result.contextProjection, backend, repacks);
+    if (!repacks.empty()) {
+      // A restore rewrites the file's f32 planes over the repack; re-run it.
+      WeightImages &images =
+          std::holds_alternative<PackedDSparkDraftFiles>(files)
+              ? std::get<PackedDSparkDraftFiles>(files).images
+              : std::get<std::reference_wrapper<DSparkCheckpointLoader>>(files)
+                    .get()
+                    .images();
+      images.setPostRestore([repacks = std::move(repacks)] {
+        for (const auto &[plane, elements] : repacks)
+          repackFloatPlane(plane, elements);
+      });
+    }
+  }
+  return result;
 }
 
 } // namespace richengine::model

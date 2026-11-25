@@ -63,6 +63,8 @@ struct Segment {
   uint64_t rowStart = 0; // the flat row its coverage begins at
   uint64_t rows = 0;
   uint32_t bits = 0, groupSize = 0;
+  // A float segment's element type: bf16 (the oQ draft format) or f32.
+  uint8_t bfloat = 0;
   uint64_t offset = 0, plane0 = 0, meta = 0;
   uint64_t plane0Bytes = 0, metaBytes = 0;
   uint64_t end = 0;
@@ -92,6 +94,7 @@ std::vector<Segment> segments(const Section &section) {
       segment.rows = i + 1 == section.parts.size() && section.parts.size() > 1
                          ? total - pos
                          : partRows(section, part);
+      segment.bfloat = part.bfloat && !part.dequantize;
       result.push_back(segment);
       pos += segment.rows;
       ++i;
@@ -172,7 +175,7 @@ void layOut(Segment &segment, const Section &section, uint64_t &cursor) {
     segment.meta = segment.plane0 + alignWeightOffset(segment.plane0Bytes);
     segment.end = segment.meta + alignWeightOffset(segment.metaBytes);
   } else {
-    segment.plane0Bytes = checkedMultiply<WeightStoreError>(segment.rows, uint64_t(section.columns) * sizeof(float),
+    segment.plane0Bytes = checkedMultiply<WeightStoreError>(segment.rows, uint64_t(section.columns) * (segment.bfloat ? 2 : sizeof(float)),
                                                           "oQ float segment");
     segment.end = segment.plane0 + alignWeightOffset(segment.plane0Bytes);
   }
@@ -367,6 +370,55 @@ void floatStep(const Section &section, const Segment &segment, uint64_t firstRow
   }
 }
 
+// floatStep's bf16 twin: BF16 copies its stored bits; F32 and F16 narrow
+// round-to-nearest-even — the oQ float-segment format of off-tile drafts
+// (QuantizedSegment::kBfloat16).
+void bfloatStep(const Section &section, const Segment &segment, uint64_t firstRow, uint32_t rows,
+                std::vector<uint8_t> &staging, uint8_t *to) {
+  const ProjectionPart &part = section.parts[segment.firstPart];
+  const uint32_t columns = section.columns;
+  const uint32_t elementBytes = part.fields[0].tensor->dtype == "F32" ? 4 : 2;
+  const uint64_t sourceRowBytes = uint64_t(columns) * elementBytes;
+  const uint64_t available = partRows(section, part) - std::min(firstRow, partRows(section, part));
+  const uint64_t count = std::min<uint64_t>(rows, available);
+  if (staging.size() < count * sourceRowBytes) staging.resize(count * sourceRowBytes);
+  for (uint64_t done = 0; done < count;) {
+    const uint64_t chunk = part.expertStride
+                               ? std::min(count - done, part.rows - (firstRow + done) % part.rows)
+                               : count - done;
+    part.fields[0].tensor->read(part.sourceRow(firstRow + done) * sourceRowBytes,
+                                {staging.data() + done * sourceRowBytes, chunk * sourceRowBytes});
+    done += chunk;
+  }
+  const bool bf16 = part.fields[0].tensor->dtype == "BF16";
+  for (uint64_t row = 0; row < rows; ++row) {
+    uint8_t *const out = to + row * uint64_t(columns) * 2;
+    if (row >= count) {
+      std::memset(out, 0, uint64_t(columns) * 2);
+      continue;
+    }
+    const uint8_t *const source = staging.data() + row * sourceRowBytes;
+    for (uint32_t e = 0; e < columns; ++e) {
+      uint16_t bits;
+      if (elementBytes == 4) {
+        uint32_t wide;
+        std::memcpy(&wide, source + 4 * e, 4);
+        bits = static_cast<uint16_t>((wide + 0x7FFFu + ((wide >> 16) & 1u)) >> 16);
+      } else if (bf16) {
+        std::memcpy(&bits, source + 2 * e, 2);
+      } else {
+        uint16_t half;
+        std::memcpy(&half, source + 2 * e, 2);
+        const float value = halfValue(half);
+        uint32_t wide;
+        std::memcpy(&wide, &value, 4);
+        bits = static_cast<uint16_t>((wide + 0x7FFFu + ((wide >> 16) & 1u)) >> 16);
+      }
+      std::memcpy(out + 2 * e, &bits, 2);
+    }
+  }
+}
+
 // The float rows of a part the source quantizes but the reader wants F32
 // (the block MoE's router and scalar gate): each value dequantizes to
 // f32(scale * code + bias), the kernel's own arithmetic; the rows past the
@@ -435,7 +487,7 @@ void addSegmentTasks(const Section &section, uint8_t *at,
         descriptor.plane0Bytes = segment.plane0Bytes;
         descriptor.metaTotalBytes = segment.metaBytes;
       } else {
-        descriptor.type = ggml::kF32;
+        descriptor.type = segment.bfloat ? ggml::kBF16 : ggml::kF32;
         descriptor.plane0Bytes = segment.plane0Bytes;
       }
       uint8_t *const base = at + segment.offset;
@@ -464,9 +516,12 @@ void addSegmentTasks(const Section &section, uint8_t *at,
       for (uint64_t first = 0; first < segment.rows; first += stepRows) {
         const uint32_t rows = static_cast<uint32_t>(std::min(stepRows, segment.rows - first));
         tasks.push_back([&section, segment, first, rows, at](std::vector<uint8_t> &staging) {
-          uint8_t *const to = at + segment.plane0 + first * section.columns * 4;
+          const uint64_t elementBytes = segment.bfloat ? 2 : 4;
+          uint8_t *const to = at + segment.plane0 + first * section.columns * elementBytes;
           if (section.parts[segment.firstPart].dequantize)
             dequantFloatStep(section, segment, first, rows, staging, to);
+          else if (segment.bfloat)
+            bfloatStep(section, segment, first, rows, staging, to);
           else
             floatStep(section, segment, first, rows, staging, to);
         });

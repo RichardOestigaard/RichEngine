@@ -81,7 +81,8 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   // Maxwell's MTP reads its block out of the target GGUF; nemotron's is a
   // checkpoint dir like the other drafts.
   const bool nemotronMtpDraft =
-      mtpDraft && result.descriptor.target.arch == "nemotron";
+      mtpDraft && (result.descriptor.target.arch == "nemotron" ||
+                   result.descriptor.target.arch == "nemotron_h_moe");
   std::optional<WeightFile> mtpImage;
   uint64_t mtpBaseline = 0;
   std::optional<DFlash2CheckpointLoader> draft;
@@ -159,8 +160,9 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
       targetBlock = true;
       result.target = readTarget(backend, layout, std::ref(loader));
       // The MTP draft's weights are sections of the same GGUF's mtp.bin
-      // image — open it while the loader lives.
-      if (mtpDraft) {
+      // image — open it while the loader lives. Nemotron's MTP block is a
+      // checkpoint dir like the other drafts, not a target-GGUF section.
+      if (mtpDraft && !nemotronMtpDraft) {
         // Capture the baseline before the image's buffer allocates — the
         // draft weights' sections are views of it, so their own delta is
         // zero.

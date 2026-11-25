@@ -287,7 +287,11 @@ inline void norm_rms_packed_row(device const bfloat *input, device const W *weig
     const float a = column < width ? float(v) : 0.0f;
     const float m = simd_max(fabs(a));
     const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
-                      ? clamp(int(floor(log2(m))) - 14, -100, 100)
+                      ? clamp((m >= 1.17549435e-38f && m < INFINITY
+                                  ? int(as_type<uint>(m) >> 23) - 127
+                                  : int(floor(log2(m)))) -
+                                 14,
+                             -100, 100)
                       : 0;
     row_packed[(column & ~31u) + slot] = half(a * as_type<float>(uint(127 - e) << 23));
     if (lane == 0) row_exponents[column >> 5] = uchar(127 + e);

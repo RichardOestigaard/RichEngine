@@ -2626,6 +2626,35 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
             h = (h ^ b[i]) * 1099511628211ULL;
           return h;
         };
+        // GDN state cells: identical prompts must leave identical
+        // recurrent/conv state per lane after prefill — a lane>=1
+        // mismatch here exonerates the verify compute entirely.
+        try {
+          const uint32_t sl = lanes[lane].request->stateLane;
+          const auto &gdnLayout = geometry.target.stateLayout;
+          for (uint32_t layer = 0; layer < gdnLayout.layers && layer < 4;
+               ++layer) {
+            for (int par = 0; par < 2; ++par) {
+              const GdnParityBuffers &cell =
+                  par ? states.next(sl) : states.current(sl);
+              const MetalBuffer &rec = cell.recurrentLayers[layer];
+              const MetalBuffer &conv = cell.convolutionLayers[layer];
+              if (rec.sizeBytes())
+                fprintf(stderr,
+                        "dump2 lane=%u sl=%u par=%d glayer=%u rec=%016llx\n",
+                        lane, sl, par, layer,
+                        (unsigned long long)fnv64(rec.contents(),
+                                                  rec.sizeBytes()));
+              if (conv.sizeBytes())
+                fprintf(stderr,
+                        "dump2 lane=%u sl=%u par=%d glayer=%u conv=%016llx\n",
+                        lane, sl, par, layer,
+                        (unsigned long long)fnv64(conv.contents(),
+                                                  conv.sizeBytes()));
+            }
+          }
+        } catch (...) {
+        }
         // Post-GPU prefill projection: seq0 vs seq1 ChunkKeys/ChunkValues
         // regions (32768-byte lane stride for 4kv x 32tok x 128d x u16).
         try {
@@ -2809,6 +2838,43 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           laneHash(decodeArena->gdnBatchSlice(
                        DecodeTensor::VerifyPackedBase, 0,
                        nlane), "gdnPacked0", 1 << 20);
+          // Row-region map of the whole layer-0 packed/mixed blocks:
+          // quarter hashes show whether lane1's fresh data lands at a
+          // displaced offset (compaction) or the bytes go unwritten.
+          try {
+            const MetalBuffer pk = decodeArena->gdnBatchSlice(
+                DecodeTensor::VerifyPackedBase, 0, nlane);
+            const MetalBuffer mx = decodeArena->gdnBatchSlice(
+                DecodeTensor::VerifyMixedBase, 0, nlane);
+            for (int which = 0; which < 2; ++which) {
+              const MetalBuffer &b = which ? mx : pk;
+              if (!b || !b.sizeBytes()) continue;
+              const auto *bp = contents<uint8_t>(b, which ? "mx" : "pk");
+              const size_t q = b.sizeBytes() / 8;
+              fprintf(stderr, "dump2 lane=%u %s8=[", lane,
+                      which ? "mx" : "pk");
+              for (int s = 0; s < 8; ++s)
+                fprintf(stderr, "%llx ",
+                        (unsigned long long)fnv64(bp + s * q, q));
+              fprintf(stderr, "]\n");
+            }
+          } catch (...) {
+          }
+        }
+        // The live-row/retention params this step encoded with — a lane1
+        // row-skip would show liveRows collapsing on the stale steps.
+        try {
+          const uint32_t sl = lanes[lane].request->stateLane;
+          fprintf(stderr,
+                  "dump2 lane=%u sl=%u vrows=%u ret=%u acc=%u "
+                  "pend=%u tpar=%u tape=%d maskRows=%u\n",
+                  lane, sl, laneResult.verifyRows,
+                  laneResult.retained, laneResult.accepted,
+                  sl < gdnPendingRows_.size() ? gdnPendingRows_[sl] : 999u,
+                  sl < gdnTapeParity_.size() ? gdnTapeParity_[sl] : 9u,
+                  gdnTape_ ? 1 : 0,
+                  lanes[lane].request->verifyMaskRows);
+        } catch (...) {
         }
         laneHash(decodeArena->packed(DecodeTensor::GdnHidden, nlane),
                  "gdnHidden", 1 << 20);

@@ -386,6 +386,33 @@ class UpstreamTest(unittest.TestCase):
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
 
+    def test_gguf_selection_ignores_draft_and_mtp_files(self):
+        # ggml-org's Nemotron repository ships the family's drafts and MTP
+        # heads as root GGUFs beside the targets; none is ever the target.
+        files = {
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf",
+            "dflash-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf",
+            "dspark-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf",
+            "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf",
+            "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf",
+            "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf",
+        }
+        for variant in ("NVFP4", "Q4_0", "Q8_0", "BF16"):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(files, variant),
+                    (
+                        f"NVIDIA-Nemotron-3.5-Lightning-30B-A3B-{variant}.gguf",
+                        False,
+                    ),
+                )
+        # No variant still asks for one rather than picking a draft.
+        with self.assertRaisesRegex(models.ModelError, "select a GGUF"):
+            upstream.select_gguf(files, None)
+
     def test_gguf_selection_reads_dot_variants(self):
         # mradermacher's repositories name quants MODEL.QUANT.gguf, and the
         # imatrix builds MODEL.i1-QUANT.gguf beside a *.imatrix.gguf data

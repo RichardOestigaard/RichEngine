@@ -395,15 +395,29 @@ namespace richengine::model {
       for (uint32_t lane = 0; lane < lanes; ++lane)
         buffers.mtpAnchors[lane] = decodeArena->get(
             laneEntry(entries, lane).stateLane, DecodeTensor::MtpAnchor);
-      buffers.mtp.streams = d(DecodeTensor::MtpCtxStreams);
-      buffers.mtp.eh = d(DecodeTensor::MtpCtxEh);
-      buffers.mtp.ehOut = d(DecodeTensor::MtpCtxEhOut);
-      buffers.mtp.plane = d(DecodeTensor::MtpCtxPlane);
-      buffers.mtp.mappings = d(DecodeTensor::MtpCtxMappings);
-      buffers.mtp.embed = d(DecodeTensor::MtpCtxEmbed);
-      buffers.mtp.embedNormed = d(DecodeTensor::MtpCtxEmbedNormed);
-      buffers.mtp.keys = d(DecodeTensor::MtpCtxKeys);
-      buffers.mtp.values = d(DecodeTensor::MtpCtxValues);
+      // The commit's projections stage lanes×verifyRows rows to the
+      // GGUF decode tile (LinearGguf.cpp stagedTileRows): bind the slots
+      // the staged plan covers, which a three-lane batch under-packs.
+      const uint32_t commitRows = lanes * ExecutionLimits::targetVerifyRows;
+      const uint32_t staged = commitRows <= 8   ? 8
+                              : commitRows <= 16 ? 16
+                              : commitRows <= 32 ? 32
+                                                 : 64;
+      const uint32_t ctxLanes =
+          (staged + ExecutionLimits::targetVerifyRows - 1) /
+          ExecutionLimits::targetVerifyRows;
+      auto dc = [&](DecodeTensor tensor) {
+        return decodeArena->packed(tensor, ctxLanes);
+      };
+      buffers.mtp.streams = dc(DecodeTensor::MtpCtxStreams);
+      buffers.mtp.eh = dc(DecodeTensor::MtpCtxEh);
+      buffers.mtp.ehOut = dc(DecodeTensor::MtpCtxEhOut);
+      buffers.mtp.plane = dc(DecodeTensor::MtpCtxPlane);
+      buffers.mtp.mappings = dc(DecodeTensor::MtpCtxMappings);
+      buffers.mtp.embed = dc(DecodeTensor::MtpCtxEmbed);
+      buffers.mtp.embedNormed = dc(DecodeTensor::MtpCtxEmbedNormed);
+      buffers.mtp.keys = dc(DecodeTensor::MtpCtxKeys);
+      buffers.mtp.values = dc(DecodeTensor::MtpCtxValues);
     }
     std::visit([&](const auto &model) {
       model.addContextCommit(graph, std::move(buffers),

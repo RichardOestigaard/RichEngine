@@ -1772,9 +1772,21 @@ MetalBackend::Impl::PreparedCommand MetalBackend::Impl::prepare(std::span<const 
             // it.
             preparedCache.clear();
         }
-        const std::string key = std::to_string(dispatches.size()) + '#' +
-                                dispatches.front().pipelineName + '#' +
-                                dispatches.back().pipelineName;
+        // FNV-1a over the same fields the old string key carried, built
+        // without an allocation: the key only selects a bucket, and
+        // commandMatches below validates every field before reuse.
+        uint64_t key = 14695981039346656037ull;
+        const auto mix = [&key](const void *data, size_t size) {
+            const auto *bytes = static_cast<const unsigned char *>(data);
+            for (size_t i = 0; i < size; ++i)
+                key = (key ^ bytes[i]) * 1099511628211ull;
+        };
+        const size_t dispatchCount = dispatches.size();
+        mix(&dispatchCount, sizeof(dispatchCount));
+        mix(dispatches.front().pipelineName.data(),
+            dispatches.front().pipelineName.size());
+        mix(dispatches.back().pipelineName.data(),
+            dispatches.back().pipelineName.size());
         std::vector<std::unique_ptr<CachedCommand>> &slots =
             preparedCache[key];
         for (const auto &candidate : slots) {

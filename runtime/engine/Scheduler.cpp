@@ -369,9 +369,13 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
   uint32_t budget = prefillBudget(ready.front(), ready);
+  // RICHENGINE_PREFILL_SOLO=1 forces one sequence per prefill command —
+  // bisects packed-prefill state corruption against multi-sequence packing.
+  static const bool soloPrefill = getenv("RICHENGINE_PREFILL_SOLO") != nullptr;
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
-        plan.width() == model::ExecutionLimits::maximumBatchWidth)
+        plan.width() == model::ExecutionLimits::maximumBatchWidth ||
+        (soloPrefill && plan.width()))
       break;
     const uint32_t rows = std::min(dispatchRemaining(view), budget);
     // A lane whose planned rows already reach an armed boundary contributes

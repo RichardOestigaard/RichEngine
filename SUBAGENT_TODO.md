@@ -1,9 +1,10 @@
 # Subagent verification findings
 
-Cross-check of `DS_FINDIGNS2.md` (audit, 2026-10-26) and
+Re-verification of the 2026-10-26 codebase audit and
 `DEEPSEEK_V4_1_FLASH_DIVE.md` (Metal 4 audit) against the current working
 tree. Verified by four read-only subagents. Verdicts: STILL VALID unless
-marked otherwise.
+marked otherwise. #4 has since been fixed; #2 was confirmed live again on
+the current tree (`decisions.py`/`dfa.py` still absent from SERVER_FILES).
 
 ## Stop-the-line (ship-blocking)
 
@@ -28,10 +29,10 @@ marked otherwise.
   `webui` target exists at :197-199); `server/webui/` gitignored
   (`.gitignore:20-21`); fallback to `chat.html` intact
   (`server.py:80-86,507-508`).
-- [ ] **#4 139 unwired tests.** `dev/Makefile:73-82` runs only
-  `dev/tests/engine` + `test_server.py` + five named modules. Unwired:
-  `test_dfa` 18, `test_pack` 7, `test_tuning` 82, `test_local` 7,
-  `test_webfetch` 15, `test_websearch` 10 — incl. SSRF cases.
+- [x] **#4 139 unwired tests — FIXED.** `test-python` now runs `test_dfa`,
+  `test_webfetch` and `test_websearch` beside `test_server`; `test-models`
+  runs `test_pack`, `test_tuning` and `test_local` (`dev/Makefile`); both
+  run in CI through `check-python-engine`.
 
 ## High-value bugs — all still valid
 

@@ -9,6 +9,7 @@
 #include "model/DFlashV1Draft.hpp"
 #include "model/DSplineDraft.hpp"
 #include "model/NemotronMtpDraft.hpp"
+#include "model/OqWrite.hpp"
 
 #include <string>
 #include <utility>
@@ -20,6 +21,23 @@ namespace {
 using affine::copy;
 using affine::embeddingSection;
 using affine::Image;
+
+// Flags an all-float image's parts bf16: the oQ writer emits a ggml::kBF16
+// float segment, read back as QuantizedSegment::kBfloat16 — half the plane
+// bytes and no load-time repack. The draft proposes; the target verifies.
+// section.bytes must be recomputed: affine::projection sized it for F32.
+void bfloatParts(Image &image) {
+  for (affine::Section &section : image.sections) {
+    bool flagged = false;
+    for (affine::ProjectionPart &part : section.parts)
+      if (part.unquantized && !part.nativeRows && !part.dequantize) {
+        part.bfloat = true;
+        flagged = true;
+      }
+    if (flagged && section.kind == affine::SectionKind::Oq)
+      section.bytes = affine::oq::sectionBytes(section);
+  }
+}
 
 // A projection's BF16 parts, stacked in row order, which the writer quantizes;
 // they fill its rows.
@@ -134,6 +152,7 @@ Image dflashV1LayerImage(const DFlashDraftLayout &layout, uint32_t layer, bool f
   projection({{prefix + "mlp.gate_proj", layout.intermediateSize}}, layout.intermediateSize, hidden);
   projection({{prefix + "mlp.up_proj", layout.intermediateSize}}, layout.intermediateSize, hidden);
   projection({{prefix + "mlp.down_proj", hidden}}, hidden, layout.intermediateSize);
+  if (floats) bfloatParts(result);
   return result;
 }
 
@@ -152,6 +171,7 @@ Image dflashV1ModelImage(const DFlashDraftLayout &layout, bool floats = false) {
   if (layout.tokenEmbedding)
     embeddingSection(result, "embed_tokens", layout.vocabularySize,
                      layout.hiddenSize, keepFloat());
+  if (floats) bfloatParts(result);
   return result;
 }
 
@@ -181,6 +201,7 @@ Image dsparkModelImage(const DFlashDraftLayout &layout, bool floats) {
   if (layout.tokenEmbedding)
     embeddingSection(result, "embed_tokens", layout.vocabularySize,
                      layout.hiddenSize, keepFloat());
+  if (floats) bfloatParts(result);
   return result;
 }
 
@@ -233,12 +254,12 @@ Image nemotronMtpImage(const DFlashDraftLayout &layout) {
   };
   copy(result, "mtp.nextn.enorm.weight", {hidden});
   copy(result, "mtp.nextn.hnorm.weight", {hidden});
-  floatProjection("mtp.nextn.eh_proj.weight", hidden, 2 * hidden);
+  floatProjection("mtp.nextn.eh_proj", hidden, 2 * hidden);
   copy(result, "mtp.attn_norm.weight", {hidden});
-  floatProjection("mtp.self_attn.q_proj.weight", layout.attentionSize, hidden);
-  floatProjection("mtp.self_attn.k_proj.weight", kv, hidden);
-  floatProjection("mtp.self_attn.v_proj.weight", kv, hidden);
-  floatProjection("mtp.self_attn.o_proj.weight", hidden, layout.attentionSize);
+  floatProjection("mtp.self_attn.q_proj", layout.attentionSize, hidden);
+  floatProjection("mtp.self_attn.k_proj", kv, hidden);
+  floatProjection("mtp.self_attn.v_proj", kv, hidden);
+  floatProjection("mtp.self_attn.o_proj", hidden, layout.attentionSize);
   copy(result, "mtp.post_attention_norm.weight", {hidden});
   copy(result, "mtp.moe.gate_inp.weight", {128, hidden});
   copy(result, "mtp.moe.exp_probs_b.bias", {128});
@@ -248,6 +269,7 @@ Image nemotronMtpImage(const DFlashDraftLayout &layout) {
   copy(result, "mtp.moe.down_shexp.weight", {hidden, 3712});
   copy(result, "mtp.output_norm.weight", {hidden});
   copy(result, "mtp.nextn.shared_head_norm.weight", {hidden});
+  bfloatParts(result);
   return result;
 }
 

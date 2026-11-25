@@ -86,6 +86,10 @@ struct ExpertProjection final {
 struct QuantizedSegment final {
   // The formatId of a float segment.
   static constexpr uint32_t kFloat32 = 0xffffffff;
+  // A float segment whose plane0 holds bf16 values instead (draft weights
+  // repacked at load, RICHENGINE_DRAFT_WBF16): the same kernels with a
+  // half-size weight operand.
+  static constexpr uint32_t kBfloat16 = 0xfffffffe;
 
   [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
@@ -103,7 +107,14 @@ struct QuantizedSegment final {
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
 
-  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
+  [[nodiscard]] bool isFloat() const noexcept {
+    return formatId == kFloat32 || formatId == kBfloat16;
+  }
+  // Bytes per weight element of a float segment's plane0 (4 for kFloat32,
+  // 2 for kBfloat16; meaningless on a quantized segment).
+  [[nodiscard]] uint64_t floatElementBytes() const noexcept {
+    return formatId == kBfloat16 ? 2 : 4;
+  }
   // The plane geometry of a quantized segment.
   [[nodiscard]] const QuantFormat &format() const noexcept;
   // The kernel name suffix of its format ("f32" for a float segment).
@@ -198,6 +209,14 @@ public:
   // Whether those views take it: its own planes, not a view, of affine Q4
   // weights or of one unrotated quantized GGUF tensor.
   [[nodiscard]] bool takesPlaneViews() const noexcept;
+  // The projection over different block segments, everything else kept.
+  [[nodiscard]] Projection withSegments(BlockWeights weights) const {
+    Projection result(outputSize, inputSize, std::move(weights));
+    result.destination = destination;
+    result.rotation = rotation;
+    result.planeInputs_ = planeInputs_;
+    return result;
+  }
   // The inputs each row of the weight planes holds when the projection reads
   // only their first inputSize, a view of leadingInputs(); zero for
   // inputSize. Only the prefill residual tiles of quantized weights take such

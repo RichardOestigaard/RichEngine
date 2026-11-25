@@ -41,8 +41,14 @@ kernel void gguf_pack_half(device bfloat *input [[buffer(0)]], device half *pack
   const float a = float(input[ulong(row) * p.input_size + slot * 32 +
                               16 * ((s >> 2) & 1) + 4 * (s >> 3) + (s & 3)]);
   const float m = simd_max(fabs(a));
+  // floor(log2(m)) is the biased exponent minus 127 for every finite normal
+  // m; subnormals and infinities keep the transcendental path.
   const int e = m > 30720.0f || (m > 0.0f && m < 6.1e-5f)
-                    ? clamp(int(floor(log2(m))) - 14, -100, 100)
+                    ? clamp((m >= 1.17549435e-38f && m < INFINITY
+                                ? int(as_type<uint>(m) >> 23) - 127
+                                : int(floor(log2(m)))) -
+                               14,
+                           -100, 100)
                     : 0;
   packed[i] = half(a * as_type<float>(uint(127 - e) << 23));
   if (s == 0) exponents[row * groups + slot] = uchar(127 + e);

@@ -311,10 +311,16 @@ GdnParityBuffers groupCellBuffers(metal::MetalBackend &backend,
   // One layer's state serves every layer: a part writes it at a layer and
   // the other step's part reads it there before any part's next layer.
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    cell.convolutionLayers.push_back(
-        backend.view(cell.stateBase, 0, convolution));
-    cell.recurrentLayers.push_back(
-        backend.view(cell.stateBase, convolution, recurrent));
+    if (convolution)
+      cell.convolutionLayers.push_back(
+          backend.view(cell.stateBase, 0, convolution));
+    else
+      cell.convolutionLayers.push_back(metal::MetalBuffer{});
+    if (recurrent)
+      cell.recurrentLayers.push_back(
+          backend.view(cell.stateBase, convolution, recurrent));
+    else
+      cell.recurrentLayers.push_back(metal::MetalBuffer{});
   }
   return cell;
 }

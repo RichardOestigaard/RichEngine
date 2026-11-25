@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from .errors import APIError
 
@@ -166,6 +166,28 @@ def _checked_url(url):
     return url
 
 
+def _ascii_url(url):
+    """The URL as the request line must carry it: a non-ASCII host
+    IDNA-encoded, every other non-ASCII character percent-encoded. A model
+    writes URLs unescaped; the transport encodes the request line as ASCII
+    and answers a UnicodeEncodeError rather than a fetch failure."""
+    parts = urlsplit(url)
+    host = parts.hostname.encode("idna").decode("ascii")
+    netloc = f"[{host}]" if ":" in host else host
+    if parts.port:
+        netloc += f":{parts.port}"
+    safe = "/%:@!$&'()*+,;=?~-._"
+    return urlunsplit(
+        (
+            parts.scheme,
+            netloc,
+            quote(parts.path, safe=safe),
+            quote(parts.query, safe=safe),
+            quote(parts.fragment, safe=safe),
+        )
+    )
+
+
 def _read(response):
     try:
         return response.read(MAX_RESPONSE_BYTES + 1)
@@ -218,7 +240,7 @@ def fetch(url, deadline=None):
         if remaining <= 0:
             raise APIError(504, "fetch timed out", "request_timeout")
         request = urllib.request.Request(
-            current,
+            _ascii_url(current),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,text/plain,"
